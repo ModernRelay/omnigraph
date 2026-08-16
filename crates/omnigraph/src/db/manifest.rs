@@ -32,9 +32,10 @@ mod recovery;
 #[path = "manifest/state.rs"]
 mod state;
 
+pub(crate) use graph::{GenesisManifestAttempt, ManifestInitError};
 use graph::{
-    init_manifest_graph, load_initial_manifest_state, open_manifest_graph,
-    open_manifest_graph_with_lineage, snapshot_state_at,
+    init_manifest_graph, load_initial_manifest_state, open_exact_genesis_manifest,
+    open_manifest_graph, open_manifest_graph_with_lineage, snapshot_state_at,
 };
 pub(crate) use layout::manifest_uri;
 #[cfg(test)]
@@ -796,7 +797,8 @@ impl ManifestCoordinator {
         catalog: &Catalog,
         control_session: &Arc<lance::session::Session>,
     ) -> Result<(Self, Vec<GraphLineageRow>)> {
-        let dataset = Self::init_commit(root_uri, catalog, control_session).await?;
+        let attempt = GenesisManifestAttempt::mint()?;
+        let dataset = Self::init_commit(root_uri, catalog, control_session, &attempt).await?;
         Self::finish_init(root_uri, dataset).await
     }
 
@@ -806,8 +808,33 @@ impl ManifestCoordinator {
         root_uri: &str,
         catalog: &Catalog,
         control_session: &Arc<lance::session::Session>,
-    ) -> Result<Dataset> {
-        init_manifest_graph(root_uri.trim_end_matches('/'), catalog, control_session).await
+        attempt: &GenesisManifestAttempt,
+    ) -> std::result::Result<Dataset, ManifestInitError> {
+        init_manifest_graph(
+            root_uri.trim_end_matches('/'),
+            catalog,
+            control_session,
+            attempt,
+        )
+        .await
+    }
+
+    /// Probe an acknowledgement-unknown manifest Create and accept only the
+    /// exact immutable genesis receipt minted by this initialization attempt.
+    /// A transport/read/mismatch error remains indeterminate to the caller;
+    /// this method never turns absence or ambiguity into cleanup authority.
+    pub(crate) async fn open_exact_genesis_with_lineage(
+        root_uri: &str,
+        attempt: &GenesisManifestAttempt,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<(Self, Vec<GraphLineageRow>)> {
+        let root = root_uri.trim_end_matches('/');
+        let (dataset, known_state, lineage_rows) =
+            open_exact_genesis_manifest(root, attempt, control_session).await?;
+        Ok((
+            Self::from_parts_with_default_publisher(root, dataset, known_state, None),
+            lineage_rows,
+        ))
     }
 
     /// Post-commit half of manifest init: reads the committed state back and

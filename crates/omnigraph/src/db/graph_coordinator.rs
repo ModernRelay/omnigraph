@@ -12,8 +12,9 @@ use crate::storage::{StorageAdapter, normalize_root_uri};
 use super::commit_graph::{CommitGraph, FirstParentEdge, GraphCommit};
 use super::is_internal_system_branch;
 use super::manifest::{
-    CapturedManifestProbe, ExpectedTableVersions, LineageIntent, ManifestChange,
-    ManifestCoordinator, ManifestIncarnation, PublishPrecondition, Snapshot, SubTableUpdate,
+    CapturedManifestProbe, ExpectedTableVersions, GenesisManifestAttempt, LineageIntent,
+    ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
+    PublishPrecondition, Snapshot, SubTableUpdate,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -130,12 +131,37 @@ impl GraphCoordinator {
         root_uri: &str,
         catalog: &Catalog,
         control_session: &Arc<lance::session::Session>,
-    ) -> Result<Dataset> {
+        attempt: &GenesisManifestAttempt,
+    ) -> std::result::Result<Dataset, ManifestInitError> {
         let root = normalize_root_uri(root_uri)?;
         // The genesis graph commit is folded into the manifest init write, so
         // `__manifest` is the single source of graph lineage from version one
         // (RFC-013 Phase 7).
-        ManifestCoordinator::init_commit(&root, catalog, control_session).await
+        ManifestCoordinator::init_commit(&root, catalog, control_session, attempt).await
+    }
+
+    /// Reopen an acknowledgement-unknown manifest Create and construct a
+    /// coordinator only when the exact attempt-local genesis receipt is
+    /// present.  The caller still owns schema-IR validation before it can
+    /// return a graph handle.
+    pub(crate) async fn open_exact_genesis_with_storage(
+        root_uri: &str,
+        attempt: &GenesisManifestAttempt,
+        storage: Arc<dyn StorageAdapter>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<Self> {
+        let root = normalize_root_uri(root_uri)?;
+        let (manifest, lineage_rows) =
+            ManifestCoordinator::open_exact_genesis_with_lineage(&root, attempt, control_session)
+                .await?;
+        let commit_graph = CommitGraph::from_manifest_rows(&root, None, lineage_rows);
+        Ok(Self {
+            root_uri: root,
+            storage,
+            manifest,
+            commit_graph,
+            bound_branch: None,
+        })
     }
 
     /// Post-commit half of coordinator init: builds the coordinator's view of

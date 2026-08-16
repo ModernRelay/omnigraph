@@ -159,6 +159,40 @@ async fn test_init_creates_manifest_and_sub_tables() {
 }
 
 #[tokio::test]
+async fn exact_genesis_probe_rejects_another_initialization_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let control_session = crate::lance_access::control_session();
+    let committed_attempt = GenesisManifestAttempt::mint().unwrap();
+
+    ManifestCoordinator::init_commit(uri, &catalog, &control_session, &committed_attempt)
+        .await
+        .unwrap();
+    ManifestCoordinator::open_exact_genesis_with_lineage(uri, &committed_attempt, &control_session)
+        .await
+        .expect("the creating attempt must authenticate its own immutable genesis");
+
+    let foreign_attempt = GenesisManifestAttempt::mint().unwrap();
+    let error = match ManifestCoordinator::open_exact_genesis_with_lineage(
+        uri,
+        &foreign_attempt,
+        &control_session,
+    )
+    .await
+    {
+        Ok(_) => panic!("a valid v1 manifest from another initializer must not authenticate"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("genesis lineage does not match this initialization attempt"),
+        "unexpected probe error: {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_open_reads_existing_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();

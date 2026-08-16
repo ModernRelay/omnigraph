@@ -290,6 +290,7 @@ graph-root/
   edges/{stable-id}-{incarnation}/ # one dataset per edge-table lifetime
   _graph_commit_recoveries.lance/  # internal crash-recovery audit log
   __recovery/{ulid}.json           # transient recovery sidecars (empty at steady state)
+  __init_claim.json                # transient init ownership (absent at steady state)
   _refs/branches/{name}.json       # graph-level branch metadata
 ```
 

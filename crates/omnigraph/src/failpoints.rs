@@ -122,10 +122,28 @@ pub mod names {
     pub const INIT_AFTER_COORDINATOR_INIT: &str = "init.after_coordinator_init";
     pub const INIT_AFTER_SCHEMA_CONTRACT_WRITTEN: &str = "init.after_schema_contract_written";
     pub const INIT_AFTER_SCHEMA_PG_WRITTEN: &str = "init.after_schema_pg_written";
-    /// The first failpoint past the graph's commit point (the `__manifest`
-    /// Create commit). A crash OR an error return here must leave an
-    /// openable graph; init's schema cleanup is unreachable from this
-    /// window (issue #495).
+    /// After Lance has durably returned the new `__manifest` Dataset, but
+    /// before OmniGraph's create half can acknowledge it. Returning an error
+    /// here models a lost object-store acknowledgement and must route through
+    /// exact-genesis classification rather than schema cleanup.
+    pub const INIT_MANIFEST_CREATE_ACK_LOST: &str = "init.manifest_create_ack_lost";
+    /// Before the durable exact-genesis probe used to classify an
+    /// acknowledgement-unknown manifest Create. An injected failure proves the
+    /// caller preserves schema artifacts when the outcome cannot be observed.
+    pub const INIT_MANIFEST_CREATE_PROBE: &str = "init.manifest_create_probe";
+    /// After a per-type Lance dataset Create returns success, before graph
+    /// initialization can acknowledge it. The graph manifest does not exist
+    /// yet, but retry and schema cleanup are unsafe because the table Create
+    /// may be durable.
+    pub const INIT_TABLE_CREATE_ACK_LOST: &str = "init.table_create_ack_lost";
+    /// Inject an indeterminate schema-artifact delete during pre-physical init
+    /// cleanup. The original init error must win and the durable claim must be
+    /// retained so a delayed delete cannot race another initializer.
+    pub const INIT_SCHEMA_CLEANUP_DELETE: &str = "init.schema_cleanup_delete";
+    /// The first ordinary post-commit read-back failpoint after the graph's
+    /// `__manifest` Create has been positively classified. A crash OR an error
+    /// return here must leave an openable graph; init's schema cleanup is
+    /// unreachable from this window (issue #495).
     pub const INIT_POST_MANIFEST_CREATE: &str = "init.post_manifest_create";
     /// A read-write bind of a local graph root, before the create-if-absent
     /// probe writes its probe object. Injecting here simulates a filesystem

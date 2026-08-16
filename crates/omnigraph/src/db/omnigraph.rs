@@ -50,7 +50,9 @@ pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 
 use super::commit_graph::GraphCommit;
-use super::manifest::{ManifestChange, Snapshot, TableRegistration, TableTombstone};
+use super::manifest::{
+    GenesisManifestAttempt, ManifestChange, Snapshot, TableRegistration, TableTombstone,
+};
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, load_validated_schema_contract,
     load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_state_identity,
@@ -296,7 +298,7 @@ pub enum OpenMode {
 /// `force` controls the safety preflight that prevents an
 /// accidental re-init from overwriting an existing graph's schema
 /// metadata. Default behavior (`force: false`) fails fast with
-/// [`OmniError::AlreadyInitialized`] if any of `_schema.pg`,
+/// [`OmniError::AlreadyInitialized`] if `__manifest` or any of `_schema.pg`,
 /// `_schema.ir.json`, or `__schema_state.json` already exists at the target
 /// URI. With `force: true`, orphan schema files may be replaced only when no
 /// `__manifest` exists. Force never rebinds an existing graph to a newly
@@ -311,12 +313,16 @@ impl Omnigraph {
     /// Create a new graph at `uri` from schema source.
     ///
     /// Strict mode errors with [`OmniError::AlreadyInitialized`] if `uri`
-    /// already holds any schema artifact. Force is intentionally limited to
-    /// orphan artifacts and refuses a root with an existing `__manifest`.
+    /// already holds `__manifest` or any schema artifact. Force is
+    /// intentionally limited to orphan artifacts and refuses a root with an
+    /// existing `__manifest`.
     ///
-    /// A failure after `__manifest` is created and stamped leaves the graph
-    /// intact and openable with [`Self::open`]; earlier failures remove the
-    /// schema artifacts this call wrote.
+    /// Schema artifacts are removed only for failures proven to precede any
+    /// physical graph initialization. A confirmed commit preserves them and
+    /// reports a typed [`OmniError::InitializationCommitted`] if final
+    /// validation fails; an acknowledgement-unknown physical outcome that
+    /// cannot be authenticated reports
+    /// [`OmniError::InitializationIndeterminate`] and fails closed.
     pub async fn init(uri: &str, schema_source: &str) -> Result<Self> {
         Self::init_with_options(uri, schema_source, InitOptions::default()).await
     }
@@ -353,19 +359,7 @@ impl Omnigraph {
         // Closes the "init is destructive against existing state"
         // class: there is no longer a code path where strict-mode
         // `init` can mutate a populated graph root.
-        if options.force {
-            refuse_force_init_over_existing_manifest(&root, storage.as_ref()).await?;
-        } else {
-            for candidate in [
-                schema_source_uri(&root),
-                schema_ir_uri(&root),
-                schema_state_uri(&root),
-            ] {
-                if storage.exists(&candidate).await? {
-                    return Err(OmniError::AlreadyInitialized { uri: root.clone() });
-                }
-            }
-        }
+        preflight_init_target(&root, storage.as_ref(), options).await?;
 
         let schema_shape = read_schema_shape_from_source(schema_source)?;
         let resolution = initialize_schema_ir(SchemaIdentityDomain::new(), &schema_shape)
@@ -386,42 +380,77 @@ impl Omnigraph {
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
 
-        // Every init write needs atomic create-if-absent (the `_schema.pg`
-        // claim, each Lance commit), so refuse an incapable local
+        // Every init write needs atomic create-if-absent (the root init claim,
+        // the strict-mode `_schema.pg` defence, and each Lance commit), so
+        // refuse an incapable local
         // filesystem here, while the root holds nothing to strand.
         verify_local_create_if_absent(&root, storage.as_ref()).await?;
 
-        // Establish an atomic ownership claim on `_schema.pg` before
-        // writing the remaining init artifacts. A check-then-write preflight
-        // is not enough under concurrent `init` calls: two callers can both
-        // observe an empty root, one can successfully initialize, and the
-        // loser can then fail in Lance `WriteMode::Create`. Only the caller
-        // that atomically created `_schema.pg` may clean up schema artifacts
-        // on later failure.
+        // Both strict and force init take the same root-scoped durable claim.
+        // Force cannot use `_schema.pg` as its claim because replacing an
+        // orphan is its explicit job; without this separate authority two
+        // force callers can overwrite one another's contracts and the loser
+        // can delete the winner's schema after losing the manifest Create.
+        // The claim remains present through any owned cleanup and is released
+        // last, so no cooperating process can enter that window.
+        let init_claim = acquire_init_claim(&root, storage.as_ref()).await?;
+
+        // The first preflight is only a fast failure. Repeat it while holding
+        // the durable claim so a competitor that passed its own first probe
+        // cannot change the target between our check and schema writes.
+        if let Err(err) = preflight_init_target(&root, storage.as_ref(), options).await {
+            best_effort_release_init_claim(&init_claim, storage.as_ref()).await;
+            return Err(err);
+        }
+
+        // Keep `_schema.pg`'s conditional create in strict mode as defence in
+        // depth against an unsupported older writer that does not understand
+        // `__init_claim.json`. Cleanup authority comes from `init_claim`, not
+        // from this file.
         let schema_pg_claimed = if options.force {
             false
         } else {
             let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
-            if !storage
+            match storage
                 .write_text_if_absent(&schema_path, schema_source)
-                .await?
+                .await
             {
-                return Err(OmniError::AlreadyInitialized { uri: root.clone() });
+                Ok(true) => {}
+                Ok(false) => {
+                    best_effort_release_init_claim(&init_claim, storage.as_ref()).await;
+                    return Err(OmniError::AlreadyInitialized { uri: root.clone() });
+                }
+                Err(err) => {
+                    best_effort_cleanup_owned_init_artifacts(&root, storage.as_ref(), &init_claim)
+                        .await;
+                    return Err(err);
+                }
             }
             if let Err(err) = crate::failpoints::maybe_fail(
                 crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN,
             ) {
-                best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
+                best_effort_cleanup_owned_init_artifacts(&root, storage.as_ref(), &init_claim)
+                    .await;
                 return Err(err);
             }
             true
         };
 
-        // Run the commit phase. On any error, best-effort-clean schema
-        // artifacts only when this invocation owns them: strict mode owns
-        // them after the atomic `_schema.pg` claim above; force is allowed
-        // only for orphan schema artifacts after proving that no manifest
-        // exists.
+        let genesis_attempt = match GenesisManifestAttempt::mint() {
+            Ok(attempt) => attempt,
+            Err(err) => {
+                best_effort_cleanup_owned_init_artifacts(&root, storage.as_ref(), &init_claim)
+                    .await;
+                return Err(err);
+            }
+        };
+
+        // Run the commit phase. Errors before any per-table or manifest
+        // Dataset::write may clean the schema artifacts owned by this claim.
+        // Once physical graph initialization begins, an error is
+        // acknowledgement-unknown: the exact attempt-local genesis must be
+        // probed, and absence of that genesis cannot prove partial table
+        // Creates are absent.
         //
         // Coverage gap: a failure DURING `GraphCoordinator::init` can leave
         // Lance per-type datasets and a partial `__manifest/` behind; those
@@ -429,7 +458,7 @@ impl Omnigraph {
         // `StorageAdapter::delete_prefix` primitive deferred with
         // `DELETE /graphs/{id}` (MR-668 PR 2b). Operators may need to
         // remove the graph directory manually before retrying `init`.
-        let manifest_dataset = match init_commit_phase(
+        let coordinator = match init_commit_phase(
             &root,
             schema_source,
             &schema_ir,
@@ -437,25 +466,63 @@ impl Omnigraph {
             &storage,
             !schema_pg_claimed,
             &lance_access.control_session(),
+            &genesis_attempt,
         )
         .await
         {
-            Ok(dataset) => dataset,
-            Err(err) => {
-                if schema_pg_claimed || options.force {
-                    best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
+            Ok(dataset) => {
+                let result = init_post_commit_checks(&root, dataset, &schema_ir, &storage).await;
+                best_effort_release_init_claim(&init_claim, storage.as_ref()).await;
+                match result {
+                    Ok(coordinator) => coordinator,
+                    Err(source) => {
+                        return Err(OmniError::InitializationCommitted {
+                            uri: root.clone(),
+                            source: Box::new(source),
+                        });
+                    }
                 }
-                return Err(err);
+            }
+            Err(InitCommitError::BeforePhysicalInit(source)) => {
+                best_effort_cleanup_owned_init_artifacts(&root, storage.as_ref(), &init_claim)
+                    .await;
+                return Err(source);
+            }
+            Err(InitCommitError::PhysicalInitOutcomeUnknown(source)) => {
+                let probe = GraphCoordinator::open_exact_genesis_with_storage(
+                    &root,
+                    &genesis_attempt,
+                    Arc::clone(&storage),
+                    &lance_access.control_session(),
+                )
+                .await;
+                let coordinator = match probe {
+                    Ok(coordinator) => coordinator,
+                    Err(probe) => {
+                        // The claim deliberately remains durable. Releasing it
+                        // would let force init overwrite a contract whose
+                        // physical outcome is still unknown.
+                        return Err(OmniError::InitializationIndeterminate {
+                            uri: root.clone(),
+                            source: Box::new(source),
+                            probe: Box::new(probe),
+                        });
+                    }
+                };
+
+                let result = finish_init_coordinator(coordinator, &schema_ir).await;
+                best_effort_release_init_claim(&init_claim, storage.as_ref()).await;
+                match result {
+                    Ok(coordinator) => coordinator,
+                    Err(validation) => {
+                        return Err(OmniError::InitializationCommitted {
+                            uri: root.clone(),
+                            source: Box::new(validation),
+                        });
+                    }
+                }
             }
         };
-
-        // Past the commit point (see `init_commit_phase`): the graph is
-        // durably complete. Errors from here must not reach the schema
-        // cleanup — deleting a complete graph's schema files strands its
-        // data behind a missing contract (issue #495).
-        let coordinator = init_post_commit_checks(&root, manifest_dataset, &schema_ir, &storage)
-            .await
-            .map_err(|err| annotate_post_commit_init_error(&root, err))?;
 
         let session = lance_access.data_session();
         Ok(Self {
@@ -595,12 +662,13 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
         // Read _schema.pg (post-recovery — may have just been renamed in).
         // The stamp guard and coordinator open above both read `__manifest`,
-        // so reaching this point proves the graph's data is present; a
-        // missing schema source is the schema-files-gone damage state.
+        // so reaching this point proves that manifest is readable; it does not
+        // prove every referenced data table exists. A missing schema source is
+        // the schema-files-gone damage state.
         let schema_path = schema_source_uri(&root);
         let Some(schema_source) = storage.read_text_if_exists(&schema_path).await? else {
             return Err(OmniError::manifest_not_found(format!(
-                "graph at '{root}' is missing its schema files: '_schema.pg' was not found although the graph's '__manifest' and data are present; restore '_schema.pg', '_schema.ir.json', and '__schema_state.json' from a backup, or rebuild the graph via export and re-init on a fresh root"
+                "graph at '{root}' is missing its schema files: '_schema.pg' was not found although '__manifest' is readable; restore the matching '_schema.pg', '_schema.ir.json', and '__schema_state.json' contract from a backup, or rebuild a fresh graph from an existing export or backup"
             )));
         };
         let (accepted_ir, accepted_state) =
@@ -3279,6 +3347,89 @@ fn read_schema_shape_from_source(schema_source: &str) -> Result<SchemaShape> {
     compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
 }
 
+/// Root-scoped durable ownership for graph initialization.
+///
+/// This is deliberately separate from `_schema.pg`: force init is allowed to
+/// replace an orphan schema source, so that file cannot arbitrate two force
+/// callers. The claim is transient control state, not part of manifest schema
+/// v6 and not graph authority after `__manifest` exists.
+const INIT_CLAIM_FILENAME: &str = "__init_claim.json";
+const INIT_CLAIM_PAYLOAD_VERSION: u32 = 1;
+
+#[derive(Debug)]
+#[must_use = "an acquired init claim must be retained through commit classification and released explicitly"]
+struct InitClaim {
+    uri: String,
+}
+
+fn init_claim_uri(root: &str) -> String {
+    join_uri(root, INIT_CLAIM_FILENAME)
+}
+
+/// Acquire the one cross-process init claim with the same create-if-absent
+/// primitive Lance relies on for manifest creation. A stale claim is never
+/// stolen automatically: without a distributed lease, a stopped initializer
+/// is indistinguishable from a slow live one.
+async fn acquire_init_claim(root: &str, storage: &dyn StorageAdapter) -> Result<InitClaim> {
+    let uri = init_claim_uri(root);
+    let payload = serde_json::json!({
+        "version": INIT_CLAIM_PAYLOAD_VERSION,
+        "attempt_id": Ulid::new().to_string(),
+    })
+    .to_string();
+    if !storage.write_text_if_absent(&uri, &payload).await? {
+        return Err(OmniError::InitializationClaimed {
+            uri: root.to_string(),
+        });
+    }
+    Ok(InitClaim { uri })
+}
+
+/// Delete a claim only after this attempt has no more schema mutations to
+/// perform. A delete error may leave safe, blocking residue and is therefore
+/// logged without masking the init result.
+async fn best_effort_release_init_claim(claim: &InitClaim, storage: &dyn StorageAdapter) {
+    if let Err(err) = storage.delete(&claim.uri).await {
+        tracing::warn!(
+            target: "omnigraph::init::claim",
+            uri = %claim.uri,
+            error = %err,
+            "initialization finished but durable claim removal is indeterminate; if the claim remains, it must not be removed until every initializer is quiesced",
+        );
+    }
+}
+
+async fn preflight_init_target(
+    root: &str,
+    storage: &dyn StorageAdapter,
+    options: InitOptions,
+) -> Result<()> {
+    if options.force {
+        refuse_force_init_over_existing_manifest(root, storage).await
+    } else {
+        if storage
+            .exists(&crate::db::manifest::manifest_uri(root))
+            .await?
+        {
+            return Err(OmniError::AlreadyInitialized {
+                uri: root.to_string(),
+            });
+        }
+        for candidate in [
+            schema_source_uri(root),
+            schema_ir_uri(root),
+            schema_state_uri(root),
+        ] {
+            if storage.exists(&candidate).await? {
+                return Err(OmniError::AlreadyInitialized {
+                    uri: root.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Prefix for transient objects a read-write bind owns while proving that the
 /// local filesystem supports atomic create-if-absent.
 const CREATE_IF_ABSENT_PROBE_FILENAME_PREFIX: &str = "__create_if_absent_probe";
@@ -3286,9 +3437,10 @@ const CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS: usize = 4;
 
 /// Refuse a local read-write bind (`init`, or `open` for read-write) whose
 /// filesystem cannot do atomic create-if-absent (no `hard_link(2)`: Android
-/// app storage, FAT/exFAT — issue #453). The `_schema.pg` claim and every
-/// Lance commit need it on every write, and it is a property of the mount
-/// behind the root (a store can be copied), so probe per root, per bind.
+/// app storage, FAT/exFAT — issue #453). The root `__init_claim.json`, the
+/// strict-mode `_schema.pg` defence, and every Lance commit need it on every
+/// write, and it is a property of the mount behind the root (a store can be
+/// copied), so probe per root, per bind.
 async fn verify_local_create_if_absent(root: &str, storage: &dyn StorageAdapter) -> Result<()> {
     if storage_kind_for_uri(root) != StorageKind::Local {
         return Ok(());
@@ -3328,9 +3480,10 @@ async fn refuse_force_init_over_existing_manifest(
 
 /// Commit phase of `Omnigraph::init_with_storage`: every durable write of
 /// graph creation, ending with the stamped `__manifest` Create commit — the
-/// graph's commit point, and this function's final operation. An error here
-/// means creation did not complete and the caller may clean up the schema
-/// artifacts; everything past the commit point lives in
+/// graph's commit point, and this function's final operation. The returned
+/// [`InitCommitError`] distinguishes a failure before any physical graph
+/// initialization from an acknowledgement-unknown physical result; only the
+/// former grants schema cleanup authority. Everything after a confirmed commit lives in
 /// `init_post_commit_checks`.
 ///
 /// Failpoints fire at the phase boundaries:
@@ -3339,6 +3492,11 @@ async fn refuse_force_init_over_existing_manifest(
 ///   force mode it fires here after the explicit overwrite.
 /// * `init.after_schema_contract_written` — `_schema.pg` + `_schema.ir.json`
 ///   + `__schema_state.json` are on disk.
+enum InitCommitError {
+    BeforePhysicalInit(OmniError),
+    PhysicalInitOutcomeUnknown(OmniError),
+}
+
 async fn init_commit_phase(
     root: &str,
     schema_source: &str,
@@ -3347,17 +3505,32 @@ async fn init_commit_phase(
     storage: &Arc<dyn StorageAdapter>,
     write_schema_pg: bool,
     control_session: &Arc<lance::session::Session>,
-) -> Result<Dataset> {
+    attempt: &GenesisManifestAttempt,
+) -> std::result::Result<Dataset, InitCommitError> {
     if write_schema_pg {
         let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
-        storage.write_text(&schema_path, schema_source).await?;
-        crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN)?;
+        storage
+            .write_text(&schema_path, schema_source)
+            .await
+            .map_err(InitCommitError::BeforePhysicalInit)?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN)
+            .map_err(InitCommitError::BeforePhysicalInit)?;
     }
 
-    write_schema_contract(root, storage.as_ref(), schema_ir).await?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)?;
+    write_schema_contract(root, storage.as_ref(), schema_ir)
+        .await
+        .map_err(InitCommitError::BeforePhysicalInit)?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)
+        .map_err(InitCommitError::BeforePhysicalInit)?;
 
-    GraphCoordinator::init_commit_with_session(root, catalog, control_session).await
+    // From this invocation onward, per-table Dataset::write(Create) calls may
+    // already have landed even if the graph manifest itself is not visible.
+    // Collapse every graph-init error to the unknown-outcome arm: releasing
+    // the claim would allow a retry to collide with a late/ack-lost table
+    // Create and could strand a hybrid root.
+    GraphCoordinator::init_commit_with_session(root, catalog, control_session, attempt)
+        .await
+        .map_err(|error| InitCommitError::PhysicalInitOutcomeUnknown(error.into_source()))
 }
 
 /// Everything past the commit point (see `init_commit_phase`): reads the
@@ -3375,67 +3548,42 @@ async fn init_post_commit_checks(
     let coordinator =
         GraphCoordinator::finish_init_with_storage(root, manifest_dataset, Arc::clone(storage))
             .await?;
+    finish_init_coordinator(coordinator, schema_ir).await
+}
+
+async fn finish_init_coordinator(
+    coordinator: GraphCoordinator,
+    schema_ir: &SchemaIR,
+) -> Result<GraphCoordinator> {
     validate_schema_ir_against_snapshot(schema_ir, &coordinator.snapshot())?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_COORDINATOR_INIT)?;
     Ok(coordinator)
 }
 
-/// Prefix a post-commit-point init error with a note that the graph is
-/// complete and opens normally.
-fn annotate_post_commit_init_error(root: &str, err: OmniError) -> OmniError {
-    let note = format!(
-        "init failed after the graph at '{root}' was durably complete; the graph is intact and can be opened normally"
-    );
-    match err {
-        OmniError::Manifest(mut manifest_err) => {
-            manifest_err.message = format!("{note}: {}", manifest_err.message);
-            OmniError::Manifest(manifest_err)
-        }
-        // The post-commit manifest read-back does Lance IO, so transient
-        // substrate failures surface here; the note rides inside the same
-        // variant.
-        OmniError::Lance(message) => OmniError::Lance(format!("{note}: {message}")),
-        // Remaining variants carry structured payloads callers match on —
-        // retry semantics, HTTP status, recovery ownership. Keep the
-        // variant and forgo the note rather than flattening it.
-        other => other,
+/// Best-effort cleanup of init-phase artifacts while `claim` excludes every
+/// cooperating initializer. Schema artifacts are removed first and the claim
+/// is released last; reversing that order would let a new force caller enter
+/// and have its contract deleted by this attempt.
+async fn best_effort_cleanup_owned_init_artifacts(
+    root: &str,
+    storage: &dyn StorageAdapter,
+    claim: &InitClaim,
+) {
+    if best_effort_cleanup_init_artifacts(root, storage).await {
+        best_effort_release_init_claim(claim, storage).await;
+    } else {
+        tracing::warn!(
+            target: "omnigraph::init::claim",
+            uri = %claim.uri,
+            "init cleanup had an indeterminate delete outcome; retaining the durable claim so a later initializer cannot race a delayed schema deletion",
+        );
     }
 }
 
-#[cfg(test)]
-mod post_commit_annotation_tests {
-    use super::*;
-
-    #[test]
-    fn annotates_manifest_and_lance_keeps_other_variants() {
-        let manifest = annotate_post_commit_init_error(
-            "file:///g",
-            OmniError::manifest("scan failed".to_string()),
-        );
-        assert!(manifest.to_string().contains("the graph is intact"));
-
-        let lance = annotate_post_commit_init_error(
-            "file:///g",
-            OmniError::Lance("read timed out".to_string()),
-        );
-        assert!(matches!(lance, OmniError::Lance(_)));
-        assert!(lance.to_string().contains("the graph is intact"));
-
-        let recovery = annotate_post_commit_init_error(
-            "file:///g",
-            OmniError::RecoveryRequired {
-                operation_id: "op".to_string(),
-                reason: "armed".to_string(),
-            },
-        );
-        assert!(matches!(recovery, OmniError::RecoveryRequired { .. }));
-        assert!(!recovery.to_string().contains("the graph is intact"));
-    }
-}
-
-/// Best-effort cleanup of init-phase artifacts. Called from
-/// `init_with_storage` on an error returned by `init_commit_phase`, and
-/// never past the commit point (see the call site; issue #495).
+/// Best-effort deletion of the three schema artifacts. This primitive must be
+/// called only by `best_effort_cleanup_owned_init_artifacts`, while the caller
+/// retains the root init claim, and never past a committed manifest outcome
+/// (issue #495).
 ///
 /// Removes the three schema files: `_schema.pg`, `_schema.ir.json`,
 /// `__schema_state.json`. Lance datasets and `__manifest/` are not
@@ -3445,13 +3593,21 @@ mod post_commit_annotation_tests {
 ///
 /// Failures to delete are logged via `tracing::warn` and do not mask
 /// the original init error.
-async fn best_effort_cleanup_init_artifacts(root: &str, storage: &dyn StorageAdapter) {
+async fn best_effort_cleanup_init_artifacts(root: &str, storage: &dyn StorageAdapter) -> bool {
+    let mut complete = true;
     for uri in [
         schema_source_uri(root),
         schema_ir_uri(root),
         schema_state_uri(root),
     ] {
-        if let Err(err) = storage.delete(&uri).await {
+        let deletion = match crate::failpoints::maybe_fail(
+            crate::failpoints::names::INIT_SCHEMA_CLEANUP_DELETE,
+        ) {
+            Ok(()) => storage.delete(&uri).await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = deletion {
+            complete = false;
             tracing::warn!(
                 target: "omnigraph::init::cleanup",
                 uri = %uri,
@@ -3460,6 +3616,7 @@ async fn best_effort_cleanup_init_artifacts(root: &str, storage: &dyn StorageAda
             );
         }
     }
+    complete
 }
 
 fn schema_table_key(type_kind: SchemaTypeKind, name: &str) -> String {
@@ -3677,6 +3834,7 @@ mod tests {
     use crate::db::manifest::ManifestCoordinator;
     use async_trait::async_trait;
     use serde_json::Value;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use crate::storage::{ListDirBounds, ObjectStorageAdapter, StorageAdapter, join_uri};
@@ -3820,7 +3978,11 @@ edge WorksAt: Person -> Company
     struct InitRaceStorageAdapter {
         inner: ObjectStorageAdapter,
         root: String,
-        barrier: Arc<tokio::sync::Barrier>,
+        initial_probe_barrier: Arc<tokio::sync::Barrier>,
+        claim_before_barrier: Arc<tokio::sync::Barrier>,
+        claim_after_barrier: Arc<tokio::sync::Barrier>,
+        first_exists_seen: AtomicBool,
+        schema_deletes: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -3846,13 +4008,29 @@ edge WorksAt: Person -> Company
         }
 
         async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
-            self.inner.write_text_if_absent(uri, contents).await
+            if uri != init_claim_uri(&self.root) {
+                return self.inner.write_text_if_absent(uri, contents).await;
+            }
+
+            // Both contenders must finish their atomic create before either
+            // caller can advance and release the claim. A single rendezvous
+            // before the create is insufficient: the scheduler could let the
+            // winner complete init and release before the loser executes its
+            // conditional write, producing two sequential winners instead of
+            // exercising contention.
+            self.claim_before_barrier.wait().await;
+            let result = self.inner.write_text_if_absent(uri, contents).await;
+            self.claim_after_barrier.wait().await;
+            result
         }
 
         async fn exists(&self, uri: &str) -> Result<bool> {
             let exists = self.inner.exists(uri).await?;
-            if uri == schema_state_uri(&self.root) {
-                self.barrier.wait().await;
+            if !self.first_exists_seen.swap(true, Ordering::SeqCst) {
+                // Get both callers through one initial read-only probe before
+                // either can reach the claim. This is needed for force/strict:
+                // their final preflight objects differ.
+                self.initial_probe_barrier.wait().await;
             }
             Ok(exists)
         }
@@ -3862,6 +4040,16 @@ edge WorksAt: Person -> Company
         }
 
         async fn delete(&self, uri: &str) -> Result<()> {
+            if [
+                schema_source_uri(&self.root),
+                schema_ir_uri(&self.root),
+                schema_state_uri(&self.root),
+            ]
+            .iter()
+            .any(|candidate| candidate == uri)
+            {
+                self.schema_deletes.fetch_add(1, Ordering::SeqCst);
+            }
             self.inner.delete(uri).await
         }
 
@@ -3900,32 +4088,60 @@ edge WorksAt: Person -> Company
         }
     }
 
+    fn init_race_adapters(
+        root: &str,
+    ) -> (
+        Arc<dyn StorageAdapter>,
+        Arc<dyn StorageAdapter>,
+        Arc<AtomicUsize>,
+    ) {
+        let initial_probe_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let claim_before_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let claim_after_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let schema_deletes = Arc::new(AtomicUsize::new(0));
+
+        let make = || -> Arc<dyn StorageAdapter> {
+            Arc::new(InitRaceStorageAdapter {
+                // Distinct concrete clients model independent processes. The
+                // only shared state is the real filesystem plus test-only
+                // rendezvous/counters.
+                inner: ObjectStorageAdapter::local(),
+                root: root.to_string(),
+                initial_probe_barrier: Arc::clone(&initial_probe_barrier),
+                claim_before_barrier: Arc::clone(&claim_before_barrier),
+                claim_after_barrier: Arc::clone(&claim_after_barrier),
+                first_exists_seen: AtomicBool::new(false),
+                schema_deletes: Arc::clone(&schema_deletes),
+            })
+        };
+
+        (make(), make(), schema_deletes)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_strict_init_does_not_delete_winning_schema_files() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap().to_string();
         let root = normalize_root_uri(&uri).unwrap();
-        let storage: Arc<dyn StorageAdapter> = Arc::new(InitRaceStorageAdapter {
-            inner: ObjectStorageAdapter::local(),
-            root,
-            barrier: Arc::new(tokio::sync::Barrier::new(2)),
-        });
+        let (left_storage, right_storage, schema_deletes) = init_race_adapters(&root);
 
-        let left = Omnigraph::init_with_storage(
-            &uri,
-            TEST_SCHEMA,
-            Arc::clone(&storage),
-            InitOptions::default(),
-        );
-        let right = Omnigraph::init_with_storage(
-            &uri,
-            TEST_SCHEMA,
-            Arc::clone(&storage),
-            InitOptions::default(),
-        );
+        let left =
+            Omnigraph::init_with_storage(&uri, TEST_SCHEMA, left_storage, InitOptions::default());
+        let right =
+            Omnigraph::init_with_storage(&uri, TEST_SCHEMA, right_storage, InitOptions::default());
         let (left, right) = tokio::join!(left, right);
         let ok_count = usize::from(left.is_ok()) + usize::from(right.is_ok());
         assert_eq!(ok_count, 1, "exactly one concurrent init should win");
+        let loser = if let Err(err) = left {
+            err
+        } else {
+            match right {
+                Ok(_) => panic!("both concurrent initializers unexpectedly succeeded"),
+                Err(err) => err,
+            }
+        };
+        assert!(matches!(loser, OmniError::InitializationClaimed { .. }));
+        assert_eq!(schema_deletes.load(Ordering::SeqCst), 0);
 
         assert!(
             dir.path().join("_schema.pg").exists(),
@@ -3938,6 +4154,131 @@ edge WorksAt: Person -> Company
         assert!(
             dir.path().join("__schema_state.json").exists(),
             "winning init must leave __schema_state.json in place"
+        );
+        assert!(
+            !dir.path().join(INIT_CLAIM_FILENAME).exists(),
+            "the completed winner must release its transient init claim"
+        );
+    }
+
+    const LEFT_RACE_SCHEMA: &str = "node Left { name: String @key }\n";
+    const RIGHT_RACE_SCHEMA: &str = "node Right { name: String @key }\n";
+
+    async fn assert_one_init_race_winner(
+        uri: &str,
+        left_options: InitOptions,
+        right_options: InitOptions,
+    ) {
+        let root = normalize_root_uri(uri).unwrap();
+        let (left_storage, right_storage, schema_deletes) = init_race_adapters(&root);
+
+        let left = Omnigraph::init_with_storage(uri, LEFT_RACE_SCHEMA, left_storage, left_options);
+        let right =
+            Omnigraph::init_with_storage(uri, RIGHT_RACE_SCHEMA, right_storage, right_options);
+        let (left, right) = tokio::join!(left, right);
+
+        let winning_schema = match (left, right) {
+            (Ok(_), Err(OmniError::InitializationClaimed { .. })) => LEFT_RACE_SCHEMA,
+            (Err(OmniError::InitializationClaimed { .. }), Ok(_)) => RIGHT_RACE_SCHEMA,
+            (left, right) => panic!(
+                "exactly one init claim must win; left={}, right={}",
+                result_label(&left),
+                result_label(&right),
+            ),
+        };
+
+        assert_eq!(
+            schema_deletes.load(Ordering::SeqCst),
+            0,
+            "the claim loser must never delete the winner's schema artifacts"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir_path_from_uri(uri).join(SCHEMA_SOURCE_FILENAME)).unwrap(),
+            winning_schema,
+            "the durable schema contract must belong to the claim winner"
+        );
+        assert!(
+            !dir_path_from_uri(uri).join(INIT_CLAIM_FILENAME).exists(),
+            "the completed winner must release its transient init claim"
+        );
+
+        let reopened = Omnigraph::open(uri)
+            .await
+            .expect("the winning graph must reopen with a coherent schema identity contract");
+        assert_eq!(reopened.schema_source().as_str(), winning_schema);
+    }
+
+    fn result_label(result: &Result<Omnigraph>) -> &'static str {
+        match result {
+            Ok(_) => "ok",
+            Err(OmniError::InitializationClaimed { .. }) => "claimed",
+            Err(_) => "other-error",
+        }
+    }
+
+    fn dir_path_from_uri(uri: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(uri.strip_prefix("file://").unwrap_or(uri))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_force_init_has_one_contract_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_one_init_race_winner(
+            dir.path().to_str().unwrap(),
+            InitOptions { force: true },
+            InitOptions { force: true },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_force_and_strict_init_have_one_contract_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_one_init_race_winner(
+            dir.path().to_str().unwrap(),
+            InitOptions { force: true },
+            InitOptions::default(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn force_refuses_stale_init_claim_without_touching_orphan_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let root = normalize_root_uri(uri).unwrap();
+        let storage = ObjectStorageAdapter::local();
+        let artifacts = [
+            (schema_source_uri(&root), "orphan source"),
+            (schema_ir_uri(&root), "orphan ir"),
+            (schema_state_uri(&root), "orphan state"),
+        ];
+        for (artifact_uri, contents) in &artifacts {
+            storage.write_text(artifact_uri, contents).await.unwrap();
+        }
+        storage
+            .write_text(&init_claim_uri(&root), "stale init owner")
+            .await
+            .unwrap();
+
+        let err = match Omnigraph::init_with_storage(
+            uri,
+            TEST_SCHEMA,
+            Arc::new(ObjectStorageAdapter::local()),
+            InitOptions { force: true },
+        )
+        .await
+        {
+            Ok(_) => panic!("force init must refuse a root with an existing init claim"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, OmniError::InitializationClaimed { .. }));
+        for (artifact_uri, contents) in &artifacts {
+            assert_eq!(storage.read_text(artifact_uri).await.unwrap(), *contents);
+        }
+        assert_eq!(
+            storage.read_text(&init_claim_uri(&root)).await.unwrap(),
+            "stale init owner"
         );
     }
 

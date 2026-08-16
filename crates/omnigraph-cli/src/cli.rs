@@ -266,11 +266,10 @@ pub(crate) enum Command {
         schema: PathBuf,
         /// Graph URI (local path or s3://)
         uri: String,
-        /// Overwrite existing schema artifacts at the URI. Without
-        /// this flag, init refuses to touch a URI that already holds
-        /// `_schema.pg`, `_schema.ir.json`, or `__schema_state.json`
-        /// — closes the re-init footgun. With the
-        /// flag, the operator opts in to destructive semantics.
+        /// Replace orphan schema artifacts only after proving that the URI
+        /// has no `__manifest`. Without this flag, init refuses a URI that
+        /// already holds a manifest or any schema artifact. This flag never
+        /// overwrites an initialized graph or purges its Lance datasets.
         #[arg(long)]
         force: bool,
     },
