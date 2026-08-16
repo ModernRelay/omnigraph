@@ -868,6 +868,25 @@ implementation, recorded here so later phases inherit them:
   manifest version history is a readability participant alongside table
   versions. Bringing internal tables into `cleanup` must account for this
   before reclaiming manifest versions.
+- **Review-round hardening (shipped).** A conformance review surfaced further
+  correctness, security, and cost issues, now fixed on the change surfaces: a
+  cross-branch net diff byte-compares managed-Blob columns (branch-local
+  fragment ids no longer alias different bytes as equal); the feed re-proves each
+  reopened commit's branch incarnation (a delete/recreate mid-poll can no longer
+  emit a replacement branch's rows under the captured commit's label); a legal
+  committed change is delivered on its own page rather than poisoning the feed
+  (the §4.4 amendment above); a direct commit diff returns 404 for a
+  known-but-forbidden commit (no commit-existence oracle); change-route errors
+  are projected to graph vocabulary (no physical path / table-key leak); a bare
+  object miss is no longer misclassified as reclaimed history; a caught-up
+  same-branch poll reuses the warm coordinator (no per-poll O(history) manifest
+  fold); the finite commit-diff gap carries no feed cursor; and `--as` is
+  rejected on the read commands. A cross-branch schema-fingerprint gate is added
+  as defense-in-depth for a future branch-scoped-schema-evolution capability
+  (unreachable today, since schema apply requires a graph with only main).
+  **Still open (own follow-ups):** the §4.4 unbounded ordered scan below (shared
+  merge/diff/export debt); CLI auto-pagination that buffers whole results before
+  output; and page-token byte accounting for pathologically long keys.
 - **OPEN — §4.4 boundedness obligation is not discharged.** §4.4 requires the
   ordering path to be provably bounded and to "not sort an unbounded graph
   commit in memory." The shipped enumerator streams the *merge* and applies
