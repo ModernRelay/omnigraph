@@ -28,7 +28,7 @@ use super::model::{
     EntityImage, GraphEntityChange, GraphTypeRef, is_reserved_storage_system_column,
 };
 use super::token::{cursor_rejected, opaque_type_id};
-use super::{TableChangeInterval, changed_table_intervals, parse_table_key};
+use super::{changed_table_intervals, parse_table_key};
 use crate::blob::BlobDescriptorDecoder;
 use crate::db::manifest::Snapshot;
 use crate::db::{export_blob_values, logical_row_image};
@@ -428,8 +428,7 @@ async fn next_emit(
 /// One paired table lifetime that survived the schema gate, with both pinned
 /// datasets already open (the same handles the scans consume, so a changed
 /// interval costs at most two opens per page).
-struct IntervalPlan<'a> {
-    interval: TableChangeInterval<'a>,
+struct IntervalPlan {
     /// The published opaque type identity: the block ordering key, the
     /// continuation key, and `GraphTypeRef.id`, all one value.
     opaque_id: String,
@@ -487,13 +486,13 @@ fn schema_boundary(graph_commit_id: &str, table_key: &str) -> OmniError {
 /// present — refused, never synthesized into entity inserts/deletes; empty
 /// ones emit nothing. The gate deliberately ignores the request scope: a
 /// boundary is a property of the commit pair, not of one filtered view.
-async fn plan_intervals<'a>(
+async fn plan_intervals(
     store: &TableStore,
-    parent: &'a Snapshot,
-    child: &'a Snapshot,
+    parent: &Snapshot,
+    child: &Snapshot,
     schema_identity_domain: &str,
     graph_commit_id: &str,
-) -> Result<Vec<IntervalPlan<'a>>> {
+) -> Result<Vec<IntervalPlan>> {
     let intervals = changed_table_intervals(parent, child);
 
     let mut plans = Vec::with_capacity(intervals.len());
@@ -519,7 +518,6 @@ async fn plan_intervals<'a>(
                 let (kind, type_name) = parse_table_key(table_key);
                 plans.push(IntervalPlan {
                     opaque_id: opaque_type_id(schema_identity_domain, interval.identity),
-                    interval,
                     kind: kind.into(),
                     type_name: type_name.to_string(),
                     from_dataset,
