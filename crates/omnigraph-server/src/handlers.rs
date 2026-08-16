@@ -2460,6 +2460,46 @@ pub(crate) fn query_params_from_json(
 }
 
 #[cfg(test)]
+mod change_route_error_tests {
+    use super::*;
+
+    #[test]
+    fn change_route_error_hides_substrate_paths() {
+        let leaky =
+            "/srv/data/graph/nodes/0000000a-0000000b.lance: No such file or directory".to_string();
+        let mapped = change_route_error(OmniError::Lance(leaky));
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !mapped.message().contains(".lance") && !mapped.message().contains("/srv/data"),
+            "change route leaked a substrate path: {}",
+            mapped.message()
+        );
+    }
+
+    #[test]
+    fn change_route_error_hides_internal_manifest_table_keys() {
+        let mapped = change_route_error(OmniError::manifest_internal(
+            "invalid table key 'node:SecretType' at internal version 7",
+        ));
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !mapped.message().contains("node:SecretType"),
+            "change route leaked an internal table key: {}",
+            mapped.message()
+        );
+    }
+
+    #[test]
+    fn change_route_error_passes_typed_graph_errors_through() {
+        // A graph-vocabulary NotFound is not substrate detail: it passes through
+        // unchanged (404), so a real "commit not found" is never masked as 500.
+        let mapped = change_route_error(OmniError::manifest_not_found("commit 'x' not found"));
+        assert_eq!(mapped.status(), StatusCode::NOT_FOUND);
+        assert!(mapped.message().contains("not found"));
+    }
+}
+
+#[cfg(test)]
 mod blob_error_tests {
     use super::*;
 
@@ -2627,7 +2667,7 @@ pub(crate) async fn server_commit_changes(
     let commit = db
         .get_commit(&commit_id)
         .await
-        .map_err(ApiError::from_omni)?;
+        .map_err(change_route_error)?;
     let branch = commit
         .manifest_branch
         .clone()
@@ -2664,8 +2704,30 @@ pub(crate) async fn server_commit_changes(
             None,
         )
         .await
-        .map_err(ApiError::from_omni)?;
+        .map_err(change_route_error)?;
     Ok(Json(api::commit_changes_output(&page)))
+}
+
+/// Map an engine error on a change route to the graph-only wire contract.
+///
+/// The typed change errors (schema boundary, feed gap, resource limit, not
+/// found, …) are graph vocabulary and pass through `from_omni` with their
+/// structured detail. Raw substrate errors — Lance, I/O, DataFusion, and
+/// internal manifest text — can carry physical paths or table keys, which the
+/// change wire contract keeps internal, so they are collapsed to a fixed
+/// internal error and the real detail is logged server-side only.
+fn change_route_error(error: OmniError) -> ApiError {
+    match &error {
+        OmniError::Lance(_) | OmniError::Io(_) | OmniError::DataFusion(_) => {
+            tracing::error!(%error, "change route storage error");
+            ApiError::internal("internal error while reading changes")
+        }
+        OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::Internal => {
+            tracing::error!(%error, "change route internal manifest error");
+            ApiError::internal("internal error while reading changes")
+        }
+        _ => ApiError::from_omni(error),
+    }
 }
 
 pub(crate) const CHANGE_FEED_PARAMS: &[&str] = &[
@@ -2768,7 +2830,7 @@ pub(crate) async fn server_changes_feed(
             max_commits: None,
         })
         .await
-        .map_err(ApiError::from_omni)?
+        .map_err(change_route_error)?
     };
     Ok(Json(api::change_feed_output(&page)))
 }
@@ -2826,7 +2888,7 @@ pub(crate) async fn server_changes_baseline(
         .engine
         .capture_served_change_baseline_cut(&branch, &scope)
         .await
-        .map_err(ApiError::from_omni)?;
+        .map_err(change_route_error)?;
     let terminal_record = {
         let mut line = serde_json::to_vec(&api::ChangeBaselineRecord {
             baseline: api::change_baseline_output(&handshake),

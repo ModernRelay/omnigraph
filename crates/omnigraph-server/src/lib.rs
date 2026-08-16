@@ -840,6 +840,17 @@ impl ApiError {
         }
     }
 
+    /// The HTTP status this error maps to.
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// The human-readable message body (used by tests to assert the wire
+    /// contract does not leak substrate detail).
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
     /// HTTP 424 Failed Dependency for an external Blob source that passed the
     /// graph's admission policy but could not be probed or read. `ErrorCode`
     /// remains a closed rolling contract; the optional structured detail is
