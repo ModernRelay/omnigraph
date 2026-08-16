@@ -2641,8 +2641,9 @@ pub(crate) fn parse_change_query(
         (status = 200, description = "Entity changes this commit made relative to its first parent, in frozen (kind, type, id, op) order with the cause stated once", body = api::CommitChangesOutput),
         (status = 400, description = "Invalid filter or limit, or a rejected page token", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 404, description = "Commit not found", body = ErrorOutput),
+        // No 403: a commit the actor cannot read is indistinguishable from an
+        // unknown commit (404), so the diff is not a commit-existence oracle.
+        (status = 404, description = "Commit not found, or the actor cannot read the commit's branch", body = ErrorOutput),
         (status = 409, description = "Commit cannot be entity-diffed (parentless commit or schema boundary); see change_diff_refusal", body = ErrorOutput),
         (status = 410, description = "Required retained history is no longer readable; see change_feed_gap and capture a new baseline", body = ErrorOutput),
         (status = 413, description = "Requested limit exceeds the public row ceiling", body = ErrorOutput),

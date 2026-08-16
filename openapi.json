@@ -1752,18 +1752,8 @@
               }
             }
           },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
           "404": {
-            "description": "Commit not found",
+            "description": "Commit not found, or the actor cannot read the commit's branch",
             "content": {
               "application/json": {
                 "schema": {

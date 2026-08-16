@@ -265,9 +265,15 @@ fn openapi_commit_changes_is_get_with_page_token_params() {
         );
     }
     let responses = op["responses"].as_object().unwrap();
-    for code in ["200", "400", "401", "403", "404", "409", "410", "413"] {
+    // No 403: a forbidden commit is indistinguishable from an unknown one (404),
+    // so the finite commit diff cannot be a commit-existence oracle.
+    for code in ["200", "400", "401", "404", "409", "410", "413"] {
         assert!(responses.contains_key(code), "missing response {code}");
     }
+    assert!(
+        !responses.contains_key("403"),
+        "the commit diff must not advertise 403 (existence oracle)"
+    );
 }
 
 #[test]
