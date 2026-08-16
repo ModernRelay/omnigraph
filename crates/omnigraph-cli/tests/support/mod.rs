@@ -1271,7 +1271,15 @@ pub fn run_both(
     local.args(args).arg("--store").arg(local_graph);
     if args.first() == Some(&"blob") {
         local.env("NO_COLOR", "1");
-    } else {
+    }
+    // The read commands (blob/query/changes/commit) reject `--as`: a served read
+    // resolves the actor from its bearer token and a direct read attributes
+    // none, so passing `--as` there is an error. Only the write verbs carry the
+    // parity actor on the direct arm.
+    if !matches!(
+        args.first().copied(),
+        Some("blob") | Some("query") | Some("changes") | Some("commit")
+    ) {
         local.arg("--as").arg(PARITY_ACTOR);
     }
     let local_out = local.output().unwrap();
