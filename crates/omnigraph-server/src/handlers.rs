@@ -2632,7 +2632,7 @@ pub(crate) async fn server_commit_changes(
         .manifest_branch
         .clone()
         .unwrap_or_else(|| "main".to_string());
-    authorize_request(
+    match authorize(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
@@ -2640,7 +2640,20 @@ pub(crate) async fn server_commit_changes(
             branch: Some(branch),
             target_branch: None,
         },
-    )?;
+    )? {
+        Authz::Allowed => {}
+        // Do not distinguish a known-but-forbidden commit from an unknown one.
+        // The commit was resolved across all branches BEFORE this check, so a
+        // 403-vs-404 split would be a graph-wide commit-existence oracle (and,
+        // with per-branch grants, would confirm the existence of commits on a
+        // branch the actor cannot read). Collapse the denial to the exact 404
+        // an unknown commit yields.
+        Authz::Denied(_) => {
+            return Err(ApiError::not_found(format!(
+                "commit '{commit_id}' not found"
+            )));
+        }
+    }
     let scope = api::change_scope(&params.kinds, &params.types, &params.ops);
     let page = db
         .commit_changes_page(
