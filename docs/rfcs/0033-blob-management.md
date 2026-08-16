@@ -16,7 +16,10 @@ owner: OmniGraph maintainers
 **Depends on:** RFC-022 unified writes, RFC-023 exact `id` fencing,
 RFC-028 stable schema identity, internal manifest schema v6, and Lance 10.0.0
 blob-v2 (`lance.blob.v2`) on file format V2_2.
-**Surveyed:** OmniGraph `8d12b66703ac`; Lance 9.0.0 as the defect baseline;
+Phase 3 and the served-route lifecycle additionally depend on RFC-034 durable
+recovery authority, RFC-035 served-operation ownership, and RFC-036 atomic
+runtime activation.
+**Surveyed:** OmniGraph `db23f58a5d97`; Lance 9.0.0 as the defect baseline;
 and Lance 10.0.0 as the required implementation substrate.
 **Audience:** engine, compiler, server, CLI, security, storage, maintenance,
 and documentation maintainers.
@@ -52,7 +55,10 @@ This RFC makes the following decisions:
 3. Add `GET` and `HEAD` delivery, bounded single-range reads, and strong
    validators for managed bytes. Add raw-byte `PUT` replacement and nullable-cell
    `DELETE` clear. Both writes are update-only and compose the existing Mutation
-   writer and recovery/publication tail.
+   staging/publication tail, return its exact commit receipt, and never add a
+   Blob-specific recovery path. Served writes become cancellation-independent
+   owned operations; served reads pin one runtime generation through response
+   completion.
 4. Add CLI parity through `blob get`, `blob stat`, `blob put`, and `blob clear`.
 5. Make external-reference ingress an explicit trust decision. It is denied by
    default, allowed only beneath normalized configured bases, and never enabled
@@ -235,12 +241,18 @@ pub struct BlobCell {
 }
 ```
 
-`type_name` and `property` are resolved through the handle's current accepted
-catalog, captured coherently with the read view. The engine then carries stable
-table identity, incarnation identity, and stable property identity internally.
+`type_name` and `property` are public graph vocabulary. They are resolved through
+the accepted catalog captured with the read view; under RFC-036 that catalog,
+the schema token, Cedar policy, and external-Blob policy all come from the same
+immutable runtime generation. The engine then carries stable table identity,
+incarnation identity, and stable property identity internally.
 A rename keeps those identities; drop/re-add mints a new lifetime. `table_key`,
 alias, physical path, field position, and Lance version are not identity
 substitutes.
+
+Responses echo only the logical node/edge selector. They never expose a table
+key, stable table/incarnation/property ID, Lance version, stable row ID, native
+branch identifier, or dataset path.
 
 Phase 1 resolves selector aliases against the handle's **current accepted
 catalog**, even when the requested target is historical. After a pure type
@@ -321,13 +333,15 @@ the property and schema fences still apply.
 A returned reader keeps the snapshot/table handle needed to finish the read.
 Advancing a branch after the reader is opened does not switch the payload under
 that reader. Branch deletion and its physical tree reclamation are destructive
-boundaries, just like `cleanup`: Phase 1 adds no durable reader lease or
-cross-process live-reader registry. Callers that require an opened reader to
-finish must quiesce it before deleting that branch or running version GC. A
-reader never retargets, but if reclamation removes an immutable object it has not
-yet cached, a later range read may fail loudly with a storage/integrity error. It
-never switches to branch HEAD, another table version, or plausible partial
-bytes.
+boundaries, just like `cleanup` and RFC-034 exclusive compensation: Phase 1 adds
+no durable reader lease or cross-process live-reader registry. Callers that
+require an opened reader to finish must quiesce it before deleting that branch,
+running version GC, or beginning offline compensation that can Restore or remove
+a ref/path. Managed `RollForwardOnly` recovery never performs those destructive
+actions. A reader never retargets, but if reclamation removes an immutable
+object it has not yet cached, a later range read may fail loudly with a
+storage/integrity error. It never switches to branch HEAD, another table version,
+or plausible partial bytes.
 
 ### 3.4 Managed validator
 
@@ -403,6 +417,17 @@ pub struct ExternalBlobRef {
     pub length: Option<u64>,
 }
 
+pub enum BlobWriteOutcome {
+    Managed {
+        length: u64,
+        etag: BlobEtag,
+        commit: GraphCommit,
+    },
+    Null {
+        commit: Option<GraphCommit>,
+    },
+}
+
 impl Omnigraph {
     pub async fn read_blob_at(
         &self,
@@ -416,7 +441,7 @@ impl Omnigraph {
         cell: BlobCell,
         bytes: bytes::Bytes,
         precondition: Option<BlobPrecondition>,
-        actor: &Actor,
+        actor_id: Option<&str>,
     ) -> Result<BlobWriteOutcome>;
 
     pub async fn clear_blob_at_as(
@@ -424,7 +449,7 @@ impl Omnigraph {
         branch: &str,
         cell: BlobCell,
         precondition: Option<BlobPrecondition>,
-        actor: &Actor,
+        actor_id: Option<&str>,
     ) -> Result<BlobWriteOutcome>;
 }
 ```
@@ -502,6 +527,12 @@ as `NotFound`, null, or an opaque Lance display string.
 sets exactly one nullable cell to null. Both require an existing entity row; they
 never insert a row. Clear on a non-nullable property is `BadRequest`.
 
+These methods require an exact-ID, update-only preparation path; they are not
+implemented by synthesizing a `.gq` update. The implementation may be a focused
+adapter or a refactored shared Mutation primitive, but it must supply the target
+managed value/null directly, materialize only untouched sibling Blob cells, and
+support node and edge cells with identical semantics.
+
 The raw managed payload limit is 32 MiB inclusive. The engine rejects a larger
 value before any staged fragment, transaction, sidecar, manifest update, or
 lineage row. The existing writer may need to materialize other Blob cells on the
@@ -511,10 +542,11 @@ can be refused when the row has other large Blob cells. This is an explicit V1
 limitation, not hidden behavior.
 
 The target cell's old payload is not read or charged before replacement. A
-replacement is declarative and retryable: after an ordinary pre-effect conflict,
-the writer captures a fresh base, re-locates the row, re-evaluates the
-precondition, and rebuilds the attempt. It does not replay a stale read-modify-
-write plan.
+replacement may reprepare after an ordinary pre-effect conflict only while the
+branch incarnation and accepted-schema identity are unchanged: it captures a
+fresh base, re-locates the row, re-evaluates the precondition, and rebuilds the
+attempt. An incarnation/schema change fails closed rather than retargeting a
+stale plan.
 
 `BlobPrecondition` is transport-neutral:
 
@@ -529,29 +561,45 @@ pub enum BlobPrecondition {
 write base; either managed or external satisfies it. An existing entity row with
 a null Blob cell does not. `Tags` uses strong comparison and matches only the
 managed token at the pinned write base. A null or external cell has no token and
-cannot match a tag. `PreconditionFailed { current_etag: Option<BlobEtag> }` is a
-typed successful decision, mapped to HTTP 412, rather than a substrate failure.
+cannot match a tag.
+`BlobWritePreconditionFailed { current_etag: Option<BlobEtag> }` is a distinct
+typed terminal decision mapped to HTTP 412. It does not reuse the graph-head
+`PreconditionFailed { branch, expected, actual }` error or its
+`precondition_failure` wire detail.
 
-After publication, a successful managed write derives the validator from the
-published table version, its exact immutable-manifest `transaction_file`
-identity, and the resulting row ID. The result is the same ETag a subsequent
-GET at that head returns.
+After the exact table effect and before graph publication, a successful managed
+write gathers all fallible evidence needed for its validator: table version,
+immutable-manifest `transaction_file`, and resulting row ID. It retains that
+request-local evidence across the manifest CAS; after a successful CAS, forming
+the outcome performs no storage read. The publisher returns the exact
+`GraphCommit`, and the ETag equals a GET at that snapshot. Neither value may be
+reconstructed from branch HEAD, so a later write cannot change the first result.
 
 ### 4.4 Publication and recovery
 
-Blob replacement and clear are not new writer kinds. They enter the current
-Mutation preparation path and use its existing validation, exact per-table
-transaction, recovery-v9 sidecar, graph lineage, and one manifest CAS. The
-shared publish tail remains one call site. The writer:
+Blob replacement and clear are not new writer kinds. The dedicated adapter uses
+Mutation's validation, exact per-table transaction, recovery-v9 sidecar, graph
+lineage, and one manifest CAS. The shared publish tail remains one call site.
+
+RFC-034 owns recovery classification and effects. A served Blob operation never
+heals inline: it forwards `RecoveryRequired`, RFC-035 emits one opaque wake, and
+RFC-036/034 own convergence. Runtime candidates use effect-free
+`ReadWriteNoRecovery`; compensation remains offline and exclusive.
+
+The engine write itself uses one coherent accepted view from its handle. A
+served caller additionally binds that handle to one RFC-036 generation and
+checks its schema token before entering the engine. The engine write:
 
 1. normalizes and rejects internal branch names;
-2. enforces Cedar `change` for the actor and branch;
-3. crosses the ordinary recovery barrier and captures one write base;
+2. enforces Cedar `change` for the supplied actor identity and branch;
+3. refuses non-clean recovery authority before effect, then captures one fresh
+   write base;
 4. resolves stable schema/table/property identity and exact row ID;
 5. evaluates the precondition and prepares one-row replacement state under the
    normal row/byte ceilings;
 6. commits through `SidecarKind::Mutation` and publishes once; and
-7. maps any post-arm uncertainty to `RecoveryRequired`.
+7. returns the exact commit plus same-publication Blob state, while mapping any
+   post-arm uncertainty to `RecoveryRequired`.
 
 No per-table publish, direct Lance commit, server-only writer, or Blob-specific
 recovery record is permitted. `forbidden_apis.rs` classifies the public Blob
@@ -577,6 +625,17 @@ entity=node|edge&type=<type>&id=<id>&property=<property>
 Reads additionally accept `branch=<name>` or `snapshot=<commit>`, never both;
 the transport default is `branch=main`. Authorization uses the existing `read`
 action and the same snapshot-to-policy-branch resolution as `/read`.
+
+Under RFC-035/036 the route first captures one exact served generation and a
+`ReadObserver` permit before target observation. The generation supplies the
+engine, catalog, policy, external-Blob policy, and cache namespace. HEAD and an
+external redirect retain the capture through response completion; a managed GET
+retains it through body/scoped-producer EOF, error, or drop. Disconnect cancels
+the read normally and releases the permit only after producer settlement. A
+closed lane fails before target work with RFC-035's lifecycle 503; a fresh
+schema-token mismatch returns RFC-036's `GenerationStale` and wakes its
+supervisor. Middleware never reloads the registry and silently switches
+generations.
 
 For managed content:
 
@@ -609,8 +668,10 @@ zero-length body.
 
 Payload chunks are at most 4 MiB and are pulled under transport backpressure.
 At most two chunks / 8 MiB are retained for one response. Disconnect drops the
-reader and its snapshot pin promptly. No implementation may call `read_all()`
-before starting a response.
+reader, snapshot pin, and read-observer capture promptly after producer
+settlement. The transport's chunk/byte permits are memory backpressure, not the
+generation-lifetime permit. No implementation may call `read_all()` before
+starting a response.
 
 For external content, GET and HEAD return `302 Found`, the stored absolute URI
 in `Location`, `Cache-Control: no-store`, and the exact resolved
@@ -634,31 +695,43 @@ their existing typed mappings.
 
 PUT accepts a branch only (default `main`); `snapshot` is invalid. The body is
 raw `application/octet-stream`, not JSON or base64. Its route-specific body
-limit is 32 MiB inclusive. The server authorizes `change`, acquires the ordinary
-per-actor write admission sized by the retained body, then calls the engine.
-Payloads over the transport or engine limit return 413 before a graph effect.
+limit is 32 MiB inclusive. After effect-free authentication, bounded parsing,
+and preliminary authorization, the request prepares the bytes, selector,
+precondition, server-resolved actor, exact generation, and workload guard, then
+calls RFC-035's non-async `try_start_write`. That operation atomically acquires
+the `Write` permit, registers, and spawns on the same generation with no
+I/O/await gap. Oversize input fails before handoff/effect; afterward a disconnect
+loses delivery only and never cancels or replays the write.
 
 `If-Match` is optional. The boundary parses `*` as `AnyExisting` and a comma-
 separated entity-tag list as `Tags`; weak tags do not participate in strong
 comparison. Header syntax stays in API-types/server code, not in the engine.
 
-Success returns `200`, the new ETag header, and a typed JSON result containing
-the selector, branch, size, ETag, commit ID, and server-resolved actor ID. Missing
-row returns 404, invalid property/target returns 400, precondition failure returns
-412 with the current managed ETag when one exists, and admission saturation
-returns 429 with the ordinary retry metadata.
+Success returns `200`, the new ETag header, and `BlobWriteOutput` containing the
+logical selector, branch, `kind=managed`, size, ETag, server-resolved actor ID,
+and `commit: Option<CommitOutput>` (always present for PUT). Its separate
+`BlobWriteStateOutput` is `managed | null`; it does not add `null` to the
+existing stat/content enum. The commit is the exact receipt from the same
+manifest CAS, not a branch-head reconstruction. Missing row returns 404, invalid
+property/target returns 400, Blob precondition failure returns 412 with the
+current managed ETag header when one exists and additive
+`blob_precondition_failure { current_etag }`; admission saturation returns 429.
 
 ### 5.3 `DELETE`
 
 DELETE has the same selector, branch, authorization, admission, and optional
-`If-Match` semantics as PUT. It clears a nullable cell and returns `204 No
-Content`. Clearing an already-null cell is idempotent and produces no graph
-commit; a matching entity row is still required. A non-nullable Blob returns
-400. A successful clear of managed content makes the previous ETag stale.
+`If-Match` semantics and owned-execution lifetime as PUT. It clears a nullable
+cell and returns `200` with the same `BlobWriteOutput`, `kind=null`, and no size
+or ETag. Effectful clear carries its exact `CommitOutput`; clearing an
+already-null cell is idempotent, produces no graph commit, and returns
+`commit: null`. A matching entity row is still required. A non-nullable Blob
+returns 400. A successful clear of managed content makes the previous ETag
+stale.
 
 The server OpenAPI describes the binary PUT body, all query parameters,
-redirect, range, conditional, 412, 413, and 416 responses. The checked-in
-`openapi.json` is regenerated in the implementing change.
+redirect, range, conditional, exact receipt, Blob-precondition detail, shared
+lifecycle 503, 412, 413, and 416 responses. The checked-in `openapi.json` is
+regenerated in the implementing change.
 
 ## 6. CLI surface
 
@@ -669,7 +742,7 @@ omnigraph blob get   ENTITY TYPE ID PROPERTY [--branch NAME | --snapshot ID]
                      [--offset N] [--length N] [--out PATH]
 omnigraph blob stat  ENTITY TYPE ID PROPERTY [--branch NAME | --snapshot ID] [--json]
 omnigraph blob put   ENTITY TYPE ID PROPERTY [--branch] [--file PATH] [--if-match TAG] [--json]
-omnigraph blob clear ENTITY TYPE ID PROPERTY [--branch] [--if-match TAG]
+omnigraph blob clear ENTITY TYPE ID PROPERTY [--branch] [--if-match TAG] [--json]
 ```
 
 `ENTITY` is `node` or `edge`. Blob commands use the ordinary Data/Any scope:
@@ -710,9 +783,12 @@ silently ignoring a client-supplied actor.
   separately and exactly echoed in `target.snapshot`.
 - `put` reads one file or stdin, never both. Input is retained only within the
   32 MiB envelope and passed as raw bytes. It never base64-encodes the payload.
+  Its structured result carries the exact commit and managed ETag.
 - `clear` asks for confirmation only according to the CLI's existing
   destructive-operation rules; it does not require the graph-cleanup `--confirm`
-  flag because this is an ordinary audited mutation, not physical GC.
+  flag because this is an ordinary audited mutation, not physical GC. Structured
+  output distinguishes an effectful clear from an already-null no-op through the
+  exact commit versus `commit: null`.
 
 The remote client disables automatic redirects for Blob calls. `stat` reports a
 whole-object external URI without following it. `get` refuses that external
@@ -723,7 +799,8 @@ unexpectedly download a caller-owned object or try to follow
 `s3://`/`file://` redirect schemes.
 
 Embedded and remote arms share API output types, If-Match parsing, validator
-formatting, range rules, and error text. The parity matrix covers managed full
+formatting, range rules, exact receipts, structured lifecycle/precondition
+errors, and error text. The parity matrix covers managed full
 and range reads, stat, snapshot reads, external references, zero bytes, and
 missing rows in Phase 2B; Phase 3 extends it with PUT, clear, stale
 preconditions, and oversize refusal. No Blob-specific known divergence is
@@ -770,11 +847,14 @@ store registry and may never use `file://`. Embedded-only bases may opt into an
 exact local directory because the process principal and caller are the same
 trust domain.
 
-The engine receives the policy at graph open, so correctness and security do not
-depend on HTTP code. Server, CLI, and embedded callers cannot set a per-request
-escape hatch. Cedar still decides who may change the graph; external-base policy
-decides which server resources any authorized writer may reference. Both gates
-must pass.
+The engine receives the policy with handle construction, so correctness and
+security do not depend on HTTP code. Embedded operations consume that
+handle/builder-bound policy. Under RFC-036, served operations instead consume it
+from the same immutable generation as the engine facade, catalog, schema token,
+and Cedar policy. Neither path rereads desired configuration or offers a
+per-request escape hatch. Cedar still decides who may change the graph;
+external-base policy decides which resources an authorized writer may reference.
+Both gates must pass.
 
 Phase 0B exposes allow-policy authority through applied cluster state and the
 embedded builder, not through a direct-store CLI flag. A direct CLI graph open
@@ -783,6 +863,8 @@ cluster-served graph with configured bases; rebuild tooling with direct storage
 can import managed `base64:` values, while a rebuild containing external URIs
 must use that served route or an embedded handle with the graph policy installed.
 This is a deliberate trust-boundary choice, not a temporary per-request bypass.
+Future direct-store Blob writes are a separate writer process under RFC-034: an
+operator must quiesce a serving writer or use the served CLI path instead.
 
 ### 7.2 Ingest behavior
 
@@ -1004,18 +1086,19 @@ Physical row addresses never become public stable identity.
 | External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
 | Engine read memory | `BlobReader::read_range` returns at most `BLOB_READ_RANGE_MAX_BYTES` (4 MiB); larger values require consecutive calls and there is no unbounded full-read method |
 | Delivery memory | Phase 2A adds a two-chunk queue, backpressure, and prompt cancellation without weakening the engine's 4 MiB per-call bound |
+| Runtime replacement | RFC-035 `ReadObserver` / `Write` permits bind the exact RFC-036 generation through read completion or owned-write terminal state; closed/stale admission fails before target work |
 | Range arithmetic | Half-open `start <= end <= length`; empty-at-end is valid; reversed/out-of-bounds ranges are typed and carry the logical length |
 | Stale overwrite | Optional strong `If-Match`, evaluated at each freshly pinned attempt |
 | Actor spoofing | Existing server-resolved actor and engine-wide Cedar enforcement |
 | Partial graph visibility | Existing Mutation sidecar and one manifest publication door |
 | External-object deletion | Never performed by OmniGraph |
 
-The workload-admission system treats PUT and DELETE as writes. GET/HEAD are
-read-only, but their transport buffering is separately bounded. If measurements
-show that long-lived Blob streams can starve ordinary reads, adding a read-stream
-permit is an operational change that may be made without changing byte or
-snapshot semantics; it still needs a cost/latency test before becoming a
-default.
+The RFC-035 lifecycle permit is mandatory and is not a workload-throttling
+control: GET/HEAD use `ReadObserver`, while PUT/DELETE use `Write`. The existing
+two-chunk semaphore bounds retained payload bytes independently. If measurements
+show that long-lived Blob streams can starve ordinary reads, a separate workload
+permit may be added without changing byte, snapshot, or generation semantics;
+it still needs a cost/latency test before becoming a default.
 
 ## 11. Error and observability contract
 
@@ -1032,8 +1115,11 @@ depends on typed code and fields, not an opaque Lance string.
 | Upload/rewrite budget exceeded | `resource_limit` with limit/observed | 413 |
 | Managed HTTP range exceeds 4 MiB | consecutive bounded engine reads | 200/206; the 4 MiB ceiling bounds each payload read, not the requested representation |
 | Valid but unsatisfiable HTTP range | `BlobRangeNotSatisfiable { start, end, length }` details | 416 plus `Content-Range: bytes */N` and `blob_range` |
-| If-Match failed | `PreconditionFailed` outcome | 412 |
+| Blob write If-Match failed | `BlobWritePreconditionFailed { current_etag }` | 412 plus `blob_precondition_failure`; never graph `precondition_failure` |
+| Generation lane closed before operation | shared RFC-035 lifecycle detail | 503, not started |
+| Captured generation schema token is stale | RFC-036 `GenerationStale` | shared mapping and supervisor wake; no Blob-specific error |
 | Recovery intent armed but completion uncertain | `recovery_required` | existing mapping |
+| Owned write panics or has no knowable terminal outcome | shared RFC-035 unknown-outcome class | 500; never success or replay |
 | Persisted table/Blob integrity contradiction | `BlobIntegrity { reason }` | exhaustive server mapping is 5xx |
 
 Phase 0 implements deterministic test probes for admitted external cells,
@@ -1050,6 +1136,8 @@ credentials, or complete sensitive URIs. URI metrics use scheme plus a
 keyed/irreversible base identifier. Phase 2A deliberately does not add a new
 metrics backend merely to claim this box; the telemetry ships in a focused
 follow-up against the repository's eventual production observability owner.
+RFC-035/036 own generic lifecycle metrics. This RFC adds only Blob
+classification, range, payload-byte, validator, and delivery timing dimensions.
 
 ## 12. Test and acceptance plan
 
@@ -1112,24 +1200,23 @@ The implementation extends existing owners before creating new fixtures, per
   `LoadMode::Overwrite`, requires typed refusal before table or manifest
   movement, and then proves a canonical retained external reference does not
   poison the following keyed write.
-- Destructive-reclamation acceptance is explicit: branch/ref retention remains
-  covered by `maintenance.rs`, but Phase 1 introduces no cross-process
-  live-reader lease. The reader never retargets; operators quiesce readers before
-  cleanup or deletion of their branch, and an uncached read raced with physical
-  reclamation may only fail loudly.
+- Destructive-reclamation acceptance remains in `maintenance.rs`: readers never
+  retarget, operators quiesce them before cleanup, branch deletion, or RFC-034
+  exclusive compensation, and a reclamation race may only fail loudly.
 - Phase 3 extends the same `end_to_end.rs` fixture with update-only PUT, nullable
-  clear, returned-ETag equality, and fresh/stale/`*` preconditions, including
-  `If-Match: *` failing for a null cell.
+  clear, exact commit receipts, no-op clear `commit: null`, returned-ETag
+  equality, and fresh/stale/`*` preconditions, including `If-Match: *` failing
+  for a null cell. The exact-cell path is exercised for node and edge rows; a
+  generic `.gq` wrapper is forbidden.
 - `writes.rs`: inclusive and +1-byte PUT bounds; aggregate carried-row bound;
   and a two-Blob-column replacement whose old target is an unavailable external
   reference, proving that target payload is not read while the untouched sibling
   remains byte-identical. Every refusal proves table HEAD, manifest, lineage,
   and sidecar state unchanged.
-- Add a deterministic retry race using the existing Mutation rendezvous: pause a
-  conditional PUT after its first precondition evaluation but before effect,
-  publish a competing replacement, then resume. The first request must
-  re-evaluate against the fresh base and return 412 with the winner's ETag,
-  without a lost update or an extra table, manifest, lineage, or sidecar effect.
+- Phase 3 extends the existing Mutation rendezvous owner: a competing write
+  forces fresh If-Match evaluation, a post-publication write cannot alter the
+  first receipt/ETag, and branch ABA fails closed. RFC-036's generation owner
+  adds a Blob representative for stale-schema refusal and wholly-G1 execution.
 - Later merge/mutation work in `branching.rs` retains merge preservation of
   empty bytes, operation-wide managed-plus-exact-range accounting, the 8,192
   external-cell and 32 MiB URI-metadata admission bounds, normalized probe
@@ -1141,7 +1228,8 @@ The implementation extends existing owners before creating new fixtures, per
   reopen and prove graph visibility and the expected completed-recovery audit
   record with no unresolved sidecar. PUT proves exact bytes and an ETag equal to
   a fresh read. Clear proves null/NotFound with no ETag and proves the old ETag is
-  stale; the injected call itself returns no successful write outcome.
+  stale; the injected call itself returns no successful write outcome. The test
+  proves the Mutation record; RFC-034/036 own later convergence.
 - Phase 3 registers new writes under Mutation in `forbidden_apis.rs`; no new
   durable call site appears.
 
@@ -1172,10 +1260,15 @@ The implementation extends existing owners before creating new fixtures, per
 - Phase 2A extends `data_routes.rs` with GET/HEAD headers; empty 200; ranges and
   conditionals; external 302 with zero external I/O; branch/snapshot validation;
   node and edge selectors; and authorization. A payload-read probe remains at
-  zero for managed HEAD on both empty and near-limit values. Phase 3 extends the
-  same owner with PUT/DELETE, 412/413, and actor attribution.
+  zero for managed HEAD on both empty and near-limit values. RFC-035/036 extend
+  the same route owner with exact-generation `ReadObserver` capture and shared
+  lifecycle 503s. Phase 3 extends it with owned PUT/DELETE, exact receipts,
+  no-op clear `commit: null`, distinct Blob 412 details, 413, and actor
+  attribution.
 - `openapi.rs`: regenerate and compare each phase's binary request/response
-  surface; Phase 2A contains read methods only.
+  surface. RFC-035/036 add GET/HEAD lifecycle responses; Phase 3 pins write
+  lifecycle, the exact receipt, and the distinct Blob precondition without
+  exposing storage identity.
 - Phase 2B's pure `crates/omnigraph-cli/src/blob_cli.rs` units own range
   validation and clamping, whole-object external URI admission versus the
   ranged-descriptor fail-closed behavior shared by `get` and `stat`, and
@@ -1188,7 +1281,8 @@ The implementation extends existing owners before creating new fixtures, per
   pre-transfer refusal, end-at-EOF clamping, JSON output, and stable failure
   text. The user-facing docs explicitly record that an
   environmental mid-stream failure exits nonzero but may leave a partial output
-  prefix. Phase 3 extends the same owner with stdin/file PUT and clear.
+  prefix. Phase 3 adds stdin/file PUT, clear, exact receipts, and structured
+  lifecycle/precondition failures to the same owner.
 - Phase 2B extends `parity_matrix.rs` with byte-identical managed full, range,
   and snapshot reads plus exact structured stat output—including ETag—against
   embedded and served graphs backed by one immutable hard-linked native
@@ -1196,17 +1290,23 @@ The implementation extends existing owners before creating new fixtures, per
   resolved-view witness and shared failure diagnostics are equal too. This does
   not make the opaque witness a cross-copy identity contract: independently
   copied stores may carry different native manifest ETags. External no-follow
-  behavior matches and `KNOWN_DIVERGENCES` remains empty. Phase 3 adds
-  mutation-verb parity.
+  behavior matches and `KNOWN_DIVERGENCES` remains empty. Phase 3 adds mutation
+  receipt and structured-error parity.
 - `write_cost.rs` and its S3 owner: fixed external-reference counts prove shared
   registry reuse, URI deduplication, bounded probes, and no per-row cold setup.
   The live S3 cell uses 64 normalized-equivalent references and requires exactly
   64 admitted cells, one metadata request, and one payload read.
 - Extend the bounded transport/backpressure owner with a paused-client test that
   records at most two retained chunks and at most 8 MiB of retained payload for a
-  near-limit managed Blob. Disconnect must drop the reader and snapshot pin.
+  near-limit managed Blob. Disconnect must drop the reader, snapshot pin, and
+  generation capture after the scoped producer settles. Empty HEAD and external
+  redirect paths also release exactly one `ReadObserver` permit.
   These deterministic counters, rather than a platform-noisy RSS number, are the
   acceptance gate.
+- Extend RFC-035's real HTTP cancellation owner with Blob PUT and DELETE after
+  Mutation arm: HTTP/1 disconnect, HTTP/2 reset, and request timeout may lose
+  delivery but the owned task reaches one terminal result, never replays, and
+  emits one opaque wake on `RecoveryRequired`.
 
 Every phase requires the canonical workspace test graph, its relevant focused
 suites from a clean baseline, and `scripts/check-agents-md.sh`. Phase 1 adds no
@@ -1315,9 +1415,18 @@ correctness gate.
 
 ### Phase 3 — mutation
 
-- Add engine PUT/clear through the shared Mutation writer.
-- Add HTTP PUT/DELETE, CLI put/clear, admission, preconditions, OpenAPI, and
-  recovery/failpoint coverage.
+- **Served-read prerequisite:** when RFC-035/036 land, retrofit the already
+  shipped GET/HEAD routes with exact-generation `ReadObserver` lifetime before
+  adding any Blob write route.
+- **3A — engine:** after RFC-034's canonical recovery interfaces stabilize, add
+  the dedicated exact-ID PUT/clear adapter through the shared Mutation
+  staging/publication tail. Return the exact commit and same-publication Blob
+  evidence; do not heal inline or synthesize `.gq`.
+- **3B — HTTP:** after RFC-035 ownership and RFC-036 generation capture land,
+  add PUT/DELETE through owned execution and pin receipts, distinct Blob
+  preconditions, lifecycle errors, OpenAPI, cancellation, and failpoint behavior.
+- **3C — CLI:** add put/clear with embedded/remote exact-receipt and
+  structured-error parity.
 
 ### Phase 4 — measured optimization
 
@@ -1341,14 +1450,17 @@ No architectural invariant is weakened.
 - **Respect the substrate:** Lance remains the Blob-v2 store and batched reader.
   OmniGraph adds coordination and transport, not a competing object layer.
 - **One publication door / mutation once:** PUT and clear enter the existing
-  Mutation transaction and one manifest CAS.
-- **One coherent accepted view:** every read resolves catalog, table version,
-  exact immutable-manifest identity, row, descriptor, and bytes from one
-  `ReadTarget`.
+  Mutation transaction and one manifest CAS; disconnect never replays them.
+- **One coherent accepted view:** every served operation uses one immutable
+  runtime generation. Every read resolves catalog, table version, exact
+  immutable-manifest identity, row, descriptor, and bytes from one `ReadTarget`
+  within it.
 - **Ordinary writes are recoverable:** no Blob-specific direct commit or recovery
-  protocol is introduced.
+  protocol is introduced; RFC-034 owns classification/effects and a Blob entry
+  point never performs inline recovery.
 - **Strong consistency:** validators and preconditions are evaluated against the
-  captured base; success is returned only after graph publication.
+  captured base; success is returned only after graph publication, with the
+  exact commit and ETag derived from that same publication outcome.
 - **Physical state is derived:** placement kind and thresholds remain Lance-owned;
   the positive guard protects current optimize. Only a future dependency bump
   may introduce a tested typed skip for unsafe physical work, without failing
@@ -1362,9 +1474,10 @@ No architectural invariant is weakened.
 - **Typed IR and pushdown:** Blob stays a first-class type, and exact ID lookup is
   a structured expression rather than SQL text.
 - **Authorization at the boundary:** engine-wide Cedar applies to embedded,
-  server, and CLI writes; external-base policy is an additional resource gate.
+  server, and CLI writes; external-base policy is handle/builder-bound for
+  embedded calls and part of the same applied generation for served calls.
 - **Bounded failure:** upload, rewrite, range, probe concurrency, stream buffering,
-  and cancellation all have explicit ceilings.
+  operation ownership, and cancellation all have explicit ceilings.
 - **One source of truth:** Lance and the manifest remain authoritative; Blob
   metadata is derived descriptor state, not a parallel catalog.
 
@@ -1391,6 +1504,10 @@ GET/HEAD/PUT/DELETE and CLI verbs are additive, but once released their routes,
 range rules, validator format, redirect behavior, error codes, and table-version
 granularity become observable contracts. The `v1` ETag domain separator permits
 a future token format without ambiguous comparison.
+
+Because Phase 3 has not shipped, replacing the draft's DELETE `204` and bare
+commit-ID response with the shared exact receipt has no released compatibility
+cost.
 
 The Phase 1 Rust facade is observable too. It removes the pre-1.0
 `Omnigraph::read_blob` method that returned Lance's `BlobFile` and replaces it
