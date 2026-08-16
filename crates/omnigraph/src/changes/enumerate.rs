@@ -310,7 +310,12 @@ pub(crate) async fn enumerate_commit_changes(
     .await?;
 
     let mut resume_seen = resume.is_none();
-    let mut next_change_index = resume.map_or(0, |key| key.change_index + 1);
+    // `change_index` is client-controlled (it round-trips through the page
+    // token, whose checksum is integrity not authenticity) and is pure
+    // monotonic bookkeeping — the authoritative resume position is `(type_id,
+    // id)`. Saturate so a crafted `usize::MAX` cannot panic under overflow
+    // checks or wrap in release; a bounded wrong counter has no observable effect.
+    let mut next_change_index = resume.map_or(0, |key| key.change_index.saturating_add(1));
     let mut last_emitted: Option<ContinuationKey> = None;
     let mut emitted_this_call = false;
 
@@ -404,7 +409,7 @@ pub(crate) async fn enumerate_commit_changes(
                 change_index: next_change_index,
             });
             emitted_this_call = true;
-            next_change_index += 1;
+            next_change_index = next_change_index.saturating_add(1);
             out.push(change);
         }
     }

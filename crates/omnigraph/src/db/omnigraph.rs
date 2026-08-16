@@ -2242,8 +2242,14 @@ impl Omnigraph {
         crate::changes::enumerate::validate_change_page_limits(max_changes, max_bytes)?;
 
         let map_gap = |error| match error {
+            // A finite commit diff has no durable FEED cursor — recovery is the
+            // baseline handshake — so `ChangeFeedGap.cursor` is None here. (It
+            // previously carried the incoming `commit-page` page token, a
+            // different token kind than the feed cursor this field holds
+            // elsewhere; the kind-tagged decoder rejected it, but it was still a
+            // wrong-typed value in the wire contract.)
             OmniError::HistoricalVersionReclaimed { .. } => OmniError::ChangeFeedGap {
-                cursor: page_token.map(str::to_string),
+                cursor: None,
                 first_unreadable_commit_id: commit_id.to_string(),
             },
             error => error,

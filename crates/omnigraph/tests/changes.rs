@@ -1493,8 +1493,13 @@ async fn commit_changes_are_exact_ordered_and_bounded() {
     match gap {
         OmniError::ChangeFeedGap {
             first_unreadable_commit_id,
-            ..
-        } => assert_eq!(first_unreadable_commit_id, inserted.commit.graph_commit_id),
+            cursor,
+        } => {
+            assert_eq!(first_unreadable_commit_id, inserted.commit.graph_commit_id);
+            // A finite commit diff carries no durable feed cursor; recovery is
+            // the baseline handshake.
+            assert_eq!(cursor, None, "finite gap must not carry a feed cursor");
+        }
         other => panic!("expected a typed change feed gap, got: {other:?}"),
     }
 }
