@@ -117,6 +117,14 @@ impl ScanTuning<'_> {
         self
     }
 
+    /// Scope the scan to exactly these physical fragments — a scan-input
+    /// selection like `filter_expr`, not an ordering decision, so the bounded
+    /// executor routing chosen by `scan_stream_with` is unaffected.
+    pub(crate) fn with_fragments(&mut self, fragments: Vec<Fragment>) -> &mut Self {
+        self.scanner.with_fragments(fragments);
+        self
+    }
+
     pub(crate) fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.scanner.batch_size(batch_size);
         self

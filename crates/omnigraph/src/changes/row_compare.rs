@@ -16,11 +16,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 
 use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array};
-use datafusion::prelude::{col, lit};
+use datafusion::prelude::{Expr, col, lit};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use lance_core::datatypes::BlobHandling;
+use lance_table::format::Fragment;
 
 use super::model::{COMMIT_CHANGES_MAX_BYTES, is_reserved_storage_system_column};
 use crate::blob::{BlobDescriptor, BlobDescriptorDecoder};
@@ -122,6 +123,30 @@ pub(crate) struct OrderedRows {
 
 impl OrderedRows {
     pub(crate) async fn open(dataset: Dataset, after_id: Option<&str>) -> Result<Self> {
+        Self::open_filtered(dataset, after_id, None).await
+    }
+
+    /// Like [`Self::open`] but AND-composes an extra predicate with the `id >
+    /// after_id` resume filter. The parent probe passes an exact `id IN (chunk)`
+    /// set; the scan stays ordered by `id`.
+    pub(crate) async fn open_filtered(
+        dataset: Dataset,
+        after_id: Option<&str>,
+        extra_filter: Option<Expr>,
+    ) -> Result<Self> {
+        Self::open_scan(dataset, after_id, extra_filter, None).await
+    }
+
+    /// The full scan surface. `fragments` scopes the scan to exactly those
+    /// physical fragments — the candidate path passes the commit's changed
+    /// fragments so the read is O(delta), not O(table), while the version-window
+    /// `extra_filter` drops carried-over rows a fragment rewrite pulled along.
+    pub(crate) async fn open_scan(
+        dataset: Dataset,
+        after_id: Option<&str>,
+        extra_filter: Option<Expr>,
+        fragments: Option<Vec<Fragment>>,
+    ) -> Result<Self> {
         let after_id = after_id.map(str::to_string);
         let stream = Box::pin(
             TableStore::scan_stream_with(
@@ -131,8 +156,17 @@ impl OrderedRows {
                 Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
                 true,
                 move |scanner| {
-                    if let Some(after_id) = after_id {
-                        scanner.filter_expr(col("id").gt(lit(after_id)));
+                    if let Some(fragments) = fragments {
+                        scanner.with_fragments(fragments);
+                    }
+                    let resume = after_id.map(|after_id| col("id").gt(lit(after_id)));
+                    if let Some(filter) = match (resume, extra_filter) {
+                        (Some(resume), Some(extra)) => Some(resume.and(extra)),
+                        (Some(resume), None) => Some(resume),
+                        (None, Some(extra)) => Some(extra),
+                        (None, None) => None,
+                    } {
+                        scanner.filter_expr(filter);
                     }
                     // Descriptor-sized batches bounded by rows AND bytes, the
                     // same shape as every other production ordered-by-id scan.

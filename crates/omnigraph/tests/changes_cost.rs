@@ -1,16 +1,19 @@
 //! Cost-budget tests for per-commit change pages, on the shared
 //! `helpers::cost` harness.
 //!
-//! The current page implementation is the exact ordered-merge fallback — the
-//! authority path: for every changed table lifetime it scans BOTH pinned
-//! versions, so page cost is O(table size), not O(delta). Following the
-//! `merge_cost.rs` idiom, that known-non-flat term is pinned as a GROWING
-//! tripwire rather than mislabeled flat; substrate candidate pruning over the
-//! Lance row-version columns is the planned fix and must flip the tripwire to
-//! a flat assertion when it lands. The bounded terms asserted here:
+//! A per-commit page has two derivation paths. When the commit's effect on a
+//! table is a proven row-set-preserving shape (RFC-030 §4.2), it is derived in
+//! O(delta): the child scan is scoped to the commit's changed fragments and the
+//! parent before-image probe is a BTREE `id IN (chunk)` lookup — page cost is
+//! flat in the table's physical extent. When the effect is unproven (delete,
+//! overwrite, …), it falls back to the exact ordered merge of both pinned
+//! versions — O(table extent), pinned honestly as a GROWING tripwire. The terms
+//! asserted here:
 //!
 //!  * dataset opens per page — at most parent + child of each changed
 //!    interval; an untouched table contributes zero opens;
+//!  * pruned-path data reads — flat in table extent (candidate pruning);
+//!  * fallback-path data reads — growing in table extent (exact merge);
 //!  * Blob payload work — proportional to emitted changes, never to the
 //!    number of unchanged Blob rows scanned (descriptor identity short-circuit).
 #![recursion_limit = "512"]
@@ -21,16 +24,18 @@ use helpers::cost::{IoCounts, assert_flat, assert_grows, cost_harness, measure};
 use omnigraph::changes::ChangeFeedScope;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::LoadMode;
+use omnigraph_compiler::ir::ParamMap;
 
-/// One page over a Δ=1 commit: opens stay bounded by the changed interval
-/// while the ordered-merge scan term grows with the changed table's physical
-/// extent (its fragments), because the exact fallback reads both pinned
-/// versions in full. Both sweep points publish the SAME number of graph
-/// commits — the smaller point pads history with commits on the untouched
-/// table — so the known `__manifest` fold term stays comparable and only the
-/// scanned table's extent moves.
+/// One page over a Δ=1 update commit: opens stay bounded by the changed
+/// interval AND the data-read term stays flat in the changed table's physical
+/// extent, because the proven interval is derived by candidate pruning — the
+/// child scan reads only the commit's changed fragment and the parent probe is
+/// a BTREE lookup. Both sweep points publish the SAME number of graph commits —
+/// the smaller point pads history with commits on the untouched table — so the
+/// known `__manifest` fold term stays comparable and only the scanned table's
+/// extent moves.
 #[tokio::test]
-async fn changes_page_opens_are_bounded_and_scan_term_grows_with_table_extent() {
+async fn changes_page_opens_and_data_reads_are_bounded_by_delta() {
     const SEED_COMMITS: u64 = 8;
     const ROWS_PER_COMMIT: u64 = 64;
     cost_harness(async {
@@ -67,6 +72,10 @@ node Company {
                     .await
                     .unwrap();
             }
+            // Reconcile the `id` BTREE so the parent probe is an index lookup,
+            // not a full scan. The parent of the measured commit is this
+            // post-reconcile version, so it carries the index.
+            db.ensure_indices().await.unwrap();
             let updated = db
                 .load_with_receipt(
                     "main",
@@ -113,17 +122,92 @@ node Company {
         // Graph-commit depth is identical at both points, so manifest work
         // must not move with the scanned table's extent.
         assert_flat(&curve, |io| io.manifest_reads, 0, "manifest reads per page");
-        // The honest non-flat pin: the exact ordered merge reads both pinned
-        // table versions in full, so data reads grow with the table's physical
-        // extent at fixed Δ. Candidate pruning over
-        // `_row_last_updated_at_version` plus exact parent membership probes is
-        // the planned fix; when it lands, replace this tripwire with an
-        // `assert_flat`.
+        // The candidate-pruning win: an insert/update/no-delete commit is
+        // derived in O(delta). The child scan is scoped to the commit's changed
+        // fragments (from the manifest diff) and the parent before-image probe
+        // is an `id IN (chunk)` BTREE lookup (reconciled above), so page data
+        // reads do NOT grow with the table's physical extent at fixed Δ. The
+        // fallback path (an unproven operation) still reads both pinned versions
+        // in full — pinned as a growing tripwire in
+        // `changes_page_unproven_op_scan_term_grows_with_table_extent`.
+        assert_flat(
+            &curve,
+            |io| io.data_reads,
+            3,
+            "candidate-pruned page data reads (O(delta), not O(table extent))",
+        );
+    })
+    .await;
+}
+
+/// The fallback path stays honestly pinned: an unproven operation (a delete)
+/// forces the exact ordered merge of both pinned versions, so page data reads
+/// grow with the table's physical extent even at Δ=1. This is the counterpart
+/// to the pruned flat assertion above — if a future change mistakenly pruned an
+/// unproven op, this tripwire would go flat and fail.
+#[tokio::test]
+async fn changes_page_unproven_op_scan_term_grows_with_table_extent() {
+    const SEED_COMMITS: u64 = 8;
+    const ROWS_PER_COMMIT: u64 = 64;
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for person_commits in [2u64, 8] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Omnigraph::init(
+                dir.path().to_str().unwrap(),
+                "node Person {\n    name: String @key\n    age: I32?\n}\nnode Company {\n    slug: String @key\n}\n",
+            )
+            .await
+            .unwrap();
+            for commit in 0..SEED_COMMITS {
+                let batch = if commit < person_commits {
+                    (0..ROWS_PER_COMMIT)
+                        .map(|row| {
+                            let name = commit * ROWS_PER_COMMIT + row;
+                            format!(r#"{{"type":"Person","data":{{"name":"p{name:05}","age":1}}}}"#)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    format!(r#"{{"type":"Company","data":{{"slug":"filler-{commit}"}}}}"#)
+                };
+                db.load_with_receipt("main", &batch, LoadMode::Merge)
+                    .await
+                    .unwrap();
+            }
+            // A delete is an unproven (row-removing) operation, so the enumerator
+            // falls back to the exact ordered merge of both pinned versions.
+            let deleted = db
+                .mutate_with_receipt(
+                    "main",
+                    "query del() { delete Person where name = \"p00000\" }",
+                    "del",
+                    &ParamMap::new(),
+                )
+                .await
+                .unwrap();
+            let commit_id = deleted
+                .commit
+                .expect("a row-removing delete publishes one commit")
+                .graph_commit_id;
+
+            let (page, io) = measure(db.commit_changes_page(
+                &commit_id,
+                &ChangeFeedScope::default(),
+                None,
+                Some(10),
+                None,
+            ))
+            .await;
+            let page = page.unwrap();
+            assert_eq!(page.block.changes.len(), 1, "the measured commit is one delete");
+            curve.push((person_commits, io));
+        }
         assert_grows(
             &curve,
             |io| io.data_reads,
             1,
-            "exact ordered-merge full-table scan term (O(table extent), not O(delta))",
+            "unproven-op fallback still reads both pinned versions (O(table extent))",
         );
     })
     .await;

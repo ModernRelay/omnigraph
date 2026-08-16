@@ -22,11 +22,22 @@
 //! compaction `Rewrite`, …) makes the whole interval fall back to the exact
 //! merge, which classifies deletes correctly.
 
+use std::collections::{HashMap, VecDeque};
+
+use datafusion::prelude::{col, lit};
 use lance::Dataset;
 use lance::dataset::transaction::{Operation, UpdateMode};
+use lance_table::format::Fragment;
 
+use super::enumerate::{Emit, next_emit};
+use super::model::ChangeFeedScope;
+use super::row_compare::{OrderedRows, RawRow, rows_equal};
 use crate::db::SubTableEntry;
 use crate::error::Result;
+
+/// Parent probe chunk size: one BTREE-backed `id IN (chunk)` lookup per chunk,
+/// matching the keyed-write delta bound (`UNIQUE_PROBE_CHUNK_KEYS`).
+const PARENT_PROBE_CHUNK: usize = 8_192;
 
 /// Scan bound on the transaction interval, mirroring the branch-merge
 /// pure-insert history walk (`PURE_INSERT_HISTORY_MAX_VERSIONS`). A commit
@@ -35,9 +46,9 @@ use crate::error::Result;
 const CANDIDATE_SCAN_MAX_VERSIONS: u64 = 1_024;
 
 /// Whether one Lance transaction's operation preserves the live logical row set
-/// — i.e. can only add or modify rows in place, never remove, reuse, or
-/// re-stamp a logical id. Only such operations are safe to derive by candidate
-/// scan + parent probe; everything else forces the exact ordered merge.
+/// — i.e. can only add or modify rows in place, never remove, reuse, or re-stamp
+/// a logical id. Only such operations are safe to derive by candidate scan +
+/// parent probe; everything else forces the exact ordered merge.
 ///
 /// The match is exhaustive with **no wildcard arm**: a new Lance `Operation`
 /// variant is a compile error that forces this classification to be reviewed
@@ -72,39 +83,40 @@ pub(crate) fn operation_is_row_set_preserving(operation: &Operation) -> bool {
     }
 }
 
-/// Whether this changed interval can be derived by the O(delta) candidate path.
+/// The changed child fragments if this interval can be derived by the O(delta)
+/// candidate path, or `None` to use the exact ordered merge.
 ///
 /// Requires: same table branch and immutable identity; the end version strictly
 /// advances from begin within the scan bound; both pinned handles are at their
 /// exact expected versions and use stable row IDs (so both row-version columns
 /// are active); and every transaction in `(begin, end]` is row-set-preserving.
 /// Any doubt — a branch/lineage change, a non-advancing or oversized interval,
-/// an inactive row-version column, a missing/cleaned transaction, or an
-/// unproven operation — returns `Ok(false)` so the caller uses the exact merge.
-/// It never returns `Err` for a normal miss (e.g. cleaned history).
-#[allow(dead_code)] // wired into the enumerator in a later stage
-pub(crate) async fn interval_is_prunable(
+/// an inactive row-version column, a missing/cleaned transaction, or an unproven
+/// operation — returns `Ok(None)` so the caller uses the exact merge. It never
+/// returns `Err` for a normal miss (e.g. cleaned history).
+pub(crate) async fn interval_changed_fragments(
     from_entry: &SubTableEntry,
     to_entry: &SubTableEntry,
     from_dataset: &Dataset,
     to_dataset: &Dataset,
-) -> Result<bool> {
-    if from_entry.table_branch != to_entry.table_branch || from_entry.identity != to_entry.identity {
-        return Ok(false);
+) -> Result<Option<Vec<Fragment>>> {
+    if from_entry.table_branch != to_entry.table_branch || from_entry.identity != to_entry.identity
+    {
+        return Ok(None);
     }
     let Some(version_count) = to_entry
         .table_version
         .checked_sub(from_entry.table_version)
         .filter(|count| *count > 0 && *count <= CANDIDATE_SCAN_MAX_VERSIONS)
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if to_dataset.version().version != to_entry.table_version
         || from_dataset.version().version != from_entry.table_version
         || !to_dataset.manifest.uses_stable_row_ids()
         || !from_dataset.manifest.uses_stable_row_ids()
     {
-        return Ok(false);
+        return Ok(None);
     }
 
     // Walk every transaction in (begin, end]. A build/list error or a missing
@@ -116,17 +128,220 @@ pub(crate) async fn interval_is_prunable(
         .with_end_version(to_entry.table_version)
         .build()
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let Ok(transactions) = delta.list_transactions().await else {
-        return Ok(false);
+        return Ok(None);
     };
     if u64::try_from(transactions.len()).ok() != Some(version_count) {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(transactions
+    if !transactions
         .iter()
-        .all(|transaction| operation_is_row_set_preserving(&transaction.operation)))
+        .all(|transaction| operation_is_row_set_preserving(&transaction.operation))
+    {
+        return Ok(None);
+    }
+
+    // The changed fragments are exactly the child fragments the parent does not
+    // have: every proven op only ADDS fragments (append, or rewrite = remove old
+    // + add new), so a child fragment absent from the parent carries this
+    // interval's inserted/updated rows. Computed from the already-loaded
+    // manifests — no object-store data reads — so the candidate scan reads only
+    // O(delta) fragments.
+    let parent_ids: std::collections::HashSet<u64> = from_dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect();
+    let changed: Vec<Fragment> = to_dataset
+        .fragments()
+        .iter()
+        .filter(|fragment| !parent_ids.contains(&fragment.id))
+        .cloned()
+        .collect();
+    Ok(Some(changed))
+}
+
+/// Fetch full before-image rows for `ids` from the parent handle in one
+/// BTREE-backed `id IN (chunk)` lookup (never per-row round trips, never a
+/// string filter). The returned rows carry `_rowid`/`_rowaddr` and Blob
+/// descriptions so `rows_equal` and `emitted_image` behave exactly as on the
+/// full-merge path.
+async fn probe_parent_images(parent: &Dataset, ids: &[String]) -> Result<HashMap<String, RawRow>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let filter = col("id").in_list(ids.iter().map(|id| lit(id.clone())).collect(), false);
+    let mut rows = OrderedRows::open_filtered(parent.clone(), None, Some(filter)).await?;
+    let mut images = HashMap::with_capacity(ids.len());
+    while let Some(row) = rows.pop().await? {
+        images.insert(row.id.clone(), row);
+    }
+    Ok(images)
+}
+
+/// The O(delta) emitter for a proven row-set-preserving interval: an id-ordered
+/// scan of the rows the commit touched (by `_row_last_updated_at_version`) plus
+/// a batched parent probe for before-images. It yields only inserts and updates
+/// — a prunable interval has zero logical deletes (see the module docs), so no
+/// delete pass is needed.
+pub(crate) struct CandidateUpserts {
+    parent: Dataset,
+    candidates: OrderedRows,
+    scope: ChangeFeedScope,
+    ready: VecDeque<Emit>,
+}
+
+impl CandidateUpserts {
+    async fn open(
+        from_entry: &SubTableEntry,
+        to_entry: &SubTableEntry,
+        from_dataset: Dataset,
+        to_dataset: Dataset,
+        changed_fragments: Vec<Fragment>,
+        after_id: Option<&str>,
+        scope: ChangeFeedScope,
+    ) -> Result<Self> {
+        // Scan only the fragments this commit wrote (O(delta)), and within them
+        // keep rows whose last update lands in (begin, end] — this drops the
+        // carried-over rows a fragment rewrite pulled along, leaving exactly the
+        // inserted and updated rows (the parent probe classifies which).
+        let window = col("_row_last_updated_at_version")
+            .gt(lit(from_entry.table_version))
+            .and(col("_row_last_updated_at_version").lt_eq(lit(to_entry.table_version)));
+        let candidates =
+            OrderedRows::open_scan(to_dataset, after_id, Some(window), Some(changed_fragments))
+                .await?;
+        Ok(Self {
+            parent: from_dataset,
+            candidates,
+            scope,
+            ready: VecDeque::new(),
+        })
+    }
+
+    fn parent_dataset(&self) -> &Dataset {
+        &self.parent
+    }
+
+    fn child_dataset(&self) -> &Dataset {
+        self.candidates.dataset()
+    }
+
+    async fn next(&mut self) -> Result<Option<Emit>> {
+        loop {
+            if let Some(emit) = self.ready.pop_front() {
+                return Ok(Some(emit));
+            }
+            // Pull the next id-ordered chunk of candidates, then probe the
+            // parent once for the whole chunk.
+            let mut chunk: Vec<RawRow> = Vec::new();
+            while chunk.len() < PARENT_PROBE_CHUNK {
+                match self.candidates.pop().await? {
+                    Some(row) => chunk.push(row),
+                    None => break,
+                }
+            }
+            if chunk.is_empty() {
+                return Ok(None);
+            }
+            let ids: Vec<String> = chunk.iter().map(|row| row.id.clone()).collect();
+            let parents = probe_parent_images(&self.parent, &ids).await?;
+            for candidate in chunk {
+                let emit = match parents.get(&candidate.id) {
+                    // Absent in the parent -> a new logical id -> insert.
+                    None => Emit::Insert(candidate),
+                    // Present in the parent -> update unless the logical image is
+                    // unchanged (a physical no-op / metadata-only movement).
+                    Some(before) => {
+                        if rows_equal(&self.parent, before, self.candidates.dataset(), &candidate)
+                            .await?
+                        {
+                            continue;
+                        }
+                        Emit::Update {
+                            before: before.clone(),
+                            after: candidate,
+                        }
+                    }
+                };
+                if self.scope.wants_op(emit.op()) {
+                    self.ready.push_back(emit);
+                }
+            }
+        }
+    }
+}
+
+/// Per-interval change emitter: the O(delta) candidate path when the interval is
+/// provably row-set-preserving, else the exact full ordered merge. Both yield
+/// the same id-ordered `Emit` stream; before-images come from the parent handle
+/// and after-images from the child handle.
+pub(crate) enum EmitSource {
+    FullMerge {
+        from: OrderedRows,
+        to: OrderedRows,
+        scope: ChangeFeedScope,
+    },
+    Pruned(CandidateUpserts),
+}
+
+impl EmitSource {
+    pub(crate) async fn plan(
+        from_entry: &SubTableEntry,
+        to_entry: &SubTableEntry,
+        from_dataset: Dataset,
+        to_dataset: Dataset,
+        after_id: Option<&str>,
+        scope: &ChangeFeedScope,
+    ) -> Result<Self> {
+        if let Some(changed_fragments) =
+            interval_changed_fragments(from_entry, to_entry, &from_dataset, &to_dataset).await?
+        {
+            Ok(Self::Pruned(
+                CandidateUpserts::open(
+                    from_entry,
+                    to_entry,
+                    from_dataset,
+                    to_dataset,
+                    changed_fragments,
+                    after_id,
+                    scope.clone(),
+                )
+                .await?,
+            ))
+        } else {
+            let from = OrderedRows::open(from_dataset, after_id).await?;
+            let to = OrderedRows::open(to_dataset, after_id).await?;
+            Ok(Self::FullMerge {
+                from,
+                to,
+                scope: scope.clone(),
+            })
+        }
+    }
+
+    pub(crate) async fn next(&mut self) -> Result<Option<Emit>> {
+        match self {
+            Self::FullMerge { from, to, scope } => next_emit(from, to, scope).await,
+            Self::Pruned(candidates) => candidates.next().await,
+        }
+    }
+
+    pub(crate) fn parent_dataset(&self) -> &Dataset {
+        match self {
+            Self::FullMerge { from, .. } => from.dataset(),
+            Self::Pruned(candidates) => candidates.parent_dataset(),
+        }
+    }
+
+    pub(crate) fn child_dataset(&self) -> &Dataset {
+        match self {
+            Self::FullMerge { to, .. } => to.dataset(),
+            Self::Pruned(candidates) => candidates.child_dataset(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -152,11 +367,11 @@ mod tests {
     #[test]
     fn append_and_rewrite_rows_update_are_row_set_preserving() {
         assert!(operation_is_row_set_preserving(&Operation::Append {
-            fragments: Vec::new()
+            fragments: vec![Fragment::new(7)],
         }));
         // A merge Update that also modifies existing rows (non-empty
-        // updated_fragments) is still row-set-preserving — unlike the
-        // pure-insert certificate, this classifier accepts updates.
+        // updated_fragments / removed_fragment_ids) is still row-set-preserving —
+        // unlike the pure-insert certificate, this classifier accepts updates.
         let mut upsert = update(Some(UpdateMode::RewriteRows));
         if let Operation::Update {
             updated_fragments,
