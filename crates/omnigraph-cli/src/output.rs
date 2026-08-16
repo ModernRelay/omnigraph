@@ -1075,6 +1075,63 @@ fn print_entity_change_row(change: &omnigraph_api_types::EntityChangeOutput) {
         change.r#type.name,
         change.id
     );
+    // Edge endpoints (present on edge images only).
+    if let Some(endpoints) = change
+        .after
+        .as_ref()
+        .or(change.before.as_ref())
+        .and_then(|image| image.endpoints.as_ref())
+    {
+        println!("  {} -> {}", endpoints.from, endpoints.to);
+    }
+    // The before/after property values are the point of a change feed; the
+    // previous output dropped them. Show inserted/deleted values, or the
+    // changed keys of an update as `before -> after`.
+    match (&change.before, &change.after) {
+        (None, Some(after)) => print_change_properties("  +", &after.properties),
+        (Some(before), None) => print_change_properties("  -", &before.properties),
+        (Some(before), Some(after)) => print_change_property_diff(before, after),
+        (None, None) => {}
+    }
+}
+
+fn render_change_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn print_change_properties(marker: &str, properties: &serde_json::Value) {
+    if let Some(map) = properties.as_object() {
+        for (key, value) in map {
+            println!("{marker} {key}: {}", render_change_value(value));
+        }
+    }
+}
+
+fn print_change_property_diff(
+    before: &omnigraph_api_types::ChangeImageOutput,
+    after: &omnigraph_api_types::ChangeImageOutput,
+) {
+    let (Some(before_map), Some(after_map)) =
+        (before.properties.as_object(), after.properties.as_object())
+    else {
+        return;
+    };
+    let mut keys: Vec<&String> = before_map.keys().chain(after_map.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        let before_value = before_map.get(key);
+        let after_value = after_map.get(key);
+        if before_value != after_value {
+            let before_str = before_value.map(render_change_value).unwrap_or_default();
+            let after_str = after_value.map(render_change_value).unwrap_or_default();
+            println!("  {key}: {before_str} -> {after_str}");
+        }
+    }
 }
 
 pub(crate) fn print_commit_changes_human(page: &omnigraph_api_types::CommitChangesOutput) {
