@@ -452,7 +452,7 @@ impl GraphNamespacePublisher {
                         return Err(OmniError::Lance(
                             NamespaceError::ConcurrentModification {
                                 message: format!(
-                                    "table version {} already exists for identity {} ({})",
+                                    "table version {} is claimed twice in one publish request for identity {} ({})",
                                     table_version, update.identity, table_key
                                 ),
                             }
@@ -463,11 +463,18 @@ impl GraphNamespacePublisher {
                     {
                         let is_owner_branch_handoff = existing.row_count == row_count
                             && existing.table_branch != table_branch;
-                        if !is_owner_branch_handoff {
+                        // Re-registering the row already stored is not a
+                        // collision: the post-publish fold reaches the same
+                        // state either way. Only a DIFFERENT row at an
+                        // occupied (identity, version) is what this guards.
+                        let reregisters_stored_row = existing.row_count == row_count
+                            && existing.table_branch == table_branch
+                            && existing.version_metadata == version_metadata;
+                        if !(is_owner_branch_handoff || reregisters_stored_row) {
                             return Err(OmniError::Lance(
                                 NamespaceError::ConcurrentModification {
                                     message: format!(
-                                        "table version {} already exists for identity {} ({})",
+                                        "table version {} already exists for identity {} ({}) with different state",
                                         table_version, update.identity, table_key
                                     ),
                                 }

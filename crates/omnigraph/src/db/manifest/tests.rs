@@ -913,10 +913,14 @@ async fn test_batch_create_table_versions_is_atomic_on_conflict() {
         None,
     );
 
+    // A genuine registry collision: the stored `(identity, version)` is
+    // occupied by a row carrying a DIFFERENT state. Re-registering the stored
+    // row byte-for-byte is not a conflict and is pinned separately by
+    // `test_batch_create_table_versions_allows_identical_reregistration`.
     let conflicting_company_request = company_version_metadata.to_create_table_version_request(
         "node:Company",
         company_entry.table_version,
-        0,
+        company_entry.row_count + 1,
         None,
     );
 
@@ -924,7 +928,10 @@ async fn test_batch_create_table_versions_is_atomic_on_conflict() {
         .publish_requests(&[person_request, conflicting_company_request])
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("already exists"));
+    assert!(
+        err.to_string().contains("with different state"),
+        "unexpected refusal: {err}"
+    );
 
     let reopened = ManifestCoordinator::open(uri).await.unwrap();
     assert_eq!(reopened.version(), manifest_version);
@@ -972,7 +979,14 @@ async fn test_batch_create_table_versions_rejects_duplicate_requests_without_adv
         .publish_requests(&[request.clone(), request])
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("already exists"));
+    // The within-request duplicate and the registry collision are distinct
+    // refusals and say so: a caller that batched the same version twice is a
+    // different bug from a caller racing a stored registration.
+    assert!(
+        err.to_string()
+            .contains("is claimed twice in one publish request"),
+        "unexpected refusal: {err}"
+    );
 
     let reopened = ManifestCoordinator::open(uri).await.unwrap();
     assert_eq!(reopened.version(), manifest_version);
@@ -987,6 +1001,95 @@ async fn test_batch_create_table_versions_rejects_duplicate_requests_without_adv
     assert_eq!(
         reopened.snapshot().entry("node:Person").unwrap().row_count,
         0
+    );
+}
+
+/// Re-registering the row already stored is not a collision.
+///
+/// The registry guard exists to catch a DIFFERENT row landing on an occupied
+/// `(identity, version)`. An identical re-registration reaches the same folded
+/// state whether it is applied or skipped, so refusing it turned a benign
+/// publish into a permanent failure (#473). The engine no longer emits one,
+/// but the guard should not be the thing that makes it fatal.
+#[tokio::test]
+async fn test_batch_create_table_versions_allows_identical_reregistration() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let snap = mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+
+    let version_metadata = table_version_metadata_for_state(
+        uri,
+        &person_entry.table_path,
+        None,
+        person_entry.table_version,
+    )
+    .await
+    .unwrap();
+    let request = version_metadata.to_create_table_version_request(
+        "node:Person",
+        person_entry.table_version,
+        person_entry.row_count,
+        None,
+    );
+
+    GraphNamespacePublisher::new(uri, None)
+        .publish_requests(&[request])
+        .await
+        .expect("re-registering the stored row must not be a conflict");
+
+    let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    let entry = reopened.snapshot().entry("node:Person").unwrap().clone();
+    assert_eq!(entry.table_version, person_entry.table_version);
+    assert_eq!(entry.table_branch, person_entry.table_branch);
+    assert_eq!(entry.row_count, person_entry.row_count);
+}
+
+/// The widened exemption stays narrow: a row that DIFFERS at an occupied
+/// `(identity, version)` on the same branch is still the collision the guard
+/// is there to catch.
+#[tokio::test]
+async fn test_batch_create_table_versions_rejects_differing_row_at_same_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let snap = mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+
+    let version_metadata = table_version_metadata_for_state(
+        uri,
+        &person_entry.table_path,
+        None,
+        person_entry.table_version,
+    )
+    .await
+    .unwrap();
+    // Same identity, same version, same branch — but a different row count.
+    let request = version_metadata.to_create_table_version_request(
+        "node:Person",
+        person_entry.table_version,
+        person_entry.row_count + 1,
+        None,
+    );
+
+    let err = GraphNamespacePublisher::new(uri, None)
+        .publish_requests(&[request])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("with different state"),
+        "unexpected refusal: {err}"
+    );
+
+    let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    assert_eq!(
+        reopened.snapshot().entry("node:Person").unwrap().row_count,
+        person_entry.row_count,
     );
 }
 
