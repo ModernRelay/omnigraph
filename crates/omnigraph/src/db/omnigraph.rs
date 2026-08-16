@@ -2365,6 +2365,11 @@ impl Omnigraph {
             .await
             .capture_change_cut(branch.as_deref())
             .await?;
+        // The cut is captured; every per-commit snapshot reopen inside `poll`
+        // happens after this and lock-free. Tests delete/recreate the polled
+        // branch here to prove `commit_snapshot`'s incarnation re-prove fails
+        // closed instead of emitting a replacement branch's rows.
+        crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_POST_CAPTURE)?;
         let graph_identity = self.schema_view.load().schema_identity_domain.clone();
         crate::changes::feed::poll(
             self.uri(),

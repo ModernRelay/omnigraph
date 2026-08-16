@@ -92,6 +92,11 @@ pub mod names {
     /// but has not opened the selected Lance table version yet. Tests replace
     /// a named branch here to prove a live read fails rather than retargeting.
     pub const BLOB_READ_POST_CAPTURE: &str = "blob_read.post_capture";
+    /// A change-feed poll has captured its cut, but has not reopened any
+    /// commit's per-branch manifest snapshot yet. Tests delete and recreate a
+    /// named branch here to prove the poll fails closed rather than emitting the
+    /// replacement branch's rows under the captured commit's label.
+    pub const CHANGE_FEED_POST_CAPTURE: &str = "change_feed.post_capture";
     pub const CLEANUP_RECONCILE_FORK: &str = "cleanup.reconcile_fork";
     /// After cleanup's fast empty-sidecar probe, before it acquires the closed
     /// schema/branch/table GC gate set and performs the authoritative recheck.

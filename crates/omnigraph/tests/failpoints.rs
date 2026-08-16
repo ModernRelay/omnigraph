@@ -10716,6 +10716,110 @@ node Document {
     );
 }
 
+/// A change-feed poll captures its cut, then reopens each commit's per-branch
+/// manifest snapshot lock-free. Deleting and recreating the polled branch in
+/// that window reuses the physical path and numeric manifest version, so the
+/// in-poll incarnation re-prove must reject the stale cut instead of emitting
+/// the replacement branch's rows under the captured commit's label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn change_feed_poll_refuses_delete_recreate_aba_after_cut_capture() {
+    use omnigraph::changes::{
+        ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart,
+    };
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let schema = r#"
+node Document {
+    title: String @key
+    content: String
+}
+"#;
+    let setup = Omnigraph::init(&uri, schema).await.unwrap();
+    load_jsonl(
+        &setup,
+        r#"{"type":"Document","data":{"title":"aba","content":"base"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    setup.branch_create("feature").await.unwrap();
+    setup
+        .load(
+            "feature",
+            r#"{"type":"Document","data":{"title":"aba","content":"old"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    drop(setup);
+
+    let reader = Omnigraph::open(&uri).await.unwrap();
+    let control = Omnigraph::open(&uri).await.unwrap();
+    let old_entry = control
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .entry("node:Document")
+        .unwrap()
+        .clone();
+
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::CHANGE_FEED_POST_CAPTURE);
+    // Poll from the beginning so the feature-authored commit is reopened; its
+    // snapshot is what the ABA retargets.
+    let request = ChangeFeedRequest {
+        branch: Some("feature".to_string()),
+        position: ChangeFeedPosition::Start(ChangeFeedStart::Beginning),
+        scope: ChangeFeedScope::default(),
+        max_changes: None,
+        max_bytes: None,
+        max_commits: None,
+    };
+    let poll_task = tokio::spawn(async move { reader.poll_change_feed(request).await });
+    rendezvous.wait_until_reached().await;
+
+    // Keep the parked poll releasable even if a control-plane op fails.
+    let replacement = async {
+        control.branch_delete("feature").await?;
+        control.branch_create("feature").await?;
+        control
+            .load(
+                "feature",
+                r#"{"type":"Document","data":{"title":"aba","content":"new"}}"#,
+                LoadMode::Merge,
+            )
+            .await?;
+        control.snapshot_of(ReadTarget::branch("feature")).await
+    }
+    .await;
+    rendezvous.release();
+
+    let new_snapshot = replacement.expect("delete/recreate replacement must complete");
+    let new_entry = new_snapshot.entry("node:Document").unwrap();
+    assert_eq!(
+        new_entry.table_version, old_entry.table_version,
+        "the regression must exercise same-version branch ABA"
+    );
+
+    let error = poll_task
+        .await
+        .unwrap()
+        .expect_err("the stale cut must never emit the replacement branch's rows");
+    assert!(
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+                    && manifest
+                        .message
+                        .contains("has no persisted native-branch incarnation witness")
+        ),
+        "in-poll branch ABA must fail with the incarnation refusal, got {error:?}"
+    );
+}
+
 async fn setup_diverged_merge_branches(dir: &tempfile::TempDir) -> (String, usize) {
     let uri = dir.path().to_str().unwrap().to_string();
     let db = helpers::init_and_load(dir).await;
