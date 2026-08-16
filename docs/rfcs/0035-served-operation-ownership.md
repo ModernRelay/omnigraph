@@ -347,10 +347,10 @@ from signal receipt to process exit, not from one participant's close to a log.
 
 ## 9. Failure and observability contract
 
-RFC-035 owns lifecycle outcomes; PR #491 classifies only engine/substrate
-failures. `ErrorOutput` gains an optional rolling-safe `lifecycle` detail whose
-`kind` and `outcome` are strings (unknown values must deserialize). The stable
-mapping is:
+RFC-035 owns lifecycle outcomes; RFC-038 classifies only engine/substrate
+failure conditions and supplies no replay decision. `ErrorOutput` gains an
+optional rolling-safe `lifecycle` detail whose `kind` and `outcome` are strings
+(unknown values must deserialize). The stable mapping is:
 
 | Event | HTTP / transport | `kind` | `outcome` |
 |---|---|---|---|
@@ -483,7 +483,7 @@ wall bound, asserting one shared deadline and retaining child logs on failure.
 
 No disk/manifest/Lance/query/success shape changes. Optional
 `ErrorOutput.lifecycle` is additive; closed `ErrorCode` stays unchanged, with
-OpenAPI/old-client tests. PR #491 owns none of these meanings.
+OpenAPI/old-client tests. RFC-038 owns none of these meanings.
 
 Observable changes are additive lifecycle failures and an admitted write may
 finish after disconnect/timeout. Docs state transport cancellation is not
