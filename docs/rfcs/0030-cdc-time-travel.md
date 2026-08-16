@@ -395,10 +395,17 @@ intermediate pages carry no advanced durable cursor. The terminal page returns
 the cursor after that complete commit, so a caller never checkpoints a partial
 block by mistake.
 
-The byte ceiling is chosen at least as large as OmniGraph's maximum legal
-logical row image. If historical or blob-backed data still produces one image
-larger than that ceiling, the request fails with a typed resource-limit error;
-it does not truncate the image or silently switch to keys-only output.
+The per-page byte ceiling is a PACKING target — how many small changes share a
+page — never a wall a single legal change must fit under. An `Update` serializes
+two row images and managed Blobs inline as base64, so one legal committed change
+can exceed the ceiling. Such a change is delivered on its own page (forward
+progress: it is emitted solo even when it exceeds the remaining budget, and the
+cursor advances past it), so no legal committed change is ever un-crossable. The
+enumerator never truncates an image or switches to keys-only output. *(Amended
+from the original "fails with a typed resource-limit error": that made a legal
+managed-Blob update a permanent poison commit no page token or feed cursor could
+cross. The resource-limit error is retained only for a zero-capacity request,
+which validation already rejects.)*
 
 The implementation must prove the ordering path is bounded. It may use Lance's
 ordered scan or a bounded merge, but it may not sort an unbounded graph commit

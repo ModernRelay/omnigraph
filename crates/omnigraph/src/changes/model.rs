@@ -19,9 +19,18 @@ use crate::db::commit_graph::GraphCommit;
 pub const COMMIT_CHANGES_DEFAULT_ROWS: usize = 1_000;
 /// Public ceiling on entity changes per bounded page.
 pub const COMMIT_CHANGES_MAX_ROWS: usize = 8_192;
-/// Default serialized-byte budget per bounded page.
+/// Default per-page serialized-byte PACKING target — how many small changes
+/// share one page, not a wall a single change must fit under. A change whose two
+/// images exceed the remaining budget is delivered on its own page (forward
+/// progress; see `enumerate`), so this never makes a legal committed change
+/// undeliverable.
 pub const COMMIT_CHANGES_DEFAULT_BYTES: u64 = 4 * 1024 * 1024;
-/// Public ceiling on the serialized-byte budget per bounded page.
+/// Public ceiling on the per-page byte packing target a caller may request.
+/// This bounds how much a caller may pack per page; it is NOT a ceiling on a
+/// single change's size — an `Update` serializes two row images and managed
+/// Blobs inline as base64 (~4/3), so one legal change can exceed this and is
+/// still delivered solo. (Historically this equalled the write-path keyed
+/// transaction budget, which wrongly implied a single change had to fit under it.)
 pub const COMMIT_CHANGES_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Default number of graph commits one feed poll examines.
 pub const CHANGE_FEED_DEFAULT_COMMITS_PER_POLL: usize = 128;

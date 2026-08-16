@@ -373,7 +373,18 @@ pub(crate) async fn enumerate_commit_changes(
             )
             .map_err(|_| OmniError::manifest_internal("change image size exceeds u64"))?;
 
-            if budget.remaining_rows == 0 || encoded_bytes > budget.remaining_bytes {
+            // Forward progress: the byte budget is a packing target, never a
+            // wall. A change that exceeds the remaining bytes ends the page at
+            // the previous boundary ONLY if the page already carries a change;
+            // if it is the FIRST change of the page it is emitted SOLO (even
+            // over budget), so a legal committed change — whose two images can
+            // exceed the write-path-derived ceiling once managed Blobs inline as
+            // base64 — is always deliverable, one per page if needed. The row
+            // budget still bounds packing. `Exhausted` now only signals a
+            // zero-capacity request (`max_changes == 0`), which validation
+            // already rejects; it is retained defensively.
+            let over_bytes = encoded_bytes > budget.remaining_bytes;
+            if budget.remaining_rows == 0 || (over_bytes && emitted_this_call) {
                 return Ok(match last_emitted {
                     Some(key) if emitted_this_call => CommitEnumeration::Truncated(key),
                     _ => CommitEnumeration::Exhausted {
@@ -382,7 +393,10 @@ pub(crate) async fn enumerate_commit_changes(
                 });
             }
             budget.remaining_rows -= 1;
-            budget.remaining_bytes -= encoded_bytes;
+            // Saturating: a solo over-budget change drives remaining_bytes to 0,
+            // so the next change (if any) ends the page here rather than
+            // overflowing it further.
+            budget.remaining_bytes = budget.remaining_bytes.saturating_sub(encoded_bytes);
             last_emitted = Some(ContinuationKey {
                 type_id: plan.opaque_id.clone(),
                 id: change.id.clone(),
