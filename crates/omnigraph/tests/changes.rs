@@ -988,6 +988,186 @@ fn properties(value: serde_json::Value) -> serde_json::Map<String, serde_json::V
     value.as_object().expect("expected object").clone()
 }
 
+/// A Blob-only update where the before/after payloads are the same length can
+/// produce byte-identical file-relative Blob descriptors in two different data
+/// files. Lance resolves those descriptors relative to the owning physical row
+/// (data file), so equal descriptors in different fragments reference different
+/// bytes. The comparator must not treat equal descriptors as equal payloads
+/// without proving the owning immutable source is also identical.
+#[tokio::test]
+async fn commit_changes_detects_same_length_blob_only_update_across_fragments() {
+    use omnigraph::changes::{ChangeFeedScope, ChangeOpKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Document {
+    title: String @key
+    payload: Blob?
+}
+"#,
+    )
+    .await
+    .unwrap();
+
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // A -> B: both payloads are one byte. A second write creates a new
+    // physical row/data file, but its file-relative Blob descriptor can be
+    // identical to the first descriptor.
+    let updated = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    let page = db
+        .commit_changes_page(
+            &updated.commit.graph_commit_id,
+            &ChangeFeedScope::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        page.block.changes.len(),
+        1,
+        "Blob-only update was suppressed"
+    );
+    let change = &page.block.changes[0];
+    assert_eq!(change.id, "doc");
+    assert_eq!(change.op, ChangeOpKind::Update);
+    assert_eq!(
+        change.before.as_ref().unwrap().properties["payload"],
+        serde_json::json!("base64:QQ==")
+    );
+    assert_eq!(
+        change.after.as_ref().unwrap().properties["payload"],
+        serde_json::json!("base64:Qg==")
+    );
+}
+
+const BLOB_DOC_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    payload: Blob?
+}
+"#;
+
+/// Acceptance #2: the durable feed shares the enumerator, so the same-length
+/// Blob-only update must also be delivered through `poll_change_feed`, not only
+/// the finite commit diff.
+#[tokio::test]
+async fn change_feed_detects_same_length_blob_only_update() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart, ChangeOpKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // Capture a caught-up cursor at the insert, then apply the A -> B update.
+    let now = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap();
+    let (cursor, _) = boundary_cursor(&now);
+
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let page = db
+        .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(cursor)))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.blocks.len(),
+        1,
+        "the feed dropped the Blob-only update"
+    );
+    let changes = &page.blocks[0].changes;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].id, "doc");
+    assert_eq!(changes[0].op, ChangeOpKind::Update);
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["payload"],
+        serde_json::json!("base64:Qg==")
+    );
+}
+
+/// Acceptance #7: the cross-branch net diff shares the same comparator, so a
+/// same-length Blob-only update on a forked branch must surface through
+/// `diff_commits` too.
+#[tokio::test]
+async fn cross_branch_diff_detects_same_length_blob_only_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let main_commit = head_commit_id(uri, None).await;
+
+    db.branch_create("feature").await.unwrap();
+    let feature = Omnigraph::open(uri).await.unwrap();
+    feature
+        .load_with_receipt(
+            "feature",
+            r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let feature_commit = head_commit_id(uri, Some("feature")).await;
+
+    let change_set = db
+        .diff_commits(&main_commit, &feature_commit, &ChangeFilter::default())
+        .await
+        .unwrap();
+    assert!(
+        change_set.changes.iter().any(|change| {
+            change.table_key == "node:Document"
+                && change.id == "doc"
+                && change.op == ChangeOp::Update
+        }),
+        "cross-branch diff dropped the Blob-only update: {:?}",
+        change_set.changes
+    );
+}
+
 #[tokio::test]
 async fn commit_changes_are_exact_ordered_and_bounded() {
     use omnigraph::changes::{ChangeEntityKind, ChangeFeedScope, ChangeOpKind};
