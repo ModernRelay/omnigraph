@@ -426,6 +426,62 @@ async fn branch_merge_updates_main_traversal() {
     assert_eq!(merged.num_rows(), 3);
 }
 
+/// A same-length Blob-only update on a branch must survive a three-way merge.
+/// Merge classifies changed-vs-unchanged rows from a display of the Blob
+/// descriptor, which is resolved by Lance relative to the owning fragment — so
+/// a one-byte A -> B update that moves the row to a new fragment with colliding
+/// local descriptor coordinates was misread as unchanged and its change was
+/// silently dropped at merge (data loss). The comparator must qualify managed
+/// descriptor identity with the owning fragment.
+#[tokio::test]
+async fn three_way_merge_detects_same_length_blob_only_update() {
+    const SCHEMA: &str = "node Document {\n    title: String @key\n    content: Blob?\n}";
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    main.load(
+        "main",
+        "{\"type\":\"Document\",\"data\":{\"title\":\"d1\",\"content\":\"base64:QQ==\"}}\n{\"type\":\"Document\",\"data\":{\"title\":\"d2\",\"content\":\"base64:QQ==\"}}",
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    main.branch_create("feature").await.unwrap();
+    let feature = Omnigraph::open(uri).await.unwrap();
+    // feature: d1 content A -> B (one byte, same length).
+    feature
+        .load(
+            "feature",
+            "{\"type\":\"Document\",\"data\":{\"title\":\"d1\",\"content\":\"base64:Qg==\"}}",
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    // main diverges on d2 so the merge is a genuine three-way, not fast-forward.
+    main.load(
+        "main",
+        "{\"type\":\"Document\",\"data\":{\"title\":\"d2\",\"content\":\"base64:Qg==\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    let merged_d1 = read_managed_blob_bytes(
+        &main,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "d1", "content"),
+    )
+    .await;
+    assert_eq!(
+        merged_d1, b"B",
+        "feature's same-length Blob-only update was dropped by the merge"
+    );
+}
+
 #[tokio::test]
 async fn branch_merge_with_blob_columns_preserves_blob_data() {
     let dir = tempfile::tempdir().unwrap();
