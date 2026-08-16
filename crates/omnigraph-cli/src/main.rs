@@ -599,30 +599,41 @@ async fn main() -> Result<()> {
                     types: &types,
                     ops: &ops,
                 };
-                // Stream into a sibling temp file and atomically replace
-                // --out only after the handshake completes, so a failed or
-                // interrupted capture never destroys the previous snapshot.
-                let partial = out.with_file_name(format!(
-                    "{}.partial",
-                    out.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "baseline".to_string())
-                ));
-                let mut writer = io::BufWriter::new(fs::File::create(&partial)?);
-                let baseline = match client
-                    .change_baseline(branch.as_deref(), &filter, &mut writer)
-                    .await
-                {
-                    Ok(baseline) => baseline,
-                    Err(error) => {
-                        drop(writer);
-                        let _ = fs::remove_file(&partial);
-                        return Err(error);
+                // Stream into a UNIQUE temp file in --out's directory and
+                // atomically replace --out only after the handshake completes
+                // AND the bytes are durable. NamedTempFile is created O_EXCL and
+                // removes itself on drop, so two concurrent captures cannot
+                // truncate each other's staging file, a failed capture never
+                // destroys the previous snapshot, and — with the fsync barrier
+                // below — a crash never exposes a resume cursor for a snapshot
+                // that is not durably on disk.
+                let out_dir = match out.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                    _ => std::path::PathBuf::from("."),
+                };
+                let mut temp = tempfile::NamedTempFile::new_in(&out_dir)?;
+                let baseline = {
+                    let mut writer = io::BufWriter::new(temp.as_file_mut());
+                    match client
+                        .change_baseline(branch.as_deref(), &filter, &mut writer)
+                        .await
+                    {
+                        Ok(baseline) => {
+                            writer.flush()?;
+                            baseline
+                        }
+                        // `temp` auto-removes on drop; --out is left untouched.
+                        Err(error) => return Err(error),
                     }
                 };
-                writer.flush()?;
-                drop(writer);
-                fs::rename(&partial, &out)?;
+                // Durability barrier BEFORE the resume cursor is printed: fsync
+                // the file, atomically persist it over --out, then fsync the
+                // parent directory so the rename itself survives a crash.
+                temp.as_file().sync_all()?;
+                temp.persist(&out).map_err(|error| error.error)?;
+                if let Ok(dir) = fs::File::open(&out_dir) {
+                    let _ = dir.sync_all();
+                }
                 if json {
                     print_json(&baseline)?;
                 } else {

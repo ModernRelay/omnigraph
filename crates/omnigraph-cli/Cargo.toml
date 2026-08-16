@@ -27,6 +27,7 @@ serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util"] }
 reqwest = { workspace = true, features = ["blocking", "stream"] }
 futures = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"

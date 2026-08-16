@@ -3160,11 +3160,13 @@ fn changes_baseline_failure_preserves_existing_out_file() {
         "previous good snapshot\n",
         "a failed baseline must not destroy the previous snapshot"
     );
+    // The uniquified staging file (NamedTempFile, `.tmp*`) must auto-remove on
+    // failure, as must any legacy `.partial`.
     let residue: Vec<String> = fs::read_dir(temp.path())
         .unwrap()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains("partial"))
+        .filter(|name| name.contains("partial") || name.starts_with(".tmp"))
         .collect();
-    assert!(residue.is_empty(), "no partial-file residue: {residue:?}");
+    assert!(residue.is_empty(), "no staging-file residue: {residue:?}");
 }
