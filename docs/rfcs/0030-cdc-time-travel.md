@@ -853,3 +853,25 @@ implementation, recorded here so later phases inherit them:
   manifest version history is a readability participant alongside table
   versions. Bringing internal tables into `cleanup` must account for this
   before reclaiming manifest versions.
+- **OPEN — §4.4 boundedness obligation is not discharged.** §4.4 requires the
+  ordering path to be provably bounded and to "not sort an unbounded graph
+  commit in memory." The shipped enumerator streams the *merge* and applies
+  page limits before building any delta-wide `Vec`, but it obtains its two
+  ordered inputs from Lance's `order_by` scan — and that scan, on pinned Lance
+  10.0.0, materializes the whole projected table in one single-partition
+  `SortExec` backed by an `UnboundedMemoryPool` with spill structurally
+  disabled (no public `Scanner` knob, no env override). So resident memory is
+  O(table projected width), embeddings included, not O(page). This is
+  pre-existing shared debt: branch merge (`OrderedTableCursor`), the legacy
+  commit diff, and export all use the identical scan shape, and it is the
+  mechanism behind the recorded `branch_merge` embedding OOM. Closing it needs
+  one of: an upstream ask to expose scanner spilling (the `FairSpillPool` +
+  `DiskManager` machinery already exists — Lance uses it for `merge_insert`);
+  an upstream index-ordered scan that elides the sort; or an OmniGraph-side
+  cursor-chunked ordered read (`id > after AND id <= bound` + `limit(k)`, which
+  DataFusion folds into a bounded TopK) that fits the feed's existing `after_id`
+  continuation but would need `changes_cost.rs`/`merge_cost.rs` re-measurement.
+  See [merge-complexity.md](../dev/merge-complexity.md) for the full source
+  citations. Until then, the practical bound is the 8,192-row / 32 MiB Mutation
+  ceiling on the *write* side; large historical tables can exceed the read-side
+  memory envelope.

@@ -139,9 +139,40 @@ normalizer. **O(Δ + B)**; emits exact chunk row counts for recovery pre-mint.
 Lance upstream (`scanner.rs`):
 
 - `order_by` docs: *“all data must be read before the first batch can be returned.”*
-- Plan inserts DataFusion **`SortExec`** → wall-clock **O(N log N)** sort work
-  and high memory/spill risk before any merge progress.
+- Plan inserts DataFusion **`SortExec`** with **no `fetch`** (`with_fetch` is set
+  only on the FTS/KNN TopK paths, not here) → wall-clock **O(N log N)** sort work
+  before any merge progress.
 - Unsorted scan would be O(N) I/O; the sort adds the log factor and TTFP delay.
+
+**The sort is unbounded-memory, and spill is structurally disabled on the scan
+path** (verified against the pinned Lance 10.0.0 source, not inferred):
+
+- `Scanner::try_into_stream` runs the plan through `execute_plan` with
+  `LanceExecutionOptions::default()`, whose `use_spilling` is `false`, and
+  exposes no public API or `Scanner` option to flip it.
+- Lance installs its `FairSpillPool` + `DiskManager` **only** when
+  `use_spilling` is true; otherwise the runtime gets DataFusion's
+  **`UnboundedMemoryPool`**. `LANCE_MEM_POOL_SIZE` / `LANCE_BYPASS_SPILLING`
+  are consulted only under spilling, so no env var changes this.
+- DataFusion's `ExternalSorter` spills only when a pool reservation *fails*; an
+  unbounded pool never fails one, so **every input batch accumulates in
+  `in_mem_batches`** and the whole ordered table is resident in one
+  single-partition `SortExec`. Lance enables spilling for `merge_insert` and
+  index training, **never for scans**.
+- A **BTREE on `id` does not help**: scalar indexes participate only in filter
+  planning, the optimizer has no sort-elision rule, and the BTREE exposes no
+  value-ordered enumeration API. The `id > after_id` continuation filter on the
+  change feed only prunes the scanned suffix — the sort is still O(remaining).
+
+So `KEYED_WRITE_MAX_ROWS` / `KEYED_WRITE_MAX_BYTES` bound *batch granularity
+downstream of the sort*, not the sort's resident set. Each ordered-by-id scan
+(merge cursors, the change enumerator, the commit diff, export) holds **O(table)
+projected width resident** — embeddings included (~12 KiB/row at 3072 dims ⇒
+~12 GiB at 1M rows). This is the mechanism behind the recorded `branch_merge`
+embedding OOM. Bounding it requires an upstream change (expose scanner spilling,
+or an index-ordered scan), or replacing `order_by` with cursor-chunked ordered
+reads that each sort only a bounded chunk. RFC-030 §14 tracks this as the open
+§4.4 boundedness obligation.
 
 `row_signature` (`merge.rs` ~1484) stringifies **every non-`_row*` column**,
 including **Vector embeddings**. Cost per row ≈ O(columns + serialized bytes).

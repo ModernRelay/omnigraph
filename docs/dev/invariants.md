@@ -365,7 +365,16 @@ them explicit.
   roadmap.
 - **Resource bounds:** some operations still lack enforced per-query memory or
   time budgets. New long-running work should add explicit bounds rather than
-  widening the gap.
+  widening the gap. A named instance: every ordered-by-id scan
+  (`ColumnOrdering::asc_nulls_last("id")` in branch merge, the change-feed
+  enumerator, the commit diff, and export) plans as a single-partition
+  DataFusion `SortExec` that, on pinned Lance 10.0.0, buffers the whole
+  projected table in an `UnboundedMemoryPool` with spill structurally disabled
+  — resident memory is O(table), embeddings included, and no `Scanner` knob or
+  env var bounds it. It is the mechanism behind the `branch_merge` embedding
+  OOM. Bounding it needs an upstream scanner-spilling option, an index-ordered
+  scan, or an OmniGraph-side cursor-chunked ordered read. See
+  [merge-complexity.md](merge-complexity.md) and RFC-030 §14.
 - **Branch-merge manifest history amplification:** coordinator open/full-refresh
   now derives manifest state and graph lineage together from one coherent scan,
   and branch merge retains the exact source/target manifest `Dataset` probe
