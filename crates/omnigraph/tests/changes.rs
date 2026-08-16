@@ -878,6 +878,110 @@ async fn diff_commits_ignores_row_version_only_differences() {
     );
 }
 
+/// The cross-branch diff must distinguish an empty string from null. The legacy
+/// display-string signature rendered both as `""` and missed the update; the
+/// typed comparator sees the validity-bit difference. This is the same
+/// conflation that silently drops a `""`↔null change on the merge path.
+#[tokio::test]
+async fn cross_branch_diff_detects_empty_string_to_null_update() {
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    body: String?\n}";
+    const SET_BODY: &str = r#"
+query set_body($slug: String, $body: String) {
+    update Doc set { body: $body } where slug = $slug
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    // body omitted → null on main.
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Doc","data":{"slug":"x"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let main_commit = head_commit_id(uri, None).await;
+
+    db.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    // Set body to the empty string on feature: null → "".
+    mutate_branch(
+        &mut feature,
+        "feature",
+        SET_BODY,
+        "set_body",
+        &mixed_params(&[("$slug", "x"), ("$body", "")], &[]),
+    )
+    .await
+    .unwrap();
+    let feature_commit = head_commit_id(uri, Some("feature")).await;
+
+    let change_set = db
+        .diff_commits(&main_commit, &feature_commit, &ChangeFilter::default())
+        .await
+        .unwrap();
+
+    assert!(
+        change_set.changes.iter().any(|change| {
+            change.table_key == "node:Doc" && change.id == "x" && change.op == ChangeOp::Update
+        }),
+        "null → empty-string must surface as an update, not be conflated: {:?}",
+        change_set.changes
+    );
+}
+
+/// A legal user property whose name begins with `_row_` (only the five exact
+/// Lance virtual columns are reserved) must participate in change detection.
+/// The legacy signature skipped every `_row_`-prefixed column and hid the
+/// update; the typed comparator skips only the reserved five.
+#[tokio::test]
+async fn cross_branch_diff_detects_underscore_prefixed_property_update() {
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    _row_notes: String?\n}";
+    const SET_NOTES: &str = r#"
+query set_notes($slug: String, $notes: String) {
+    update Doc set { _row_notes: $notes } where slug = $slug
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Doc","data":{"slug":"x","_row_notes":"before"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let main_commit = head_commit_id(uri, None).await;
+
+    db.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        SET_NOTES,
+        "set_notes",
+        &mixed_params(&[("$slug", "x"), ("$notes", "after")], &[]),
+    )
+    .await
+    .unwrap();
+    let feature_commit = head_commit_id(uri, Some("feature")).await;
+
+    let change_set = db
+        .diff_commits(&main_commit, &feature_commit, &ChangeFilter::default())
+        .await
+        .unwrap();
+
+    assert!(
+        change_set.changes.iter().any(|change| {
+            change.table_key == "node:Doc" && change.id == "x" && change.op == ChangeOp::Update
+        }),
+        "a change to a legal _row_-prefixed property must be detected: {:?}",
+        change_set.changes
+    );
+}
+
 // ─── Per-commit entity change pages ────────────────────────────────────────
 
 fn properties(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
