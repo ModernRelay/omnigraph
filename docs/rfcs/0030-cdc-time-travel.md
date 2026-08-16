@@ -818,7 +818,20 @@ implementation, recorded here so later phases inherit them:
   page token also binds the filter digest. The feed cursor binds the hashed
   graph identity domain, the first-parent genesis, `changes/forward`, the
   branch name plus its Lance-native incarnation witness (main uses a fixed
-  witness), the filter digest, and the last complete commit.
+  witness), the filter digest, and the last complete commit. In-commit
+  continuation positions are keyed by the PUBLISHED opaque type identity —
+  the same key that orders emission — so a token's decodable payload carries
+  no numeric table or incarnation component (the appended SHA-256 is
+  integrity, not encryption), honoring §4.4's payload exclusion literally.
+- **Continuations bind position, not page bounds.** §5.1 lists "enforced
+  bounds" among a page token's bindings; v1 deliberately deviates: tokens
+  bind identity, scope, and position, while row limits stay per-request
+  (server-clamped) and byte ceilings stay server-owned. Replaying one token
+  is therefore position-stable — the continuation resumes at exactly the same
+  event — but not page-size-stable. Binding bounds would reject legitimate
+  client reconfiguration (a smaller limit on retry after a timeout, an SDK
+  default change) without any correctness gain, since resume position is
+  limit-independent.
 - **Feed stop rules:** a mid-block page carries only a page token and its
   block rides partially with its cause; a boundary page carries the cursor
   plus a `caught_up` flag; an unreadable or boundary-refused commit surfaces
