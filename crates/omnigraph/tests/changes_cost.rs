@@ -273,6 +273,81 @@ async fn change_feed_caught_up_poll_is_data_flat() {
     .await;
 }
 
+/// A caught-up poll of the branch the handle is bound to must reuse the warm
+/// coordinator: no cold manifest open, no lineage re-fold. Swept over
+/// COMMIT-HISTORY DEPTH (not rows), its `__manifest` reads must stay flat —
+/// otherwise every poll pays an O(total history) fold, and a long-lived feed
+/// consumer gets more expensive forever. The prior caught-up test swept rows and
+/// deliberately left the manifest term un-asserted; this pins the term the warm
+/// path exists to bound.
+#[tokio::test]
+async fn change_feed_caught_up_poll_manifest_reads_are_flat_in_history() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for depth in [5u64, 40] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Omnigraph::init(
+                dir.path().to_str().unwrap(),
+                "node Person {\n    name: String @key\n    age: I32?\n}\n",
+            )
+            .await
+            .unwrap();
+            // Build commit-history depth: one commit per load.
+            for i in 0..depth {
+                db.load_with_receipt(
+                    "main",
+                    &format!(r#"{{"type":"Person","data":{{"name":"p{i:05}","age":1}}}}"#),
+                    LoadMode::Merge,
+                )
+                .await
+                .unwrap();
+            }
+            let now = db
+                .poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+                    branch: None,
+                    position: ChangeFeedPosition::Start(ChangeFeedStart::Now),
+                    scope: ChangeFeedScope::default(),
+                    max_changes: None,
+                    max_bytes: None,
+                    max_commits: None,
+                })
+                .await
+                .unwrap();
+            let cursor = match now.continuation {
+                omnigraph::changes::ChangeFeedContinuation::AtBlockBoundary { cursor, .. } => {
+                    cursor
+                }
+                other => panic!("expected boundary, got {other:?}"),
+            };
+
+            let (page, io) = measure(db.poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+                branch: None,
+                position: ChangeFeedPosition::Cursor(cursor),
+                scope: ChangeFeedScope::default(),
+                max_changes: None,
+                max_bytes: None,
+                max_commits: None,
+            }))
+            .await;
+            assert!(page.unwrap().blocks.is_empty(), "the poll is caught up");
+            eprintln!(
+                "CAUGHT-UP depth={depth}: manifest_reads={} data_open_count={}",
+                io.manifest_reads, io.data_open_count,
+            );
+            curve.push((depth, io));
+        }
+        assert_flat(
+            &curve,
+            |io| io.manifest_reads,
+            2,
+            "caught-up poll manifest reads must not grow with commit history",
+        );
+    })
+    .await;
+}
+
 /// A backlog walk pays one manifest snapshot resolution per commit examined
 /// (plus one), and at most two data opens per effectful commit — both honest
 /// linear-in-backlog terms, pinned as growing with the backlog while the
