@@ -233,6 +233,13 @@ fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
             ));
         }
     }
+    // Name-order the signatures so `rows_equal`'s positional zip aligns by
+    // column NAME whenever the two sides' column sets match — the same
+    // order-insensitivity the schema gate's name-keyed fingerprint provides.
+    // No supported writer reorders columns within one table lifetime, so this
+    // is defense in depth against a physical reorder surfacing as phantom
+    // whole-table updates.
+    blob_columns.sort_by(|left, right| left.0.cmp(right.0));
 
     let mut rows = VecDeque::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
