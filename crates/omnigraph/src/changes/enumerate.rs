@@ -21,7 +21,7 @@ use super::model::{
     COMMIT_CHANGES_MAX_BYTES, ChangeEntityKind, ChangeFeedScope, ChangeOpKind, EntityEndpoints,
     EntityImage, GraphEntityChange, GraphTypeRef, is_reserved_storage_system_column,
 };
-use super::row_compare::{OrderedRows, RawRow, rows_equal};
+use super::row_compare::{BlobComparisonScope, OrderedRows, RawRow, rows_equal};
 use super::token::{cursor_rejected, opaque_type_id};
 use super::{changed_table_intervals, parse_table_key};
 use crate::db::logical_row_image;
@@ -174,7 +174,17 @@ async fn next_emit(
             (Some(_), Some(_)) => {
                 let left = from.pop().await?.expect("peeked row present");
                 let right = to.pop().await?.expect("peeked row present");
-                if rows_equal(from.dataset(), &left, to.dataset(), &right).await? {
+                // Parent→child within one branch lifetime: managed descriptor
+                // identity is source-qualified and authoritative.
+                if rows_equal(
+                    from.dataset(),
+                    &left,
+                    to.dataset(),
+                    &right,
+                    BlobComparisonScope::SameLineage,
+                )
+                .await?
+                {
                     continue;
                 }
                 Emit::Update {

@@ -23,10 +23,42 @@ use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use lance_core::datatypes::BlobHandling;
 
 use super::model::{COMMIT_CHANGES_MAX_BYTES, is_reserved_storage_system_column};
-use crate::blob::BlobDescriptorDecoder;
+use crate::blob::{BlobDescriptor, BlobDescriptorDecoder};
 use crate::db::export_blob_values;
 use crate::error::{OmniError, Result};
 use crate::table_store::TableStore;
+
+/// Whether the two rows being compared belong to one table lifetime on one
+/// branch, or to two different branch lifetimes. This changes only how managed
+/// Blob descriptor identity is trusted (see [`rows_equal`]); every other column
+/// compares identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlobComparisonScope {
+    /// Both rows are the same table lifetime on one branch — the per-commit
+    /// parent→child enumerator, or a same-lineage net diff. A managed
+    /// descriptor's identity is authoritative here: an equal identity implies
+    /// equal immutable bytes (the owning fragment is source-qualified), so
+    /// payload I/O is paid only on a descriptor difference (compaction/relocation).
+    SameLineage,
+    /// The two rows are different branch lifetimes — a cross-branch net diff. A
+    /// managed descriptor's fragment id is branch-local, so an equal identity
+    /// across branches does NOT imply equal bytes (two branches can relocate a
+    /// row to the same next fragment id with colliding local coordinates). Every
+    /// managed column is byte-compared regardless of descriptor identity.
+    CrossBranch,
+}
+
+/// One Blob column's comparison signature: its source-qualified physical
+/// identity plus whether it is a managed (inline/packed/dedicated) descriptor.
+/// External and null identities are source-independent and fully encode the
+/// logical value, so a difference is authoritative; managed identity is
+/// file-relative and only conditionally authoritative (see [`BlobComparisonScope`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlobColumnSig {
+    name: String,
+    identity: String,
+    managed: bool,
+}
 
 /// Ordered-scan batch shape, matching the other production ordered-by-id
 /// scans (branch merge, export): row estimate plus byte target, never strict.
@@ -42,11 +74,11 @@ const CHANGE_SCAN_TARGET_ROWS: usize = 8_192;
 pub(crate) struct RawRow {
     pub(crate) id: String,
     pub(crate) slice: RecordBatch,
-    /// `(column, source-qualified physical identity)` per Blob column, in
-    /// schema order. Managed identities carry the owning fragment (Blob
-    /// descriptor fields are file-relative), so equal identities on one table
-    /// lifetime imply equal payloads and inequality forces a payload compare.
-    blob_signatures: Vec<(String, String)>,
+    /// One [`BlobColumnSig`] per Blob column, in schema (name) order. Managed
+    /// identities carry the owning fragment (Blob descriptor fields are
+    /// file-relative); the kind flag lets [`rows_equal`] decide when an equal
+    /// identity is authoritative and when a payload byte-compare is required.
+    blob_signatures: Vec<BlobColumnSig>,
 }
 
 /// An `id`-ordered stream of one table snapshot's rows, filled lazily one Lance
@@ -196,10 +228,11 @@ fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
         if let Some(row_addresses) = row_addresses {
             let fragment_id = (row_addresses.value(row) >> 32) as u32;
             for (name, decoder) in &blob_columns {
-                blob_signatures.push((
-                    name.to_string(),
-                    decoder.physical_identity(row, fragment_id)?,
-                ));
+                blob_signatures.push(BlobColumnSig {
+                    name: name.to_string(),
+                    identity: decoder.physical_identity(row, fragment_id)?,
+                    managed: matches!(decoder.classify(row)?, BlobDescriptor::Managed { .. }),
+                });
             }
         }
         rows.push_back(RawRow {
@@ -211,14 +244,24 @@ fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
     Ok(rows)
 }
 
-/// Typed structural row equality with an exact Blob payload tie-break.
+/// Typed structural row equality with an exact managed-Blob payload tie-break.
 ///
 /// Non-Blob user columns compare by Arrow logical equality on the two one-row
 /// slices — typed, offset-aware, validity-aware, so null, `""`, and `[]` stay
-/// distinct and no display-string join can conflate values. Blob columns
-/// compare by physical descriptor identity first; only a descriptor tie —
-/// equal scalars, relocated descriptor — pays payload I/O, because compaction
-/// relocates identical bytes and must not surface as a phantom update.
+/// distinct and no display-string join can conflate values.
+///
+/// Blob columns compare per descriptor kind:
+/// - **External / null**: the physical identity is source-independent and fully
+///   encodes the logical value (`uri`/`offset`/`length`, or null), so a
+///   difference is authoritative — no payload I/O, and a same-URI range change
+///   is never conflated by a bare-URI value compare. *(Ranged externals are not
+///   yet writable through a supported path, so this branch is defense in depth.)*
+/// - **Managed**: descriptor fields are file-relative. Within one lifetime
+///   ([`BlobComparisonScope::SameLineage`]) an equal source-qualified identity
+///   implies equal bytes, so payload I/O is paid only on a descriptor
+///   difference (relocation). Across branches
+///   ([`BlobComparisonScope::CrossBranch`]) the fragment id is branch-local, so
+///   the descriptor is not authoritative and every managed column is byte-compared.
 ///
 /// The two slices are required to share one user schema (both diff surfaces
 /// gate on a schema fingerprint before comparison), so a missing column is an
@@ -228,11 +271,12 @@ pub(crate) async fn rows_equal(
     left: &RawRow,
     to_dataset: &Dataset,
     right: &RawRow,
+    scope: BlobComparisonScope,
 ) -> Result<bool> {
     let blob_columns: HashSet<&str> = left
         .blob_signatures
         .iter()
-        .map(|(name, _)| name.as_str())
+        .map(|sig| sig.name.as_str())
         .collect();
     for (field, column) in left
         .slice
@@ -255,29 +299,48 @@ pub(crate) async fn rows_equal(
         }
     }
 
-    if left.blob_signatures == right.blob_signatures {
-        return Ok(true);
-    }
-    let column_sets_match = left.blob_signatures.len() == right.blob_signatures.len()
-        && left
+    // The two sides must agree on the Blob column set (name order); a shape
+    // mismatch means the logical image necessarily changed shape.
+    if left.blob_signatures.len() != right.blob_signatures.len()
+        || left
             .blob_signatures
             .iter()
             .zip(&right.blob_signatures)
-            .all(|(l, r)| l.0 == r.0);
-    if !column_sets_match {
-        // The two pinned versions disagree on the Blob column set, so the
-        // logical image necessarily changed shape.
+            .any(|(l, r)| l.name != r.name)
+    {
         return Ok(false);
     }
-    let differing: HashSet<String> = left
-        .blob_signatures
-        .iter()
-        .zip(&right.blob_signatures)
-        .filter(|(l, r)| l.1 != r.1)
-        .map(|(l, _)| l.0.clone())
-        .collect();
-    let left_values = blob_values_for(from_dataset, &left.slice, &differing).await?;
-    let right_values = blob_values_for(to_dataset, &right.slice, &differing).await?;
+
+    // Classify each Blob column. Only managed columns whose bytes cannot be
+    // decided by descriptor identity alone reach the payload tie-break.
+    let mut managed_to_bytecheck: HashSet<String> = HashSet::new();
+    for (l, r) in left.blob_signatures.iter().zip(&right.blob_signatures) {
+        if l.managed && r.managed {
+            match scope {
+                // Branch-local fragment id: an equal identity does not prove
+                // equal bytes across branches, so always byte-compare.
+                BlobComparisonScope::CrossBranch => {
+                    managed_to_bytecheck.insert(l.name.clone());
+                }
+                // Source-qualified identity is authoritative within one
+                // lifetime; a difference is a relocation that needs the tie-break.
+                BlobComparisonScope::SameLineage => {
+                    if l.identity != r.identity {
+                        managed_to_bytecheck.insert(l.name.clone());
+                    }
+                }
+            }
+        } else if l.identity != r.identity {
+            // At least one side is external or null: identity is authoritative
+            // and source-independent, so a difference is a real change.
+            return Ok(false);
+        }
+    }
+    if managed_to_bytecheck.is_empty() {
+        return Ok(true);
+    }
+    let left_values = blob_values_for(from_dataset, &left.slice, &managed_to_bytecheck).await?;
+    let right_values = blob_values_for(to_dataset, &right.slice, &managed_to_bytecheck).await?;
     Ok(left_values == right_values)
 }
 
