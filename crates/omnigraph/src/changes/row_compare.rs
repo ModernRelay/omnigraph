@@ -24,9 +24,37 @@ use lance_core::datatypes::BlobHandling;
 
 use super::model::{COMMIT_CHANGES_MAX_BYTES, is_reserved_storage_system_column};
 use crate::blob::{BlobDescriptor, BlobDescriptorDecoder};
-use crate::db::export_blob_values;
+use crate::db::{STABLE_PROPERTY_ID_METADATA_KEY, export_blob_values};
 use crate::error::{OmniError, Result};
 use crate::table_store::TableStore;
+
+/// Fingerprint of one table's user-visible schema for the schema-compatibility
+/// proof both change surfaces rely on: per field, its Arrow type, nullability,
+/// stable property identity marker, and whether it is a Blob. Name-keyed map
+/// comparison is order-insensitive, so a physical column reorder is not a false
+/// boundary. Shared by the per-commit enumerator (parent→child gate) and the
+/// cross-branch net diff so the two cannot drift.
+pub(crate) fn user_schema_fingerprint(
+    dataset: &Dataset,
+) -> HashMap<String, (String, bool, Option<String>, bool)> {
+    dataset
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| !is_reserved_storage_system_column(&field.name))
+        .map(|field| {
+            (
+                field.name.clone(),
+                (
+                    format!("{:?}", field.data_type()),
+                    field.nullable,
+                    field.metadata.get(STABLE_PROPERTY_ID_METADATA_KEY).cloned(),
+                    field.is_blob(),
+                ),
+            )
+        })
+        .collect()
+}
 
 /// Whether the two rows being compared belong to one table lifetime on one
 /// branch, or to two different branch lifetimes. This changes only how managed

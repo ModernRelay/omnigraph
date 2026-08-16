@@ -17,10 +17,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 
-use self::row_compare::{BlobComparisonScope, OrderedRows, RawRow, rows_equal};
+use self::row_compare::{
+    BlobComparisonScope, OrderedRows, RawRow, rows_equal, user_schema_fingerprint,
+};
 use crate::db::SubTableEntry;
 use crate::db::manifest::{Snapshot, TableIdentity};
-use crate::error::Result;
+use crate::error::{OmniError, Result};
 use crate::storage_layer::{SnapshotHandle, TableStorage};
 use crate::table_store::TableStore;
 
@@ -186,6 +188,10 @@ pub(crate) async fn diff_snapshots(
     to: &Snapshot,
     filter: &ChangeFilter,
     branch: Option<String>,
+    // Graph-vocabulary identity of the `to` side, used only to name a
+    // cross-branch schema boundary. `None`/empty when the target is a raw
+    // snapshot with no resolved commit.
+    to_commit_id: Option<String>,
 ) -> Result<ChangeSet> {
     let mut changes = Vec::new();
 
@@ -223,7 +229,16 @@ pub(crate) async fn diff_snapshots(
             }
             // Cross-branch path: streaming ID-based diff
             (Some(from), Some(to)) => {
-                diff_table_cross_branch(table_store, from, to, is_edge, filter).await?
+                diff_table_cross_branch(
+                    table_store,
+                    from,
+                    to,
+                    is_edge,
+                    filter,
+                    type_name,
+                    to_commit_id.as_deref().unwrap_or_default(),
+                )
+                .await?
             }
             // Unreachable: `same_state` above already skipped absent-on-both-sides tables.
             (None, None) => continue,
@@ -364,6 +379,8 @@ async fn diff_table_cross_branch(
     to_entry: &SubTableEntry,
     is_edge: bool,
     filter: &ChangeFilter,
+    type_name: &str,
+    to_commit_id: &str,
 ) -> Result<Vec<EntityChange>> {
     // Stream both snapshots id-ordered and merge them, using the SAME typed
     // row-equality that the per-commit enumerator uses (`row_compare`). The
@@ -373,6 +390,23 @@ async fn diff_table_cross_branch(
     // them distinct and only skips the five reserved virtual columns.
     let from_dataset = table_store.open_at_entry(from_entry).await?;
     let to_dataset = table_store.open_at_entry(to_entry).await?;
+
+    // Schema-boundary gate, symmetric with the per-commit enumerator. The typed
+    // row equality below walks the left row's fields, so it is only sound when
+    // both sides share one user schema. Today no two branch lifetimes of one
+    // table can diverge in user schema (schema apply requires a graph with only
+    // main, so a branch cannot be evolved separately), which is why this gate
+    // does not fire on any supported operation. It is load-bearing for future
+    // branch-scoped schema evolution: it turns a divergent-schema pair into a
+    // loud typed refusal instead of a silently dropped update (extra column on
+    // the right) or a `manifest_internal` error (extra column on the left).
+    if user_schema_fingerprint(&from_dataset) != user_schema_fingerprint(&to_dataset) {
+        return Err(OmniError::ChangeSchemaBoundary {
+            graph_commit_id: to_commit_id.to_string(),
+            type_name: type_name.to_string(),
+        });
+    }
+
     let mut from = OrderedRows::open(from_dataset, None).await?;
     let mut to = OrderedRows::open(to_dataset, None).await?;
 

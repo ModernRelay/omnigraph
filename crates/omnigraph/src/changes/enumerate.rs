@@ -13,15 +13,15 @@
 //! `(entity kind: nodes first, opaque type identity, id, operation rank)`;
 //! the continuation key inside a page token names a position in that order.
 
-use std::collections::HashMap;
-
 use lance::Dataset;
 
 use super::model::{
     COMMIT_CHANGES_MAX_BYTES, ChangeEntityKind, ChangeFeedScope, ChangeOpKind, EntityEndpoints,
-    EntityImage, GraphEntityChange, GraphTypeRef, is_reserved_storage_system_column,
+    EntityImage, GraphEntityChange, GraphTypeRef,
 };
-use super::row_compare::{BlobComparisonScope, OrderedRows, RawRow, rows_equal};
+use super::row_compare::{
+    BlobComparisonScope, OrderedRows, RawRow, rows_equal, user_schema_fingerprint,
+};
 use super::token::{cursor_rejected, opaque_type_id};
 use super::{changed_table_intervals, parse_table_key};
 use crate::db::logical_row_image;
@@ -211,35 +211,6 @@ struct IntervalPlan {
     type_name: String,
     from_dataset: Dataset,
     to_dataset: Dataset,
-}
-
-/// Fingerprint of one user-visible field for the schema-compatibility proof:
-/// Arrow type, nullability, stable property identity marker, and whether the
-/// field is a Blob. Name-keyed map comparison is order-insensitive, so a
-/// physical column reorder is not a false boundary.
-fn user_schema_fingerprint(
-    dataset: &Dataset,
-) -> HashMap<String, (String, bool, Option<String>, bool)> {
-    dataset
-        .schema()
-        .fields
-        .iter()
-        .filter(|field| !is_reserved_storage_system_column(&field.name))
-        .map(|field| {
-            (
-                field.name.clone(),
-                (
-                    format!("{:?}", field.data_type()),
-                    field.nullable,
-                    field
-                        .metadata
-                        .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
-                        .cloned(),
-                    field.is_blob(),
-                ),
-            )
-        })
-        .collect()
 }
 
 fn schema_boundary(graph_commit_id: &str, table_key: &str) -> OmniError {

@@ -2174,6 +2174,7 @@ impl Omnigraph {
             &to_resolved.snapshot,
             filter,
             to_resolved.branch.clone().or(from_resolved.branch.clone()),
+            to_resolved.graph_commit_id.clone(),
         )
         .await
     }
@@ -2217,6 +2218,7 @@ impl Omnigraph {
             &to_snap.snapshot,
             filter,
             to_snap.branch.clone().or(from_snap.branch.clone()),
+            to_snap.graph_commit_id.clone(),
         )
         .await
     }
