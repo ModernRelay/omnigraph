@@ -805,11 +805,14 @@ durable_calls! {
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    // Commit-change enumeration: pinned parent/child handles for typed row
-    // comparison, lazy image materialization, and descriptor-tie payload
-    // reads. Read-only by construction — the enumerator stages no transaction
-    // and publishes nothing.
-    ("changes/enumerate.rs", ".dataset()", 6, WriteProtocol::ReadOnlyAccess),
+    // Commit-change enumeration: pinned parent/child handles for the ordered
+    // merge's typed row comparison. Read-only by construction — the enumerator
+    // stages no transaction and publishes nothing.
+    ("changes/enumerate.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    // Candidate-pruning emitter: pinned parent/child handles for the O(delta)
+    // candidate scan + parent before-image probe and the full-merge fallback.
+    // Read-only — it stages and publishes nothing.
+    ("changes/candidate_scan.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     // Net-diff cross-branch path: the same typed row comparison over two
     // pinned snapshot handles. Read-only — the diff stages and publishes
     // nothing.
