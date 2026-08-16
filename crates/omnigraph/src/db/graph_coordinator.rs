@@ -501,6 +501,10 @@ impl GraphCoordinator {
     /// branch-incarnation witness, its first-parent genesis, and the full
     /// commit projection — all from ONE branch-pinned coordinator open, so a
     /// concurrent commit cannot split the head from the chain it tops.
+    /// Capture a change-feed cut by COLD-opening the requested branch. Used
+    /// only when the requested branch differs from this handle's warm
+    /// coordinator; the common same-branch poll uses [`Self::build_change_feed_cut`]
+    /// on the already-warm coordinator (no manifest re-open or lineage re-fold).
     pub(crate) async fn capture_change_cut(
         &self,
         branch: Option<&str>,
@@ -524,16 +528,27 @@ impl GraphCoordinator {
                 .await?
             }
         };
-        let head = other.effective_graph_head().await?.ok_or_else(|| {
+        other.build_change_feed_cut().await
+    }
+
+    /// Build a change-feed cut from THIS coordinator's current state. When the
+    /// coordinator is the warm handle already bound to the polled branch, this
+    /// performs no cold manifest open and no lineage re-fold — `load_commits`
+    /// reads the in-memory projection and `branch_identifier` probes the held
+    /// manifest — so a caught-up poll's cost does not grow with commit history.
+    pub(crate) async fn build_change_feed_cut(
+        &self,
+    ) -> Result<crate::changes::feed::ChangeFeedCut> {
+        let head = self.effective_graph_head().await?.ok_or_else(|| {
             OmniError::manifest_internal("branch has no lineage head; genesis is always published")
         })?;
         // Main cannot be deleted/recreated, so a fixed witness suffices; a
         // named ref's Lance-native identifier changes on delete/recreate and
         // fences cursor ABA.
-        let witness = match other.current_branch() {
+        let witness = match self.current_branch() {
             None => crate::changes::token::hashed_identity("branch:main"),
             Some(_) => {
-                let identifier = other.branch_identifier().await?;
+                let identifier = self.branch_identifier().await?;
                 let encoded = serde_json::to_string(&identifier).map_err(|error| {
                     OmniError::manifest_internal(format!(
                         "failed to encode Lance branch identifier: {error}"
@@ -542,7 +557,7 @@ impl GraphCoordinator {
                 crate::changes::token::hashed_identity(&encoded)
             }
         };
-        let commits: std::collections::HashMap<String, GraphCommit> = other
+        let commits: std::collections::HashMap<String, GraphCommit> = self
             .load_commits()
             .await?
             .into_iter()
@@ -559,7 +574,7 @@ impl GraphCoordinator {
             }
         }
         Ok(crate::changes::feed::ChangeFeedCut {
-            branch: other.bound_branch.clone(),
+            branch: self.bound_branch.clone(),
             head,
             witness,
             genesis,

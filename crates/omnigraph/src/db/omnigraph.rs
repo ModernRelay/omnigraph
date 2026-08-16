@@ -2359,12 +2359,42 @@ impl Omnigraph {
             .as_deref()
             .filter(|branch| *branch != "main")
             .map(str::to_string);
-        let cut = self
-            .coordinator
-            .read()
-            .await
-            .capture_change_cut(branch.as_deref())
-            .await?;
+        // Warm same-branch capture, mirroring `resolve_target_inner`: a poll of
+        // the branch this handle is already bound to reuses the warm coordinator
+        // (no cold manifest open, no lineage re-fold), so a caught-up poll's cost
+        // does not grow with commit history. A different branch, or a stale
+        // probe, falls back to the cold open / write-lock refresh.
+        let requested = branch.as_deref();
+        let cut = {
+            let coord = self.coordinator.read().await;
+            if requested == coord.current_branch() {
+                let held = coord.manifest_incarnation();
+                if coord.probe_latest_incarnation().await?.matches(&held) {
+                    coord.build_change_feed_cut().await?
+                } else {
+                    drop(coord);
+                    let mut coord = self.coordinator.write().await;
+                    if requested == coord.current_branch() {
+                        let held = coord.manifest_incarnation();
+                        let mut refreshed = false;
+                        if !coord.probe_latest_incarnation().await?.matches(&held) {
+                            coord.refresh_for_live_read().await?;
+                            refreshed = true;
+                        }
+                        let cut = coord.build_change_feed_cut().await?;
+                        drop(coord);
+                        if refreshed {
+                            self.invalidate_read_caches().await;
+                        }
+                        cut
+                    } else {
+                        coord.capture_change_cut(requested).await?
+                    }
+                }
+            } else {
+                coord.capture_change_cut(requested).await?
+            }
+        };
         // The cut is captured; every per-commit snapshot reopen inside `poll`
         // happens after this and lock-free. Tests delete/recreate the polled
         // branch here to prove `commit_snapshot`'s incarnation re-prove fails
