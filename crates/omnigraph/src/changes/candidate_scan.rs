@@ -48,9 +48,9 @@ pub(crate) fn operation_is_row_set_preserving(operation: &Operation) -> bool {
         Operation::Append { .. } => true,
         // OmniGraph's keyed writes (strict-insert / upsert / known-present
         // update) are all `RewriteRows` merge_insert and never delete an
-        // unmatched-by-source row — `WhenNotMatchedBySource::Delete` is absent
-        // from the codebase (locked by the write-path guard test). A different
-        // update mode is a foreign or unknown shape, so fall back.
+        // unmatched-by-source row — no delete-capable by-source merge arm exists
+        // in the engine (locked by the write-path guard in forbidden_apis.rs). A
+        // different update mode is a foreign or unknown shape, so fall back.
         Operation::Update { update_mode, .. } => update_mode == &Some(UpdateMode::RewriteRows),
         // Everything that can remove, reuse, or re-stamp rows falls back to the
         // exact ordered merge. Listed explicitly so a new variant fails to
