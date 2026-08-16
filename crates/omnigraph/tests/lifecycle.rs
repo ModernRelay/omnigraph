@@ -614,7 +614,7 @@ async fn snapshot_version_is_pinned() {
 /// graph must NOT modify or destroy the existing graph's schema
 /// artifacts. Today's behavior is destructive either way — the
 /// `write_text(_schema.pg, ...)` call at the top of
-/// `init_storage_phase` overwrites the existing file before any
+/// `init_commit_phase` overwrites the existing file before any
 /// preflight, and `best_effort_cleanup_init_artifacts` will later
 /// delete all three files if the inner `GraphCoordinator::init`
 /// fails. Both outcomes corrupt an existing graph.

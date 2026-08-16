@@ -3,6 +3,7 @@
 | Name | Value | Area |
 |---|---|---|
 | `MANIFEST_DIR` | `__manifest` | manifest layout |
+| Init ownership object | `__init_claim.json` | transient create-if-absent ownership for strict/force init; absent after normal success, retained on indeterminate physical creation or cleanup |
 | Commit graph dirs (retired) | `_graph_commits.lance` / `_graph_commit_actors.lance` | retired in Phase B; lineage lives in `__manifest` (`graph_commit` / `graph_head` rows) since RFC-013 Phase 7. A graph this binary creates has neither. |
 | Recovery audit dir | `_graph_commit_recoveries.lance` | internal exact record of completed crash-recovery actions; no public CLI query yet |
 | BranchMerge logical data-transaction ceiling | `MAX_BRANCH_MERGE_DATA_TRANSACTIONS = 1024` | maximum strict-insert/upsert/delete transactions one table may arm in a `protocol_v4` chain; a larger plan fails before sidecar arm |

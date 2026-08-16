@@ -72,6 +72,7 @@ flowchart TB
     edges["edges/{stable-id}-{incarnation}/<br/>one dataset per edge-table lifetime"]:::l2
     cgraph["_graph_commit_recoveries.lance/<br/>crash-recovery audit log"]:::l2
     recovery["__recovery/{ulid}.json<br/>recovery sidecars (transient)"]:::l2
+    initclaim["__init_claim.json<br/>init ownership (transient)"]:::l2
     refs["_refs/branches/{name}.json<br/>graph-level branches"]:::l2
 
     graph --> manifest
@@ -79,6 +80,7 @@ flowchart TB
     graph --> edges
     graph --> cgraph
     graph --> recovery
+    graph --> initclaim
     graph --> refs
 
     subgraph dataset[Inside each Lance dataset — L1]
@@ -102,6 +104,7 @@ flowchart TB
 - The graph commit DAG lives in **`__manifest`** as `graph_commit` / `graph_head` rows written in the publish CAS (RFC-013 Phase 7). The former `_graph_commits.lance` / `_graph_commit_actors.lance` lineage tables are retired — a graph this binary creates has neither.
 - **`_graph_commit_recoveries.lance`** — one internal row per completed crash-recovery action, including its exact per-table outcomes and the original actor. It joins by `graph_commit_id` to the graph commit lineage in `__manifest`. An exact v9 writer roll-forward keeps the interrupted writer's original actor; rollback and legacy recovery commits use `omnigraph:recovery`. The CLI does not currently expose this internal table.
 - **`__recovery/{ulid}.json`** — transient sidecar files written by a writer before it advances the underlying dataset, deleted once the matching manifest publish succeeds. A sidecar persisting after process exit means the writer crashed mid-commit; the next read-write open processes it. Steady-state directory is empty.
+- **`__init_claim.json`** — transient create-if-absent ownership for one graph initialization attempt. It is absent after a normal init. An indeterminate physical Create or interrupted cleanup retains it so another strict or force initializer cannot overwrite uncertain state; remove stale residue only after every initializer for the root is quiesced and the root has been inspected.
 - **`_refs/branches/{name}.json`** is graph-level branch metadata — pointers from a branch name to the manifest version it heads.
 - **Inside each Lance dataset** (orange): the standard Lance directory layout. `_versions/{n}.manifest` records every commit; `data/` holds the actual Arrow fragments; `_indices/{uuid}/` holds index segments with their own `fragment_bitmap` for partial coverage; `_refs/` holds Lance-native per-dataset branches and tags.
 
@@ -117,9 +120,9 @@ The split — L2 owns the cross-dataset catalog; L1 owns the per-dataset interna
 
 ### Local filesystem requirement: hard links
 
-The local backend publishes every atomic create-if-absent write — the
-`_schema.pg` ownership claim at `init` and each Lance manifest commit, i.e.
-every graph write — via `hard_link(2)`. Filesystems that refuse hard links
+The local backend publishes every atomic create-if-absent write — the root
+`__init_claim.json`, strict init's additional `_schema.pg` defense, and each
+Lance manifest commit, i.e. every graph write — via `hard_link(2)`. Filesystems that refuse hard links
 (Android app-private storage, FAT/exFAT, some network and FUSE mounts) cannot
 hold a writable local graph. `init` and read-write opens probe the graph
 root's filesystem and fail up front with an error naming this requirement,

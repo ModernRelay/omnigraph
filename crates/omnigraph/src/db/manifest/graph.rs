@@ -13,7 +13,7 @@ use crate::error::{OmniError, Result};
 
 use super::layout::{manifest_uri, open_manifest_dataset_with_session};
 use super::metadata::TableVersionMetadata;
-use super::migrations::current_stamp_entry;
+use super::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, current_stamp_entry, guard_stamp};
 use super::state::{
     GraphLineageRow, ManifestState, SubTableEntry, entries_to_batch, graph_lineage_row_parts,
     manifest_schema, read_manifest_state, read_manifest_state_and_lineage,
@@ -27,27 +27,86 @@ use super::{TableIdentity, table_path_for_identity};
 /// internal-schema stamp all ride it), genesis IS the live version at init.
 const GENESIS_MANIFEST_VERSION: u64 = 1;
 
+/// Exact, attempt-local receipt embedded in a fresh graph's atomic manifest
+/// birth.  The random commit id distinguishes this initialization attempt from
+/// another valid v1 manifest whose deterministic table identities happen to
+/// have the same numeric values.
+#[derive(Debug, Clone)]
+pub(crate) struct GenesisManifestAttempt {
+    lineage: GraphLineageRow,
+}
+
+impl GenesisManifestAttempt {
+    /// Mint the receipt before invoking the manifest Create operation so the
+    /// caller retains enough information to classify a lost acknowledgement.
+    pub(crate) fn mint() -> Result<Self> {
+        Ok(Self {
+            lineage: GraphLineageRow {
+                graph_commit_id: ulid::Ulid::new().to_string(),
+                manifest_branch: None,
+                manifest_version: GENESIS_MANIFEST_VERSION,
+                parent_commit_id: None,
+                merged_parent_commit_id: None,
+                actor_id: None,
+                created_at: crate::db::now_micros()?,
+            },
+        })
+    }
+
+    fn lineage(&self) -> &GraphLineageRow {
+        &self.lineage
+    }
+}
+
+/// Internal phase distinction for graph initialization.  Once the manifest
+/// Create call has been invoked, any returned error is acknowledgement-unknown:
+/// the immutable v1 manifest may already be durable and must be probed before
+/// any schema cleanup is considered.
+#[derive(Debug)]
+pub(crate) enum ManifestInitError {
+    BeforeManifestCreate(OmniError),
+    ManifestCreateOutcomeUnknown(OmniError),
+}
+
+impl ManifestInitError {
+    pub(crate) fn into_source(self) -> OmniError {
+        match self {
+            Self::BeforeManifestCreate(source) | Self::ManifestCreateOutcomeUnknown(source) => {
+                source
+            }
+        }
+    }
+}
+
+impl From<OmniError> for ManifestInitError {
+    fn from(source: OmniError) -> Self {
+        Self::BeforeManifestCreate(source)
+    }
+}
+
+impl From<ManifestInitError> for OmniError {
+    fn from(error: ManifestInitError) -> Self {
+        error.into_source()
+    }
+}
+
+/// Assembles the initial entries, genesis lineage, and internal-schema stamp,
+/// and lands them all in the one `__manifest` Create commit. A returned error
+/// from the Create call is acknowledgement-unknown; reading the state back is
+/// `load_initial_manifest_state`, on the confirmed post-commit side.
 pub(super) async fn init_manifest_graph(
     root_uri: &str,
     catalog: &Catalog,
     control_session: &Arc<lance::session::Session>,
-) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
+    attempt: &GenesisManifestAttempt,
+) -> std::result::Result<Dataset, ManifestInitError> {
     let root = root_uri.trim_end_matches('/');
     let (entries, version_metadata) = build_initial_entries(root, catalog, control_session).await?;
 
-    // Genesis graph commit: parentless, actorless, minted once and folded into
-    // the init write so `__manifest` is the single source of graph lineage from
-    // version one (no `_graph_commits.lance` row, no separate publish).
-    let genesis = GraphLineageRow {
-        graph_commit_id: ulid::Ulid::new().to_string(),
-        manifest_branch: None,
-        manifest_version: GENESIS_MANIFEST_VERSION,
-        parent_commit_id: None,
-        merged_parent_commit_id: None,
-        actor_id: None,
-        created_at: crate::db::now_micros()?,
-    };
-    let genesis_lineage = graph_lineage_row_parts(&genesis, None)?;
+    // The caller pre-mints this exact parentless, actorless receipt and retains
+    // it across the Create call.  Both lineage rows ride the same immutable v1
+    // commit as every table entry and the internal-schema stamp.
+    let genesis_lineage = graph_lineage_row_parts(attempt.lineage(), None)?;
 
     let manifest_batch = entries_to_batch(&entries, &version_metadata, &genesis_lineage)?;
     // The internal-schema stamp rides the Create write's schema metadata, so
@@ -81,11 +140,102 @@ pub(super) async fn init_manifest_graph(
     let manifest_path = manifest_uri(root);
     let dataset = Dataset::write(reader, &manifest_path, Some(params))
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_POST_MANIFEST_CREATE)?;
+        .map_err(|e| {
+            ManifestInitError::ManifestCreateOutcomeUnknown(OmniError::Lance(e.to_string()))
+        })?;
+    // Models the object-store shape where the immutable Create landed but its
+    // acknowledgement was lost before `Dataset::write` returned success to
+    // OmniGraph.  It deliberately sits inside the create half, before the
+    // caller can classify the returned Dataset as proof of commitment.
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_MANIFEST_CREATE_ACK_LOST)
+        .map_err(ManifestInitError::ManifestCreateOutcomeUnknown)?;
+    Ok(dataset)
+}
 
-    let (known_state, lineage_rows) = read_manifest_state_and_lineage(&dataset).await?;
+/// Reopen and authenticate the one immutable genesis manifest created by
+/// `attempt`.  This is the only positive classification of an ambiguous Create
+/// result; a merely valid v1 manifest from another initializer is not enough.
+pub(super) async fn open_exact_genesis_manifest(
+    root_uri: &str,
+    attempt: &GenesisManifestAttempt,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_MANIFEST_CREATE_PROBE)?;
+    let (dataset, known_state, lineage_rows) =
+        open_manifest_graph_with_lineage(root_uri, None, control_session).await?;
+
+    // `read_manifest_state_and_lineage` intentionally folds head rows into a
+    // branch-keyed map for normal reads.  Authentication needs the stronger
+    // raw-shape guarantee: two duplicate `graph_head:main` rows must not be
+    // mistaken for the one head row emitted by this Create attempt.
+    let mut head_scanner = dataset.scan();
+    head_scanner.filter_expr(
+        datafusion::prelude::col("object_type")
+            .eq(datafusion::prelude::lit(super::OBJECT_TYPE_GRAPH_HEAD)),
+    );
+    let graph_head_row_count = head_scanner
+        .count_rows()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+
+    let stamp = guard_stamp(&dataset)?;
+    if stamp != INTERNAL_MANIFEST_SCHEMA_VERSION {
+        return Err(genesis_probe_mismatch(
+            root_uri,
+            format!(
+                "internal-schema stamp is v{stamp}, expected v{INTERNAL_MANIFEST_SCHEMA_VERSION}"
+            ),
+        ));
+    }
+    if dataset.version().version != GENESIS_MANIFEST_VERSION
+        || known_state.version != GENESIS_MANIFEST_VERSION
+    {
+        return Err(genesis_probe_mismatch(
+            root_uri,
+            format!(
+                "manifest version is {}, expected {GENESIS_MANIFEST_VERSION}",
+                dataset.version().version
+            ),
+        ));
+    }
+    if lineage_rows.as_slice() != std::slice::from_ref(attempt.lineage()) {
+        return Err(genesis_probe_mismatch(
+            root_uri,
+            "genesis lineage does not match this initialization attempt",
+        ));
+    }
+    if graph_head_row_count != 1
+        || known_state.graph_heads.len() != 1
+        || known_state
+            .graph_heads
+            .get(super::MAIN_BRANCH_HEAD_KEY)
+            .map(String::as_str)
+            != Some(attempt.lineage().graph_commit_id.as_str())
+    {
+        return Err(genesis_probe_mismatch(
+            root_uri,
+            "main graph head does not match this initialization attempt",
+        ));
+    }
+
     Ok((dataset, known_state, lineage_rows))
+}
+
+fn genesis_probe_mismatch(root_uri: &str, detail: impl std::fmt::Display) -> OmniError {
+    OmniError::manifest_conflict(format!(
+        "__manifest at '{}' is not the exact genesis created by this initialization attempt: {detail}",
+        root_uri.trim_end_matches('/')
+    ))
+}
+
+/// Reads back the state the `__manifest` Create commit landed. The
+/// `init.post_manifest_create` failpoint fires as this function's first
+/// statement.
+pub(super) async fn load_initial_manifest_state(
+    dataset: &Dataset,
+) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_POST_MANIFEST_CREATE)?;
+    read_manifest_state_and_lineage(dataset).await
 }
 
 pub(super) async fn open_manifest_graph(
@@ -232,9 +382,11 @@ async fn create_empty_dataset(
         session: Some(Arc::clone(control_session)),
         ..Default::default()
     };
-    Dataset::write(reader, uri, Some(params))
+    let dataset = Dataset::write(reader, uri, Some(params))
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_TABLE_CREATE_ACK_LOST)?;
+    Ok(dataset)
 }
 
 fn keyed_graph_table_schema(schema: &SchemaRef) -> Result<SchemaRef> {

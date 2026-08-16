@@ -10,6 +10,15 @@
   - `ManifestConflictDetails::ExpectedVersionMismatch { table_key, expected, actual }` — caller's `expected_table_versions` did not match the manifest's current latest non-tombstoned version (set by `OmniError::manifest_expected_version_mismatch`).
   - `ManifestConflictDetails::ReadSetChanged { member, expected, actual }` — an RFC-022 prepared write's branch/head/table authority changed before physical effects. HTTP returns **409** with `read_set_conflict`. A retry must start from preparation; strict writes leave that choice to the caller.
   - `ManifestConflictDetails::RowLevelCasContention` — Lance row-level CAS rejected the publish because a concurrent writer landed the same `object_id`. Retried internally by the publisher; only surfaces if the retry budget exhausts.
+  - **Missing schema files on open**: after opening a readable `__manifest`,
+    `open` returns `NotFound` when `_schema.pg` is absent. This proves that the
+    manifest is readable, not that every referenced data table is present or
+    valid. Restore the matching `_schema.pg`, `_schema.ir.json`, and
+    `__schema_state.json` contract from a backup, or rebuild a fresh graph from
+    an existing export or backup. The damaged graph cannot be exported through
+    the normal API because it cannot open. A graph missing only
+    `_schema.ir.json` or `__schema_state.json` is refused by the schema-contract
+    validation that runs at open.
   - **D₂ parse-time rejection**: a single mutation query that mixes inserts/updates with deletes errors out *before any I/O* with kind `BadRequest`. Message: `mutation '<name>' on the same query mixes inserts/updates and deletes; split into separate mutations: (1) inserts and updates, then (2) deletes`. See [query-language.md](../queries/index.md) for the rule.
   - **Blob property-lifetime refusal**: `read_blob_at` returns `BadRequest` when
     the selected field's persisted `omnigraph.stable_property_id` belongs to a
@@ -130,8 +139,37 @@
   structured `blob_range { start, end, length }` details.
 - `Policy(String)` — a Cedar policy denied the action for the resolved actor.
   HTTP returns **403**.
-- `AlreadyInitialized { uri }` — `init` targeted a root that already holds a
-  graph. HTTP returns **409**.
+- `AlreadyInitialized { uri }` — strict `init` targeted a root that already
+  holds a graph or orphan schema metadata. `--force` may replace only orphan
+  schema files after proving no `__manifest` exists; it never overwrites an
+  initialized graph. HTTP returns **409**.
+- `InitializationCommitted { uri, source }` — the authoritative `__manifest`
+  Create commit completed, but a later read-back or validation step failed.
+  The schema artifacts are preserved and the original typed error is retained
+  in `source`. This outcome does **not** promise that an ordinary `open` will
+  succeed: inspect or try to open the graph, diagnose `source`, and do not
+  delete its schema files.
+- `InitializationIndeterminate { uri, source, probe }` — physical graph
+  initialization returned `source`, then the exact genesis probe failed with
+  `probe`. OmniGraph therefore cannot prove which table or manifest Creates
+  landed.
+  It preserves both the schema artifacts and `__init_claim.json`, so another
+  initializer cannot enter the uncertain root. Do not retry `init`, remove the
+  claim, or delete the root until the storage failure is resolved, every
+  initializer is quiesced, and the root is inspected.
+- `InitializationClaimed { uri }` — `__init_claim.json` already reserves this
+  root for another initialization attempt. That attempt may still be running,
+  or the claim may be residue from a stopped process. Quiesce every initializer
+  for the root before manually removing a stale claim and retrying `init`; use
+  `--force` only when orphan schema files remain. Never remove the claim while
+  another initializer may be live.
+- Init cleanup is best-effort and is attempted only for failures returned
+  before any physical graph initialization. It removes the schema-contract
+  artifacts owned by the attempt, not partially created Lance table
+  directories. If any schema delete has an indeterminate outcome, the init
+  claim is retained so a delayed delete cannot race a later initializer. A
+  confirmed manifest or indeterminate physical outcome is never cleaned
+  backward.
 - `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
 
 For RFC-023 Mutation/Load keyed writes, `KeyConflict` is returned only after
