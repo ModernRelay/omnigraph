@@ -846,13 +846,29 @@ whose cost is justified by C1.
 C0 through C3 shipped on the surveyed contract. Details frozen by the
 implementation, recorded here so later phases inherit them:
 
-- **v1 derivation is the exact ordered-merge authority path only.** No
-  row-version candidate pruning and no transaction-interval no-delete proof
-  shipped; both remain the sanctioned optimizations of §4.2/§4.3. The cost
-  instrument (`changes_cost.rs`) pins the O(table-extent) scan term as a
-  growing tripwire that the pruning slice must flip to a flat assertion, and
-  pins bounded per-page opens, Blob-lazy payload work, data-flat caught-up
-  polls, and the one-manifest-snapshot-per-commit backlog term.
+- **Candidate pruning shipped (§4.2/§4.3).** The exact ordered merge remains the
+  authority path, but a proven row-set-preserving interval is now derived in
+  O(delta) (`changes::candidate_scan`). Per changed interval the classifier reads
+  the interval's Lance transactions and requires every op to be `Append` or a
+  `RewriteRows` merge `Update` (an exhaustive, wildcard-free `Operation` match, so
+  a new Lance variant compile-errors into review). When proven, the child scan is
+  scoped by `Scanner::with_fragments` to exactly the fragments the parent lacks
+  (the manifest diff — no data reads to compute) with the
+  `_row_last_updated_at_version ∈ (begin, end]` window dropping carried-over rows,
+  and each candidate is classified against a batched `id IN (chunk)` BTREE probe
+  of the parent using the same typed `rows_equal`/`emitted_image`. A prunable
+  interval has zero logical deletes (one transaction per commit + the D2 rule +
+  no delete-capable merge arm — locked by a `forbidden_apis.rs` guard), so the
+  pruned path needs no delete pass; any unproven op (delete, overwrite, restore,
+  compaction, a branch/lineage change, a non-advancing or oversized interval, a
+  missing/cleaned transaction) falls back to the exact merge. The
+  `changes_cost.rs` tripwire is now `assert_flat` on the pruned path (data reads
+  do not grow with table extent at fixed Δ, with a reconciled `id` BTREE — the
+  production steady state) with a companion growing tripwire for the fallback;
+  bounded per-page opens, Blob-lazy payload work, data-flat caught-up polls, and
+  the one-manifest-snapshot-per-commit backlog term are still pinned. Deferred:
+  the inductive per-write row-set-preserving certificate (a write-path change,
+  needed only if a delete-capable merge arm is ever introduced).
 - **Typed structural equality** uses Arrow logical equality on one-row
   slices for non-Blob user columns and physical descriptor identity with an
   exact payload tie-break for Blob columns. Float comparison is bitwise.
