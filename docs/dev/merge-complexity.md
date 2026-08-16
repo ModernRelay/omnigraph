@@ -174,10 +174,19 @@ or an index-ordered scan), or replacing `order_by` with cursor-chunked ordered
 reads that each sort only a bounded chunk. RFC-030 §14 tracks this as the open
 §4.4 boundedness obligation.
 
-`row_signature` (`merge.rs` ~1484) stringifies **every non-`_row*` column**,
-including **Vector embeddings**. Cost per row ≈ O(columns + serialized bytes).
-On the three-way path this runs for **every** base/source/target row (eager).
-On adopt fallback it runs only for matched ids (lazy).
+`row_signature` (`merge.rs`) builds a faithful per-row change-detection token:
+it skips **only the five reserved Lance virtual columns** (a legal
+`_row_`-prefixed user property participates), distinguishes null from every
+rendered value including `""`, and length-prefixes each value so no value can
+spoof a column boundary. It still stringifies every user column including
+**Vector embeddings**, so cost per row ≈ O(columns + serialized bytes). On the
+three-way path this runs for **every** base/source/target row (eager); on the
+adopt fallback only for matched ids (lazy). (The former `starts_with("_row")`
+skip plus raw `\x1f` join conflated null with `""` and hid `_row_`-prefixed
+properties — merge silently dropped such changes. Full unification with the
+change feed's `changes::row_compare` comparator, which additionally compares
+Blob columns by descriptor identity, is a larger follow-up gated on the merge
+cursor's scan mode.)
 
 ### D. Validation — `validate_merge_candidates`
 

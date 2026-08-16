@@ -1748,18 +1748,38 @@ fn classify_merge_conflict(
     }
 }
 
+/// A faithful per-row change-detection signature.
+///
+/// Skips ONLY the five reserved Lance virtual columns — a legal
+/// `_row_`-prefixed user property still participates (the former
+/// `starts_with("_row")` hid such properties). Distinguishes null from every
+/// rendered value including `""` (the raw display string renders both as `""`,
+/// conflating a real null↔"" change into a no-op the merge silently dropped),
+/// and length-prefixes each value so no value can spoof a column boundary. Two
+/// rows on one table lifetime compare equal iff every user column matches by
+/// presence and rendered value. Ephemeral, internal to merge classification —
+/// never persisted, so the format is free to change.
+///
+/// Blob columns are still rendered via `array_value_to_string`, preserving
+/// today's behavior; full unification with `changes::row_compare` (which
+/// compares Blob columns by descriptor identity) is a larger follow-up gated on
+/// the merge cursor's scan mode.
 fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
-    let mut values = Vec::with_capacity(batch.num_columns());
+    use std::fmt::Write as _;
+    let mut signature = String::new();
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        if field.name().starts_with("_row") {
+        if crate::changes::model::is_reserved_storage_system_column(field.name()) {
             continue;
         }
-        values.push(
-            array_value_to_string(column.as_ref(), row)
-                .map_err(|e| OmniError::Lance(e.to_string()))?,
-        );
+        if column.is_null(row) {
+            signature.push_str("N;");
+            continue;
+        }
+        let value = array_value_to_string(column.as_ref(), row)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let _ = write!(signature, "V{}:{value};", value.len());
     }
-    Ok(values.join("\u{1f}"))
+    Ok(signature)
 }
 
 /// Operation-wide budget for the scalar delta retained by merge validation.
