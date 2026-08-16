@@ -316,9 +316,12 @@ pub(crate) async fn poll(
                 });
             }
             Ok(CommitEnumeration::Exhausted { required_bytes }) => {
-                if blocks.is_empty() && position.resume.is_none() {
-                    // A fresh poll could not admit even one change: the single
-                    // change exceeds the byte ceiling itself.
+                // Nothing was emitted for this commit. With no blocks on the
+                // page the budget is untouched — whether this is a fresh poll
+                // or a page-token resume, the single change exceeds the
+                // poll's own byte ceiling, so surface the typed limit now
+                // instead of deferring it behind an empty boundary page.
+                if blocks.is_empty() {
                     return Err(OmniError::resource_limit(
                         "commit_changes_page_bytes",
                         max_bytes,
