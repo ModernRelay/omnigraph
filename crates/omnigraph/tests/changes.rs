@@ -1168,6 +1168,69 @@ async fn cross_branch_diff_detects_same_length_blob_only_update() {
     );
 }
 
+/// Two sibling branches forked from the same base each apply a same-length
+/// Blob-only update to the same entity. On each branch the update relocates the
+/// row to the SAME next fragment id, so the two managed descriptors are
+/// byte-identical (`mgd:<frag>:0:0:<len>:0`) even though the payloads differ.
+/// Fragment ids are branch-local, so a cross-branch diff must byte-compare
+/// managed columns rather than trust equal descriptor identities — otherwise
+/// the update is silently dropped. (`cross_branch_diff_detects_same_length_..`
+/// above diffs main→feature, where the two fragment ids differ, so it does not
+/// exercise this collision.)
+#[tokio::test]
+async fn cross_branch_diff_detects_same_length_blob_update_between_sibling_branches() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    db.branch_create("branch-a").await.unwrap();
+    db.branch_create("branch-b").await.unwrap();
+
+    // "B" on branch-a and "C" on branch-b: both one byte, both relocate `doc`
+    // to the first forked fragment, so the two managed descriptors collide.
+    let a = Omnigraph::open(uri).await.unwrap();
+    a.load_with_receipt(
+        "branch-a",
+        r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let a_commit = head_commit_id(uri, Some("branch-a")).await;
+
+    let b = Omnigraph::open(uri).await.unwrap();
+    b.load_with_receipt(
+        "branch-b",
+        r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qw=="}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let b_commit = head_commit_id(uri, Some("branch-b")).await;
+
+    let change_set = db
+        .diff_commits(&a_commit, &b_commit, &ChangeFilter::default())
+        .await
+        .unwrap();
+    assert!(
+        change_set.changes.iter().any(|change| {
+            change.table_key == "node:Document"
+                && change.id == "doc"
+                && change.op == ChangeOp::Update
+        }),
+        "cross-branch diff dropped the sibling-branch Blob update (branch-local \
+         fragment-id collision): {:?}",
+        change_set.changes
+    );
+}
+
 #[tokio::test]
 async fn commit_changes_are_exact_ordered_and_bounded() {
     use omnigraph::changes::{ChangeEntityKind, ChangeFeedScope, ChangeOpKind};
