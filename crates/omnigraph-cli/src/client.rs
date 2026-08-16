@@ -1469,6 +1469,45 @@ fn validate_content_range(
     Ok(())
 }
 
+/// Shared spelling of the change-surface filters across the three verbs; one
+/// translation (`change_scope`) is used by the embedded arm and the server.
+pub(crate) struct ChangeFilterArgs<'a> {
+    pub kinds: &'a [ChangeEntityKind],
+    pub types: &'a [String],
+    pub ops: &'a [ChangeOpOutput],
+}
+
+impl ChangeFilterArgs<'_> {
+    fn query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = Vec::new();
+        for kind in self.kinds {
+            pairs.push(("kind", kind.as_str().to_string()));
+        }
+        for type_name in self.types {
+            pairs.push(("type", type_name.clone()));
+        }
+        for op in self.ops {
+            pairs.push(("op", op.as_str().to_string()));
+        }
+        pairs
+    }
+}
+
+/// The embedded arm's twin of the served start-mode parser.
+fn parse_change_feed_start(start: &str) -> Result<omnigraph::changes::ChangeFeedStart> {
+    match start {
+        "now" => Ok(omnigraph::changes::ChangeFeedStart::Now),
+        "beginning" => Ok(omnigraph::changes::ChangeFeedStart::Beginning),
+        other => other
+            .strip_prefix("after:")
+            .filter(|commit_id| !commit_id.is_empty())
+            .map(|commit_id| {
+                omnigraph::changes::ChangeFeedStart::AfterCommit(commit_id.to_string())
+            })
+            .ok_or_else(|| eyre!("start must be now | beginning | after:<commit_id>")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1507,44 +1546,5 @@ mod tests {
 
         let open = BlobRangeRequest::new(Some(97), None).unwrap().unwrap();
         validate_content_range(&content_range_headers("bytes 97-99/100"), open, 3).unwrap();
-    }
-}
-
-/// Shared spelling of the change-surface filters across the three verbs; one
-/// translation (`change_scope`) is used by the embedded arm and the server.
-pub(crate) struct ChangeFilterArgs<'a> {
-    pub kinds: &'a [ChangeEntityKind],
-    pub types: &'a [String],
-    pub ops: &'a [ChangeOpOutput],
-}
-
-impl ChangeFilterArgs<'_> {
-    fn query_pairs(&self) -> Vec<(&'static str, String)> {
-        let mut pairs = Vec::new();
-        for kind in self.kinds {
-            pairs.push(("kind", kind.as_str().to_string()));
-        }
-        for type_name in self.types {
-            pairs.push(("type", type_name.clone()));
-        }
-        for op in self.ops {
-            pairs.push(("op", op.as_str().to_string()));
-        }
-        pairs
-    }
-}
-
-/// The embedded arm's twin of the served start-mode parser.
-fn parse_change_feed_start(start: &str) -> Result<omnigraph::changes::ChangeFeedStart> {
-    match start {
-        "now" => Ok(omnigraph::changes::ChangeFeedStart::Now),
-        "beginning" => Ok(omnigraph::changes::ChangeFeedStart::Beginning),
-        other => other
-            .strip_prefix("after:")
-            .filter(|commit_id| !commit_id.is_empty())
-            .map(|commit_id| {
-                omnigraph::changes::ChangeFeedStart::AfterCommit(commit_id.to_string())
-            })
-            .ok_or_else(|| eyre!("start must be now | beginning | after:<commit_id>")),
     }
 }

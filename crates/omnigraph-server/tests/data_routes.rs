@@ -3619,12 +3619,7 @@ async fn change_responses_carry_no_storage_vocabulary() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
-    let terminal: Value = serde_json::from_str(
-        text.lines()
-            .filter(|line| !line.is_empty())
-            .next_back()
-            .unwrap(),
-    )
-    .unwrap();
+    let terminal: Value =
+        serde_json::from_str(text.lines().rfind(|line| !line.is_empty()).unwrap()).unwrap();
     assert_clean(&terminal, "baseline terminal record");
 }

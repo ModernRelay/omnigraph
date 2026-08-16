@@ -1854,7 +1854,7 @@ async fn change_feed_start_modes_now_aftercommit_beginning() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let extra = db
         .load_with_receipt(
             "main",

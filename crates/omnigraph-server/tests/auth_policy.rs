@@ -1099,11 +1099,9 @@ async fn change_routes_enforce_bearer_and_policy() {
         (g("/changes?start=now"), Method::GET),
         (g("/changes/baseline"), Method::POST),
     ] {
-        let mut request = Request::builder().uri(uri).method(method);
-        if request.headers_ref().is_none() {
-            unreachable!();
-        }
-        let request = request
+        let request = Request::builder()
+            .uri(uri)
+            .method(method)
             .header("content-type", "application/json")
             .body(Body::from("{}"))
             .unwrap();
