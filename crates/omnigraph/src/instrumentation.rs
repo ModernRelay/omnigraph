@@ -618,9 +618,21 @@ pub(crate) async fn open_dataset(
         });
     }
     builder.load().await.map_err(|error| match error {
-        lance::Error::VersionNotFound { .. }
-        | lance::Error::DatasetNotFound { .. }
-        | lance::Error::NotFound { .. }
+        // Only the two shapes cleanup/drop legitimately leaves behind for a
+        // pinned historical read count as reclaimed history:
+        //   - VersionNotFound: the dataset exists, that version was GC'd.
+        //   - DatasetNotFound: the whole dataset directory is gone (a dropped
+        //     table's history fully GC'd).
+        // A bare NotFound is NOT a cleanup shape: it is a live manifest
+        // referencing a missing object — corruption or an object-store
+        // inconsistency — so it must stay loud rather than be masked as a benign
+        // retention gap (which the change feed would surface as a 410 "reset via
+        // baseline"). Residual: this cannot tell a corrupt CURRENT table's
+        // DatasetNotFound from a legitimately dropped historical table's; that
+        // needs caller context (whether the version is the table's current one),
+        // and the baseline handshake the gap points to still fails loudly on
+        // genuine current-state loss.
+        lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
             if matches!(version, VersionResolution::At(_)) =>
         {
             OmniError::HistoricalVersionReclaimed {
