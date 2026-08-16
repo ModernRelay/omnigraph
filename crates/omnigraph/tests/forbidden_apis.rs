@@ -777,6 +777,10 @@ durable_calls! {
     // reads. Read-only by construction — the enumerator stages no transaction
     // and publishes nothing.
     ("changes/enumerate.rs", ".dataset()", 6, WriteProtocol::ReadOnlyAccess),
+    // Net-diff cross-branch path: the same typed row comparison over two
+    // pinned snapshot handles. Read-only — the diff stages and publishes
+    // nothing.
+    ("changes/mod.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),
