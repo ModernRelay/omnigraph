@@ -1891,6 +1891,38 @@ fn proven_insert_capability_has_one_production_mint_site() {
     );
 }
 
+/// The CDC candidate-pruning classifier (`changes::candidate_scan`) treats every
+/// persisted `Operation::Update` as row-set-preserving, deriving the change feed
+/// from a candidate scan without a delete pass. That is sound only because
+/// OmniGraph's `merge_insert` never deletes an unmatched-by-source row — Lance
+/// defaults the by-source arm to Keep and no engine code sets it otherwise. If a
+/// delete-capable by-source merge arm were ever introduced, a persisted
+/// `Operation::Update` could remove rows and the feed would silently drop that
+/// delete. Lock the floor: the by-source merge arm must be absent from engine
+/// source (production or test), so introducing one forces this classifier to be
+/// re-gated first.
+#[test]
+fn no_delete_capable_merge_arm_in_engine_source() {
+    let src = engine_src_root();
+    let mut offenders: Vec<String> = Vec::new();
+    for file in walk_rust_files(&src) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        if contents.contains("WhenNotMatchedBySource")
+            || contents.contains("when_not_matched_by_source")
+        {
+            offenders.push(relative_to_src(&src, &file));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a by-source merge arm appeared in engine source, which can make an \
+         Operation::Update delete rows. The CDC candidate-pruning classifier \
+         (changes::candidate_scan) assumes every Update is non-deleting; re-gate \
+         it before introducing this. Found in: {offenders:?}"
+    );
+}
+
 #[test]
 fn graph_visible_write_chokepoints_are_registered() {
     let src = engine_src_root();
