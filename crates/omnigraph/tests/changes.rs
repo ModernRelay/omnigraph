@@ -2837,14 +2837,13 @@ node Foxtrot { name: String @key }
 }
 
 /// A page-token resume whose FIRST change exceeds the poll's own byte budget
-/// must surface the typed resource limit immediately — the resumed poll's
-/// budget is fresh, so an empty-page exhaustion already proves the single
-/// change cannot fit, and an empty boundary page would only defer the same
-/// typed error to the following poll.
+/// must still DELIVER that change — a legal committed change is always
+/// crossable, emitted on its own page rather than wedging the feed with a typed
+/// limit. The byte budget is a packing target (how many small changes share a
+/// page), never a wall a single legal two-image change cannot pass.
 #[tokio::test]
-async fn change_feed_resumed_oversized_change_is_a_typed_resource_limit() {
+async fn change_feed_resumed_oversized_change_is_delivered_solo() {
     use omnigraph::changes::{ChangeFeedContinuation, ChangeFeedPosition, ChangeFeedStart};
-    use omnigraph::error::OmniError;
 
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
@@ -2882,14 +2881,29 @@ async fn change_feed_resumed_oversized_change_is_a_typed_resource_limit() {
     };
     assert_eq!(first.blocks[0].changes[0].id, "a-small");
 
-    // Resume with a byte budget the remaining change cannot fit.
+    // Resume with a byte budget smaller than the remaining change: it is
+    // delivered on its own page, and the feed advances past it.
     let mut resumed = feed_request(None, ChangeFeedPosition::PageToken(token));
     resumed.max_bytes = Some(64);
-    let err = db.poll_change_feed(resumed).await.unwrap_err();
-    match err {
-        OmniError::ResourceLimitExceeded { resource, .. } => {
-            assert_eq!(resource, "commit_changes_page_bytes")
+    let page = db.poll_change_feed(resumed).await.unwrap();
+    let delivered: Vec<&str> = page
+        .blocks
+        .iter()
+        .flat_map(|block| block.changes.iter())
+        .map(|change| change.id.as_str())
+        .collect();
+    assert_eq!(
+        delivered,
+        vec![large_name.as_str()],
+        "the oversized change must be delivered solo, not refused"
+    );
+    match &page.continuation {
+        ChangeFeedContinuation::AtBlockBoundary { caught_up, .. } => {
+            assert!(
+                *caught_up,
+                "the feed must advance past the solo oversized change"
+            )
         }
-        other => panic!("expected a typed resource limit, got: {other:?}"),
+        other => panic!("expected a caught-up block boundary after the solo change, got {other:?}"),
     }
 }
