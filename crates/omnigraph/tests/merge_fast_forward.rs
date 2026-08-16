@@ -17,6 +17,7 @@
 
 mod helpers;
 
+use arrow_array::Array;
 use lance::Dataset;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, OmniError};
@@ -567,6 +568,138 @@ async fn changed_only_adopt_uses_known_present_update() {
     );
     assert_eq!(probes.stage_known_present_update_calls(), 1);
     assert_eq!(probes.stage_known_present_update_rows(), 1);
+}
+
+/// Read `column` for the node whose `id == id` from `main`. Outer `None` = id
+/// absent; inner `None` = the value is null; inner `Some` = its string value.
+/// Distinguishing null from `""` is exactly what the merge comparator must do.
+async fn node_string_value(
+    db: &Omnigraph,
+    type_name: &str,
+    id: &str,
+    column: &str,
+) -> Option<Option<String>> {
+    for batch in read_table(db, &format!("node:{type_name}")).await {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let values = batch
+            .column_by_name(column)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        for i in 0..ids.len() {
+            if ids.value(i) == id {
+                return Some((!values.is_null(i)).then(|| values.value(i).to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// A three-way merge must not conflate `""` with null. Feature flips a row's
+/// `body` from null → "" while main diverges on another row (forcing a true
+/// three-way, not a fast-forward). The display-string signature rendered both
+/// null and "" as "" and classified the row unchanged, silently dropping the
+/// change; typed comparison keeps it. RED before the merge comparator fix.
+#[tokio::test]
+async fn three_way_merge_detects_empty_string_to_null_change() {
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    body: String?\n}";
+    const SET_BODY: &str = "query set_body($slug: String, $body: String) {\n    update Doc set { body: $body } where slug = $slug\n}";
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    main.load(
+        "main",
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"x\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"y\"}}",
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    main.branch_create("feature").await.unwrap();
+    let feature = Omnigraph::open(uri).await.unwrap();
+    // feature: x body null → "".
+    feature
+        .mutate(
+            "feature",
+            SET_BODY,
+            "set_body",
+            &mixed_params(&[("$slug", "x"), ("$body", "")], &[]),
+        )
+        .await
+        .unwrap();
+    // main diverges on y so the merge is a genuine three-way, not a fast-forward.
+    main.mutate(
+        "main",
+        SET_BODY,
+        "set_body",
+        &mixed_params(&[("$slug", "y"), ("$body", "main")], &[]),
+    )
+    .await
+    .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    assert_eq!(
+        node_string_value(&main, "Doc", "x", "body").await,
+        Some(Some(String::new())),
+        "feature's null → empty-string change must survive the merge, not be dropped as unchanged"
+    );
+}
+
+/// A legal `_row_`-prefixed user property (only the five exact Lance virtual
+/// columns are reserved) must participate in merge change detection. The merge
+/// signature skipped every `_row`-prefixed column, so feature's change was
+/// invisible and silently dropped. RED before the merge comparator fix.
+#[tokio::test]
+async fn three_way_merge_detects_underscore_prefixed_property_change() {
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    _row_notes: String?\n}";
+    const SET_NOTES: &str = "query set_notes($slug: String, $notes: String) {\n    update Doc set { _row_notes: $notes } where slug = $slug\n}";
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    main.load(
+        "main",
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"x\",\"_row_notes\":\"before\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"y\",\"_row_notes\":\"before\"}}",
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    main.branch_create("feature").await.unwrap();
+    let feature = Omnigraph::open(uri).await.unwrap();
+    feature
+        .mutate(
+            "feature",
+            SET_NOTES,
+            "set_notes",
+            &mixed_params(&[("$slug", "x"), ("$notes", "after")], &[]),
+        )
+        .await
+        .unwrap();
+    main.mutate(
+        "main",
+        SET_NOTES,
+        "set_notes",
+        &mixed_params(&[("$slug", "y"), ("$notes", "main")], &[]),
+    )
+    .await
+    .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    assert_eq!(
+        node_string_value(&main, "Doc", "x", "_row_notes").await,
+        Some(Some("after".to_string())),
+        "a change to a legal _row_-prefixed property must survive the merge"
+    );
 }
 
 const WIDE_VALIDATION_SCHEMA: &str = r#"
