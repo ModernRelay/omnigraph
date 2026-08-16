@@ -2391,3 +2391,100 @@ async fn change_feed_gap_then_baseline_reset() {
             .is_err()
     );
 }
+
+/// The frozen block order is keyed by the PUBLISHED opaque type identity, not
+/// by any internal numeric identity: within one kind, types emit in
+/// lexicographic order of the `entity_type.id` the caller actually sees, and a
+/// paged walk resumes across those type boundaries on the same key.
+///
+/// The opaque ids are hash projections of a per-graph identity domain, so
+/// which permutation the internal numeric order would produce varies per run —
+/// with six types, an implementation sorting by internal identity matches this
+/// assertion only with probability 1/720 per run.
+#[tokio::test]
+async fn commit_changes_blocks_order_by_published_type_id() {
+    use omnigraph::changes::ChangeFeedScope;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Alpha { name: String @key }
+node Bravo { name: String @key }
+node Charlie { name: String @key }
+node Delta { name: String @key }
+node Echo { name: String @key }
+node Foxtrot { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    let scope = ChangeFeedScope::default();
+    let commit = db
+        .load_with_receipt(
+            "main",
+            concat!(
+                r#"{"type":"Alpha","data":{"name":"a"}}"#,
+                "\n",
+                r#"{"type":"Bravo","data":{"name":"b"}}"#,
+                "\n",
+                r#"{"type":"Charlie","data":{"name":"c"}}"#,
+                "\n",
+                r#"{"type":"Delta","data":{"name":"d"}}"#,
+                "\n",
+                r#"{"type":"Echo","data":{"name":"e"}}"#,
+                "\n",
+                r#"{"type":"Foxtrot","data":{"name":"f"}}"#,
+            ),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    let page = db
+        .commit_changes_page(&commit.commit.graph_commit_id, &scope, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.block.changes.len(), 6);
+    let emitted: Vec<(String, String)> = page
+        .block
+        .changes
+        .iter()
+        .map(|change| (change.entity_type.id.clone(), change.id.clone()))
+        .collect();
+    let mut expected = emitted.clone();
+    expected.sort();
+    assert_eq!(
+        emitted, expected,
+        "changes must emit in lexicographic order of the published type id"
+    );
+
+    // A bounded walk (two changes per page) crosses type boundaries and must
+    // reproduce exactly the same published order.
+    let mut token = None;
+    let mut paged = Vec::new();
+    loop {
+        let page = db
+            .commit_changes_page(
+                &commit.commit.graph_commit_id,
+                &scope,
+                token.as_deref(),
+                Some(2),
+                None,
+            )
+            .await
+            .unwrap();
+        paged.extend(
+            page.block
+                .changes
+                .iter()
+                .map(|change| (change.entity_type.id.clone(), change.id.clone())),
+        );
+        match page.next_page_token {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(paged, expected, "a paged walk resumes on the published key");
+}
