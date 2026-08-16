@@ -3125,3 +3125,46 @@ fn profile_show_unknown_name_errors() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("unknown profile 'nope'"), "{stderr}");
 }
+
+#[test]
+fn changes_baseline_failure_preserves_existing_out_file() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let schema = temp.path().join("schema.pg");
+    fs::write(&schema, "node Person {\n    name: String @key\n}\n").unwrap();
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
+
+    // A previous good baseline lives at --out; a failed capture must not
+    // clobber it or leave temp residue beside it.
+    let out = temp.path().join("baseline.jsonl");
+    fs::write(&out, "previous good snapshot\n").unwrap();
+
+    let output = cli()
+        .arg("changes")
+        .arg("baseline")
+        .arg("--branch")
+        .arg("no-such-branch")
+        .arg("--out")
+        .arg(&out)
+        .arg("--store")
+        .arg(&graph)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a baseline of a missing branch must fail"
+    );
+
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "previous good snapshot\n",
+        "a failed baseline must not destroy the previous snapshot"
+    );
+    let residue: Vec<String> = fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("partial"))
+        .collect();
+    assert!(residue.is_empty(), "no partial-file residue: {residue:?}");
+}
