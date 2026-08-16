@@ -2488,3 +2488,61 @@ node Foxtrot { name: String @key }
     }
     assert_eq!(paged, expected, "a paged walk resumes on the published key");
 }
+
+/// A page-token resume whose FIRST change exceeds the poll's own byte budget
+/// must surface the typed resource limit immediately — the resumed poll's
+/// budget is fresh, so an empty-page exhaustion already proves the single
+/// change cannot fit, and an empty boundary page would only defer the same
+/// typed error to the following poll.
+#[tokio::test]
+async fn change_feed_resumed_oversized_change_is_a_typed_resource_limit() {
+    use omnigraph::changes::{ChangeFeedContinuation, ChangeFeedPosition, ChangeFeedStart};
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let (c0, _) = boundary_cursor(
+        &db.poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap(),
+    );
+
+    // One commit, two changes: a small row first, then one whose image alone
+    // exceeds the resumed poll's byte budget.
+    let large_name = format!("z-large-{}", "x".repeat(512));
+    db.load_with_receipt(
+        "main",
+        &format!(
+            "{}\n{}",
+            r#"{"type":"Person","data":{"name":"a-small","age":1}}"#,
+            format_args!(r#"{{"type":"Person","data":{{"name":"{large_name}","age":2}}}}"#),
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // Split the block after the small change.
+    let mut first = feed_request(None, ChangeFeedPosition::Cursor(c0));
+    first.max_changes = Some(1);
+    let first = db.poll_change_feed(first).await.unwrap();
+    let token = match &first.continuation {
+        ChangeFeedContinuation::MidBlock { page_token } => page_token.clone(),
+        other => panic!("expected a mid-block continuation, got {other:?}"),
+    };
+    assert_eq!(first.blocks[0].changes[0].id, "a-small");
+
+    // Resume with a byte budget the remaining change cannot fit.
+    let mut resumed = feed_request(None, ChangeFeedPosition::PageToken(token));
+    resumed.max_bytes = Some(64);
+    let err = db.poll_change_feed(resumed).await.unwrap_err();
+    match err {
+        OmniError::ResourceLimitExceeded { resource, .. } => {
+            assert_eq!(resource, "commit_changes_page_bytes")
+        }
+        other => panic!("expected a typed resource limit, got: {other:?}"),
+    }
+}
