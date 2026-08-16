@@ -396,12 +396,26 @@ async fn commit_snapshot(root_uri: &str, cut: &ChangeFeedCut, commit_id: &str) -
             "lineage projection is missing commit '{commit_id}'"
         ))
     })?;
-    ManifestCoordinator::snapshot_at(
+    let snapshot = ManifestCoordinator::snapshot_at(
         root_uri,
         commit.manifest_branch.as_deref(),
         commit.manifest_version,
     )
-    .await
+    .await?;
+    // The cut was captured earlier; this reopen happens later and lock-free by
+    // `(manifest branch, version)`. A named branch deleted and recreated at the
+    // same version in that window would reopen the REPLACEMENT bytes under the
+    // captured commit's label. Each commit is the head of its own
+    // `manifest_version`, so a matching incarnation must still report this exact
+    // commit as that branch's head; fail closed otherwise rather than emit
+    // another branch's rows as this commit's changes. Main cannot undergo
+    // branch-name ABA, but the check is structural and harmless there.
+    if snapshot.graph_head(commit.manifest_branch.as_deref()) != Some(commit_id) {
+        return Err(OmniError::manifest(format!(
+            "change feed commit '{commit_id}' has no persisted native-branch incarnation witness at the reopened snapshot; the branch was deleted and recreated during the poll"
+        )));
+    }
+    Ok(snapshot)
 }
 
 fn resolve_position(
