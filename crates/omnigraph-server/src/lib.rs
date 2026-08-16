@@ -840,13 +840,16 @@ impl ApiError {
         }
     }
 
-    /// The HTTP status this error maps to.
+    /// The HTTP status this error maps to. Test-only: production reads the
+    /// status through `IntoResponse`.
+    #[cfg(test)]
     pub(crate) fn status(&self) -> StatusCode {
         self.status
     }
 
-    /// The human-readable message body (used by tests to assert the wire
-    /// contract does not leak substrate detail).
+    /// The human-readable message body, used by tests to assert the wire
+    /// contract does not leak substrate detail.
+    #[cfg(test)]
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
