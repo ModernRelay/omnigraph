@@ -804,6 +804,14 @@ implementation, recorded here so later phases inherit them:
 - **Typed structural equality** uses Arrow logical equality on one-row
   slices for non-Blob user columns and physical descriptor identity with an
   exact payload tie-break for Blob columns. Float comparison is bitwise.
+  Managed Blob descriptor fields (`position`/`size`/`blob_id`) are resolved by
+  Lance RELATIVE to the owning data file (via the row's fragment), so the
+  identity is qualified with the owning fragment id (high 32 bits of
+  `_rowaddr`, projected via `with_row_address`). Without that, a same-length
+  Blob-only update that moves the row to a new fragment with colliding local
+  descriptor coordinates would be misread as unchanged and silently dropped
+  from the diff and feed. External references resolve by URI independently of
+  placement, so their identity stays source-independent.
 - **Strict schema gate:** paired lifetimes must share one user-schema
   fingerprint (name-keyed Arrow type + nullability + stable property marker +
   Blob marker; the five reserved Lance virtual columns excluded); a non-empty

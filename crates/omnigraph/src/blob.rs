@@ -911,24 +911,42 @@ impl<'a> BlobDescriptorDecoder<'a> {
         }
     }
 
-    /// Canonical physical identity of one descriptor row, after full
-    /// classification. Within one table lifetime, equal identities reference
-    /// identical immutable stored bytes (fragments and blob files never mutate
-    /// in place), so a comparator can skip payload I/O on equality. Inequality
-    /// proves nothing about the payload — compaction relocates identical bytes
-    /// — so callers must byte-compare payloads before reporting a change.
-    /// Null uses the classified state, never sentinel child values, so the two
-    /// physical null encodings share one identity.
-    pub(crate) fn physical_identity(&self, row: usize) -> Result<String> {
+    /// Canonical payload identity of one descriptor row, qualified by the
+    /// owning physical source. Within one table lifetime, equal identities
+    /// reference identical immutable stored bytes, so a comparator can skip
+    /// payload I/O on equality; inequality proves nothing (compaction relocates
+    /// identical bytes), so callers must byte-compare payloads before reporting
+    /// a change.
+    ///
+    /// **A managed descriptor's fields are file-relative, not global.** Lance
+    /// resolves managed (inline/packed/dedicated) bytes from the row's fragment
+    /// (`RowAddress::fragment_id(row_addr)` → data file), then `position`/
+    /// `size`/`blob_id` within that data file. Two rows with byte-identical
+    /// managed descriptors in DIFFERENT fragments therefore reference DIFFERENT
+    /// bytes (e.g. a same-length Blob-only update moves the row to a new
+    /// fragment that can reuse the same local coordinates). The owning
+    /// `source_fragment_id` is part of the managed identity so equal identities
+    /// really do imply equal bytes. External references resolve by URI
+    /// independently of physical placement, so their identity is
+    /// source-independent. Null uses the classified state, never sentinel child
+    /// values, so the two physical null encodings share one identity.
+    pub(crate) fn physical_identity(&self, row: usize, source_fragment_id: u32) -> Result<String> {
         match self.classify(row)? {
             BlobDescriptor::Null => Ok("null".to_string()),
-            _ => Ok(format!(
-                "{}:{}:{}:{}:{}",
+            BlobDescriptor::External {
+                uri,
+                offset,
+                length,
+            } => Ok(format!(
+                "ext:{offset}:{}:{uri}",
+                length.map(|len| len.to_string()).unwrap_or_default(),
+            )),
+            BlobDescriptor::Managed { .. } => Ok(format!(
+                "mgd:{source_fragment_id}:{}:{}:{}:{}",
                 self.kinds.value(row),
                 self.positions.value(row),
                 self.sizes.value(row),
                 self.blob_ids.value(row),
-                self.blob_uris.value(row),
             )),
         }
     }

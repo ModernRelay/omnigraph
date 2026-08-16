@@ -24,8 +24,8 @@ use super::model::{
 use super::row_compare::{OrderedRows, RawRow, rows_equal};
 use super::token::{cursor_rejected, opaque_type_id};
 use super::{changed_table_intervals, parse_table_key};
-use crate::db::manifest::Snapshot;
 use crate::db::logical_row_image;
+use crate::db::manifest::Snapshot;
 use crate::error::{OmniError, Result};
 use crate::table_store::TableStore;
 

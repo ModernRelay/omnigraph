@@ -42,8 +42,10 @@ const CHANGE_SCAN_TARGET_ROWS: usize = 8_192;
 pub(crate) struct RawRow {
     pub(crate) id: String,
     pub(crate) slice: RecordBatch,
-    /// `(column, physical descriptor identity)` per Blob column, in schema
-    /// order. Equal identities on one table lifetime imply equal payloads.
+    /// `(column, source-qualified physical identity)` per Blob column, in
+    /// schema order. Managed identities carry the owning fragment (Blob
+    /// descriptor fields are file-relative), so equal identities on one table
+    /// lifetime imply equal payloads and inequality forces a payload compare.
     blob_signatures: Vec<(String, String)>,
 }
 
@@ -78,6 +80,13 @@ impl OrderedRows {
                     scanner.batch_size(CHANGE_SCAN_TARGET_ROWS);
                     scanner.batch_size_bytes(COMMIT_CHANGES_MAX_BYTES);
                     scanner.blob_handling(BlobHandling::BlobsDescriptions);
+                    // Managed Blob descriptors are file-relative, so the owning
+                    // fragment (high 32 bits of `_rowaddr`) is required to tell
+                    // an in-place unchanged row from a same-length Blob-only
+                    // update that moved to a new fragment with colliding local
+                    // descriptor coordinates. `with_row_id` above stays on for
+                    // the payload tie-break's stable-id `take_blobs`.
+                    scanner.with_row_address();
                     Ok(())
                 },
             )
@@ -162,11 +171,36 @@ fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
     // whole-table updates.
     blob_columns.sort_by(|left, right| left.0.cmp(right.0));
 
+    // Managed Blob descriptors are resolved relative to the owning fragment, so
+    // qualify each managed identity with the row's fragment id (high 32 bits of
+    // `_rowaddr`). Only needed when the table has a Blob column.
+    let row_addresses = if blob_columns.is_empty() {
+        None
+    } else {
+        Some(
+            batch
+                .column_by_name("_rowaddr")
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::Lance(
+                        "change scan is missing _rowaddr; managed Blob comparison needs the owning fragment"
+                            .to_string(),
+                    )
+                })?,
+        )
+    };
+
     let mut rows = VecDeque::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
         let mut blob_signatures = Vec::with_capacity(blob_columns.len());
-        for (name, decoder) in &blob_columns {
-            blob_signatures.push((name.to_string(), decoder.physical_identity(row)?));
+        if let Some(row_addresses) = row_addresses {
+            let fragment_id = (row_addresses.value(row) >> 32) as u32;
+            for (name, decoder) in &blob_columns {
+                blob_signatures.push((
+                    name.to_string(),
+                    decoder.physical_identity(row, fragment_id)?,
+                ));
+            }
         }
         rows.push_back(RawRow {
             id: ids.value(row).to_string(),
