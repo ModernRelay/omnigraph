@@ -542,6 +542,83 @@ async fn policy_authorizes_omitted_commit_list_branch_as_main() {
     assert_eq!(omitted_body, explicit_body);
 }
 
+/// A direct commit diff resolves the commit across ALL branches before it
+/// authorizes the commit's branch, so a 403-vs-404 split would be a graph-wide
+/// commit-existence oracle: an actor without read on a branch could confirm a
+/// commit exists on it. A known-but-forbidden commit must return the same 404
+/// as an unknown commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+
+    // Author a commit on an UNPROTECTED branch the read grant does not cover.
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    let receipt = db
+        .load_with_receipt(
+            "feature",
+            r#"{"type":"Person","data":{"name":"feature-only","age":40}}"#,
+            omnigraph::loader::LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let feature_commit = receipt.commit.graph_commit_id.clone();
+    drop(db);
+
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_PROTECTED_READ_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("act-bruno".to_string(), "team-token".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    // act-bruno may read main (protected) but NOT feature. Diffing a commit that
+    // lives on feature must look exactly like diffing a commit that does not
+    // exist at all.
+    let (forbidden_status, forbidden_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!("/commits/{feature_commit}/changes")))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    let unknown_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let (unknown_status, unknown_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!("/commits/{unknown_id}/changes")))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(
+        forbidden_status,
+        StatusCode::NOT_FOUND,
+        "a known-but-forbidden commit must not be distinguishable from unknown by status"
+    );
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    let forbidden: ErrorOutput = serde_json::from_value(forbidden_body).unwrap();
+    let unknown: ErrorOutput = serde_json::from_value(unknown_body).unwrap();
+    assert_eq!(
+        forbidden.code, unknown.code,
+        "forbidden and unknown must share the same error code"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() {
     let temp = init_loaded_graph().await;
