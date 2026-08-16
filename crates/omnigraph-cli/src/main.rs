@@ -599,12 +599,30 @@ async fn main() -> Result<()> {
                     types: &types,
                     ops: &ops,
                 };
-                let mut writer = io::BufWriter::new(fs::File::create(&out)?);
-                let baseline = client
+                // Stream into a sibling temp file and atomically replace
+                // --out only after the handshake completes, so a failed or
+                // interrupted capture never destroys the previous snapshot.
+                let partial = out.with_file_name(format!(
+                    "{}.partial",
+                    out.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "baseline".to_string())
+                ));
+                let mut writer = io::BufWriter::new(fs::File::create(&partial)?);
+                let baseline = match client
                     .change_baseline(branch.as_deref(), &filter, &mut writer)
-                    .await?;
+                    .await
+                {
+                    Ok(baseline) => baseline,
+                    Err(error) => {
+                        drop(writer);
+                        let _ = fs::remove_file(&partial);
+                        return Err(error);
+                    }
+                };
                 writer.flush()?;
                 drop(writer);
+                fs::rename(&partial, &out)?;
                 if json {
                     print_json(&baseline)?;
                 } else {
