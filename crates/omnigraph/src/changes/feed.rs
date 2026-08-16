@@ -103,8 +103,7 @@ impl FeedScope {
             cut_commit_id: cut_commit_id.to_string(),
             after_commit_id: after_commit_id.to_string(),
             current_commit_id: current_commit_id.to_string(),
-            stable_table_id: key.identity.stable_table_id,
-            table_incarnation_id: key.identity.table_incarnation_id,
+            type_id: key.type_id.clone(),
             id: key.id.clone(),
             operation_rank: key.operation_rank,
             change_index: key.change_index,
@@ -464,7 +463,7 @@ fn resolve_position(
                 ));
             }
             let key = ContinuationKey {
-                identity: page.identity(),
+                type_id: page.type_id.clone(),
                 id: page.id.clone(),
                 operation_rank: page.operation_rank,
                 change_index: page.change_index,

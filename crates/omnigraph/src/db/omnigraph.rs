@@ -2284,7 +2284,7 @@ impl Omnigraph {
                     ));
                 }
                 Ok(crate::changes::enumerate::ContinuationKey {
-                    identity: decoded.identity(),
+                    type_id: decoded.type_id,
                     id: decoded.id,
                     operation_rank: decoded.operation_rank,
                     change_index: decoded.change_index,
@@ -2317,8 +2317,7 @@ impl Omnigraph {
                     graph_identity: token::hashed_identity(&graph_identity),
                     commit_id: commit_id.to_string(),
                     filter_digest,
-                    stable_table_id: key.identity.stable_table_id,
-                    table_incarnation_id: key.identity.table_incarnation_id,
+                    type_id: key.type_id,
                     id: key.id,
                     operation_rank: key.operation_rank,
                     change_index: key.change_index,

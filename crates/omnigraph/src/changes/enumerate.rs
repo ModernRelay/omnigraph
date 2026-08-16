@@ -30,7 +30,7 @@ use super::model::{
 use super::token::{cursor_rejected, opaque_type_id};
 use super::{TableChangeInterval, changed_table_intervals, parse_table_key};
 use crate::blob::BlobDescriptorDecoder;
-use crate::db::manifest::{Snapshot, TableIdentity};
+use crate::db::manifest::Snapshot;
 use crate::db::{export_blob_values, logical_row_image};
 use crate::error::{OmniError, Result};
 use crate::table_store::TableStore;
@@ -90,11 +90,14 @@ impl PageBudget {
 }
 
 /// Continuation position of the last emitted change, carried opaquely inside
-/// page tokens. `change_index` is internal bookkeeping that keeps a resumed
-/// enumeration's positions monotonic across pages; it is never a public field.
+/// page tokens. The type is named by its PUBLISHED opaque identity — the same
+/// key the emission order uses — so token payloads never carry numeric table
+/// or incarnation components. `change_index` is internal bookkeeping that
+/// keeps a resumed enumeration's positions monotonic across pages; it is
+/// never a public field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContinuationKey {
-    pub(crate) identity: TableIdentity,
+    pub(crate) type_id: String,
     pub(crate) id: String,
     pub(crate) operation_rank: u8,
     pub(crate) change_index: usize,
@@ -420,6 +423,9 @@ async fn next_emit(
 /// interval costs at most two opens per page).
 struct IntervalPlan<'a> {
     interval: TableChangeInterval<'a>,
+    /// The published opaque type identity: the block ordering key, the
+    /// continuation key, and `GraphTypeRef.id`, all one value.
+    opaque_id: String,
     kind: ChangeEntityKind,
     type_name: String,
     from_dataset: Dataset,
@@ -464,7 +470,9 @@ fn schema_boundary(graph_commit_id: &str, table_key: &str) -> OmniError {
 }
 
 /// Prove the P→C pair compatible for entity diff and open every surviving
-/// paired lifetime, in the frozen `(kind rank, identity)` order.
+/// paired lifetime, in the frozen `(kind rank, published type id)` order —
+/// the same opaque identity the emitted changes and continuation keys carry,
+/// so a caller can reproduce the order from the response alone.
 ///
 /// The gate runs over ALL changed intervals before anything is emitted, so a
 /// schema boundary refuses the whole commit deterministically on every page.
@@ -476,16 +484,10 @@ async fn plan_intervals<'a>(
     store: &TableStore,
     parent: &'a Snapshot,
     child: &'a Snapshot,
+    schema_identity_domain: &str,
     graph_commit_id: &str,
 ) -> Result<Vec<IntervalPlan<'a>>> {
-    let mut intervals = changed_table_intervals(parent, child);
-    intervals.sort_by(|left, right| {
-        let left_rank = ChangeEntityKind::from(parse_table_key(left.table_key()).0).rank();
-        let right_rank = ChangeEntityKind::from(parse_table_key(right.table_key()).0).rank();
-        left_rank
-            .cmp(&right_rank)
-            .then_with(|| left.identity.cmp(&right.identity))
-    });
+    let intervals = changed_table_intervals(parent, child);
 
     let mut plans = Vec::with_capacity(intervals.len());
     for interval in intervals {
@@ -509,6 +511,7 @@ async fn plan_intervals<'a>(
                 }
                 let (kind, type_name) = parse_table_key(table_key);
                 plans.push(IntervalPlan {
+                    opaque_id: opaque_type_id(schema_identity_domain, interval.identity),
                     interval,
                     kind: kind.into(),
                     type_name: type_name.to_string(),
@@ -519,6 +522,14 @@ async fn plan_intervals<'a>(
             (None, None) => unreachable!("changed intervals have at least one endpoint"),
         }
     }
+    // The opaque ids are domain-scoped SHA-256 projections of distinct
+    // immutable identities, so this order is total and deterministic.
+    plans.sort_by(|left, right| {
+        left.kind
+            .rank()
+            .cmp(&right.kind.rank())
+            .then_with(|| left.opaque_id.cmp(&right.opaque_id))
+    });
     Ok(plans)
 }
 
@@ -538,7 +549,14 @@ pub(crate) async fn enumerate_commit_changes(
     budget: &mut PageBudget,
     out: &mut Vec<GraphEntityChange>,
 ) -> Result<CommitEnumeration> {
-    let plans = plan_intervals(store, parent, child, graph_commit_id).await?;
+    let plans = plan_intervals(
+        store,
+        parent,
+        child,
+        schema_identity_domain,
+        graph_commit_id,
+    )
+    .await?;
 
     let mut resume_seen = resume.is_none();
     let mut next_change_index = resume.map_or(0, |key| key.change_index + 1);
@@ -553,7 +571,7 @@ pub(crate) async fn enumerate_commit_changes(
         }
         let after_id = match resume {
             Some(key) if !resume_seen => {
-                if plan.interval.identity == key.identity {
+                if plan.opaque_id == key.type_id {
                     resume_seen = true;
                     Some(key.id.as_str())
                 } else {
@@ -566,7 +584,7 @@ pub(crate) async fn enumerate_commit_changes(
         };
 
         let type_ref = GraphTypeRef {
-            id: opaque_type_id(schema_identity_domain, plan.interval.identity),
+            id: plan.opaque_id.clone(),
             name: plan.type_name.clone(),
         };
         let mut left = OrderedRows::open(plan.from_dataset, after_id).await?;
@@ -615,7 +633,7 @@ pub(crate) async fn enumerate_commit_changes(
             budget.remaining_rows -= 1;
             budget.remaining_bytes -= encoded_bytes;
             last_emitted = Some(ContinuationKey {
-                identity: plan.interval.identity,
+                type_id: plan.opaque_id.clone(),
                 id: change.id.clone(),
                 operation_rank: op.rank(),
                 change_index: next_change_index,

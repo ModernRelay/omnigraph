@@ -45,20 +45,13 @@ pub(crate) struct CommitPageTokenV1 {
     pub graph_identity: String,
     pub commit_id: String,
     pub filter_digest: String,
-    pub stable_table_id: u64,
-    pub table_incarnation_id: u64,
+    /// Opaque graph type identity of the last emitted change. A token's
+    /// decodable payload never carries numeric table or incarnation
+    /// components — the checksum is integrity, not encryption.
+    pub type_id: String,
     pub id: String,
     pub operation_rank: u8,
     pub change_index: usize,
-}
-
-impl CommitPageTokenV1 {
-    pub(crate) fn identity(&self) -> TableIdentity {
-        TableIdentity {
-            stable_table_id: self.stable_table_id,
-            table_incarnation_id: self.table_incarnation_id,
-        }
-    }
 }
 
 /// Durable caller-owned feed position: everything needed to prove the resumed
@@ -102,20 +95,11 @@ pub(crate) struct FeedPageTokenV1 {
     pub after_commit_id: String,
     /// The commit whose block this token splits.
     pub current_commit_id: String,
-    pub stable_table_id: u64,
-    pub table_incarnation_id: u64,
+    /// Opaque graph type identity of the last emitted change.
+    pub type_id: String,
     pub id: String,
     pub operation_rank: u8,
     pub change_index: usize,
-}
-
-impl FeedPageTokenV1 {
-    pub(crate) fn identity(&self) -> TableIdentity {
-        TableIdentity {
-            stable_table_id: self.stable_table_id,
-            table_incarnation_id: self.table_incarnation_id,
-        }
-    }
 }
 
 fn kind_label(kind: &str) -> &'static str {
@@ -251,10 +235,7 @@ fn decode_token<T: DeserializeOwned>(token: &str, expected_kind: &'static str) -
 
 pub(crate) fn decode_commit_page_token(token: &str) -> Result<CommitPageTokenV1> {
     let decoded: CommitPageTokenV1 = decode_token(token, KIND_COMMIT_PAGE)?;
-    if decoded.stable_table_id == 0
-        || decoded.table_incarnation_id == 0
-        || decoded.operation_rank > ChangeOpKind::Delete.rank()
-    {
+    if decoded.type_id.is_empty() || decoded.operation_rank > ChangeOpKind::Delete.rank() {
         return Err(cursor_rejected(
             "invalid commit changes page token identity",
         ));
@@ -279,10 +260,7 @@ pub(crate) fn decode_feed_page_token(token: &str) -> Result<FeedPageTokenV1> {
             "change feed page token purpose does not match this feed",
         ));
     }
-    if decoded.stable_table_id == 0
-        || decoded.table_incarnation_id == 0
-        || decoded.operation_rank > ChangeOpKind::Delete.rank()
-    {
+    if decoded.type_id.is_empty() || decoded.operation_rank > ChangeOpKind::Delete.rank() {
         return Err(cursor_rejected("invalid change feed page token identity"));
     }
     Ok(decoded)
@@ -299,8 +277,13 @@ mod tests {
             graph_identity: hashed_identity("graph"),
             commit_id: "commit".to_string(),
             filter_digest: filter_digest(&ChangeFeedScope::default()),
-            stable_table_id: 3,
-            table_incarnation_id: 7,
+            type_id: opaque_type_id(
+                "graph",
+                TableIdentity {
+                    stable_table_id: 3,
+                    table_incarnation_id: 7,
+                },
+            ),
             id: "alice".to_string(),
             operation_rank: 1,
             change_index: 41,
