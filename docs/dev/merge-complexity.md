@@ -178,15 +178,18 @@ reads that each sort only a bounded chunk. RFC-030 §14 tracks this as the open
 it skips **only the five reserved Lance virtual columns** (a legal
 `_row_`-prefixed user property participates), distinguishes null from every
 rendered value including `""`, and length-prefixes each value so no value can
-spoof a column boundary. It still stringifies every user column including
-**Vector embeddings**, so cost per row ≈ O(columns + serialized bytes). On the
-three-way path this runs for **every** base/source/target row (eager); on the
-adopt fallback only for matched ids (lazy). (The former `starts_with("_row")`
-skip plus raw `\x1f` join conflated null with `""` and hid `_row_`-prefixed
-properties — merge silently dropped such changes. Full unification with the
-change feed's `changes::row_compare` comparator, which additionally compares
-Blob columns by descriptor identity, is a larger follow-up gated on the merge
-cursor's scan mode.)
+spoof a column boundary. Scalar/Vector columns are stringified (so cost per row
+≈ O(columns + serialized bytes)); **Blob columns compare by source-qualified
+physical identity** — the managed descriptor plus the owning fragment (high 32
+bits of `_rowaddr`, projected by the cursor via `with_row_address`), the same
+identity `changes::row_compare` uses. On the three-way path this runs for
+**every** base/source/target row (eager); on the adopt fallback only for matched
+ids (lazy). (The former `starts_with("_row")` skip plus raw `\x1f` join
+conflated null with `""` and hid `_row_`-prefixed properties, and rendering the
+Blob descriptor directly conflated a same-length Blob-only update across
+fragments — merge silently dropped all three change classes. The Blob identity
+is fragment-qualified because Lance resolves a managed descriptor relative to
+the owning data file.)
 
 ### D. Validation — `validate_merge_candidates`
 

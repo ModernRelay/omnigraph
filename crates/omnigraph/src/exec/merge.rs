@@ -410,14 +410,26 @@ impl OrderedTableCursor {
                 KEYED_WRITE_MAX_BYTES,
             );
             Some(Box::pin(
-                crate::table_store::TableStore::scan_stream_bounded(
+                crate::table_store::TableStore::scan_stream_with(
                     ds,
                     None,
                     None,
                     Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
                     true,
-                    KEYED_WRITE_MAX_ROWS,
-                    KEYED_WRITE_MAX_BYTES,
+                    |scanner| {
+                        scanner.batch_size(KEYED_WRITE_MAX_ROWS);
+                        scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+                        // Managed Blob descriptors are resolved by Lance relative
+                        // to the owning data file, so the row signature needs the
+                        // owning fragment (high 32 bits of `_rowaddr`) to tell an
+                        // in-place unchanged row from a same-length Blob-only
+                        // update that moved to a new fragment with colliding local
+                        // descriptor coordinates. The staged writers project to
+                        // the target schema by name, so this extra system column
+                        // (like `_rowid`) never reaches the delta.
+                        scanner.with_row_address();
+                        Ok(())
+                    },
                 )
                 .await?,
             ))
@@ -1760,15 +1772,47 @@ fn classify_merge_conflict(
 /// presence and rendered value. Ephemeral, internal to merge classification —
 /// never persisted, so the format is free to change.
 ///
-/// Blob columns are still rendered via `array_value_to_string`, preserving
-/// today's behavior; full unification with `changes::row_compare` (which
-/// compares Blob columns by descriptor identity) is a larger follow-up gated on
-/// the merge cursor's scan mode.
+/// Blob columns compare by source-qualified physical identity, not a display of
+/// the descriptor. Lance resolves a managed (inline/packed/dedicated) descriptor
+/// RELATIVE to the owning data file (the row's fragment), so byte-identical
+/// descriptors in different fragments reference different bytes — a same-length
+/// Blob-only update moves the row to a new fragment and can reuse the same local
+/// coordinates. Qualifying the managed identity with the owning fragment (high
+/// 32 bits of `_rowaddr`) makes equal signatures imply equal bytes; external
+/// references resolve by URI independently of placement and stay
+/// source-independent. This is the same identity `changes::row_compare` uses for
+/// the CDC comparator.
 fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
     use std::fmt::Write as _;
+    let fragment_id = batch
+        .column_by_name("_rowaddr")
+        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+        .map(|addresses| (addresses.value(row) >> 32) as u32);
     let mut signature = String::new();
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
         if crate::changes::model::is_reserved_storage_system_column(field.name()) {
+            continue;
+        }
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if lance_field.is_blob() {
+            let descriptions = column
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
+                .ok_or_else(|| {
+                    OmniError::Lance(format!(
+                        "expected blob descriptions for merge column '{}'",
+                        field.name()
+                    ))
+                })?;
+            let fragment_id = fragment_id.ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "merge Blob comparison requires _rowaddr; cursor must scan row addresses",
+                )
+            })?;
+            let identity = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?
+                .physical_identity(row, fragment_id)?;
+            let _ = write!(signature, "B{}:{identity};", identity.len());
             continue;
         }
         if column.is_null(row) {
