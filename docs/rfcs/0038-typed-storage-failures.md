@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
+| **Status** | Accepted |
 | **Author track** | Public contribution |
 | **Author(s)** | Ragnor Comerford ([`ragnorc`](https://github.com/ragnorc)) |
 | **Discussion** | [PR #491](https://github.com/ModernRelay/omnigraph/pull/491) and its [maintainer review](https://github.com/ModernRelay/omnigraph/pull/491#issuecomment-5281302575) |
