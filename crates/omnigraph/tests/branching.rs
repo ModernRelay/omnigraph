@@ -2101,6 +2101,80 @@ async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     assert_eq!(eve.num_rows(), 1);
 }
 
+/// The three-way merge classifier must compare row values TYPED, not by Arrow's
+/// display string, which is not injective for nested values: `["a, b"]` (one
+/// element with a comma) and `["a","b"]` (two elements) render identically as
+/// `[a, b]`. A feature-branch change between two such values would be classified
+/// as a no-op and silently dropped.
+#[tokio::test]
+async fn branch_merge_detects_nested_list_value_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = "node Doc {\n    slug: String @key\n    tags: [String]\n}";
+    let mut main = Omnigraph::init(uri, schema).await.unwrap();
+    // Base: one element containing a comma.
+    main.load_with_receipt(
+        "main",
+        r#"{"type":"Doc","data":{"slug":"x","tags":["a, b"]}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    main.branch_create("feature").await.unwrap();
+    let feature = Omnigraph::open(uri).await.unwrap();
+    // Feature changes it to two elements — displays identically to the base.
+    feature
+        .load_with_receipt(
+            "feature",
+            r#"{"type":"Doc","data":{"slug":"x","tags":["a","b"]}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    // Diverge main with an unrelated row so the merge is a real three-way, not
+    // a fast-forward (the display-string classifier only runs on the three-way path).
+    main.load_with_receipt(
+        "main",
+        r#"{"type":"Doc","data":{"slug":"y","tags":["z"]}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    // `["a","b"]` contains the element "b"; `["a, b"]` does not. So `x` is
+    // returned only if feature's change survived the merge.
+    let queries = r#"
+query docs_with_tag($tag: String) {
+    match { $d: Doc  $d.tags contains $tag }
+    return { $d.slug }
+}
+"#;
+    let result = query_main(
+        &mut main,
+        queries,
+        "docs_with_tag",
+        &params(&[("$tag", "b")]),
+    )
+    .await
+    .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let slugs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let got: Vec<&str> = (0..slugs.len()).map(|i| slugs.value(i)).collect();
+    assert!(
+        got.contains(&"x"),
+        "merge dropped the nested-list value change (display-string collision): {got:?}"
+    );
+}
+
 #[tokio::test]
 async fn branch_merge_allows_identical_updates_on_both_sides() {
     let dir = tempfile::tempdir().unwrap();
