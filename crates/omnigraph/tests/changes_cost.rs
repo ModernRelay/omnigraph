@@ -408,9 +408,17 @@ async fn change_feed_backlog_walk_grows_with_commits_examined() {
                 io.data_open_count <= 2 * backlog,
                 "at most two pinned opens per effectful commit: {io:?}"
             );
+            // F4: the CPU/allocation term the IO counters cannot see. The poll
+            // clones the whole backlog into its first-parent chain, so this
+            // grows with the backlog even for a small page ceiling — pinned so a
+            // future forward-child projection (B1) that bounds it is measurable.
+            assert_eq!(
+                io.feed_commits_visited, backlog,
+                "poll walks exactly the backlog into its chain: {io:?}"
+            );
             eprintln!(
-                "BACKLOG commits={backlog}: data_open_count={} data_reads={} manifest_reads={}",
-                io.data_open_count, io.data_reads, io.manifest_reads,
+                "BACKLOG commits={backlog}: data_open_count={} data_reads={} manifest_reads={} feed_commits_visited={}",
+                io.data_open_count, io.data_reads, io.manifest_reads, io.feed_commits_visited,
             );
             curve.push((backlog, io));
         }
@@ -419,6 +427,12 @@ async fn change_feed_backlog_walk_grows_with_commits_examined() {
             |io| io.manifest_reads,
             1,
             "one manifest snapshot resolution per commit examined",
+        );
+        assert_grows(
+            &curve,
+            |io| io.feed_commits_visited,
+            1,
+            "commits walked into the chain grow with the backlog (F4)",
         );
     })
     .await;

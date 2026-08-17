@@ -252,6 +252,10 @@ pub struct IoCounts {
     /// this distinguishes one coherent state+lineage scan from two projections
     /// over the same already-open handle.
     pub manifest_scan_count: u64,
+    /// Commits a change-feed poll walked into its first-parent chain. The
+    /// CPU/allocation term that grows with the backlog independently of the
+    /// manifest/data IO counters.
+    pub feed_commits_visited: u64,
 }
 
 impl IoCounts {
@@ -498,6 +502,7 @@ struct OpProbes {
     data_open_count: Arc<AtomicU64>,
     internal_open_count: Arc<AtomicU64>,
     manifest_scan_count: Arc<AtomicU64>,
+    feed_commits_visited: Arc<AtomicU64>,
 }
 
 impl OpProbes {
@@ -517,6 +522,7 @@ impl OpProbes {
             data_open_count: Arc::new(AtomicU64::new(0)),
             internal_open_count: Arc::new(AtomicU64::new(0)),
             manifest_scan_count: Arc::new(AtomicU64::new(0)),
+            feed_commits_visited: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
@@ -525,6 +531,7 @@ impl OpProbes {
             data_open_count: Arc::clone(&h.data_open_count),
             internal_open_count: Arc::clone(&h.internal_open_count),
             manifest_scan_count: Arc::clone(&h.manifest_scan_count),
+            feed_commits_visited: Arc::clone(&h.feed_commits_visited),
             // graph_build_count / graph_edges_built unused by this harness.
             ..Default::default()
         };
@@ -556,6 +563,7 @@ impl OpProbes {
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
             internal_open_count: self.internal_open_count.load(Ordering::Relaxed),
             manifest_scan_count: self.manifest_scan_count.load(Ordering::Relaxed),
+            feed_commits_visited: self.feed_commits_visited.load(Ordering::Relaxed),
         }
     }
 }

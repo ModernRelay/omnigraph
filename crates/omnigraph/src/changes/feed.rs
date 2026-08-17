@@ -220,6 +220,12 @@ pub(crate) async fn poll(
             "change feed continuation names a commit outside this branch's first-parent chain",
         ));
     };
+    // The chain is the whole backlog (cut head → cursor), cloned commit-by-commit
+    // by `chain_after`. Record its length so a cost test can see this CPU term
+    // grow with the backlog — it is invisible to the manifest/data IO counters,
+    // and a small-ceiling poll over a large backlog still walks the full chain
+    // until the forward-child projection (B1) bounds the visit.
+    crate::instrumentation::record_feed_commits_visited(chain.len());
     if chain.is_empty() {
         return Ok(ChangeFeedPage {
             blocks: Vec::new(),

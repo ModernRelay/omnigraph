@@ -84,6 +84,12 @@ pub struct QueryIoProbes {
     /// Filters evaluated by the in-memory arm (`projection.rs::apply_filter`),
     /// the complement of `pushed_filter_exprs` for hoist assertions.
     pub in_memory_filters: Arc<AtomicU64>,
+    /// Commits the change-feed poll walked into its first-parent chain (the
+    /// `chain_after` head→cursor clone). This is the CPU/allocation term that
+    /// grows with the *backlog* even when the page ceiling is small, and it is
+    /// invisible to the manifest/data IO counters — a cost test asserts it so a
+    /// future forward-child projection (the bounded-visit fix) is measurable.
+    pub feed_commits_visited: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -200,6 +206,15 @@ pub(crate) fn record_pushed_filter_exprs(n: u64) {
 /// probes are installed (production).
 pub(crate) fn record_in_memory_filter() {
     let _ = current(|p| p.in_memory_filters.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record `commits` walked into a change-feed poll's first-parent chain. No-op
+/// when no probes are installed (production).
+pub(crate) fn record_feed_commits_visited(commits: usize) {
+    let _ = current(|p| {
+        p.feed_commits_visited
+            .fetch_add(commits as u64, Ordering::Relaxed)
+    });
 }
 
 /// Per-operation staged-write counts, installed for a task via
