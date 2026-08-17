@@ -205,6 +205,20 @@ pub struct Omnigraph {
     coordinator: Arc<tokio::sync::RwLock<GraphCoordinator>>,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
+    /// Warm change-feed cut for this handle's bound branch. A cut (head,
+    /// witness, genesis, lineage projection, forward child index) is a PURE
+    /// projection of `__manifest`, so it is exactly valid while the manifest
+    /// incarnation is unchanged — the same probe the warm poll already pays.
+    /// Without this, every poll re-cloned the full commit map and re-walked to
+    /// genesis: O(total history) CPU/allocation per poll even when caught up.
+    /// Keyed by the incarnation; a stale entry misses and rebuilds, so this is
+    /// a non-authoritative hint per invariant 15.
+    feed_cut_cache: tokio::sync::RwLock<
+        Option<(
+            crate::db::manifest::ManifestIncarnation,
+            Arc<crate::changes::feed::ChangeFeedCut>,
+        )>,
+    >,
     /// Per-graph read caches: one shared Lance `Session` plus the held-`Dataset`
     /// handle cache, handed to live-Branch-read snapshots (via
     /// `resolved_target`) so table opens reuse handles (0 IO on a warm repeat)
@@ -537,6 +551,7 @@ impl Omnigraph {
             // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session.clone()),
             runtime_cache: RuntimeCache::default(),
+            feed_cut_cache: tokio::sync::RwLock::new(None),
             read_caches: Arc::new(crate::runtime_cache::ReadCaches {
                 session,
                 handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
@@ -692,6 +707,7 @@ impl Omnigraph {
             // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session.clone()),
             runtime_cache: RuntimeCache::default(),
+            feed_cut_cache: tokio::sync::RwLock::new(None),
             read_caches: Arc::new(crate::runtime_cache::ReadCaches {
                 session,
                 handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
@@ -1674,6 +1690,11 @@ impl Omnigraph {
     async fn invalidate_read_caches(&self) {
         self.runtime_cache.invalidate_all().await;
         self.read_caches.handles.invalidate_all().await;
+        // Hygiene, like the caches above: the incarnation key already makes a
+        // stale feed cut miss, but a same-branch refresh clears it so an
+        // e_tag-less substrate cannot serve a recreated branch's projection
+        // under a coincidentally-matching key.
+        *self.feed_cut_cache.write().await = None;
     }
 
     /// Re-read the handle-local coordinator state from storage AND run
@@ -2456,36 +2477,58 @@ impl Omnigraph {
         // does not grow with commit history. A different branch, or a stale
         // probe, falls back to the cold open / write-lock refresh.
         let requested = branch.as_deref();
-        let cut = {
-            let coord = self.coordinator.read().await;
-            if requested == coord.current_branch() {
-                let held = coord.manifest_incarnation();
-                if coord.probe_latest_incarnation().await?.matches(&held) {
-                    coord.build_change_feed_cut().await?
-                } else {
-                    drop(coord);
-                    let mut coord = self.coordinator.write().await;
-                    if requested == coord.current_branch() {
-                        let held = coord.manifest_incarnation();
-                        let mut refreshed = false;
-                        if !coord.probe_latest_incarnation().await?.matches(&held) {
-                            coord.refresh_for_live_read().await?;
-                            refreshed = true;
+        let cut =
+            {
+                let coord = self.coordinator.read().await;
+                if requested == coord.current_branch() {
+                    let held = coord.manifest_incarnation();
+                    if coord.probe_latest_incarnation().await?.matches(&held) {
+                        // The cut is a pure projection of the manifest, so while
+                        // the incarnation is unchanged the cached cut is exactly
+                        // valid — a caught-up poll then pays O(1) CPU instead of
+                        // re-cloning the whole lineage projection and re-walking
+                        // to genesis on every poll.
+                        let cached = self.feed_cut_cache.read().await.as_ref().and_then(
+                            |(incarnation, cut)| {
+                                (incarnation == &held && cut.branch.as_deref() == requested)
+                                    .then(|| Arc::clone(cut))
+                            },
+                        );
+                        match cached {
+                            Some(cut) => cut,
+                            None => {
+                                let cut = Arc::new(coord.build_change_feed_cut().await?);
+                                *self.feed_cut_cache.write().await = Some((held, Arc::clone(&cut)));
+                                cut
+                            }
                         }
-                        let cut = coord.build_change_feed_cut().await?;
-                        drop(coord);
-                        if refreshed {
-                            self.invalidate_read_caches().await;
-                        }
-                        cut
                     } else {
-                        coord.capture_change_cut(requested).await?
+                        drop(coord);
+                        let mut coord = self.coordinator.write().await;
+                        if requested == coord.current_branch() {
+                            let held = coord.manifest_incarnation();
+                            let mut refreshed = false;
+                            if !coord.probe_latest_incarnation().await?.matches(&held) {
+                                coord.refresh_for_live_read().await?;
+                                refreshed = true;
+                            }
+                            let refreshed_incarnation = coord.manifest_incarnation();
+                            let cut = Arc::new(coord.build_change_feed_cut().await?);
+                            drop(coord);
+                            if refreshed {
+                                self.invalidate_read_caches().await;
+                            }
+                            *self.feed_cut_cache.write().await =
+                                Some((refreshed_incarnation, Arc::clone(&cut)));
+                            cut
+                        } else {
+                            Arc::new(coord.capture_change_cut(requested).await?)
+                        }
                     }
+                } else {
+                    Arc::new(coord.capture_change_cut(requested).await?)
                 }
-            } else {
-                coord.capture_change_cut(requested).await?
-            }
-        };
+            };
         // The cut is captured; every per-commit snapshot reopen inside `poll`
         // happens after this and lock-free. Tests delete/recreate the polled
         // branch here to prove `commit_snapshot`'s incarnation re-prove fails
