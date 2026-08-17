@@ -367,10 +367,15 @@ snapshot.
 
 An optimization may skip this comparison only after inspecting every exact
 table transaction in the interval and proving that every operation is a mature,
-row-set-preserving shape used by OmniGraph. Missing transaction files, cleaned
-version holes, `Overwrite`, `Restore`, delete-capable `Update`, unknown/new
-operation variants, and experimental Lance operations all mean **unknown** and
-fall back to the exact ID comparison. The optimization is never authority.
+row-set-preserving shape used by OmniGraph. A `RewriteRows` `Update` proves this
+only by carrying a durable OmniGraph provenance marker (`omnigraph.no_by_source_delete`,
+stamped on every keyed write, or the `insert_absence` certificate) — the op
+shape alone is insufficient because `repair --force` can adopt an external Lance
+merge that persists a delete-capable `Update{RewriteRows}`. Missing transaction
+files, cleaned version holes, `Overwrite`, `Restore`, an unmarked or
+delete-capable `Update`, unknown/new operation variants, and experimental Lance
+operations all mean **unknown** and fall back to the exact ID comparison. The
+optimization is never authority.
 
 Forbidden delete shortcuts:
 
@@ -657,6 +662,11 @@ Extend existing owners before adding a new test silo: `changes.rs`,
   merge-delete, compaction, and missing transaction files.
 - A source-walk or exhaustive match makes new Lance `Operation` variants fall
   back to exact ID comparison until reviewed.
+- A `RewriteRows` `Update` prunes only with a durable OmniGraph provenance proof
+  (`omnigraph.no_by_source_delete` marker or `insert_absence`); a marker-less
+  `Update` (an external delete-capable merge adopted via `repair --force`) falls
+  back. The write path stamps the marker at the one keyed merge chokepoint and it
+  survives commit → `list_transactions`.
 
 ### G0 — graph semantics
 
@@ -856,19 +866,30 @@ implementation, recorded here so later phases inherit them:
   (the manifest diff — no data reads to compute) with the
   `_row_last_updated_at_version ∈ (begin, end]` window dropping carried-over rows,
   and each candidate is classified against a batched `id IN (chunk)` BTREE probe
-  of the parent using the same typed `rows_equal`/`emitted_image`. A prunable
-  interval has zero logical deletes (one transaction per commit + the D2 rule +
-  no delete-capable merge arm — locked by a `forbidden_apis.rs` guard), so the
-  pruned path needs no delete pass; any unproven op (delete, overwrite, restore,
-  compaction, a branch/lineage change, a non-advancing or oversized interval, a
-  missing/cleaned transaction) falls back to the exact merge. The
-  `changes_cost.rs` tripwire is now `assert_flat` on the pruned path (data reads
-  do not grow with table extent at fixed Δ, with a reconciled `id` BTREE — the
-  production steady state) with a companion growing tripwire for the fallback;
-  bounded per-page opens, Blob-lazy payload work, data-flat caught-up polls, and
-  the one-manifest-snapshot-per-commit backlog term are still pinned. Deferred:
-  the inductive per-write row-set-preserving certificate (a write-path change,
-  needed only if a delete-capable merge arm is ever introduced).
+  of the parent using the same typed `rows_equal`/`emitted_image`. A `RewriteRows`
+  `Update` is trusted as delete-free only with a **durable per-transaction
+  provenance proof** — the `omnigraph.no_by_source_delete` marker every OmniGraph
+  keyed write stamps (`table_store::stamp_no_by_source_delete` at the one keyed
+  merge chokepoint), or the RFC-023 `insert_absence` certificate. The op shape
+  plus the D2 rule and the retained `forbidden_apis.rs` source guard
+  (`no_delete_capable_merge_arm_in_engine_source`, now defense-in-depth) prove
+  only that *current engine code* builds no by-source-delete arm; they cannot
+  authenticate a *persisted* `Update` that `repair --force --confirm` may adopt
+  from an external Lance merge, whose child-only candidate scan would silently
+  drop the removed rows. So an `Update` carrying neither proof falls back to the
+  exact merge, as does any unproven op (delete, overwrite, restore, compaction, a
+  branch/lineage change, a non-advancing or oversized interval, a missing/cleaned
+  transaction). The `changes_cost.rs` tripwire is now `assert_flat` on the pruned
+  path (data reads do not grow with table extent at fixed Δ, with a reconciled
+  `id` BTREE — the production steady state) with a companion growing tripwire for
+  the fallback; bounded per-page opens, Blob-lazy payload work, data-flat
+  caught-up polls, and the one-manifest-snapshot-per-commit backlog term are
+  still pinned. Shipped: the inductive per-write row-set-preserving proof is the
+  read-advisory `no_by_source_delete` marker (stamped unconditionally on keyed
+  writes; a missing marker only forces the exact-merge fallback, never a
+  correctness change). It is required independently of whether a delete-capable
+  arm ever exists in engine, because the exposure is external *persisted* history
+  adopted by `repair --force`, not engine code.
 - **Typed structural equality** uses Arrow logical equality on one-row
   slices for non-Blob user columns and physical descriptor identity with an
   exact payload tie-break for Blob columns. Float comparison is bitwise.
