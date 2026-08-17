@@ -602,13 +602,21 @@ impl GraphCoordinator {
             .into_iter()
             .map(|commit| (commit.graph_commit_id.clone(), commit))
             .collect();
+        // One walk finds genesis AND builds the forward first-parent child
+        // index (chain member → its unique on-chain child), so a poll can walk
+        // FORWARD from its cursor bounded by its commit ceiling instead of
+        // cloning the whole unread backlog, and on-chain validation is O(1).
+        let mut first_parent_children = std::collections::HashMap::with_capacity(commits.len());
         let mut genesis = head.clone();
         loop {
             let commit = commits.get(&genesis).ok_or_else(|| {
                 OmniError::manifest_internal(format!("lineage chain is missing commit '{genesis}'"))
             })?;
             match &commit.parent_commit_id {
-                Some(parent) => genesis = parent.clone(),
+                Some(parent) => {
+                    first_parent_children.insert(parent.clone(), genesis.clone());
+                    genesis = parent.clone();
+                }
                 None => break,
             }
         }
@@ -618,6 +626,7 @@ impl GraphCoordinator {
             witness,
             genesis,
             commits,
+            first_parent_children,
         })
     }
 

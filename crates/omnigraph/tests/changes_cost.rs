@@ -408,13 +408,14 @@ async fn change_feed_backlog_walk_grows_with_commits_examined() {
                 io.data_open_count <= 2 * backlog,
                 "at most two pinned opens per effectful commit: {io:?}"
             );
-            // F4: the CPU/allocation term the IO counters cannot see. The poll
-            // clones the whole backlog into its first-parent chain, so this
-            // grows with the backlog even for a small page ceiling — pinned so a
-            // future forward-child projection (B1) that bounds it is measurable.
+            // The CPU term the IO counters cannot see: commits walked into the
+            // poll's forward chain. An unbounded-ceiling poll emits the whole
+            // backlog, so it walks exactly the backlog — the bounded-ceiling
+            // counterpart (`change_feed_small_ceiling_poll_is_bounded_across_
+            // backlog_depths`) pins that a small ceiling does NOT.
             assert_eq!(
                 io.feed_commits_visited, backlog,
-                "poll walks exactly the backlog into its chain: {io:?}"
+                "an unbounded-ceiling poll walks exactly the backlog: {io:?}"
             );
             eprintln!(
                 "BACKLOG commits={backlog}: data_open_count={} data_reads={} manifest_reads={} feed_commits_visited={}",
@@ -433,6 +434,104 @@ async fn change_feed_backlog_walk_grows_with_commits_examined() {
             |io| io.feed_commits_visited,
             1,
             "commits walked into the chain grow with the backlog (F4)",
+        );
+    })
+    .await;
+}
+
+/// A SMALL-ceiling poll over a growing backlog is bounded by the ceiling, not
+/// the backlog: `max_commits = 1` walks at most two commits into its forward
+/// chain (the one emitted plus one sentinel proving more remain), performs the
+/// manifest/data work of that one commit only, and stops at a boundary with
+/// `caught_up: false`. Before the forward-child projection, the poll cloned
+/// the ENTIRE unread backlog into a `Vec` (and walked it a second time for
+/// on-chain validation) before the ceiling was consulted — this cell pins that
+/// term flat so a regression to the backlog-proportional walk fails loudly.
+#[tokio::test]
+async fn change_feed_small_ceiling_poll_is_bounded_across_backlog_depths() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for backlog in [3u64, 9] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Omnigraph::init(
+                dir.path().to_str().unwrap(),
+                "node Person {\n    name: String @key\n    age: I32?\n}\n",
+            )
+            .await
+            .unwrap();
+            let now = db
+                .poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+                    branch: None,
+                    position: ChangeFeedPosition::Start(ChangeFeedStart::Now),
+                    scope: ChangeFeedScope::default(),
+                    max_changes: None,
+                    max_bytes: None,
+                    max_commits: None,
+                })
+                .await
+                .unwrap();
+            let cursor = match now.continuation {
+                omnigraph::changes::ChangeFeedContinuation::AtBlockBoundary { cursor, .. } => {
+                    cursor
+                }
+                other => panic!("expected boundary, got {other:?}"),
+            };
+            for row in 0..backlog {
+                db.load_with_receipt(
+                    "main",
+                    &format!(r#"{{"type":"Person","data":{{"name":"b-{row}","age":1}}}}"#),
+                    LoadMode::Merge,
+                )
+                .await
+                .unwrap();
+            }
+
+            let (page, io) = measure(db.poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+                branch: None,
+                position: ChangeFeedPosition::Cursor(cursor),
+                scope: ChangeFeedScope::default(),
+                max_changes: None,
+                max_bytes: None,
+                max_commits: Some(1),
+            }))
+            .await;
+            let page = page.unwrap();
+            assert_eq!(page.blocks.len(), 1, "the ceiling admits exactly one commit");
+            match &page.continuation {
+                omnigraph::changes::ChangeFeedContinuation::AtBlockBoundary {
+                    caught_up, ..
+                } => assert!(!caught_up, "more commits remain behind the ceiling"),
+                other => panic!("expected a boundary stop, got {other:?}"),
+            }
+            assert_eq!(
+                io.feed_commits_visited, 2,
+                "one emitted commit plus one sentinel, regardless of backlog: {io:?}"
+            );
+            eprintln!(
+                "SMALL-CEILING backlog={backlog}: data_open_count={} manifest_reads={} feed_commits_visited={}",
+                io.data_open_count, io.manifest_reads, io.feed_commits_visited,
+            );
+            curve.push((backlog, io));
+        }
+        assert_flat(
+            &curve,
+            |io| io.feed_commits_visited,
+            0,
+            "small-ceiling chain walk is bounded by the ceiling, not the backlog",
+        );
+        assert_flat(
+            &curve,
+            |io| io.manifest_reads,
+            0,
+            "small-ceiling poll resolves only its one commit's snapshots",
+        );
+        assert_flat(
+            &curve,
+            |io| io.data_open_count,
+            0,
+            "small-ceiling poll opens only its one commit's changed interval",
         );
     })
     .await;

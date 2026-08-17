@@ -36,28 +36,54 @@ pub(crate) struct ChangeFeedCut {
     pub(crate) witness: String,
     pub(crate) genesis: String,
     pub(crate) commits: HashMap<String, GraphCommit>,
+    /// Forward first-parent child index over this cut's head→genesis chain:
+    /// chain member → its unique child ON the chain (head has none). Built
+    /// during cut construction by the same walk that finds genesis, it makes
+    /// on-chain membership O(1) and lets a poll walk FORWARD from its cursor
+    /// bounded by `max_commits`, instead of cloning the whole unread backlog
+    /// into a `Vec` before the ceiling is consulted.
+    pub(crate) first_parent_children: HashMap<String, String>,
 }
 
 impl ChangeFeedCut {
-    /// The first-parent chain strictly after `after`, from `from` (inclusive)
-    /// down, returned oldest-first. `None` when `after` is not an ancestor of
-    /// (or equal to) `from` on this chain.
-    fn chain_after(&self, from: &str, after: &str) -> Option<Vec<String>> {
+    /// Up to `limit + 1` commits of the first-parent chain strictly after
+    /// `after` and at most up to `from` (inclusive), walking FORWARD via the
+    /// child index, oldest-first. The one element past `limit` is a sentinel
+    /// proving more commits remain, so the caller can distinguish a ceiling
+    /// stop from a caught-up walk without materializing the backlog. `None`
+    /// when either endpoint is off this cut's chain or `from` is behind
+    /// `after` (both endpoints originate from checksummed continuations, whose
+    /// mint order guarantees `after` is an ancestor of its `from`; a stale or
+    /// cross-cut pairing surfaces as the walk running past `from`'s position
+    /// into the head without meeting it).
+    fn chain_after(&self, from: &str, after: &str, limit: usize) -> Option<Vec<String>> {
+        if !self.is_on_chain(from) || !self.is_on_chain(after) {
+            return None;
+        }
+        if after == from {
+            return Some(Vec::new());
+        }
         let mut chain = Vec::new();
-        let mut cursor = from.to_string();
-        loop {
-            if cursor == after {
-                chain.reverse();
+        let mut cursor = after;
+        while chain.len() <= limit {
+            // Running past the head without meeting `from` means `from` is not
+            // ahead of `after` on this chain.
+            let child = self.first_parent_children.get(cursor)?;
+            chain.push(child.clone());
+            if child == from {
                 return Some(chain);
             }
-            let commit = self.commits.get(&cursor)?;
-            chain.push(cursor.clone());
-            cursor = commit.parent_commit_id.clone()?;
+            cursor = child;
         }
+        // Ceiling reached with `from` still ahead: `chain[..limit]` is a valid
+        // oldest-first prefix of `(after, from]`, plus one sentinel element.
+        Some(chain)
     }
 
+    /// O(1): every chain member except the head is a key of the child index;
+    /// the head is on the chain by definition.
     fn is_on_chain(&self, commit_id: &str) -> bool {
-        self.chain_after(&self.head, commit_id).is_some()
+        commit_id == self.head || self.first_parent_children.contains_key(commit_id)
     }
 }
 
@@ -215,16 +241,20 @@ pub(crate) async fn poll(
     };
 
     let position = resolve_position(&scope, cut, &request.position)?;
-    let Some(chain) = cut.chain_after(&position.cut_commit_id, &position.after_commit_id) else {
+    let Some(chain) = cut.chain_after(
+        &position.cut_commit_id,
+        &position.after_commit_id,
+        max_commits,
+    ) else {
         return Err(cursor_rejected(
             "change feed continuation names a commit outside this branch's first-parent chain",
         ));
     };
-    // The chain is the whole backlog (cut head → cursor), cloned commit-by-commit
-    // by `chain_after`. Record its length so a cost test can see this CPU term
-    // grow with the backlog — it is invisible to the manifest/data IO counters,
-    // and a small-ceiling poll over a large backlog still walks the full chain
-    // until the forward-child projection (B1) bounds the visit.
+    // Commits actually walked into this poll's forward chain: bounded by
+    // `max_commits + 1` (the sentinel), NOT the backlog — the forward-child
+    // index replaced the head→cursor clone that visited the whole unread
+    // backlog before the ceiling was consulted. On-chain validation is O(1)
+    // membership, so this counter is the poll's complete chain-walk CPU term.
     crate::instrumentation::record_feed_commits_visited(chain.len());
     if chain.is_empty() {
         return Ok(ChangeFeedPage {
