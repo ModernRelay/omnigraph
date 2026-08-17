@@ -13,7 +13,7 @@ name = "omnigraph"
 
 [features]
 default = []
-failpoints = ["dep:fail", "fail/failpoints"]
+failpoints = ["dep:fail-parallel", "fail-parallel/failpoints"]
 
 [dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.10.0" }
@@ -49,7 +49,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
-fail = { workspace = true, optional = true }
+fail-parallel = { workspace = true, optional = true }
 time = { workspace = true }
 async-trait = { workspace = true }
 url = { workspace = true }

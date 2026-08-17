@@ -1,0 +1,104 @@
+# Detector census — the verdict/detector taxonomy, GENERATED from
+# crates/omnigraph-dst/src/detectors.rs (guard 1).
+# Do not edit by hand: regenerate via the DST_REGEN_CENSUS flow in
+# detectors.rs tests; `census_golden_matches_code` diffs this file
+# against the code on every suite run.
+#
+# verdict = observation + independent expectation + mechanical comparison
+# detector = one (observation source, oracle) pair — the unit that fires;
+# an oracle listed with two sources is two detectors.
+#
+# 21 oracles: differential 7 / prediction 4 / obligation 8 / meta 2 (named-mechanism grain;
+# new oracles enter by deliberate census bump).
+
+[differential]  expectation = model state
+WorldDifferential
+  sources: Store(Query)
+  anchor:  harness.rs::assert_world_matches (continuous, every 3rd op + final audit)
+  doc:     the whole observable world — branch list plus every branch's persons and edges, read via real traversal — equals the model state
+MembershipQuery
+  sources: Store(Query)
+  anchor:  harness.rs::run_universe mid-run get_person check
+  doc:     one live point query (get_person) through the full read path agrees with the model on a row's presence
+ReadOnlyAudit
+  sources: Store(Query)
+  anchor:  harness.rs::assert_matches_model at the final audit's read-only reopen
+  doc:     the read-only open path renders main equal to the model (main only; branch RO reads are a candidate widening)
+PhysicalExport
+  sources: Store(Physical)
+  anchor:  harness.rs::assert_physical_matches (final audit, every branch)
+  doc:     the stored-row dump via export_jsonl equals the model's physical expectation — persons exactly, Knows = logical ∪ ghosts
+HistoryDifferential
+  sources: Store(History)
+  anchor:  harness.rs::assert_history_matches (final audit)
+  doc:     every recorded commit re-read via ReadTarget::Snapshot equals the model's memory of that moment, plus a conservative Person diff over adjacent commits
+TraversalModeDifferential
+  sources: Store(Query)
+  anchor:  harness.rs::assert_traversal_modes_agree (every check + final audit)
+  doc:     forced-indexed, forced-CSR, and the model agree pairwise, and the bound-edge arm equals logical ∪ ghosts exactly (#474's delta as a checked contract)
+SessionDifferential
+  sources: Store(Session)
+  anchor:  harness.rs::check_sessions (three sessions per universe)
+  doc:     actor, fresh, and bystander sessions stay coherent — actor strict-equal, bystander view ∈ history ∪ current and monotone — with the model as arbiter
+
+[prediction]  expectation = the model's per-op prediction
+OpArbitration
+  sources: Store(Query), Store(Physical)
+  anchor:  harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break)
+  doc:     after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects
+MergePrediction
+  sources: Store(Claim)
+  anchor:  harness.rs::predict_merge + the accept/conflict asserts around branch_merge
+  doc:     the engine's merge accept/conflict decision matches the model's three-way prediction, asserted in both directions
+LegalRejection
+  sources: Store(Claim), Store(Query)
+  anchor:  harness.rs::is_legal_rejection
+  doc:     every op failure matches the written-down definite-error catalog — an unlisted rejection is a red, not a shrug
+AckLossArbitration
+  sources: Store(Claim), Store(Query)
+  anchor:  harness.rs::reconcile_after_failure via FailingStorage::lose_ack routing
+  doc:     an ack-lost write's outcome is arbitrated Applied-or-NotApplied against the durable world — never double-applied, never silently retried
+
+[obligation]  expectation = a standing contract
+CrashContract
+  sources: Store(Query)
+  anchor:  harness.rs::reconcile_after_failure (legal-state + monotonicity asserts)
+  doc:     the two-sided crash contract: atomicity (no partial application) and recovery monotonicity (no demoted commit, no deleted durable fork)
+BirthContract
+  sources: Store(Claim)
+  anchor:  harness.rs::run_birth_universe / run_open_crash_universe
+  doc:     a store that dies during init is honestly-unopenable or indistinguishable from never-inited, and a crashed open is effect-free
+RecoveryObligation
+  sources: Store(Physical)
+  anchor:  harness.rs::reconcile_after_failure residue check (recovery_residue)
+  doc:     a successful read-write reopen leaves __recovery/ empty — recovery may not silently do nothing (added after the recovery-no-op honesty audit)
+ResidueObligation
+  sources: Store(Physical)
+  anchor:  harness.rs final audit residue check + tests::dst_residue_channel_sees_planted_file
+  doc:     no universe ends owing recovery work: __recovery/ empty at quiesce, backed by the planted-file channel canary
+MaintenanceObligations
+  sources: Store(Query)
+  anchor:  harness.rs::maintenance_obligations
+  doc:     after every maintenance death the rerun converges (idempotence), post-Cleanup state stays readable, and indexes agree immediately
+DetectedOrHarmless
+  sources: Store(Claim)
+  anchor:  harness.rs damage-attribution window (corruption_detections)
+  doc:     an injected storage lie is either surfaced as an error attributed by damage-ledger overlap or provably harmless — never a silent wrong answer
+CommitIdUniqueness
+  sources: Store(History)
+  anchor:  harness.rs final audit list_commits walk
+  doc:     no two commits in one branch's history share a graph_commit_id (the OCC invariant; cross-branch reuse is legal shared-fork lineage)
+LivenessBound
+  sources: Time
+  anchor:  harness.rs final audit ensure_indices timeout (real clock)
+  doc:     convergence completes within the real-clock bound — the deadlock detector every state oracle is blind to
+
+[meta]  expectation = the harness's own guarantees
+StrictReplay
+  sources: HarnessOutput
+  anchor:  tests/scenarios.rs replay pins (run twice, compare UniverseReport)
+  doc:     the same seed reproduces an equal UniverseReport, row order included (adapter-realm and crash universes; the lance-realm carve-out is documented on the report)
+SensitivityProof
+  sources: HarnessOutput
+  anchor:  tests/scenarios.rs dst_*_sensitivity_* + the seeded honesty procedures
+  doc:     a deliberately planted defect turns the guarded oracle red — a green is trusted only after a manufactured red

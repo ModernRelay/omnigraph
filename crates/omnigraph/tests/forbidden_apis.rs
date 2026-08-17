@@ -219,7 +219,7 @@ macro_rules! write_surfaces {
 }
 
 write_surfaces! {
-    "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options"],
+    "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options", "init_with_storage"],
     "db/omnigraph.rs" => WriteProtocol::RecoveryExecutor => ["open", "open_with_storage", "refresh"],
     "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_with_receipt", "mutate_as", "mutate_as_with_receipt", "mutate_as_with_expected_head", "mutate_as_with_expected_head_receipt"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_with_receipt", "load_file", "load_graph_batch"],
@@ -242,6 +242,7 @@ write_surfaces! {
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
+    ("db/omnigraph.rs", "open_read_only_with_storage"),
     ("db/omnigraph/export.rs", "capture_served_export_cut"),
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "plan_schema_with_options"),

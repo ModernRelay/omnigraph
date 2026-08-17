@@ -339,7 +339,9 @@ impl Omnigraph {
         Self::init_with_storage(uri, schema_source, storage_for_uri(uri)?, options).await
     }
 
-    pub(crate) async fn init_with_storage(
+    // DST spike (task 0031): widened from pub(crate) so the spike harness can
+    // init against an injected in-memory adapter. Real PR designs this properly.
+    pub async fn init_with_storage(
         uri: &str,
         schema_source: &str,
         storage: Arc<dyn StorageAdapter>,
@@ -573,6 +575,15 @@ impl Omnigraph {
     /// decorator for IO-budget tests). Defaults to `OpenMode::ReadWrite`.
     pub async fn open_with_storage(uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
         Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
+    }
+
+    // DST spike (task 0031): read-only twin, so the harness can audit the
+    // same universe through the read-only open path (third-view oracle).
+    pub async fn open_read_only_with_storage(
+        uri: &str,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<Self> {
+        Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadOnly).await
     }
 
     pub(crate) async fn open_with_storage_and_mode(
@@ -3202,7 +3213,10 @@ fn blob_properties_for_table_key<'a>(
 /// table entry and refuse every older snapshot rather than inferring identity
 /// from Lance field IDs or positions, even when no rename occurred.
 fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
-    let node_names = catalog.node_types.keys().cloned().collect::<Vec<_>>();
+    // Canonically ordered walk (DST determinism: hash order must not leak
+    // into schema fixups).
+    let mut node_names = catalog.node_types.keys().cloned().collect::<Vec<_>>();
+    node_names.sort();
     for name in node_names {
         let stable_property_ids = catalog.node_types[&name]
             .properties
@@ -3229,7 +3243,8 @@ fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
             &format!("node:{name}"),
         )?;
     }
-    let edge_names = catalog.edge_types.keys().cloned().collect::<Vec<_>>();
+    let mut edge_names = catalog.edge_types.keys().cloned().collect::<Vec<_>>();
+    edge_names.sort();
     for name in edge_names {
         let stable_property_ids = catalog.edge_types[&name]
             .properties

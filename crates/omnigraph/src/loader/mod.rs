@@ -357,6 +357,11 @@ impl Omnigraph {
                 )
                 .await?;
                 branch_created = true;
+                // DST window (loader walk D1 → D2): the implicit fork is
+                // durable, the load has not begun.
+                crate::failpoints::maybe_fail(
+                    crate::failpoints::names::LOAD_POST_BRANCH_CREATE_PRE_STAGE,
+                )?;
             }
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
@@ -665,7 +670,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let mut node_id_remap = TypedNodeIdRemap::default();
     let mut prepared_nodes: Vec<(String, String, Vec<RecordBatch>, usize)> =
         Vec::with_capacity(node_rows.len().saturating_add(strict_nodes.len()));
-    for (type_name, rows) in &node_rows {
+    let mut __dst_nr: Vec<_> = node_rows.iter().collect();
+    __dst_nr.sort_by(|a, b| a.0.cmp(b.0));
+    for (type_name, rows) in __dst_nr {
         let node_type = &catalog.node_types[type_name];
         let batch = build_node_batch(node_type, rows, &mut node_id_remap)?;
         // Validation (value/enum/unique) runs end-of-load via the evaluator.
@@ -676,7 +683,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
         prepared_nodes.push((type_name.clone(), table_key, vec![batch], loaded_count));
     }
-    for (type_name, rows) in strict_nodes {
+    let mut __dst_sn: Vec<_> = strict_nodes.into_iter().collect();
+    __dst_sn.sort_by(|a, b| a.0.cmp(&b.0));
+    for (type_name, rows) in __dst_sn {
         let table_key = format!("node:{type_name}");
         let _entry = snapshot
             .entry(&table_key)
@@ -716,7 +725,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // runs end-of-load via the unified evaluator, below.
     let mut prepared_edges: Vec<(String, String, Vec<RecordBatch>, usize)> =
         Vec::with_capacity(edge_rows.len().saturating_add(strict_edges.len()));
-    for (edge_name, rows) in &edge_rows {
+    let mut __dst_er: Vec<_> = edge_rows.iter().collect();
+    __dst_er.sort_by(|a, b| a.0.cmp(b.0));
+    for (edge_name, rows) in __dst_er {
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows, &node_id_remap)?;
         // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
@@ -727,7 +738,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
         prepared_edges.push((edge_name.clone(), table_key, vec![batch], loaded_count));
     }
-    for (edge_name, rows) in strict_edges {
+    let mut __dst_se: Vec<_> = strict_edges.into_iter().collect();
+    __dst_se.sort_by(|a, b| a.0.cmp(&b.0));
+    for (edge_name, rows) in __dst_se {
         let table_key = format!("edge:{edge_name}");
         let _entry = snapshot
             .entry(&table_key)
@@ -2655,7 +2668,7 @@ fn load_write_concurrency() -> usize {
 }
 
 fn generate_id() -> String {
-    ulid::Ulid::new().to_string()
+    crate::dst_ids::new_ulid().to_string()
 }
 
 pub(crate) fn parse_date32_literal(value: &str) -> Result<i32> {
@@ -2783,7 +2796,9 @@ pub(crate) fn validate_enum_constraints(
 ) -> Result<()> {
     use arrow_array::{Array, ListArray};
 
-    for (prop_name, prop_type) in properties {
+    let mut __dst_pp: Vec<_> = properties.iter().collect();
+    __dst_pp.sort_by(|a, b| a.0.cmp(b.0));
+    for (prop_name, prop_type) in __dst_pp {
         let Some(allowed) = prop_type.enum_values.as_ref() else {
             continue;
         };

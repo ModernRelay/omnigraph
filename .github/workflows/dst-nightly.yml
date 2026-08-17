@@ -1,0 +1,109 @@
+# DST nightly tier: the volume hunts — hours,
+# nobody waits, runs latest main (which already passed the per-PR tier).
+# Seed-space discipline (the exploration planner's design): every night
+# owns a fresh DISJOINT interval derived from the date, so no two nights
+# overlap and any past night's failure replays from its logged seed line.
+# The D5 law binds here: volume without fresh territory flattens — the
+# date-derived base gives fresh seeds automatically; fresh RECIPES come
+# from the territory ledger's demand list (test_harness/ in the campaign
+# workspace; planner integration is the recorded follow-up).
+#
+# A failure does not block anything: the shard goes red, the log carries
+# the seed+arm row and (deterministic fleet) the D1 auto-replay BUNDLE —
+# triage next morning starts from a transcript, not a log dig.
+name: DST nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: --cfg tokio_unstable
+
+jobs:
+  det-fleet:
+    name: Deterministic fleet (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: dst
+          save-if: false
+      # Disjoint interval: 1000 seeds/night from the epoch 2026-08-14;
+      # det-fleet owns offsets 0..360 (6 shards x 60 seeds). Failures are
+      # replayable seeds; the pass log carries the D1 bundles.
+      - name: Fleet shard
+        run: |
+          days=$(( ( $(date -u +%s) - $(date -u -d 2026-08-14 +%s) ) / 86400 ))
+          export DST_FLEET_SEED_BASE=$(( 200000 + days * 1000 + ${{ matrix.shard }} * 60 ))
+          export DST_FLEET_SEEDS=60
+          echo "night base interval: $DST_FLEET_SEED_BASE (+60)"
+          cargo test -p omnigraph-dst --locked --test scenarios dst_fleet -- --exact --ignored --nocapture
+
+  concurrent-fleet:
+    name: Concurrent fleet ${{ matrix.mode }} (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+        mode: [wild, sched]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: dst
+          save-if: false
+      # Two regimes, per the measured doctrine: `wild` hunts with real
+      # simultaneity (unquiesced pools; failures are logs — law 23);
+      # `sched` runs under the storage-call arbiter (quiesced-scope
+      # replay). Offsets 600..660 (wild) and 800..860 (sched) inside the
+      # night's interval keep every job disjoint.
+      - name: Concurrent shard
+        run: |
+          days=$(( ( $(date -u +%s) - $(date -u -d 2026-08-14 +%s) ) / 86400 ))
+          offset=600
+          if [ "${{ matrix.mode }}" = "sched" ]; then
+            offset=800
+            export OMNIGRAPH_DST_SEAM_SCHEDULE=1
+          else
+            export LANCE_CPU_THREADS=4
+            export RAYON_NUM_THREADS=4
+          fi
+          base=$(( 200000 + days * 1000 + offset + ${{ matrix.shard }} * 15 ))
+          export OMNIGRAPH_DST_SEEDS=$(seq -s, "$base" $(( base + 14 )))
+          echo "night seeds: $OMNIGRAPH_DST_SEEDS (mode ${{ matrix.mode }})"
+          cargo test -p omnigraph-dst --locked --test scenarios dst_concurrent_fleet -- --exact --ignored --nocapture

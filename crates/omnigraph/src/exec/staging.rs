@@ -364,7 +364,9 @@ impl MutationStaging {
     /// and loader write paths so their validation input cannot drift.
     pub(crate) fn to_changeset(&self) -> crate::validate::ChangeSet {
         let mut changeset = crate::validate::ChangeSet::new();
-        for table_key in self.pending.keys() {
+        let mut __dst_pk: Vec<_> = self.pending.keys().collect();
+        __dst_pk.sort();
+        for table_key in __dst_pk {
             let batches = self.pending_batches(table_key);
             if batches.is_empty() {
                 continue;
@@ -376,7 +378,9 @@ impl MutationStaging {
         // Deletes (disjoint from `pending` by D₂) carry their removed ids so the
         // evaluator recounts the srcs a delete empties (`@card`) and sees removed
         // rows for RI — the faithful change-set the merge path also builds.
-        for (table_key, ids) in &self.deleted_ids {
+        let mut __dst_di: Vec<_> = self.deleted_ids.iter().collect();
+        __dst_di.sort_by(|a, b| a.0.cmp(b.0));
+        for (table_key, ids) in __dst_di {
             if ids.is_empty() {
                 continue;
             }
@@ -471,7 +475,9 @@ impl MutationStaging {
 
         let mut stage_inputs: Vec<(String, PreparedPendingTable, StagedTablePath, u64)> =
             Vec::with_capacity(pending.len());
-        for (table_key, table) in pending {
+        let mut __dst_pt: Vec<_> = pending.into_iter().collect();
+        __dst_pt.sort_by(|a, b| a.0.cmp(&b.0));
+        for (table_key, table) in __dst_pt {
             let path = paths.get(&table_key).cloned().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "MutationStaging::stage_all: missing path for table '{}'",
@@ -548,8 +554,16 @@ impl MutationStaging {
         }
         let concurrency = concurrency.min(stage_inputs.len()).max(1);
         let mut staged_entries: Vec<StagedTableEntry> =
-            futures::stream::iter(stage_inputs.into_iter().map(
-                |(table_key, table, path, expected)| async move {
+            futures::stream::iter(stage_inputs.into_iter().enumerate().map(
+                |(stage_idx, (table_key, table, path, expected))| async move {
+                    // DST window (loader walk, inside D2): between per-table
+                    // fragment uploads — a partial staged set with no
+                    // breadcrumb (benign by construction; cleanup reclaims).
+                    if stage_idx > 0 {
+                        crate::failpoints::maybe_fail(
+                            crate::failpoints::names::LOAD_BETWEEN_TABLE_STAGES,
+                        )?;
+                    }
                     stage_pending_table(db, table_key, table, path, expected).await
                 },
             ))
@@ -572,7 +586,9 @@ impl MutationStaging {
         // predicate matching zero committed rows yields `None` and is skipped
         // (the staged equivalent of the old "skip record_inline on 0 rows" —
         // no inline HEAD advance, closing the zero-row drift class).
-        for (table_key, predicates) in delete_predicates {
+        let mut __dst_dp: Vec<_> = delete_predicates.into_iter().collect();
+        __dst_dp.sort_by(|a, b| a.0.cmp(&b.0));
+        for (table_key, predicates) in __dst_dp {
             let path = paths.get(&table_key).cloned().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "MutationStaging::stage_all: missing path for delete table '{}'",
@@ -886,7 +902,7 @@ fn pre_minted_transaction_identity(
         // Lance treats the UUID as an opaque transaction identity/path
         // component. A ULID is equally unique and filesystem-safe while
         // avoiding a second UUID generator in the engine surface.
-        uuid: format!("omnigraph-{}", ulid::Ulid::new()),
+        uuid: format!("omnigraph-{}", crate::dst_ids::new_ulid()),
     }
 }
 
@@ -976,7 +992,7 @@ pub(crate) struct CommittedMutation {
     /// Root schema, coarse branch, and sorted `(table, branch)` guards. The
     /// caller MUST hold the complete set across manifest publish (see
     /// `commit_all`) so no same-process writer interleaves after revalidation.
-    pub(crate) guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+    pub(crate) guards: Vec<crate::db::write_queue::QueueGuard>,
 }
 
 impl StagedMutation {

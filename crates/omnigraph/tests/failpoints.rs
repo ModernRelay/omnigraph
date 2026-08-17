@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::Schema;
-use fail::FailScenario;
 use lance::Dataset;
 use lance::dataset::{CommitBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::failpoints::FailScenario;
 use omnigraph::failpoints::ScopedFailPoint;
 use omnigraph::failpoints::names;
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};

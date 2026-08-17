@@ -328,9 +328,21 @@ impl ObjectStorageAdapter {
                     StorageError::internal(format!("invalid s3 object path for '{}': {}", uri, err))
                 })
             }
-            UriCodec::Memory => ObjectPath::parse(uri.trim_start_matches('/')).map_err(|err| {
-                StorageError::internal(format!("invalid memory object path for '{}': {}", uri, err))
-            }),
+            UriCodec::Memory => {
+                // DST spike (task 0031): accept scheme-carrying roots
+                // (shared-memory://name/key) — scheme is namespacing only; the
+                // authority+path becomes the opaque key.
+                let key = match uri.find("://") {
+                    Some(idx) => &uri[idx + 3..],
+                    None => uri,
+                };
+                ObjectPath::parse(key.trim_start_matches('/')).map_err(|err| {
+                    StorageError::internal(format!(
+                        "invalid memory object path for '{}': {}",
+                        uri, err
+                    ))
+                })
+            }
         }
     }
 
@@ -849,6 +861,11 @@ pub fn storage_handle_for_uri(uri: &str) -> Result<StorageHandle> {
 }
 
 pub fn normalize_root_uri(uri: &str) -> Result<String> {
+    // DST spike (task 0031): Lance's `shared-memory://` scheme is opaque —
+    // normalized like other object-store URIs, never as a local path.
+    if uri.starts_with("shared-memory://") {
+        return Ok(trim_trailing_slashes(uri));
+    }
     match storage_kind_for_uri(uri) {
         StorageKind::Local => {
             let path = local_path_from_uri(uri)?;

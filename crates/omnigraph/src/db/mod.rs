@@ -108,7 +108,7 @@ pub(crate) fn is_internal_system_branch(name: &str) -> bool {
 /// helper so the clock-error mapping (variant + message) cannot drift across
 /// the call sites that record those timestamps.
 pub(crate) fn now_micros() -> Result<i64> {
-    let duration = std::time::SystemTime::now()
+    let duration = crate::dst_clock::system_time_now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| OmniError::manifest(format!("system clock before UNIX_EPOCH: {e}")))?;
     Ok(duration.as_micros() as i64)

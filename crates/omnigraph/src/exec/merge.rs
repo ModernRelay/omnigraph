@@ -1951,7 +1951,9 @@ fn validation_projection(catalog: &Catalog, table_key: &str) -> Vec<String> {
     let mut cols = vec!["id".to_string()];
     if let Some(name) = table_key.strip_prefix("node:") {
         if let Some(node_type) = catalog.node_types.get(name) {
-            for (prop, ty) in &node_type.properties {
+            let mut __dst_np: Vec<_> = node_type.properties.iter().collect();
+            __dst_np.sort_by(|a, b| a.0.cmp(b.0));
+            for (prop, ty) in __dst_np {
                 if !is_heavy(ty) {
                     cols.push(prop.clone());
                 }
@@ -1961,7 +1963,9 @@ fn validation_projection(catalog: &Catalog, table_key: &str) -> Vec<String> {
         cols.push("src".to_string());
         cols.push("dst".to_string());
         if let Some(edge_type) = catalog.edge_types.get(name) {
-            for (prop, ty) in &edge_type.properties {
+            let mut __dst_ep: Vec<_> = edge_type.properties.iter().collect();
+            __dst_ep.sort_by(|a, b| a.0.cmp(b.0));
+            for (prop, ty) in __dst_ep {
                 if !is_heavy(ty) {
                     cols.push(prop.clone());
                 }
@@ -2381,7 +2385,7 @@ fn pre_minted_merge_transaction(
 ) -> crate::table_store::StagedTransactionIdentity {
     crate::table_store::StagedTransactionIdentity {
         read_version,
-        uuid: format!("omnigraph-merge-{}", ulid::Ulid::new()),
+        uuid: format!("omnigraph-merge-{}", crate::dst_ids::new_ulid()),
     }
 }
 
@@ -3845,7 +3849,9 @@ impl Omnigraph {
                 )),
             ));
         }
-        for (table_key, candidate) in &candidates {
+        let mut __dst_cand: Vec<_> = candidates.iter().collect();
+        __dst_cand.sort_by(|a, b| a.0.cmp(b.0));
+        for (table_key, candidate) in __dst_cand {
             if let CandidateTableState::AdoptPureInserts(proven) = candidate {
                 revalidate_proven_pure_insert_source(
                     self,

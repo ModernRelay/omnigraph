@@ -630,7 +630,7 @@ impl GraphCoordinator {
         merged_parent_commit_id: Option<String>,
     ) -> Result<LineageIntent> {
         Ok(LineageIntent {
-            graph_commit_id: ulid::Ulid::new().to_string(),
+            graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             branch: self.current_branch().map(str::to_string),
             actor_id: actor_id.map(str::to_string),
             merged_parent_commit_id,

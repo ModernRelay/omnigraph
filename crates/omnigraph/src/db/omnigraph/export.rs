@@ -371,7 +371,9 @@ async fn export_blob_values(
     blob_properties: &std::collections::HashSet<String>,
 ) -> Result<HashMap<String, Vec<Option<String>>>> {
     let mut values = HashMap::with_capacity(blob_properties.len());
-    for property in blob_properties {
+    let mut __dst_props: Vec<_> = blob_properties.iter().collect();
+    __dst_props.sort();
+    for property in __dst_props {
         let descriptions = batch
             .column_by_name(property)
             .and_then(|col| col.as_any().downcast_ref::<StructArray>())

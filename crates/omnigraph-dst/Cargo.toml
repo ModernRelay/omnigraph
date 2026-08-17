@@ -1,0 +1,38 @@
+# omnigraph's deterministic-simulation-testing crate —
+# the slatedb-dst pattern. Owns the harness, oracles, catalogs, instruments,
+# and its own fixtures; the engine keeps only the injection seams.
+# Build from this directory (its .cargo/config.toml sets the required
+# --cfg tokio_unstable): cd crates/omnigraph-dst && cargo test.
+[package]
+name = "omnigraph-dst"
+version = "0.10.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["failpoints"]
+failpoints = ["omnigraph-engine/failpoints", "dep:fail-parallel"]
+
+[dependencies]
+omnigraph-engine = { path = "../omnigraph", version = "0.10.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.10.0" }
+arrow-array = { workspace = true }
+lance-core = { workspace = true }
+lance-io = { workspace = true }
+object_store = { workspace = true }
+bytes = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+fail-parallel = { workspace = true, optional = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serial_test = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
