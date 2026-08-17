@@ -1231,6 +1231,111 @@ async fn cross_branch_diff_detects_same_length_blob_update_between_sibling_branc
     );
 }
 
+/// `LoadMode::Overwrite` restarts Lance fragment ids at 0, so the before image
+/// (old fragment 0) and the after image (new fragment 0) collide on a
+/// fragment-qualified managed identity even within one lineage — a same-length
+/// Blob-only overwrite is silently dropped. The identity must be qualified by
+/// the immutable data-file path (a per-file UUID that overwrite never reuses),
+/// not the numeric fragment id.
+#[tokio::test]
+async fn commit_changes_detects_same_length_blob_update_after_overwrite() {
+    use omnigraph::changes::{ChangeFeedScope, ChangeOpKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let overwritten = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+    let page = db
+        .commit_changes_page(
+            &overwritten.commit.graph_commit_id,
+            &ChangeFeedScope::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.block.changes.len(),
+        1,
+        "same-length Blob update after Overwrite was dropped (fragment-id reuse)"
+    );
+    let change = &page.block.changes[0];
+    assert_eq!(change.id, "doc");
+    assert_eq!(change.op, ChangeOpKind::Update);
+    assert_eq!(
+        change.after.as_ref().unwrap().properties["payload"],
+        serde_json::json!("base64:Qg==")
+    );
+}
+
+/// The durable feed shares the enumerator, so the Overwrite same-length
+/// Blob-only update must also survive `poll_change_feed`.
+#[tokio::test]
+async fn change_feed_detects_same_length_blob_update_after_overwrite() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart, ChangeOpKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let now = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap();
+    let (cursor, _) = boundary_cursor(&now);
+
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    let page = db
+        .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(cursor)))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.blocks.len(),
+        1,
+        "the feed dropped the Overwrite Blob update"
+    );
+    let changes = &page.blocks[0].changes;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].id, "doc");
+    assert_eq!(changes[0].op, ChangeOpKind::Update);
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["payload"],
+        serde_json::json!("base64:Qg==")
+    );
+}
+
 #[tokio::test]
 async fn commit_changes_are_exact_ordered_and_bounded() {
     use omnigraph::changes::{ChangeEntityKind, ChangeFeedScope, ChangeOpKind};
