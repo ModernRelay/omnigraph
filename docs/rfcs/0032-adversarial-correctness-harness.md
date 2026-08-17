@@ -61,6 +61,12 @@ do not claim that two agreeing implementations must be correct, that a replay
 proves semantics, or that bounded crash/schedule search proves the absence of
 bugs (§6 records why a second full graph implementation is rejected).
 
+**Amendment note (2026-08-17).** §13 records the deterministic simulation
+harness (PR #507, in review) as an execution layer this RFC's instruments can
+also run on, notes the stronger determinism contract now available beside
+§3.3, and corrects two §6 entries against measured evidence. Nothing in
+§§1-12 is restructured; each affected section is engaged in place.
+
 ## 1. Why the existing instruments do not cover this
 
 | Instrument | Provides | Cannot |
@@ -588,3 +594,74 @@ Each phase lands with its §9 gate. No phase blocks RFC-031's implementation.
    transcript vs. both).
 3. **shuttle seam shape** — cfg alias inside the modules vs. extracting the
    lock-order core into a shape both production and shuttle drive.
+
+## 13. Amendment (2026-08-17): the deterministic execution layer
+
+Added after the original draft. Since this RFC merged, DST v1 (the first
+iteration of the project's deterministic simulation testing) built and
+measured a harness that runs engine operations in a fully seeded simulated
+world; its design document is the deterministic simulation RFC (PR #507, in
+review). That RFC's unresolved question 1 asked whether it should amend this
+RFC in place or stand beside it; this amendment is the in-place half of the
+answer. Details live in the simulation RFC; this amendment cites, it does
+not restate.
+
+### 13.1 §3.3: two determinism contracts, each with its domain
+
+§3.3 chose normalized replay: fresh commit IDs and timestamps are
+alpha-normalized to ordinals before transcripts compare. A stronger contract
+now exists in the simulation: a run is a function of its (scenario, seed)
+pair, where a scenario names the sampled workload's shape and the seed
+drives every draw, and IDs and timestamps are seed-determined through the
+engine's builder injection points, so they compare directly instead of
+being normalized away. The two contracts divide cleanly by execution layer:
+instruments running on the real substrate (the RustFS child runner, real
+backends) keep normalized replay, the right frame where the substrate mints
+identities a test cannot seed; instruments running in the simulated world
+get the ID-inclusive contract for free. §3.3 stands as written for its
+layer.
+
+### 13.2 Instrument twins in the simulation
+
+Two of §4's instruments now have working twins in the simulated world:
+
+- The §4.1 durable-write-cut sweep's twin is crash-state enumeration: the
+  simulation kills the run at each durable write in turn and judges the
+  reopened store, with recovery required to either restore the committed
+  state or refuse cleanly. The two cover different territory: the sweep's
+  cells are evidence about the real substrate's schedules; the
+  enumeration's cells cover every durable write its sampled universes
+  perform, at in-process cost per cell (a universe is one sampled
+  operation stream run in the simulated world).
+- The §4.2 generator and the simulation's operation sampler share one
+  shape: a single seed drives generation, generation is operation-aware,
+  and a new operation kind joins sampling automatically. Whether the two
+  converge on one alphabet definition is a landing-time decision, not
+  forced by either RFC.
+
+### 13.3 §6 corrected: two entries, against evidence
+
+- The Antithesis / libc-override entry priced byte determinism as one
+  bundle. Measured, the libc half is separable and small: the simulation's
+  entropy shim is a ~60-line crate-level link-time interposition that
+  feeds getrandom-class calls from a seeded stream. The entry's conclusion
+  survives for the hypervisor half (whole-VM byte determinism stays
+  deferred), but its price argument no longer covers crate-level
+  interposition, which is in use today.
+- The rejection table never evaluated one lane: contributing the missing
+  seams upstream to Lance instead of forking it or buying around it. That
+  lane is now open and cheap to name: the first ask is an injectable clock
+  (the mock-time ask, evidenced by the counting golden's byte wobble
+  recorded in RFC-031 §11), with entropy and scheduling seams as
+  candidates behind it. Each accepted upstream seam shrinks §2's
+  cannot-virtualize list by one.
+
+### 13.4 §4.1 replay hygiene: the checked upgrade path
+
+§4.1 honestly disclaims trace replay: each cut is its own observed
+schedule. The simulation contributes a checked pattern for the claim's
+strong form: a strict-replay meta-test, which reruns the same (scenario,
+seed) pair and byte-diffs the two runs' reports, so the replay claim is
+itself under test instead of asserted. If the record/replay arbiter
+sketched in §4.1 is ever attempted, that meta-test shape is its acceptance
+gate.
