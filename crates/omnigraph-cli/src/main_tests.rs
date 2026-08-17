@@ -9,6 +9,19 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::json;
 
 #[test]
+fn embedded_cli_preserves_complete_storage_diagnostic_without_reprefixing() {
+    let diagnostic = "storage read failed for 's3://bucket/key': request timed out".to_string();
+    let error = omnigraph::error::OmniError::Storage(omnigraph::error::StorageFailure::new(
+        omnigraph::error::StorageFailureKind::Transient,
+        diagnostic.clone(),
+    ));
+    let report = color_eyre::eyre::Report::from(error);
+
+    assert_eq!(report.to_string(), diagnostic);
+    assert!(!report.to_string().contains("storage: storage"));
+}
+
+#[test]
 fn legacy_change_request_body_uses_legacy_field_names() {
     // `mutate`'s remote arm hits `POST /change`, which old
     // `omnigraph-server` builds deserialize as `ChangeRequest` with

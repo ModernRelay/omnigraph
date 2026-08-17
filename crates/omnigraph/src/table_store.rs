@@ -3457,10 +3457,15 @@ impl TableStore {
         if let Some(affected_rows) = staged.commit_metadata.affected_rows {
             builder = builder.with_affected_rows(affected_rows);
         }
-        let dataset = builder
-            .execute(staged.transaction)
-            .await
-            .map_err(map_lance_commit_error)?;
+        let commit = builder.execute(staged.transaction).await;
+        let dataset = match max_retries {
+            // This private branch is reached only by `commit_staged_exact`.
+            // Its zero-retry contract is the operation-local proof that a
+            // surfaced contention result is effect-free; ordinary staged
+            // commits must retain the generic `Storage(Precondition)` meaning.
+            Some(0) => commit.map_err(map_lance_exact_commit_error)?,
+            _ => commit.map_err(OmniError::storage)?,
+        };
         let committed_identity = if max_retries.is_some() {
             dataset
                 .read_transaction()
@@ -4202,7 +4207,10 @@ impl TableStore {
     }
 }
 
-fn map_lance_commit_error(error: lance::Error) -> OmniError {
+/// Translate only the zero-retry exact staged-commit conflict vocabulary into
+/// the engine's effect-free replay signal. Generic Lance classification keeps
+/// these variants as `Storage(Precondition)`.
+fn map_lance_exact_commit_error(error: lance::Error) -> OmniError {
     match error {
         error @ (lance::Error::RetryableCommitConflict { .. }
         | lance::Error::TooMuchWriteContention { .. }) => {

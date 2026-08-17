@@ -47,13 +47,13 @@ use std::sync::Arc;
 use super::PendingScanAccount;
 
 #[test]
-fn effect_free_commit_adapter_is_the_only_generic_conflict_replay_signal() {
+fn exact_effect_free_commit_adapter_is_the_only_generic_conflict_replay_signal() {
     let retryable = lance::Error::retryable_commit_conflict_source(
         7,
         Box::new(std::io::Error::other("stale exact transaction")),
     );
     assert!(matches!(
-        super::map_lance_commit_error(retryable),
+        super::map_lance_exact_commit_error(retryable),
         OmniError::RetryableCommitConflict(_)
     ));
     let generic = OmniError::storage(lance::Error::retryable_commit_conflict_source(
@@ -66,7 +66,7 @@ fn effect_free_commit_adapter_is_the_only_generic_conflict_replay_signal() {
     );
 
     assert!(matches!(
-        super::map_lance_commit_error(lance::Error::too_much_write_contention("contention")),
+        super::map_lance_exact_commit_error(lance::Error::too_much_write_contention("contention")),
         OmniError::RetryableCommitConflict(_)
     ));
     let generic = OmniError::storage(lance::Error::too_much_write_contention("contention"));
@@ -75,7 +75,7 @@ fn effect_free_commit_adapter_is_the_only_generic_conflict_replay_signal() {
         Some(StorageFailureKind::Precondition)
     );
 
-    let timeout = super::map_lance_commit_error(lance::Error::timeout("timeout"));
+    let timeout = super::map_lance_exact_commit_error(lance::Error::timeout("timeout"));
     assert_eq!(
         timeout.storage_failure().map(|failure| failure.kind),
         Some(StorageFailureKind::Transient)
