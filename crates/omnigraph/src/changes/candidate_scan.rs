@@ -201,7 +201,31 @@ pub(crate) async fn interval_changed_fragments(
         .filter(|fragment| !parent_ids.contains(&fragment.id))
         .cloned()
         .collect();
+    // Row-version metadata is correctness-bearing on the pruned path: the
+    // candidate scan filters on `_row_last_updated_at_version`, and pinned
+    // Lance 10 silently fills that column with 1 for a fragment whose sequence
+    // is missing OR fails to load ("Default to version 1 if sequence not
+    // provided" in lance-table's stream reader — a failed `load_sequence()` is
+    // swallowed the same way). For any interval with `begin > 1` such rows
+    // fall outside the candidate window and real updates vanish without an
+    // error. Require every changed fragment to carry loadable, structurally
+    // valid last-updated metadata; any gap is a normal miss that falls back to
+    // the exact ordered merge (which does not consume the version column).
+    if !changed.iter().all(fragment_version_metadata_is_loadable) {
+        return Ok(None);
+    }
     Ok(Some(changed))
+}
+
+/// Whether one changed fragment's `_row_last_updated_at_version` sequence is
+/// present and decodable — the §4.2 "genuinely active" requirement at the
+/// fragment level. `uses_stable_row_ids()` alone is a dataset-level flag and
+/// cannot prove a specific fragment's sequence survives loading.
+fn fragment_version_metadata_is_loadable(fragment: &Fragment) -> bool {
+    fragment
+        .last_updated_at_version_meta
+        .as_ref()
+        .is_some_and(|meta| meta.load_sequence().is_ok())
 }
 
 /// Fetch full before-image rows for `ids` from the parent handle in one
@@ -516,5 +540,18 @@ mod tests {
             },
             &[(NO_BY_SOURCE_DELETE_PROPERTY, NO_BY_SOURCE_DELETE_V1)],
         )));
+    }
+
+    #[test]
+    fn missing_row_version_metadata_is_not_loadable() {
+        // Pinned Lance 10 fills `_row_last_updated_at_version` with 1 when a
+        // fragment's sequence is missing or fails to load, which would silently
+        // empty the candidate window for begin > 1. A fragment without the
+        // metadata (Lance's `Fragment::new` default) must therefore fail the
+        // loadability gate so the interval falls back to the exact merge. The
+        // positive case — every real OmniGraph-written changed fragment carries
+        // a loadable sequence — is proven end-to-end by the pruned cost/image
+        // tests staying flat/green (they would fall back and fail otherwise).
+        assert!(!fragment_version_metadata_is_loadable(&Fragment::new(7)));
     }
 }
