@@ -610,6 +610,69 @@ async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
     assert!(super::has_insert_absence_certificate(&history[0]));
 }
 
+/// Every general keyed-write `Update` (here an upsert that UPDATES an existing
+/// row, so it is not a pure insert and earns no `insert_absence`) carries the
+/// durable no-by-source-delete marker, and it survives commit → reopen →
+/// `list_transactions` (the exact read path the CDC candidate-pruning classifier
+/// uses). This is the durable provenance that lets pruning trust a persisted
+/// `Update` removed no rows; an external merge would carry no marker.
+#[tokio::test]
+async fn keyed_upsert_stamps_no_by_source_delete_marker_and_persists_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let base_version = ds.version().version;
+
+    let staged = store
+        .stage_keyed_write(
+            ds.clone(),
+            "Person",
+            person_pk_batch(&[("alice", Some(31))]),
+            KeyedWriteSemantics::Upsert,
+        )
+        .await
+        .unwrap();
+    assert!(
+        super::has_no_by_source_delete_marker(&staged.transaction),
+        "every keyed-write Update carries the no-by-source-delete marker"
+    );
+    assert!(
+        !super::has_insert_absence_certificate(&staged.transaction),
+        "an upsert that updates an existing row is not a pure insert, so no insert_absence"
+    );
+
+    let committed = store.commit_staged(Arc::new(ds), staged).await.unwrap();
+    let committed_version = committed.version().version;
+    let reopened = Dataset::open(&uri).await.unwrap();
+    let persisted = reopened
+        .read_transaction_by_version(committed_version)
+        .await
+        .unwrap()
+        .expect("committed keyed upsert transaction");
+    assert!(
+        super::has_no_by_source_delete_marker(&persisted),
+        "the marker must survive commit and reopen"
+    );
+
+    let history = reopened
+        .delta()
+        .with_begin_version(base_version)
+        .with_end_version(committed_version)
+        .build()
+        .unwrap()
+        .list_transactions()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert!(
+        super::has_no_by_source_delete_marker(&history[0]),
+        "list_transactions (the candidate-pruning read path) sees the marker"
+    );
+}
+
 #[tokio::test]
 async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
     let dir = tempfile::tempdir().unwrap();
