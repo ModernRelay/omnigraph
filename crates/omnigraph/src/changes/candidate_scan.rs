@@ -24,8 +24,9 @@
 //!
 //! A `RewriteRows` `Update` is trusted as row-set-preserving only with a
 //! **durable per-transaction provenance proof** — the `omnigraph.no_by_source_delete`
-//! marker every OmniGraph keyed write stamps, or the RFC-023 `insert_absence`
-//! certificate. The op shape alone is not enough: `repair --force --confirm` can
+//! marker every general keyed MergeInsert update stamps, or the RFC-023
+//! `insert_absence` certificate that proven strict inserts carry instead. The
+//! op shape alone is not enough: `repair --force --confirm` can
 //! adopt an external Lance merge whose delete-capable by-source arm persists as
 //! `Update { RewriteRows }`, and its child-only candidate scan has no delete
 //! pass. The source-walk guard (`no_delete_capable_merge_arm_in_engine_source`)

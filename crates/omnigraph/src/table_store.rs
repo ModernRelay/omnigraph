@@ -253,11 +253,13 @@ pub(crate) fn has_insert_absence_certificate(transaction: &Transaction) -> bool 
 /// such an arm in engine source). It therefore removed no unmatched-by-source
 /// row, so a
 /// consumer may treat the interval as row-set-preserving. Unlike
-/// `insert_absence`, it is stamped on *every* keyed write — real upserts and
-/// known-present updates included — not only pure inserts. It is read-advisory:
-/// a missing marker only forces a fall-back, never a correctness change. A
-/// persisted `Update` from an external Lance merge (e.g. adopted via
-/// `repair --force`) carries no marker and cannot be pruned.
+/// `insert_absence`, it is stamped on every **general keyed MergeInsert
+/// update** — real upserts, known-present updates, and stream strict inserts —
+/// not only pure inserts; batch/proven strict inserts carry `insert_absence`
+/// instead, which consumers accept as the same no-delete proof. It is
+/// read-advisory: a missing marker only forces a fall-back, never a
+/// correctness change. A persisted `Update` from an external Lance merge
+/// (e.g. adopted via `repair --force`) carries no marker and cannot be pruned.
 pub(crate) const NO_BY_SOURCE_DELETE_PROPERTY: &str = "omnigraph.no_by_source_delete";
 pub(crate) const NO_BY_SOURCE_DELETE_V1: &str = "v1";
 
