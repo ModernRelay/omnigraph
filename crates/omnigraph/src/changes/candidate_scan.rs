@@ -15,18 +15,29 @@
 //! the parse-time D2 rule keeps inserts/updates and deletes out of the same
 //! mutation. So a commit's effect on one table is *either* a row-set-preserving
 //! insert/update *or* a delete — never both. If every transaction in the
-//! interval is `Append` or a row-set-preserving merge `Update`, then no live
-//! logical id can disappear (neither op removes a row), so the interval has zero
-//! logical deletes and the candidate scan is complete. Any operation that can
-//! remove, reuse, or re-stamp rows (`Delete`, `Overwrite`, `Restore`,
-//! compaction `Rewrite`, …) makes the whole interval fall back to the exact
-//! merge, which classifies deletes correctly.
+//! interval is an `Append` or a **provably** row-set-preserving merge `Update`,
+//! then no live logical id can disappear (neither op removes a row), so the
+//! interval has zero logical deletes and the candidate scan is complete. Any
+//! operation that can remove, reuse, or re-stamp rows (`Delete`, `Overwrite`,
+//! `Restore`, compaction `Rewrite`, …) makes the whole interval fall back to the
+//! exact merge, which classifies deletes correctly.
+//!
+//! A `RewriteRows` `Update` is trusted as row-set-preserving only with a
+//! **durable per-transaction provenance proof** — the `omnigraph.no_by_source_delete`
+//! marker every OmniGraph keyed write stamps, or the RFC-023 `insert_absence`
+//! certificate. The op shape alone is not enough: `repair --force --confirm` can
+//! adopt an external Lance merge whose delete-capable by-source arm persists as
+//! `Update { RewriteRows }`, and its child-only candidate scan has no delete
+//! pass. The source-walk guard (`no_delete_capable_merge_arm_in_engine_source`)
+//! proves only that *current engine code* builds no such arm; the marker
+//! authenticates the *persisted* transaction. An unproven `Update` falls back.
+//! See [`transaction_is_row_set_preserving`].
 
 use std::collections::{HashMap, VecDeque};
 
 use datafusion::prelude::{col, lit};
 use lance::Dataset;
-use lance::dataset::transaction::{Operation, UpdateMode};
+use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
 use lance_table::format::Fragment;
 
 use super::enumerate::{Emit, next_emit};
@@ -34,6 +45,7 @@ use super::model::ChangeFeedScope;
 use super::row_compare::{OrderedRows, RawRow, rows_equal};
 use crate::db::SubTableEntry;
 use crate::error::Result;
+use crate::table_store::{has_insert_absence_certificate, has_no_by_source_delete_marker};
 
 /// Parent probe chunk size: one BTREE-backed `id IN (chunk)` lookup per chunk,
 /// matching the keyed-write delta bound (`UNIQUE_PROBE_CHUNK_KEYS`).
@@ -80,6 +92,38 @@ pub(crate) fn operation_is_row_set_preserving(operation: &Operation) -> bool {
         | Operation::UpdateMemWalState { .. }
         | Operation::Clone { .. }
         | Operation::UpdateBases { .. } => false,
+    }
+}
+
+/// Whether one transaction is safe to derive by the O(delta) candidate path.
+///
+/// It must have a row-set-preserving operation SHAPE
+/// ([`operation_is_row_set_preserving`]) AND, for a `RewriteRows` `Update`, a
+/// durable OmniGraph provenance proof that it removed no rows: either the
+/// no-by-source-delete marker every keyed write stamps, or the RFC-023
+/// `insert_absence` certificate (a pure insert deletes nothing). `Append` is
+/// unconditionally additive and needs no marker.
+///
+/// The shape check alone is NOT sufficient: `repair --force --confirm` can adopt
+/// an external Lance merge whose delete-capable by-source arm persists as
+/// `Operation::Update { RewriteRows }`. Such a transaction carries neither proof,
+/// so it falls back to the exact ordered merge — whose delete pass reports the
+/// removed rows the child-only candidate scan would miss.
+pub(crate) fn transaction_is_row_set_preserving(transaction: &Transaction) -> bool {
+    if !operation_is_row_set_preserving(&transaction.operation) {
+        return false;
+    }
+    match &transaction.operation {
+        Operation::Append { .. } => true,
+        Operation::Update { .. } => {
+            has_no_by_source_delete_marker(transaction)
+                || has_insert_absence_certificate(transaction)
+        }
+        // Unreachable: the shape guard above already rejected every other
+        // variant. Keeping the match total means a future variant that
+        // `operation_is_row_set_preserving` starts accepting must be classified
+        // here too, rather than silently pruning.
+        _ => false,
     }
 }
 
@@ -136,10 +180,7 @@ pub(crate) async fn interval_changed_fragments(
     if u64::try_from(transactions.len()).ok() != Some(version_count) {
         return Ok(None);
     }
-    if !transactions
-        .iter()
-        .all(|transaction| operation_is_row_set_preserving(&transaction.operation))
-    {
+    if !transactions.iter().all(transaction_is_row_set_preserving) {
         return Ok(None);
     }
 
@@ -404,5 +445,76 @@ mod tests {
         assert!(!operation_is_row_set_preserving(
             &Operation::ReserveFragments { num_fragments: 1 }
         ));
+    }
+
+    fn txn(operation: Operation, properties: &[(&str, &str)]) -> Transaction {
+        let transaction_properties = (!properties.is_empty()).then(|| {
+            std::sync::Arc::new(
+                properties
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )
+        });
+        Transaction {
+            read_version: 0,
+            uuid: "test".to_string(),
+            operation,
+            tag: None,
+            transaction_properties,
+        }
+    }
+
+    #[test]
+    fn transaction_update_prunes_only_with_a_durable_no_delete_proof() {
+        use crate::table_store::{
+            INSERT_ABSENCE_PROPERTY, INSERT_ABSENCE_V1, NO_BY_SOURCE_DELETE_PROPERTY,
+            NO_BY_SOURCE_DELETE_V1,
+        };
+        // Append is unconditionally additive — no marker required.
+        assert!(transaction_is_row_set_preserving(&txn(
+            Operation::Append {
+                fragments: vec![Fragment::new(1)],
+            },
+            &[],
+        )));
+        // A RewriteRows Update prunes with the keyed-write no-delete marker ...
+        assert!(transaction_is_row_set_preserving(&txn(
+            update(Some(UpdateMode::RewriteRows)),
+            &[(NO_BY_SOURCE_DELETE_PROPERTY, NO_BY_SOURCE_DELETE_V1)],
+        )));
+        // ... or the RFC-023 insert_absence certificate (a pure insert deletes
+        // nothing) ...
+        assert!(transaction_is_row_set_preserving(&txn(
+            update(Some(UpdateMode::RewriteRows)),
+            &[(INSERT_ABSENCE_PROPERTY, INSERT_ABSENCE_V1)],
+        )));
+        // ... but NOT without a durable proof. An external Lance merge with a
+        // delete-capable by-source arm, adopted via `repair --force`, persists
+        // this exact `Update{RewriteRows}` shape and carries no marker — this is
+        // the data-loss regression the fix closes (the op-shape classifier alone
+        // returns true here).
+        assert!(operation_is_row_set_preserving(&update(Some(
+            UpdateMode::RewriteRows
+        ))));
+        assert!(!transaction_is_row_set_preserving(&txn(
+            update(Some(UpdateMode::RewriteRows)),
+            &[],
+        )));
+        // An unrelated property is not a no-delete proof.
+        assert!(!transaction_is_row_set_preserving(&txn(
+            update(Some(UpdateMode::RewriteRows)),
+            &[("lance.something", "x")],
+        )));
+        // The shape guard still fences a delete even if a marker were spoofed
+        // onto it, so a stray marker can never make a removing op prune.
+        assert!(!transaction_is_row_set_preserving(&txn(
+            Operation::Delete {
+                updated_fragments: Vec::new(),
+                deleted_fragment_ids: Vec::new(),
+                predicate: String::new(),
+            },
+            &[(NO_BY_SOURCE_DELETE_PROPERTY, NO_BY_SOURCE_DELETE_V1)],
+        )));
     }
 }
