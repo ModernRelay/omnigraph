@@ -10,7 +10,11 @@ owner: OmniGraph maintainers
 
 # RFC-030: Graph change feed and retained-history contract
 
-**Status:** Accepted for C0–C3 (shipped); C4+ remain design-stage
+**Status:** Accepted for C0–C3 — implementation shipped with two recorded open
+§14 obligations that gate full acceptance: the §4.4 ordered-scan memory bound
+(the pinned-Lance single-partition `SortExec` is O(table), shared debt with
+merge/diff/export) and bounded client auto-pagination (the SDK/CLI helpers
+still aggregate whole results). C4+ remain design-stage.
 
 **Date:** 2026-08-05
 
@@ -246,6 +250,15 @@ dimension. A supplied opaque type ID therefore matches nothing rather than
 filtering by identity; select the current type name instead. Filters may not
 select a Lance dataset, table alias/path, native branch, fragment, or physical
 version.
+
+Name-only filtering is a **deliberate v1 scope decision**, not a drafting
+correction: it narrows the earlier ID-or-name draft, so an identity-scoped
+subscription does not follow a supported type rename — a consumer that must
+survive renames filters by nothing (full feed) and joins on the emitted opaque
+identity client-side. If rename-stable server-side filtering becomes a
+requirement, the sanctioned extension is an explicit ID filter dimension
+carried through engine scope, cursor digest, HTTP, CLI, and baseline together;
+partial support is not.
 
 Page tokens and feed cursors bind the canonical filter and image contract.
 Reusing either with a different scope fails with its corresponding typed scope
@@ -764,7 +777,7 @@ must return to this RFC's format audit before landing.
 |---|---|---|
 | C0 — foundation correction | Graph type-lifetime pairing with deterministic graph-semantic ordering; O(1) adjacent first-parent validation; Lance surface guards; remove speculative binary lifting | No new public API or persisted state; physical placement remains private |
 | C1 — private enumerator | Internal graph commit blocks with exact logical images, exact-end insert/update adapter, complete delete fallback, bounded page positions, typed gaps, and schema-compatibility refusal | Engine-only correctness before wire commitment |
-| C2 — finite commit entity diff | Graph-vocabulary DTO, exact commit-vs-first-parent diff, next-page token, bounded SDK/CLI auto-pagination, HTTP/OpenAPI, authorization, docs, and parity tests | Useful audit/inspection surface without a durable feed protocol |
+| C2 — finite commit entity diff | Graph-vocabulary DTO, exact commit-vs-first-parent diff, next-page token, bounded SDK/CLI auto-pagination *(open: the shipped helpers aggregate whole results in memory — see the header status)*, HTTP/OpenAPI, authorization, docs, and parity tests | Useful audit/inspection surface without a durable feed protocol |
 | C3 — public entity feed | First-parent feed cursor plus exact snapshot/cursor baseline and at-least-once consumer contract | Useful caller-owned feed within a proven compatible schema |
 | C4 — entity history | Newest-first history derived from the same per-commit enumerator, with separate backward continuation domains | Investigation surface; no new storage authority |
 | C5 — publication time, optional | Derived `published_at` and possibly a measured as-of-time selector | Lands only after its semantics and cold-history cost pass §7 |
