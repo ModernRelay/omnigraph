@@ -14,6 +14,17 @@ pub(crate) fn maybe_fail(_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Boolean behavior seam: true when the named failpoint is configured (any
+/// action). Unlike [`maybe_fail`], it injects no error — a test uses it to
+/// flip a code path into a configuration that cannot be reached naturally on
+/// the local test substrate (e.g. simulating an object store that persists no
+/// table e_tags). Always false without the `failpoints` feature.
+pub(crate) fn is_enabled(_name: &str) -> bool {
+    #[cfg(feature = "failpoints")]
+    fail::fail_point!(_name, |_| true);
+    false
+}
+
 /// Failpoint that injects a *retryable* `RowLevelCasContention` `OmniError` — the
 /// typed conflict the manifest publisher's outer retry treats as retryable
 /// (`is_retryable_publish_conflict`). Used to drive the publisher's
@@ -103,6 +114,13 @@ pub mod names {
     /// re-proves the branch incarnation (via the manifest e_tag) rather than
     /// reading the replacement branch's rows at the same path and version.
     pub const CHANGE_FEED_PRE_TABLE_OPEN: &str = "change_feed.pre_table_open";
+    /// Behavior seam (`is_enabled`), not an error injection: simulates a store
+    /// whose persisted table version metadata carries no e_tag, so
+    /// `open_at_entry_verified` cannot use its e_tag comparison. Tests combine
+    /// it with `CHANGE_FEED_PRE_TABLE_OPEN` + a branch delete/recreate to prove
+    /// the LOGICAL post-open head re-prove still refuses the replacement —
+    /// the e_tag is defense-in-depth, not the load-bearing witness.
+    pub const CHANGE_FEED_SKIP_ETAG_WITNESS: &str = "change_feed.skip_etag_witness";
     pub const CLEANUP_RECONCILE_FORK: &str = "cleanup.reconcile_fork";
     /// After cleanup's fast empty-sidecar probe, before it acquires the closed
     /// schema/branch/table GC gate set and performs the authoritative recheck.

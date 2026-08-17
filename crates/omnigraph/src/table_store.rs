@@ -810,7 +810,17 @@ impl TableStore {
             return self.open_at_entry(entry).await;
         }
         let dataset = entry.open(&self.root_uri, None).await?;
-        if let Some(expected) = entry.version_metadata.e_tag()
+        // Defense-in-depth only: the e_tag is not a sufficient native-branch
+        // incarnation witness (a store may persist none, and equality is a
+        // content heuristic, not identity). The load-bearing witness is the
+        // LOGICAL post-open head re-prove in `plan_intervals`
+        // (`reprove_named_branch_heads`), which is store-independent. The
+        // failpoint seam simulates the e_tag-less-store configuration so tests
+        // can prove the logical witness alone refuses a branch delete/recreate.
+        let etag_witness_unavailable =
+            crate::failpoints::is_enabled(crate::failpoints::names::CHANGE_FEED_SKIP_ETAG_WITNESS);
+        if !etag_witness_unavailable
+            && let Some(expected) = entry.version_metadata.e_tag()
             && dataset.manifest_location().e_tag.as_deref() != Some(expected)
         {
             return Err(OmniError::manifest(format!(
