@@ -76,6 +76,29 @@ fn sync_dir(_dir: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Parse the terminal `{"baseline": …}` NDJSON record from an installed
+/// baseline file, reading only a bounded tail. Returns the record's `baseline`
+/// value, or `None` when the file ends without one (an interrupted or foreign
+/// file). Used to refuse printing a resume cursor that does not match what is
+/// actually installed at `--out` (a concurrent capture may have replaced it).
+fn read_terminal_baseline_record(path: &std::path::Path) -> Result<Option<serde_json::Value>> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 256 * 1024;
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))?;
+    let mut tail = Vec::with_capacity(len.min(TAIL_BYTES) as usize);
+    file.read_to_end(&mut tail)?;
+    let tail = String::from_utf8_lossy(&tail);
+    let Some(last_line) = tail.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(last_line) else {
+        return Ok(None);
+    };
+    Ok(record.get("baseline").cloned())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -617,6 +640,22 @@ async fn main() -> Result<()> {
                     types: &types,
                     ops: &ops,
                 };
+                // The install contract below (file fsync + atomic replace +
+                // parent-directory fsync) is POSIX-shaped. Elsewhere (e.g.
+                // Windows, where std's rename is not write-through and a
+                // directory is not an fsync-able durability primitive) the
+                // namespace replacement cannot be proven durable before the
+                // resume cursor prints, so fail closed BEFORE any capture work
+                // rather than print a cursor for a snapshot the filesystem may
+                // lose. A durable/write-through replace is the sanctioned
+                // future lift for those platforms.
+                if cfg!(not(unix)) {
+                    bail!(
+                        "changes baseline is not supported on this platform: the \
+                         snapshot-install durability barrier (directory fsync after \
+                         an atomic replace) requires a POSIX filesystem"
+                    );
+                }
                 // Stream into a UNIQUE temp file in --out's directory and
                 // atomically replace --out only after the handshake completes
                 // AND the bytes are durable. NamedTempFile is created O_EXCL and
@@ -653,6 +692,25 @@ async fn main() -> Result<()> {
                 temp.as_file().sync_all()?;
                 temp.persist(&out).map_err(|error| error.error)?;
                 sync_dir(&out_dir)?;
+                // Concurrent-capture guard: two processes targeting the same
+                // --out both replace it and would each print their own cursor,
+                // so one could print a cursor for a snapshot another capture
+                // had already replaced — a consumer restoring the file and
+                // resuming from that printed cursor would skip the changes
+                // between the two snapshots. Re-read the installed file's
+                // terminal record and refuse to print a cursor that does not
+                // match it. (The file's own terminal record is always the
+                // authoritative pairing for any later reader.)
+                let installed = read_terminal_baseline_record(&out)?;
+                if installed.as_ref() != Some(&serde_json::to_value(&baseline)?) {
+                    bail!(
+                        "the baseline at {} was replaced by a concurrent capture \
+                         after this capture installed its snapshot; no resume \
+                         cursor printed — resume from the replacing file's own \
+                         terminal record, or re-run the capture",
+                        out.display()
+                    );
+                }
                 if json {
                     print_json(&baseline)?;
                 } else {
