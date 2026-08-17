@@ -1,4 +1,5 @@
 use super::*;
+use crate::changes::row_compare::{RawRow, rows_equal};
 use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
@@ -346,18 +347,33 @@ struct ProvenPureInsertAdopt {
 #[derive(Debug, Clone)]
 struct CursorRow {
     id: String,
-    signature: String,
+    /// The typed comparison unit, precomputed when the cursor is eager (`None`
+    /// on the lazy adopt path, built on demand). Compared through the shared
+    /// `rows_equal` so merge and the change surfaces classify rows identically:
+    /// Arrow-typed for scalars/nested (injective, unlike a display string) and
+    /// data-file-qualified for Blob columns.
+    typed: Option<RawRow>,
     dataset: Dataset,
     batch: RecordBatch,
     row_index: usize,
 }
 
 impl CursorRow {
-    /// Compute this row's signature on demand. Used by the lazy adopt cursor,
-    /// where `signature` is left empty; the value is identical to the eager
-    /// `signature` field the three-way cursor populates.
-    fn compute_signature(&self) -> Result<String> {
-        row_signature(&self.batch, self.row_index)
+    /// The typed comparison unit — cloned when eager, built on demand when lazy.
+    fn typed(&self) -> Result<RawRow> {
+        match &self.typed {
+            Some(typed) => Ok(typed.clone()),
+            None => RawRow::single(&self.dataset, &self.batch, self.row_index),
+        }
+    }
+
+    /// Whether this row's logical value differs from `other`, via the shared
+    /// typed comparator (injective for nested values; Blob columns by immutable
+    /// data-file identity with a payload byte-compare only on a descriptor tie).
+    async fn equals(&self, other: &CursorRow) -> Result<bool> {
+        let this = self.typed()?;
+        let that = other.typed()?;
+        rows_equal(&self.dataset, &this, &other.dataset, &that).await
     }
 
     /// Classify this exact persisted row without opening an external target.
@@ -368,6 +384,16 @@ impl CursorRow {
         selection: &mut crate::table_store::PersistedBlobSelection,
     ) -> Result<()> {
         selection.include_batch(&self.batch.slice(self.row_index, 1))
+    }
+}
+
+/// Equality of two optional cursor rows: two absent rows are equal; present vs
+/// absent differ; two present rows compare via the shared typed comparator.
+async fn cursor_rows_equal(a: Option<&CursorRow>, b: Option<&CursorRow>) -> Result<bool> {
+    match (a, b) {
+        (None, None) => Ok(true),
+        (Some(a), Some(b)) => a.equals(b).await,
+        _ => Ok(false),
     }
 }
 
@@ -410,14 +436,23 @@ impl OrderedTableCursor {
                 KEYED_WRITE_MAX_BYTES,
             );
             Some(Box::pin(
-                crate::table_store::TableStore::scan_stream_bounded(
+                crate::table_store::TableStore::scan_stream_with(
                     ds,
                     None,
                     None,
                     Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
                     true,
-                    KEYED_WRITE_MAX_ROWS,
-                    KEYED_WRITE_MAX_BYTES,
+                    |scanner| {
+                        scanner.batch_size(KEYED_WRITE_MAX_ROWS);
+                        scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+                        // Blob columns must yield DESCRIPTORS (not payloads) for
+                        // the shared typed comparator's data-file identity, and
+                        // `_rowaddr` gives the owning fragment.
+                        scanner
+                            .blob_handling(lance_core::datatypes::BlobHandling::BlobsDescriptions);
+                        scanner.with_row_address();
+                        Ok(())
+                    },
                 )
                 .await?,
             ))
@@ -458,14 +493,14 @@ impl OrderedTableCursor {
                     let dataset = self.dataset.clone().ok_or_else(|| {
                         OmniError::manifest("cursor row missing source dataset".to_string())
                     })?;
-                    let signature = if self.eager_signatures {
-                        row_signature(batch, row_index)?
+                    let typed = if self.eager_signatures {
+                        Some(RawRow::single(&dataset, batch, row_index)?)
                     } else {
-                        String::new()
+                        None
                     };
                     return Ok(Some(CursorRow {
                         id: row_id_at(batch, row_index)?,
-                        signature,
+                        typed,
                         dataset,
                         batch: batch.clone(),
                         row_index,
@@ -1302,10 +1337,10 @@ async fn compute_adopt_delta(
                 needs_update = true;
             }
             (Some(base), Some(src)) => {
-                // Present on both — compute signatures lazily (the only case
-                // that needs them) to tell a changed row from an unchanged one.
-                // New/deleted rows above skip the embedding stringify entirely.
-                if src.compute_signature()? != base.compute_signature()? {
+                // Present on both — compare lazily (the only case that needs it)
+                // to tell a changed row from an unchanged one. New/deleted rows
+                // above skip building the typed unit entirely.
+                if !src.equals(base).await? {
                     // Changed on source → upsert.
                     upsert_writer
                         .push_row(src, &materializer, external_preflight)
@@ -1381,7 +1416,7 @@ async fn collect_adopt_blob_selection(
                 source.include_blob_selection(blob_selection)?;
             }
             (Some(base), Some(source)) => {
-                if source.compute_signature()? != base.compute_signature()? {
+                if !source.equals(base).await? {
                     source.include_blob_selection(blob_selection)?;
                 }
             }
@@ -1450,22 +1485,23 @@ async fn stage_streaming_table_merge(
             None
         };
 
-        let base_sig = base_row.as_ref().map(|row| row.signature.as_str());
-        let source_sig = source_row.as_ref().map(|row| row.signature.as_str());
-        let target_sig = target_row.as_ref().map(|row| row.signature.as_str());
-
-        let source_changed = source_sig != base_sig;
-        let target_changed = target_sig != base_sig;
+        let source_changed = !cursor_rows_equal(source_row.as_ref(), base_row.as_ref()).await?;
+        let target_changed = !cursor_rows_equal(target_row.as_ref(), base_row.as_ref()).await?;
 
         let selection = if !source_changed {
             target_row.as_ref()
         } else if !target_changed {
             source_row.as_ref()
-        } else if source_sig == target_sig {
+        } else if cursor_rows_equal(source_row.as_ref(), target_row.as_ref()).await? {
+            // Both sides changed but agree — no conflict; target already has it.
             target_row.as_ref()
         } else {
             conflicts.push(classify_merge_conflict(
-                table_key, &next_id, base_sig, source_sig, target_sig,
+                table_key,
+                &next_id,
+                base_row.is_some(),
+                source_row.is_some(),
+                target_row.is_some(),
             ));
             None
         };
@@ -1485,7 +1521,7 @@ async fn stage_streaming_table_merge(
             // Only changed rows go to the delta (for publish). The full merged
             // table is no longer staged — validation works off this delta plus
             // the committed target via index lookups, not a full re-scan.
-            if selection.signature.as_str() != target_sig.unwrap_or("") {
+            if !cursor_rows_equal(Some(selection), target_row.as_ref()).await? {
                 delta_writer
                     .push_row(selection, &materializer, external_preflight)
                     .await?;
@@ -1554,20 +1590,21 @@ async fn collect_three_way_blob_selection(
             None
         };
 
-        let base_sig = base_row.as_ref().map(|row| row.signature.as_str());
-        let source_sig = source_row.as_ref().map(|row| row.signature.as_str());
-        let target_sig = target_row.as_ref().map(|row| row.signature.as_str());
-        let source_changed = source_sig != base_sig;
-        let target_changed = target_sig != base_sig;
+        let source_changed = !cursor_rows_equal(source_row.as_ref(), base_row.as_ref()).await?;
+        let target_changed = !cursor_rows_equal(target_row.as_ref(), base_row.as_ref()).await?;
         let selection = if !source_changed {
             target_row.as_ref()
         } else if !target_changed {
             source_row.as_ref()
-        } else if source_sig == target_sig {
+        } else if cursor_rows_equal(source_row.as_ref(), target_row.as_ref()).await? {
             target_row.as_ref()
         } else {
             conflicts.push(classify_merge_conflict(
-                table_key, &next_id, base_sig, source_sig, target_sig,
+                table_key,
+                &next_id,
+                base_row.is_some(),
+                source_row.is_some(),
+                target_row.is_some(),
             ));
             None
         };
@@ -1575,10 +1612,10 @@ async fn collect_three_way_blob_selection(
         if conflicts.len() > prior_conflict_count {
             continue;
         }
-        if let Some(selection) = selection
-            && selection.signature.as_str() != target_sig.unwrap_or("")
-        {
-            selection.include_blob_selection(blob_selection)?;
+        if let Some(selection) = selection {
+            if !cursor_rows_equal(Some(selection), target_row.as_ref()).await? {
+                selection.include_blob_selection(blob_selection)?;
+            }
         }
     }
 
@@ -1722,16 +1759,16 @@ mod table_identity_tests {
 fn classify_merge_conflict(
     table_key: &str,
     row_id: &str,
-    base_sig: Option<&str>,
-    source_sig: Option<&str>,
-    target_sig: Option<&str>,
+    base_present: bool,
+    source_present: bool,
+    target_present: bool,
 ) -> MergeConflict {
-    let (kind, message) = match (base_sig, source_sig, target_sig) {
-        (None, Some(_), Some(_)) => (
+    let (kind, message) = match (base_present, source_present, target_present) {
+        (false, true, true) => (
             MergeConflictKind::DivergentInsert,
             format!("divergent insert for id '{}'", row_id),
         ),
-        (Some(_), None, Some(_)) | (Some(_), Some(_), None) => (
+        (true, false, true) | (true, true, false) => (
             MergeConflictKind::DeleteVsUpdate,
             format!("delete/update conflict for id '{}'", row_id),
         ),
@@ -1746,40 +1783,6 @@ fn classify_merge_conflict(
         kind,
         message,
     }
-}
-
-/// A faithful per-row change-detection signature.
-///
-/// Skips ONLY the five reserved Lance virtual columns — a legal
-/// `_row_`-prefixed user property still participates (the former
-/// `starts_with("_row")` hid such properties). Distinguishes null from every
-/// rendered value including `""` (the raw display string renders both as `""`,
-/// conflating a real null↔"" change into a no-op the merge silently dropped),
-/// and length-prefixes each value so no value can spoof a column boundary. Two
-/// rows on one table lifetime compare equal iff every user column matches by
-/// presence and rendered value. Ephemeral, internal to merge classification —
-/// never persisted, so the format is free to change.
-///
-/// Blob columns are still rendered via `array_value_to_string`, preserving
-/// today's behavior; full unification with `changes::row_compare` (which
-/// compares Blob columns by descriptor identity) is a larger follow-up gated on
-/// the merge cursor's scan mode.
-fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
-    use std::fmt::Write as _;
-    let mut signature = String::new();
-    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        if crate::changes::model::is_reserved_storage_system_column(field.name()) {
-            continue;
-        }
-        if column.is_null(row) {
-            signature.push_str("N;");
-            continue;
-        }
-        let value = array_value_to_string(column.as_ref(), row)
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let _ = write!(signature, "V{}:{value};", value.len());
-    }
-    Ok(signature)
 }
 
 /// Operation-wide budget for the scalar delta retained by merge validation.

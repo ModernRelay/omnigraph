@@ -92,6 +92,25 @@ pub(crate) struct RawRow {
     blob_signatures: Vec<BlobColumnSig>,
 }
 
+impl RawRow {
+    /// Build the typed comparison unit for one row of a scanned batch — the
+    /// per-row form of [`prepare_batch`]. The batch must carry `id` (and, for a
+    /// Blob table, `_rowaddr`); Blob identities resolve from the in-memory
+    /// `dataset` manifest, no object-store I/O. Used by the branch-merge cursor
+    /// so merge and the change surfaces classify rows through ONE comparator.
+    pub(crate) fn single(
+        dataset: &Dataset,
+        batch: &RecordBatch,
+        row_index: usize,
+    ) -> Result<RawRow> {
+        prepare_batch(dataset, &batch.slice(row_index, 1))?
+            .pop_front()
+            .ok_or_else(|| {
+                OmniError::manifest_internal("single-row batch produced no comparison row")
+            })
+    }
+}
+
 /// An `id`-ordered stream of one table snapshot's rows, filled lazily one Lance
 /// batch at a time. Both endpoints of a diff are walked in lockstep so the
 /// merge stays streaming and never buffers a delta-wide row set.
