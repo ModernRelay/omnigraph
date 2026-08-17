@@ -657,7 +657,7 @@ pub(crate) async fn open_dataset(
                 },
             }
         }
-        error => OmniError::Lance(error.to_string()),
+        error => OmniError::storage(error),
     })
 }
 

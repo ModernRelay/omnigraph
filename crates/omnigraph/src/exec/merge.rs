@@ -572,7 +572,7 @@ impl StagedTableWriter {
         // Copy exactly one row before sizing or buffering it.
         let indices = UInt64Array::from(vec![row.row_index as u64]);
         let input = arrow_select::take::take_record_batch(&row.batch, &indices)
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::arrow_internal)?;
         let predicted_row_bytes = if self.materialize_blobs {
             materializer.predicted_materialized_blob_batch_bytes(
                 &row.dataset,
@@ -667,12 +667,11 @@ impl StagedTableWriter {
             .iter()
             .map(|field| {
                 batch.column_by_name(field.name()).cloned().ok_or_else(|| {
-                    OmniError::Lance(format!("batch missing column '{}'", field.name()))
+                    OmniError::manifest_internal(format!("batch missing column '{}'", field.name()))
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        RecordBatch::try_new(self.schema.clone(), columns)
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(OmniError::arrow_internal)
     }
 
     async fn finish(mut self) -> Result<StagedTable> {
@@ -704,7 +703,7 @@ impl StagedTableWriter {
         } else {
             let batches = std::mem::take(&mut self.batches);
             arrow_select::concat::concat_batches(&self.schema, &batches)
-                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .map_err(OmniError::arrow_internal)?
         };
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
@@ -813,14 +812,11 @@ async fn try_proven_pure_insert_history(
     {
         return Ok(None);
     }
-    let base_identifier = base
-        .branch_identifier()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let base_identifier = base.branch_identifier().await.map_err(OmniError::storage)?;
     let source_identifier = source
         .branch_identifier()
         .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?;
+        .map_err(OmniError::storage)?;
     if base_entry.native_dataset_branch == source_entry.native_dataset_branch
         && source_identifier != base_identifier
     {
@@ -1145,11 +1141,7 @@ async fn plan_proven_pure_insert_chunks(
         .await?;
     let mut chunk_rows = Vec::new();
     let mut observed_rows = 0_u64;
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
-    {
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::datafusion)? {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -1652,8 +1644,8 @@ fn schema_has_blob(schema: &SchemaRef) -> Result<bool> {
             // logical Blob placeholder.
             return Ok(true);
         }
-        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let lance_field =
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
         if lance_field.is_blob() {
             return Ok(true);
         }
@@ -2020,11 +2012,7 @@ async fn scan_staged_for_validation(
             KEYED_WRITE_MAX_BYTES,
         )
         .await?;
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
-    {
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -2070,11 +2058,7 @@ async fn scan_proven_pure_inserts_for_validation(
         )
         .await?;
     let mut observed_rows = 0_u64;
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
-    {
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -3079,11 +3063,7 @@ async fn next_exact_staged_chunk(
         let batch = match carry.take() {
             Some(batch) => batch,
             None => loop {
-                match stream
-                    .try_next()
-                    .await
-                    .map_err(|error| OmniError::Lance(error.to_string()))?
-                {
+                match stream.try_next().await.map_err(OmniError::datafusion)? {
                     Some(batch) if batch.num_rows() > 0 => break batch,
                     Some(_) => continue,
                     None => {
@@ -3104,8 +3084,7 @@ async fn next_exact_staged_chunk(
     let chunk = if slices.len() == 1 {
         slices.pop().expect("one slice")
     } else {
-        arrow_select::concat::concat_batches(schema, &slices)
-            .map_err(|error| OmniError::Lance(error.to_string()))?
+        arrow_select::concat::concat_batches(schema, &slices).map_err(OmniError::arrow_internal)?
     };
     let chunk_bytes = u64::try_from(chunk.get_array_memory_size())
         .map_err(|_| OmniError::manifest_internal("branch merge chunk bytes exceed u64"))?;
@@ -3227,11 +3206,7 @@ async fn commit_keyed_stream_chunks(
 
     let mut has_extra_rows = carry.as_ref().is_some_and(|batch| batch.num_rows() > 0);
     while !has_extra_rows {
-        match stream
-            .try_next()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
-        {
+        match stream.try_next().await.map_err(OmniError::datafusion)? {
             Some(batch) => has_extra_rows = batch.num_rows() > 0,
             None => break,
         }

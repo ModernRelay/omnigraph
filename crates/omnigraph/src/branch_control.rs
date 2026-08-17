@@ -28,7 +28,7 @@ pub(crate) enum BranchCreateOutcome {
 }
 
 fn lance_error(error: lance::Error) -> OmniError {
-    OmniError::Lance(error.to_string())
+    OmniError::storage(error)
 }
 
 const BRANCH_ENUMERATION_MAX_ATTEMPTS: usize = 3;

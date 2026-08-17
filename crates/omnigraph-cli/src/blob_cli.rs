@@ -184,7 +184,7 @@ pub(crate) fn map_embedded_blob_error(error: OmniError) -> Report {
         }
         OmniError::ResourceLimitExceeded { .. } => eyre!("Blob read range exceeds the limit"),
         OmniError::BlobIntegrity { .. }
-        | OmniError::Lance(_)
+        | OmniError::Storage(_)
         | OmniError::DataFusion(_)
         | OmniError::Io(_) => eyre!("Blob delivery failed"),
         OmniError::Policy(_) => eyre!("Blob read is forbidden"),

@@ -668,7 +668,7 @@ fn prepare_pending_table(table_key: &str, table: PendingTable) -> Result<Prepare
                 table.batches.into_iter().next().unwrap()
             } else {
                 arrow_select::concat::concat_batches(&table.schema, &table.batches)
-                    .map_err(|error| OmniError::Lance(error.to_string()))?
+                    .map_err(OmniError::arrow_internal)?
             }
         }
     };
@@ -1589,7 +1589,7 @@ fn dedupe_merge_batches_by_id(
             return Ok(batches.into_iter().next().unwrap());
         }
         return arrow_select::concat::concat_batches(schema, &batches)
-            .map_err(|e| OmniError::Lance(e.to_string()));
+            .map_err(OmniError::arrow_internal);
     }
 
     // Slow path: build per-batch slices via `take`, then concat.
@@ -1604,9 +1604,9 @@ fn dedupe_merge_batches_by_id(
             .iter()
             .map(|col| arrow_select::take::take(col, &take_array, None))
             .collect::<std::result::Result<_, _>>()
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::arrow_internal)?;
         let new_batch = RecordBatch::try_new(batches[b_idx].schema(), columns)
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::arrow_internal)?;
         sliced.push(new_batch);
     }
     if sliced.is_empty() {
@@ -1617,6 +1617,5 @@ fn dedupe_merge_batches_by_id(
     if sliced.len() == 1 {
         return Ok(sliced.into_iter().next().unwrap());
     }
-    arrow_select::concat::concat_batches(schema, &sliced)
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    arrow_select::concat::concat_batches(schema, &sliced).map_err(OmniError::arrow_internal)
 }

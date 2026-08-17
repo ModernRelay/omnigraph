@@ -838,7 +838,7 @@ impl TableStorage for TableStore {
             .dataset()
             .branch_identifier()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(OmniError::storage)
     }
 
     async fn fork_branch_from_state(

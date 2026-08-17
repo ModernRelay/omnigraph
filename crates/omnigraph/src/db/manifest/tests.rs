@@ -15,14 +15,38 @@ use tokio::sync::Mutex;
 
 use super::publisher::{
     GraphHeadExpectation, LineageIntent, ManifestBatchPublisher, PublishOutcome,
-    PublishPrecondition,
+    PublishPrecondition, is_retryable_publish_conflict, map_lance_publish_error,
 };
 use super::state::read_publish_scan;
 use super::*;
+use crate::error::{ManifestConflictDetails, ManifestError, StorageFailureKind};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
     SchemaIdentityDomain, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
 };
+
+#[test]
+fn publisher_retry_vocabulary_remains_row_level_cas_only() {
+    let row_cas = map_lance_publish_error(lance::Error::too_much_write_contention("contended"));
+    assert!(is_retryable_publish_conflict(&row_cas));
+    assert!(matches!(
+        row_cas,
+        OmniError::Manifest(ManifestError {
+            details: Some(ManifestConflictDetails::RowLevelCasContention),
+            ..
+        })
+    ));
+
+    let generic = map_lance_publish_error(lance::Error::retryable_commit_conflict_source(
+        3,
+        Box::new(std::io::Error::other("stale transaction")),
+    ));
+    assert!(!is_retryable_publish_conflict(&generic));
+    assert_eq!(
+        generic.storage_failure().map(|failure| failure.kind),
+        Some(StorageFailureKind::Precondition)
+    );
+}
 
 fn test_schema_source() -> &'static str {
     r#"

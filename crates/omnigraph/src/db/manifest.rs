@@ -191,17 +191,13 @@ pub struct SnapshotScanner {
 impl SnapshotScanner {
     /// Select the output columns.
     pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
-        self.scanner
-            .project(columns)
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        self.scanner.project(columns).map_err(OmniError::storage)?;
         Ok(self)
     }
 
     /// Apply a SQL filter expression.
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
-        self.scanner
-            .filter(filter)
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        self.scanner.filter(filter).map_err(OmniError::storage)?;
         Ok(self)
     }
 
@@ -239,7 +235,7 @@ impl SnapshotScanner {
     pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
         self.scanner
             .limit(limit, offset)
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         Ok(self)
     }
 
@@ -260,7 +256,7 @@ impl SnapshotScanner {
         self.scanner
             .try_into_stream()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(OmniError::storage)
     }
 }
 
@@ -281,7 +277,7 @@ impl SnapshotDataset {
         self.dataset
             .count_rows(filter)
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(OmniError::storage)
     }
 
     /// Lance schema of this pinned dataset version.
@@ -299,7 +295,7 @@ impl SnapshotDataset {
         self.dataset
             .load_indices()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(OmniError::storage)
     }
 
     /// Whether `column` has complete usable BTREE coverage.
@@ -525,7 +521,7 @@ async fn probe_dataset_latest_incarnation(
             version: dataset
                 .latest_version_id()
                 .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?,
+                .map_err(OmniError::storage)?,
             e_tag: dataset.manifest_location().e_tag.clone(),
             timestamp_nanos: Some(dataset.manifest().timestamp_nanos),
             branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
@@ -1236,7 +1232,7 @@ impl ManifestCoordinator {
         self.dataset
             .latest_version_id()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(OmniError::storage)
     }
 
     /// Lance-native stable identity captured with the active manifest state.

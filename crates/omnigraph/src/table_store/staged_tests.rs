@@ -20,7 +20,7 @@
 //!    behavior so a future change either (a) preserves it or
 //!    (b) consciously fixes it (and updates this test).
 
-use crate::error::OmniError;
+use crate::error::{OmniError, StorageFailureKind};
 use crate::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use crate::storage_layer::{
     IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
@@ -45,6 +45,43 @@ fn test_session() -> std::sync::Arc<lance::session::Session> {
 use std::sync::Arc;
 
 use super::PendingScanAccount;
+
+#[test]
+fn effect_free_commit_adapter_is_the_only_generic_conflict_replay_signal() {
+    let retryable = lance::Error::retryable_commit_conflict_source(
+        7,
+        Box::new(std::io::Error::other("stale exact transaction")),
+    );
+    assert!(matches!(
+        super::map_lance_commit_error(retryable),
+        OmniError::RetryableCommitConflict(_)
+    ));
+    let generic = OmniError::storage(lance::Error::retryable_commit_conflict_source(
+        7,
+        Box::new(std::io::Error::other("stale exact transaction")),
+    ));
+    assert_eq!(
+        generic.storage_failure().map(|failure| failure.kind),
+        Some(StorageFailureKind::Precondition)
+    );
+
+    assert!(matches!(
+        super::map_lance_commit_error(lance::Error::too_much_write_contention("contention")),
+        OmniError::RetryableCommitConflict(_)
+    ));
+    let generic = OmniError::storage(lance::Error::too_much_write_contention("contention"));
+    assert_eq!(
+        generic.storage_failure().map(|failure| failure.kind),
+        Some(StorageFailureKind::Precondition)
+    );
+
+    let timeout = super::map_lance_commit_error(lance::Error::timeout("timeout"));
+    assert_eq!(
+        timeout.storage_failure().map(|failure| failure.kind),
+        Some(StorageFailureKind::Transient)
+    );
+    assert!(!timeout.is_retryable_commit_conflict());
+}
 
 fn person_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
