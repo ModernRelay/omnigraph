@@ -411,16 +411,14 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         "row_count",
     ];
     let mut scanner = dataset.scan();
-    scanner
-        .project(&projection)
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    scanner.project(&projection).map_err(OmniError::storage)?;
     let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .map_err(OmniError::storage)?
         .try_collect()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
 
     let mut table_registrations = HashMap::new();
     let mut version_entries = Vec::new();
@@ -630,10 +628,10 @@ pub(crate) async fn read_graph_lineage(
         .scan()
         .try_into_stream()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .map_err(OmniError::storage)?
         .try_collect()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
 
     let mut graph_commits = Vec::new();
     let mut graph_heads = HashMap::new();
@@ -927,7 +925,7 @@ pub(super) fn manifest_rows_batch(
             Arc::new(UInt64Array::from(row_counts)),
         ],
     )
-    .map_err(|e| OmniError::Lance(e.to_string()))
+    .map_err(OmniError::arrow_internal)
 }
 
 pub(super) fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {

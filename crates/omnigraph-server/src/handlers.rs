@@ -2576,9 +2576,10 @@ mod blob_error_tests {
     async fn pre_header_internal_errors_do_not_expose_physical_storage_or_identity() {
         for (error, secret) in [
             (
-                OmniError::Lance(
-                    "GET s3://private-bucket/tenant-a/table.lance?token=secret".to_string(),
-                ),
+                OmniError::Storage(omnigraph::error::StorageFailure::new(
+                    omnigraph::error::StorageFailureKind::Unknown,
+                    "storage: GET s3://private-bucket/tenant-a/table.lance?token=secret",
+                )),
                 "private-bucket",
             ),
             (

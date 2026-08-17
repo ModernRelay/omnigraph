@@ -165,9 +165,9 @@ pub(super) async fn ensure_indices_for_branch(
                     .stage_create_indices(&ds, &work.specs)
                     .await
                     .map_err(|error| {
-                        OmniError::Lance(format!(
-                            "stage index batch on {} ({:?}): {}",
-                            table_key, work.specs, error
+                        error.with_context(format!(
+                            "stage index batch on {table_key} ({:?})",
+                            work.specs
                         ))
                     })?;
                 crate::failpoints::maybe_fail(
@@ -222,9 +222,9 @@ pub(super) async fn ensure_indices_for_branch(
                     .stage_create_indices(&ds, &work.specs)
                     .await
                     .map_err(|error| {
-                        OmniError::Lance(format!(
-                            "stage index batch on {} ({:?}): {}",
-                            table_key, work.specs, error
+                        error.with_context(format!(
+                            "stage index batch on {table_key} ({:?})",
+                            work.specs
                         ))
                     })?;
                 crate::failpoints::maybe_fail(
@@ -453,9 +453,9 @@ pub(super) async fn ensure_indices_for_branch(
                         .stage_create_indices(&ds, &work.specs)
                         .await
                         .map_err(|error| {
-                            OmniError::Lance(format!(
-                                "stage first-touch index batch on {} ({:?}): {}",
-                                table_key, work.specs, error
+                            error.with_context(format!(
+                                "stage first-touch index batch on {table_key} ({:?})",
+                                work.specs
                             ))
                         })?;
                     crate::failpoints::maybe_fail(
@@ -1439,9 +1439,9 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
         .stage_create_indices(ds, &work.specs)
         .await
         .map_err(|error| {
-            OmniError::Lance(format!(
-                "stage index batch on {} ({:?}): {}",
-                table_key, work.specs, error
+            error.with_context(format!(
+                "stage index batch on {table_key} ({:?})",
+                work.specs
             ))
         })?;
     // Retain the established test seam at the now-batched stage/commit
@@ -1456,9 +1456,9 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
         .commit_staged(ds.clone(), staged)
         .await
         .map_err(|error| {
-            OmniError::Lance(format!(
-                "commit index batch on {} ({:?}): {}",
-                table_key, work.specs, error
+            error.with_context(format!(
+                "commit index batch on {table_key} ({:?})",
+                work.specs
             ))
         })?;
     *ds = new_ds;

@@ -51,7 +51,7 @@ pub(super) async fn open_manifest_dataset_with_session(
         Some(branch) if branch != "main" => dataset
             .checkout_branch(branch)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string())),
+            .map_err(OmniError::storage),
         _ => Ok(dataset),
     }
 }

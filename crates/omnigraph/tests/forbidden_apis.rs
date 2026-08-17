@@ -2680,6 +2680,77 @@ fn lance_ordering_stays_behind_bounded_scan_executor() {
 }
 
 #[test]
+fn omni_error_has_no_global_upstream_error_conversions() {
+    use syn::{GenericArgument, PathArguments};
+
+    let src = engine_src_root();
+    let mut violations = Vec::new();
+    for file in walk_rust_files(&src) {
+        let Ok(contents) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let relative = file.strip_prefix(&src).unwrap_or(&file);
+        let ast = parse_rust_source(&contents, &relative.display().to_string());
+        for item in ast.items {
+            let Item::Impl(implementation) = item else {
+                continue;
+            };
+            let Type::Path(target) = implementation.self_ty.as_ref() else {
+                continue;
+            };
+            if !target
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "OmniError")
+            {
+                continue;
+            }
+            let Some((_, trait_path, _)) = implementation.trait_ else {
+                continue;
+            };
+            let Some(from) = trait_path.segments.last() else {
+                continue;
+            };
+            if from.ident != "From" {
+                continue;
+            }
+            let PathArguments::AngleBracketed(arguments) = &from.arguments else {
+                continue;
+            };
+            let Some(GenericArgument::Type(Type::Path(source))) = arguments.args.first() else {
+                continue;
+            };
+            let segments = source
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            let last = segments.last().map(String::as_str);
+            let forbidden = matches!(last, Some("ArrowError" | "DataFusionError" | "LanceError"))
+                || (last == Some("Error")
+                    && segments
+                        .iter()
+                        .any(|segment| segment == "lance" || segment == "lance_core"));
+            if forbidden {
+                violations.push(format!(
+                    "{}: impl From<{}> for OmniError",
+                    relative.display(),
+                    segments.join("::")
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "upstream errors require named, call-site-specific conversion helpers; global conversions found:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+#[test]
 fn engine_code_does_not_call_forbidden_lance_apis() {
     let src = engine_src_root();
     let mut violations = Vec::new();

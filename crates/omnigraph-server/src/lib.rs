@@ -1277,7 +1277,7 @@ impl ApiError {
                 Self::range_not_satisfiable(start, end, length)
             }
             err @ OmniError::BlobIntegrity { .. } => Self::internal(err.to_string()),
-            OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
+            OmniError::Storage(failure) => Self::internal(failure.to_string()),
             OmniError::RetryableCommitConflict(message) => {
                 Self::conflict(format!("retryable storage commit conflict: {message}"))
             }
@@ -1500,6 +1500,54 @@ mod api_error_tests {
             error.error.starts_with("change cursor rejected: "),
             "the 400 prefix is a stable contract: {}",
             error.error
+        );
+    }
+
+    async fn response_error(error: OmniError) -> (StatusCode, ErrorOutput) {
+        let response = ApiError::from_omni(error).into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn storage_query_precondition_and_blob_messages_map_exactly() {
+        let (status, output) =
+            response_error(OmniError::Storage(omnigraph::error::StorageFailure::new(
+                omnigraph::error::StorageFailureKind::Transient,
+                "storage: nearest: Operation timed out",
+            )))
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(output.error, "storage: nearest: Operation timed out");
+
+        let (status, output) =
+            response_error(OmniError::DataFusion("invalid projection".to_string())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(output.error, "query: invalid projection");
+
+        let (status, output) = response_error(OmniError::PreconditionFailed {
+            branch: "main".to_string(),
+            expected: "01EXPECTED".to_string(),
+            actual: Some("01ACTUAL".to_string()),
+        })
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            output.error,
+            "precondition failed on branch 'main': expected head '01EXPECTED' but current is 01ACTUAL"
+        );
+
+        let (status, output) = response_error(OmniError::BlobIntegrity {
+            reason: "malformed descriptor".to_string(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            output.error,
+            "blob integrity violation: malformed descriptor"
         );
     }
 

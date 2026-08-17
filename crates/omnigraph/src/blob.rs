@@ -137,7 +137,7 @@ impl BlobReader {
         self.file
             .read_range(range)
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(OmniError::storage)
     }
 }
 
@@ -1162,21 +1162,19 @@ impl Omnigraph {
         let mut scanner = dataset.scan();
         scanner
             .project(&[cell.property.as_str()])
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         scanner.filter_expr(col("id").eq(lit(cell.id.clone())));
         scanner.blob_handling(BlobHandling::BlobsDescriptions);
         scanner.with_row_id();
-        scanner
-            .limit(Some(2), None)
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        scanner.limit(Some(2), None).map_err(OmniError::storage)?;
         let stream = scanner
             .try_into_stream()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         let batches = stream
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
 
         let mut selected = None;
         for batch in &batches {
@@ -1262,7 +1260,7 @@ impl Omnigraph {
                 let mut files = dataset
                     .take_blobs(&[stable_row_id], &cell.property)
                     .await
-                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                    .map_err(OmniError::storage)?;
                 if files.len() != 1 {
                     return Err(OmniError::blob_integrity(format!(
                         "managed Blob lookup returned {} slots instead of one",

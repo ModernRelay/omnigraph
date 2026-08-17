@@ -8,7 +8,7 @@ pub(super) fn apply_filter(
     crate::instrumentation::record_in_memory_filter();
     let mask = evaluate_filter(batch, filter, params)?;
     let filtered = arrow_select::filter::filter_record_batch(batch, &mask)
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::arrow_internal)?;
     *batch = filtered;
     Ok(())
 }
@@ -31,8 +31,7 @@ fn evaluate_filter(
 
     // Cast right to match left's type if needed (e.g. Int64 literal vs Int32 column)
     let right = if left.data_type() != right.data_type() {
-        arrow_cast::cast::cast(&right, left.data_type())
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+        arrow_cast::cast::cast(&right, left.data_type()).map_err(OmniError::arrow_internal)?
     } else {
         right
     };
@@ -49,7 +48,7 @@ fn evaluate_filter(
             unreachable!("handled above")
         }
     }
-    .map_err(|e| OmniError::Lance(e.to_string()))?;
+    .map_err(OmniError::arrow_internal)?;
 
     Ok(result)
 }
@@ -111,8 +110,7 @@ fn evaluate_contains_filter(left: &ArrayRef, right: &ArrayRef) -> Result<Boolean
         ));
     };
     let right = if right.data_type() != field.data_type() {
-        arrow_cast::cast::cast(right, field.data_type())
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+        arrow_cast::cast::cast(right, field.data_type()).map_err(OmniError::arrow_internal)?
     } else {
         Arc::clone(right)
     };
@@ -157,8 +155,7 @@ fn evaluate_string_match_filter(
     // typically a broadcast literal already matching, so this cast is usually
     // a no-op.
     let right = if right.data_type() != left.data_type() {
-        arrow_cast::cast::cast(right, left.data_type())
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+        arrow_cast::cast::cast(right, left.data_type()).map_err(OmniError::arrow_internal)?
     } else {
         Arc::clone(right)
     };
@@ -184,10 +181,9 @@ fn array_value_eq(
     if left.is_null(left_index) || right.is_null(right_index) {
         return Ok(false);
     }
-    let left_value =
-        array_value_to_string(left, left_index).map_err(|e| OmniError::Lance(e.to_string()))?;
+    let left_value = array_value_to_string(left, left_index).map_err(OmniError::arrow_internal)?;
     let right_value =
-        array_value_to_string(right, right_index).map_err(|e| OmniError::Lance(e.to_string()))?;
+        array_value_to_string(right, right_index).map_err(OmniError::arrow_internal)?;
     Ok(left_value == right_value)
 }
 
@@ -377,7 +373,7 @@ pub(super) fn project_return(
     }
 
     let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }
 
 /// Evaluate a single projection expression against a wide batch.
@@ -496,17 +492,16 @@ pub(super) fn apply_ordering(
         }
     }
 
-    let indices =
-        lexsort_to_indices(&sort_columns, None).map_err(|e| OmniError::Lance(e.to_string()))?;
+    let indices = lexsort_to_indices(&sort_columns, None).map_err(OmniError::arrow_internal)?;
 
     let columns: Vec<ArrayRef> = batch
         .columns()
         .iter()
         .map(|col| arrow_select::take::take(col.as_ref(), &indices, None))
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::arrow_internal)?;
 
-    RecordBatch::try_new(batch.schema(), columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(batch.schema(), columns).map_err(OmniError::arrow_internal)
 }
 
 // ─── Aggregate execution ───────────────────────────────────────────────────
@@ -593,7 +588,7 @@ fn aggregate_return(
         let first_row_indices: Vec<u32> = group_indices.iter().map(|rows| rows[0] as u32).collect();
         let take_idx = UInt32Array::from(first_row_indices);
         let col = arrow_select::take::take(gk.column.as_ref(), &take_idx, None)
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::arrow_internal)?;
         result_columns.push((gk.proj_idx, gk.name.clone(), col));
     }
 
@@ -611,7 +606,7 @@ fn aggregate_return(
     let columns: Vec<ArrayRef> = result_columns.into_iter().map(|(_, _, col)| col).collect();
 
     let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }
 
 /// Build a string key for grouping using length-prefixed encoding.
@@ -855,5 +850,5 @@ fn build_empty_aggregate_result(projections: &[IRProjection]) -> Result<RecordBa
     }
 
     let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }

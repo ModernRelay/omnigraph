@@ -590,7 +590,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
         .await
     {
         Ok(bytes) => assert_eq!(&bytes[..], &[0x5a]),
-        Err(OmniError::Lance(_)) => {}
+        Err(OmniError::Storage(_)) => {}
         Err(other) => panic!(
             "destructive branch reclamation may return old bytes or fail loudly, never retarget; got {other:?}"
         ),

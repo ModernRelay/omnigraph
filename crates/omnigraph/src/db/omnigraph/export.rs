@@ -464,7 +464,7 @@ where
                 .column_by_name("_rowid")
                 .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
                 .ok_or_else(|| {
-                    OmniError::Lance(format!(
+                    OmniError::manifest_internal(format!(
                         "expected _rowid column when exporting '{}'",
                         table_key
                     ))
@@ -495,7 +495,7 @@ pub(crate) async fn export_blob_values(
             .column_by_name(property)
             .and_then(|col| col.as_any().downcast_ref::<StructArray>())
             .ok_or_else(|| {
-                OmniError::Lance(format!(
+                OmniError::blob_integrity(format!(
                     "expected blob descriptions for export column '{}'",
                     property
                 ))
@@ -721,10 +721,10 @@ async fn export_blob_column_values(
     let sorted_blobs = Arc::new(source_ds.clone())
         .take_blobs(&sorted_ids, column_name)
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
 
     if sorted_blobs.len() != managed_positions.len() {
-        return Err(OmniError::Lance(format!(
+        return Err(OmniError::blob_integrity(format!(
             "blob export for '{}' lost alignment with selected rows",
             column_name
         )));
@@ -737,21 +737,18 @@ async fn export_blob_column_values(
 
     for (idx, position) in managed_positions.into_iter().enumerate() {
         let blob = sorted_blobs[inverse_perm[idx]].as_ref().ok_or_else(|| {
-            OmniError::Lance(format!(
+            OmniError::blob_integrity(format!(
                 "blob export for '{}' returned a null accessor for a managed description",
                 column_name
             ))
         })?;
         if blob.uri().is_some() {
-            return Err(OmniError::Lance(format!(
+            return Err(OmniError::blob_integrity(format!(
                 "blob export for '{}' resolved a managed description as external",
                 column_name
             )));
         }
-        let bytes = blob
-            .read()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let bytes = blob.read().await.map_err(OmniError::storage)?;
         let value = format!(
             "base64:{}",
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
@@ -784,21 +781,23 @@ fn json_value_from_named_column(
     row: usize,
 ) -> Result<serde_json::Value> {
     let column = batch.column_by_name(field_name).ok_or_else(|| {
-        OmniError::Lance(format!("missing column '{}' in export batch", field_name))
+        OmniError::manifest_internal(format!("missing column '{}' in export batch", field_name))
     })?;
     json_value_from_array(column.as_ref(), row)
 }
 
 fn named_string_value(batch: &RecordBatch, field_name: &str, row: usize) -> Result<String> {
     let column = batch.column_by_name(field_name).ok_or_else(|| {
-        OmniError::Lance(format!("missing column '{}' in export batch", field_name))
+        OmniError::manifest_internal(format!("missing column '{}' in export batch", field_name))
     })?;
     let array = column
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::Lance(format!("expected Utf8 column '{}'", field_name)))?;
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("expected Utf8 column '{}'", field_name))
+        })?;
     if array.is_null(row) {
-        return Err(OmniError::Lance(format!(
+        return Err(OmniError::manifest_internal(format!(
             "unexpected null in export column '{}'",
             field_name
         )));

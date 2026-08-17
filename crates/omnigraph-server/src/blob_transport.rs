@@ -961,9 +961,10 @@ mod tests {
     impl RangeReader for FailingReader {
         fn read_range(&self, _range: Range<u64>) -> BoxFuture<'static, Result<Bytes, OmniError>> {
             Box::pin(async {
-                Err(OmniError::Lance(
-                    "s3://private-bucket/physical/object".to_string(),
-                ))
+                Err(OmniError::Storage(omnigraph::error::StorageFailure::new(
+                    omnigraph::error::StorageFailureKind::Unknown,
+                    "storage: s3://private-bucket/physical/object",
+                )))
             })
         }
     }

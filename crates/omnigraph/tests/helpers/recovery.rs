@@ -539,12 +539,12 @@ async fn lance_head_for_entry(root_uri: &str, entry: &DatasetEntry) -> Result<u6
     let table_uri = format!("{}/{}", root_uri.trim_end_matches('/'), entry.dataset_path);
     let ds = Dataset::open(&table_uri)
         .await
-        .map_err(|err| OmniError::Lance(err.to_string()))?;
+        .map_err(OmniError::storage)?;
     let ds = match entry.native_dataset_branch.as_deref() {
         Some(branch) if branch != "main" => ds
             .checkout_branch(branch)
             .await
-            .map_err(|err| OmniError::Lance(err.to_string()))?,
+            .map_err(OmniError::storage)?,
         _ => ds,
     };
     Ok(ds.version().version)
@@ -594,15 +594,15 @@ async fn matching_audit_rows(
     }
     let ds = Dataset::open(recoveries_dir.to_str().unwrap())
         .await
-        .map_err(|err| OmniError::Lance(err.to_string()))?;
+        .map_err(OmniError::storage)?;
     let batches: Vec<RecordBatch> = ds
         .scan()
         .try_into_stream()
         .await
-        .map_err(|err| OmniError::Lance(err.to_string()))?
+        .map_err(OmniError::storage)?
         .try_collect()
         .await
-        .map_err(|err| OmniError::Lance(err.to_string()))?;
+        .map_err(OmniError::storage)?;
 
     let mut rows = Vec::new();
     for batch in batches {

@@ -3,7 +3,30 @@
 ## Error taxonomy (`omnigraph::error::OmniError`)
 
 - `Compiler(...)` — schema/query parse/typecheck errors
-- `Lance(String)` — storage layer
+- `Storage(StorageFailure { kind, message })` — a graph-storage failure with a
+  closed typed classification. `message` is the complete operator-facing
+  diagnostic; display it directly without adding a `storage:` prefix. The
+  exported `StorageFailureKind` values are:
+  - `Transient` — positive evidence of timeout, throttling, cancellation, or a
+    transport interruption.
+  - `Configuration` — authentication, permission, unsupported operation,
+    malformed input/location, or an exhausted configured disk cap.
+  - `NotFound` — a requested object, dataset, ref, version, index, or namespace
+    entity is absent.
+  - `Precondition` — state must be re-evaluated after an already-exists,
+    not-modified, CAS/concurrency, stale-authority, or fenced-authority
+    condition.
+  - `Permanent` — positive evidence of corruption, an invariant failure, a
+    panic, or a substrate-internal failure.
+  - `Unknown` — typed evidence is insufficient; neither retry nor permanent
+    escalation is implied.
+
+  `StorageFailure::is_transient()` is exactly `kind == Transient`. It does not
+  decide whether replay is safe. Only the operation that knows whether an
+  attempt had effects can authorize another attempt. In particular,
+  `Precondition` means re-evaluate state, not “retry this operation.” The HTTP
+  API does not expose this Rust classification: generic storage failures remain
+  **500**, and the OpenAPI schema is unchanged.
 - `HistoricalVersionReclaimed { published_dataset_version }` — an exact graph-manifest-pinned Lance
   version was reclaimed. Historical callers keep this distinct from ordinary
   absence; change routes project it to the typed 410 baseline-reset contract.
@@ -201,6 +224,15 @@
   confirmed graph manifest or indeterminate physical outcome is never cleaned
   backward.
 - `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
+
+The v0.10 Rust API intentionally replaces the exhaustive
+`OmniError::Lance(String)` variant with
+`OmniError::Storage(StorageFailure)`. Exhaustive embedded consumers must add a
+`Storage` arm. Arrow batch/shape failures owned by manifest machinery now map
+to manifest-internal errors, persisted Blob descriptor contradictions map to
+`BlobIntegrity`, and ordinary user query planning/schema/execution failures
+remain `DataFusion`. These are deliberate category corrections; no graph,
+manifest, HTTP, or OpenAPI format changes accompany them.
 
 For RFC-023 Mutation/Load keyed writes, `KeyConflict` is returned only after
 the writer proves that none of its planned dataset effects landed, finalizes the

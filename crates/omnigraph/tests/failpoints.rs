@@ -11782,11 +11782,11 @@ async fn branch_merge_pure_insert_rejects_source_table_ref_aba_before_arm() {
     let replacement_result = async {
         let mut root = lance::Dataset::open(&person_uri)
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         let main_version = root.version().version;
         root.force_delete_branch("source")
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         if let Err(error) = std::fs::remove_dir_all(
             std::path::Path::new(&person_uri)
                 .join("tree")
@@ -11797,11 +11797,11 @@ async fn branch_merge_pure_insert_rejects_source_table_ref_aba_before_arm() {
         }
         root.create_branch("source", main_version, None)
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         let mut replacement = root
             .checkout_branch("source")
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         // The manifest publisher refuses to register the same table version a
         // second time for one logical table identity, so advance the recreated
         // ref beyond the captured version. The final native identifier check,
@@ -11820,7 +11820,7 @@ async fn branch_merge_pure_insert_rejects_source_table_ref_aba_before_arm() {
             replacement
                 .branch_identifier()
                 .await
-                .map_err(|error| OmniError::Lance(error.to_string()))?,
+                .map_err(OmniError::storage)?,
         ))
     }
     .await;

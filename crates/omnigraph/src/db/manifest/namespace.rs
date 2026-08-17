@@ -129,7 +129,7 @@ impl StagedTableNamespace {
         } else {
             ds.checkout_version(version)
                 .await
-                .map_err(|e| OmniError::Lance(e.to_string()))
+                .map_err(OmniError::storage)
         }
     }
 

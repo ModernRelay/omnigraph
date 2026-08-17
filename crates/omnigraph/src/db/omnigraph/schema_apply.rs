@@ -1239,7 +1239,7 @@ async fn cleanup_dataset_old_versions(db: &Omnigraph, full_uri: &str) -> Result<
     };
     let _removed = lance::dataset::cleanup::cleanup_old_versions(&ds, policy)
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     let _ = db;
     Ok(())
 }
@@ -1353,7 +1353,7 @@ pub(super) async fn batch_for_schema_apply_rewrite(
                 .column_by_name("_rowid")
                 .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
                 .ok_or_else(|| {
-                    OmniError::Lance(format!(
+                    OmniError::manifest_internal(format!(
                         "expected _rowid column when rewriting '{}'",
                         source_table_key
                     ))
@@ -1382,7 +1382,7 @@ pub(super) async fn batch_for_schema_apply_rewrite(
                         .as_any()
                         .downcast_ref::<StructArray>()
                         .ok_or_else(|| {
-                            OmniError::Lance(format!(
+                            OmniError::blob_integrity(format!(
                                 "expected blob descriptions for '{}.{}'",
                                 source_table_key, source_name
                             ))
@@ -1404,7 +1404,7 @@ pub(super) async fn batch_for_schema_apply_rewrite(
         }
     }
 
-    RecordBatch::try_new(target_schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(target_schema, columns).map_err(OmniError::arrow_internal)
 }
 
 /// Descriptor-only pre-arm validation for external Blob cells that a schema
@@ -1451,17 +1451,13 @@ async fn validate_schema_rewrite_external_ranges(
         SCHEMA_BLOB_DESCRIPTOR_SCAN_BYTES,
     )
     .await?;
-    while let Some(batch) = batches
-        .try_next()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
-    {
+    while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
         for source_name in &source_columns {
             let descriptions = batch
                 .column_by_name(source_name)
                 .and_then(|column| column.as_any().downcast_ref::<StructArray>())
                 .ok_or_else(|| {
-                    OmniError::Lance(format!(
+                    OmniError::blob_integrity(format!(
                         "expected blob descriptions for '{}.{}' during pre-arm schema validation",
                         source_table_key, source_name
                     ))
@@ -1508,67 +1504,57 @@ async fn rebuild_blob_column(
         Arc::new(source_ds.dataset().clone())
             .take_blobs(&managed_row_ids, column_name)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .map_err(OmniError::storage)?
     };
 
     let mut files = blob_files.into_iter();
     for descriptor in row_descriptors {
         match descriptor {
-            crate::blob::BlobDescriptor::Null => builder
-                .push_null()
-                .map_err(|e| OmniError::Lance(e.to_string()))?,
+            crate::blob::BlobDescriptor::Null => builder.push_null().map_err(OmniError::storage)?,
             crate::blob::BlobDescriptor::External {
                 uri,
                 offset,
                 length,
             } => {
                 let uri = whole_external_uri_for_schema_rewrite(uri, offset, length)?;
-                builder
-                    .push_uri(uri)
-                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+                builder.push_uri(uri).map_err(OmniError::storage)?;
             }
             crate::blob::BlobDescriptor::Managed { .. } => {
                 let blob = files
                     .next()
                     .ok_or_else(|| {
-                        OmniError::Lance(format!(
+                        OmniError::blob_integrity(format!(
                             "blob rewrite for '{}' lost alignment with managed source rows",
                             column_name
                         ))
                     })?
                     .ok_or_else(|| {
-                        OmniError::Lance(format!(
+                        OmniError::blob_integrity(format!(
                             "blob rewrite for '{}' returned a null accessor for a managed description",
                             column_name
                         ))
                     })?;
                 if blob.uri().is_some() {
-                    return Err(OmniError::Lance(format!(
+                    return Err(OmniError::blob_integrity(format!(
                         "blob rewrite for '{}' resolved a managed description as external",
                         column_name
                     )));
                 }
                 builder
-                    .push_bytes(
-                        blob.read()
-                            .await
-                            .map_err(|e| OmniError::Lance(e.to_string()))?,
-                    )
-                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+                    .push_bytes(blob.read().await.map_err(OmniError::storage)?)
+                    .map_err(OmniError::storage)?;
             }
         }
     }
 
     if files.next().is_some() {
-        return Err(OmniError::Lance(format!(
+        return Err(OmniError::blob_integrity(format!(
             "blob rewrite for '{}' produced extra source blobs",
             column_name
         )));
     }
 
-    builder
-        .finish()
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    builder.finish().map_err(OmniError::storage)
 }
 
 /// Lance's logical Blob input can retain a whole-object URI but cannot encode

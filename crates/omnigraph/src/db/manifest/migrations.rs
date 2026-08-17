@@ -228,7 +228,7 @@ async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
     dataset
         .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), version.to_string())])
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     Ok(())
 }
 
@@ -247,7 +247,7 @@ pub(crate) async fn set_raw_stamp_for_test(dataset: &mut Dataset, value: &str) -
     dataset
         .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), value.to_string())])
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     Ok(())
 }
 
@@ -267,7 +267,7 @@ pub(crate) async fn remove_stamp_for_test(dataset: &mut Dataset) -> Result<()> {
         .update_schema_metadata(remaining)
         .replace()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     Ok(())
 }
 

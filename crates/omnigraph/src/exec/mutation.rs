@@ -325,20 +325,14 @@ fn typed_list_literal_to_array(
 fn build_blob_array_from_value(value: &str) -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(1);
     crate::loader::append_blob_value(&mut builder, value)?;
-    builder
-        .finish()
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    builder.finish().map_err(OmniError::storage)
 }
 
 /// Build a null blob array with one element.
 fn build_null_blob_array() -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(1);
-    builder
-        .push_null()
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    builder
-        .finish()
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    builder.push_null().map_err(OmniError::storage)?;
+    builder.finish().map_err(OmniError::storage)
 }
 
 /// Build a single-row RecordBatch from resolved assignments.
@@ -386,7 +380,7 @@ fn build_insert_batch(
         }
     }
 
-    RecordBatch::try_new(schema.clone(), columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(schema.clone(), columns).map_err(OmniError::arrow_internal)
 }
 
 /// Convert an IRMutationPredicate to a Lance SQL filter string.
@@ -462,18 +456,14 @@ fn apply_assignments(
                 for _ in 0..batch.num_rows() {
                     crate::loader::append_blob_value(&mut builder, uri)?;
                 }
-                columns.push(
-                    builder
-                        .finish()
-                        .map_err(|e| OmniError::Lance(e.to_string()))?,
-                );
+                columns.push(builder.finish().map_err(OmniError::storage)?);
             } else {
                 // Unassigned: the materializing scan must have normalized the
                 // committed value (or pending value) to the logical blob
                 // schema, so copying it preserves both bytes and full-schema
                 // merge compatibility.
                 let col = batch.column_by_name(field.name()).ok_or_else(|| {
-                    OmniError::Lance(format!(
+                    OmniError::manifest_internal(format!(
                         "blob column '{}' not found in full-schema mutation scan",
                         field.name()
                     ))
@@ -488,7 +478,7 @@ fn apply_assignments(
             )?);
         } else {
             let col = batch.column_by_name(field.name()).ok_or_else(|| {
-                OmniError::Lance(format!(
+                OmniError::manifest_internal(format!(
                     "column '{}' not found in scan result",
                     field.name()
                 ))
@@ -497,7 +487,7 @@ fn apply_assignments(
         }
     }
 
-    RecordBatch::try_new(full_schema.clone(), columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(full_schema.clone(), columns).map_err(OmniError::arrow_internal)
 }
 
 // ─── Mutation execution ──────────────────────────────────────────────────────
@@ -1662,10 +1652,10 @@ fn concat_match_batches_to_schema(
     if batches.len() == 1 {
         let batch = batches.into_iter().next().unwrap();
         return RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
-            .map_err(|e| OmniError::Lance(e.to_string()));
+            .map_err(OmniError::arrow_internal);
     }
     arrow_select::concat::concat_batches(schema, &batches).map_err(|e| {
-        OmniError::Lance(format!(
+        OmniError::manifest_internal(format!(
             "mutation scan returned batches that violate the full logical schema \
              across the committed/pending boundary ({})",
             e
