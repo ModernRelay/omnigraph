@@ -239,9 +239,13 @@ the CDC order and is not a cross-branch cursor.
 
 ### 3.3 Graph-level filtering
 
-Filters may select graph concepts—node/edge kind, opaque graph type identity or
-name, and operation. They may not select a Lance dataset, table alias/path,
-native branch, fragment, or physical version.
+Filters may select graph concepts—node/edge kind, type name, and operation.
+Type filtering is **by name only**: the opaque graph type identity carried on
+every emitted change is a stable, rename-safe display and join key, not a filter
+dimension. A supplied opaque type ID therefore matches nothing rather than
+filtering by identity; select the current type name instead. Filters may not
+select a Lance dataset, table alias/path, native branch, fragment, or physical
+version.
 
 Page tokens and feed cursors bind the canonical filter and image contract.
 Reusing either with a different scope fails with its corresponding typed scope
