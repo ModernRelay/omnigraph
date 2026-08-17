@@ -1075,14 +1075,19 @@ fn print_entity_change_row(change: &omnigraph_api_types::EntityChangeOutput) {
         change.r#type.name,
         change.id
     );
-    // Edge endpoints (present on edge images only).
-    if let Some(endpoints) = change
+    // Edge endpoints (present on edge images only). An endpoint-moving update
+    // must show BOTH pairs; `after.or(before)` alone silently hid the old
+    // endpoints of a move.
+    let before_endpoints = change
+        .before
+        .as_ref()
+        .and_then(|image| image.endpoints.as_ref());
+    let after_endpoints = change
         .after
         .as_ref()
-        .or(change.before.as_ref())
-        .and_then(|image| image.endpoints.as_ref())
-    {
-        println!("  {} -> {}", endpoints.from, endpoints.to);
+        .and_then(|image| image.endpoints.as_ref());
+    if let Some(rendered) = format_endpoint_change(before_endpoints, after_endpoints) {
+        println!("  {rendered}");
     }
     // The before/after property values are the point of a change feed; the
     // previous output dropped them. Show inserted/deleted values, or the
@@ -1095,13 +1100,43 @@ fn print_entity_change_row(change: &omnigraph_api_types::EntityChangeOutput) {
     }
 }
 
+/// Render an edge change's endpoints for human output. An endpoint-moving
+/// update shows `old_from -> old_to => new_from -> new_to`; an insert, delete,
+/// or endpoint-preserving update shows the single pair. Nodes (no endpoints)
+/// render nothing.
+fn format_endpoint_change(
+    before: Option<&omnigraph_api_types::ChangeEndpointsOutput>,
+    after: Option<&omnigraph_api_types::ChangeEndpointsOutput>,
+) -> Option<String> {
+    match (before, after) {
+        (Some(b), Some(a)) if b.from != a.from || b.to != a.to => {
+            Some(format!("{} -> {} => {} -> {}", b.from, b.to, a.from, a.to))
+        }
+        (Some(endpoints), Some(_)) | (Some(endpoints), None) | (None, Some(endpoints)) => {
+            Some(format!("{} -> {}", endpoints.from, endpoints.to))
+        }
+        (None, None) => None,
+    }
+}
+
+/// Render one property value for human output so the ambiguous states stay
+/// distinguishable: a JSON string prints verbatim (so the literal string
+/// `"null"` prints as `null`), a JSON null prints the sentinel `<null>`, and an
+/// absent key (only one image has it) prints `<absent>` at the diff call site.
+/// The `--json` output remains the exact, machine-parseable form.
 fn render_change_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Null => "<null>".to_string(),
         other => other.to_string(),
     }
 }
+
+/// The sentinel a property diff prints when a key is present in only one image.
+/// Distinct from an empty string (`""` renders empty) and from a JSON null
+/// (`<null>`), so add/drop-of-key reads differently from a value change to/from
+/// null or empty.
+const ABSENT_PROPERTY: &str = "<absent>";
 
 fn print_change_properties(marker: &str, properties: &serde_json::Value) {
     if let Some(map) = properties.as_object() {
@@ -1127,8 +1162,12 @@ fn print_change_property_diff(
         let before_value = before_map.get(key);
         let after_value = after_map.get(key);
         if before_value != after_value {
-            let before_str = before_value.map(render_change_value).unwrap_or_default();
-            let after_str = after_value.map(render_change_value).unwrap_or_default();
+            let before_str = before_value
+                .map(render_change_value)
+                .unwrap_or_else(|| ABSENT_PROPERTY.to_string());
+            let after_str = after_value
+                .map(render_change_value)
+                .unwrap_or_else(|| ABSENT_PROPERTY.to_string());
             println!("  {key}: {before_str} -> {after_str}");
         }
     }
@@ -1211,6 +1250,68 @@ mod tests {
             parsed.is_ok(),
             "rendered @embed must re-parse: {:?}",
             parsed.err()
+        );
+    }
+
+    fn endpoints(from: &str, to: &str) -> omnigraph_api_types::ChangeEndpointsOutput {
+        omnigraph_api_types::ChangeEndpointsOutput {
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    #[test]
+    fn endpoint_change_shows_both_pairs_on_a_move() {
+        // An endpoint-moving update must not hide the old endpoints — the
+        // previous `after.or(before)` printed only `a -> d`, losing `a -> b`.
+        let before = endpoints("a", "b");
+        let after = endpoints("a", "d");
+        assert_eq!(
+            super::format_endpoint_change(Some(&before), Some(&after)),
+            Some("a -> b => a -> d".to_string())
+        );
+    }
+
+    #[test]
+    fn endpoint_change_shows_single_pair_when_unchanged_or_one_sided() {
+        let ab = endpoints("a", "b");
+        // Endpoint-preserving update collapses to one pair.
+        assert_eq!(
+            super::format_endpoint_change(Some(&ab), Some(&endpoints("a", "b"))),
+            Some("a -> b".to_string())
+        );
+        // Insert (after only) and delete (before only) each show their pair.
+        assert_eq!(
+            super::format_endpoint_change(None, Some(&ab)),
+            Some("a -> b".to_string())
+        );
+        assert_eq!(
+            super::format_endpoint_change(Some(&ab), None),
+            Some("a -> b".to_string())
+        );
+        // Nodes carry no endpoints.
+        assert_eq!(super::format_endpoint_change(None, None), None);
+    }
+
+    #[test]
+    fn render_change_value_distinguishes_null_from_the_string_null() {
+        // The core F7 ambiguity: JSON null and the literal string "null" used to
+        // render identically. They must now differ.
+        let json_null = super::render_change_value(&serde_json::Value::Null);
+        let string_null = super::render_change_value(&serde_json::json!("null"));
+        assert_eq!(json_null, "<null>");
+        assert_eq!(string_null, "null");
+        assert_ne!(json_null, string_null);
+        // An empty string renders empty — distinct from null and from an absent
+        // key (`<absent>`), so the four states never collide.
+        assert_eq!(super::render_change_value(&serde_json::json!("")), "");
+        assert_ne!(
+            super::render_change_value(&serde_json::json!("")),
+            json_null
+        );
+        assert_ne!(
+            super::render_change_value(&serde_json::json!("")),
+            super::ABSENT_PROPERTY
         );
     }
 }
