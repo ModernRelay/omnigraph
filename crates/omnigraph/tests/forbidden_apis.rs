@@ -281,6 +281,16 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
 // crate-visible wrapper would otherwise create a new internal route to the
 // manifest publisher without changing the durable gateway count.
 const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "finish_init_with_storage",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "open_exact_genesis_with_storage",
+    ),
     ("db/graph_coordinator.rs", "GraphCoordinator", "open"),
     (
         "db/graph_coordinator.rs",
@@ -375,6 +385,12 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "GraphCoordinator",
         "list_commits",
     ),
+    ("db/manifest.rs", "ManifestCoordinator", "finish_init"),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "open_exact_genesis_with_lineage",
+    ),
     ("db/manifest.rs", "ManifestCoordinator", "open"),
     ("db/manifest.rs", "ManifestCoordinator", "open_with_session"),
     ("db/manifest.rs", "ManifestCoordinator", "open_at_branch"),
@@ -418,7 +434,7 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "init_with_session",
+        "init_commit_with_session",
         WriteProtocol::Bootstrap,
     ),
     (
@@ -454,7 +470,7 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/manifest.rs",
         "ManifestCoordinator",
-        "init_with_lineage",
+        "init_commit",
         WriteProtocol::Bootstrap,
     ),
     (
@@ -724,17 +740,17 @@ durable_calls! {
     ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/omnigraph/table_ops.rs", ".commit_updates_with_actor_with_expected(", 2, WriteProtocol::TestOnly),
-    ("db/omnigraph.rs", ".write_text_if_absent(", 2, WriteProtocol::Composed("bootstrap `_schema.pg` claim + bind-time create-if-absent probe")),
+    ("db/omnigraph.rs", ".write_text_if_absent(", 3, WriteProtocol::Composed("bootstrap init claim + strict `_schema.pg` defence + bind-time create-if-absent probe")),
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
     ("db/manifest/recovery.rs", ".write_text(", 6, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V9),
-    ("db/omnigraph.rs", ".delete(", 2, WriteProtocol::Composed("bootstrap init cleanup + create-if-absent probe removal")),
+    ("db/omnigraph.rs", ".delete(", 3, WriteProtocol::Composed("bootstrap init cleanup + claim release + create-if-absent probe removal")),
     ("db/schema_state.rs", ".delete(", 3, WriteProtocol::Composed("schema staging cleanup")),
     ("db/schema_state.rs", ".rename_text(", 1, WriteProtocol::Composed("schema staging promotion")),
     ("db/manifest/recovery.rs", ".delete(", 2, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".delete_prefix(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph.rs", "GraphCoordinator::init_with_session(", 1, WriteProtocol::Bootstrap),
+    ("db/omnigraph.rs", "GraphCoordinator::init_commit_with_session(", 1, WriteProtocol::Bootstrap),
     ("db/omnigraph.rs", "recover_manifest_drift(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "heal_pending_sidecars_roll_forward(", 2, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "recover_schema_state_files(", 2, WriteProtocol::RecoveryExecutor),
@@ -822,7 +838,7 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".put_opts(",
     ".rename(",
     ".rename_text(",
-    "GraphCoordinator::init_with_session(",
+    "GraphCoordinator::init_commit_with_session(",
     "recover_manifest_drift(",
     "heal_pending_sidecars_roll_forward(",
     "recover_schema_state_files(",
@@ -2321,7 +2337,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
     }
 
     let methods = [
-        ("db/manifest.rs", "init_with_lineage"),
+        ("db/manifest.rs", "init_commit"),
         ("db/manifest.rs", "commit"),
         ("db/manifest.rs", "commit_with_expected"),
         ("db/manifest.rs", "commit_changes"),
@@ -2334,7 +2350,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         ("db/manifest.rs", "create_branch"),
         ("db/manifest.rs", "delete_branch"),
         ("db/manifest.rs", "delete_branch_with_expected"),
-        ("db/graph_coordinator.rs", "init_with_session"),
+        ("db/graph_coordinator.rs", "init_commit_with_session"),
         ("db/graph_coordinator.rs", "branch_create"),
         ("db/graph_coordinator.rs", "branch_delete"),
         ("db/graph_coordinator.rs", "branch_delete_captured"),

@@ -10206,16 +10206,17 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
 // `GraphCoordinator::init`. Without cleanup, a failure between any of those
 // steps left orphan files behind, making the URI unusable for a retry of
 // `init` (it would refuse because `_schema.pg` already exists). The tests
-// below pin: on failpoint trigger at each of the three phase boundaries,
+// below pin: on failpoint trigger at the two pre-commit phase boundaries,
 // the three schema files are removed before the error is returned.
 //
-// Coverage note: the third boundary (`init.after_coordinator_init`) only
-// asserts cleanup of the schema files. Lance per-type directories and
-// `__manifest/` are NOT cleaned up — that requires a recursive
-// `StorageAdapter::delete_prefix` primitive deferred along with
-// `DELETE /graphs/{id}` (MR-668 PR 2b). The orphan Lance directories
-// after a coordinator-init-phase failure are documented as a known
-// limitation.
+// The third boundary (`init.after_coordinator_init`) sits past the graph's
+// commit point, where the cleanup must not run (issue #495 — deleting the
+// schema files there left a graph that could neither open nor re-init).
+// Its test asserts the graph survives an error at that window.
+//
+// Coverage note: orphan Lance directories after a failure DURING
+// `GraphCoordinator::init` are a known limitation — see the coverage-gap
+// comment in `init_with_storage`.
 
 #[tokio::test]
 #[serial]
@@ -10241,6 +10242,10 @@ async fn init_failpoint_after_schema_pg_written_cleans_up_schema_file() {
     assert!(
         !dir.path().join("_schema.pg").exists(),
         "_schema.pg must be cleaned up after init failure"
+    );
+    assert!(
+        !dir.path().join("__init_claim.json").exists(),
+        "pre-create failure must release the init claim after cleanup"
     );
 }
 
@@ -10274,47 +10279,296 @@ async fn init_failpoint_after_schema_contract_written_cleans_up_all_schema_files
         !dir.path().join("__schema_state.json").exists(),
         "__schema_state.json must be cleaned up"
     );
+    assert!(
+        !dir.path().join("__init_claim.json").exists(),
+        "pre-create failure must release the init claim after cleanup"
+    );
 }
 
 #[tokio::test]
 #[serial]
-async fn init_failpoint_after_coordinator_init_cleans_up_schema_files() {
+async fn init_failpoint_after_coordinator_init_leaves_completed_store_intact() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
     let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_COORDINATOR_INIT, "return");
 
-    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
+    let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
         Err(e) => e,
     };
+    let OmniError::InitializationCommitted {
+        uri: error_uri,
+        source,
+    } = err
+    else {
+        panic!("post-commit validation failure must remain typed");
+    };
+    assert_eq!(error_uri, uri);
+    let msg = source.to_string();
     assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: init.after_coordinator_init"),
-        "got: {err}"
+        msg.contains("injected failpoint triggered: init.after_coordinator_init"),
+        "init error must surface the original cause, got: {msg}"
     );
 
-    // Schema files are cleaned up by `best_effort_cleanup_init_artifacts`.
+    // The graph was durably complete before the failpoint fired; the schema
+    // files must survive the failed init.
+    for schema_file in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
+        assert!(
+            dir.path().join(schema_file).exists(),
+            "{schema_file} must survive a post-commit-point init failure"
+        );
+    }
+
+    // And the graph is not merely present but fully usable: it opens,
+    // accepts a write, and serves a read.
+    let mut db = Omnigraph::open(&uri)
+        .await
+        .expect("graph must open cleanly after a post-commit-point init failure");
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "post-commit-survivor")], &[("$age", 1)]),
+    )
+    .await
+    .expect("graph must accept writes after a post-commit-point init failure");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
+// Error-return twin of `init_crash_after_manifest_create_leaves_openable_store`:
+// an error injected just past the commit point must not trigger cleanup.
+#[tokio::test]
+#[serial]
+async fn init_failpoint_post_manifest_create_leaves_completed_graph_intact() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let _failpoint = ScopedFailPoint::new(names::INIT_POST_MANIFEST_CREATE, "return");
+
+    let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
+        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
+        Err(e) => e,
+    };
+    let OmniError::InitializationCommitted {
+        uri: error_uri,
+        source,
+    } = err
+    else {
+        panic!("post-commit read-back failure must remain typed");
+    };
+    assert_eq!(error_uri, uri);
+    let msg = source.to_string();
     assert!(
-        !dir.path().join("_schema.pg").exists(),
-        "_schema.pg must be cleaned up after late-phase init failure"
-    );
-    assert!(
-        !dir.path().join("_schema.ir.json").exists(),
-        "_schema.ir.json must be cleaned up after late-phase init failure"
-    );
-    assert!(
-        !dir.path().join("__schema_state.json").exists(),
-        "__schema_state.json must be cleaned up after late-phase init failure"
+        msg.contains("injected failpoint triggered: init.post_manifest_create"),
+        "init error must surface the original cause, got: {msg}"
     );
 
-    // Documented limitation: Lance per-type datasets and `__manifest/`
-    // created by `GraphCoordinator::init` are NOT cleaned up — recursive
-    // deletion requires the deferred `delete_prefix` primitive. This
-    // assertion does NOT check for their absence; it merely documents
-    // the boundary by noting we don't validate orphan directories here.
-    // When PR 2b lands, this test can be tightened to assert the graph
-    // root is fully empty.
+    for schema_file in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
+        assert!(
+            dir.path().join(schema_file).exists(),
+            "{schema_file} must survive a post-commit-point init failure"
+        );
+    }
+
+    let mut db = Omnigraph::open(&uri)
+        .await
+        .expect("graph must open cleanly after a post-commit-point init failure");
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "post-commit-survivor")], &[("$age", 1)]),
+    )
+    .await
+    .expect("graph must accept writes after a post-commit-point init failure");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn init_manifest_create_lost_ack_recovers_exact_genesis() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let _lost_ack = ScopedFailPoint::new(names::INIT_MANIFEST_CREATE_ACK_LOST, "return");
+
+    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA)
+        .await
+        .expect("exact genesis probe must recover a lost Create acknowledgement");
+    drop(db);
+    for artifact in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
+        assert!(
+            dir.path().join(artifact).exists(),
+            "lost-ack recovery must preserve {artifact}"
+        );
+    }
+    assert!(
+        !dir.path().join("__init_claim.json").exists(),
+        "exactly recovered initialization must release its transient claim"
+    );
+    let mut db = Omnigraph::open(&uri)
+        .await
+        .expect("an exactly recovered genesis must reopen through the ordinary path");
+    let commits = db.list_commits(None).await.expect("list genesis commit");
+    assert_eq!(commits.len(), 1);
+    assert!(commits[0].parent_commit_id.is_none());
+    assert!(commits[0].actor_id.is_none());
+
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "lost-ack-survivor")], &[("$age", 1)]),
+    )
+    .await
+    .expect("recovered graph must accept writes");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn init_table_create_lost_ack_preserves_claim_and_schema() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let _lost_ack = ScopedFailPoint::new(names::INIT_TABLE_CREATE_ACK_LOST, "return");
+
+    let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
+        Ok(_) => panic!("a table Create acknowledgement failure must not return success"),
+        Err(err) => err,
+    };
+    let OmniError::InitializationIndeterminate {
+        uri: error_uri,
+        source,
+        ..
+    } = err
+    else {
+        panic!("a physical table Create outcome must remain indeterminate");
+    };
+    assert_eq!(error_uri, uri);
+    assert!(source.to_string().contains("init.table_create_ack_lost"));
+    for artifact in [
+        "_schema.pg",
+        "_schema.ir.json",
+        "__schema_state.json",
+        "__init_claim.json",
+    ] {
+        assert!(
+            dir.path().join(artifact).exists(),
+            "physical-init ambiguity must preserve {artifact}"
+        );
+    }
+    assert!(
+        dir.path().join("nodes").exists() || dir.path().join("edges").exists(),
+        "the injected error must follow a real durable table Create"
+    );
+    assert!(
+        !dir.path().join("__manifest").exists(),
+        "the table-Create test must fail before graph manifest creation"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_schema() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let lost_ack = ScopedFailPoint::new(names::INIT_MANIFEST_CREATE_ACK_LOST, "return");
+    let probe_failure = ScopedFailPoint::new(names::INIT_MANIFEST_CREATE_PROBE, "return");
+
+    let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
+        Ok(_) => panic!("an unavailable exact probe must leave the outcome indeterminate"),
+        Err(err) => err,
+    };
+    let OmniError::InitializationIndeterminate {
+        uri: error_uri,
+        source,
+        probe,
+    } = err
+    else {
+        panic!("unknown Create plus failed probe must remain typed");
+    };
+    assert_eq!(error_uri, uri);
+    assert!(source.to_string().contains("init.manifest_create_ack_lost"));
+    assert!(probe.to_string().contains("init.manifest_create_probe"));
+    for artifact in [
+        "_schema.pg",
+        "_schema.ir.json",
+        "__schema_state.json",
+        "__init_claim.json",
+    ] {
+        assert!(
+            dir.path().join(artifact).exists(),
+            "indeterminate initialization must preserve {artifact}"
+        );
+    }
+
+    drop(probe_failure);
+    drop(lost_ack);
+    let _db = Omnigraph::open(&uri)
+        .await
+        .expect("clearing the observation fault must reveal the committed graph");
+    assert!(
+        dir.path().join("__init_claim.json").exists(),
+        "ordinary open must not speculate that an indeterminate init claim is stale"
+    );
+}
+
+// The floor under the schema-files-gone damage state: however a graph loses
+// its schema files while keeping its data and `__manifest`, `open` must
+// diagnose the state by name.
+#[tokio::test]
+#[serial]
+async fn open_missing_schema_pg_reports_schema_files_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    Omnigraph::init(&uri, helpers::TEST_SCHEMA)
+        .await
+        .expect("init must succeed");
+    std::fs::remove_file(dir.path().join("_schema.pg")).unwrap();
+
+    let err = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!("open must fail without _schema.pg"),
+        Err(e) => e,
+    };
+    let OmniError::Manifest(manifest) = &err else {
+        panic!("missing schema source must remain a typed manifest error");
+    };
+    assert_eq!(manifest.kind, ManifestErrorKind::NotFound);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("missing its schema files") && msg.contains("_schema.pg"),
+        "open must name the missing schema files, got: {msg}"
+    );
+
+    let read_only_err = match Omnigraph::open_read_only(&uri).await {
+        Ok(_) => panic!("read-only open must also fail without _schema.pg"),
+        Err(err) => err,
+    };
+    let OmniError::Manifest(manifest) = read_only_err else {
+        panic!("read-only missing schema source must remain a typed manifest error");
+    };
+    assert_eq!(manifest.kind, ManifestErrorKind::NotFound);
+
+    std::fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
+    std::fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
+    let reinit = match Omnigraph::init(&uri, "node Replacement { key: String @key }\n").await {
+        Ok(_) => panic!("strict init must not rebind a readable manifest with missing schema"),
+        Err(err) => err,
+    };
+    assert!(matches!(reinit, OmniError::AlreadyInitialized { .. }));
+    for artifact in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
+        assert!(
+            !dir.path().join(artifact).exists(),
+            "manifest preflight must not write replacement {artifact}"
+        );
+    }
+    assert!(
+        !dir.path().join("__init_claim.json").exists(),
+        "manifest preflight must refuse before acquiring an init claim"
+    );
 }
 
 // The torn-init regression: the `__manifest` Create commit is the manifest's
@@ -10367,27 +10621,31 @@ async fn init_crash_after_manifest_create_leaves_openable_store() {
 #[tokio::test]
 #[serial]
 async fn init_failpoint_returns_original_error_not_cleanup_error() {
-    // The cleanup is best-effort. If `storage.delete` fails (e.g. transient
-    // network blip on S3), the original init failpoint error must still
-    // surface — not be masked by a cleanup failure. This test triggers the
-    // failpoint and asserts the returned error references the failpoint,
-    // not the cleanup. (The cleanup currently logs via `tracing::warn`;
-    // we can't easily fault-inject delete failures without another seam,
-    // so this is a smoke test for the precedence contract.)
+    // A delete failure is outcome-unknown: retain the claim so a delayed
+    // delete cannot race a later initializer, but still return the original
+    // pre-physical init error rather than masking it with cleanup failure.
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_SCHEMA_PG_WRITTEN, "return");
+    let _delete_failure = ScopedFailPoint::new(names::INIT_SCHEMA_CLEANUP_DELETE, "return");
 
     let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
         Err(e) => e,
     };
-    // Failpoint message wins; no "cleanup" substring expected.
     let msg = err.to_string();
     assert!(
         msg.contains("init.after_schema_pg_written"),
         "init error must surface the failpoint cause, got: {msg}"
+    );
+    assert!(
+        dir.path().join("_schema.pg").exists(),
+        "the injected delete failure must leave the owned schema artifact"
+    );
+    assert!(
+        dir.path().join("__init_claim.json").exists(),
+        "an indeterminate schema delete must retain the init claim"
     );
 }
 

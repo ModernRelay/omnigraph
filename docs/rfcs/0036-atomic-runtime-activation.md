@@ -14,8 +14,8 @@ owner: OmniGraph maintainers
 - **Date:** 2026-08-13
 - **Author track:** Maintainer design series
 - **Depends on:** RFC-034 durable recovery authority; RFC-035 served-operation
-  admission and lifetime; the typed storage-failure classifier retained in PR
-  #491; internal manifest schema v6; Lance 10.0.0.
+  admission and lifetime; RFC-038 typed storage-failure classification;
+  internal manifest schema v6; Lance 10.0.0.
 - **Replaces:** the unmerged graph-supervision direction in PR #489. Useful
   tests and operational requirements from that PR remain inputs, but its
   implementation is not the architecture.
@@ -93,9 +93,10 @@ before recovery or build, and only `Drained(DrainedProof)` authorizes progress.
 `DrainPending` parks the strong drain and does not authorize work. Recovery tasks
 join RFC-035's one `ShutdownDeadline`; this RFC neither resets it nor defines cutoff.
 
-PR #491's retained classifier owns the mapping from substrate errors to stable
-retry classes. This RFC consumes that class; it does not classify by matching
-error strings or redefine the taxonomy.
+RFC-038 owns the mapping from substrate errors to stable condition classes. A
+condition class is not replay authority. This RFC may consider `Transient` only
+after its operation-local effect and recovery rules authorize another attempt;
+it does not classify by matching error strings or redefine the taxonomy.
 
 This RFC does not define recovery formats or choices, HTTP-write cancellation
 or acknowledgement, shutdown, hot config reload, graph add/remove, multi-writer
@@ -458,10 +459,12 @@ from applied configuration and durable graph authority.
 
 ### 11.2 Retry and stale-attempt fencing
 
-The supervisor consumes PR #491's typed class. Retryable attempt failures use
-capped exponential backoff with full jitter. Non-retryable failures remain
-blocked until an explicit operator/configuration/authority change. Unknown is
-not silently retryable.
+The supervisor consumes RFC-038's typed condition class only after the
+operation-local recovery disposition authorizes another attempt. Authorized
+attempts whose condition is `Transient` use capped exponential backoff with
+full jitter. Other conditions remain blocked until an explicit
+operator/configuration/authority change. `Unknown` is not silently retryable,
+and RFC-038 exposes no generic retry decision.
 
 `RecoveryDisposition::NeedsCompensation` bypasses managed retry: no wake can mint an
 `ExclusiveRecoveryPermit`. Only completed offline recovery after all serving

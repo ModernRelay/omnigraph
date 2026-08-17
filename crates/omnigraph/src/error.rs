@@ -210,14 +210,50 @@ pub enum OmniError {
     /// callers can match on this variant directly.
     #[error("policy: {0}")]
     Policy(String),
-    /// `Omnigraph::init` was called against a URI that already holds
-    /// schema artifacts from a previous init. Strict mode (the default)
-    /// fails fast with this error before touching disk so an existing
-    /// graph's metadata cannot be overwritten or destroyed. Operators
-    /// who actually want to overwrite pass `InitOptions { force: true }`
-    /// (CLI: `omnigraph init --force`).
-    #[error("graph already initialized at '{uri}'; pass --force to overwrite")]
+    /// `Omnigraph::init` was called against a URI that already holds a
+    /// manifest or schema artifacts from a previous init. Strict mode (the
+    /// default) fails fast with this error before touching disk so an existing
+    /// graph's metadata cannot be overwritten or destroyed.
+    /// `InitOptions { force: true }` is limited to orphan schema artifacts at
+    /// a root with no manifest; it never overwrites an initialized graph.
+    #[error(
+        "graph already initialized or initialization metadata exists at '{uri}'; --force may replace only orphan schema files after proving that no __manifest exists"
+    )]
     AlreadyInitialized { uri: String },
+    /// The authoritative `__manifest` Create commit completed, but a later
+    /// read-back or validation step failed. The schema artifacts are retained:
+    /// deleting them would strand the committed graph behind a missing
+    /// contract. Callers may inspect the typed source, but must not interpret
+    /// this outcome as proof that an ordinary open will succeed.
+    #[error(
+        "graph initialization at '{uri}' committed its manifest, but finalization failed; schema artifacts were preserved; inspect or open the graph before taking further action: {source}"
+    )]
+    InitializationCommitted {
+        uri: String,
+        #[source]
+        source: Box<OmniError>,
+    },
+    /// Physical graph initialization returned an error and the follow-up exact
+    /// genesis probe failed, so the engine cannot prove which table or
+    /// manifest Creates committed. Cleanup and retry are unsafe until an
+    /// operator has inspected the root. Both typed causes are retained because
+    /// they describe different failure boundaries.
+    #[error(
+        "graph initialization at '{uri}' has an indeterminate physical outcome; schema artifacts and '__init_claim.json' were preserved; do not retry initialization or delete the root until it is inspected (create error: {source}; exact-genesis probe error: {probe})"
+    )]
+    InitializationIndeterminate {
+        uri: String,
+        #[source]
+        source: Box<OmniError>,
+        probe: Box<OmniError>,
+    },
+    /// A durable initialization-ownership claim already exists. It may belong
+    /// to a live initializer or be residue from a stopped attempt, so another
+    /// initialization attempt must not overwrite or remove it speculatively.
+    #[error(
+        "graph initialization at '{uri}' is claimed by '__init_claim.json'; another initializer may still be running or a prior initializer may have stopped; quiesce all initializers before manually removing the claim, then retry init (use --force only when orphan schema files remain)"
+    )]
+    InitializationClaimed { uri: String },
 }
 
 impl From<omnigraph_storage::StorageError> for OmniError {

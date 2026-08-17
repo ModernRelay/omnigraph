@@ -32,8 +32,10 @@ mod recovery;
 #[path = "manifest/state.rs"]
 mod state;
 
+pub(crate) use graph::{GenesisManifestAttempt, ManifestInitError};
 use graph::{
-    init_manifest_graph, open_manifest_graph, open_manifest_graph_with_lineage, snapshot_state_at,
+    init_manifest_graph, load_initial_manifest_state, open_exact_genesis_manifest,
+    open_manifest_graph, open_manifest_graph_with_lineage, snapshot_state_at,
 };
 pub(crate) use layout::manifest_uri;
 #[cfg(test)]
@@ -786,21 +788,64 @@ impl ManifestCoordinator {
         Ok(coordinator)
     }
 
-    /// Create a new graph at `root_uri` from a catalog.
-    ///
-    /// Creates per-type Lance datasets and the namespace `__manifest` table.
-    /// The genesis graph commit is folded into the init write, so `__manifest`
-    /// is the single source of graph lineage from version one — callers read it
-    /// back through the lineage projection rather than via a second write.
+    /// Test-only composition of the two init halves; production init goes
+    /// through them separately so the commit point is a caller-visible
+    /// boundary (issue #495).
+    #[cfg(test)]
     pub(crate) async fn init_with_lineage(
         root_uri: &str,
         catalog: &Catalog,
         control_session: &Arc<lance::session::Session>,
     ) -> Result<(Self, Vec<GraphLineageRow>)> {
+        let attempt = GenesisManifestAttempt::mint()?;
+        let dataset = Self::init_commit(root_uri, catalog, control_session, &attempt).await?;
+        Self::finish_init(root_uri, dataset).await
+    }
+
+    /// Commit half of manifest init; ends at the `__manifest` Create commit
+    /// (assembled in `init_manifest_graph`).
+    pub(crate) async fn init_commit(
+        root_uri: &str,
+        catalog: &Catalog,
+        control_session: &Arc<lance::session::Session>,
+        attempt: &GenesisManifestAttempt,
+    ) -> std::result::Result<Dataset, ManifestInitError> {
+        init_manifest_graph(
+            root_uri.trim_end_matches('/'),
+            catalog,
+            control_session,
+            attempt,
+        )
+        .await
+    }
+
+    /// Probe an acknowledgement-unknown manifest Create and accept only the
+    /// exact immutable genesis receipt minted by this initialization attempt.
+    /// A transport/read/mismatch error remains indeterminate to the caller;
+    /// this method never turns absence or ambiguity into cleanup authority.
+    pub(crate) async fn open_exact_genesis_with_lineage(
+        root_uri: &str,
+        attempt: &GenesisManifestAttempt,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<(Self, Vec<GraphLineageRow>)> {
         let root = root_uri.trim_end_matches('/');
         let (dataset, known_state, lineage_rows) =
-            init_manifest_graph(root, catalog, control_session).await?;
+            open_exact_genesis_manifest(root, attempt, control_session).await?;
+        Ok((
+            Self::from_parts_with_default_publisher(root, dataset, known_state, None),
+            lineage_rows,
+        ))
+    }
 
+    /// Post-commit half of manifest init: reads the committed state back and
+    /// assembles the coordinator; see `init_post_commit_checks` for the
+    /// caller contract.
+    pub(crate) async fn finish_init(
+        root_uri: &str,
+        dataset: Dataset,
+    ) -> Result<(Self, Vec<GraphLineageRow>)> {
+        let root = root_uri.trim_end_matches('/');
+        let (known_state, lineage_rows) = load_initial_manifest_state(&dataset).await?;
         Ok((
             Self::from_parts_with_default_publisher(root, dataset, known_state, None),
             lineage_rows,

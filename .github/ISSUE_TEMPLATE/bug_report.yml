@@ -6,13 +6,13 @@ body:
   - type: markdown
     attributes:
       value: |
-        Issues are for **reporting problems** — concrete, reproducible bugs.
-        For ideas, feature requests, or questions, please use
-        [Discussions](../../discussions) instead.
-        For a security vulnerability, follow [SECURITY.md](../../blob/main/SECURITY.md) — do **not** file it here.
+        This form is for **reporting problems** — concrete, reproducible bugs.
+        For an idea or feature request, use the
+        [feature proposal form](https://github.com/ModernRelay/omnigraph/issues/new/choose) instead.
+        For a security vulnerability, follow [SECURITY.md](https://github.com/ModernRelay/omnigraph/blob/main/SECURITY.md) — do **not** file it here.
 
         A maintainer will triage this; once labelled **`accepted`** it's open for a pull request
-        (see [GOVERNANCE.md](../../blob/main/GOVERNANCE.md)).
+        (see [GOVERNANCE.md](https://github.com/ModernRelay/omnigraph/blob/main/GOVERNANCE.md)).
   - type: textarea
     id: what-happened
     attributes:

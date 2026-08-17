@@ -1,0 +1,35 @@
+name: 📐 Design / RFC proposal
+description: Propose a design-level change. The issue is accepted first; the RFC document follows as its own PR.
+labels: ["rfc", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For design-level changes: new user-facing surface, on-disk or wire formats,
+        new substrate dependencies, anything irreversible. Do **not** write the RFC
+        document yet — this issue gets `accepted` first, so nobody invests in a
+        design a maintainer hasn't agreed should exist. Once accepted (and labelled
+        `needs-rfc`), open an RFC PR per
+        [docs/rfcs/README.md](https://github.com/ModernRelay/omnigraph/blob/main/docs/rfcs/README.md);
+        the merged RFC then sanctions the implementation PRs, and this issue tracks them.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is wrong or missing, and why does it matter?
+    validations:
+      required: true
+  - type: textarea
+    id: direction
+    attributes:
+      label: Proposed design direction
+      description: The shape of the solution — enough to judge whether the problem is worth an RFC, not the full design.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Blast radius
+      description: What does this touch — storage format, wire protocol, query language, dependencies? What becomes hard to reverse?
+    validations:
+      required: true

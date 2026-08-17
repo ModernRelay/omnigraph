@@ -173,9 +173,9 @@ This RFC does not define:
 - a new recovery, manifest, schema, or Lance format.
 
 RFC-035 owns served-operation lifetime and shutdown. RFC-036 owns runtime
-activation and supervision. The typed storage-failure work in PR #491 remains
-independent: failure retryability and durable recovery progress are different
-contracts.
+activation and supervision. RFC-038 owns typed storage-failure classification,
+which remains independent: an observed failure condition and durable recovery
+progress are different contracts, and neither alone authorizes replay.
 
 ## 3. Terminology and invariants
 
@@ -515,8 +515,8 @@ effect retry. If recapture proves the outcome, classification resumes. If it
 remains unknown, the unit requires operator action.
 
 A typed substrate failure classification may inform an external scheduler, but
-this RFC never equates `Unknown` with transient. PR #491 remains the owner of
-that separate classification.
+this RFC never equates `Unknown` with transient or treats classification as
+retry authority. RFC-038 owns that separate classification.
 
 Orphan-control disposition explicitly reports any main-lineage publication,
 audit append, and cleanup. No caller may reduce it to an unqualified boolean

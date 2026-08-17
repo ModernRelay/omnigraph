@@ -1249,6 +1249,14 @@ impl ApiError {
             // single canonical translation when a future runtime
             // create endpoint lands.
             err @ OmniError::AlreadyInitialized { .. } => Self::conflict(err.to_string()),
+            // Init is not currently HTTP-reachable. Keep the exhaustive future
+            // mapping conservative: a claimed root is a caller-visible
+            // ownership conflict, while committed-but-unavailable and
+            // indeterminate outcomes require operator inspection and must not
+            // be advertised as ordinary retryable conflicts.
+            err @ OmniError::InitializationClaimed { .. } => Self::conflict(err.to_string()),
+            err @ (OmniError::InitializationCommitted { .. }
+            | OmniError::InitializationIndeterminate { .. }) => Self::internal(err.to_string()),
         }
     }
 }
