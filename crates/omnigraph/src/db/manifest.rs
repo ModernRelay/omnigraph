@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::branch_control::branch_enumeration_error;
+use crate::branch_control::list_branch_contents;
 use crate::error::{OmniError, Result};
 use datafusion::logical_expr::Expr;
 use lance::Dataset;
@@ -1199,7 +1199,7 @@ impl ManifestCoordinator {
 
     pub(crate) async fn delete_branch(&mut self, name: &str) -> Result<()> {
         let mut ds = self.open_branch_control_dataset().await?;
-        let branches = ds.list_branches().await.map_err(branch_enumeration_error)?;
+        let branches = list_branch_contents(&ds).await?;
         let expected_identifier = branches
             .get(name)
             .ok_or_else(|| OmniError::manifest_not_found(format!("branch '{}' not found", name)))?
@@ -1228,11 +1228,7 @@ impl ManifestCoordinator {
     }
 
     pub async fn list_branches(&self) -> Result<Vec<String>> {
-        let branches = self
-            .dataset
-            .list_branches()
-            .await
-            .map_err(branch_enumeration_error)?;
+        let branches = list_branch_contents(&self.dataset).await?;
         let mut names: Vec<String> = branches.into_keys().filter(|name| name != "main").collect();
         names.sort();
         let mut all = vec!["main".to_string()];
@@ -1241,11 +1237,7 @@ impl ManifestCoordinator {
     }
 
     pub async fn descendant_branches(&self, name: &str) -> Result<Vec<String>> {
-        let branches = self
-            .dataset
-            .list_branches()
-            .await
-            .map_err(branch_enumeration_error)?;
+        let branches = list_branch_contents(&self.dataset).await?;
         let mut frontier = vec![name.to_string()];
         let mut descendants = Vec::new();
         let mut seen = HashSet::new();

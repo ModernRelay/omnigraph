@@ -832,10 +832,7 @@ impl TableStore {
             crate::instrumentation::table_wrapper(),
         )
         .await?;
-        let branches = ds
-            .list_branches()
-            .await
-            .map_err(crate::branch_control::branch_enumeration_error)?;
+        let branches = crate::branch_control::list_branch_contents(&ds).await?;
         Ok(branches.into_keys().collect())
     }
 

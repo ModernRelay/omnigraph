@@ -316,11 +316,7 @@ pub(super) async fn ensure_indices_for_branch(
                     pin.table_key,
                 ))
             })?;
-            let branches = source
-                .dataset()
-                .list_branches()
-                .await
-                .map_err(crate::branch_control::branch_enumeration_error)?;
+            let branches = crate::branch_control::list_branch_contents(source.dataset()).await?;
             if branches.contains_key(target_branch) {
                 return Err(OmniError::manifest_conflict(format!(
                     "index target ref '{}:{}' already exists while the graph manifest still \
