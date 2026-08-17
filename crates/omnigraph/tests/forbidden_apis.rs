@@ -2698,11 +2698,11 @@ fn omni_error_has_no_global_upstream_error_conversions() {
             let Type::Path(target) = implementation.self_ty.as_ref() else {
                 continue;
             };
-            if !target
+            if target
                 .path
                 .segments
                 .last()
-                .is_some_and(|segment| segment.ident == "OmniError")
+                .is_none_or(|segment| segment.ident != "OmniError")
             {
                 continue;
             }

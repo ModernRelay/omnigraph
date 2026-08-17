@@ -6,7 +6,7 @@
 | **Author track** | Public contribution |
 | **Author(s)** | Ragnor Comerford ([`ragnorc`](https://github.com/ragnorc)) |
 | **Discussion** | [PR #491](https://github.com/ModernRelay/omnigraph/pull/491) and its [maintainer review](https://github.com/ModernRelay/omnigraph/pull/491#issuecomment-5281302575) |
-| **Implementation** | [PR #491](https://github.com/ModernRelay/omnigraph/pull/491) is the obsolete prototype; a replacement PR will implement this RFC from current `main`. |
+| **Implementation** | [PR #491](https://github.com/ModernRelay/omnigraph/pull/491) is the obsolete prototype; [PR #524](https://github.com/ModernRelay/omnigraph/pull/524) is its replacement from current `main`. |
 
 > Status is maintained by maintainers: `Proposed` while the PR is open,
 > `Accepted` on merge, `Declined` on close, and `Superseded by NNNN` later.

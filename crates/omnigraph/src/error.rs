@@ -148,10 +148,10 @@ pub enum OmniError {
     /// the common opener so historical APIs never infer retention from error text.
     #[error("historical published dataset version {published_dataset_version} was reclaimed")]
     HistoricalVersionReclaimed { published_dataset_version: u64 },
-    /// Lance rejected a stale transaction as semantically retryable. Kept
-    /// typed at the storage boundary so RFC-023 can distinguish an
-    /// effect-free key fence from an arbitrary I/O or execution failure
-    /// without parsing upstream error text.
+    /// The exact staged-commit adapter proved that Lance contention was
+    /// effect-free. This operation-local signal lets RFC-023 distinguish a
+    /// safe key-fence re-evaluation from an arbitrary storage failure; generic
+    /// Lance conflicts remain `Storage(Precondition)`.
     #[error("retryable storage commit conflict: {0}")]
     RetryableCommitConflict(String),
     #[error("query: {0}")]
@@ -380,7 +380,7 @@ impl OmniError {
     /// Preserve typed storage evidence carried through DataFusion execution;
     /// otherwise retain the user query/execution category.
     pub(crate) fn datafusion(error: datafusion::error::DataFusionError) -> Self {
-        match find_lance_source_kind(&error, 0) {
+        match find_storage_source_kind(&error, 0) {
             Some(kind) => Self::Storage(StorageFailure::new(kind, format!("storage: {error}"))),
             None => Self::DataFusion(error.to_string()),
         }
@@ -390,10 +390,11 @@ impl OmniError {
     pub(crate) fn with_context(self, context: impl std::fmt::Display) -> Self {
         match self {
             Self::Storage(mut failure) => {
-                failure.message = match failure.message.strip_prefix("storage: ") {
-                    Some(message) => format!("storage: {context}: {message}"),
-                    None => format!("{context}: {}", failure.message),
-                };
+                let message = failure
+                    .message
+                    .strip_prefix("storage: ")
+                    .unwrap_or(&failure.message);
+                failure.message = format!("storage: {context}: {message}");
                 Self::Storage(failure)
             }
             Self::Manifest(mut error) => {
@@ -583,41 +584,23 @@ fn classify_lance_error_at_depth(error: &lance::Error, depth: usize) -> StorageF
         | lance::Error::PrerequisiteFailed { .. }
         | lance::Error::Stop => StorageFailureKind::Unknown,
         lance::Error::IO { source, .. } | lance::Error::External { source } => {
-            classify_lance_source_at_depth(source.as_ref(), depth + 1)
+            find_storage_source_kind(source.as_ref(), depth + 1)
+                .unwrap_or(StorageFailureKind::Unknown)
         }
-        lance::Error::Wrapped { error, .. } => {
-            classify_lance_source_at_depth(error.as_ref(), depth + 1)
-        }
+        lance::Error::Wrapped { error, .. } => find_storage_source_kind(error.as_ref(), depth + 1)
+            .unwrap_or(StorageFailureKind::Unknown),
         lance::Error::Namespace { source, .. } => source
             .downcast_ref::<lance_namespace::NamespaceError>()
             .map(|error| classify_namespace_code(error.code()))
-            .unwrap_or_else(|| classify_lance_source_at_depth(source.as_ref(), depth + 1)),
+            .or_else(|| find_storage_source_kind(source.as_ref(), depth + 1))
+            .unwrap_or(StorageFailureKind::Unknown),
     }
 }
 
-fn classify_lance_source_at_depth(
-    source: &(dyn std::error::Error + 'static),
-    depth: usize,
-) -> StorageFailureKind {
-    if depth >= omnigraph_storage::MAX_STORAGE_SOURCE_DEPTH {
-        return StorageFailureKind::Unknown;
-    }
-    if let Some(error) = source.downcast_ref::<lance::Error>() {
-        return classify_lance_error_at_depth(error, depth);
-    }
-    if let Some(error) = source.downcast_ref::<object_store::Error>() {
-        return omnigraph_storage::classify_object_store_error_at_depth(error, depth);
-    }
-    if let Some(error) = source.downcast_ref::<std::io::Error>() {
-        return omnigraph_storage::classify_io_error_at_depth(error, depth);
-    }
-    source
-        .source()
-        .map(|inner| classify_lance_source_at_depth(inner, depth + 1))
-        .unwrap_or(StorageFailureKind::Unknown)
-}
-
-fn find_lance_source_kind(
+/// The engine's one bounded typed-source walker. `Some(Unknown)` means a
+/// recognized storage wrapper carried insufficient evidence; `None` means no
+/// storage-owned type was found before the shared depth bound.
+fn find_storage_source_kind(
     source: &(dyn std::error::Error + 'static),
     depth: usize,
 ) -> Option<StorageFailureKind> {
@@ -637,7 +620,7 @@ fn find_lance_source_kind(
     }
     source
         .source()
-        .and_then(|inner| find_lance_source_kind(inner, depth + 1))
+        .and_then(|inner| find_storage_source_kind(inner, depth + 1))
 }
 
 fn classify_namespace_code(code: lance_namespace::ErrorCode) -> StorageFailureKind {
@@ -673,6 +656,30 @@ fn classify_namespace_code(code: lance_namespace::ErrorCode) -> StorageFailureKi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct SourceLink {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    }
+
+    impl std::fmt::Display for SourceLink {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("source link")
+        }
+    }
+
+    impl std::error::Error for SourceLink {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.source.as_ref())
+        }
+    }
+
+    fn source_chain(
+        links: usize,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        (0..links).fold(source, |source, _| Box::new(SourceLink { source }))
+    }
 
     fn assert_lance_kind(error: lance::Error, expected: StorageFailureKind) {
         assert_eq!(classify_lance_error(&error), expected, "{error}");
@@ -775,6 +782,40 @@ mod tests {
             lance::Error::io_source(Box::new(std::fmt::Error)),
             StorageFailureKind::Unknown,
         );
+        assert_lance_kind(
+            lance::Error::namespace_source(timeout()),
+            StorageFailureKind::Transient,
+        );
+        assert_lance_kind(
+            lance::Error::namespace_source(Box::new(std::fmt::Error)),
+            StorageFailureKind::Unknown,
+        );
+    }
+
+    #[test]
+    fn lance_and_storage_wrappers_share_one_source_depth_budget() {
+        let nested_generic = |links| object_store::Error::Generic {
+            store: "test",
+            source: source_chain(
+                links,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "typed source",
+                )),
+            ),
+        };
+
+        // Lance IO consumes the first link and object-store Generic consumes
+        // the second. Five opaque links leave the typed I/O source at depth
+        // seven; a sixth exhausts the shared eight-link budget.
+        assert_lance_kind(
+            lance::Error::io_source(Box::new(nested_generic(5))),
+            StorageFailureKind::Transient,
+        );
+        assert_lance_kind(
+            lance::Error::io_source(Box::new(nested_generic(6))),
+            StorageFailureKind::Unknown,
+        );
     }
 
     #[test]
@@ -847,6 +888,16 @@ mod tests {
             contextual.storage_failure().unwrap().kind,
             StorageFailureKind::Transient
         );
+
+        let contextual_adapter = OmniError::Storage(StorageFailure::new(
+            StorageFailureKind::NotFound,
+            "storage read failed for 's3://bucket/key': not found",
+        ))
+        .with_context("load manifest");
+        assert_eq!(
+            contextual_adapter.to_string(),
+            "storage: load manifest: storage read failed for 's3://bucket/key': not found"
+        );
     }
 
     #[test]
@@ -855,6 +906,11 @@ mod tests {
             "bad user query".to_string(),
         ));
         assert!(matches!(user, OmniError::DataFusion(_)));
+
+        let opaque = OmniError::datafusion(datafusion::error::DataFusionError::External(Box::new(
+            std::fmt::Error,
+        )));
+        assert!(matches!(opaque, OmniError::DataFusion(_)));
 
         let nested = lance::Error::io_source(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -867,6 +923,21 @@ mod tests {
             nested.storage_failure().map(|failure| failure.kind),
             Some(StorageFailureKind::Transient)
         );
+
+        let arrow_wrapped = arrow_schema::ArrowError::ExternalError(Box::new(
+            lance::Error::io_source(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "arrow-wrapped transport timeout",
+            ))),
+        ));
+        let arrow_wrapped = OmniError::datafusion(datafusion::error::DataFusionError::ArrowError(
+            Box::new(arrow_wrapped),
+            None,
+        ));
+        assert_eq!(
+            arrow_wrapped.storage_failure().map(|failure| failure.kind),
+            Some(StorageFailureKind::Transient)
+        );
     }
 
     #[test]
@@ -876,6 +947,18 @@ mod tests {
         ));
         assert!(matches!(
             arrow,
+            OmniError::Manifest(ManifestError {
+                kind: ManifestErrorKind::Internal,
+                ..
+            })
+        ));
+
+        let arrow_with_storage_source =
+            OmniError::arrow_internal(arrow_schema::ArrowError::ExternalError(Box::new(
+                lance::Error::timeout("typed source deliberately owned by manifest adapter"),
+            )));
+        assert!(matches!(
+            arrow_with_storage_source,
             OmniError::Manifest(ManifestError {
                 kind: ManifestErrorKind::Internal,
                 ..
