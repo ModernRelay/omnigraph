@@ -3,7 +3,7 @@
 
 use super::{
     DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, legacy_change_request_body,
-    normalize_bearer_token, resolve_remote_bearer_token,
+    normalize_bearer_token, resolve_remote_bearer_token, sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -121,4 +121,26 @@ fn resolve_remote_bearer_token_falls_back_to_default_env() {
             std::env::remove_var("OMNIGRAPH_HOME");
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_dir_propagates_open_failure_instead_of_swallowing_it() {
+    // The F5 defect was `if let Ok(dir) = File::open(..)` / `let _ =
+    // dir.sync_all()` — both errors were dropped, so the baseline resume
+    // cursor could print for a rename that never reached disk. `sync_dir`
+    // must instead return the error so the caller's `?` aborts before the
+    // cursor is emitted.
+    let missing = std::path::Path::new("/nonexistent-omnigraph-sync-dir/xyz");
+    assert!(
+        sync_dir(missing).is_err(),
+        "sync_dir must propagate a directory-open failure, not swallow it"
+    );
+
+    // A real directory fsyncs cleanly.
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(
+        sync_dir(dir.path()).is_ok(),
+        "sync_dir must succeed on an existing directory"
+    );
 }

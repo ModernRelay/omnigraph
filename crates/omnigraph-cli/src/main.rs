@@ -58,6 +58,24 @@ use output::*;
 /// wrote first — re-read and retry" without matching message text.
 const EXIT_PRECONDITION_FAILED: i32 = 4;
 
+/// fsync the directory holding a just-atomically-persisted file so the rename
+/// itself is durable before a resume cursor is printed. On Unix this opens the
+/// directory and `fsync`s it, **propagating** any open or sync failure — the
+/// caller must `?` this so no cursor is emitted for a rename that is not on
+/// disk (the prior code swallowed both errors with `if let Ok(dir)` /
+/// `let _ = dir.sync_all()`). On non-Unix platforms a directory is not a
+/// file-fsync durability primitive (and opening one as a file fails), so this
+/// is a documented no-op and callers rely on the file `sync_all` plus the
+/// platform's atomic-replace semantics.
+#[cfg(unix)]
+fn sync_dir(dir: &std::path::Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+#[cfg(not(unix))]
+fn sync_dir(_dir: &std::path::Path) -> io::Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -628,12 +646,13 @@ async fn main() -> Result<()> {
                 };
                 // Durability barrier BEFORE the resume cursor is printed: fsync
                 // the file, atomically persist it over --out, then fsync the
-                // parent directory so the rename itself survives a crash.
+                // parent directory so the rename itself survives a crash. Every
+                // step propagates its failure with `?`, so a durability error
+                // returns before any cursor is emitted — a printed cursor always
+                // implies the snapshot is durably on disk.
                 temp.as_file().sync_all()?;
                 temp.persist(&out).map_err(|error| error.error)?;
-                if let Ok(dir) = fs::File::open(&out_dir) {
-                    let _ = dir.sync_all();
-                }
+                sync_dir(&out_dir)?;
                 if json {
                     print_json(&baseline)?;
                 } else {
