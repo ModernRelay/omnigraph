@@ -1315,7 +1315,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1325,7 +1325,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1335,7 +1335,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1345,7 +1345,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1355,7 +1355,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1365,7 +1365,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1375,7 +1375,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1419,9 +1419,13 @@
         },
         "responses": {
           "200": {
-            "description": "NDJSON entity snapshot pinned at one captured commit. The FINAL record is {\"baseline\": {snapshot_commit_id, resume_cursor}} — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.",
+            "description": "NDJSON entity snapshot pinned at one captured commit. Every preceding record is one type-keyed entity row (the load/export NDJSON shape); the FINAL record is the ChangeBaselineRecord envelope — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.",
             "content": {
-              "application/x-ndjson": {}
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeBaselineRecord"
+                }
+              }
             }
           },
           "400": {
@@ -1429,7 +1433,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1439,7 +1443,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1449,7 +1453,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1459,7 +1463,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1469,7 +1473,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1479,7 +1483,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1737,7 +1741,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1747,7 +1751,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1757,7 +1761,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1767,7 +1771,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1777,7 +1781,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -1787,7 +1791,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -3804,6 +3808,61 @@
           "node",
           "edge"
         ]
+      },
+      "ChangeErrorOutput": {
+        "type": "object",
+        "description": "Error envelope for the read-only change surfaces (`…/changes`,\n`…/changes/baseline`, `…/commits/{commit_id}/changes`): a wire-compatible\nprojection of [`ErrorOutput`] restricted to the graph-vocabulary details\nthose routes can produce after their error projection. The write-path\nconflict shapes (key / manifest / merge / read-set), which carry physical\nstorage identifiers, are structurally absent, so storage vocabulary is\nunreachable from the change operations' schema graph. Servers serialize\n[`ErrorOutput`]; every field a change route can populate appears here with\nthe same name and meaning, and absent optionals are wire-compatible.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "change_diff_refusal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeDiffRefusalOutput",
+                "description": "Set with HTTP 409 when a commit entity diff is refused (parentless\ncommit or an unprovable schema boundary)."
+              }
+            ]
+          },
+          "change_feed_gap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeFeedGapOutput",
+                "description": "Set with HTTP 410 when retained history can no longer reconstruct a\nchange continuation. Recover via the baseline handshake."
+              }
+            ]
+          },
+          "code": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ErrorCode"
+              }
+            ]
+          },
+          "error": {
+            "type": "string"
+          },
+          "resource_limit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ResourceLimitOutput",
+                "description": "Set when a requested limit exceeds a public ceiling, or a single change\nexceeds the poll's own byte ceiling."
+              }
+            ]
+          }
+        }
       },
       "ChangeFeedGapOutput": {
         "type": "object",

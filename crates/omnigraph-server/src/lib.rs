@@ -126,7 +126,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
     ),
-    components(schemas(api::BlobEntityKind, api::ChangeBaselineRecord)),
+    components(schemas(api::BlobEntityKind, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
     modifiers(&SecurityAddon),
 )]
 pub struct ApiDoc;

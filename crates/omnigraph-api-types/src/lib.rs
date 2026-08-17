@@ -555,6 +555,34 @@ pub struct ChangeBaselineRecord {
     pub baseline: ChangeBaselineOutput,
 }
 
+/// Error envelope for the read-only change surfaces (`…/changes`,
+/// `…/changes/baseline`, `…/commits/{commit_id}/changes`): a wire-compatible
+/// projection of [`ErrorOutput`] restricted to the graph-vocabulary details
+/// those routes can produce after their error projection. The write-path
+/// conflict shapes (key / manifest / merge / read-set), which carry physical
+/// storage identifiers, are structurally absent, so storage vocabulary is
+/// unreachable from the change operations' schema graph. Servers serialize
+/// [`ErrorOutput`]; every field a change route can populate appears here with
+/// the same name and meaning, and absent optionals are wire-compatible.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ChangeErrorOutput {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<ErrorCode>,
+    /// Set when a requested limit exceeds a public ceiling, or a single change
+    /// exceeds the poll's own byte ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_limit: Option<ResourceLimitOutput>,
+    /// Set with HTTP 410 when retained history can no longer reconstruct a
+    /// change continuation. Recover via the baseline handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_feed_gap: Option<ChangeFeedGapOutput>,
+    /// Set with HTTP 409 when a commit entity diff is refused (parentless
+    /// commit or an unprovable schema boundary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadRequest {
     /// GQ query source. May declare one or more named queries; pick one with

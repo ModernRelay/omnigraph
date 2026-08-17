@@ -394,6 +394,126 @@ fn openapi_change_schemas_reject_storage_vocabulary() {
     }
 }
 
+/// Reachability form of the vocabulary gate: walk every schema component
+/// TRANSITIVELY referenced by the change operations (responses, request
+/// bodies, and parameters — error envelopes included) and require every
+/// reachable schema to be free of physical storage properties. The name-prefix
+/// gate above cannot see a generic component (e.g. a shared error envelope)
+/// pulled in by reference; this walk closes that hole — the change routes now
+/// reference the graph-vocabulary `ChangeErrorOutput` projection instead of
+/// the generic error envelope whose conflict details carry storage keys.
+/// Also pins that the baseline's NDJSON success response declares a schema
+/// (the terminal `ChangeBaselineRecord` handshake) so generated clients can
+/// discover the cursor contract.
+#[test]
+fn openapi_change_operations_reach_only_graph_vocabulary_schemas() {
+    const FORBIDDEN_PROPERTIES: &[&str] = &[
+        "table_key",
+        "stable_table_id",
+        "table_incarnation_id",
+        "manifest_version",
+        "table_version",
+        "table_branch",
+        "table_path",
+        "row_addr",
+    ];
+
+    fn collect_refs(value: &serde_json::Value, refs: &mut std::collections::BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(reference) = map.get("$ref").and_then(|v| v.as_str())
+                    && let Some(name) = reference.rsplit('/').next()
+                {
+                    refs.insert(name.to_string());
+                }
+                for nested in map.values() {
+                    collect_refs(nested, refs);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for nested in items {
+                    collect_refs(nested, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_properties_clean(name: &str, value: &serde_json::Value) {
+        if let Some(properties) = value.get("properties").and_then(|v| v.as_object()) {
+            for (property, nested) in properties {
+                assert!(
+                    !FORBIDDEN_PROPERTIES.contains(&property.as_str()),
+                    "schema '{name}', reachable from a change operation, declares \
+                     forbidden storage property '{property}'"
+                );
+                assert_properties_clean(name, nested);
+            }
+        }
+        for key in ["items", "additionalProperties", "allOf", "oneOf", "anyOf"] {
+            if let Some(nested) = value.get(key) {
+                assert_properties_clean(name, nested);
+            }
+        }
+    }
+
+    let doc = openapi_json();
+    let schemas = doc["components"]["schemas"].as_object().unwrap();
+    let change_paths: Vec<(&String, &serde_json::Value)> = doc["paths"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path.contains("/changes"))
+        .collect();
+    assert_eq!(
+        change_paths.len(),
+        3,
+        "the three change routes are registered: {change_paths:?}"
+    );
+
+    let mut frontier = std::collections::BTreeSet::new();
+    for (_, operations) in &change_paths {
+        collect_refs(operations, &mut frontier);
+    }
+    let mut reachable = std::collections::BTreeSet::new();
+    while let Some(name) = frontier.pop_first() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        let Some(schema) = schemas.get(&name) else {
+            continue;
+        };
+        let mut nested = std::collections::BTreeSet::new();
+        collect_refs(schema, &mut nested);
+        for reference in nested {
+            if !reachable.contains(&reference) {
+                frontier.insert(reference);
+            }
+        }
+    }
+    assert!(
+        reachable.contains("ChangeErrorOutput"),
+        "change routes reference the graph-vocabulary error projection: {reachable:?}"
+    );
+    assert!(
+        !reachable.contains("ErrorOutput"),
+        "the generic error envelope (whose conflict details carry storage keys) \
+         must not be reachable from a change operation: {reachable:?}"
+    );
+    for name in &reachable {
+        if let Some(schema) = schemas.get(name) {
+            assert_properties_clean(name, schema);
+        }
+    }
+
+    let baseline_content = &doc["paths"]["/graphs/{graph_id}/changes/baseline"]["post"]["responses"]
+        ["200"]["content"]["application/x-ndjson"];
+    assert!(
+        baseline_content.get("schema").is_some(),
+        "the baseline NDJSON success response declares the terminal-record schema"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // HTTP method tests
 // ---------------------------------------------------------------------------
