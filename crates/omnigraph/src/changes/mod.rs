@@ -17,9 +17,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 
-use self::row_compare::{
-    BlobComparisonScope, OrderedRows, RawRow, rows_equal, user_schema_fingerprint,
-};
+use self::row_compare::{OrderedRows, RawRow, rows_equal, user_schema_fingerprint};
 use crate::db::SubTableEntry;
 use crate::db::manifest::{Snapshot, TableIdentity};
 use crate::error::{OmniError, Result};
@@ -442,21 +440,15 @@ async fn diff_table_cross_branch(
                     changes.push(entity_change_from_raw(&row, ChangeOp::Insert, is_edge));
                 }
             }
-            // Same ID — typed structural comparison, Blob-descriptor aware.
-            // These are two different branch lifetimes, so managed Blob
-            // descriptor identities are branch-local and byte-compared.
+            // Same ID — typed structural comparison, Blob-descriptor aware. The
+            // managed-Blob identity is qualified by the immutable data-file UUID,
+            // which is globally unique, so cross-branch equality is sound without
+            // a scope hint.
             (Some(_), Some(_)) => {
                 let left = from.pop().await?.expect("peeked row present");
                 let right = to.pop().await?.expect("peeked row present");
                 if filter.wants_op(ChangeOp::Update)
-                    && !rows_equal(
-                        from.dataset(),
-                        &left,
-                        to.dataset(),
-                        &right,
-                        BlobComparisonScope::CrossBranch,
-                    )
-                    .await?
+                    && !rows_equal(from.dataset(), &left, to.dataset(), &right).await?
                 {
                     changes.push(entity_change_from_raw(&right, ChangeOp::Update, is_edge));
                 }

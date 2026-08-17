@@ -56,31 +56,13 @@ pub(crate) fn user_schema_fingerprint(
         .collect()
 }
 
-/// Whether the two rows being compared belong to one table lifetime on one
-/// branch, or to two different branch lifetimes. This changes only how managed
-/// Blob descriptor identity is trusted (see [`rows_equal`]); every other column
-/// compares identically.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BlobComparisonScope {
-    /// Both rows are the same table lifetime on one branch — the per-commit
-    /// parent→child enumerator, or a same-lineage net diff. A managed
-    /// descriptor's identity is authoritative here: an equal identity implies
-    /// equal immutable bytes (the owning fragment is source-qualified), so
-    /// payload I/O is paid only on a descriptor difference (compaction/relocation).
-    SameLineage,
-    /// The two rows are different branch lifetimes — a cross-branch net diff. A
-    /// managed descriptor's fragment id is branch-local, so an equal identity
-    /// across branches does NOT imply equal bytes (two branches can relocate a
-    /// row to the same next fragment id with colliding local coordinates). Every
-    /// managed column is byte-compared regardless of descriptor identity.
-    CrossBranch,
-}
-
-/// One Blob column's comparison signature: its source-qualified physical
+/// One Blob column's comparison signature: its data-file-qualified physical
 /// identity plus whether it is a managed (inline/packed/dedicated) descriptor.
 /// External and null identities are source-independent and fully encode the
-/// logical value, so a difference is authoritative; managed identity is
-/// file-relative and only conditionally authoritative (see [`BlobComparisonScope`]).
+/// logical value, so a difference is authoritative; a managed identity is
+/// qualified by the owning data file's immutable UUID path, so an equal managed
+/// identity implies equal bytes across overwrites and branches (see
+/// [`BlobDescriptorDecoder::physical_identity`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlobColumnSig {
     name: String,
@@ -103,9 +85,10 @@ pub(crate) struct RawRow {
     pub(crate) id: String,
     pub(crate) slice: RecordBatch,
     /// One [`BlobColumnSig`] per Blob column, in schema (name) order. Managed
-    /// identities carry the owning fragment (Blob descriptor fields are
-    /// file-relative); the kind flag lets [`rows_equal`] decide when an equal
-    /// identity is authoritative and when a payload byte-compare is required.
+    /// identities carry the owning data file's immutable UUID path (Blob
+    /// descriptor fields are file-relative); the kind flag lets [`rows_equal`]
+    /// decide when an equal identity is authoritative and when a payload
+    /// byte-compare is required.
     blob_signatures: Vec<BlobColumnSig>,
 }
 
@@ -140,11 +123,12 @@ impl OrderedRows {
                     scanner.batch_size(CHANGE_SCAN_TARGET_ROWS);
                     scanner.batch_size_bytes(COMMIT_CHANGES_MAX_BYTES);
                     scanner.blob_handling(BlobHandling::BlobsDescriptions);
-                    // Managed Blob descriptors are file-relative, so the owning
-                    // fragment (high 32 bits of `_rowaddr`) is required to tell
-                    // an in-place unchanged row from a same-length Blob-only
-                    // update that moved to a new fragment with colliding local
-                    // descriptor coordinates. `with_row_id` above stays on for
+                    // Managed Blob descriptors are file-relative, so `prepare_batch`
+                    // maps the row's fragment (high 32 bits of `_rowaddr`) to the
+                    // owning data file's immutable UUID path — the qualifier that
+                    // tells an unchanged row from a same-length Blob-only update
+                    // (which lands in a new data file) across relocation,
+                    // Overwrite, and branches. `with_row_id` above stays on for
                     // the payload tie-break's stable-id `take_blobs`.
                     scanner.with_row_address();
                     Ok(())
@@ -175,7 +159,7 @@ impl OrderedRows {
                 return Ok(());
             };
             match stream.try_next().await {
-                Ok(Some(batch)) => self.pending = prepare_batch(&batch)?,
+                Ok(Some(batch)) => self.pending = prepare_batch(&self.dataset, &batch)?,
                 Ok(None) => {
                     self.stream = None;
                     return Ok(());
@@ -192,9 +176,10 @@ impl OrderedRows {
 }
 
 /// Turn one scanned batch into comparison-ready rows: one-row slices plus
-/// physical descriptor identities for Blob columns. Pure in-memory work —
-/// Blob payloads are never touched here.
-fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
+/// physical descriptor identities for Blob columns. Pure in-memory work — Blob
+/// payloads are never touched here, and the data-file resolution below reads
+/// only the already-loaded `dataset` manifest (no object-store call).
+fn prepare_batch(dataset: &Dataset, batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
     let ids = batch
         .column_by_name("id")
         .and_then(|column| column.as_any().downcast_ref::<StringArray>())
@@ -217,23 +202,40 @@ fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
                         field.name()
                     ))
                 })?;
+            // The Lance field id keys the row's owning data file (a Blob column
+            // has one field id spanning several physical columns).
+            let field_id = dataset.schema().field_id(field.name()).map_err(|error| {
+                OmniError::Lance(format!(
+                    "blob column '{}' has no field id: {error}",
+                    field.name()
+                ))
+            })?;
             blob_columns.push((
-                field.name().as_str(),
+                field.name().to_string(),
                 BlobDescriptorDecoder::try_new(descriptions)?,
+                field_id,
             ));
         }
     }
     // Name-order the signatures so `rows_equal`'s positional zip aligns by
     // column NAME whenever the two sides' column sets match — the same
     // order-insensitivity the schema gate's name-keyed fingerprint provides.
-    // No supported writer reorders columns within one table lifetime, so this
-    // is defense in depth against a physical reorder surfacing as phantom
-    // whole-table updates.
-    blob_columns.sort_by(|left, right| left.0.cmp(right.0));
+    blob_columns.sort_by(|left, right| left.0.cmp(&right.0));
 
-    // Managed Blob descriptors are resolved relative to the owning fragment, so
-    // qualify each managed identity with the row's fragment id (high 32 bits of
-    // `_rowaddr`). Only needed when the table has a Blob column.
+    // Managed Blob descriptors resolve relative to the owning DATA FILE, so each
+    // managed identity is qualified by that file's immutable path (a per-file
+    // UUID). Map the row's fragment id (high 32 bits of `_rowaddr`) to the
+    // fragment, then the fragment's data file that holds the blob column's field
+    // id. All in-memory manifest reads. Only needed when the table has a Blob.
+    let fragments_by_id: HashMap<u64, &lance_table::format::Fragment> = if blob_columns.is_empty() {
+        HashMap::new()
+    } else {
+        dataset
+            .fragments()
+            .iter()
+            .map(|fragment| (fragment.id, fragment))
+            .collect()
+    };
     let row_addresses = if blob_columns.is_empty() {
         None
     } else {
@@ -243,7 +245,7 @@ fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
                 .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
                 .ok_or_else(|| {
                     OmniError::Lance(
-                        "change scan is missing _rowaddr; managed Blob comparison needs the owning fragment"
+                        "change scan is missing _rowaddr; managed Blob comparison needs the owning data file"
                             .to_string(),
                     )
                 })?,
@@ -254,11 +256,13 @@ fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
     for row in 0..batch.num_rows() {
         let mut blob_signatures = Vec::with_capacity(blob_columns.len());
         if let Some(row_addresses) = row_addresses {
-            let fragment_id = (row_addresses.value(row) >> 32) as u32;
-            for (name, decoder) in &blob_columns {
+            let fragment_id = row_addresses.value(row) >> 32;
+            for (name, decoder, field_id) in &blob_columns {
+                let data_file_path =
+                    data_file_path_for_field(&fragments_by_id, fragment_id, *field_id)?;
                 blob_signatures.push(BlobColumnSig {
-                    name: name.to_string(),
-                    identity: decoder.physical_identity(row, fragment_id)?,
+                    name: name.clone(),
+                    identity: decoder.physical_identity(row, data_file_path)?,
                     managed: matches!(decoder.classify(row)?, BlobDescriptor::Managed { .. }),
                 });
             }
@@ -270,6 +274,31 @@ fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
         });
     }
     Ok(rows)
+}
+
+/// Resolve the immutable data-file path that holds `field_id` in the fragment
+/// owning a row — the stable UUID qualifier for a managed-Blob identity. Reads
+/// only the in-memory manifest.
+fn data_file_path_for_field<'a>(
+    fragments_by_id: &'a HashMap<u64, &'a lance_table::format::Fragment>,
+    fragment_id: u64,
+    field_id: i32,
+) -> Result<&'a str> {
+    let fragment = fragments_by_id.get(&fragment_id).ok_or_else(|| {
+        OmniError::Lance(format!(
+            "change scan referenced fragment {fragment_id} absent from the manifest"
+        ))
+    })?;
+    fragment
+        .files
+        .iter()
+        .find(|file| file.fields.contains(&field_id))
+        .map(|file| file.path.as_str())
+        .ok_or_else(|| {
+            OmniError::Lance(format!(
+                "fragment {fragment_id} has no data file for blob field {field_id}"
+            ))
+        })
 }
 
 /// Typed structural row equality with an exact managed-Blob payload tie-break.
@@ -284,12 +313,12 @@ fn prepare_batch(batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
 ///   difference is authoritative — no payload I/O, and a same-URI range change
 ///   is never conflated by a bare-URI value compare. *(Ranged externals are not
 ///   yet writable through a supported path, so this branch is defense in depth.)*
-/// - **Managed**: descriptor fields are file-relative. Within one lifetime
-///   ([`BlobComparisonScope::SameLineage`]) an equal source-qualified identity
-///   implies equal bytes, so payload I/O is paid only on a descriptor
-///   difference (relocation). Across branches
-///   ([`BlobComparisonScope::CrossBranch`]) the fragment id is branch-local, so
-///   the descriptor is not authoritative and every managed column is byte-compared.
+/// - **Managed**: the identity is qualified by the owning data file's immutable
+///   UUID path, which is globally unique (it does not restart on `Overwrite` and
+///   is not branch-local). So an equal managed identity implies equal bytes even
+///   across overwrites and branches — payload I/O is paid only on a descriptor
+///   difference (which proves nothing on its own, since compaction relocates
+///   identical bytes to a new file), where the byte-compare tie-break decides.
 ///
 /// The two slices are required to share one user schema (both diff surfaces
 /// gate on a schema fingerprint before comparison), so a missing column is an
@@ -299,7 +328,6 @@ pub(crate) async fn rows_equal(
     left: &RawRow,
     to_dataset: &Dataset,
     right: &RawRow,
-    scope: BlobComparisonScope,
 ) -> Result<bool> {
     let blob_columns: HashSet<&str> = left
         .blob_signatures
@@ -339,24 +367,15 @@ pub(crate) async fn rows_equal(
         return Ok(false);
     }
 
-    // Classify each Blob column. Only managed columns whose bytes cannot be
-    // decided by descriptor identity alone reach the payload tie-break.
+    // Classify each Blob column. A managed column whose data-file-qualified
+    // identity differs reaches the payload tie-break (the difference could be a
+    // compaction relocation of identical bytes); an equal identity proves equal
+    // bytes and is skipped. External/null identities are authoritative.
     let mut managed_to_bytecheck: HashSet<String> = HashSet::new();
     for (l, r) in left.blob_signatures.iter().zip(&right.blob_signatures) {
         if l.managed && r.managed {
-            match scope {
-                // Branch-local fragment id: an equal identity does not prove
-                // equal bytes across branches, so always byte-compare.
-                BlobComparisonScope::CrossBranch => {
-                    managed_to_bytecheck.insert(l.name.clone());
-                }
-                // Source-qualified identity is authoritative within one
-                // lifetime; a difference is a relocation that needs the tie-break.
-                BlobComparisonScope::SameLineage => {
-                    if l.identity != r.identity {
-                        managed_to_bytecheck.insert(l.name.clone());
-                    }
-                }
+            if l.identity != r.identity {
+                managed_to_bytecheck.insert(l.name.clone());
             }
         } else if l.identity != r.identity {
             // At least one side is external or null: identity is authoritative
