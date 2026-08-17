@@ -576,6 +576,7 @@ gateway_surfaces! {
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
+        "open_at_entry_verified",
         "open_dataset_head", "list_branches", "ensure_expected_version",
         "reopen_for_mutation", "scan_batches", "scan_batches_for_rewrite",
         "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",

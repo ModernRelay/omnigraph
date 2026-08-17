@@ -795,6 +795,34 @@ impl TableStore {
         entry.open(&self.root_uri, Some(&self.session)).await
     }
 
+    /// Open a table for change-feed enumeration, re-proving the branch
+    /// incarnation after the physical open. The feed captures and proves a
+    /// manifest snapshot, THEN opens the per-table datasets by (branch path,
+    /// numeric version) — a window in which a named branch delete/recreate at
+    /// the same path and version would retarget the open to the replacement
+    /// branch's rows. For a named-branch entry this opens cache-bypassing (so a
+    /// stale warm handle cannot mask the retarget) and requires the opened
+    /// dataset's manifest e_tag to match the entry's recorded incarnation; a
+    /// mismatch fails closed. Main entries cannot undergo branch-name ABA and
+    /// use the warm path unchanged.
+    pub async fn open_at_entry_verified(&self, entry: &SubTableEntry) -> Result<Dataset> {
+        if entry.table_branch.is_none() {
+            return self.open_at_entry(entry).await;
+        }
+        let dataset = entry.open(&self.root_uri, None).await?;
+        if let Some(expected) = entry.version_metadata.e_tag()
+            && dataset.manifest_location().e_tag.as_deref() != Some(expected)
+        {
+            return Err(OmniError::manifest(format!(
+                "change feed table '{}' has no persisted native-branch incarnation \
+                 witness at the reopened dataset; the branch was deleted and \
+                 recreated during the poll",
+                entry.table_key,
+            )));
+        }
+        Ok(dataset)
+    }
+
     pub async fn open_dataset_head(
         &self,
         dataset_uri: &str,

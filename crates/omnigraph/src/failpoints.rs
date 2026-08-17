@@ -97,6 +97,12 @@ pub mod names {
     /// named branch here to prove the poll fails closed rather than emitting the
     /// replacement branch's rows under the captured commit's label.
     pub const CHANGE_FEED_POST_CAPTURE: &str = "change_feed.post_capture";
+    /// A change-feed poll has reopened and re-proven a commit's manifest
+    /// snapshot, but has not yet opened the per-table datasets it names. Tests
+    /// delete and recreate a named branch here to prove the physical table open
+    /// re-proves the branch incarnation (via the manifest e_tag) rather than
+    /// reading the replacement branch's rows at the same path and version.
+    pub const CHANGE_FEED_PRE_TABLE_OPEN: &str = "change_feed.pre_table_open";
     pub const CLEANUP_RECONCILE_FORK: &str = "cleanup.reconcile_fork";
     /// After cleanup's fast empty-sidecar probe, before it acquires the closed
     /// schema/branch/table GC gate set and performs the authoritative recheck.

@@ -229,6 +229,13 @@ async fn plan_intervals(
 ) -> Result<Vec<IntervalPlan>> {
     let intervals = changed_table_intervals(parent, child);
 
+    // The manifest snapshots are captured and re-proven, but the per-table
+    // datasets are opened next by (branch path, numeric version). A branch
+    // delete/recreate in this window would retarget those opens, so
+    // `open_at_entry_verified` re-proves each named-branch table's incarnation
+    // via its manifest e_tag. Tests park here to exercise that second window.
+    crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_PRE_TABLE_OPEN)?;
+
     let mut plans = Vec::with_capacity(intervals.len());
     for interval in intervals {
         let table_key = interval.table_key();
@@ -244,8 +251,8 @@ async fn plan_intervals(
                 }
             }
             (Some(from), Some(to)) => {
-                let from_dataset = store.open_at_entry(from).await?;
-                let to_dataset = store.open_at_entry(to).await?;
+                let from_dataset = store.open_at_entry_verified(from).await?;
+                let to_dataset = store.open_at_entry_verified(to).await?;
                 if user_schema_fingerprint(&from_dataset) != user_schema_fingerprint(&to_dataset) {
                     return Err(schema_boundary(graph_commit_id, table_key));
                 }
