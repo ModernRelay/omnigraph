@@ -816,13 +816,22 @@ implementation, recorded here so later phases inherit them:
   slices for non-Blob user columns and physical descriptor identity with an
   exact payload tie-break for Blob columns. Float comparison is bitwise.
   Managed Blob descriptor fields (`position`/`size`/`blob_id`) are resolved by
-  Lance RELATIVE to the owning data file (via the row's fragment), so the
-  identity is qualified with the owning fragment id (high 32 bits of
-  `_rowaddr`, projected via `with_row_address`). Without that, a same-length
-  Blob-only update that moves the row to a new fragment with colliding local
-  descriptor coordinates would be misread as unchanged and silently dropped
-  from the diff and feed. External references resolve by URI independently of
-  placement, so their identity stays source-independent.
+  Lance RELATIVE to the owning data file, so the identity is qualified with that
+  data file's **immutable path** — the globally-unique v4 UUID Lance mints for
+  every data file, resolved I/O-free from the row's fragment via the Blob
+  column's field id. A fragment id is NOT a sufficient qualifier: it resets to 0
+  on Overwrite and is branch-local, so a same-length Blob-only update after
+  compaction, an Overwrite, or on a different branch could reuse a colliding
+  fragment id plus local descriptor coordinates and be misread as unchanged —
+  silently dropped from the diff and feed. A data-file path never repeats
+  (compaction, Overwrite, and per-branch writes each mint a new UUID), so one
+  comparator is correct for same-lineage, cross-branch, and post-Overwrite pairs
+  with no scope hint. External references resolve by URI independently of
+  placement, so their identity stays source-independent. The same comparator is
+  the merge classifier's row equality, so the CDC diff/feed and three-way merge
+  cannot drift (a display-string signature was not injective for nested Arrow
+  values — `["a, b"]` and `["a","b"]` rendered identically and a real change was
+  dropped).
 - **Strict schema gate:** paired lifetimes must share one user-schema
   fingerprint (name-keyed Arrow type + nullability + stable property marker +
   Blob marker; the five reserved Lance virtual columns excluded); a non-empty
@@ -913,3 +922,37 @@ implementation, recorded here so later phases inherit them:
   citations. Until then, the practical bound is the 8,192-row / 32 MiB Mutation
   ceiling on the *write* side; large historical tables can exceed the read-side
   memory envelope.
+- **Second review round (shipped).** A second independent review found three
+  correctness gaps and four polish items, now fixed:
+  - **Managed-Blob identity is the immutable data-file path, not the fragment
+    id** (see the corrected "Typed structural equality" bullet above). The
+    fragment-id qualifier closed same-lineage collisions but still aliased a
+    same-length Blob update across an Overwrite (fragment id resets to 0) — a
+    reachable silent data-loss gap. The data-file-path qualifier closes it and
+    subsumes the earlier cross-branch scope hint, so the enum that carried it is
+    gone.
+  - **Merge classification uses the shared typed comparator.** The three-way
+    branch-merge classifier compared rows by `array_value_to_string`, which is
+    not injective for nested Arrow values, so a genuine list change was
+    classified as a no-op and silently dropped. It now routes through the same
+    `rows_equal` the CDC diff/feed uses.
+  - **The feed re-proves branch incarnation at the per-table open (second
+    window).** `commit_snapshot` re-proves the manifest head, but `plan_intervals`
+    then opens each per-table dataset separately by (branch path, version); a
+    delete/recreate between the head proof and the table open could retarget the
+    open to the replacement branch. The per-table open now bypasses the warm
+    cache and requires the reopened dataset's manifest e_tag to match the
+    entry's recorded incarnation, failing closed otherwise.
+  - **Backlog CPU term made observable (F4).** A poll clones the whole backlog
+    into its first-parent chain (`chain_after`), which grows with the backlog
+    independently of the manifest/data IO counters. A `feed_commits_visited`
+    probe now surfaces it through `changes_cost.rs`, so the bounded-visit fix
+    (a warm forward-child projection — the B1 follow-up) is measurable rather
+    than a silent regression surface.
+  - **Baseline durability, filter scope, and human output (F5–F7).** The
+    baseline install now propagates a parent-directory fsync failure instead of
+    swallowing it (no cursor prints for a rename that is not durable); §3.3 is
+    amended to name-only type filtering (the opaque id is a display/join key,
+    not a filter dimension); and human change output distinguishes an
+    endpoint-moving update (`old -> old => new -> new`), a JSON null (`<null>`),
+    the literal string `null`, an empty string, and an absent key.
