@@ -521,7 +521,9 @@ impl OrderedTableCursor {
                     self.current_batch = None;
                     return Ok(None);
                 }
-                Err(err) => return Err(OmniError::Lance(err.to_string())),
+                Err(err) => {
+                    return Err(crate::table_store::TableStore::ordered_scan_error(err));
+                }
             }
         }
     }

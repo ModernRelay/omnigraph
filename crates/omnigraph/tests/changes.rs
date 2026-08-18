@@ -1,3 +1,8 @@
+// This integration owner composes the full engine + cost helper futures across
+// many exact-snapshot/feed scenarios. Keep compiler query depth aligned with
+// the engine crate; this does not change any runtime test-thread stack.
+#![recursion_limit = "256"]
+
 mod helpers;
 
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
@@ -2289,6 +2294,87 @@ async fn change_feed_byte_budget_admits_one_solo_oversized_change_per_page() {
     }
 }
 
+/// A positive byte remainder is still page-wide state. After the first commit
+/// consumes almost all of the budget, the next commit may not treat itself as
+/// the page's first change and claim another solo-oversized exception.
+#[tokio::test]
+async fn change_feed_byte_budget_does_not_reset_solo_exception_per_commit() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, "node Person {\n    name: String @key\n}")
+        .await
+        .unwrap();
+    let now = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap();
+    let (cursor, _) = boundary_cursor(&now);
+
+    let first = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"budget-first"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let second = db
+        .load_with_receipt(
+            "main",
+            &format!(
+                r#"{{"type":"Person","data":{{"name":"budget-second-{}"}}}}"#,
+                "x".repeat(512)
+            ),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    let first_change = db
+        .commit_changes_page(
+            &first.commit.graph_commit_id,
+            &ChangeFeedScope::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .block
+        .changes
+        .remove(0);
+    let first_bytes = u64::try_from(serde_json::to_vec(&first_change).unwrap().len()).unwrap();
+
+    let mut request = feed_request(None, ChangeFeedPosition::Cursor(cursor));
+    request.max_bytes = Some(first_bytes + 1);
+    let page = db.poll_change_feed(request).await.unwrap();
+    assert_eq!(
+        page.blocks
+            .iter()
+            .map(|block| block.cause.graph_commit_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![first.commit.graph_commit_id.as_str()],
+        "the second commit must wait for a fresh page even though one byte remains"
+    );
+    let (cursor, caught_up) = boundary_cursor(&page);
+    assert!(!caught_up);
+
+    let resumed = db
+        .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(cursor)))
+        .await
+        .unwrap();
+    assert_eq!(resumed.blocks.len(), 1);
+    assert_eq!(
+        resumed.blocks[0].cause.graph_commit_id,
+        second.commit.graph_commit_id
+    );
+}
+
 #[tokio::test]
 async fn change_feed_advances_only_at_block_boundaries_and_pins_the_cut() {
     use omnigraph::changes::{ChangeFeedContinuation, ChangeFeedPosition, ChangeFeedStart};
@@ -2712,6 +2798,35 @@ async fn change_feed_cursor_scope_mismatches_are_typed() {
         "different branch incarnation",
     );
 
+    // The warm same-branch path must make the same check before reusing its
+    // cached cut. Both lifetimes fork the exact same main source, so their
+    // manifest version, e_tag, timestamp, head, and rows can all coincide;
+    // only Lance's BranchIdentifier distinguishes the replacement.
+    db.branch_create("warm-aba").await.unwrap();
+    let warm_reader = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    warm_reader.sync_branch("warm-aba").await.unwrap();
+    let (warm_cursor, _) = boundary_cursor(
+        &warm_reader
+            .poll_change_feed(feed_request(
+                Some("warm-aba"),
+                ChangeFeedPosition::Start(ChangeFeedStart::Now),
+            ))
+            .await
+            .unwrap(),
+    );
+    db.branch_delete("warm-aba").await.unwrap();
+    db.branch_create("warm-aba").await.unwrap();
+    assert_rejected(
+        warm_reader
+            .poll_change_feed(feed_request(
+                Some("warm-aba"),
+                ChangeFeedPosition::Cursor(warm_cursor),
+            ))
+            .await
+            .unwrap_err(),
+        "different branch incarnation",
+    );
+
     // Another graph entirely (fresh identity domain and genesis).
     let other_dir = tempfile::tempdir().unwrap();
     let other_db = init_and_load(&other_dir).await;
@@ -3046,6 +3161,92 @@ node Foxtrot { name: String @key }
         }
     }
     assert_eq!(paged, expected, "a paged walk resumes on the published key");
+}
+
+/// IDs above the exact continuation cap use a bounded prefix+digest position.
+/// Both finite commit paging and a split feed block must resolve that position
+/// within the shared-prefix range and resume after the exact row — no duplicate
+/// and no skipped successor even though the token never carries the long tail.
+#[tokio::test]
+async fn long_ids_resume_exactly_with_bounded_commit_and_feed_tokens() {
+    use omnigraph::changes::{
+        ChangeFeedContinuation, ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, "node Person {\n    name: String @key\n}")
+        .await
+        .unwrap();
+    let now = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap();
+    let (cursor, _) = boundary_cursor(&now);
+
+    let common = "long-prefix-".repeat(32);
+    let first_id = format!("{common}a");
+    let second_id = format!("{common}b");
+    assert!(first_id.len() > 256, "fixture must take the digest path");
+    let commit = db
+        .load_with_receipt(
+            "main",
+            &format!(
+                "{}\n{}",
+                serde_json::json!({"type": "Person", "data": {"name": &first_id}}),
+                serde_json::json!({"type": "Person", "data": {"name": &second_id}}),
+            ),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    let scope = ChangeFeedScope::default();
+    let first = db
+        .commit_changes_page(&commit.commit.graph_commit_id, &scope, None, Some(1), None)
+        .await
+        .unwrap();
+    assert_eq!(first.block.changes[0].id, first_id);
+    let token = first.next_page_token.expect("long-id page must continue");
+    assert!(
+        token.len() <= 4096,
+        "continuation must have a fixed ceiling"
+    );
+    let second = db
+        .commit_changes_page(
+            &commit.commit.graph_commit_id,
+            &scope,
+            Some(&token),
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.block.changes.len(), 1);
+    assert_eq!(second.block.changes[0].id, second_id);
+    assert!(second.next_page_token.is_none());
+
+    let mut request = feed_request(None, ChangeFeedPosition::Cursor(cursor));
+    request.max_changes = Some(1);
+    let first = db.poll_change_feed(request).await.unwrap();
+    assert_eq!(first.blocks[0].changes[0].id, first_id);
+    let token = match first.continuation {
+        ChangeFeedContinuation::MidBlock { page_token } => page_token,
+        other => panic!("expected a split long-id block, got {other:?}"),
+    };
+    assert!(token.len() <= 4096, "feed token must have a fixed ceiling");
+    let second = db
+        .poll_change_feed(feed_request(None, ChangeFeedPosition::PageToken(token)))
+        .await
+        .unwrap();
+    assert_eq!(second.blocks.len(), 1);
+    assert_eq!(second.blocks[0].changes.len(), 1);
+    assert_eq!(second.blocks[0].changes[0].id, second_id);
+    let (_, caught_up) = boundary_cursor(&second);
+    assert!(caught_up);
 }
 
 /// A page-token resume whose FIRST change exceeds the poll's own byte budget

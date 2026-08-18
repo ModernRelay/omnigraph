@@ -133,6 +133,12 @@ pub enum OmniError {
     /// continuation bug from a retention gap without parsing text.
     #[error("change cursor rejected: {reason}")]
     ChangeCursorRejected { reason: String },
+    /// A logical graph branch named by the caller does not exist. Minted only
+    /// at the branch-ref lookup boundary, before physical table work, so HTTP
+    /// change routes can return a fixed graph-vocabulary 404 without treating
+    /// an arbitrary storage `NotFound` as branch absence.
+    #[error("branch '{branch}' not found")]
+    BranchNotFound { branch: String },
     /// A change page or feed can no longer be reconstructed contiguously:
     /// cleanup reclaimed a table version one of its commits pins. Recovery is
     /// the exact baseline handshake, never a retried continuation.

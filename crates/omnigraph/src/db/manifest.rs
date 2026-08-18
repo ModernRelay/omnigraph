@@ -40,7 +40,10 @@ use graph::{
 pub(crate) use layout::manifest_uri;
 #[cfg(test)]
 use layout::open_manifest_dataset;
-use layout::{open_manifest_dataset_with_session, table_uri_for_path};
+use layout::{
+    branch_ref_error, open_manifest_dataset_with_identifier_with_session,
+    open_manifest_dataset_with_session, table_uri_for_path,
+};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
@@ -461,11 +464,12 @@ pub(crate) struct ManifestIncarnation {
     pub(crate) version: u64,
     pub(crate) e_tag: Option<String>,
     timestamp_nanos: Option<u128>,
+    branch_identifier: lance::dataset::refs::BranchIdentifier,
 }
 
 impl ManifestIncarnation {
     pub(crate) fn matches(&self, held: &Self) -> bool {
-        if self.version != held.version {
+        if self.version != held.version || self.branch_identifier != held.branch_identifier {
             return false;
         }
         match (&self.e_tag, &held.e_tag) {
@@ -520,16 +524,23 @@ async fn probe_dataset_latest_incarnation(
                 .map_err(|e| OmniError::Lance(e.to_string()))?,
             e_tag: dataset.manifest_location().e_tag.clone(),
             timestamp_nanos: Some(dataset.manifest().timestamp_nanos),
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
         });
     }
+    let branch = active_branch.expect("named-branch arm checked above");
     let (manifest, location) = dataset
         .latest_manifest()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(|error| branch_ref_error(error, branch))?;
+    let branch_identifier = dataset
+        .branch_identifier()
+        .await
+        .map_err(|error| branch_ref_error(error, branch))?;
     Ok(ManifestIncarnation {
         version: manifest.version,
         e_tag: location.e_tag,
         timestamp_nanos: Some(manifest.timestamp_nanos),
+        branch_identifier,
     })
 }
 
@@ -716,6 +727,10 @@ pub(crate) struct ManifestCoordinator {
     dataset: Dataset,
     known_state: ManifestState,
     active_branch: Option<String>,
+    /// Lance-native lifetime captured coherently with `dataset` and
+    /// `known_state`. A named ref keeps this value across ordinary commits and
+    /// receives a new value after delete/recreate.
+    branch_identifier: lance::dataset::refs::BranchIdentifier,
     publisher: Arc<dyn ManifestBatchPublisher>,
 }
 
@@ -737,6 +752,7 @@ impl ManifestCoordinator {
         dataset: Dataset,
         known_state: ManifestState,
         active_branch: Option<String>,
+        branch_identifier: lance::dataset::refs::BranchIdentifier,
         publisher: Arc<dyn ManifestBatchPublisher>,
     ) -> Self {
         Self {
@@ -744,6 +760,7 @@ impl ManifestCoordinator {
             dataset,
             known_state,
             active_branch,
+            branch_identifier,
             publisher,
         }
     }
@@ -753,10 +770,18 @@ impl ManifestCoordinator {
         dataset: Dataset,
         known_state: ManifestState,
         active_branch: Option<String>,
+        branch_identifier: lance::dataset::refs::BranchIdentifier,
     ) -> Self {
         let publisher =
             Self::default_batch_publisher(root_uri, active_branch.as_deref(), dataset.session());
-        Self::from_parts(root_uri, dataset, known_state, active_branch, publisher)
+        Self::from_parts(
+            root_uri,
+            dataset,
+            known_state,
+            active_branch,
+            branch_identifier,
+            publisher,
+        )
     }
 
     fn snapshot_from_state(root_uri: &str, state: ManifestState) -> Snapshot {
@@ -832,7 +857,13 @@ impl ManifestCoordinator {
         let (dataset, known_state, lineage_rows) =
             open_exact_genesis_manifest(root, attempt, control_session).await?;
         Ok((
-            Self::from_parts_with_default_publisher(root, dataset, known_state, None),
+            Self::from_parts_with_default_publisher(
+                root,
+                dataset,
+                known_state,
+                None,
+                lance::dataset::refs::BranchIdentifier::main(),
+            ),
             lineage_rows,
         ))
     }
@@ -847,7 +878,13 @@ impl ManifestCoordinator {
         let root = root_uri.trim_end_matches('/');
         let (known_state, lineage_rows) = load_initial_manifest_state(&dataset).await?;
         Ok((
-            Self::from_parts_with_default_publisher(root, dataset, known_state, None),
+            Self::from_parts_with_default_publisher(
+                root,
+                dataset,
+                known_state,
+                None,
+                lance::dataset::refs::BranchIdentifier::main(),
+            ),
             lineage_rows,
         ))
     }
@@ -863,12 +900,14 @@ impl ManifestCoordinator {
         control_session: &Arc<lance::session::Session>,
     ) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state) = open_manifest_graph(root, None, control_session).await?;
+        let (dataset, known_state, branch_identifier) =
+            open_manifest_graph(root, None, control_session).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
             dataset,
             known_state,
             None,
+            branch_identifier,
         ))
     }
 
@@ -888,13 +927,14 @@ impl ManifestCoordinator {
         }
 
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state) =
+        let (dataset, known_state, branch_identifier) =
             open_manifest_graph(root, Some(branch), control_session).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
             dataset,
             known_state,
             Some(branch.to_string()),
+            branch_identifier,
         ))
     }
 
@@ -905,7 +945,7 @@ impl ManifestCoordinator {
     ) -> Result<(Self, Vec<GraphLineageRow>)> {
         let root = root_uri.trim_end_matches('/');
         let branch = branch.filter(|branch| *branch != "main");
-        let (dataset, known_state, lineage_rows) =
+        let (dataset, known_state, lineage_rows, branch_identifier) =
             open_manifest_graph_with_lineage(root, branch, control_session).await?;
         Ok((
             Self::from_parts_with_default_publisher(
@@ -913,6 +953,7 @@ impl ManifestCoordinator {
                 dataset,
                 known_state,
                 branch.map(str::to_string),
+                branch_identifier,
             ),
             lineage_rows,
         ))
@@ -949,14 +990,16 @@ impl ManifestCoordinator {
 
     pub(crate) async fn refresh_with_lineage(&mut self) -> Result<Vec<GraphLineageRow>> {
         let control_session = self.dataset.session();
-        let (dataset, known_state, lineage_rows) = open_manifest_graph_with_lineage(
-            &self.root_uri,
-            self.active_branch.as_deref(),
-            &control_session,
-        )
-        .await?;
+        let (dataset, known_state, lineage_rows, branch_identifier) =
+            open_manifest_graph_with_lineage(
+                &self.root_uri,
+                self.active_branch.as_deref(),
+                &control_session,
+            )
+            .await?;
         self.dataset = dataset;
         self.known_state = known_state;
+        self.branch_identifier = branch_identifier;
         Ok(lineage_rows)
     }
 
@@ -981,7 +1024,7 @@ impl ManifestCoordinator {
         projection_has_head: impl FnOnce(&str) -> bool,
     ) -> Result<Option<Vec<GraphLineageRow>>> {
         let control_session = self.dataset.session();
-        let dataset = open_manifest_dataset_with_session(
+        let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
             &self.root_uri,
             self.active_branch.as_deref(),
             &control_session,
@@ -1004,6 +1047,7 @@ impl ManifestCoordinator {
 
         self.dataset = dataset;
         self.known_state = known_state;
+        self.branch_identifier = branch_identifier;
         Ok(lineage_rows)
     }
 
@@ -1148,14 +1192,13 @@ impl ManifestCoordinator {
             .map_err(|error| OmniError::Lance(error.to_string()))
     }
 
-    /// Lance-native stable identity for the active manifest branch. Unlike a
-    /// manifest version/eTag, this remains stable across ordinary commits and
-    /// changes when a named branch is deleted and recreated (ABA protection).
+    /// Lance-native stable identity captured with the active manifest state.
+    /// Unlike a manifest version/eTag, this remains stable across ordinary
+    /// commits and changes when a named branch is deleted and recreated (ABA
+    /// protection). Returning the capture, rather than re-reading the live ref,
+    /// prevents callers from pairing old state with a replacement witness.
     pub(crate) async fn branch_identifier(&self) -> Result<lance::dataset::refs::BranchIdentifier> {
-        self.dataset
-            .branch_identifier()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        Ok(self.branch_identifier.clone())
     }
 
     /// Exact materialized `graph_head:<active-branch>` from the same pinned
@@ -1175,13 +1218,15 @@ impl ManifestCoordinator {
             version: self.version(),
             e_tag: self.dataset.manifest_location().e_tag.clone(),
             timestamp_nanos: Some(self.dataset.manifest().timestamp_nanos),
+            branch_identifier: self.branch_identifier.clone(),
         }
     }
 
     /// Latest committed manifest identity. Main cannot be deleted/recreated, so
     /// the cheap version-number probe is sufficient there. Non-main Lance
-    /// branches can be deleted and recreated with the same version number, so
-    /// load the latest manifest location and compare its e_tag / timestamp too.
+    /// branches can be deleted and recreated with the same version, e_tag, and
+    /// timestamp when both lifetimes fork the same source; the native branch
+    /// identifier is therefore part of the freshness result as well.
     pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
         probe_dataset_latest_incarnation(&self.dataset, self.active_branch.as_deref()).await
     }

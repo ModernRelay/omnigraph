@@ -20,8 +20,8 @@ use super::model::{
     GraphEntityChange,
 };
 use super::token::{
-    self, FEED_PURPOSE, FeedCursorV1, FeedPageTokenV1, KIND_FEED_CURSOR, KIND_FEED_PAGE,
-    cursor_rejected,
+    self, BranchScopeV1, FEED_PURPOSE, FeedCursorV1, FeedPageTokenV1, KIND_FEED_CURSOR,
+    KIND_FEED_PAGE, cursor_rejected,
 };
 use crate::db::commit_graph::GraphCommit;
 use crate::db::manifest::{ManifestCoordinator, Snapshot};
@@ -90,7 +90,7 @@ impl ChangeFeedCut {
 struct FeedScope {
     graph_identity: String,
     genesis: String,
-    branch: Option<String>,
+    branch: BranchScopeV1,
     witness: String,
     filter_digest: String,
 }
@@ -130,7 +130,7 @@ impl FeedScope {
             after_commit_id: after_commit_id.to_string(),
             current_commit_id: current_commit_id.to_string(),
             type_id: key.type_id.clone(),
-            id: key.id.clone(),
+            position: key.position.clone(),
             operation_rank: key.operation_rank,
             change_index: key.change_index,
         })
@@ -141,7 +141,7 @@ impl FeedScope {
         &self,
         graph_identity: &str,
         genesis: &str,
-        branch: &Option<String>,
+        branch: &BranchScopeV1,
         witness: &str,
         filter_digest: &str,
     ) -> Result<()> {
@@ -185,7 +185,7 @@ pub(crate) fn mint_cursor_after(
     FeedScope {
         graph_identity: token::hashed_identity(graph_identity),
         genesis: cut.genesis.clone(),
-        branch: cut.branch.clone(),
+        branch: BranchScopeV1::for_branch(cut.branch.as_deref()),
         witness: cut.witness.clone(),
         filter_digest: token::filter_digest(scope),
     }
@@ -235,7 +235,7 @@ pub(crate) async fn poll(
     let scope = FeedScope {
         graph_identity: token::hashed_identity(graph_identity),
         genesis: cut.genesis.clone(),
-        branch: cut.branch.clone(),
+        branch: BranchScopeV1::for_branch(cut.branch.as_deref()),
         witness: cut.witness.clone(),
         filter_digest: token::filter_digest(&request.scope),
     };
@@ -296,14 +296,11 @@ pub(crate) async fn poll(
                     },
                 })
             };
-        // Also stop when the BYTE budget is exhausted: the solo-oversized
-        // forward-progress rule is scoped to one `enumerate_commit_changes`
-        // call, so without this check a poll whose bytes ran out would
-        // force-emit the first change of EVERY later commit as another "solo"
-        // oversized change — one over-budget event per commit instead of one
-        // per page. A page that ends with zero remaining bytes stops at the
-        // block boundary; the next poll's fresh budget resumes forward
-        // progress from there.
+        // Also stop when the BYTE budget is exhausted. The budget remembers
+        // page-wide emission state, so even a positive remainder cannot grant
+        // the next commit another solo-oversized exception; zero can stop here
+        // without opening that commit. The next poll's fresh budget resumes
+        // forward progress from this block boundary.
         if index == max_commits || budget.remaining_rows == 0 || budget.remaining_bytes == 0 {
             return boundary_stop(blocks, &after_completed);
         }
@@ -525,7 +522,7 @@ fn resolve_position(
             }
             let key = ContinuationKey {
                 type_id: page.type_id.clone(),
-                id: page.id.clone(),
+                position: page.position.clone(),
                 operation_rank: page.operation_rank,
                 change_index: page.change_index,
             };

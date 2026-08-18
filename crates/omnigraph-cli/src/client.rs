@@ -430,35 +430,10 @@ impl GraphClient {
         }
     }
 
-    /// One page of a commit's entity diff (`page_token: Some`), or the whole
-    /// block auto-paginated into one merged output (`page_token: None`) — the
-    /// transport contract says helpers consume page tokens automatically.
-    pub(crate) async fn commit_changes(
-        &self,
-        commit_id: &str,
-        page_token: Option<&str>,
-        limit: Option<usize>,
-        filter: &ChangeFilterArgs<'_>,
-    ) -> Result<CommitChangesOutput> {
-        if page_token.is_some() {
-            return self
-                .commit_changes_page(commit_id, page_token, limit, filter)
-                .await;
-        }
-        let mut merged = self
-            .commit_changes_page(commit_id, None, limit, filter)
-            .await?;
-        while let Some(token) = merged.next_page_token.take() {
-            let page = self
-                .commit_changes_page(commit_id, Some(&token), limit, filter)
-                .await?;
-            merged.changes.extend(page.changes);
-            merged.next_page_token = page.next_page_token;
-        }
-        Ok(merged)
-    }
-
-    async fn commit_changes_page(
+    /// Fetch one bounded page of a commit's entity diff. Auto-pagination is
+    /// deliberately owned by the command output loop, which emits each page
+    /// before fetching the next one instead of rebuilding an unbounded result.
+    pub(crate) async fn commit_changes_page(
         &self,
         commit_id: &str,
         page_token: Option<&str>,
@@ -505,52 +480,9 @@ impl GraphClient {
         }
     }
 
-    /// One complete poll of the change feed: page tokens are consumed
-    /// internally (a partial poll never exposes an advanced cursor), split
-    /// blocks are merged back together, and the terminal cursor is returned.
-    pub(crate) async fn poll_changes(
-        &self,
-        branch: Option<&str>,
-        cursor: Option<&str>,
-        start: Option<&str>,
-        limit: Option<usize>,
-        filter: &ChangeFilterArgs<'_>,
-    ) -> Result<ChangeFeedOutput> {
-        let mut merged: Option<ChangeFeedOutput> = None;
-        let mut page_token: Option<String> = None;
-        loop {
-            let page = self
-                .poll_changes_page(branch, cursor, start, page_token.as_deref(), limit, filter)
-                .await?;
-            merged = Some(match merged {
-                None => page,
-                Some(mut merged) => {
-                    let mut blocks = page.blocks.into_iter();
-                    if let (Some(last), Some(first)) = (merged.blocks.last_mut(), blocks.next()) {
-                        // A resumed page repeats the split block's cause;
-                        // stitch its remaining changes back onto that block.
-                        if last.cause.graph_commit_id == first.cause.graph_commit_id {
-                            last.changes.extend(first.changes);
-                        } else {
-                            merged.blocks.push(first);
-                        }
-                    }
-                    merged.blocks.extend(blocks);
-                    merged.next_page_token = page.next_page_token;
-                    merged.cursor = page.cursor;
-                    merged.caught_up = page.caught_up;
-                    merged
-                }
-            });
-            match merged.as_mut().and_then(|page| page.next_page_token.take()) {
-                Some(token) => page_token = Some(token),
-                None => break,
-            }
-        }
-        Ok(merged.expect("at least one page was fetched"))
-    }
-
-    async fn poll_changes_page(
+    /// Fetch one bounded page of a captured feed poll. The caller continues
+    /// with `next_page_token`; this method never aggregates pages in memory.
+    pub(crate) async fn poll_changes_page(
         &self,
         branch: Option<&str>,
         cursor: Option<&str>,

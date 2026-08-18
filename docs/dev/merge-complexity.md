@@ -3,7 +3,9 @@
 **Type:** investigation artifact (complexity + object-store cost)
 **Status:** living reference for timeout diagnosis
 **Audience:** anyone debugging slow / timed-out `branch_merge`
-**Upstream surveyed:** Lance 9.0.0 (`v9.0.0` / `7653c206`)
+**Upstream surveyed:** Lance 9.0.0 (`v9.0.0` / `7653c206`) for the original
+merge analysis; ordered execution was revalidated against the repository's
+pinned Lance 10.0.0 source.
 **Companion docs:** [merge.md](merge.md) (correctness / routes),
 [testing.md](testing.md) (`merge_cost.rs`, `merge_fast_forward.rs`),
 [lance.md](lance.md)
@@ -144,35 +146,55 @@ Lance upstream (`scanner.rs`):
   before any merge progress.
 - Unsorted scan would be O(N) I/O; the sort adds the log factor and TTFP delay.
 
-**The sort is unbounded-memory, and spill is structurally disabled on the scan
-path** (verified against the pinned Lance 10.0.0 source, not inferred):
+**The sort is executed through OmniGraph's bounded spill envelope** (verified
+against the pinned Lance 10.0.0 source, not inferred):
 
-- `Scanner::try_into_stream` runs the plan through `execute_plan` with
-  `LanceExecutionOptions::default()`, whose `use_spilling` is `false`, and
-  exposes no public API or `Scanner` option to flip it.
-- Lance installs its `FairSpillPool` + `DiskManager` **only** when
-  `use_spilling` is true; otherwise the runtime gets DataFusion's
-  **`UnboundedMemoryPool`**. `LANCE_MEM_POOL_SIZE` / `LANCE_BYPASS_SPILLING`
-  are consulted only under spilling, so no env var changes this.
-- DataFusion's `ExternalSorter` spills only when a pool reservation *fails*; an
-  unbounded pool never fails one, so **every input batch accumulates in
-  `in_mem_batches`** and the whole ordered table is resident in one
-  single-partition `SortExec`. Lance enables spilling for `merge_insert` and
-  index training, **never for scans**.
+- OmniGraph obtains the public scanner plan with `Scanner::create_plan`, builds
+  a per-operation DataFusion context with the same public pool/disk primitives
+  Lance uses, and executes the plan directly rather than using
+  `Scanner::try_into_stream`, whose default still disables spilling.
+- Every ordered scan supplies `LanceExecutionOptions` with spilling enabled, a
+  150 MiB `FairSpillPool`, and a 100 GiB scratch quota in that Lance execution
+  context, backed by DataFusion's `DiskManager`. The values are explicit, so
+  ambient `LANCE_MEM_POOL_SIZE` and scratch-size tuning cannot widen one
+  execution. OmniGraph creates a fresh context for each ordered execution
+  instead of using Lance's session cache: a quota breach cannot poison a later
+  scan, and concurrent executions each own the envelope. This is deliberately
+  not claimed as one process-global pool.
+- `TableStore::scan_stream_with` applies ordering before its callback and gives
+  that callback only the restricted `ScanTuning` surface, which deliberately
+  has no `order_by` method. Callers therefore cannot add ordering after the
+  bounded-vs-ordinary executor decision.
+- Lance permits `LANCE_BYPASS_SPILLING` to override an explicit option.
+  OmniGraph detects that override and refuses the ordered scan instead of
+  silently returning to an `UnboundedMemoryPool`.
+- Every `SortExec` input is wrapped in Lance's `HardCapBatchSizeExec` at one
+  quarter of the pool (37.5 MiB in production). DataFusion cannot spill its first
+  input batch; this cap deep-slices a larger batch and returns a typed resource
+  error if one indivisible row itself exceeds the cap.
+- DataFusion's `ExternalSorter` retains data only until the execution's pool refuses
+  a reservation, then spills sorted runs against the scratch quota. The disk
+  manager accounts completed writes, so concurrent in-flight spill writes can
+  overshoot the quota; decoded batches and individual rows also remain
+  indivisible. A forced 2 MiB-pool regression proves the bounded executor
+  reports nonzero spill count, bytes, and rows while preserving global `id`
+  order.
 - A **BTREE on `id` does not help**: scalar indexes participate only in filter
   planning, the optimizer has no sort-elision rule, and the BTREE exposes no
   value-ordered enumeration API. The `id > after_id` continuation filter on the
   change feed only prunes the scanned suffix — the sort is still O(remaining).
 
-So `KEYED_WRITE_MAX_ROWS` / `KEYED_WRITE_MAX_BYTES` bound *batch granularity
-downstream of the sort*, not the sort's resident set. Each ordered-by-id scan
-(merge cursors, the change enumerator, the commit diff, export) holds **O(table)
-projected width resident** — embeddings included (~12 KiB/row at 3072 dims ⇒
-~12 GiB at 1M rows). This is the mechanism behind the recorded `branch_merge`
-embedding OOM. Bounding it requires an upstream change (expose scanner spilling,
-or an index-ordered scan), or replacing `order_by` with cursor-chunked ordered
-reads that each sort only a bounded chunk. RFC-030 §14 tracks this as the open
-§4.4 boundedness obligation.
+`KEYED_WRITE_MAX_ROWS` / `KEYED_WRITE_MAX_BYTES` still describe approximate
+batch granularity, not a hard decoded-batch ceiling. The full projected table
+(embeddings included) still crosses `SortExec`, so the operation remains
+**O(N log N)** with full-input time to first row and can write substantial local
+scratch. Its resident sort set no longer grows with table width; scratch has an
+explicit quota plus the documented in-flight overshoot. Exhaustion fails loudly
+instead of returning a partial result. This is not a general process-OOM
+guarantee: a first input batch or individual row is indivisible, and scanner
+byte targets are approximate. The hard-cap node bounds the batch presented to
+the sorter, but one legal row remains indivisible. RFC-030 §4.4 records this
+bounded-spill contract.
 
 `row_signature` (`merge.rs`) builds a faithful per-row change-detection token:
 it skips **only the five reserved Lance virtual columns** (a legal
@@ -269,7 +291,8 @@ All merge routes defer missing-index work to `ensure_indices` / `optimize`.
 
 ## Lance substrate costs (not in OmniGraph source)
 
-Surveyed from `/tmp/lance-src/lance` at `v9.0.0` and full docs under
+Originally surveyed from `/tmp/lance-src/lance` at `v9.0.0`; the ordered-scan
+executor row below was revalidated against pinned Lance 10.0.0. Full docs under
 `format/table/{transaction,layout,branch_tag,row_id_lineage}` and
 `guide/{read_and_write,object_store,performance,observability}`.
 
@@ -277,7 +300,7 @@ Surveyed from `/tmp/lance-src/lance` at `v9.0.0` and full docs under
 |---|---|---|---|
 | Open pinned table | `DatasetBuilder::with_version` / `checkout_version` | Parse **O(F+I)** | 1 manifest HEAD/GET |
 | Open branch HEAD | `with_branch` / `checkout_latest` | + latest resolution | branch JSON GET; latest via hint **O(1–K)** or list **O(V)** |
-| Sorted `id` scan | `scan().order_by(id).batch_size(8192).batch_size_bytes(32MiB)` | **O(N log N)** `SortExec`; TTFP after full sort input | Data page GETs for all projected columns |
+| Sorted `id` scan | `scan().order_by(id)` through an owned bounded execution context | **O(N log N)** `SortExec`; 150 MiB per-execution resident pool, 100 GiB scratch quota plus concurrent in-flight-write overshoot; TTFP after full sort input | Data page GETs for all projected columns + local spill I/O |
 | Tx history `(base, source]` | `read_transaction_by_version` loop | **O(K)** | ≈ K manifest + ≤ K `_transactions` GETs |
 | Stage append | `InsertBuilder::execute_uncommitted` | O(M) rows | Data file PUTs |
 | Keyed StrictInsert | exact preflight + `InsertBuilder` fragments converted to filtered `Update` | indexed preflight O(M·lookup), worst O(N), then O(M) write | preflight index/scan GETs + data PUTs |

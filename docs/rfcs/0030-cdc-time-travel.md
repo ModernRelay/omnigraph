@@ -2,7 +2,7 @@
 type: spec
 title: "RFC-030 — Graph change feed and retained-history contract"
 description: Defines graph-vocabulary commit diffs and a graph change feed with bounded page tokens, durable cursors, and no public storage-table machinery.
-status: draft
+status: implemented
 tags: [eng, rfc, cdc, change-feed, time-travel, provenance, lineage, audit, omnigraph]
 timestamp: 2026-08-05
 owner: OmniGraph maintainers
@@ -10,11 +10,8 @@ owner: OmniGraph maintainers
 
 # RFC-030: Graph change feed and retained-history contract
 
-**Status:** Accepted for C0–C3 — implementation shipped with two recorded open
-§14 obligations that gate full acceptance: the §4.4 ordered-scan memory bound
-(the pinned-Lance single-partition `SortExec` is O(table), shared debt with
-merge/diff/export) and bounded client auto-pagination (the SDK/CLI helpers
-still aggregate whole results). C4+ remain design-stage.
+**Status:** Implemented for C0–C3. The §4.4 ordering, client-pagination, and
+continuation-size gates are closed as recorded in §14. C4+ remain design-stage.
 
 **Date:** 2026-08-05
 
@@ -52,7 +49,8 @@ Two public surfaces share one private adjacent-commit enumerator:
 
 A page token and feed cursor are deliberately separate. The token means
 "continue this response." The cursor means "resume the durable feed after this
-complete commit." Normal SDK/CLI usage consumes page tokens automatically.
+complete commit." The CLI consumes page tokens automatically without retaining
+earlier pages; raw HTTP and page-level engine clients continue explicitly.
 
 The implementation reuses the coordinator we already have:
 
@@ -406,11 +404,13 @@ The total event order inside a block is
 incarnation identity may locate data internally but is not part of the public
 ordering contract or continuation payload.
 
-Raw HTTP may return `next_page_token`; SDK and CLI helpers consume it
-automatically and stream or spool the block within explicit bounds. In a feed,
-intermediate pages carry no advanced durable cursor. The terminal page returns
-the cursor after that complete commit, so a caller never checkpoints a partial
-block by mistake.
+Raw HTTP may return `next_page_token`; the CLI consumes it automatically and
+renders each page before fetching the next one. It retains at most one bounded
+page plus one open split-block cause (and one indivisible change while encoding),
+not the complete result. Page-level engine/HTTP consumers continue explicitly.
+In a feed, intermediate pages carry no advanced durable cursor. The terminal
+page returns the cursor after that complete commit, so a caller never
+checkpoints a partial block by mistake.
 
 The per-page byte ceiling is a PACKING target — how many small changes share a
 page — never a wall a single legal change must fit under. An `Update` serializes
@@ -428,6 +428,24 @@ The implementation must prove the ordering path is bounded. It may use Lance's
 ordered scan or a bounded merge, but it may not sort an unbounded graph commit
 in memory or depend on unspecified concurrent scan order.
 
+OmniGraph obtains Lance's public scanner plan and executes every ordered scan
+with spilling enabled, an explicit 150 MiB memory pool and an explicit 100 GiB
+scratch quota in that Lance execution context. OmniGraph creates a fresh
+context for each ordered execution instead of using Lance's session cache, so
+a quota breach cannot poison a later scan; concurrent scans each own the
+envelope. This is deliberately a per-execution bound rather than a
+process-global admission controller. The disk manager accounts completed spill
+writes, so concurrent in-flight writes can overshoot the quota. If
+`LANCE_BYPASS_SPILLING` disables that guarantee, the scan refuses before plan
+execution. This bounds resident sort state and gives scratch a fixed quota; it does not make
+the operation cheap. The sort remains O(N log N), reads the full projected
+table (including embeddings), may consume substantial local scratch, and has
+full-input time to first row. Each sorter input is hard-capped at 37.5 MiB so an
+approximate scanner batch cannot exceed the pool before it can spill. One row
+and one logical change remain indivisible allocations; a row above the cap, or
+pool/quota exhaustion, returns a typed error without a partial page. This is
+not a general process-OOM guarantee.
+
 ## 5. Continuation contracts
 
 ### 5.1 Page token
@@ -439,9 +457,18 @@ continuation key. It contains no durable consumer position and is not accepted
 as a feed cursor.
 
 The token does not expose table aliases/IDs, dataset paths, Lance versions, or
-row addresses. Private placement is re-derived after validation. A page token
-is useful to raw HTTP clients that must resume interrupted bounded work; normal
-CLI and SDK calls auto-fetch it.
+row addresses. Private placement is re-derived after validation. Its encoded
+form is capped at 4 KiB. Logical IDs up to 256 UTF-8 bytes are carried exactly,
+preserving the ordinary `id > last_id` seek. A longer legal ID is represented
+by a canonical at-most-64-byte UTF-8 prefix plus SHA-256. On that exceptional
+resume path the immutable commit is rescanned from the prefix until exactly one
+matching digest and operation is proven, then enumeration resumes after the
+resolved full ID; zero or multiple matches are a typed rejection. This retains
+support for already-legal long IDs without an unbounded query parameter or a
+new write-time ID limit.
+
+A page token is useful to raw HTTP and page-level engine clients that resume
+bounded work explicitly; the CLI auto-fetches it while streaming output.
 
 ### 5.2 Durable feed cursor
 
@@ -659,7 +686,8 @@ Extend existing owners before adding a new test silo: `changes.rs`,
 - New commits arriving between pages do not enter the captured cut.
 - Oversized single commits split and replay exactly under row, byte, and
   commits-scanned ceilings.
-- SDK/CLI helpers consume page tokens automatically; the feed exposes no
+- CLI auto-pagination emits each bounded page before fetching the next; raw
+  HTTP and page-level engine clients continue explicitly. The feed exposes no
   advanced durable cursor before the terminal page.
 - Sparse filters stop at the commits-scanned bound.
 - Reopen and another process can resume from the caller's cursor with no server
@@ -777,7 +805,7 @@ must return to this RFC's format audit before landing.
 |---|---|---|
 | C0 — foundation correction | Graph type-lifetime pairing with deterministic graph-semantic ordering; O(1) adjacent first-parent validation; Lance surface guards; remove speculative binary lifting | No new public API or persisted state; physical placement remains private |
 | C1 — private enumerator | Internal graph commit blocks with exact logical images, exact-end insert/update adapter, complete delete fallback, bounded page positions, typed gaps, and schema-compatibility refusal | Engine-only correctness before wire commitment |
-| C2 — finite commit entity diff | Graph-vocabulary DTO, exact commit-vs-first-parent diff, next-page token, bounded SDK/CLI auto-pagination *(open: the shipped helpers aggregate whole results in memory — see the header status)*, HTTP/OpenAPI, authorization, docs, and parity tests | Useful audit/inspection surface without a durable feed protocol |
+| C2 — finite commit entity diff | Graph-vocabulary DTO, exact commit-vs-first-parent diff, bounded next-page token, page-level engine/HTTP APIs, bounded streaming CLI auto-pagination, HTTP/OpenAPI, authorization, docs, and parity tests | Useful audit/inspection surface without a durable feed protocol |
 | C3 — public entity feed | First-parent feed cursor plus exact snapshot/cursor baseline and at-least-once consumer contract | Useful caller-owned feed within a proven compatible schema |
 | C4 — entity history | Newest-first history derived from the same per-commit enumerator, with separate backward continuation domains | Investigation surface; no new storage authority |
 | C5 — publication time, optional | Derived `published_at` and possibly a measured as-of-time selector | Lands only after its semantics and cold-history cost pass §7 |
@@ -858,8 +886,9 @@ implementation, recorded here so later phases inherit them:
   mismatch is one typed rejection surfaced as a stable-prefix 400. The commit
   page token also binds the filter digest. The feed cursor binds the hashed
   graph identity domain, the first-parent genesis, `changes/forward`, the
-  branch name plus its Lance-native incarnation witness (main uses a fixed
-  witness), the filter digest, and the last complete commit. In-commit
+  fixed-size digest of the normalized branch scope plus its Lance-native
+  incarnation witness (main uses a fixed witness), the filter digest, and the
+  last complete commit. In-commit
   continuation positions are keyed by the PUBLISHED opaque type identity —
   the same key that orders emission — so a token's decodable payload carries
   no numeric table or incarnation component (the appended SHA-256 is
@@ -910,31 +939,26 @@ implementation, recorded here so later phases inherit them:
   rejected on the read commands. A cross-branch schema-fingerprint gate is added
   as defense-in-depth for a future branch-scoped-schema-evolution capability
   (unreachable today, since schema apply requires a graph with only main).
-  **Still open (own follow-ups):** the §4.4 unbounded ordered scan below (shared
-  merge/diff/export debt); CLI auto-pagination that buffers whole results before
-  output; and page-token byte accounting for pathologically long keys.
-- **OPEN — §4.4 boundedness obligation is not discharged.** §4.4 requires the
-  ordering path to be provably bounded and to "not sort an unbounded graph
-  commit in memory." The shipped enumerator streams the *merge* and applies
-  page limits before building any delta-wide `Vec`, but it obtains its two
-  ordered inputs from Lance's `order_by` scan — and that scan, on pinned Lance
-  10.0.0, materializes the whole projected table in one single-partition
-  `SortExec` backed by an `UnboundedMemoryPool` with spill structurally
-  disabled (no public `Scanner` knob, no env override). So resident memory is
-  O(table projected width), embeddings included, not O(page). This is
-  pre-existing shared debt: branch merge (`OrderedTableCursor`), the legacy
-  commit diff, and export all use the identical scan shape, and it is the
-  mechanism behind the recorded `branch_merge` embedding OOM. Closing it needs
-  one of: an upstream ask to expose scanner spilling (the `FairSpillPool` +
-  `DiskManager` machinery already exists — Lance uses it for `merge_insert`);
-  an upstream index-ordered scan that elides the sort; or an OmniGraph-side
-  cursor-chunked ordered read (`id > after AND id <= bound` + `limit(k)`, which
-  DataFusion folds into a bounded TopK) that fits the feed's existing `after_id`
-  continuation but would need `changes_cost.rs`/`merge_cost.rs` re-measurement.
-  See [merge-complexity.md](../dev/merge-complexity.md) for the full source
-  citations. Until then, the practical bound is the 8,192-row / 32 MiB Mutation
-  ceiling on the *write* side; large historical tables can exceed the read-side
-  memory envelope.
+  **Owned acceptance gates closed:** ordered scans now use Lance's public plan
+  executor with explicit spill memory/scratch ceilings and a forced-spill
+  regression; CLI auto-pagination renders each bounded page before fetching the
+  next; and page tokens use a fixed ceiling plus the exact-or-prefix/digest
+  logical position described in §5.1. The remaining O(N log N) full-scan cost,
+  local spill I/O, and approximate decoded-batch size are explicit operational
+  costs, not unbounded resident-state gaps.
+- **§4.4 boundedness obligation discharged.** The enumerator streams the merge
+  and applies page limits before building any delta-wide `Vec`. Its two
+  `order_by` inputs still plan as single-partition `SortExec`s on pinned Lance
+  10.0.0, but OmniGraph does not call the default unbounded scanner executor:
+  it executes the public plan with spilling enabled, a 150 MiB `FairSpillPool`
+  and a 100 GiB `DiskManager` quota in a fresh Lance execution context.
+  Concurrent scans each own the envelope, and in-flight spill writes can
+  overshoot the quota; neither value is claimed as a process-global ceiling. An ambient
+  `LANCE_BYPASS_SPILLING` causes a refusal instead of silently weakening the
+  contract. This one chokepoint also bounds branch merge, finite diff, and
+  export, which share the ordered scan. See
+  [merge-complexity.md](../dev/merge-complexity.md) for the source-level cost
+  audit and retained caveats.
 - **Second review round (shipped).** A second independent review found three
   correctness gaps and four polish items, now fixed:
   - **Managed-Blob identity is the immutable data-file path, not the fragment
@@ -969,3 +993,18 @@ implementation, recorded here so later phases inherit them:
     not a filter dimension); and human change output distinguishes an
     endpoint-moving update (`old -> old => new -> new`), a JSON null (`<null>`),
     the literal string `null`, an empty string, and an absent key.
+- **Final acceptance hardening (shipped).** The last RFC-owned review gates are
+  closed in the implementation that advances this record to `implemented`:
+  - a warm coordinator now captures the named Lance `BranchIdentifier` with its
+    manifest projection and includes it in freshness matching, so a same-source
+    delete/recreate cannot pair old lineage with a replacement witness;
+  - the solo-oversized forward-progress exception is page-wide, not reset at
+    each commit, so a positive byte remainder cannot make a later commit exceed
+    the packing target again;
+  - change-route errors use a graph-vocabulary allowlist, unknown resource
+    names and physical/integrity failures collapse to a fixed 500, and an exact
+    branch-ref miss has its own safe 404 variant;
+  - continuation keys and encoded tokens are bounded as specified in §5.1; and
+  - CLI auto-pagination incrementally renders the historical aggregate output
+    shape, retaining only the current page/open split block and withholding the
+    durable cursor until the terminal page.

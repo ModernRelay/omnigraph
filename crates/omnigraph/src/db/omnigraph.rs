@@ -208,7 +208,9 @@ pub struct Omnigraph {
     /// Warm change-feed cut for this handle's bound branch. A cut (head,
     /// witness, genesis, lineage projection, forward child index) is a PURE
     /// projection of `__manifest`, so it is exactly valid while the manifest
-    /// incarnation is unchanged — the same probe the warm poll already pays.
+    /// incarnation is unchanged — including the named ref's captured
+    /// BranchIdentifier, which distinguishes same-source delete/recreate — the
+    /// same probe the warm poll already pays.
     /// Without this, every poll re-cloned the full commit map and re-walked to
     /// genesis: O(total history) CPU/allocation per poll even when caught up.
     /// Keyed by the incarnation; a stale entry misses and rebuilds, so this is
@@ -2399,7 +2401,7 @@ impl Omnigraph {
                 }
                 Ok(crate::changes::enumerate::ContinuationKey {
                     type_id: decoded.type_id,
-                    id: decoded.id,
+                    position: decoded.position,
                     operation_rank: decoded.operation_rank,
                     change_index: decoded.change_index,
                 })
@@ -2432,7 +2434,7 @@ impl Omnigraph {
                     commit_id: commit_id.to_string(),
                     filter_digest,
                     type_id: key.type_id,
-                    id: key.id,
+                    position: key.position,
                     operation_rank: key.operation_rank,
                     change_index: key.change_index,
                 })?)
@@ -2484,10 +2486,11 @@ impl Omnigraph {
                     let held = coord.manifest_incarnation();
                     if coord.probe_latest_incarnation().await?.matches(&held) {
                         // The cut is a pure projection of the manifest, so while
-                        // the incarnation is unchanged the cached cut is exactly
-                        // valid — a caught-up poll then pays O(1) CPU instead of
-                        // re-cloning the whole lineage projection and re-walking
-                        // to genesis on every poll.
+                        // the incarnation (including the named BranchIdentifier)
+                        // is unchanged the cached cut is exactly valid — a
+                        // caught-up poll then pays O(1) CPU instead of re-cloning
+                        // the whole lineage projection and re-walking to genesis
+                        // on every poll.
                         let cached = self.feed_cut_cache.read().await.as_ref().and_then(
                             |(incarnation, cut)| {
                                 (incarnation == &held && cut.branch.as_deref() == requested)

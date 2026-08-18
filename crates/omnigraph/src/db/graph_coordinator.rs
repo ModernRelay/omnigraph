@@ -258,8 +258,9 @@ impl GraphCoordinator {
         self.manifest.captured_probe()
     }
 
-    /// Lance-native identity of the active `__manifest` branch. Stable across
-    /// commits; changes when a named branch is deleted and recreated.
+    /// Lance-native identity captured with this coordinator's active
+    /// `__manifest` state. Stable across commits; changes when a named branch
+    /// is deleted and recreated.
     pub(crate) async fn branch_identifier(&self) -> Result<lance::dataset::refs::BranchIdentifier> {
         self.manifest.branch_identifier().await
     }
@@ -605,8 +606,9 @@ impl GraphCoordinator {
     /// Build a change-feed cut from THIS coordinator's current state. When the
     /// coordinator is the warm handle already bound to the polled branch, this
     /// performs no cold manifest open and no lineage re-fold — `load_commits`
-    /// reads the in-memory projection and `branch_identifier` probes the held
-    /// manifest — so a caught-up poll's cost does not grow with commit history.
+    /// reads the in-memory projection and uses the branch identifier captured
+    /// with that projection — so a caught-up poll's cost does not grow with
+    /// commit history and cannot pair old lineage with a replacement witness.
     pub(crate) async fn build_change_feed_cut(
         &self,
     ) -> Result<crate::changes::feed::ChangeFeedCut> {
@@ -615,7 +617,8 @@ impl GraphCoordinator {
         })?;
         // Main cannot be deleted/recreated, so a fixed witness suffices; a
         // named ref's Lance-native identifier changes on delete/recreate and
-        // fences cursor ABA.
+        // fences cursor ABA. This is the identifier captured with the head and
+        // lineage above, never a fresh ref read that could name a replacement.
         let witness = match self.current_branch() {
             None => crate::changes::token::hashed_identity("branch:main"),
             Some(_) => {

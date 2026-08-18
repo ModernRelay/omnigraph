@@ -365,16 +365,24 @@ them explicit.
   roadmap.
 - **Resource bounds:** some operations still lack enforced per-query memory or
   time budgets. New long-running work should add explicit bounds rather than
-  widening the gap. A named instance: every ordered-by-id scan
-  (`ColumnOrdering::asc_nulls_last("id")` in branch merge, the change-feed
-  enumerator, the commit diff, and export) plans as a single-partition
-  DataFusion `SortExec` that, on pinned Lance 10.0.0, buffers the whole
-  projected table in an `UnboundedMemoryPool` with spill structurally disabled
-  — resident memory is O(table), embeddings included, and no `Scanner` knob or
-  env var bounds it. It is the mechanism behind the `branch_merge` embedding
-  OOM. Bounding it needs an upstream scanner-spilling option, an index-ordered
-  scan, or an OmniGraph-side cursor-chunked ordered read. See
-  [merge-complexity.md](merge-complexity.md) and RFC-030 §14.
+  widening the gap. Ordered-by-id scans (`ColumnOrdering::asc_nulls_last("id")`
+  in branch merge, the change-feed enumerator, the commit diff, and export) are
+  one concrete bounded shape: OmniGraph executes Lance's plan with spilling
+  enabled, a 150 MiB memory pool and a 100 GiB scratch quota in that Lance
+  execution context. OmniGraph creates that context per ordered execution
+  instead of using Lance's session cache, so a quota breach cannot poison a
+  later scan; concurrent scans each own this envelope. This is a per-execution
+  bound, not a process-global admission controller. The disk
+  manager accounts completed spill writes, so concurrent in-flight writes can
+  overshoot the quota before failing. `LANCE_BYPASS_SPILLING` makes the
+  operation refuse rather
+  than fall back to Lance's unbounded scanner default. The sort is still
+  O(N log N), reads full projected rows (embeddings included), has full-input
+  time to first row, and may consume substantial local scratch. A 37.5 MiB
+  `HardCapBatchSizeExec` below each sorter prevents an approximate scanner
+  batch from exceeding the pool before it can spill; one row remains an
+  indivisible allocation and fails typed if it exceeds that cap. See
+  [merge-complexity.md](merge-complexity.md) and RFC-030 §4.4.
 - **Branch-merge manifest history amplification:** coordinator open/full-refresh
   now derives manifest state and graph lineage together from one coherent scan,
   and branch merge retains the exact source/target manifest `Dataset` probe
@@ -419,9 +427,10 @@ them explicit.
   A coordinator open/full refresh decodes manifest state and lineage from one
   row scan. A warm
   same-branch read does one probe, one schema read, and zero opens on a repeat.
-  Non-main branch freshness compares the manifest incarnation (`version` plus
-  manifest-location e_tag when available, otherwise Lance manifest timestamp),
-  because Lance branch names can be deleted/recreated at the same version number;
+  Non-main branch freshness compares the Lance-native `BranchIdentifier`
+  captured coherently with the manifest projection, because a same-source
+  branch delete/recreate can repeat the manifest version, eTag, and timestamp;
+  those fields remain freshness aids, not branch-lifetime identity;
   the manifest e_tag is carried into synthetic snapshot ids when available, and
   a detected same-branch manifest refresh clears read caches as the fallback for
   e_tag-less table locations/topology. Remaining: `optimize` now compacts the

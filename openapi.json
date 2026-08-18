@@ -1379,6 +1379,26 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Internal failure while reading changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Recovery required before changes can be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1470,6 +1490,16 @@
           },
           "413": {
             "description": "Baseline cut or transport capacity exhausted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure while capturing the baseline",
             "content": {
               "application/json": {
                 "schema": {
@@ -1788,6 +1818,26 @@
           },
           "413": {
             "description": "Requested limit exceeds the public row ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure while reading changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Recovery required before changes can be read",
             "content": {
               "application/json": {
                 "schema": {
@@ -3850,6 +3900,17 @@
           },
           "error": {
             "type": "string"
+          },
+          "recovery_required": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryRequiredOutput",
+                "description": "Set with HTTP 503 when the graph has a durable recovery intent that\nmust be resolved before the requested change read can proceed."
+              }
+            ]
           },
           "resource_limit": {
             "oneOf": [

@@ -446,7 +446,7 @@ where
         while let Some(batch) = batches
             .try_next()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
+            .map_err(crate::table_store::TableStore::ordered_scan_error)?
         {
             emit_export_rows_from_batch(catalog, table_key, &batch, None, emit).await?;
         }
@@ -473,7 +473,7 @@ where
     while let Some(batch) = batches
         .try_next()
         .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
+        .map_err(crate::table_store::TableStore::ordered_scan_error)?
     {
         for row_index in 0..batch.num_rows() {
             let row = batch.slice(row_index, 1);

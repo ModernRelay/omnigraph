@@ -586,13 +586,53 @@ async fn main() -> Result<()> {
                     types: &types,
                     ops: &ops,
                 };
-                let page = client
-                    .commit_changes(&commit_id, page_token.as_deref(), limit, &filter)
-                    .await?;
-                if json {
-                    print_json(&page)?;
+                if let Some(page_token) = page_token.as_deref() {
+                    // An explicit token is the raw one-page escape hatch.
+                    let page = client
+                        .commit_changes_page(&commit_id, Some(page_token), limit, &filter)
+                        .await?;
+                    if json {
+                        print_json(&page)?;
+                    } else {
+                        print_commit_changes_human(&page);
+                    }
+                } else if json {
+                    let mut output = CommitChangesJsonStream::new(io::BufWriter::new(io::stdout()));
+                    let mut next_page_token: Option<String> = None;
+                    loop {
+                        let page = client
+                            .commit_changes_page(
+                                &commit_id,
+                                next_page_token.as_deref(),
+                                limit,
+                                &filter,
+                            )
+                            .await?;
+                        next_page_token = page.next_page_token.clone();
+                        output.write_page(&page)?;
+                        if next_page_token.is_none() {
+                            break;
+                        }
+                    }
+                    let _ = output.finish()?;
                 } else {
-                    print_commit_changes_human(&page);
+                    let mut output = CommitChangesHumanStream::new();
+                    let mut next_page_token: Option<String> = None;
+                    loop {
+                        let page = client
+                            .commit_changes_page(
+                                &commit_id,
+                                next_page_token.as_deref(),
+                                limit,
+                                &filter,
+                            )
+                            .await?;
+                        next_page_token = page.next_page_token.clone();
+                        output.write_page(&page)?;
+                        if next_page_token.is_none() {
+                            break;
+                        }
+                    }
                 }
             }
         },
@@ -626,19 +666,48 @@ async fn main() -> Result<()> {
                     types: &types,
                     ops: &ops,
                 };
-                let page = client
-                    .poll_changes(
-                        branch.as_deref(),
-                        cursor.as_deref(),
-                        start.as_deref(),
-                        limit,
-                        &filter,
-                    )
-                    .await?;
                 if json {
-                    print_json(&page)?;
+                    let mut output = ChangeFeedJsonStream::new(io::BufWriter::new(io::stdout()));
+                    let mut next_page_token: Option<String> = None;
+                    loop {
+                        let page = client
+                            .poll_changes_page(
+                                branch.as_deref(),
+                                cursor.as_deref(),
+                                start.as_deref(),
+                                next_page_token.as_deref(),
+                                limit,
+                                &filter,
+                            )
+                            .await?;
+                        next_page_token = page.next_page_token.clone();
+                        output.write_page(&page)?;
+                        if next_page_token.is_none() {
+                            let _ = output.finish(page.cursor.as_deref(), page.caught_up)?;
+                            break;
+                        }
+                    }
                 } else {
-                    print_change_feed_human(&page);
+                    let mut output = ChangeFeedHumanStream::new();
+                    let mut next_page_token: Option<String> = None;
+                    loop {
+                        let page = client
+                            .poll_changes_page(
+                                branch.as_deref(),
+                                cursor.as_deref(),
+                                start.as_deref(),
+                                next_page_token.as_deref(),
+                                limit,
+                                &filter,
+                            )
+                            .await?;
+                        next_page_token = page.next_page_token.clone();
+                        output.write_page(&page)?;
+                        if next_page_token.is_none() {
+                            output.finish(page.cursor.as_deref(), page.caught_up);
+                            break;
+                        }
+                    }
                 }
             }
             ChangesCommand::Baseline {

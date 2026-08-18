@@ -781,8 +781,9 @@ pub(crate) enum ChangesCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Capture an exact entity snapshot plus the cursor that resumes the feed
-    /// immediately after it.
+    /// Capture an exact entity snapshot plus its resume cursor (POSIX only).
+    /// Non-POSIX platforms fail before capture until a durable write-through
+    /// namespace replacement is available.
     Baseline {
         /// Graph URI
         #[arg(long)]

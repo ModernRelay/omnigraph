@@ -183,7 +183,7 @@ impl OrderedRows {
                     self.stream = None;
                     return Ok(());
                 }
-                Err(error) => return Err(OmniError::Lance(error.to_string())),
+                Err(error) => return Err(TableStore::ordered_scan_error(error)),
             }
         }
         Ok(())

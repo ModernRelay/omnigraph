@@ -573,6 +573,10 @@ pub struct ChangeErrorOutput {
     /// exceeds the poll's own byte ceiling.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limit: Option<ResourceLimitOutput>,
+    /// Set with HTTP 503 when the graph has a durable recovery intent that
+    /// must be resolved before the requested change read can proceed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_required: Option<RecoveryRequiredOutput>,
     /// Set with HTTP 410 when retained history can no longer reconstruct a
     /// change continuation. Recover via the baseline handshake.
     #[serde(default, skip_serializing_if = "Option::is_none")]

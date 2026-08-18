@@ -2490,12 +2490,79 @@ mod change_route_error_tests {
     }
 
     #[test]
-    fn change_route_error_passes_typed_graph_errors_through() {
-        // A graph-vocabulary NotFound is not substrate detail: it passes through
-        // unchanged (404), so a real "commit not found" is never masked as 500.
-        let mapped = change_route_error(OmniError::manifest_not_found("commit 'x' not found"));
+    fn change_route_error_passes_only_allowlisted_graph_errors_through() {
+        // Even Manifest::NotFound is too broad for the shared mapper. Only a
+        // route that knows which public graph resource it looked up may turn
+        // that category into a fixed 404.
+        let mapped = change_route_error(OmniError::manifest_not_found(
+            "missing /srv/private/table.lance for node:Secret",
+        ));
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!mapped.message().contains("node:Secret"));
+        let mapped = change_route_not_found(
+            OmniError::manifest_not_found("missing /srv/private/table.lance"),
+            "commit 'x' not found".to_string(),
+        );
         assert_eq!(mapped.status(), StatusCode::NOT_FOUND);
         assert!(mapped.message().contains("not found"));
+        assert!(!mapped.message().contains("/srv/private"));
+
+        let mapped = change_route_error(OmniError::ChangeCursorRejected {
+            reason: "token does not match this filter".to_string(),
+        });
+        assert_eq!(mapped.status(), StatusCode::BAD_REQUEST);
+        assert!(mapped.message().contains("change cursor rejected"));
+
+        let mapped = change_route_error(OmniError::BranchNotFound {
+            branch: "feature".to_string(),
+        });
+        assert_eq!(mapped.status(), StatusCode::NOT_FOUND);
+        assert_eq!(mapped.message(), "branch 'feature' not found");
+
+        let mapped = change_route_commit_lookup_error(
+            OmniError::BranchNotFound {
+                branch: "secret-feature".to_string(),
+            },
+            "commit-x",
+        );
+        assert_eq!(mapped.status(), StatusCode::NOT_FOUND);
+        assert_eq!(mapped.message(), "commit 'commit-x' not found");
+        assert!(!mapped.message().contains("secret-feature"));
+
+        // Manifest::BadRequest is intentionally NOT a pass-through category:
+        // it is used throughout the engine and may acquire physical context.
+        // The route validates its own public inputs before entering the engine.
+        let mapped = change_route_error(OmniError::manifest(
+            "bad table node:Secret at /srv/private/table.lance",
+        ));
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!mapped.message().contains("node:Secret"));
+
+        let mapped = change_route_error(OmniError::ResourceLimitExceeded {
+            resource: "table node:Secret bytes".to_string(),
+            limit: 1,
+            actual: 2,
+        });
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!mapped.message().contains("node:Secret"));
+    }
+
+    #[test]
+    fn change_route_recovery_exposes_id_but_redacts_internal_reason() {
+        let mapped = change_route_error(OmniError::RecoveryRequired {
+            operation_id: "op-public".to_string(),
+            reason: "sidecar /srv/private/recovery.json names node:Secret".to_string(),
+        });
+        assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(mapped.message().contains("recovery required"));
+        assert!(!mapped.message().contains("/srv/private"));
+        assert_eq!(
+            mapped
+                .recovery_required
+                .as_deref()
+                .map(|details| details.operation_id.as_str()),
+            Some("op-public")
+        );
     }
 }
 
@@ -2647,6 +2714,8 @@ pub(crate) fn parse_change_query(
         (status = 409, description = "Commit cannot be entity-diffed (parentless commit or schema boundary); see change_diff_refusal", body = api::ChangeErrorOutput),
         (status = 410, description = "Required retained history is no longer readable; see change_feed_gap and capture a new baseline", body = api::ChangeErrorOutput),
         (status = 413, description = "Requested limit exceeds the public row ceiling", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure while reading changes", body = api::ChangeErrorOutput),
+        (status = 503, description = "Recovery required before changes can be read", body = api::ChangeErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -2662,13 +2731,14 @@ pub(crate) async fn server_commit_changes(
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::CommitChangesOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), COMMIT_CHANGES_PARAMS)?;
+    validate_change_http_limit(params.limit)?;
     // Resolve the commit first: unlike commit-show, this response carries row
     // images, so read authorization binds to the branch the commit landed on.
     let db = &handle.engine;
     let commit = db
         .get_commit(&commit_id)
         .await
-        .map_err(change_route_error)?;
+        .map_err(|error| change_route_commit_lookup_error(error, &commit_id))?;
     let branch = commit
         .manifest_branch
         .clone()
@@ -2709,25 +2779,90 @@ pub(crate) async fn server_commit_changes(
     Ok(Json(api::commit_changes_output(&page)))
 }
 
+fn validate_change_http_limit(limit: Option<usize>) -> std::result::Result<(), ApiError> {
+    if limit == Some(0) {
+        return Err(ApiError::bad_request(
+            "change page limit must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+/// Contextual 404 projection. `Manifest::NotFound` is a broad internal
+/// category, so its original text is never reused; the handler supplies the
+/// exact public resource spelling it attempted to resolve.
+fn change_route_not_found(error: OmniError, public_message: String) -> ApiError {
+    match error {
+        OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::NotFound => {
+            tracing::debug!(internal_error = %manifest, %public_message, "change resource not found");
+            ApiError::not_found(public_message)
+        }
+        other => change_route_error(other),
+    }
+}
+
+/// Commit lookup runs before branch authorization because the persisted commit
+/// selects the policy resource. A raced named-ref deletion can therefore fail
+/// while the engine is searching branches. Collapse that typed branch miss to
+/// the same fixed commit 404: the caller is not yet authorized to learn which
+/// otherwise-unreadable branch was involved.
+fn change_route_commit_lookup_error(error: OmniError, commit_id: &str) -> ApiError {
+    match error {
+        OmniError::BranchNotFound { branch } => {
+            tracing::debug!(%branch, %commit_id, "commit lookup branch disappeared");
+            ApiError::not_found(format!("commit '{commit_id}' not found"))
+        }
+        other => change_route_not_found(other, format!("commit '{commit_id}' not found")),
+    }
+}
+
 /// Map an engine error on a change route to the graph-only wire contract.
 ///
-/// The typed change errors (schema boundary, feed gap, resource limit, not
-/// found, …) are graph vocabulary and pass through `from_omni` with their
-/// structured detail. Raw substrate errors — Lance, I/O, DataFusion, and
-/// internal manifest text — can carry physical paths or table keys, which the
-/// change wire contract keeps internal, so they are collapsed to a fixed
-/// internal error and the real detail is logged server-side only.
+/// This is intentionally an allowlist. Only variants whose types guarantee
+/// graph-vocabulary fields cross the wire. Everything else — including broad
+/// `Manifest::BadRequest` / conflict categories and any future `OmniError`
+/// variant — is logged and collapsed to a fixed 500 so adding an engine error
+/// can never accidentally expose a path, dataset, table key, or sidecar.
 fn change_route_error(error: OmniError) -> ApiError {
-    match &error {
-        OmniError::Lance(_) | OmniError::Io(_) | OmniError::DataFusion(_) => {
-            tracing::error!(%error, "change route storage error");
+    match error {
+        OmniError::ResourceLimitExceeded {
+            resource,
+            limit,
+            actual,
+        } if matches!(
+            resource.as_str(),
+            "commit_changes_page_rows"
+                | "commit_changes_page_bytes"
+                | "change_feed_commits_per_poll"
+                | "change_continuation_token_encoded_bytes"
+                | "stream_export_slots"
+        ) =>
+        {
+            ApiError::from_omni(OmniError::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            })
+        }
+        safe @ (OmniError::ChangeCursorRejected { .. }
+        | OmniError::BranchNotFound { .. }
+        | OmniError::ChangeFeedGap { .. }
+        | OmniError::CommitHasNoParent { .. }
+        | OmniError::ChangeSchemaBoundary { .. }) => ApiError::from_omni(safe),
+        OmniError::RecoveryRequired {
+            operation_id,
+            reason,
+        } => {
+            tracing::warn!(%operation_id, %reason, "change route requires recovery");
+            ApiError::recovery_required(
+                "recovery required before changes can be read".to_string(),
+                operation_id,
+            )
+        }
+        other => {
+            tracing::error!(error = %other, "change route internal error");
             ApiError::internal("internal error while reading changes")
         }
-        OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::Internal => {
-            tracing::error!(%error, "change route internal manifest error");
-            ApiError::internal("internal error while reading changes")
-        }
-        _ => ApiError::from_omni(error),
     }
 }
 
@@ -2789,6 +2924,8 @@ fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, 
         (status = 409, description = "The feed crossed an unprovable schema boundary; see change_diff_refusal", body = api::ChangeErrorOutput),
         (status = 410, description = "Feed gap: required history was reclaimed; reset via the baseline handshake", body = api::ChangeErrorOutput),
         (status = 413, description = "Requested limit exceeds the public row ceiling", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure while reading changes", body = api::ChangeErrorOutput),
+        (status = 503, description = "Recovery required before changes can be read", body = api::ChangeErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -2805,6 +2942,7 @@ pub(crate) async fn server_changes_feed(
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), CHANGE_FEED_PARAMS)?;
+    validate_change_http_limit(params.limit)?;
     let branch = normalize_change_branch(params.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
@@ -2837,7 +2975,7 @@ pub(crate) async fn server_changes_feed(
     let page = {
         let db = &handle.engine;
         db.poll_change_feed(omnigraph::changes::ChangeFeedRequest {
-            branch: Some(branch),
+            branch: Some(branch.clone()),
             position,
             scope,
             max_changes: params.limit,
@@ -2863,6 +3001,7 @@ pub(crate) async fn server_changes_feed(
         (status = 403, description = "Forbidden", body = api::ChangeErrorOutput),
         (status = 404, description = "Branch not found", body = api::ChangeErrorOutput),
         (status = 413, description = "Baseline cut or transport capacity exhausted", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure while capturing the baseline", body = api::ChangeErrorOutput),
         (status = 503, description = "Recovery required", body = api::ChangeErrorOutput),
     ),
     security(("bearer_token" = [])),

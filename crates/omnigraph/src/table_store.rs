@@ -3,7 +3,23 @@ use arrow_array::{
     builder::StringBuilder,
 };
 use arrow_schema::SchemaRef;
-use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
+use datafusion::common::{
+    DataFusionError,
+    tree_node::{Transformed, TreeNode},
+};
+use datafusion::execution::{
+    context::{SessionConfig, SessionContext},
+    disk_manager::DiskManagerBuilder,
+    memory_pool::{FairSpillPool, TrackConsumersPool},
+    runtime_env::RuntimeEnvBuilder,
+};
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream,
+    coalesce_partitions::CoalescePartitionsExec,
+    sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
+    stream::RecordBatchStreamAdapter,
+};
+use datafusion::prelude::Expr;
 use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
@@ -20,8 +36,18 @@ use lance::dataset::{
 use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
+use lance_core::{
+    datatypes::BlobHandling,
+    utils::{
+        futures::FinallyStreamExt,
+        tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION},
+    },
+};
+use lance_datafusion::exec::{
+    ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions, collect_execution_metrics,
+};
 use lance_file::version::LanceFileVersion;
-use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
+use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
 use lance_select::mask::RowAddrTreeMap;
@@ -29,7 +55,7 @@ use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::{num::NonZero, sync::Arc};
 
 use crate::blob::{
     BlobDescriptor, BlobDescriptorDecoder, ExternalBlobPolicy, NormalizedExternalBlobUri,
@@ -58,6 +84,158 @@ pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
 const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
 const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
 const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
+
+// Lance's ordinary Scanner stream executes SortExec with an unbounded memory
+// pool and spilling disabled. Every OmniGraph-ordered scan instead uses an
+// explicitly bounded FairSpillPool and scratch quota in its Lance execution
+// context. Concurrent contexts each own that envelope; these are per-execution
+// bounds, not a process-global admission controller. Keep the values explicit
+// so ambient Lance tuning cannot silently widen one execution.
+const ORDERED_SCAN_MEMORY_BYTES: u64 = 150 * 1024 * 1024;
+const ORDERED_SCAN_SCRATCH_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+const ORDERED_SCAN_EXECUTION_BATCH_ROWS: usize = 8_192;
+// Lance uses the same guard below its own SortExecs because a sorter cannot
+// spill its first input batch. One quarter of the production pool is 37.5 MiB,
+// above OmniGraph's 32 MiB logical write envelope while leaving room for sort
+// bookkeeping. Tests with smaller pools derive the same fraction dynamically.
+const ORDERED_SCAN_MAX_INPUT_BATCH_BYTES: u64 = ORDERED_SCAN_MEMORY_BYTES / 4;
+
+/// Configuration surface for a scan after projection, filtering, and ordering
+/// have been selected by [`TableStore::scan_stream_with`].
+///
+/// Deliberately does not expose `Scanner::order_by`: ordering is a routing
+/// decision because it requires the bounded spill executor below. Keeping that
+/// method out of the callback type makes it impossible for a caller to add an
+/// ordered plan after `scan_stream_with` chose the ordinary Lance executor.
+pub(crate) struct ScanTuning<'a> {
+    scanner: &'a mut Scanner,
+}
+
+impl ScanTuning<'_> {
+    pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
+        self.scanner.filter_expr(filter);
+        self
+    }
+
+    pub(crate) fn batch_size(&mut self, batch_size: usize) -> &mut Self {
+        self.scanner.batch_size(batch_size);
+        self
+    }
+
+    pub(crate) fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
+        self.scanner.batch_size_bytes(batch_size_bytes);
+        self
+    }
+
+    pub(crate) fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
+        self.scanner.prefilter(should_prefilter);
+        self
+    }
+
+    pub(crate) fn full_text_search(
+        &mut self,
+        query: FullTextSearchQuery,
+    ) -> std::result::Result<&mut Self, lance::Error> {
+        self.scanner.full_text_search(query)?;
+        Ok(self)
+    }
+
+    pub(crate) fn nearest(
+        &mut self,
+        column: &str,
+        query: &dyn Array,
+        limit: usize,
+    ) -> std::result::Result<&mut Self, lance::Error> {
+        self.scanner.nearest(column, query, limit)?;
+        Ok(self)
+    }
+
+    pub(crate) fn target_parallelism(&mut self, target_parallelism: usize) -> &mut Self {
+        self.scanner.target_parallelism(target_parallelism);
+        self
+    }
+
+    pub(crate) fn blob_handling(&mut self, blob_handling: BlobHandling) -> &mut Self {
+        self.scanner.blob_handling(blob_handling);
+        self
+    }
+
+    pub(crate) fn with_row_address(&mut self) -> &mut Self {
+        self.scanner.with_row_address();
+        self
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("ordered scan exhausted {resource} (limit {limit} bytes)")]
+struct OrderedScanResourceExhausted {
+    resource: &'static str,
+    limit: u64,
+}
+
+fn mark_ordered_scan_resource_error(
+    error: DataFusionError,
+    memory_limit: u64,
+    scratch_limit: u64,
+    input_batch_limit: u64,
+) -> DataFusionError {
+    let message = error.to_string();
+    if matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)) {
+        let (resource, limit) =
+            if message.contains("disk space") || message.contains("max_temp_directory_size") {
+                ("ordered_scan_scratch_bytes", scratch_limit)
+            } else {
+                ("ordered_scan_memory_bytes", memory_limit)
+            };
+        return DataFusionError::External(Box::new(OrderedScanResourceExhausted {
+            resource,
+            limit,
+        }));
+    }
+    if message.contains("single row is") && message.contains("maximum allowed batch size") {
+        return DataFusionError::External(Box::new(OrderedScanResourceExhausted {
+            resource: "ordered_scan_input_batch_bytes",
+            limit: input_batch_limit,
+        }));
+    }
+    error
+}
+
+fn collect_ordered_scan_spills(plan: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
+    if let Some(metrics) = plan.metrics() {
+        for (name, value) in [
+            ("spill_count", metrics.spill_count()),
+            ("spilled_bytes", metrics.spilled_bytes()),
+            ("spilled_rows", metrics.spilled_rows()),
+        ] {
+            *counts.all_counts.entry(name.to_string()).or_default() += value.unwrap_or_default();
+        }
+    }
+    for child in plan.children() {
+        collect_ordered_scan_spills(child.as_ref(), counts);
+    }
+}
+
+fn ordered_scan_plan_summary(plan: &dyn ExecutionPlan) -> String {
+    fn append(plan: &dyn ExecutionPlan, output: &mut String) {
+        output.push_str(plan.name().trim_end_matches("Exec"));
+        let children = plan.children();
+        if !children.is_empty() {
+            output.push('(');
+            for (index, child) in children.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                append(child.as_ref(), output);
+            }
+            output.push(')');
+        }
+    }
+
+    let mut output = String::new();
+    append(plan, &mut output);
+    output
+}
 
 pub(crate) fn has_insert_absence_certificate(transaction: &Transaction) -> bool {
     transaction
@@ -1528,8 +1706,11 @@ impl TableStore {
         configure: F,
     ) -> Result<DatasetRecordBatchStream>
     where
-        F: FnOnce(&mut Scanner) -> Result<()>,
+        F: FnOnce(&mut ScanTuning<'_>) -> Result<()>,
     {
+        let has_ordering = order_by
+            .as_ref()
+            .is_some_and(|ordering| !ordering.is_empty());
         let mut scanner = ds.scan();
         if with_row_id {
             scanner.with_row_id();
@@ -1549,11 +1730,196 @@ impl TableStore {
                 .order_by(Some(ordering))
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
         }
-        configure(&mut scanner)?;
-        scanner
-            .try_into_stream()
+        configure(&mut ScanTuning {
+            scanner: &mut scanner,
+        })?;
+        if has_ordering {
+            Self::execute_bounded_ordered_scan(
+                scanner,
+                LanceExecutionOptions {
+                    use_spilling: true,
+                    mem_pool_size: Some(ORDERED_SCAN_MEMORY_BYTES),
+                    max_temp_directory_size: Some(ORDERED_SCAN_SCRATCH_BYTES),
+                    batch_size: Some(ORDERED_SCAN_EXECUTION_BATCH_ROWS),
+                    ..Default::default()
+                },
+            )
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        } else {
+            scanner
+                .try_into_stream()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))
+        }
+    }
+
+    async fn execute_bounded_ordered_scan(
+        scanner: Scanner,
+        options: LanceExecutionOptions,
+    ) -> Result<DatasetRecordBatchStream> {
+        // Lance permits LANCE_BYPASS_SPILLING to override even an explicit
+        // option. Ordered graph scans fail closed instead of falling back to
+        // an unbounded SortExec resident set.
+        if !options.use_spilling() {
+            return Err(OmniError::ResourceLimitExceeded {
+                resource: "ordered_scan_spilling_disabled".to_string(),
+                limit: 0,
+                actual: 1,
+            });
+        }
+        let memory_limit = options.mem_pool_size.ok_or_else(|| {
+            OmniError::manifest_internal("ordered scan requires an explicit memory bound")
+        })?;
+        let scratch_limit = options.max_temp_directory_size.ok_or_else(|| {
+            OmniError::manifest_internal("ordered scan requires an explicit scratch bound")
+        })?;
+
+        let input_batch_limit = (memory_limit / 4)
+            .min(ORDERED_SCAN_MAX_INPUT_BATCH_BYTES)
+            .max(1) as usize;
+        let plan = scanner
+            .create_plan()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        // DataFusion cannot spill a first SortExec input batch that is larger
+        // than its memory pool. Lance applies this same hard-cap node below
+        // sorts in MergeInsert; ordered graph scans do so here as well.
+        let plan = plan
+            .transform_down(|node| {
+                if node.downcast_ref::<SortExec>().is_some() {
+                    let children = node
+                        .children()
+                        .into_iter()
+                        .map(|child| {
+                            Arc::new(HardCapBatchSizeExec::new(
+                                Arc::clone(child),
+                                input_batch_limit,
+                            )) as Arc<dyn ExecutionPlan>
+                        })
+                        .collect();
+                    Ok(Transformed::yes(node.with_new_children(children)?))
+                } else {
+                    Ok(Transformed::no(node))
+                }
+            })
+            .map_err(|error| OmniError::DataFusion(error.to_string()))?
+            .data;
+
+        // Own one runtime context for this execution. Lance's general helper
+        // caches contexts; after LRU eviction an active old context can coexist
+        // with a new one, and a quota breach can poison the cached disk-usage
+        // counter. Per-operation ownership makes the envelope and its cleanup
+        // exact without maintaining another long-lived runtime view.
+        let mut session_config = SessionConfig::new()
+            .with_sort_spill_reservation_bytes((memory_limit / 3).min(40 * 1024 * 1024) as usize);
+        if let Some(target_partitions) = options.target_partition {
+            session_config = session_config.with_target_partitions(target_partitions);
+        }
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_max_temp_directory_size(scratch_limit),
+            )
+            .with_memory_pool(Arc::new(TrackConsumersPool::new(
+                FairSpillPool::new(memory_limit as usize),
+                NonZero::new(16).expect("16 is non-zero"),
+            )))
+            .build_arc()
+            .map_err(|error| OmniError::DataFusion(error.to_string()))?;
+        let session = SessionContext::new_with_config_rt(session_config, runtime);
+        let mut state = session.state();
+        if let Some(batch_size) = options.batch_size {
+            state.config_mut().options_mut().execution.batch_size = batch_size;
+        }
+        let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1
+        {
+            plan
+        } else if let Some(ordering) = plan.output_ordering() {
+            Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
+        } else {
+            Arc::new(CoalescePartitionsExec::new(plan))
+        };
+        let stream = plan
+            .execute(0, state.task_ctx())
+            .map_err(|error| OmniError::DataFusion(error.to_string()))?;
+        let stream = stream.map(move |result| {
+            result.map_err(|error| {
+                mark_ordered_scan_resource_error(
+                    error,
+                    memory_limit,
+                    scratch_limit,
+                    input_batch_limit as u64,
+                )
+            })
+        });
+        let skip_logging = options.skip_logging;
+        let callback = options.execution_stats_callback;
+        let plan_for_metrics = Arc::clone(&plan);
+        let stream = stream.finally(move || {
+            if !skip_logging || callback.is_some() {
+                let mut counts = ExecutionSummaryCounts::default();
+                collect_execution_metrics(plan_for_metrics.as_ref(), &mut counts);
+                collect_ordered_scan_spills(plan_for_metrics.as_ref(), &mut counts);
+                if !skip_logging {
+                    let output_rows = plan_for_metrics
+                        .metrics()
+                        .and_then(|metrics| metrics.output_rows())
+                        .unwrap_or_default();
+                    tracing::info!(
+                        target: TRACE_EXECUTION,
+                        r#type = EXECUTION_PLAN_RUN,
+                        plan_summary = ordered_scan_plan_summary(plan_for_metrics.as_ref()),
+                        output_rows,
+                        iops = counts.iops,
+                        requests = counts.requests,
+                        bytes_read = counts.bytes_read,
+                        indices_loaded = counts.indices_loaded,
+                        parts_loaded = counts.parts_loaded,
+                        index_comparisons = counts.index_comparisons,
+                        index_cache_hits = counts.index_cache_hits(),
+                        index_cache_misses = counts.index_cache_misses(),
+                        spill_count = counts.all_counts.get("spill_count").copied().unwrap_or_default(),
+                        spilled_bytes = counts.all_counts.get("spilled_bytes").copied().unwrap_or_default(),
+                        spilled_rows = counts.all_counts.get("spilled_rows").copied().unwrap_or_default(),
+                    );
+                }
+                if let Some(callback) = callback {
+                    callback(&counts);
+                }
+            }
+        });
+        let schema = plan.schema();
+        let stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        Ok(DatasetRecordBatchStream::new(stream))
+    }
+
+    /// Preserve a typed resource failure after Lance converts the DataFusion
+    /// stream error at the public Dataset boundary.
+    pub(crate) fn ordered_scan_error(error: lance::Error) -> OmniError {
+        if let Some(resource) = error
+            .external_source()
+            .and_then(|source| source.downcast_ref::<OrderedScanResourceExhausted>())
+        {
+            return OmniError::ResourceLimitExceeded {
+                resource: resource.resource.to_string(),
+                limit: resource.limit,
+                actual: resource.limit.saturating_add(1),
+            };
+        }
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        while let Some(candidate) = current {
+            if let Some(resource) = candidate.downcast_ref::<OrderedScanResourceExhausted>() {
+                return OmniError::ResourceLimitExceeded {
+                    resource: resource.resource.to_string(),
+                    limit: resource.limit,
+                    // DataFusion reports only that the bound was crossed. The
+                    // smallest truthful lower bound is one byte over it.
+                    actual: resource.limit.saturating_add(1),
+                };
+            }
+            current = candidate.source();
+        }
+        OmniError::Lance(error.to_string())
     }
 
     pub async fn scan(
@@ -1563,11 +1929,20 @@ impl TableStore {
         filter: Option<&str>,
         order_by: Option<Vec<ColumnOrdering>>,
     ) -> Result<Vec<RecordBatch>> {
+        let ordered = order_by
+            .as_ref()
+            .is_some_and(|ordering| !ordering.is_empty());
         Self::scan_stream(ds, projection, filter, order_by, false)
             .await?
             .try_collect()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+            .map_err(|error| {
+                if ordered {
+                    Self::ordered_scan_error(error)
+                } else {
+                    OmniError::Lance(error.to_string())
+                }
+            })
     }
 
     pub async fn scan_with<F>(
@@ -1580,13 +1955,22 @@ impl TableStore {
         configure: F,
     ) -> Result<Vec<RecordBatch>>
     where
-        F: FnOnce(&mut Scanner) -> Result<()>,
+        F: FnOnce(&mut ScanTuning<'_>) -> Result<()>,
     {
+        let ordered = order_by
+            .as_ref()
+            .is_some_and(|ordering| !ordering.is_empty());
         Self::scan_stream_with(ds, projection, filter, order_by, with_row_id, configure)
             .await?
             .try_collect()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+            .map_err(|error| {
+                if ordered {
+                    Self::ordered_scan_error(error)
+                } else {
+                    OmniError::Lance(error.to_string())
+                }
+            })
     }
 
     /// Indexed neighbor lookup for graph traversal. Given an edge dataset and a
@@ -5393,6 +5777,157 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let col = Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
         RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ordered_scan_spills_under_explicit_memory_and_scratch_bounds() {
+        const ROWS: usize = 20_000;
+        const PAYLOAD_BYTES: usize = 8;
+
+        let ids = (0..ROWS)
+            .rev()
+            // Keep the ordering key itself larger than the test pool. Lance
+            // can late-materialize non-ordering payload columns below Take,
+            // so a wide payload alone would not prove SortExec spilled.
+            .map(|row| format!("{row:08}-{row:0248}"))
+            .collect::<Vec<_>>();
+        let payloads = (0..ROWS)
+            .map(|_| "x".repeat(PAYLOAD_BYTES))
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(payloads)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let dataset = TableStore::write_dataset(
+            directory.path().join("ordered.lance").to_str().unwrap(),
+            batch,
+        )
+        .await
+        .unwrap();
+
+        let summary = Arc::new(std::sync::Mutex::new(None));
+        let summary_for_callback = Arc::clone(&summary);
+        let mut scanner = dataset.scan();
+        scanner
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]))
+            .unwrap();
+        scanner.batch_size(1_024);
+        let mut stream = TableStore::execute_bounded_ordered_scan(
+            scanner,
+            LanceExecutionOptions {
+                use_spilling: true,
+                mem_pool_size: Some(2 * 1024 * 1024),
+                max_temp_directory_size: Some(64 * 1024 * 1024),
+                batch_size: Some(1_024),
+                execution_stats_callback: Some(Arc::new(move |counts| {
+                    *summary_for_callback.lock().unwrap() = Some(counts.clone());
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut previous = None::<String>;
+        let mut observed = 0_usize;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for id in ids.iter().flatten() {
+                if let Some(previous) = previous.as_deref() {
+                    assert!(previous < id, "ordered scan returned {id} after {previous}");
+                }
+                previous = Some(id.to_string());
+                observed += 1;
+            }
+        }
+        drop(stream);
+        assert_eq!(observed, ROWS);
+
+        let summary = summary.lock().unwrap().clone().unwrap();
+        for metric in ["spill_count", "spilled_bytes", "spilled_rows"] {
+            assert!(
+                summary.all_counts.get(metric).copied().unwrap_or_default() > 0,
+                "ordered scan must report non-zero {metric}: {summary:?}"
+            );
+        }
+
+        // A fresh per-operation context with an impossible scratch quota must
+        // fail before a globally sorted row can be emitted, and the Lance
+        // stream boundary must preserve the typed resource classification.
+        let mut scanner = dataset.scan();
+        scanner
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]))
+            .unwrap();
+        scanner.batch_size(1_024);
+        let mut exhausted = TableStore::execute_bounded_ordered_scan(
+            scanner,
+            LanceExecutionOptions {
+                use_spilling: true,
+                mem_pool_size: Some(2 * 1024 * 1024),
+                max_temp_directory_size: Some(1),
+                batch_size: Some(1_024),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut emitted_before_error = 0_usize;
+        let error = loop {
+            match exhausted.try_next().await {
+                Ok(Some(batch)) => emitted_before_error += batch.num_rows(),
+                Ok(None) => panic!("one-byte scratch quota unexpectedly completed the sort"),
+                Err(error) => break TableStore::ordered_scan_error(error),
+            }
+        };
+        assert_eq!(emitted_before_error, 0);
+        assert!(
+            matches!(
+                &error,
+                OmniError::ResourceLimitExceeded {
+                    resource,
+                    limit: 1,
+                    actual: 2,
+                } if resource == "ordered_scan_scratch_bytes"
+            ),
+            "unexpected scratch exhaustion classification: {error:?}"
+        );
+
+        let mut scanner = dataset.scan();
+        scanner
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]))
+            .unwrap();
+        let refusal = TableStore::execute_bounded_ordered_scan(
+            scanner,
+            LanceExecutionOptions {
+                use_spilling: false,
+                mem_pool_size: Some(1024 * 1024),
+                max_temp_directory_size: Some(1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            refusal,
+            Err(OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 0,
+                actual: 1,
+            }) if resource == "ordered_scan_spilling_disabled"
+        ));
     }
 
     fn logical_blob_batch(values: &[&str]) -> RecordBatch {

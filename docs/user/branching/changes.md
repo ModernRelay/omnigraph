@@ -65,6 +65,14 @@ feed cursor — and binds the exact commit and filter scope. Filters
 (`kind`, `type`, `op`; all repeatable) select graph concepts only; unknown
 query parameters are rejected with 400.
 
+The CLI auto-consumes those pages without rebuilding one in-memory result:
+JSON keeps one output array open and human output prints each row before the
+next page is fetched. `--page-token` instead fetches and prints exactly one raw
+page. If a later auto-pagination request fails, the command exits nonzero and
+stdout may contain the already-emitted prefix; redirect through a temporary
+file and rename it after exit 0 when an all-or-nothing output file is required.
+The embedded API exposes the bounded `commit_changes_page` primitive directly.
+
 The parentless genesis commit has no diff (409, `parentless_commit`):
 bootstrap from a baseline instead. A commit whose parent/child pair crosses a
 schema change (a property add/drop rewriting a table, or dropping a type that
@@ -90,8 +98,11 @@ omnigraph changes poll --cursor <cursor> --json      # resume durably
 - The durable **cursor** appears only on a terminal page and only after
   complete commits — a page that ends inside a block carries only
   `next_page_token`, so a partial block can never be checkpointed. The CLI
-  and SDK consume page tokens automatically. `caught_up` on a terminal page
-  says whether more complete commits already wait.
+  consumes page tokens incrementally and prints the cursor only after the
+  terminal page; the embedded API returns one bounded page at a time.
+  `caught_up` on a terminal page says whether more complete commits already
+  wait. A later-page CLI failure can leave a partial stdout prefix but never
+  prints or advances the terminal cursor.
 - The server persists **no consumer state**: the cursor is opaque,
   caller-owned, and valid from any handle or process. It binds the graph,
   the branch and its incarnation (deleting and recreating a branch invalidates
@@ -124,3 +135,9 @@ policy action (the feed and commit diffs require `read`).
 
 The snapshot honors the scope's `kind` and `type` filters; `op` binds only
 the resume cursor's feed scope.
+
+The CLI's durable `--out` installer is currently POSIX-only. It fails before
+capture on other platforms because the contract requires a file fsync,
+atomic replacement, and parent-directory fsync before printing the cursor;
+Windows needs a future write-through replacement implementation rather than a
+weaker success claim.

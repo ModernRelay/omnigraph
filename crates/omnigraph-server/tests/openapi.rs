@@ -267,7 +267,9 @@ fn openapi_commit_changes_is_get_with_page_token_params() {
     let responses = op["responses"].as_object().unwrap();
     // No 403: a forbidden commit is indistinguishable from an unknown one (404),
     // so the finite commit diff cannot be a commit-existence oracle.
-    for code in ["200", "400", "401", "404", "409", "410", "413"] {
+    for code in [
+        "200", "400", "401", "404", "409", "410", "413", "500", "503",
+    ] {
         assert!(responses.contains_key(code), "missing response {code}");
     }
     assert!(
@@ -307,7 +309,9 @@ fn openapi_change_feed_is_get_with_cursor_and_start() {
         "caller byte limits never ride the feed"
     );
     let responses = op["responses"].as_object().unwrap();
-    for code in ["200", "400", "401", "403", "404", "409", "410", "413"] {
+    for code in [
+        "200", "400", "401", "403", "404", "409", "410", "413", "500", "503",
+    ] {
         assert!(responses.contains_key(code), "missing response {code}");
     }
 }
@@ -322,7 +326,7 @@ fn openapi_change_baseline_is_streaming_post() {
         ok["content"]["application/x-ndjson"].is_object(),
         "the baseline streams NDJSON: {ok}"
     );
-    for code in ["400", "401", "403", "404", "413", "503"] {
+    for code in ["400", "401", "403", "404", "413", "500", "503"] {
         assert!(
             op["responses"].as_object().unwrap().contains_key(code),
             "missing response {code}"
@@ -1185,6 +1189,31 @@ fn error_output_schema_has_expected_fields() {
     assert!(props.contains_key("external_blob_source"));
     assert!(props.contains_key("recovery_required"));
     assert!(props.contains_key("precondition_failure"));
+}
+
+#[test]
+fn change_error_output_schema_matches_every_change_route_detail() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["ChangeErrorOutput"];
+    let props = schema["properties"].as_object().unwrap();
+    for field in [
+        "error",
+        "code",
+        "resource_limit",
+        "recovery_required",
+        "change_feed_gap",
+        "change_diff_refusal",
+    ] {
+        assert!(
+            props.contains_key(field),
+            "missing change error field {field}"
+        );
+    }
+    assert_eq!(
+        props.len(),
+        6,
+        "change errors must not grow generic storage-conflict details: {props:?}"
+    );
 }
 
 #[test]

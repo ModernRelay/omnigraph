@@ -3369,6 +3369,34 @@ async fn commit_changes_parentless_commit_is_typed_409() {
 // ─── Change feed route ──────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
+async fn change_routes_report_a_missing_branch_without_storage_detail() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, feed) = get_json(&app, g("/changes?branch=missing&start=now")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(feed["error"], "branch 'missing' not found");
+    assert!(!feed.to_string().contains("_refs"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/changes/baseline"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"branch":"missing"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let baseline: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(baseline["error"], "branch 'missing' not found");
+    assert!(!baseline.to_string().contains("_refs"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn change_feed_poll_advances_cursor_only_after_complete_commits() {
     let (_temp, app) = app_for_loaded_graph().await;
 

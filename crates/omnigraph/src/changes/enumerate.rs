@@ -66,6 +66,10 @@ pub(crate) fn validate_change_page_limits(max_changes: usize, max_bytes: u64) ->
 pub(crate) struct PageBudget {
     pub(crate) remaining_rows: usize,
     pub(crate) remaining_bytes: u64,
+    /// Page-wide, not commit-local. A feed threads one budget through multiple
+    /// commit enumerations, and the solo-oversized forward-progress exception
+    /// is legal only for the first change of the whole page.
+    emitted_changes: usize,
 }
 
 impl PageBudget {
@@ -73,7 +77,16 @@ impl PageBudget {
         Self {
             remaining_rows: max_changes,
             remaining_bytes: max_bytes,
+            emitted_changes: 0,
         }
+    }
+
+    fn has_emitted(&self) -> bool {
+        self.emitted_changes != 0
+    }
+
+    fn record_emitted(&mut self) {
+        self.emitted_changes = self.emitted_changes.saturating_add(1);
     }
 }
 
@@ -86,7 +99,7 @@ impl PageBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContinuationKey {
     pub(crate) type_id: String,
-    pub(crate) id: String,
+    pub(crate) position: super::token::IdPositionV1,
     pub(crate) operation_rank: u8,
     pub(crate) change_index: usize,
 }
@@ -201,6 +214,53 @@ struct IntervalPlan {
     type_name: String,
     from_dataset: Dataset,
     to_dataset: Dataset,
+}
+
+/// Resolve the exceptional bounded digest position to its exact logical ID.
+///
+/// Normal (<=256-byte) IDs still use one `id > exact` scan. A longer ID begins
+/// at its fixed-size prefix and scans only the equal-prefix change range. We do
+/// this proof before constructing any response change so a missing or
+/// ambiguous digest fails the whole page rather than publishing a guessed
+/// continuation. Once the unique row is known, the ordinary ordered merge is
+/// reopened after that exact ID.
+async fn resolve_digest_position(
+    plan: &IntervalPlan,
+    scope: &ChangeFeedScope,
+    key: &ContinuationKey,
+) -> Result<String> {
+    debug_assert!(key.position.is_digest());
+    let mut left =
+        OrderedRows::open(plan.from_dataset.clone(), Some(key.position.scan_after())).await?;
+    let mut right =
+        OrderedRows::open(plan.to_dataset.clone(), Some(key.position.scan_after())).await?;
+    let mut resolved: Option<String> = None;
+    while let Some(emit) = next_emit(&mut left, &mut right, scope).await? {
+        let (id, operation_rank) = match &emit {
+            Emit::Insert(row) | Emit::Delete(row) => (row.id.as_str(), emit.op().rank()),
+            Emit::Update { after, .. } => (after.id.as_str(), emit.op().rank()),
+        };
+        if !key.position.prefix_contains(id) {
+            break;
+        }
+        if !key.position.matches_digest(id) {
+            continue;
+        }
+        if operation_rank != key.operation_rank {
+            return Err(cursor_rejected(
+                "change continuation digest names the wrong operation",
+            ));
+        }
+        if resolved.is_some() {
+            return Err(cursor_rejected(
+                "change continuation digest is ambiguous within its prefix range",
+            ));
+        }
+        resolved = Some(id.to_string());
+    }
+    resolved.ok_or_else(|| {
+        cursor_rejected("change continuation digest no longer names a change in this commit")
+    })
 }
 
 fn schema_boundary(graph_commit_id: &str, table_key: &str) -> OmniError {
@@ -378,8 +438,13 @@ pub(crate) async fn enumerate_commit_changes(
         let after_id = match resume {
             Some(key) if !resume_seen => {
                 if plan.opaque_id == key.type_id {
+                    let exact = if key.position.is_digest() {
+                        resolve_digest_position(&plan, scope, key).await?
+                    } else {
+                        key.position.scan_after().to_string()
+                    };
                     resume_seen = true;
-                    Some(key.id.as_str())
+                    Some(exact)
                 } else {
                     // Sorted before the continuation position: consumed by an
                     // earlier page.
@@ -393,8 +458,8 @@ pub(crate) async fn enumerate_commit_changes(
             id: plan.opaque_id.clone(),
             name: plan.type_name.clone(),
         };
-        let mut left = OrderedRows::open(plan.from_dataset, after_id).await?;
-        let mut right = OrderedRows::open(plan.to_dataset, after_id).await?;
+        let mut left = OrderedRows::open(plan.from_dataset, after_id.as_deref()).await?;
+        let mut right = OrderedRows::open(plan.to_dataset, after_id.as_deref()).await?;
 
         while let Some(emit) = next_emit(&mut left, &mut right, scope).await? {
             let op = emit.op();
@@ -439,7 +504,7 @@ pub(crate) async fn enumerate_commit_changes(
             // zero-capacity request (`max_changes == 0`), which validation
             // already rejects; it is retained defensively.
             let over_bytes = encoded_bytes > budget.remaining_bytes;
-            if budget.remaining_rows == 0 || (over_bytes && emitted_this_call) {
+            if budget.remaining_rows == 0 || (over_bytes && budget.has_emitted()) {
                 return Ok(match last_emitted {
                     Some(key) if emitted_this_call => CommitEnumeration::Truncated(key),
                     _ => CommitEnumeration::Exhausted {
@@ -452,9 +517,10 @@ pub(crate) async fn enumerate_commit_changes(
             // so the next change (if any) ends the page here rather than
             // overflowing it further.
             budget.remaining_bytes = budget.remaining_bytes.saturating_sub(encoded_bytes);
+            budget.record_emitted();
             last_emitted = Some(ContinuationKey {
                 type_id: plan.opaque_id.clone(),
-                id: change.id.clone(),
+                position: super::token::IdPositionV1::for_id(&change.id),
                 operation_rank: op.rank(),
                 change_index: next_change_index,
             });

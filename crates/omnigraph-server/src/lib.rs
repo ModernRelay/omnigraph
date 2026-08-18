@@ -1173,6 +1173,9 @@ impl ApiError {
             OmniError::ChangeCursorRejected { reason } => {
                 Self::bad_request(format!("change cursor rejected: {reason}"))
             }
+            OmniError::BranchNotFound { branch } => {
+                Self::not_found(format!("branch '{branch}' not found"))
+            }
             // Retention loss under a change continuation: 410 with the
             // structured resume hint. Recovery is the baseline handshake.
             OmniError::ChangeFeedGap {
