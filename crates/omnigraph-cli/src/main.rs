@@ -76,27 +76,55 @@ fn sync_dir(_dir: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Parse the terminal `{"baseline": …}` NDJSON record from an installed
-/// baseline file, reading only a bounded tail. Returns the record's `baseline`
-/// value, or `None` when the file ends without one (an interrupted or foreign
-/// file). Used to refuse printing a resume cursor that does not match what is
-/// actually installed at `--out` (a concurrent capture may have replaced it).
-fn read_terminal_baseline_record(path: &std::path::Path) -> Result<Option<serde_json::Value>> {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL_BYTES: u64 = 256 * 1024;
-    let mut file = fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))?;
-    let mut tail = Vec::with_capacity(len.min(TAIL_BYTES) as usize);
-    file.read_to_end(&mut tail)?;
-    let tail = String::from_utf8_lossy(&tail);
-    let Some(last_line) = tail.lines().rev().find(|line| !line.trim().is_empty()) else {
-        return Ok(None);
-    };
-    let Ok(record) = serde_json::from_str::<serde_json::Value>(last_line) else {
-        return Ok(None);
-    };
-    Ok(record.get("baseline").cloned())
+/// Exclusive advisory lock on `<out>.lock`, serializing cooperating baseline
+/// captures of the same `--out` from before staging through cursor delivery.
+/// Two concurrent captures otherwise both replace `--out` and both print their
+/// own cursor, and the one that printed after being replaced pairs its cursor
+/// with the other's snapshot — a consumer restoring that pairing skips the
+/// changes between the two snapshot positions. The lock file is a stable
+/// sibling (never removed), so lockers cannot race a delete; blocking
+/// `LOCK_EX` makes the second capture wait rather than fail. Unix-only, like
+/// the rest of the baseline install barrier.
+#[cfg(unix)]
+struct BaselineOutLock {
+    _file: fs::File,
+}
+
+#[cfg(unix)]
+impl BaselineOutLock {
+    fn acquire(out: &std::path::Path) -> Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = {
+            let mut os = out.as_os_str().to_os_string();
+            os.push(".lock");
+            std::path::PathBuf::from(os)
+        };
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        // Blocking exclusive lock; released on drop (close).
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// Whether the file NOW at `path` is the very file handle this capture
+/// installed (same device + inode). A concurrent or foreign writer that
+/// replaced `--out` after our atomic persist yields a different inode, so the
+/// caller can refuse to print a resume cursor that no longer pairs with the
+/// installed snapshot. Content-free: the baseline file deliberately carries
+/// only snapshot rows (the handshake goes to stdout), so identity — not a
+/// terminal marker — is the correct witness.
+#[cfg(unix)]
+fn installed_file_is_current(installed: &fs::File, path: &std::path::Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let ours = installed.metadata()?;
+    let now = fs::metadata(path)?;
+    Ok(ours.dev() == now.dev() && ours.ino() == now.ino())
 }
 
 #[tokio::main]
@@ -656,6 +684,10 @@ async fn main() -> Result<()> {
                          an atomic replace) requires a POSIX filesystem"
                     );
                 }
+                // Serialize cooperating captures of the same --out from before
+                // staging through cursor delivery; held until this arm returns.
+                #[cfg(unix)]
+                let _out_lock = BaselineOutLock::acquire(&out)?;
                 // Stream into a UNIQUE temp file in --out's directory and
                 // atomically replace --out only after the handshake completes
                 // AND the bytes are durable. NamedTempFile is created O_EXCL and
@@ -690,27 +722,27 @@ async fn main() -> Result<()> {
                 // returns before any cursor is emitted — a printed cursor always
                 // implies the snapshot is durably on disk.
                 temp.as_file().sync_all()?;
-                temp.persist(&out).map_err(|error| error.error)?;
+                let installed = temp.persist(&out).map_err(|error| error.error)?;
                 sync_dir(&out_dir)?;
-                // Concurrent-capture guard: two processes targeting the same
-                // --out both replace it and would each print their own cursor,
-                // so one could print a cursor for a snapshot another capture
-                // had already replaced — a consumer restoring the file and
-                // resuming from that printed cursor would skip the changes
-                // between the two snapshots. Re-read the installed file's
-                // terminal record and refuse to print a cursor that does not
-                // match it. (The file's own terminal record is always the
-                // authoritative pairing for any later reader.)
-                let installed = read_terminal_baseline_record(&out)?;
-                if installed.as_ref() != Some(&serde_json::to_value(&baseline)?) {
+                // Concurrent-capture guard (belt to the lock's braces): if a
+                // NON-cooperating writer replaced --out after our atomic
+                // persist, the path no longer names the file we installed
+                // (different inode), and printing our cursor would pair it
+                // with someone else's snapshot — a consumer restoring that
+                // pairing skips the changes between the two snapshot
+                // positions. Refuse the print instead. Cooperating captures
+                // are already serialized by the .lock file, so they can never
+                // hit this between our persist and print.
+                #[cfg(unix)]
+                if !installed_file_is_current(&installed, &out)? {
                     bail!(
-                        "the baseline at {} was replaced by a concurrent capture \
-                         after this capture installed its snapshot; no resume \
-                         cursor printed — resume from the replacing file's own \
-                         terminal record, or re-run the capture",
+                        "the baseline at {} was replaced by another writer after \
+                         this capture installed its snapshot; no resume cursor \
+                         printed — re-run the capture",
                         out.display()
                     );
                 }
+                let _ = installed;
                 if json {
                     print_json(&baseline)?;
                 } else {

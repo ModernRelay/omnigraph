@@ -3126,6 +3126,78 @@ fn profile_show_unknown_name_errors() {
     assert!(stderr.contains("unknown profile 'nope'"), "{stderr}");
 }
 
+/// The SUCCESS path, asserted end-to-end: exit 0, a non-empty paired
+/// handshake on stdout, the snapshot rows in the file, and NO terminal
+/// handshake record inside the file (it is deliberately out-of-band). The
+/// regression this cell exists for: an install-verification guard once
+/// expected the handshake INSIDE the snapshot file, so every successful
+/// capture bailed after persisting — and nothing caught it, because the
+/// parity cell compares the two arms to each other (two identical failures
+/// count as parity) and the only direct CLI cell asserted the failure path.
+#[test]
+fn changes_baseline_succeeds_and_prints_the_paired_cursor() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let schema = temp.path().join("schema.pg");
+    fs::write(&schema, "node Person {\n    name: String @key\n}\n").unwrap();
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
+    let data = temp.path().join("seed.jsonl");
+    fs::write(
+        &data,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n",
+    )
+    .unwrap();
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&data)
+            .arg("--mode")
+            .arg("merge")
+            .arg(&graph),
+    );
+
+    let out = temp.path().join("baseline.jsonl");
+    let output = cli()
+        .arg("changes")
+        .arg("baseline")
+        .arg("--out")
+        .arg(&out)
+        .arg("--store")
+        .arg(&graph)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a plain baseline capture must succeed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let handshake: Value = serde_json::from_str(&stdout).expect("handshake JSON on stdout");
+    assert!(
+        handshake["resume_cursor"]
+            .as_str()
+            .is_some_and(|cursor| !cursor.is_empty()),
+        "the handshake carries a resume cursor: {handshake}"
+    );
+    assert!(
+        handshake["snapshot_commit_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "the handshake names its snapshot commit: {handshake}"
+    );
+    let snapshot = fs::read_to_string(&out).unwrap();
+    assert!(
+        snapshot.lines().any(|line| line.contains("alice")),
+        "the snapshot carries the seeded entity: {snapshot}"
+    );
+    assert!(
+        !snapshot.contains("\"baseline\""),
+        "the handshake is out-of-band, never inside the snapshot file: {snapshot}"
+    );
+}
+
 #[test]
 fn changes_baseline_failure_preserves_existing_out_file() {
     let temp = tempdir().unwrap();

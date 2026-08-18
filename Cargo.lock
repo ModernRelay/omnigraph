@@ -5057,6 +5057,7 @@ dependencies = [
  "futures",
  "lance",
  "lance-index",
+ "libc",
  "omnigraph-api-types",
  "omnigraph-cluster",
  "omnigraph-compiler",
