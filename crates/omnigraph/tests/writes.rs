@@ -19,6 +19,7 @@
 mod helpers;
 
 use arrow_array::Array;
+use serial_test::serial;
 use lance::Dataset;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
@@ -490,6 +491,12 @@ query insert_then_update_same_person(
 query insert_two_friends($from: String, $a: String, $b: String) {
     insert Knows { from: $from, to: $a }
     insert Knows { from: $from, to: $b }
+}
+
+query person_with_two_friends($name: String, $age: I32, $a: String, $b: String) {
+    insert Person { name: $name, age: $age }
+    insert Knows { from: $name, to: $a }
+    insert Knows { from: $name, to: $b }
 }
 
 query mixed_insert_and_delete($name: String, $age: I32, $victim: String) {
@@ -2599,4 +2606,113 @@ async fn insert_only_mutation_stale_expected_head_is_terminal_issue_365() {
     .await
     .unwrap();
     assert_eq!(absent.num_rows(), 0, "rejected insert must leave no row");
+}
+
+/// `stage_all` now stages independent tables at the loader's concurrency
+/// (issue #504). The risk a reviewer cares about is not speed but sameness:
+/// a multi-table mutation staged concurrently must land the same observable
+/// effects as the serial staging it replaces. Same query, two fresh stores,
+/// concurrency forced to 1 and then 4 via the env knob; affected counts,
+/// per-table row counts, the inserted person's row values, and the exact
+/// edge endpoint pairs must all agree.
+#[tokio::test]
+#[serial]
+async fn multi_table_staging_matches_serial_staging() {
+    async fn run_at(concurrency: &str) -> (usize, usize, usize, usize, Option<i32>, Vec<(String, String)>) {
+        let _env = EnvGuard::set(&[("OMNIGRAPH_LOAD_CONCURRENCY", Some(concurrency))]);
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        let result = db
+            .mutate(
+                "main",
+                STAGED_QUERIES,
+                "person_with_two_friends",
+                &mixed_params(
+                    &[("$name", "Nadia"), ("$a", "Alice"), ("$b", "Bob")],
+                    &[("$age", 41)],
+                ),
+            )
+            .await
+            .unwrap();
+        // Nadia's stored age proves the node batch landed with its values,
+        // not just its cardinality.
+        let mut nadia_age: Option<i32> = None;
+        for batch in &read_table(&db, "node:Person").await {
+            let names = batch
+                .column_by_name("name").unwrap()
+                .as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+            let ages = batch
+                .column_by_name("age").unwrap()
+                .as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            for i in 0..batch.num_rows() {
+                if names.value(i) == "Nadia" {
+                    nadia_age = Some(ages.value(i));
+                }
+            }
+        }
+        // The exact endpoint pairs prove the edge batches landed unswapped.
+        let mut edges: Vec<(String, String)> = Vec::new();
+        for batch in &read_table(&db, "edge:Knows").await {
+            let from = batch
+                .column_by_name("src").unwrap()
+                .as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+            let to = batch
+                .column_by_name("dst").unwrap()
+                .as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+            for i in 0..batch.num_rows() {
+                edges.push((from.value(i).to_string(), to.value(i).to_string()));
+            }
+        }
+        edges.sort();
+        (
+            result.affected_nodes,
+            result.affected_edges,
+            count_rows(&db, "node:Person").await,
+            count_rows(&db, "edge:Knows").await,
+            nadia_age,
+            edges,
+        )
+    }
+
+    let serial = run_at("1").await;
+    let concurrent = run_at("4").await;
+    assert_eq!(
+        serial, concurrent,
+        "staging concurrency must not change any observable effect"
+    );
+}
+
+struct EnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvGuard {
+    fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for (name, value) in vars {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..) {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 }
