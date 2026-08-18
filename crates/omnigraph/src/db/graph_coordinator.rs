@@ -325,7 +325,7 @@ impl GraphCoordinator {
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
-        self.manifest.list_branches().await.map(|branches| {
+        self.manifest.list_graph_branches().await.map(|branches| {
             branches
                 .into_iter()
                 .filter(|branch| !is_internal_system_branch(branch))
@@ -334,7 +334,7 @@ impl GraphCoordinator {
     }
 
     pub(crate) async fn all_branches(&self) -> Result<Vec<String>> {
-        self.manifest.list_branches().await
+        self.manifest.list_graph_branches().await
     }
 
     pub async fn branch_descendants(&self, name: &str) -> Result<Vec<String>> {
@@ -497,7 +497,7 @@ impl GraphCoordinator {
             return Ok(commit);
         }
 
-        for branch in self.manifest.list_branches().await? {
+        for branch in self.manifest.list_graph_branches().await? {
             let normalized = normalize_branch_name(&branch)?;
             let commit_graph = self
                 .open_commit_graph_for_branch(normalized.as_deref())

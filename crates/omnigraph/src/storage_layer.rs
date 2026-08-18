@@ -461,7 +461,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// The `cleanup` orphan reconciler diffs this against the manifest
     /// branch set to find orphaned per-table forks. `main`/default is not a
     /// named branch and never appears here.
-    async fn list_branches(&self, dataset_uri: &str) -> Result<Vec<String>>;
+    async fn list_native_branches(&self, dataset_uri: &str) -> Result<Vec<String>>;
 
     async fn reopen_for_mutation(
         &self,
@@ -870,8 +870,8 @@ impl TableStorage for TableStore {
         TableStore::force_delete_branch(self, dataset_uri, branch).await
     }
 
-    async fn list_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
-        TableStore::list_branches(self, dataset_uri).await
+    async fn list_native_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
+        TableStore::list_native_branches(self, dataset_uri).await
     }
 
     async fn reopen_for_mutation(

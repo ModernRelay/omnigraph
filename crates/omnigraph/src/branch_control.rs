@@ -31,6 +31,32 @@ fn lance_error(error: lance::Error) -> OmniError {
     OmniError::Lance(error.to_string())
 }
 
+const BRANCH_ENUMERATION_MAX_ATTEMPTS: usize = 3;
+
+/// List Lance's authoritative named-branch refs through one bounded
+/// read-only retry boundary.
+///
+/// Lance first lists `_refs/branches/` and then reads each listed ref. A legal
+/// concurrent delete can remove one ref between those two reads, yielding a
+/// `NotFound` even though a fresh enumeration is valid. Relisting is safe: it
+/// has no durable effect and does not replay the enclosing graph operation.
+/// Every other failure, and repeated branch churn beyond the fixed bound,
+/// retains the substrate error for the owning operation to classify.
+pub(crate) async fn list_branch_contents(
+    dataset: &Dataset,
+) -> Result<HashMap<String, BranchContents>> {
+    for attempt in 1..=BRANCH_ENUMERATION_MAX_ATTEMPTS {
+        match dataset.list_branches().await {
+            Ok(branches) => return Ok(branches),
+            Err(lance::Error::NotFound { .. }) if attempt < BRANCH_ENUMERATION_MAX_ATTEMPTS => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(lance_error(error)),
+        }
+    }
+    unreachable!("the bounded branch-enumeration loop always returns")
+}
+
 /// Pinned Lance treats an already-absent target tree as success. OmniGraph
 /// still normalizes `RefNotFound` / `NotFound` around the whole call because
 /// Lance's branch-contents existence check and delete are separate operations,
@@ -58,10 +84,6 @@ async fn force_delete_branch_tree_unchecked(dataset: &mut Dataset, branch: &str)
         }
         Err(error) => Err(lance_error(error)),
     }
-}
-
-async fn list_branch_contents(dataset: &Dataset) -> Result<HashMap<String, BranchContents>> {
-    dataset.list_branches().await.map_err(lance_error)
 }
 
 async fn branch_contents(dataset: &Dataset, branch: &str) -> Result<Option<BranchContents>> {
@@ -359,11 +381,191 @@ pub(crate) async fn delete_branch_recoverably(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
     use lance::dataset::{WriteMode, WriteParams};
+    use lance::io::WrappingObjectStore;
+    use object_store::path::Path;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as ObjectStoreResult,
+    };
+
+    fn is_branch_ref_directory(path: &Path) -> bool {
+        path.filename() == Some("branches")
+            && path
+                .parent()
+                .is_some_and(|parent| parent.filename() == Some("_refs"))
+    }
+
+    fn is_target_branch_ref(path: &Path, target_file: &str) -> bool {
+        path.filename() == Some(target_file)
+            && path
+                .parent()
+                .is_some_and(|parent| is_branch_ref_directory(&parent))
+    }
+
+    #[derive(Debug, Clone)]
+    struct VanishingBranchRefFault {
+        remaining_failures: Arc<AtomicUsize>,
+        injected_failures: Arc<AtomicUsize>,
+        branch_lists: Arc<AtomicUsize>,
+        delete_ref: bool,
+        always_not_found: bool,
+        target_file: Arc<str>,
+    }
+
+    impl VanishingBranchRefFault {
+        fn delete_once(target_file: &str) -> Self {
+            Self::new(target_file, 1, true, false)
+        }
+
+        fn always_not_found(target_file: &str) -> Self {
+            Self::new(target_file, 0, false, true)
+        }
+
+        fn new(
+            target_file: &str,
+            failures: usize,
+            delete_ref: bool,
+            always_not_found: bool,
+        ) -> Self {
+            Self {
+                remaining_failures: Arc::new(AtomicUsize::new(failures)),
+                injected_failures: Arc::new(AtomicUsize::new(0)),
+                branch_lists: Arc::new(AtomicUsize::new(0)),
+                delete_ref,
+                always_not_found,
+                target_file: Arc::from(target_file),
+            }
+        }
+
+        fn injected_failures(&self) -> usize {
+            self.injected_failures.load(Ordering::SeqCst)
+        }
+
+        fn branch_lists(&self) -> usize {
+            self.branch_lists.load(Ordering::SeqCst)
+        }
+    }
+
+    impl WrappingObjectStore for VanishingBranchRefFault {
+        fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(VanishingBranchRefStore {
+                target,
+                fault: self.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct VanishingBranchRefStore {
+        target: Arc<dyn ObjectStore>,
+        fault: VanishingBranchRefFault,
+    }
+
+    impl fmt::Display for VanishingBranchRefStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "VanishingBranchRefStore({})", self.target)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for VanishingBranchRefStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.target.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            if is_target_branch_ref(location, &self.fault.target_file) {
+                let injected = self.fault.always_not_found
+                    || self
+                        .fault
+                        .remaining_failures
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_ok();
+                if injected {
+                    self.fault.injected_failures.fetch_add(1, Ordering::SeqCst);
+                    if self.fault.delete_ref {
+                        self.target.delete(location).await?;
+                        return self.target.get_opts(location, options).await;
+                    }
+                    return Err(object_store::Error::NotFound {
+                        path: location.to_string(),
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "injected branch-ref deletion race",
+                        )),
+                    });
+                }
+            }
+            self.target.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.target.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            if prefix.is_some_and(is_branch_ref_directory) {
+                self.fault.branch_lists.fetch_add(1, Ordering::SeqCst);
+            }
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.target.copy_opts(from, to, options).await
+        }
+    }
 
     async fn test_dataset(dir: &tempfile::TempDir) -> Dataset {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
@@ -373,10 +575,13 @@ mod tests {
         )
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let path = dir.path().to_str().unwrap().replace('\\', "/");
+        let path_prefix = if path.starts_with('/') { "" } else { "/" };
+        let uri = format!("file-object-store://{path_prefix}{path}");
         // forbidden-api-allow: test-only raw Lance fixture for native branch-control truth cells
         Dataset::write(
             reader,
-            dir.path().to_str().unwrap(),
+            &uri,
             Some(WriteParams {
                 mode: WriteMode::Create,
                 auto_cleanup: None,
@@ -386,6 +591,56 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn branch_enumeration_relists_after_ref_vanishes_between_list_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = test_dataset(&dir).await;
+        let version = dataset.version().version;
+        dataset
+            .create_branch("vanish", version, None)
+            .await
+            .unwrap();
+        dataset
+            .create_branch("survivor", version, None)
+            .await
+            .unwrap();
+
+        let fault = Arc::new(VanishingBranchRefFault::delete_once("vanish.json"));
+        let wrapped = dataset
+            .with_object_store_wrappers(vec![Arc::clone(&fault) as Arc<dyn WrappingObjectStore>]);
+
+        let branches = list_branch_contents(&wrapped).await.unwrap();
+        assert!(!branches.contains_key("vanish"));
+        assert!(branches.contains_key("survivor"));
+        assert_eq!(fault.injected_failures(), 1);
+        assert_eq!(fault.branch_lists(), 2);
+    }
+
+    #[tokio::test]
+    async fn branch_enumeration_stops_after_the_fixed_retry_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = test_dataset(&dir).await;
+        let version = dataset.version().version;
+        dataset
+            .create_branch("feature", version, None)
+            .await
+            .unwrap();
+
+        let fault = Arc::new(VanishingBranchRefFault::always_not_found("feature.json"));
+        let wrapped = dataset
+            .with_object_store_wrappers(vec![Arc::clone(&fault) as Arc<dyn WrappingObjectStore>]);
+
+        let error = list_branch_contents(&wrapped)
+            .await
+            .expect_err("persistent branch churn must escape after the fixed bound");
+        assert!(matches!(error, OmniError::Lance(_)));
+        assert_eq!(fault.branch_lists(), BRANCH_ENUMERATION_MAX_ATTEMPTS);
+        assert!(
+            fault.injected_failures() >= BRANCH_ENUMERATION_MAX_ATTEMPTS,
+            "every branch-list attempt must observe the injected missing ref"
+        );
     }
 
     #[test]
