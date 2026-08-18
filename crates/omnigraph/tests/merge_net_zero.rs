@@ -14,19 +14,50 @@
 //! These tests pin the whole contract rather than "the merge stops erroring";
 //! each one names the half it owns.
 
+#![recursion_limit = "512"]
+
 mod helpers;
 
+use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
+use futures::TryStreamExt;
 use helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_QUERIES, TEST_SCHEMA, count_rows, first_column_sorted,
-    init_and_load, mixed_params, mutate_branch, mutate_main, params, query_main, snapshot_main,
+    init_and_load, mixed_params, mutate_branch, mutate_main, node_blob_cell, params, query_main,
+    read_managed_blob_bytes, snapshot_main,
 };
+use lance::Dataset;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 /// `Diana` has no outgoing `Knows` in the fixture, so adding one edge from her
 /// and then deleting every edge from her returns `edge:Knows` to its exact
 /// fork-point content while advancing its Lance version twice.
 const NET_ZERO_SOURCE: &str = "Diana";
+
+const ADOPT_EQUALITY_SCHEMA: &str = r#"
+node Document {
+    slug: String @key
+    note: String?
+    first: String
+    second: String
+    _row_id: String
+}
+"#;
+
+const ADOPT_EQUALITY_QUERIES: &str = r#"
+query set_note($slug: String, $note: String) {
+    update Document set { note: $note } where slug = $slug
+}
+
+query move_separator($slug: String, $first: String, $second: String) {
+    update Document set { first: $first, second: $second } where slug = $slug
+}
+
+query set_near_miss_row_property($slug: String, $value: String) {
+    update Document set { _row_id: $value } where slug = $slug
+}
+"#;
 
 /// Insert one edge from [`NET_ZERO_SOURCE`], then delete it again.
 async fn apply_net_zero_edge_cycle(db: &mut Omnigraph, branch: &str) {
@@ -66,6 +97,423 @@ async fn friend_map(db: &mut Omnigraph) -> Vec<(String, Vec<String>)> {
         out.push((person.to_string(), first_column_sorted(&result)));
     }
     out
+}
+
+/// Exercise one source-only update that the old display-string signature
+/// classified as equal. The value assertions precede the lineage assertion:
+/// completing merge lineage while leaving the source value behind is exactly
+/// the silent-loss failure this helper guards.
+async fn assert_adopted_string_change(
+    input: &str,
+    query_name: &str,
+    query_params: &omnigraph_compiler::ir::ParamMap,
+    expected: &[(&str, Option<&str>)],
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = Omnigraph::init(uri, ADOPT_EQUALITY_SCHEMA).await.unwrap();
+    load_jsonl(&main, input, LoadMode::Overwrite).await.unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        ADOPT_EQUALITY_QUERIES,
+        query_name,
+        query_params,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        main.branch_merge("feature", "main").await.unwrap(),
+        MergeOutcome::FastForward,
+    );
+
+    let snapshot = snapshot_main(&main).await.unwrap();
+    let dataset = snapshot.open("node:Document").await.unwrap();
+    let batches = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        1
+    );
+    let batch = batches.iter().find(|batch| batch.num_rows() == 1).unwrap();
+    for (column_name, expected_value) in expected {
+        let values = batch
+            .column_by_name(column_name)
+            .unwrap_or_else(|| panic!("missing expected column '{column_name}'"))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("column '{column_name}' is not Utf8"));
+        match expected_value {
+            Some(expected_value) => {
+                assert!(!values.is_null(0), "column '{column_name}' stayed null");
+                assert_eq!(values.value(0), *expected_value, "column '{column_name}'");
+            }
+            None => assert!(values.is_null(0), "column '{column_name}' became non-null"),
+        }
+    }
+
+    assert_eq!(
+        main.branch_merge("feature", "main").await.unwrap(),
+        MergeOutcome::AlreadyUpToDate,
+        "the value must land before merge lineage is considered complete",
+    );
+}
+
+fn document_row(batches: &[RecordBatch], title: &str) -> RecordBatch {
+    for batch in batches {
+        let titles = batch
+            .column_by_name("title")
+            .expect("Document title column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Document title is Utf8");
+        if let Some(row) = (0..batch.num_rows()).find(|row| titles.value(*row) == title) {
+            return batch.slice(row, 1);
+        }
+    }
+    panic!("Document '{title}' did not scan")
+}
+
+#[tokio::test]
+async fn adopt_equality_distinguishes_null_from_empty_string() {
+    assert_adopted_string_change(
+        r#"{"type":"Document","data":{"slug":"doc","first":"stable","second":"stable","_row_id":"stable"}}"#,
+        "set_note",
+        &params(&[("$slug", "doc"), ("$note", "")]),
+        &[("note", Some(""))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn adopt_equality_frames_columns_instead_of_joining_with_a_separator() {
+    assert_adopted_string_change(
+        r#"{"type":"Document","data":{"slug":"doc","first":"a\u001fb","second":"c","_row_id":"stable"}}"#,
+        "move_separator",
+        &params(&[
+            ("$slug", "doc"),
+            ("$first", "a"),
+            ("$second", "b\u{1f}c"),
+        ]),
+        &[("first", Some("a")), ("second", Some("b\u{1f}c"))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn adopt_equality_does_not_hide_a_legal_row_prefix_property() {
+    assert_adopted_string_change(
+        r#"{"type":"Document","data":{"slug":"doc","first":"stable","second":"stable","_row_id":"before"}}"#,
+        "set_near_miss_row_property",
+        &params(&[("$slug", "doc"), ("$value", "after")]),
+        &[("_row_id", Some("after"))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn adopt_equality_resolves_inherited_managed_blob_file_identity() {
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String
+}
+"#;
+    const QUERIES: &str = r#"
+query set_note($title: String, $note: String) {
+    update Document set { note: $note } where title = $title
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    // Separate loads put the managed and scalar-only rows in distinct base
+    // fragments. Updating the latter on the branch must leave the managed row
+    // as a shallow-clone reference to the original main data file.
+    load_jsonl(
+        &main,
+        r#"{"type":"Document","data":{"title":"blob","content":"base64:U2hhcmVk","note":"stable"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    load_jsonl(
+        &main,
+        r#"{"type":"Document","data":{"title":"scalar","note":"before"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let base = snapshot_main(&main).await.unwrap();
+    let base_entry = base.entry("node:Document").expect("base Document entry");
+    let base_table_uri = dir
+        .path()
+        .join(&base_entry.table_path)
+        .to_string_lossy()
+        .into_owned();
+    let base_dataset = Dataset::open(&base_table_uri).await.unwrap();
+    assert!(
+        base_dataset.get_fragments().len() >= 2,
+        "fixture requires distinct managed and scalar fragments"
+    );
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        QUERIES,
+        "set_note",
+        &params(&[("$title", "scalar"), ("$note", "after")]),
+    )
+    .await
+    .unwrap();
+
+    // Pin the exact Lance shallow-clone shape behind the regression: the
+    // untouched managed row scans from a branch fragment whose data file has a
+    // base_id resolving back to main, even though the Dataset URI is the branch
+    // root. Comparing raw Dataset URI + base_id would call this row changed.
+    let source = main
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    let source_entry = source
+        .entry("node:Document")
+        .expect("feature Document entry");
+    assert_eq!(source_entry.table_path, base_entry.table_path);
+    assert_eq!(source_entry.table_branch.as_deref(), Some("feature"));
+    let source_table_uri = format!("{base_table_uri}/tree/feature");
+    let source_dataset = Dataset::open(&source_table_uri).await.unwrap();
+    assert_ne!(source_dataset.uri(), base_dataset.uri());
+    let mut scanner = source_dataset.scan();
+    scanner.with_row_address();
+    let batches = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let source_blob_row = document_row(&batches, "blob");
+    let blob_row_address = source_blob_row
+        .column_by_name("_rowaddr")
+        .expect("source Blob row address")
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("source Blob row address is UInt64")
+        .value(0);
+
+    let mut base_scanner = base_dataset.scan();
+    base_scanner.with_row_address();
+    let base_batches = base_scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let base_blob_row = document_row(&base_batches, "blob");
+    assert_eq!(base_blob_row.schema(), source_blob_row.schema());
+    for column in ["id", "title", "note", "content"] {
+        assert_eq!(
+            base_blob_row.column_by_name(column).unwrap().to_data(),
+            source_blob_row.column_by_name(column).unwrap().to_data(),
+            "unchanged inherited row differs in '{column}'"
+        );
+    }
+
+    let content_field_id = u32::try_from(
+        source_dataset
+            .schema()
+            .field("content")
+            .expect("content field")
+            .id,
+    )
+    .unwrap();
+    let blob_fragment = source_dataset
+        .get_fragment((blob_row_address >> 32) as usize)
+        .expect("managed fixture fragment");
+    let blob_data_file = blob_fragment
+        .data_file_for_field(content_field_id)
+        .expect("managed fixture data file");
+    let base_blob_row_address = base_blob_row
+        .column_by_name("_rowaddr")
+        .expect("base Blob row address")
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("base Blob row address is UInt64")
+        .value(0);
+    let base_blob_fragment = base_dataset
+        .get_fragment((base_blob_row_address >> 32) as usize)
+        .expect("base managed fixture fragment");
+    let base_blob_data_file = base_blob_fragment
+        .data_file_for_field(content_field_id)
+        .expect("base managed fixture data file");
+    assert_eq!(base_blob_data_file.base_id, None);
+    assert_eq!(blob_data_file.path, base_blob_data_file.path);
+    let inherited_base_id = blob_data_file
+        .base_id
+        .expect("untouched branch Blob file must be inherited");
+    let inherited_base = source_dataset
+        .manifest()
+        .base_paths
+        .get(&inherited_base_id)
+        .expect("inherited Blob base path");
+    assert!(inherited_base.is_dataset_root);
+    assert_eq!(
+        omnigraph::storage::normalize_root_uri(&inherited_base.path).unwrap(),
+        omnigraph::storage::normalize_root_uri(base_dataset.uri()).unwrap(),
+        "inherited and local Blob files must resolve to the same physical base"
+    );
+
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(
+        probes.stage_known_present_update_rows(),
+        1,
+        "only the scalar row changed; the inherited managed row must be suppressed"
+    );
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        0,
+        "suppressing the inherited managed row must avoid Blob selection/materialization"
+    );
+
+    let merged = snapshot_main(&main).await.unwrap();
+    let merged_batches = merged
+        .open("node:Document")
+        .await
+        .unwrap()
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let scalar_note = merged_batches.iter().find_map(|batch| {
+        let titles = batch
+            .column_by_name("title")?
+            .as_any()
+            .downcast_ref::<StringArray>()?;
+        let notes = batch
+            .column_by_name("note")?
+            .as_any()
+            .downcast_ref::<StringArray>()?;
+        (0..batch.num_rows())
+            .find(|row| titles.value(*row) == "scalar")
+            .map(|row| notes.value(row).to_owned())
+    });
+    assert_eq!(scalar_note.as_deref(), Some("after"));
+}
+
+#[tokio::test]
+async fn adopt_equality_qualifies_managed_blob_descriptors_by_data_file() {
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob
+}
+"#;
+    const QUERIES: &str = r#"
+query replace_content($title: String, $content: Blob) {
+    update Document set { content: $content } where title = $title
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    load_jsonl(
+        &main,
+        r#"{"type":"Document","data":{"title":"doc","content":"base64:T2xkIQ=="}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        QUERIES,
+        "replace_content",
+        &params(&[("$title", "doc"), ("$content", "base64:TmV3IQ==")]),
+    )
+    .await
+    .unwrap();
+
+    // Both four-byte inline payloads receive the same file-relative descriptor
+    // tuple. Display-string or descriptor-only equality therefore collides;
+    // the immutable owning data-file path is the distinguishing witness.
+    let base = snapshot_main(&main).await.unwrap();
+    let source = main
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    let base_batch = base
+        .open("node:Document")
+        .await
+        .unwrap()
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .remove(0);
+    let source_batch = source
+        .open("node:Document")
+        .await
+        .unwrap()
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        base_batch.column_by_name("content").unwrap().to_data(),
+        source_batch.column_by_name("content").unwrap().to_data(),
+        "fixture must retain the descriptor-only collision",
+    );
+
+    assert_eq!(
+        main.branch_merge("feature", "main").await.unwrap(),
+        MergeOutcome::FastForward,
+    );
+    assert_eq!(
+        read_managed_blob_bytes(
+            &main,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "doc", "content"),
+        )
+        .await,
+        b"New!",
+    );
+    assert_eq!(
+        main.branch_merge("feature", "main").await.unwrap(),
+        MergeOutcome::AlreadyUpToDate,
+    );
 }
 
 /// The merge succeeds, its lineage lands, and it is idempotent.

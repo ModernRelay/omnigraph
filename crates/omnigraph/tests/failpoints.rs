@@ -12137,8 +12137,9 @@ async fn branch_merge_dropping_a_net_zero_table_confirms_and_recovers() {
         );
     }
 
-    // Reopening resolves the sidecar. A mismatch between the confirmed updates
-    // and the intended delta would fail here instead.
+    // Reopening resolves the still-unconfirmed sidecar by compensating the
+    // unpublished Person effect. The target must keep its accepted Erin row,
+    // while the source keeps Frank available for a clean retry.
     let db = Omnigraph::open(&uri).await.unwrap();
     let recovery_dir = dir.path().join("__recovery");
     if recovery_dir.exists() {
@@ -12157,16 +12158,46 @@ async fn branch_merge_dropping_a_net_zero_table_confirms_and_recovers() {
         knows_before,
         "the dropped net-zero table must be untouched by recovery"
     );
+    assert_eq!(
+        recovery_audit_kinds(dir.path()).await,
+        vec!["RolledBack"],
+        "the pre-confirmation crash must have one exact rollback disposition"
+    );
 
-    // The merge is complete either way it resolved; re-running it must be a
-    // typed no-op rather than a repeat or a failure.
+    let mut recovered_main_names =
+        collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    recovered_main_names.sort();
+    assert_eq!(
+        recovered_main_names,
+        vec!["Alice", "Bob", "Charlie", "Diana", "Erin"],
+        "rollback must preserve the accepted target row and remove only the unpublished Frank effect"
+    );
+    let mut recovered_feature_names = collect_column_strings(
+        &helpers::read_table_branch(&db, "feature", "node:Person").await,
+        "name",
+    );
+    recovered_feature_names.sort();
+    assert_eq!(
+        recovered_feature_names,
+        vec!["Alice", "Bob", "Charlie", "Diana", "Frank"],
+        "rollback must not consume or alter the source delta"
+    );
+
+    // The compensated merge remains retryable. The clean retry must publish
+    // Frank alongside Erin, while continuing to suppress the net-zero table.
     let outcome = db.branch_merge("feature", "main").await.unwrap();
-    assert!(
-        matches!(
-            outcome,
-            omnigraph::db::MergeOutcome::AlreadyUpToDate | omnigraph::db::MergeOutcome::Merged
-        ),
-        "unexpected outcome after recovery: {outcome:?}"
+    assert_eq!(
+        outcome,
+        omnigraph::db::MergeOutcome::Merged,
+        "a compensated source delta must be published by the retry"
+    );
+    let mut merged_main_names =
+        collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    merged_main_names.sort();
+    assert_eq!(
+        merged_main_names,
+        vec!["Alice", "Bob", "Charlie", "Diana", "Erin", "Frank"],
+        "the retry must combine the target and source Person deltas"
     );
     assert_eq!(
         count_rows(&db, "edge:Knows").await,

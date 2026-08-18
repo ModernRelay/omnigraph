@@ -348,16 +348,125 @@ struct CursorRow {
     id: String,
     signature: String,
     dataset: Dataset,
+    managed_blob_data_files: Option<std::sync::Arc<crate::blob::ManagedBlobDataFileIndex>>,
     batch: RecordBatch,
     row_index: usize,
 }
 
 impl CursorRow {
-    /// Compute this row's signature on demand. Used by the lazy adopt cursor,
-    /// where `signature` is left empty; the value is identical to the eager
-    /// `signature` field the three-way cursor populates.
-    fn compute_signature(&self) -> Result<String> {
-        row_signature(&self.batch, self.row_index)
+    fn row_address(&self) -> Result<u64> {
+        let row_addresses = self
+            .batch
+            .column_by_name("_rowaddr")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::manifest(
+                    "branch-adopt equality scan omitted its _rowaddr column".to_string(),
+                )
+            })?;
+        if self.row_index >= row_addresses.len() || row_addresses.is_null(self.row_index) {
+            return Err(OmniError::manifest(
+                "branch-adopt equality encountered an absent _rowaddr".to_string(),
+            ));
+        }
+        Ok(row_addresses.value(self.row_index))
+    }
+
+    /// Prove that every logical value in these two rows is equal.
+    ///
+    /// This is deliberately separate from the legacy display signature used
+    /// by the general three-way merge. Adopt classification may use equality
+    /// to discard a table and complete merge lineage, so it requires a proof:
+    /// typed Arrow one-cell equality, exact nulls, exact field framing, and a
+    /// physical-object-qualified comparison for managed Blob descriptors.
+    fn adopt_values_provably_equal(&self, other: &Self) -> Result<bool> {
+        if self.row_index >= self.batch.num_rows()
+            || other.row_index >= other.batch.num_rows()
+            || self.batch.num_columns() != other.batch.num_columns()
+        {
+            return Ok(false);
+        }
+
+        let left_schema = self.batch.schema();
+        let right_schema = other.batch.schema();
+        for (left_index, left_field) in left_schema.fields().iter().enumerate() {
+            let Ok(right_index) = right_schema.index_of(left_field.name()) else {
+                return Ok(false);
+            };
+            let right_field = right_schema.field(right_index);
+            if left_field.as_ref() != right_field {
+                return Ok(false);
+            }
+            if is_lance_virtual_row_column(left_field.name()) {
+                continue;
+            }
+
+            let left_column = self.batch.column(left_index);
+            let right_column = other.batch.column(right_index);
+            let left_is_blob = self
+                .dataset
+                .schema()
+                .field(left_field.name())
+                .is_some_and(|field| field.is_blob());
+            let right_is_blob = other
+                .dataset
+                .schema()
+                .field(right_field.name())
+                .is_some_and(|field| field.is_blob());
+            if left_is_blob != right_is_blob {
+                return Ok(false);
+            }
+
+            if left_is_blob {
+                let left_data_files = self.managed_blob_data_files.as_deref().ok_or_else(|| {
+                    OmniError::manifest(
+                        "branch-adopt Blob equality omitted its data-file index".to_string(),
+                    )
+                })?;
+                let right_data_files =
+                    other.managed_blob_data_files.as_deref().ok_or_else(|| {
+                        OmniError::manifest(
+                            "branch-adopt Blob equality omitted its data-file index".to_string(),
+                        )
+                    })?;
+                let left_descriptions = left_column
+                    .as_any()
+                    .downcast_ref::<arrow_array::StructArray>()
+                    .ok_or_else(|| {
+                        OmniError::blob_integrity(format!(
+                            "Blob column '{}' did not scan as a Blob-v2 descriptor",
+                            left_field.name()
+                        ))
+                    })?;
+                let right_descriptions = right_column
+                    .as_any()
+                    .downcast_ref::<arrow_array::StructArray>()
+                    .ok_or_else(|| {
+                        OmniError::blob_integrity(format!(
+                            "Blob column '{}' did not scan as a Blob-v2 descriptor",
+                            right_field.name()
+                        ))
+                    })?;
+                if !crate::blob::persisted_blob_values_provably_equal(
+                    left_data_files,
+                    left_descriptions,
+                    self.row_index,
+                    self.row_address()?,
+                    right_data_files,
+                    right_descriptions,
+                    other.row_index,
+                    other.row_address()?,
+                    left_field.name(),
+                )? {
+                    return Ok(false);
+                }
+            } else if left_column.slice(self.row_index, 1).to_data()
+                != right_column.slice(other.row_index, 1).to_data()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Classify this exact persisted row without opening an external target.
@@ -377,11 +486,12 @@ struct OrderedTableCursor {
     current_batch: Option<RecordBatch>,
     current_row: usize,
     peeked: Option<CursorRow>,
-    /// When false, `next_row` leaves `CursorRow::signature` empty and callers
-    /// compute it on demand via `CursorRow::compute_signature`. The adopt path
-    /// uses this: new/deleted rows never need a signature comparison and would
-    /// otherwise eagerly stringify their embedding for nothing.
+    /// When false, the adopt path leaves the legacy display signature empty,
+    /// requests row addresses, and compares common rows with typed equality.
+    /// New/deleted rows therefore avoid stringifying their embeddings, while
+    /// general three-way cursors retain their existing eager signatures.
     eager_signatures: bool,
+    managed_blob_data_files: Option<std::sync::Arc<crate::blob::ManagedBlobDataFileIndex>>,
 }
 
 impl OrderedTableCursor {
@@ -389,8 +499,8 @@ impl OrderedTableCursor {
         Self::open(snapshot, table_key, true).await
     }
 
-    /// Like `from_snapshot` but leaves row signatures uncomputed (callers use
-    /// `CursorRow::compute_signature` on demand). See `eager_signatures`.
+    /// Like `from_snapshot` but equips rows for adopt-only typed equality
+    /// instead of computing legacy display signatures. See `eager_signatures`.
     async fn from_snapshot_lazy(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
         Self::open(snapshot, table_key, false).await
     }
@@ -404,20 +514,39 @@ impl OrderedTableCursor {
     }
 
     async fn from_dataset(dataset: Option<Dataset>, eager_signatures: bool) -> Result<Self> {
+        let managed_blob_data_files = if eager_signatures {
+            None
+        } else if let Some(dataset) = &dataset {
+            Some(std::sync::Arc::new(
+                crate::blob::ManagedBlobDataFileIndex::from_dataset(dataset)?,
+            ))
+        } else {
+            None
+        };
         let stream = if let Some(ds) = &dataset {
             crate::instrumentation::record_ordered_cursor_scan(
                 KEYED_WRITE_MAX_ROWS,
                 KEYED_WRITE_MAX_BYTES,
             );
             Some(Box::pin(
-                crate::table_store::TableStore::scan_stream_bounded(
+                crate::table_store::TableStore::scan_stream_with(
                     ds,
                     None,
                     None,
                     Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
                     true,
-                    KEYED_WRITE_MAX_ROWS,
-                    KEYED_WRITE_MAX_BYTES,
+                    |scanner| {
+                        if !eager_signatures {
+                            // Adopt-only Blob equality qualifies descriptor
+                            // numbers by the immutable data file owning this
+                            // exact physical row. General three-way scans keep
+                            // their existing projection and semantics.
+                            scanner.with_row_address();
+                        }
+                        scanner.batch_size(KEYED_WRITE_MAX_ROWS);
+                        scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+                        Ok(())
+                    },
                 )
                 .await?,
             ))
@@ -432,6 +561,7 @@ impl OrderedTableCursor {
             current_row: 0,
             peeked: None,
             eager_signatures,
+            managed_blob_data_files,
         })
     }
 
@@ -467,6 +597,7 @@ impl OrderedTableCursor {
                         id: row_id_at(batch, row_index)?,
                         signature,
                         dataset,
+                        managed_blob_data_files: self.managed_blob_data_files.clone(),
                         batch: batch.clone(),
                         row_index,
                     }));
@@ -1302,10 +1433,11 @@ async fn compute_adopt_delta(
                 needs_update = true;
             }
             (Some(base), Some(src)) => {
-                // Present on both — compute signatures lazily (the only case
-                // that needs them) to tell a changed row from an unchanged one.
-                // New/deleted rows above skip the embedding stringify entirely.
-                if src.compute_signature()? != base.compute_signature()? {
+                // Present on both — use typed/null-aware equality to distinguish
+                // a changed row from an unchanged one. New/deleted rows above
+                // never pay for comparison, and this adopt path never builds
+                // the legacy display-string signature.
+                if !src.adopt_values_provably_equal(base)? {
                     // Changed on source → upsert.
                     upsert_writer
                         .push_row(src, &materializer, external_preflight)
@@ -1381,7 +1513,7 @@ async fn collect_adopt_blob_selection(
                 source.include_blob_selection(blob_selection)?;
             }
             (Some(base), Some(source)) => {
-                if source.compute_signature()? != base.compute_signature()? {
+                if !source.adopt_values_provably_equal(base)? {
                     source.include_blob_selection(blob_selection)?;
                 }
             }
@@ -1760,6 +1892,20 @@ fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
         );
     }
     Ok(values.join("\u{1f}"))
+}
+
+/// Lance virtual columns carried by merge scans but excluded from graph-value
+/// equality. Near-miss user properties such as `_row_id` are ordinary data and
+/// must be compared.
+fn is_lance_virtual_row_column(name: &str) -> bool {
+    matches!(
+        name,
+        "_rowid"
+            | "_rowaddr"
+            | "_rowoffset"
+            | "_row_created_at_version"
+            | "_row_last_updated_at_version"
+    )
 }
 
 /// Operation-wide budget for the scalar delta retained by merge validation.
