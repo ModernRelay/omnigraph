@@ -157,6 +157,29 @@ pub(crate) struct MutationStaging {
     pub(crate) op_kinds: HashMap<String, MutationOpKind>,
 }
 
+/// Concurrency for the fragment-writing stage, shared by the loader and
+/// end-of-query mutation staging. Each staged write is an independent Lance
+/// dataset (manifest + fragments for a different table); ops within a single
+/// table stay serial under Lance's manifest OCC, so cross-table staging has
+/// no shared state to race.
+///
+/// 8 is a conservative default — enough to overlap S3 round-trip latency
+/// across the typical 10-30 table schemas without flooding the runtime.
+/// Override via `OMNIGRAPH_LOAD_CONCURRENCY`.
+pub(crate) const DEFAULT_STAGE_WRITE_CONCURRENCY: usize = 8;
+
+pub(crate) fn stage_write_concurrency() -> usize {
+    parse_stage_write_concurrency(std::env::var("OMNIGRAPH_LOAD_CONCURRENCY").ok().as_deref())
+}
+
+/// Pure half of [`stage_write_concurrency`], split out so the parse rules are
+/// unit-testable without mutating process-global environment.
+fn parse_stage_write_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_STAGE_WRITE_CONCURRENCY)
+}
+
 impl MutationStaging {
     /// Capture pre-write metadata on first touch of a table. Subsequent
     /// touches preserve the original `paths` and `expected_versions`
@@ -434,15 +457,21 @@ impl MutationStaging {
     /// run between staging (slow S3 PUTs, no queue) and commit (fast,
     /// under per-`(table_key, branch)` queue).
     ///
-    /// Sequential per-table for now — parallelizing across independent
-    /// Lance datasets is a perf follow-up; same loop structure as the
-    /// pre-split `finalize`.
+    /// Stages independent Lance datasets concurrently at
+    /// [`stage_write_concurrency`] — the same knob the loader path has
+    /// always run at. Publication is untouched: everything after staging
+    /// still funnels through the single manifest CAS. Failure semantics are
+    /// also untouched: the staging stream drains before the first error
+    /// surfaces, exactly as the width-1 delegation it replaces did (any
+    /// staged-but-unpublished residue was already reclaimable, not
+    /// graph-visible).
     pub(crate) async fn stage_all(
         self,
         db: &crate::db::Omnigraph,
         branch: Option<&str>,
     ) -> Result<StagedMutation> {
-        self.stage_all_with_concurrency(db, branch, 1).await
+        self.stage_all_with_concurrency(db, branch, stage_write_concurrency())
+            .await
     }
 
     /// Loader-facing variant of [`stage_all`] that preserves
@@ -1619,4 +1648,18 @@ fn dedupe_merge_batches_by_id(
     }
     arrow_select::concat::concat_batches(schema, &sliced)
         .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+#[cfg(test)]
+mod stage_write_concurrency_tests {
+    use super::parse_stage_write_concurrency;
+
+    // Pure parser, no process-global environment touched.
+    #[test]
+    fn resolves_default_override_and_junk() {
+        assert_eq!(parse_stage_write_concurrency(None), 8, "default without the env var");
+        assert_eq!(parse_stage_write_concurrency(Some("3")), 3, "override wins");
+        assert_eq!(parse_stage_write_concurrency(Some("0")), 8, "zero is not a concurrency");
+        assert_eq!(parse_stage_write_concurrency(Some("banana")), 8, "junk falls back to default");
+    }
 }
