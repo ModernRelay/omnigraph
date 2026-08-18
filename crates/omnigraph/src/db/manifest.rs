@@ -1227,7 +1227,7 @@ impl ManifestCoordinator {
         crate::branch_control::delete_branch_recoverably(&mut ds, name, expected_identifier).await
     }
 
-    pub async fn list_branches(&self) -> Result<Vec<String>> {
+    pub async fn list_graph_branches(&self) -> Result<Vec<String>> {
         let branches = list_branch_contents(&self.dataset).await?;
         let mut names: Vec<String> = branches.into_keys().filter(|name| name != "main").collect();
         names.sort();

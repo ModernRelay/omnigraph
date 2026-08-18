@@ -464,13 +464,13 @@ async fn test_version_is_manifest_version() {
 }
 
 #[tokio::test]
-async fn test_list_branches_only_returns_main_once() {
+async fn test_list_graph_branches_only_returns_main_once() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
 
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    let branches = mc.list_branches().await.unwrap();
+    let branches = mc.list_graph_branches().await.unwrap();
     assert_eq!(
         branches
             .iter()

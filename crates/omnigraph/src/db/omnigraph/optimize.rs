@@ -1347,7 +1347,7 @@ async fn reconcile_orphaned_branches_with_catalog(
     // logged, never aborting the rest of the sweep.
     let storage = db.storage();
     for (identity, table_key, full_path) in table_targets {
-        let listed = match storage.list_branches(&full_path).await {
+        let listed = match storage.list_native_branches(&full_path).await {
             Ok(listed) => listed,
             Err(err) => {
                 tracing::warn!(

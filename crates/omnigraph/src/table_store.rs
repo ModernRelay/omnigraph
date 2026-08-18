@@ -824,7 +824,7 @@ impl TableStore {
     /// The `cleanup` orphan reconciler diffs this against the manifest branch
     /// set to find orphaned per-table forks. `main`/default is not a named
     /// branch and never appears here.
-    pub async fn list_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
+    pub async fn list_native_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
         let ds = crate::instrumentation::open_dataset(
             dataset_uri,
             crate::instrumentation::VersionResolution::Latest,
