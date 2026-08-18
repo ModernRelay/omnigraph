@@ -963,11 +963,23 @@ impl ManifestCoordinator {
     /// Refresh one live-read view without ever installing a manifest state
     /// whose inherited lineage projection has not also been refreshed.
     ///
-    /// Branches with an exact `graph_head` row keep the cheap state-only path.
-    /// A fresh named branch has no such row and needs the lineage fallback;
-    /// every fallible read completes before either field is replaced so a
-    /// transient lineage failure leaves the previous coordinator coherent.
-    pub(crate) async fn refresh_for_live_read(&mut self) -> Result<Option<Vec<GraphLineageRow>>> {
+    /// `projection_has_head` reports whether the caller's lineage projection
+    /// already contains a commit id. The cheap state-only path is taken ONLY
+    /// when the refreshed branch head row exists AND the projection already
+    /// knows that exact head (the manifest moved without extending this
+    /// branch's chain — e.g. a maintenance pointer publish). A head the
+    /// projection lacks means another handle or process committed, so the
+    /// lineage is re-read atomically with the state — otherwise the caller
+    /// would pair the new head with a stale commit map and every later feed
+    /// poll or head resolution on this handle would fail with a
+    /// missing-commit error and never self-heal. An absent head row (fresh
+    /// named branch) refreshes the inherited lineage, as before; every
+    /// fallible read completes before either field is replaced so a transient
+    /// lineage failure leaves the previous coordinator coherent.
+    pub(crate) async fn refresh_for_live_read(
+        &mut self,
+        projection_has_head: impl FnOnce(&str) -> bool,
+    ) -> Result<Option<Vec<GraphLineageRow>>> {
         let control_session = self.dataset.session();
         let dataset = open_manifest_dataset_with_session(
             &self.root_uri,
@@ -980,13 +992,14 @@ impl ManifestCoordinator {
             .active_branch
             .as_deref()
             .unwrap_or(MAIN_BRANCH_HEAD_KEY);
-        let lineage_rows = if known_state.graph_heads.contains_key(branch_key) {
-            None
-        } else {
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::READ_REFRESH_POST_STATE_PRE_LINEAGE,
-            )?;
-            Some(read_graph_lineage(&dataset).await?.0)
+        let lineage_rows = match known_state.graph_heads.get(branch_key) {
+            Some(head) if projection_has_head(head) => None,
+            _ => {
+                crate::failpoints::maybe_fail(
+                    crate::failpoints::names::READ_REFRESH_POST_STATE_PRE_LINEAGE,
+                )?;
+                Some(read_graph_lineage(&dataset).await?.0)
+            }
         };
 
         self.dataset = dataset;

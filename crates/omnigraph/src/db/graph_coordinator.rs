@@ -306,7 +306,17 @@ impl GraphCoordinator {
     /// completes every required read before installing either new view, so a
     /// failure cannot leave replacement rows paired with stale branch lineage.
     pub(crate) async fn refresh_for_live_read(&mut self) -> Result<()> {
-        if let Some(lineage_rows) = self.manifest.refresh_for_live_read().await? {
+        // Disjoint field borrows: the membership probe reads `commit_graph`
+        // while `manifest` is mutably borrowed. The lineage projection is
+        // refreshed whenever the durable branch head is a commit it does not
+        // already contain — a foreign handle's commit must never leave a new
+        // head paired with a stale commit map.
+        let commit_graph = &self.commit_graph;
+        if let Some(lineage_rows) = self
+            .manifest
+            .refresh_for_live_read(|head| commit_graph.get_commit(head).is_some())
+            .await?
+        {
             self.commit_graph.replace_from_manifest_rows(lineage_rows);
         }
         Ok(())
@@ -481,6 +491,28 @@ impl GraphCoordinator {
                     commit.manifest_version,
                 )
                 .await?;
+                // The reopen above is keyed only by (manifest branch, numeric
+                // version). A named branch deleted and recreated at the same
+                // numeric version between this handle's commit resolution and
+                // the reopen would resolve REPLACEMENT state under the
+                // commit's label — and a warm handle can hold the old commit
+                // in its lineage projection long after the recreation. Every
+                // commit is written as the head of its own manifest version,
+                // so the reopened snapshot must still name it as that branch's
+                // graph head (the same structural proof the feed's
+                // commit_snapshot performs); fail closed otherwise. Main
+                // cannot undergo branch-name ABA, but the check is structural
+                // and harmless there.
+                if snapshot.graph_head(commit.manifest_branch.as_deref())
+                    != Some(commit.graph_commit_id.as_str())
+                {
+                    return Err(OmniError::manifest(format!(
+                        "commit '{}' has no persisted native-branch incarnation \
+                         witness at the reopened snapshot; the branch was deleted \
+                         and recreated since this handle resolved it",
+                        commit.graph_commit_id
+                    )));
+                }
                 Ok(ResolvedTarget {
                     requested: target.clone(),
                     branch: commit.manifest_branch.clone(),

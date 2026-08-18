@@ -296,7 +296,15 @@ pub(crate) async fn poll(
                     },
                 })
             };
-        if index == max_commits || budget.remaining_rows == 0 {
+        // Also stop when the BYTE budget is exhausted: the solo-oversized
+        // forward-progress rule is scoped to one `enumerate_commit_changes`
+        // call, so without this check a poll whose bytes ran out would
+        // force-emit the first change of EVERY later commit as another "solo"
+        // oversized change — one over-budget event per commit instead of one
+        // per page. A page that ends with zero remaining bytes stops at the
+        // block boundary; the next poll's fresh budget resumes forward
+        // progress from there.
+        if index == max_commits || budget.remaining_rows == 0 || budget.remaining_bytes == 0 {
             return boundary_stop(blocks, &after_completed);
         }
 

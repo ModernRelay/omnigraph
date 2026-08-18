@@ -832,8 +832,15 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
             stale_snapshot_error,
             OmniError::Manifest(ref error)
                 if error.kind == ManifestErrorKind::BadRequest
-                    && error.message
-                        == "Blob property 'Document.content' has no persisted native-branch incarnation witness at the selected target"
+                    // The commit-level snapshot resolution now performs the
+                    // structural head re-prove first, so this scenario is
+                    // refused there; the Blob-level witness remains for the
+                    // windows commit resolution cannot see (post-capture
+                    // table-open ABA, pinned by the failpoint cells). Either
+                    // refusal carries the shared incarnation-witness phrase.
+                    && error
+                        .message
+                        .contains("has no persisted native-branch incarnation witness")
         ),
         "named-branch ABA must fail loudly instead of retargeting; got {stale_snapshot_error:?}"
     );
@@ -963,8 +970,15 @@ node Marker {
             stale_snapshot_error,
             OmniError::Manifest(ref error)
                 if error.kind == ManifestErrorKind::BadRequest
-                    && error.message
-                        == "Blob property 'Document.content' has no persisted native-branch incarnation witness at the selected target"
+                    // The commit-level snapshot resolution now performs the
+                    // structural head re-prove first, so this scenario is
+                    // refused there; the Blob-level witness remains for the
+                    // windows commit resolution cannot see (post-capture
+                    // table-open ABA, pinned by the failpoint cells). Either
+                    // refusal carries the shared incarnation-witness phrase.
+                    && error
+                        .message
+                        .contains("has no persisted native-branch incarnation witness")
         ),
         "named graph-ref ABA must fail loudly even when the Blob table is inherited from main; got {stale_snapshot_error:?}"
     );

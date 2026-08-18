@@ -2187,6 +2187,108 @@ fn boundary_cursor(page: &omnigraph::changes::ChangeFeedPage) -> (String, bool) 
     }
 }
 
+/// A handle that already polled must FOLLOW commits made through a DIFFERENT
+/// handle. The warm live-read refresh sees the new durable head; a state-only
+/// refresh (taken whenever the head row merely exists) would pair that new
+/// head with a stale lineage projection, and every later poll on this handle
+/// would fail with a missing-commit error and never self-heal. The refresh
+/// must re-read lineage whenever the durable head is a commit the projection
+/// does not contain.
+#[tokio::test]
+async fn change_feed_poll_follows_commits_from_another_handle() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db_a = Omnigraph::init(uri, "node Person {\n    name: String @key\n}\n")
+        .await
+        .unwrap();
+    let now = db_a
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap();
+    let (cursor, _) = boundary_cursor(&now);
+
+    let db_b = Omnigraph::open(uri).await.unwrap();
+    db_b.load(
+        "main",
+        r#"{"type":"Person","data":{"name":"from-b"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let page = db_a
+        .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(cursor)))
+        .await
+        .expect("a warm handle must follow another handle's commit");
+    assert_eq!(page.blocks.len(), 1, "the foreign commit is one block");
+    assert_eq!(page.blocks[0].changes.len(), 1);
+    assert_eq!(page.blocks[0].changes[0].id, "from-b");
+    let (cursor, caught_up) = boundary_cursor(&page);
+    assert!(caught_up);
+    // The projection now contains the foreign head, so the next poll stays
+    // healthy rather than repeating a missing-commit failure.
+    let again = db_a
+        .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(cursor)))
+        .await
+        .unwrap();
+    assert!(again.blocks.is_empty());
+}
+
+/// Once the poll-wide BYTE budget is exhausted, the page ends at the block
+/// boundary: the solo-oversized forward-progress rule admits ONE over-budget
+/// change per PAGE, not one per commit. Each of the three commits here carries
+/// a change larger than the 1-byte budget, so each poll delivers exactly one
+/// solo block and the backlog drains across three polls.
+#[tokio::test]
+async fn change_feed_byte_budget_admits_one_solo_oversized_change_per_page() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, "node Person {\n    name: String @key\n}\n")
+        .await
+        .unwrap();
+    let now = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap();
+    let (mut cursor, _) = boundary_cursor(&now);
+    for row in 0..3 {
+        db.load(
+            "main",
+            &format!(r#"{{"type":"Person","data":{{"name":"solo-{row}"}}}}"#),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    }
+
+    for expected in ["solo-0", "solo-1", "solo-2"] {
+        let mut request = feed_request(None, ChangeFeedPosition::Cursor(cursor.clone()));
+        request.max_bytes = Some(1);
+        let page = db.poll_change_feed(request).await.unwrap();
+        assert_eq!(
+            page.blocks.len(),
+            1,
+            "an exhausted byte budget must stop at the block boundary instead \
+             of force-emitting one oversized change per remaining commit"
+        );
+        assert_eq!(page.blocks[0].changes.len(), 1);
+        assert_eq!(page.blocks[0].changes[0].id, expected);
+        let (next, caught_up) = boundary_cursor(&page);
+        assert_eq!(caught_up, expected == "solo-2");
+        cursor = next;
+    }
+}
+
 #[tokio::test]
 async fn change_feed_advances_only_at_block_boundaries_and_pins_the_cut() {
     use omnigraph::changes::{ChangeFeedContinuation, ChangeFeedPosition, ChangeFeedStart};
