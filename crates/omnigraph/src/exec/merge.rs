@@ -403,10 +403,9 @@ struct OrderedTableCursor {
     current_batch: Option<RecordBatch>,
     current_row: usize,
     peeked: Option<CursorRow>,
-    /// When false, `next_row` leaves `CursorRow::signature` empty and callers
-    /// compute it on demand via `CursorRow::compute_signature`. The adopt path
-    /// uses this: new/deleted rows never need a signature comparison and would
-    /// otherwise eagerly stringify their embedding for nothing.
+    /// When false, the adopt path builds the typed comparison unit only for
+    /// common rows. New/deleted rows therefore avoid comparison work, while
+    /// general three-way cursors retain their eager typed rows.
     eager_signatures: bool,
 }
 
@@ -415,8 +414,8 @@ impl OrderedTableCursor {
         Self::open(snapshot, table_key, true).await
     }
 
-    /// Like `from_snapshot` but leaves row signatures uncomputed (callers use
-    /// `CursorRow::compute_signature` on demand). See `eager_signatures`.
+    /// Like `from_snapshot` but builds typed rows lazily for adopt-only
+    /// equality. See `eager_signatures`.
     async fn from_snapshot_lazy(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
         Self::open(snapshot, table_key, false).await
     }
@@ -1331,7 +1330,7 @@ async fn compute_adopt_delta(
                 needs_update = true;
             }
             (None, Some(src)) => {
-                // New on source → strict fenced insert. No signature
+                // New on source → strict fenced insert. No comparison unit is
                 // needed — a new id is absent from base by construction.
                 append_writer
                     .push_row(src, &materializer, external_preflight)
@@ -2223,12 +2222,12 @@ async fn classify_adopt(
     table_key: &str,
     target_active: Option<&str>,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
-) -> Result<CandidateTableState> {
+) -> Result<Option<CandidateTableState>> {
     let Some(source_entry) = source_snapshot.entry(table_key) else {
         // Source has no such table — nothing to adopt or validate.
-        return Ok(CandidateTableState::AdoptSourceState {
+        return Ok(Some(CandidateTableState::AdoptSourceState {
             validation_delta: None,
-        });
+        }));
     };
     let target_entry = target_snapshot.entry(table_key);
     ensure_merge_identity_compatible(
@@ -2247,10 +2246,10 @@ async fn classify_adopt(
             try_proven_pure_insert_adopt(target_db, table_key, base_snapshot, source_snapshot)
                 .await?
     {
-        return Ok(CandidateTableState::AdoptPureInserts(proven));
+        return Ok(Some(CandidateTableState::AdoptPureInserts(proven)));
     }
 
-    classify_general_adopt(
+    let candidate = classify_general_adopt(
         target_db,
         catalog,
         base_snapshot,
@@ -2259,7 +2258,15 @@ async fn classify_adopt(
         advances_head,
         external_preflight,
     )
-    .await
+    .await?;
+
+    Ok(keep_publishing_candidate(
+        candidate,
+        target_active,
+        source_entry,
+        target_entry,
+        table_key,
+    ))
 }
 
 /// Classify the general adopt route after the pure-insert proof was either
@@ -2299,16 +2306,285 @@ async fn classify_general_adopt(
     }
 }
 
+/// What publishing a table's adopted source state does to `__manifest`.
+///
+/// An empty delta does not imply an empty publish: source and target can hold
+/// the same content at different Lance versions. Planning purely lets
+/// classification drop a table whose registration is already stored, which the
+/// registry guard would otherwise reject (#473).
+#[must_use = "the adopt plan decides whether this table is a merge candidate"]
+enum AdoptPublish {
+    /// The planned registration is field-for-field the stored entry.
+    Nothing,
+    /// A pointer switch onto a lineage the target can already read.
+    Pointer(crate::db::SubTableUpdate),
+    /// The target holds no ref for this table yet; publication forks one. The
+    /// only arm that touches storage.
+    Fork {
+        source_branch: String,
+        target_branch: String,
+    },
+}
+
+/// Plan what adopting the source's table state publishes, without an effect.
+///
+/// Reaching a branch-bearing arm means the delta was empty: the HEAD-advancing
+/// case is classified [`CandidateTableState::AdoptWithDelta`] and published by
+/// [`publish_adopted_delta`].
+fn plan_adopted_source_state(
+    target_active: Option<&str>,
+    source_entry: &crate::db::SubTableEntry,
+    target_entry: Option<&crate::db::SubTableEntry>,
+    table_key: &str,
+) -> AdoptPublish {
+    let identity = source_entry.identity;
+    let planned = match (target_active, source_entry.table_branch.as_deref()) {
+        // Source on main — pointer switch to its version. The target reads the
+        // same lineage whether it sits on main or on a branch.
+        (None, None) | (Some(_), None) => crate::db::SubTableUpdate {
+            identity,
+            table_key: table_key.to_string(),
+            table_version: source_entry.table_version,
+            table_branch: None,
+            row_count: source_entry.row_count,
+            version_metadata: source_entry.version_metadata.clone(),
+        },
+        // Source on a branch, target on main — the target keeps its own
+        // version and metadata; only the row count comes from the source.
+        (None, Some(_)) => crate::db::SubTableUpdate {
+            identity,
+            table_key: table_key.to_string(),
+            table_version: target_entry
+                .map(|entry| entry.table_version)
+                .unwrap_or(source_entry.table_version),
+            table_branch: None,
+            row_count: source_entry.row_count,
+            version_metadata: target_entry
+                .map(|entry| entry.version_metadata.clone())
+                .unwrap_or_else(|| source_entry.version_metadata.clone()),
+        },
+        (Some(target_branch), Some(source_branch)) => {
+            let Some(owned) =
+                target_entry.filter(|entry| entry.table_branch.as_deref() == Some(target_branch))
+            else {
+                // A fork registers a ref the target lacks, so it is never a
+                // no-op.
+                return AdoptPublish::Fork {
+                    source_branch: source_branch.to_string(),
+                    target_branch: target_branch.to_string(),
+                };
+            };
+            crate::db::SubTableUpdate {
+                identity,
+                table_key: table_key.to_string(),
+                table_version: owned.table_version,
+                table_branch: Some(target_branch.to_string()),
+                row_count: source_entry.row_count,
+                version_metadata: owned.version_metadata.clone(),
+            }
+        }
+    };
+
+    if target_entry.is_some_and(|current| reregisters_current_entry(&planned, current)) {
+        return AdoptPublish::Nothing;
+    }
+    AdoptPublish::Pointer(planned)
+}
+
+/// Whether a planned registration is field-for-field the stored entry.
+///
+/// `table_path` is absent from [`crate::db::SubTableUpdate`] by design: a
+/// pointer switch never moves a table, so the path cannot differ.
+fn reregisters_current_entry(
+    planned: &crate::db::SubTableUpdate,
+    current: &crate::db::SubTableEntry,
+) -> bool {
+    planned.identity == current.identity
+        && planned.table_version == current.table_version
+        && planned.table_branch == current.table_branch
+        && planned.row_count == current.row_count
+        && planned.version_metadata == current.version_metadata
+}
+
+/// Keep a classified candidate only if publishing it changes `__manifest`.
+///
+/// Dropping it here gives the same disposition the manifest-equal tables get
+/// before classification. Only an empty validation delta qualifies: a
+/// non-empty one is the evaluator's RI / uniqueness / cardinality input and is
+/// still checked even when the publish is a pointer switch.
+fn keep_publishing_candidate(
+    candidate: CandidateTableState,
+    target_active: Option<&str>,
+    source_entry: &crate::db::SubTableEntry,
+    target_entry: Option<&crate::db::SubTableEntry>,
+    table_key: &str,
+) -> Option<CandidateTableState> {
+    let publishes_nothing = matches!(
+        candidate,
+        CandidateTableState::AdoptSourceState {
+            validation_delta: None
+        }
+    ) && matches!(
+        plan_adopted_source_state(target_active, source_entry, target_entry, table_key),
+        AdoptPublish::Nothing
+    );
+    if publishes_nothing {
+        return None;
+    }
+    Some(candidate)
+}
+
+#[cfg(test)]
+mod adopt_plan_tests {
+    use super::*;
+
+    /// Build a `TableVersionMetadata` without touching storage. The type is
+    /// crate-private with private fields, so the derived `Deserialize` is the
+    /// only in-crate constructor available to a unit test.
+    fn metadata(manifest_path: &str) -> crate::db::manifest::TableVersionMetadata {
+        serde_json::from_value(serde_json::json!({
+            "manifest_path": manifest_path,
+            "manifest_size": null,
+            "e_tag": null,
+            "naming_scheme": null,
+        }))
+        .expect("construct table version metadata")
+    }
+
+    fn entry(
+        version: u64,
+        branch: Option<&str>,
+        row_count: u64,
+        manifest_path: &str,
+    ) -> crate::db::SubTableEntry {
+        crate::db::SubTableEntry {
+            identity: crate::db::manifest::TableIdentity::new(3, 12).unwrap(),
+            table_key: "edge:Knows".to_string(),
+            table_path: "edges/0000000000000003-000000000000000c".to_string(),
+            table_version: version,
+            table_branch: branch.map(ToOwned::to_owned),
+            row_count,
+            version_metadata: metadata(manifest_path),
+        }
+    }
+
+    /// The #473 shape: the source advanced two Lance versions on a branch and
+    /// came back to the target's content. The plan must be `Nothing`.
+    ///
+    /// This pins the classification layer specifically. The publisher's
+    /// widened registry guard also lets the redundant registration through, so
+    /// no integration test can tell the two layers apart and a revert of this
+    /// one would otherwise go unnoticed.
+    #[test]
+    fn net_zero_source_on_a_branch_plans_nothing() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(4, Some("b0"), 3, "manifest-v4");
+        assert!(matches!(
+            plan_adopted_source_state(None, &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Nothing
+        ));
+    }
+
+    #[test]
+    fn identical_state_on_main_plans_nothing() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(2, None, 3, "manifest-v2");
+        assert!(matches!(
+            plan_adopted_source_state(None, &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Nothing
+        ));
+    }
+
+    #[test]
+    fn target_owned_branch_table_with_equal_rows_plans_nothing() {
+        let target = entry(5, Some("target"), 3, "manifest-v5");
+        let source = entry(7, Some("source"), 3, "manifest-v7");
+        assert!(matches!(
+            plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Nothing
+        ));
+    }
+
+    /// Source on main while the target sits on a branch whose table still
+    /// points at main. The planned pointer equals what is stored, so there is
+    /// nothing to publish.
+    #[test]
+    fn source_on_main_matching_a_branch_target_plans_nothing() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(2, None, 3, "manifest-v2");
+        assert!(matches!(
+            plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Nothing
+        ));
+    }
+
+    #[test]
+    fn source_on_main_ahead_of_a_branch_target_plans_a_pointer() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(5, None, 6, "manifest-v5");
+        assert!(matches!(
+            plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Pointer(_)
+        ));
+    }
+
+    /// Row counts differing means content differs, so the table must still be
+    /// published even though the version and branch would match.
+    #[test]
+    fn differing_row_count_plans_a_pointer() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(4, Some("b0"), 4, "manifest-v4");
+        assert!(matches!(
+            plan_adopted_source_state(None, &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Pointer(_)
+        ));
+    }
+
+    #[test]
+    fn advanced_source_on_main_plans_a_pointer() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(3, None, 4, "manifest-v3");
+        assert!(matches!(
+            plan_adopted_source_state(None, &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Pointer(_)
+        ));
+    }
+
+    #[test]
+    fn absent_target_entry_plans_a_pointer() {
+        let source = entry(4, Some("b0"), 3, "manifest-v4");
+        assert!(matches!(
+            plan_adopted_source_state(None, &source, None, "edge:Knows"),
+            AdoptPublish::Pointer(_)
+        ));
+    }
+
+    /// A target branch that does not own the table has no ref to compare, so
+    /// the publish forks one. This arm can never be a no-op.
+    #[test]
+    fn unowned_target_branch_plans_a_fork() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(4, Some("source"), 3, "manifest-v4");
+        assert!(matches!(
+            plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Fork { .. }
+        ));
+    }
+}
+
 /// Adopt the source's table state without applying a row delta: a pointer
-/// switch (source/target share lineage) or a branch fork. The HEAD-advancing
-/// delta case is classified [`CandidateTableState::AdoptWithDelta`] and
-/// published by [`publish_adopted_delta`], so reaching the branch-bearing arms
-/// here means the delta was empty.
+/// switch (source/target share lineage) or a branch fork, as planned by
+/// [`plan_adopted_source_state`].
+///
+/// `target_active` is threaded in rather than re-read. Re-reading agrees today
+/// only because the merge's coordinator swap and its restore bracket both
+/// calls; taking it as an argument makes agreement a property of the signature.
 async fn publish_adopted_source_state(
     target_db: &Omnigraph,
     source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
     table_key: &str,
+    target_active: Option<&str>,
 ) -> Result<crate::db::SubTableUpdate> {
     let source_entry = source_snapshot
         .entry(table_key)
@@ -2320,84 +2596,40 @@ async fn publish_adopted_source_state(
         Some(source_entry.identity),
         target_entry.map(|entry| entry.identity),
     )?;
-    let identity = source_entry.identity;
 
-    let target_active = target_db.active_branch().await;
-    match (
-        target_active.as_deref(),
-        source_entry.table_branch.as_deref(),
-    ) {
-        // Both on main — pointer switch is safe (same lineage, version columns valid)
-        (None, None) => Ok(crate::db::SubTableUpdate {
-            identity,
-            table_key: table_key.to_string(),
-            table_version: source_entry.table_version,
-            table_branch: None,
-            row_count: source_entry.row_count,
-            version_metadata: source_entry.version_metadata.clone(),
-        }),
-        // Source on main, target on branch — pointer switch to main version
-        // (target reads from main, same lineage)
-        (Some(_target_branch), None) => Ok(crate::db::SubTableUpdate {
-            identity,
-            table_key: table_key.to_string(),
-            table_version: source_entry.table_version,
-            table_branch: None,
-            row_count: source_entry.row_count,
-            version_metadata: source_entry.version_metadata.clone(),
-        }),
-        // Source on branch, target on main, empty delta — adopt source's
-        // version by a pointer switch (the non-empty case is `AdoptWithDelta`).
-        (None, Some(_source_branch)) => Ok(crate::db::SubTableUpdate {
-            identity,
-            table_key: table_key.to_string(),
-            table_version: target_entry
-                .map(|e| e.table_version)
-                .unwrap_or(source_entry.table_version),
-            table_branch: None,
-            row_count: source_entry.row_count,
-            version_metadata: target_entry
-                .map(|entry| entry.version_metadata.clone())
-                .unwrap_or_else(|| source_entry.version_metadata.clone()),
-        }),
-        // Both on branches
-        (Some(target_branch), Some(source_branch)) => {
-            if target_entry.and_then(|entry| entry.table_branch.as_deref()) == Some(target_branch) {
-                // Target already owns this table, empty delta — pointer switch
-                // onto its own lineage (the non-empty case is `AdoptWithDelta`).
-                Ok(crate::db::SubTableUpdate {
-                    identity,
-                    table_key: table_key.to_string(),
-                    table_version: target_entry.unwrap().table_version,
-                    table_branch: Some(target_branch.to_string()),
-                    row_count: source_entry.row_count,
-                    version_metadata: target_entry.unwrap().version_metadata.clone(),
-                })
-            } else {
-                // Target doesn't own this table yet — fork from source state.
-                // This creates the target branch on the sub-table dataset.
-                let full_path = format!("{}/{}", target_db.uri(), source_entry.table_path);
-                let ds = target_db
-                    .fork_dataset_from_entry_state(
-                        table_key,
-                        source_entry.identity,
-                        &full_path,
-                        Some(source_branch),
-                        source_entry.table_version,
-                        target_branch,
-                    )
-                    .await?;
-                let state = target_db.storage().table_state(&full_path, &ds).await?;
-                Ok(crate::db::SubTableUpdate {
-                    identity,
-                    table_key: table_key.to_string(),
-                    table_version: state.version,
-                    table_branch: Some(target_branch.to_string()),
-                    row_count: state.row_count,
-                    version_metadata: state.version_metadata,
-                })
-            }
+    match plan_adopted_source_state(target_active, source_entry, target_entry, table_key) {
+        AdoptPublish::Pointer(update) => Ok(update),
+        AdoptPublish::Fork {
+            source_branch,
+            target_branch,
+        } => {
+            let full_path = format!("{}/{}", target_db.uri(), source_entry.table_path);
+            let ds = target_db
+                .fork_dataset_from_entry_state(
+                    table_key,
+                    source_entry.identity,
+                    &full_path,
+                    Some(&source_branch),
+                    source_entry.table_version,
+                    &target_branch,
+                )
+                .await?;
+            let state = target_db.storage().table_state(&full_path, &ds).await?;
+            Ok(crate::db::SubTableUpdate {
+                identity: source_entry.identity,
+                table_key: table_key.to_string(),
+                table_version: state.version,
+                table_branch: Some(target_branch),
+                row_count: state.row_count,
+                version_metadata: state.version_metadata,
+            })
         }
+        // Classification drops a table whose adopt publishes nothing, so this
+        // arm means the candidate set and the plan disagree — an engine bug,
+        // not a caller error.
+        AdoptPublish::Nothing => Err(OmniError::manifest_internal(format!(
+            "branch merge table '{table_key}' publishes nothing and must not be a merge candidate"
+        ))),
     }
 }
 
@@ -3427,19 +3659,26 @@ impl Omnigraph {
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
             outer_prepare_start.elapsed(),
         );
-        let merge_result = self
-            .branch_merge_on_current_target(
-                &base_snapshot,
-                &source_txn,
-                &target_txn,
-                source_branch.as_deref(),
-                target_branch.as_deref(),
-                &target_head_commit_id,
-                &source_head_commit_id,
-                is_fast_forward,
-                actor_id,
-            )
-            .await;
+        // Keep the deliberately large merge planner/publisher state out of the
+        // operation shell's generated future. The inner operation composes
+        // ordered typed comparison, Blob materialization, validation, recovery,
+        // and publication; carrying that state inline makes debug builds retain
+        // large construction/projection temporaries across the shell's guards
+        // and restore path. Boxing at this natural ownership boundary changes
+        // no scheduling or lifetime semantics; this child slot is one pointer
+        // while the inner operation runs.
+        let merge_result = Box::pin(self.branch_merge_on_current_target(
+            &base_snapshot,
+            &source_txn,
+            &target_txn,
+            source_branch.as_deref(),
+            target_branch.as_deref(),
+            &target_head_commit_id,
+            &source_head_commit_id,
+            is_fast_forward,
+            actor_id,
+        ))
+        .await;
         let outer_restore_start = std::time::Instant::now();
         if let Some(previous) = previous {
             self.restore_coordinator(previous).await;
@@ -3531,7 +3770,7 @@ impl Omnigraph {
             let has_blob = schema_has_blob(&schema_for_table_key(catalog, table_key)?)?;
             if !has_blob {
                 if same_manifest_state(base_entry, target_entry) {
-                    let candidate = classify_adopt(
+                    if let Some(candidate) = classify_adopt(
                         self,
                         catalog,
                         base_snapshot,
@@ -3541,8 +3780,10 @@ impl Omnigraph {
                         target_active.as_deref(),
                         &empty_external_preflight,
                     )
-                    .await?;
-                    candidates.insert(table_key.clone(), candidate);
+                    .await?
+                    {
+                        candidates.insert(table_key.clone(), candidate);
+                    }
                 } else if let Some(staged) = stage_streaming_table_merge(
                     self,
                     table_key,
@@ -3672,7 +3913,7 @@ impl Omnigraph {
                             "branch merge Blob proof for '{table_key}' lost its HEAD-advancing classification"
                         )));
                     }
-                    match blob_pure_insert_histories.remove(table_key) {
+                    let classified = match blob_pure_insert_histories.remove(table_key) {
                         Some(proven) => match finalize_proven_pure_insert_adopt(
                             self,
                             table_key,
@@ -3707,6 +3948,21 @@ impl Omnigraph {
                             )
                             .await?
                         }
+                    };
+                    // Blob-bearing tables reach the same net-zero shape, so
+                    // they share the one candidate rule.
+                    match source_entry {
+                        Some(source_entry) => keep_publishing_candidate(
+                            classified,
+                            target_active.as_deref(),
+                            source_entry,
+                            target_entry,
+                            table_key,
+                        ),
+                        // A blob adopt proof is only attempted for a table the
+                        // source carries, so this arm is unreachable; keep the
+                        // classified candidate rather than inventing a refusal.
+                        None => Some(classified),
                     }
                 } else {
                     classify_adopt(
@@ -3721,7 +3977,9 @@ impl Omnigraph {
                     )
                     .await?
                 };
-                candidates.insert(table_key.clone(), candidate);
+                if let Some(candidate) = candidate {
+                    candidates.insert(table_key.clone(), candidate);
+                }
                 continue;
             }
 
@@ -4145,7 +4403,12 @@ impl Omnigraph {
         let recovery_operation_id = recovery
             .as_ref()
             .map(|(_, handle)| handle.operation_id.clone());
-        let post_arm_result = async {
+        // The armed publisher is a natural state-machine boundary: it owns the
+        // physical effects, confirmation, and the one manifest publication.
+        // Keep that large future out of the already broad planning/revalidation
+        // future so debug builds do not stack both generated state machines'
+        // transition storage while polling the substrate publisher.
+        let post_arm_result = Box::pin(async {
             if recovery.is_some() && !first_touch_effects.is_empty() {
                 crate::failpoints::maybe_fail(
                     crate::failpoints::names::BRANCH_MERGE_POST_SIDECAR_PRE_FORK,
@@ -4190,6 +4453,7 @@ impl Omnigraph {
                             source_snapshot,
                             target_snapshot,
                             table_key,
+                            target_active.as_deref(),
                         )
                         .await?
                     }
@@ -4313,14 +4577,18 @@ impl Omnigraph {
                 Some(target_head_commit_id)
             );
             let manifest_publish_start = std::time::Instant::now();
-            self.commit_updates_on_branch_with_expected(
+            // The manifest publisher reaches Lance MergeInsert and DataFusion's
+            // physical planner. Erase that substrate-heavy future at the graph
+            // publication boundary instead of making this recovery envelope's
+            // generated state carry it inline.
+            Box::pin(self.commit_updates_on_branch_with_expected(
                 target_branch,
                 &updates,
                 &expected_versions,
                 actor_id,
                 target_txn,
                 merge_lineage,
-            )
+            ))
             .await?;
             crate::instrumentation::record_merge_timing(
                 crate::instrumentation::MergeTimingPhase::ManifestPublish,
@@ -4328,7 +4596,7 @@ impl Omnigraph {
             );
 
             Ok::<_, OmniError>((updates, changed_edge_tables))
-        }
+        })
         .await;
         let (_updates, changed_edge_tables) = match post_arm_result {
             Ok(result) => result,

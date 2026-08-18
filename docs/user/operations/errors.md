@@ -4,6 +4,9 @@
 
 - `Compiler(...)` — schema/query parse/typecheck errors
 - `Lance(String)` — storage layer
+- `HistoricalVersionReclaimed { version }` — an exact manifest-pinned Lance
+  version was reclaimed. Historical callers keep this distinct from ordinary
+  absence; change routes project it to the typed 410 baseline-reset contract.
 - `DataFusion(String)` — execution layer
 - `Io(io::Error)`
 - `Manifest(ManifestError { kind: BadRequest|NotFound|Conflict|Internal, details: Option<ManifestConflictDetails>, … })`
@@ -46,6 +49,23 @@
   `key_conflict.key` only after an observed preflight or fresh exact-ID probe;
   the field stays optional in the additive wire schema. Retrying the same
   strict operation does not turn it into an upsert.
+- `ChangeCursorRejected { reason }` — an opaque change page token or feed
+  cursor is malformed, non-canonical, the wrong token kind, or bound to another
+  graph/commit/branch-incarnation/filter scope. HTTP returns **400**; restart
+  from a valid cursor or capture a new baseline rather than parsing `reason`.
+- `BranchNotFound { branch }` — the caller-selected logical graph branch was
+  absent at the typed branch-ref boundary. HTTP change routes return a fixed
+  graph-vocabulary **404** and do not expose the branch name or physical path.
+- `ChangeFeedGap { cursor, first_unreadable_commit_id }` — retention prevents a
+  contiguous diff/feed reconstruction. HTTP returns **410** with
+  `change_feed_gap`; recover through the exact baseline handshake.
+- `CommitHasNoParent { graph_commit_id }` — a parentless genesis commit has no
+  first-parent entity diff. HTTP returns **409** with `change_diff_refusal`;
+  bootstrap from a baseline.
+- `ChangeSchemaBoundary { graph_commit_id, type_name }` — the two exact commit
+  snapshots do not have a provably identical logical schema for the paired
+  lifetime. HTTP returns **409** with `change_diff_refusal` instead of guessing
+  or returning a false empty diff.
 - `RetryableCommitConflict(String)` — the typed internal signal that Lance
   rejected a stale filtered transaction. Upsert writers consume an effect-free
   instance by discarding and fully repreparing the logical operation; a strict
@@ -88,7 +108,10 @@
   `stream_export_transport_bytes`, `Blob read range bytes`, `external Blob URI
   bytes`, `external Blob reference cells`, `external Blob URI metadata bytes`,
   `external Blob object bytes`, `decoded blob input bytes`, `materialized blob
-  payload bytes`,
+  payload bytes`, `commit_changes_page_rows`, `commit_changes_page_bytes`,
+  `change_feed_commits_per_poll`, `change_continuation_token_encoded_bytes`,
+  `ordered_scan_memory_bytes`, `ordered_scan_scratch_bytes`,
+  `ordered_scan_input_batch_bytes`, `ordered_scan_spilling_disabled`,
   `materialized external blob payload bytes`, `branch-merge delete filter
   bytes`, `branch-merge retained delete plan bytes`, `branch-merge fenced row
   bytes`, `branch-merge recovery transaction chain`, and `branch-merge retained

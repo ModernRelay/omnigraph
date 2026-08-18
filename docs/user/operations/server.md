@@ -306,7 +306,7 @@ rather than widening that value to the whole target object.
 ## Error model
 
 Uniform
-`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, resource_limit?, external_blob_source?, blob_range?, recovery_required?, precondition_failure? }`
+`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, resource_limit?, external_blob_source?, blob_range?, recovery_required?, precondition_failure?, change_feed_gap?, change_diff_refusal? }`
 with
 `code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
 Merge conflicts attach structured
@@ -350,6 +350,22 @@ structured field is additive and rolling-safe.
 Do not blindly resubmit the write: let a read-write open or the recovery sweep
 resolve that operation first, then retry from a fresh snapshot.
 
+`change_feed_gap` is set when a commit diff or feed continuation can no longer
+be reconstructed because cleanup reclaimed one of its pinned table versions.
+The HTTP status is 410 and
+`ChangeFeedGapOutput { cursor, first_unreadable_commit_id }` identifies the
+failed continuation point. Retrying the same token cannot repair retention;
+capture an exact baseline, install it durably, and resume from the terminal
+baseline cursor.
+
+`change_diff_refusal` is set when a requested commit has no first parent or its
+two exact snapshots cross an unprovable logical schema boundary. The HTTP
+status is 409 and
+`ChangeDiffRefusalOutput { reason, graph_commit_id, type_name? }` identifies
+the refused diff. Bootstrap a parentless history from a baseline;
+for a schema boundary, request separate baselines or another provable range
+instead of interpreting the refusal as an empty change.
+
 `precondition_failure` is set when a mutation carried an
 `Omnigraph-If-Graph-Commit: <commit_id>` branch-head precondition and the
 branch's head no longer matches that id. The HTTP status is 412 and
@@ -377,7 +393,7 @@ losing request may already own durable table effects and therefore returns
 `recovery_required` (503) for recovery instead of 412.
 
 HTTP status codes used include 200, 206, 302, 304, 400, 401, 403, 404, 405,
-409, 412, 413, 415, 416, 424, 429, 500, and 503.
+409, 410, 412, 413, 415, 416, 424, 429, 500, and 503.
 
 ## Per-actor admission control
 

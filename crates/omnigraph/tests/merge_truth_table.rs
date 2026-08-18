@@ -2,12 +2,19 @@
 //!
 //! Enumerates every `(left_op, right_op)` cell from the graph operation
 //! vocabulary `{noop, addNode, removeNode, addEdge, removeEdge,
-//! setProperty, dropProperty, addLabel, removeLabel}` and asserts the
-//! deterministic outcome of `Omnigraph::branch_merge`.
+//! setProperty, netZeroEdge, dropProperty, addLabel, removeLabel}` and
+//! asserts the deterministic outcome of `Omnigraph::branch_merge`.
 //!
-//! The vocabulary is the one named in the ticket. Today's mutation grammar
-//! only exposes `insert | update set | delete`, so `dropProperty`,
-//! `addLabel`, and `removeLabel` are dispositioned as
+//! `netZeroEdge` is the ticket vocabulary plus one: a side that commits real
+//! changes whose net content effect is zero. It is deliberately not folded
+//! into `noop`, because the two take different engine routes — `noop` is
+//! skipped on manifest equality while `netZeroEdge` reaches adopt
+//! classification (#473). Crossing it with every other op is what makes the
+//! matrix cover the interaction rather than the single reported example.
+//!
+//! The rest of the vocabulary is the one named in the ticket. Today's
+//! mutation grammar only exposes `insert | update set | delete`, so
+//! `dropProperty`, `addLabel`, and `removeLabel` are dispositioned as
 //! [`Expected::Unsupported`] cells — they live in the matrix so adding the
 //! ops later is a compile-time, fail-on-omission task. Adding a new op to
 //! [`OpVariant`] forces a non-exhaustive match in [`build_case`] and so
@@ -122,6 +129,11 @@ enum OpVariant {
     AddEdge,
     RemoveEdge,
     SetProperty,
+    /// Add an edge and remove it again: real commits whose net content change
+    /// is zero. The side's manifest state still advances, so it is not the
+    /// same cell as [`OpVariant::Noop`] — it reaches adopt classification
+    /// where `Noop` is skipped outright. Regression cover for #473.
+    NetZeroEdge,
     /// Not in today's mutation grammar; see `crates/omnigraph/docs/query-language.md`
     /// (`.gq` exposes only `insert | update set | delete`).
     DropProperty,
@@ -133,13 +145,14 @@ enum OpVariant {
 }
 
 impl OpVariant {
-    const ALL: [OpVariant; 9] = [
+    const ALL: [OpVariant; 10] = [
         OpVariant::Noop,
         OpVariant::AddNode,
         OpVariant::RemoveNode,
         OpVariant::AddEdge,
         OpVariant::RemoveEdge,
         OpVariant::SetProperty,
+        OpVariant::NetZeroEdge,
         OpVariant::DropProperty,
         OpVariant::AddLabel,
         OpVariant::RemoveLabel,
@@ -153,6 +166,7 @@ impl OpVariant {
             OpVariant::AddEdge => "addEdge",
             OpVariant::RemoveEdge => "removeEdge",
             OpVariant::SetProperty => "setProperty",
+            OpVariant::NetZeroEdge => "netZeroEdge",
             OpVariant::DropProperty => "dropProperty",
             OpVariant::AddLabel => "addLabel",
             OpVariant::RemoveLabel => "removeLabel",
@@ -179,6 +193,10 @@ enum Apply {
     SetAliceAge {
         age: i32,
     },
+    /// Insert `Alice -> Carol` and delete it again. Two real commits whose
+    /// net content change is zero: `edge:Knows` returns to the base image at
+    /// a manifest version two ahead of it.
+    NetZeroKnowsFromAlice,
 }
 
 async fn apply(db: &mut Omnigraph, branch: &str, action: Apply) {
@@ -235,6 +253,26 @@ async fn apply(db: &mut Omnigraph, branch: &str, action: Apply) {
                 TRUTH_MUTATIONS,
                 "set_person_age",
                 &mixed_params(&[("$name", "Alice")], &[("$age", age as i64)]),
+            )
+            .await
+            .unwrap();
+        }
+        Apply::NetZeroKnowsFromAlice => {
+            mutate_branch(
+                db,
+                branch,
+                TRUTH_MUTATIONS,
+                "insert_knows",
+                &params(&[("$from", "Alice"), ("$to", "Carol")]),
+            )
+            .await
+            .unwrap();
+            mutate_branch(
+                db,
+                branch,
+                TRUTH_MUTATIONS,
+                "delete_knows_from",
+                &params(&[("$from", "Alice")]),
             )
             .await
             .unwrap();
@@ -437,6 +475,12 @@ fn build_case(left: OpVariant, right: OpVariant) -> MergeCase {
             Expected::AlreadyUpToDate,
             "source unchanged → up to date",
         ),
+        (Noop, NetZeroEdge) => mk(
+            Skip,
+            NetZeroKnowsFromAlice,
+            Expected::AlreadyUpToDate,
+            "source unchanged → up to date",
+        ),
 
         // ─── Row: AddNode ───────────────────────────────────────────────
         (AddNode, Noop) => mk(
@@ -479,6 +523,12 @@ fn build_case(left: OpVariant, right: OpVariant) -> MergeCase {
             Expected::Merged(GraphAssert::base().with_eve().with_alice_age(31)),
             "disjoint: insert node + update other node",
         ),
+        (AddNode, NetZeroEdge) => mk(
+            InsertEve { age: 22 },
+            NetZeroKnowsFromAlice,
+            Expected::Merged(GraphAssert::base().with_eve()),
+            "target's edge churn nets to zero; only the source's node lands",
+        ),
 
         // ─── Row: RemoveNode ────────────────────────────────────────────
         (RemoveNode, Noop) => mk(
@@ -520,6 +570,12 @@ fn build_case(left: OpVariant, right: OpVariant) -> MergeCase {
                 Some("Alice"),
             ),
             "delete vs update on same row",
+        ),
+        (RemoveNode, NetZeroEdge) => mk(
+            DeleteAlice,
+            NetZeroKnowsFromAlice,
+            Expected::Merged(GraphAssert::base().without_alice()),
+            "target's edge churn nets to zero; the source's delete lands",
         ),
 
         // ─── Row: AddEdge ───────────────────────────────────────────────
@@ -576,6 +632,12 @@ fn build_case(left: OpVariant, right: OpVariant) -> MergeCase {
             ),
             "disjoint: insert edge involving Alice + update Alice.age",
         ),
+        (AddEdge, NetZeroEdge) => mk(
+            InsertAliceCarol,
+            NetZeroKnowsFromAlice,
+            Expected::Merged(GraphAssert::base().with_extra_knows_edge()),
+            "both sides moved edge:Knows; the target's churn cancels out",
+        ),
 
         // ─── Row: RemoveEdge ────────────────────────────────────────────
         (RemoveEdge, Noop) => mk(
@@ -614,6 +676,12 @@ fn build_case(left: OpVariant, right: OpVariant) -> MergeCase {
             SetAliceAge { age: 31 },
             Expected::Merged(GraphAssert::base().without_bob_carol().with_alice_age(31)),
             "disjoint: delete edge + update unrelated node",
+        ),
+        (RemoveEdge, NetZeroEdge) => mk(
+            DeleteKnowsFromBob,
+            NetZeroKnowsFromAlice,
+            Expected::Merged(GraphAssert::base().without_bob_carol()),
+            "both sides moved edge:Knows; only the source's delete survives",
         ),
 
         // ─── Row: SetProperty ───────────────────────────────────────────
@@ -664,6 +732,61 @@ fn build_case(left: OpVariant, right: OpVariant) -> MergeCase {
                 Some("Alice"),
             ),
             "both sides set Alice.age to different values",
+        ),
+        (SetProperty, NetZeroEdge) => mk(
+            SetAliceAge { age: 31 },
+            NetZeroKnowsFromAlice,
+            Expected::Merged(GraphAssert::base().with_alice_age(31)),
+            "disjoint tables: the target's edge churn nets to zero",
+        ),
+
+        // ─── Row: NetZeroEdge ───────────────────────────────────────────
+        // A source whose edits net back to the fork point (#473). It is not
+        // `Noop`: its manifest state advanced, so the table reaches adopt
+        // classification instead of the manifest-equality skip. No cell in
+        // this row conflicts — a side that changes nothing cannot diverge
+        // from anything.
+        (NetZeroEdge, Noop) => mk(
+            NetZeroKnowsFromAlice,
+            Skip,
+            Expected::FastForward(GraphAssert::base()),
+            "source nets to zero against an unmoved target → #473",
+        ),
+        (NetZeroEdge, AddNode) => mk(
+            NetZeroKnowsFromAlice,
+            InsertEve { age: 22 },
+            Expected::Merged(GraphAssert::base().with_eve()),
+            "source nets to zero; the target's node survives",
+        ),
+        (NetZeroEdge, RemoveNode) => mk(
+            NetZeroKnowsFromAlice,
+            DeleteAlice,
+            Expected::Merged(GraphAssert::base().without_alice()),
+            "source nets to zero; the target's delete survives",
+        ),
+        (NetZeroEdge, AddEdge) => mk(
+            NetZeroKnowsFromAlice,
+            InsertAliceCarol,
+            Expected::Merged(GraphAssert::base().with_extra_knows_edge()),
+            "both sides moved edge:Knows; the source's churn cancels out",
+        ),
+        (NetZeroEdge, RemoveEdge) => mk(
+            NetZeroKnowsFromAlice,
+            DeleteKnowsFromBob,
+            Expected::Merged(GraphAssert::base().without_bob_carol()),
+            "both sides moved edge:Knows; only the target's delete survives",
+        ),
+        (NetZeroEdge, SetProperty) => mk(
+            NetZeroKnowsFromAlice,
+            SetAliceAge { age: 31 },
+            Expected::Merged(GraphAssert::base().with_alice_age(31)),
+            "disjoint tables: the source's edge churn nets to zero",
+        ),
+        (NetZeroEdge, NetZeroEdge) => mk(
+            NetZeroKnowsFromAlice,
+            NetZeroKnowsFromAlice,
+            Expected::Merged(GraphAssert::base()),
+            "both sides net to zero; the graph is unchanged either way",
         ),
 
         // ─── Unsupported (DropProperty / AddLabel / RemoveLabel) ────────
@@ -778,6 +901,8 @@ fn state_after_apply_only(action: Apply) -> GraphAssert {
         Apply::InsertAliceCarol => GraphAssert::base().with_extra_knows_edge(),
         Apply::DeleteKnowsFromBob => GraphAssert::base().without_bob_carol(),
         Apply::SetAliceAge { age } => GraphAssert::base().with_alice_age(age),
+        // The whole point of the op: two commits, zero net content change.
+        Apply::NetZeroKnowsFromAlice => GraphAssert::base(),
     }
 }
 
@@ -932,14 +1057,14 @@ async fn merge_pair_truth_table() {
         elapsed.as_secs_f64(),
     );
 
-    assert_eq!(total_cells, 81, "truth table must enumerate all 81 cells");
+    assert_eq!(total_cells, 100, "truth table must enumerate all 100 cells");
     assert_eq!(
-        executable_cells, 36,
-        "expected 6×6 executable cells under the current mutation grammar"
+        executable_cells, 49,
+        "expected 7×7 executable cells under the current mutation grammar"
     );
     assert_eq!(
-        unsupported_cells, 45,
-        "expected 45 cells involving dropProperty/addLabel/removeLabel"
+        unsupported_cells, 51,
+        "expected 51 cells involving dropProperty/addLabel/removeLabel"
     );
     // No wall-clock assertion here: `elapsed` is logged above for visibility, but
     // a fixed time budget in a correctness test flakes under parallel test load

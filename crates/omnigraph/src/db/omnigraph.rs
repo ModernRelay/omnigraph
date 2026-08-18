@@ -2787,26 +2787,28 @@ impl Omnigraph {
         }
 
         // Dependency detection reads ONLY each surviving branch's manifest
-        // `table_branch` entries, so take the manifest-only snapshot. A full
-        // `snapshot_of` resolve would additionally load the commit-lineage
-        // projection and re-read + re-validate the schema contract PER BRANCH —
-        // O(branches x history) I/O that made deletion time out on large
-        // graphs — and its per-foreign-branch schema validation could wedge
-        // deletion of an unrelated branch behind another branch's schema
-        // drift. This operation's own schema was already validated under the
-        // schema gate above.
+        // `table_branch` entries. The schema-control gate held by the caller
+        // serializes native branch create/delete, while the target branch and
+        // table gates prevent a writer from creating new target-owned state.
+        // An ordinary write to a surviving branch can only replace an inherited
+        // target fork with that branch's own fork, so a concurrent write can
+        // make this check conservatively stale-true, never stale-false. The
+        // candidate branch's native incarnation is therefore not part of this
+        // proof and must not add two discarded BranchContents reads per branch.
+        // General coordinator/OCC/feed opens retain the coherent incarnation
+        // capture required by RFC-030.
         for other_branch in branches
             .iter()
             .filter(|candidate| candidate.as_str() != branch)
         {
-            let snapshot = self
-                .fresh_snapshot_for_branch_unchecked(
-                    Self::normalize_branch_name(other_branch)?.as_deref(),
-                )
-                .await?;
-            if snapshot
-                .entries()
-                .any(|entry| entry.table_branch.as_deref() == Some(branch))
+            let candidate_branch = Self::normalize_branch_name(other_branch)?;
+            if crate::db::manifest::ManifestCoordinator::branch_depends_on_delete_target_under_control_gates(
+                self.uri(),
+                candidate_branch.as_deref(),
+                branch,
+                &self.control_session(),
+            )
+            .await?
             {
                 return Err(OmniError::manifest_conflict(format!(
                     "cannot delete branch '{}' because branch '{}' still depends on it",

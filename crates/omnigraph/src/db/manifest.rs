@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::branch_control::list_branch_contents;
 use crate::error::{OmniError, Result};
 use datafusion::logical_expr::Expr;
 use lance::Dataset;
@@ -528,8 +529,15 @@ async fn probe_dataset_latest_incarnation(
         });
     }
     let branch = active_branch.expect("named-branch arm checked above");
-    let (manifest, location) = dataset
-        .latest_manifest()
+    // A named branch's native identifier is its lifetime witness. Pair it with
+    // the branch-local latest version instead of loading the manifest body:
+    // version changes catch ordinary commits, while the identifier catches a
+    // same-source delete/recreate even when version, e-tag, and timestamp all
+    // repeat. Read the version first so a recreation between the two probes
+    // yields the replacement identifier rather than a false match to the held
+    // lifetime.
+    let version = dataset
+        .latest_version_id()
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
     let branch_identifier = dataset
@@ -537,9 +545,9 @@ async fn probe_dataset_latest_incarnation(
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
     Ok(ManifestIncarnation {
-        version: manifest.version,
-        e_tag: location.e_tag,
-        timestamp_nanos: Some(manifest.timestamp_nanos),
+        version,
+        e_tag: None,
+        timestamp_nanos: None,
         branch_identifier,
     })
 }
@@ -971,6 +979,38 @@ impl ManifestCoordinator {
         ))
     }
 
+    /// Test whether one live graph branch still inherits a table fork from a
+    /// branch being deleted, without capturing the candidate branch's native
+    /// incarnation.
+    ///
+    /// This deliberately narrow predicate is valid only while the caller holds
+    /// branch-delete's complete control envelope: the schema-control gate, the
+    /// delete-target branch gate, and every accepted-catalog table gate for the
+    /// target. The schema gate serializes native branch create/delete in the
+    /// supported single-writer process, and an ordinary writer can only replace
+    /// an inherited `table_branch` with its own branch; it cannot make a live
+    /// branch newly inherit the held delete target. A raced write can therefore
+    /// make this snapshot conservatively report an old dependency, never hide a
+    /// new one.
+    ///
+    /// General coordinator, OCC, and live-read/feed opens must not use this
+    /// path: they need the BranchIdentifier captured with their manifest
+    /// projection to fence delete/recreate ABA.
+    pub(super) async fn branch_depends_on_delete_target_under_control_gates(
+        root_uri: &str,
+        candidate_branch: Option<&str>,
+        delete_target: &str,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<bool> {
+        let root = root_uri.trim_end_matches('/');
+        let dataset =
+            open_manifest_dataset_with_session(root, candidate_branch, control_session).await?;
+        let snapshot = Self::snapshot_from_state(root, read_manifest_state(&dataset).await?);
+        Ok(snapshot
+            .entries()
+            .any(|entry| entry.table_branch.as_deref() == Some(delete_target)))
+    }
+
     /// Return a Snapshot from the known manifest state. No storage I/O.
     pub fn snapshot(&self) -> Snapshot {
         Self::snapshot_from_state(&self.root_uri, self.known_state.clone())
@@ -1256,10 +1296,7 @@ impl ManifestCoordinator {
 
     pub(crate) async fn delete_branch(&mut self, name: &str) -> Result<()> {
         let mut ds = self.open_branch_control_dataset().await?;
-        let branches = ds
-            .list_branches()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let branches = list_branch_contents(&ds).await?;
         let expected_identifier = branches
             .get(name)
             .ok_or_else(|| OmniError::manifest_not_found(format!("branch '{}' not found", name)))?
@@ -1287,12 +1324,8 @@ impl ManifestCoordinator {
         crate::branch_control::delete_branch_recoverably(&mut ds, name, expected_identifier).await
     }
 
-    pub async fn list_branches(&self) -> Result<Vec<String>> {
-        let branches = self
-            .dataset
-            .list_branches()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    pub async fn list_graph_branches(&self) -> Result<Vec<String>> {
+        let branches = list_branch_contents(&self.dataset).await?;
         let mut names: Vec<String> = branches.into_keys().filter(|name| name != "main").collect();
         names.sort();
         let mut all = vec!["main".to_string()];
@@ -1301,11 +1334,7 @@ impl ManifestCoordinator {
     }
 
     pub async fn descendant_branches(&self, name: &str) -> Result<Vec<String>> {
-        let branches = self
-            .dataset
-            .list_branches()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let branches = list_branch_contents(&self.dataset).await?;
         let mut frontier = vec![name.to_string()];
         let mut descendants = Vec::new();
         let mut seen = HashSet::new();

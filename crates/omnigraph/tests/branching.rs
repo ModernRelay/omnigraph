@@ -704,7 +704,10 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
         ),
         "the advanced branch must observe the deletion, got {deleted:?}"
     );
+}
 
+#[tokio::test]
+async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_reads() {
     // Lance branch versions live in independent namespaces and a deleted
     // branch can be recreated at the same name and numeric table version.
     // The UUID-bearing transaction-file identity in each immutable manifest
@@ -986,6 +989,10 @@ node Marker {
 
 #[tokio::test]
 async fn branch_merge_with_external_blob_uri_materializes_payload() {
+    Box::pin(branch_merge_with_external_blob_uri_materializes_payload_body()).await;
+}
+
+async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let external_dir = tempfile::tempdir().unwrap();
@@ -1252,12 +1259,21 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
     assert_eq!(converged.uri, canonical_external_uri);
     assert_eq!(converged.offset, 0);
     assert_eq!(converged.length, None);
+}
 
-    // A pointer-only main -> named-branch adoption is not new ingress and does
-    // not write a row. It must preserve the already-stored descriptor without
-    // policy approval or source I/O, even when the caller-owned target has
-    // disappeared.
-    main.branch_create("pointer-target").await.unwrap();
+/// A pointer-only main -> named-branch adoption is not new ingress and does
+/// not write a row. It must preserve the already-stored descriptor without
+/// policy approval or source I/O, even when the caller-owned target has
+/// disappeared.
+#[tokio::test]
+async fn branch_merge_pointer_only_external_blob_needs_no_source_io() {
+    Box::pin(branch_merge_pointer_only_external_blob_needs_no_source_io_body()).await;
+}
+
+async fn branch_merge_pointer_only_external_blob_needs_no_source_io_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
     let pointer_path = external_dir.path().join("pointer-only.txt");
     fs::write(&pointer_path, b"Pointer only").unwrap();
     let pointer_uri = url::Url::from_file_path(&pointer_path)
@@ -1266,6 +1282,19 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
     let canonical_pointer_uri = url::Url::from_file_path(fs::canonicalize(&pointer_path).unwrap())
         .expect("canonical pointer-only external blob path is absolute")
         .to_string();
+    let base_uri = url::Url::from_directory_path(external_dir.path())
+        .expect("external blob base is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+    let main = Omnigraph::init(uri, MULTI_TABLE_EXTERNAL_BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    main.branch_create("pointer-target").await.unwrap();
     let pointer_data = serde_json::json!({
         "type": "Document",
         "data": {
@@ -1341,6 +1370,10 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
 /// row total exceeds 32 MiB. Both failures are entirely pre-effect.
 #[tokio::test]
 async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
+    Box::pin(branch_merge_rejects_external_blob_payloads_pre_effect_body()).await;
+}
+
+async fn branch_merge_rejects_external_blob_payloads_pre_effect_body() {
     const LIMIT: u64 = 32 * 1024 * 1024;
 
     for (case, first_bytes, second_bytes, split_across_tables, expected_actual) in [
@@ -1499,10 +1532,19 @@ async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
             "{case}: pre-effect rejection must not leave a recovery sidecar"
         );
     }
+}
 
-    // Managed descriptors need no external HEAD, but their carried payload is
-    // still one operation-wide merge budget. Load each row in its own valid
-    // source operation so only the merge's aggregate can exceed the ceiling.
+/// Managed descriptors need no external HEAD, but their carried payload is
+/// still one operation-wide merge budget. Load each row in its own valid
+/// source operation so only the merge's aggregate can exceed the ceiling.
+#[tokio::test]
+async fn branch_merge_rejects_managed_blob_payloads_pre_effect() {
+    Box::pin(branch_merge_rejects_managed_blob_payloads_pre_effect_body()).await;
+}
+
+async fn branch_merge_rejects_managed_blob_payloads_pre_effect_body() {
+    const LIMIT: u64 = 32 * 1024 * 1024;
+
     let dir = tempfile::tempdir().unwrap();
     let graph_path = dir.path().join("managed-aggregate-graph");
     let graph_uri = graph_path.to_str().unwrap();
@@ -1580,12 +1622,18 @@ async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
     );
     let recovery_dir = graph_path.join("__recovery");
     assert!(!recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none());
+}
 
-    // The descriptor pass owns one operation-wide cell bound. Assemble a
-    // source image with two separate Overwrites that are each legal on their
-    // own, then prove the merge refuses their 8,193 selected external cells
-    // before the first external HEAD, payload GET, recovery arm, or target
-    // effect.
+/// The descriptor pass owns one operation-wide cell bound. Assemble a source
+/// image with two separate Overwrites that are each legal on their own, then
+/// prove the merge refuses their 8,193 selected external cells before the
+/// first external HEAD, payload GET, recovery arm, or target effect.
+#[tokio::test]
+async fn branch_merge_rejects_external_blob_reference_cells_pre_effect() {
+    Box::pin(branch_merge_rejects_external_blob_reference_cells_pre_effect_body()).await;
+}
+
+async fn branch_merge_rejects_external_blob_reference_cells_pre_effect_body() {
     const REFERENCE_LIMIT: usize = 8192;
     let dir = tempfile::tempdir().unwrap();
     let graph_path = dir.path().join("external-cell-aggregate-graph");

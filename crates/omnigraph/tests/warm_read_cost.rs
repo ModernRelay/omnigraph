@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
 
-use helpers::cost::{cost_harness, measure};
+use helpers::cost::{cost_harness, last_manifest_reads, measure};
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, commit_many, count_rows, first_column_sorted, init_and_load,
     mixed_params, mutate_branch, mutate_main, params,
@@ -206,12 +206,15 @@ async fn schema_source_drift_is_caught_on_read() {
 
 // ── Morphological-matrix coverage: branch-warm + stale-refresh cells ──────────
 
-/// A WARM read on a non-main branch (handle synced to that branch) also scans
-/// `__manifest` zero times. Exercises Fix 2's branch-owned-table open
-/// (`{table_path}/tree/{branch}` + with_version) on Fix 1's warm path — the cell
-/// that regressed when the open used `with_branch` against the base.
+/// A WARM read on a non-main branch (handle synced to that branch) reads only
+/// that branch's authoritative `BranchContents` lifetime witness. It does not
+/// read or scan a `__manifest` version body. Exercises Fix 2's
+/// branch-owned-table open (`{table_path}/tree/{branch}` + with_version) on Fix
+/// 1's warm path — the cell that regressed when the open used `with_branch`
+/// against the base. The one ref read is required because version/e-tag/time
+/// can all repeat across a same-source delete/recreate.
 #[tokio::test]
-async fn warm_branch_read_does_no_manifest_scans() {
+async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
         let mut db = init_and_load(&dir).await;
@@ -240,13 +243,24 @@ async fn warm_branch_read_does_no_manifest_scans() {
         .await;
         out.unwrap();
 
-        assert_eq!(
-            io.manifest_reads, 0,
-            "warm branch read must not scan __manifest (branch-owned table opened by location)"
+        assert_eq!(io.manifest_reads, 1, "warm branch read must spend exactly one read on the native branch-lifetime witness; reads: {:#?}", last_manifest_reads());
+        let reads = last_manifest_reads();
+        assert_eq!(reads.len(), 1);
+        assert!(
+            reads[0].contains("_refs/branches/feature.json"),
+            "the sole warm named-branch read must be BranchContents, not a manifest body: {reads:#?}"
         );
         assert_eq!(
             io.version_probes, 1,
             "warm branch read probes only the requested branch once"
+        );
+        assert_eq!(
+            io.internal_open_count, 0,
+            "the native lifetime witness must not reopen the manifest dataset"
+        );
+        assert_eq!(
+            io.manifest_scan_count, 0,
+            "the native lifetime witness must not scan manifest rows"
         );
     })
     .await;

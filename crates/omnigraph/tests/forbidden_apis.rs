@@ -422,11 +422,20 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "ManifestCoordinator",
         "probe_latest_incarnation",
     ),
-    ("db/manifest.rs", "ManifestCoordinator", "list_branches"),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "list_graph_branches",
+    ),
     (
         "db/manifest.rs",
         "ManifestCoordinator",
         "descendant_branches",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "branch_depends_on_delete_target_under_control_gates",
     ),
 ];
 
@@ -559,7 +568,7 @@ gateway_surfaces! {
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::ReadOrPure => [
         "open_snapshot_at_entry", "open_snapshot_at_table", "open_dataset_head",
-        "branch_identifier", "list_branches", "reopen_for_mutation",
+        "branch_identifier", "list_native_branches", "reopen_for_mutation",
         "ensure_expected_version", "scan", "scan_with_row_id", "scan_batches",
         "scan_batches_for_rewrite", "count_rows", "count_rows_with_staged",
         "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
@@ -592,13 +601,14 @@ gateway_surfaces! {
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
-        "open_at_entry_verified",
-        "open_dataset_head", "list_branches", "ensure_expected_version",
+        "open_at_entry_verified", "open_dataset_head", "list_native_branches",
+        "ensure_expected_version",
         "reopen_for_mutation", "scan_batches", "scan_batches_for_rewrite",
         "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
-        "scan_stream_with", "scan", "scan_with", "scan_edges_by_endpoint",
+        "scan_stream_with", "ordered_scan_error", "scan", "scan_with",
+        "scan_edges_by_endpoint",
         "scan_edges_by_endpoint_projected",
         "key_column_index_coverage", "has_unindexed_fragments", "count_rows",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
@@ -2000,8 +2010,15 @@ fn structural_call_scanner_skips_test_module_but_keeps_later_production() {
 fn structural_call_scanner_closes_raw_dataset_and_ufcs_routes() {
     let ast = parse_rust_source(
         r#"
-        fn exercise(ds: &Dataset, storage: &Storage, audit: &mut RecoveryAudit) {
+        fn exercise(
+            ds: &Dataset,
+            scanner: &mut Scanner,
+            storage: &Storage,
+            audit: &mut RecoveryAudit,
+        ) {
             ds.append(reader, params);
+            ds.list_branches();
+            scanner.order_by(ordering);
             Dataset::append(ds, reader, params);
             <Dataset>::merge_insert(ds, params);
             ds.add_columns(transforms, None);
@@ -2021,6 +2038,8 @@ fn structural_call_scanner_closes_raw_dataset_and_ufcs_routes() {
     );
     let inventory = call_inventory(&ast);
     assert_eq!(inventory.counts.get(".raw_dataset_append("), Some(&2));
+    assert_eq!(inventory.counts.get("list_branches"), Some(&1));
+    assert_eq!(inventory.counts.get("order_by"), Some(&1));
     assert_eq!(inventory.counts.get("merge_insert"), Some(&1));
     assert_eq!(inventory.counts.get("add_columns"), Some(&1));
     assert_eq!(inventory.counts.get("Dataset::write("), Some(&1));
@@ -2492,6 +2511,142 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
         method_call_count(&delete_helper.block, "invalidate_read_caches"),
         1,
         "captured branch deletion must invalidate derived caches after successful ref removal"
+    );
+}
+
+/// Lance's raw `Dataset::list_branches` is safe only behind the bounded retry
+/// in `branch_control.rs`. OmniGraph's forwarding layers deliberately use
+/// distinct method names, so the ordinary structural inventory can require
+/// this to remain the sole production call.
+#[test]
+fn lance_branch_enumeration_stays_behind_retry_boundary() {
+    let src = engine_src_root();
+    let mut sites = Vec::new();
+    for file in protocol_scan_files(&src) {
+        let relative = relative_to_src(&src, &file);
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let count = call_inventory(&ast)
+            .counts
+            .get("list_branches")
+            .copied()
+            .unwrap_or(0);
+        if count > 0 {
+            sites.push((relative, count));
+        }
+    }
+    sites.sort();
+
+    assert_eq!(
+        sites,
+        vec![("branch_control.rs".to_string(), 1)],
+        "raw Lance branch enumeration must remain centralized in branch_control.rs"
+    );
+
+    let branch_control = std::fs::read_to_string(src.join("branch_control.rs"))
+        .expect("read branch_control.rs for raw branch-enumeration owner signature");
+    let ast = parse_rust_source(&branch_control, "branch_control.rs");
+    let owner = ast
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Fn(function) if function.sig.ident == "list_branch_contents" => Some(function),
+            _ => None,
+        })
+        .expect("branch_control.rs must define list_branch_contents");
+    assert_eq!(
+        owner.sig.inputs.len(),
+        1,
+        "the raw branch-enumeration owner must accept only its Dataset handle"
+    );
+    let syn::FnArg::Typed(parameter) = &owner.sig.inputs[0] else {
+        panic!("the raw branch-enumeration owner must accept dataset: &Dataset");
+    };
+    assert!(
+        matches!(
+            parameter.pat.as_ref(),
+            syn::Pat::Ident(identifier) if identifier.ident == "dataset"
+        ),
+        "the raw branch-enumeration owner parameter must remain named `dataset`"
+    );
+    assert!(
+        matches!(
+            parameter.ty.as_ref(),
+            Type::Reference(reference) if is_named_type(&reference.elem, "Dataset")
+        ),
+        "the raw branch-enumeration owner must accept dataset: &Dataset"
+    );
+    let mut owner_inventory = CallInventory::default();
+    owner_inventory.visit_item_fn(owner);
+    assert_eq!(
+        owner_inventory.counts.get("list_branches"),
+        Some(&1),
+        "list_branch_contents(dataset: &Dataset) must own the one raw Lance call"
+    );
+}
+
+/// Ordering is an executor-selection boundary: Lance's ordinary scanner uses
+/// an unbounded SortExec. Every raw `Scanner::order_by` call must therefore
+/// remain in `TableStore::scan_stream_with`, whose callback receives the
+/// restricted `ScanTuning` surface and cannot add ordering afterward.
+#[test]
+fn lance_ordering_stays_behind_bounded_scan_executor() {
+    let src = engine_src_root();
+    let mut sites = Vec::new();
+    for file in protocol_scan_files(&src) {
+        let relative = relative_to_src(&src, &file);
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let count = call_inventory(&ast)
+            .counts
+            .get("order_by")
+            .copied()
+            .unwrap_or(0);
+        if count > 0 {
+            sites.push((relative, count));
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![("table_store.rs".to_string(), 1)],
+        "raw Lance ordering must remain centralized in TableStore::scan_stream_with"
+    );
+
+    let table_store = std::fs::read_to_string(src.join("table_store.rs"))
+        .expect("read table_store.rs for ordered-scan owner signature");
+    let ast = parse_rust_source(&table_store, "table_store.rs");
+    let mut owner = None;
+    let mut tuning_exposes_order_by = false;
+    for item in &ast.items {
+        let Item::Impl(implementation) = item else {
+            continue;
+        };
+        if is_named_type(&implementation.self_ty, "TableStore") {
+            owner = implementation.items.iter().find_map(|item| match item {
+                syn::ImplItem::Fn(function) if function.sig.ident == "scan_stream_with" => {
+                    Some(function)
+                }
+                _ => None,
+            });
+        }
+        if is_named_type(&implementation.self_ty, "ScanTuning") {
+            tuning_exposes_order_by = implementation.items.iter().any(|item| {
+                matches!(item, syn::ImplItem::Fn(function) if function.sig.ident == "order_by")
+            });
+        }
+    }
+    let owner = owner.expect("TableStore::scan_stream_with must own raw Lance ordering");
+    assert_eq!(
+        method_call_count(&owner.block, "order_by"),
+        1,
+        "TableStore::scan_stream_with must own the one raw Lance order_by call"
+    );
+    assert!(
+        !tuning_exposes_order_by,
+        "ScanTuning must not expose order_by after executor routing"
     );
 }
 

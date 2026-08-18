@@ -20,7 +20,7 @@ use datafusion::physical_plan::{
     stream::RecordBatchStreamAdapter,
 };
 use datafusion::prelude::Expr;
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
@@ -1040,7 +1040,7 @@ impl TableStore {
     /// The `cleanup` orphan reconciler diffs this against the manifest branch
     /// set to find orphaned per-table forks. `main`/default is not a named
     /// branch and never appears here.
-    pub async fn list_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
+    pub async fn list_native_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
         let ds = crate::instrumentation::open_dataset(
             dataset_uri,
             crate::instrumentation::VersionResolution::Latest,
@@ -1048,10 +1048,7 @@ impl TableStore {
             crate::instrumentation::table_wrapper(),
         )
         .await?;
-        let branches = ds
-            .list_branches()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let branches = crate::branch_control::list_branch_contents(&ds).await?;
         Ok(branches.into_keys().collect())
     }
 
@@ -1697,60 +1694,71 @@ impl TableStore {
         .await
     }
 
-    pub async fn scan_stream_with<F>(
+    pub fn scan_stream_with<F>(
         ds: &Dataset,
         projection: Option<&[&str]>,
         filter: Option<&str>,
         order_by: Option<Vec<ColumnOrdering>>,
         with_row_id: bool,
         configure: F,
-    ) -> Result<DatasetRecordBatchStream>
+    ) -> BoxFuture<'static, Result<DatasetRecordBatchStream>>
     where
         F: FnOnce(&mut ScanTuning<'_>) -> Result<()>,
     {
-        let has_ordering = order_by
-            .as_ref()
-            .is_some_and(|ordering| !ordering.is_empty());
-        let mut scanner = ds.scan();
-        if with_row_id {
-            scanner.with_row_id();
-        }
-        if let Some(columns) = projection {
-            scanner
-                .project(columns)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-        }
-        if let Some(filter_sql) = filter {
-            scanner
-                .filter(filter_sql)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-        }
-        if let Some(ordering) = order_by {
-            scanner
-                .order_by(Some(ordering))
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-        }
-        configure(&mut ScanTuning {
-            scanner: &mut scanner,
-        })?;
-        if has_ordering {
-            Self::execute_bounded_ordered_scan(
-                scanner,
-                LanceExecutionOptions {
-                    use_spilling: true,
-                    mem_pool_size: Some(ORDERED_SCAN_MEMORY_BYTES),
-                    max_temp_directory_size: Some(ORDERED_SCAN_SCRATCH_BYTES),
-                    batch_size: Some(ORDERED_SCAN_EXECUTION_BATCH_ROWS),
-                    ..Default::default()
-                },
-            )
-            .await
-        } else {
-            scanner
-                .try_into_stream()
+        // Configure synchronously, then erase the scanner-execution future.
+        // The storage and mutation futures are already deeply composed; making
+        // every closure here another generic async layer pushes otherwise
+        // ordinary integration-test crates past rustc's layout-query limit.
+        let prepared: Result<(Scanner, bool)> = (|| {
+            let has_ordering = order_by
+                .as_ref()
+                .is_some_and(|ordering| !ordering.is_empty());
+            let mut scanner = ds.scan();
+            if with_row_id {
+                scanner.with_row_id();
+            }
+            if let Some(columns) = projection {
+                scanner
+                    .project(columns)
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
+            if let Some(filter_sql) = filter {
+                scanner
+                    .filter(filter_sql)
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
+            if let Some(ordering) = order_by {
+                scanner
+                    .order_by(Some(ordering))
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
+            configure(&mut ScanTuning {
+                scanner: &mut scanner,
+            })?;
+            Ok((scanner, has_ordering))
+        })();
+
+        Box::pin(async move {
+            let (scanner, has_ordering) = prepared?;
+            if has_ordering {
+                Self::execute_bounded_ordered_scan(
+                    scanner,
+                    LanceExecutionOptions {
+                        use_spilling: true,
+                        mem_pool_size: Some(ORDERED_SCAN_MEMORY_BYTES),
+                        max_temp_directory_size: Some(ORDERED_SCAN_SCRATCH_BYTES),
+                        batch_size: Some(ORDERED_SCAN_EXECUTION_BATCH_ROWS),
+                        ..Default::default()
+                    },
+                )
                 .await
-                .map_err(|e| OmniError::Lance(e.to_string()))
-        }
+            } else {
+                scanner
+                    .try_into_stream()
+                    .await
+                    .map_err(|e| OmniError::Lance(e.to_string()))
+            }
+        })
     }
 
     async fn execute_bounded_ordered_scan(
@@ -1774,9 +1782,8 @@ impl TableStore {
             OmniError::manifest_internal("ordered scan requires an explicit scratch bound")
         })?;
 
-        let input_batch_limit = (memory_limit / 4)
-            .min(ORDERED_SCAN_MAX_INPUT_BATCH_BYTES)
-            .max(1) as usize;
+        let input_batch_limit =
+            (memory_limit / 4).clamp(1, ORDERED_SCAN_MAX_INPUT_BATCH_BYTES) as usize;
         let plan = scanner
             .create_plan()
             .await
