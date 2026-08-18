@@ -392,6 +392,12 @@ struct StagedCommitMetadata {
     affected_rows: Option<RowAddrTreeMap>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedCommitMode {
+    Generic,
+    EffectFreeExact,
+}
+
 impl StagedCommitMetadata {
     fn affected_rows(affected_rows: Option<RowAddrTreeMap>) -> Self {
         Self { affected_rows }
@@ -3164,7 +3170,11 @@ impl TableStore {
         let mut raw =
             Self::scan_proven_insert_blob_row_ids(source, begin_version, end_version).await?;
         let mut observed_rows = 0_u64;
-        while let Some(batch) = raw.try_next().await.map_err(OmniError::datafusion)? {
+        while let Some(batch) = raw
+            .try_next()
+            .await
+            .map_err(OmniError::datafusion_internal)?
+        {
             let row_ids = batch
                 .column_by_name("_rowid")
                 .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
@@ -3354,7 +3364,7 @@ impl TableStore {
     /// the publisher at end-of-query to materialize all staged writes before
     /// the meta-manifest commit.
     pub async fn commit_staged(&self, ds: Arc<Dataset>, staged: StagedWrite) -> Result<Dataset> {
-        self.commit_staged_with_retry_budget(ds, staged, None)
+        self.commit_staged_with_mode(ds, staged, StagedCommitMode::Generic)
             .await
             .map(|(dataset, _)| dataset)
     }
@@ -3376,7 +3386,7 @@ impl TableStore {
         staged: StagedWrite,
     ) -> Result<(Dataset, StagedTransactionIdentity)> {
         let (dataset, committed_identity) = self
-            .commit_staged_with_retry_budget(ds, staged, Some(0))
+            .commit_staged_with_mode(ds, staged, StagedCommitMode::EffectFreeExact)
             .await?;
         let committed_identity = committed_identity.ok_or_else(|| {
             OmniError::manifest_internal(
@@ -3436,11 +3446,11 @@ impl TableStore {
         Ok((dataset, committed_identity))
     }
 
-    async fn commit_staged_with_retry_budget(
+    async fn commit_staged_with_mode(
         &self,
         ds: Arc<Dataset>,
         staged: StagedWrite,
-        max_retries: Option<u32>,
+        mode: StagedCommitMode,
     ) -> Result<(Dataset, Option<StagedTransactionIdentity>)> {
         // Skip Lance's auto-cleanup hook on every commit. OmniGraph owns version
         // GC explicitly (optimize.rs::cleanup_all_datasets); Lance's hook fires off
@@ -3451,22 +3461,22 @@ impl TableStore {
         // data path) for new and legacy datasets alike, preventing Lance from
         // GC'ing versions the __manifest still pins for snapshots/time-travel.
         let mut builder = CommitBuilder::new(ds).with_skip_auto_cleanup(true);
-        if let Some(max_retries) = max_retries {
-            builder = builder.with_max_retries(max_retries);
+        if mode == StagedCommitMode::EffectFreeExact {
+            builder = builder.with_max_retries(0);
         }
         if let Some(affected_rows) = staged.commit_metadata.affected_rows {
             builder = builder.with_affected_rows(affected_rows);
         }
         let commit = builder.execute(staged.transaction).await;
-        let dataset = match max_retries {
+        let dataset = match mode {
             // This private branch is reached only by `commit_staged_exact`.
             // Its zero-retry contract is the operation-local proof that a
             // surfaced contention result is effect-free; ordinary staged
             // commits must retain the generic `Storage(Precondition)` meaning.
-            Some(0) => commit.map_err(map_lance_exact_commit_error)?,
-            _ => commit.map_err(OmniError::storage)?,
+            StagedCommitMode::EffectFreeExact => commit.map_err(map_lance_exact_commit_error)?,
+            StagedCommitMode::Generic => commit.map_err(OmniError::storage)?,
         };
-        let committed_identity = if max_retries.is_some() {
+        let committed_identity = if mode == StagedCommitMode::EffectFreeExact {
             dataset
                 .read_transaction()
                 .await
@@ -4576,9 +4586,9 @@ async fn scan_pending_batches(
     config.options_mut().sql_parser.enable_ident_normalization = false;
     let ctx = datafusion::execution::context::SessionContext::new_with_config(config);
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![pending_batches.to_vec()])
-        .map_err(OmniError::datafusion)?;
+        .map_err(OmniError::datafusion_internal)?;
     ctx.register_table("pending", Arc::new(mem))
-        .map_err(OmniError::datafusion)?;
+        .map_err(OmniError::datafusion_internal)?;
 
     let proj = projection
         .map(|cols| {
@@ -4590,8 +4600,11 @@ async fn scan_pending_batches(
         .unwrap_or_else(|| "*".to_string());
     let where_clause = filter.map(|f| format!("WHERE {f}")).unwrap_or_default();
     let sql = format!("SELECT {proj} FROM pending {where_clause}");
-    let df = ctx.sql(&sql).await.map_err(OmniError::datafusion)?;
-    df.collect().await.map_err(OmniError::datafusion)
+    let df = ctx
+        .sql(&sql)
+        .await
+        .map_err(OmniError::datafusion_internal)?;
+    df.collect().await.map_err(OmniError::datafusion_internal)
 }
 
 // Staged-write helper retained alongside the sealed storage surface; its

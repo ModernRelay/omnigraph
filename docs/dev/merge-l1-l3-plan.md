@@ -743,7 +743,7 @@ FixedSizeList<Float32, 8>`, 256 rows):**
    - Never-indexed table: `scanner.full_text_search` returns a hard Lance
      error (*"Cannot perform full text search unless an INVERTED index has
      been created on at least one column"*). OmniGraph's executor passes the
-     scanner error straight through as `OmniError::Lance`
+     scanner error straight through as `OmniError::Storage`
      (`exec/query.rs` ~2491) — no pre-check, no scan fallback.
    - Never-indexed `nearest`: returns Ok via flat KNN (brute force) — the
      documented vector fallback is real.

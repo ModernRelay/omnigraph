@@ -174,6 +174,18 @@ pub(crate) fn validate_external_blob_uri_raw_limit(raw: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject URI spellings that Lance's Blob builder would otherwise turn into
+/// a storage-layer error before operation-wide policy admission runs.
+pub(crate) fn validate_external_blob_uri_builder_input(raw: &str) -> Result<()> {
+    validate_external_blob_uri_raw_limit(raw)?;
+    if raw.is_empty() {
+        return Err(policy_error(
+            "external Blob URI must be non-empty and contain no surrounding whitespace",
+        ));
+    }
+    Ok(())
+}
+
 /// Where an external Blob base is safe to dereference.
 ///
 /// `ServerSafe` is deliberately narrower than "the URI parses": it currently

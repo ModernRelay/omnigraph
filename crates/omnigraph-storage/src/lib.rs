@@ -79,32 +79,8 @@ pub fn classify_io_error(error: &std::io::Error) -> StorageFailureKind {
 
 #[doc(hidden)]
 pub fn classify_io_error_at_depth(error: &std::io::Error, depth: usize) -> StorageFailureKind {
-    if depth >= MAX_STORAGE_SOURCE_DEPTH {
-        return StorageFailureKind::Unknown;
-    }
-    use std::io::ErrorKind;
-    match error.kind() {
-        ErrorKind::NotFound => StorageFailureKind::NotFound,
-        ErrorKind::AlreadyExists => StorageFailureKind::Precondition,
-        ErrorKind::PermissionDenied | ErrorKind::InvalidInput | ErrorKind::Unsupported => {
-            StorageFailureKind::Configuration
-        }
-        ErrorKind::TimedOut
-        | ErrorKind::Interrupted
-        | ErrorKind::ConnectionAborted
-        | ErrorKind::ConnectionRefused
-        | ErrorKind::ConnectionReset
-        | ErrorKind::BrokenPipe
-        | ErrorKind::NotConnected
-        | ErrorKind::HostUnreachable
-        | ErrorKind::NetworkUnreachable
-        | ErrorKind::WouldBlock => StorageFailureKind::Transient,
-        ErrorKind::InvalidData => StorageFailureKind::Permanent,
-        _ => error
-            .get_ref()
-            .map(|source| classify_storage_source_at_depth(source, depth + 1))
-            .unwrap_or(StorageFailureKind::Unknown),
-    }
+    find_storage_source_kind_with(error, depth, no_additional_storage_source)
+        .unwrap_or(StorageFailureKind::Unknown)
 }
 
 /// Classify an `object_store` 0.13 failure by its typed variant. Opaque
@@ -119,36 +95,12 @@ pub fn classify_object_store_error_at_depth(
     error: &object_store::Error,
     depth: usize,
 ) -> StorageFailureKind {
-    if depth >= MAX_STORAGE_SOURCE_DEPTH {
-        return StorageFailureKind::Unknown;
-    }
-    match error {
-        object_store::Error::NotFound { .. } => StorageFailureKind::NotFound,
-        object_store::Error::NotModified { .. }
-        | object_store::Error::Precondition { .. }
-        | object_store::Error::AlreadyExists { .. } => StorageFailureKind::Precondition,
-        object_store::Error::InvalidPath { .. }
-        | object_store::Error::NotSupported { .. }
-        | object_store::Error::NotImplemented { .. }
-        | object_store::Error::PermissionDenied { .. }
-        | object_store::Error::Unauthenticated { .. }
-        | object_store::Error::UnknownConfigurationKey { .. } => StorageFailureKind::Configuration,
-        object_store::Error::JoinError { source } if source.is_cancelled() => {
-            StorageFailureKind::Transient
-        }
-        object_store::Error::JoinError { source } if source.is_panic() => {
-            StorageFailureKind::Permanent
-        }
-        object_store::Error::JoinError { .. } => StorageFailureKind::Unknown,
-        object_store::Error::Generic { source, .. } => {
-            classify_storage_source_at_depth(source.as_ref(), depth + 1)
-        }
-        _ => StorageFailureKind::Unknown,
-    }
+    find_storage_source_kind_with(error, depth, no_additional_storage_source)
+        .unwrap_or(StorageFailureKind::Unknown)
 }
 
-/// Recover typed object-store or I/O evidence from an opaque wrapper. This is
-/// public for the engine's Lance boundary; callers must not inspect text.
+/// Recover typed object-store or I/O evidence from an opaque wrapper without
+/// inspecting display text.
 pub fn classify_storage_source(source: &(dyn std::error::Error + 'static)) -> StorageFailureKind {
     classify_storage_source_at_depth(source, 0)
 }
@@ -158,19 +110,127 @@ pub fn classify_storage_source_at_depth(
     source: &(dyn std::error::Error + 'static),
     depth: usize,
 ) -> StorageFailureKind {
-    if depth >= MAX_STORAGE_SOURCE_DEPTH {
-        return StorageFailureKind::Unknown;
+    find_storage_source_kind_with(source, depth, no_additional_storage_source)
+        .unwrap_or(StorageFailureKind::Unknown)
+}
+
+/// Extension classifier used by the shared typed-source traversal.
+/// `Break(kind)` supplies typed engine-owned evidence,
+/// `Continue(Some(source))` supplies a recognized wrapper's typed source, and
+/// `Continue(None)` means the node is not owned by the extension.
+#[doc(hidden)]
+pub type StorageSourceClassifier = for<'a> fn(
+    &'a (dyn std::error::Error + 'static),
+) -> std::ops::ControlFlow<
+    StorageFailureKind,
+    Option<&'a (dyn std::error::Error + 'static)>,
+>;
+
+/// The single bounded typed-source traversal shared by the storage adapter
+/// and engine-specific storage wrappers.
+#[doc(hidden)]
+pub fn find_storage_source_kind_with(
+    source: &(dyn std::error::Error + 'static),
+    depth: usize,
+    classify_additional: StorageSourceClassifier,
+) -> Option<StorageFailureKind> {
+    let mut current = source;
+    let mut current_depth = depth;
+    let mut saw_storage_wrapper = false;
+    loop {
+        if current_depth >= MAX_STORAGE_SOURCE_DEPTH {
+            return saw_storage_wrapper.then_some(StorageFailureKind::Unknown);
+        }
+        let evidence = match classify_builtin_storage_source(current) {
+            std::ops::ControlFlow::Continue(None) => classify_additional(current),
+            evidence => evidence,
+        };
+        match evidence {
+            std::ops::ControlFlow::Break(kind) => return Some(kind),
+            std::ops::ControlFlow::Continue(Some(inner)) => {
+                saw_storage_wrapper = true;
+                current = inner;
+                current_depth += 1;
+                continue;
+            }
+            std::ops::ControlFlow::Continue(None) => {}
+        }
+        let Some(inner) = current.source() else {
+            return saw_storage_wrapper.then_some(StorageFailureKind::Unknown);
+        };
+        current = inner;
+        current_depth += 1;
     }
+}
+
+fn no_additional_storage_source<'a>(
+    _source: &'a (dyn std::error::Error + 'static),
+) -> std::ops::ControlFlow<StorageFailureKind, Option<&'a (dyn std::error::Error + 'static)>> {
+    std::ops::ControlFlow::Continue(None)
+}
+
+fn classify_builtin_storage_source<'a>(
+    source: &'a (dyn std::error::Error + 'static),
+) -> std::ops::ControlFlow<StorageFailureKind, Option<&'a (dyn std::error::Error + 'static)>> {
+    use std::io::ErrorKind;
+    use std::ops::ControlFlow::{Break, Continue};
+
     if let Some(error) = source.downcast_ref::<object_store::Error>() {
-        return classify_object_store_error_at_depth(error, depth);
+        return match error {
+            object_store::Error::NotFound { .. } => Break(StorageFailureKind::NotFound),
+            object_store::Error::NotModified { .. }
+            | object_store::Error::Precondition { .. }
+            | object_store::Error::AlreadyExists { .. } => Break(StorageFailureKind::Precondition),
+            object_store::Error::InvalidPath { .. }
+            | object_store::Error::NotSupported { .. }
+            | object_store::Error::NotImplemented { .. }
+            | object_store::Error::PermissionDenied { .. }
+            | object_store::Error::Unauthenticated { .. }
+            | object_store::Error::UnknownConfigurationKey { .. } => {
+                Break(StorageFailureKind::Configuration)
+            }
+            object_store::Error::JoinError { source } if source.is_cancelled() => {
+                Break(StorageFailureKind::Transient)
+            }
+            object_store::Error::JoinError { source } if source.is_panic() => {
+                Break(StorageFailureKind::Permanent)
+            }
+            object_store::Error::JoinError { .. } => Break(StorageFailureKind::Unknown),
+            object_store::Error::Generic { source, .. } => Continue(Some(source.as_ref())),
+            _ => Break(StorageFailureKind::Unknown),
+        };
     }
     if let Some(error) = source.downcast_ref::<std::io::Error>() {
-        return classify_io_error_at_depth(error, depth);
+        return match error.kind() {
+            ErrorKind::NotFound => Break(StorageFailureKind::NotFound),
+            ErrorKind::AlreadyExists => Break(StorageFailureKind::Precondition),
+            ErrorKind::PermissionDenied
+            | ErrorKind::InvalidInput
+            | ErrorKind::Unsupported
+            | ErrorKind::StorageFull
+            | ErrorKind::QuotaExceeded
+            | ErrorKind::ReadOnlyFilesystem
+            | ErrorKind::FileTooLarge => Break(StorageFailureKind::Configuration),
+            ErrorKind::TimedOut
+            | ErrorKind::Interrupted
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::BrokenPipe
+            | ErrorKind::NotConnected
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::WouldBlock => Break(StorageFailureKind::Transient),
+            ErrorKind::InvalidData => Break(StorageFailureKind::Permanent),
+            _ if error.get_ref().is_some() => Continue(
+                error
+                    .get_ref()
+                    .map(|source| source as &(dyn std::error::Error + 'static)),
+            ),
+            _ => Break(StorageFailureKind::Unknown),
+        };
     }
-    source
-        .source()
-        .map(|inner| classify_storage_source_at_depth(inner, depth + 1))
-        .unwrap_or(StorageFailureKind::Unknown)
+    Continue(None)
 }
 
 /// Resource envelope for one suffix-filtered directory listing.
@@ -195,13 +255,23 @@ pub struct ListDirBounds {
 ///
 /// `Internal` preserves the engine's historical manifest-internal message
 /// verbatim when converted by the compatibility facade. `Backend` carries the
-/// complete historical diagnostic plus typed substrate evidence.
+/// complete historical diagnostic plus typed substrate evidence; `Io` also
+/// retains the original structured filesystem source for embedded callers.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("{0}")]
     Internal(String),
     #[error("{0}")]
     Backend(StorageFailure),
+    /// A storage-owned filesystem failure. The classified failure drives
+    /// engine/HTTP semantics while the original I/O value remains available
+    /// to embedded callers through the source chain.
+    #[error("{failure}")]
+    Io {
+        failure: StorageFailure,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("storage resource '{resource}' for '{uri}' exceeds limit {limit} (actual {actual})")]
     ResourceLimit {
         resource: String,
@@ -222,7 +292,18 @@ impl StorageError {
 
     fn io(error: std::io::Error) -> Self {
         let kind = classify_io_error(&error);
-        Self::backend(kind, format!("io: {error}"))
+        Self::Io {
+            failure: StorageFailure::new(kind, format!("io: {error}")),
+            source: error,
+        }
+    }
+
+    fn io_context(error: std::io::Error, message: impl Into<String>) -> Self {
+        let kind = classify_io_error(&error);
+        Self::Io {
+            failure: StorageFailure::new(kind, message),
+            source: error,
+        }
     }
 }
 
@@ -514,14 +595,12 @@ impl ObjectStorageAdapter {
             && let Some(dir) = path.parent()
             && let Some(link_error) = hard_link_refusal_in(dir)
         {
-            return StorageError::backend(
-                StorageFailureKind::Configuration,
-                format!(
-                    "the filesystem at '{}' does not support hard links, which the local storage backend requires for atomic create-if-absent writes (seen on Android app storage, FAT/exFAT, and some network mounts); move the graph to a filesystem with hard-link support or use an S3-compatible backend: {}",
-                    dir.display(),
-                    link_error
-                ),
+            let message = format!(
+                "the filesystem at '{}' does not support hard links, which the local storage backend requires for atomic create-if-absent writes (seen on Android app storage, FAT/exFAT, and some network mounts); move the graph to a filesystem with hard-link support or use an S3-compatible backend: {}",
+                dir.display(),
+                link_error
             );
+            return StorageError::io_context(link_error, message);
         }
         storage_backend_error("write_if_absent", uri, err)
     }
@@ -587,12 +666,7 @@ impl StorageAdapter for ObjectStorageAdapter {
             .await
             .map_err(|err| storage_backend_error("read", uri, err))?;
 
-        String::from_utf8(bytes.to_vec()).map_err(|err| {
-            StorageError::backend(
-                StorageFailureKind::Permanent,
-                format!("storage read failed for '{}': {}", uri, err),
-            )
-        })
+        decode_storage_text(uri, bytes.as_ref())
     }
 
     async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
@@ -607,12 +681,7 @@ impl StorageAdapter for ObjectStorageAdapter {
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(err) => return Err(storage_backend_error("read", uri, err)),
         };
-        let text = String::from_utf8(bytes.to_vec()).map_err(|err| {
-            StorageError::backend(
-                StorageFailureKind::Permanent,
-                format!("storage read failed for '{}': {}", uri, err),
-            )
-        })?;
+        let text = decode_storage_text(uri, bytes.as_ref())?;
         Ok(Some(text))
     }
 
@@ -645,12 +714,7 @@ impl StorageAdapter for ObjectStorageAdapter {
                 uri: uri.to_string(),
             });
         }
-        let text = String::from_utf8(bytes.to_vec()).map_err(|err| {
-            StorageError::backend(
-                StorageFailureKind::Permanent,
-                format!("storage read failed for '{uri}': {err}"),
-            )
-        })?;
+        let text = decode_storage_text(uri, bytes.as_ref())?;
         Ok(Some(text))
     }
 
@@ -912,12 +976,7 @@ impl StorageAdapter for ObjectStorageAdapter {
         } else {
             local_version_token(&bytes)
         };
-        let text = String::from_utf8(bytes.to_vec()).map_err(|err| {
-            StorageError::backend(
-                StorageFailureKind::Permanent,
-                format!("storage read failed for '{}': {}", uri, err),
-            )
-        })?;
+        let text = decode_storage_text(uri, bytes.as_ref())?;
         Ok((text, version))
     }
 
@@ -1147,15 +1206,12 @@ fn absolutize_lexically(path: PathBuf) -> Result<PathBuf> {
     } else {
         std::env::current_dir()
             .map_err(|err| {
-                let kind = classify_io_error(&err);
-                StorageError::backend(
-                    kind,
-                    format!(
-                        "cannot resolve relative storage path '{}': {}",
-                        path.display(),
-                        err
-                    ),
-                )
+                let message = format!(
+                    "cannot resolve relative storage path '{}': {}",
+                    path.display(),
+                    err
+                );
+                StorageError::io_context(err, message)
             })?
             .join(path)
     };
@@ -1218,6 +1274,15 @@ fn storage_backend_error(action: &str, uri: &str, err: object_store::Error) -> S
         kind,
         format!("storage {} failed for '{}': {}", action, uri, err),
     )
+}
+
+fn decode_storage_text(uri: &str, bytes: &[u8]) -> Result<String> {
+    String::from_utf8(bytes.to_vec()).map_err(|error| {
+        StorageError::backend(
+            StorageFailureKind::Permanent,
+            format!("storage read failed for '{uri}': {error}"),
+        )
+    })
 }
 
 fn normalize_local_path(path: &Path) -> String {
@@ -1351,6 +1416,10 @@ mod tests {
             ErrorKind::PermissionDenied,
             ErrorKind::InvalidInput,
             ErrorKind::Unsupported,
+            ErrorKind::StorageFull,
+            ErrorKind::QuotaExceeded,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::FileTooLarge,
         ] {
             assert_eq!(
                 classify_io_error(&std::io::Error::new(kind, "test")),
@@ -1392,13 +1461,23 @@ mod tests {
             (ErrorKind::Other, StorageFailureKind::Unknown),
         ] {
             let error = StorageError::io(std::io::Error::new(error_kind, "local failure"));
-            let StorageError::Backend(failure) = error else {
-                panic!("local storage I/O must use classified backend failures")
+            let StorageError::Io { failure, source } = error else {
+                panic!("local storage I/O must retain its structured source")
             };
             assert_eq!(failure.kind, failure_kind, "{error_kind:?}");
             assert_eq!(failure.message, "io: local failure");
             assert_eq!(failure.to_string(), "io: local failure");
+            assert_eq!(source.kind(), error_kind);
         }
+
+        let raw = std::io::Error::from_raw_os_error(28);
+        let expected_kind = classify_io_error(&raw);
+        let error = StorageError::io(raw);
+        let StorageError::Io { failure, source } = error else {
+            panic!("local storage I/O must retain its structured source")
+        };
+        assert_eq!(failure.kind, expected_kind);
+        assert_eq!(source.raw_os_error(), Some(28));
     }
 
     #[test]
