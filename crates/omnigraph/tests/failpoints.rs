@@ -12048,3 +12048,160 @@ async fn full_recovery_rereads_sidecar_body_after_discovery() {
         "fresh unconfirmed sidecar must roll the interrupted merge back; stale discovery would expose six rows"
     );
 }
+
+/// A merge that drops a net-zero table still confirms its sidecar (#473).
+///
+/// The confirmed updates must equal the sidecar's intended delta, and both are
+/// derived from the merge candidates, so dropping a table at classification
+/// keeps them equal. `edge:Knows` nets back to the fork point while
+/// `node:Person` gains a real row, so the sidecar is armed and the window is
+/// reachable.
+#[tokio::test]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_dropping_a_net_zero_table_confirms_and_recovers() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, helpers::TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        db.branch_create("feature").await.unwrap();
+
+        // edge:Knows moves two versions and lands back on its fork content.
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Diana"), ("$to", "Alice")]),
+        )
+        .await
+        .unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "remove_friendship",
+            &params(&[("$from", "Diana")]),
+        )
+        .await
+        .unwrap();
+        // node:Person gains a real row, so the merge has a durable effect to
+        // pin and the recovery sidecar is armed.
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
+        )
+        .await
+        .unwrap();
+        // Move the target too, so node:Person takes the HEAD-advancing route.
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Erin")], &[("$age", 41)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    let knows_before = {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        count_rows(&db, "edge:Knows").await
+    };
+
+    // Crash between the durable effects and the sidecar confirmation.
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        let _failpoint =
+            ScopedFailPoint::new(names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM, "return");
+        let err = db.branch_merge("feature", "main").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM),
+            "unexpected error: {err}"
+        );
+
+        let sidecars: Vec<_> = std::fs::read_dir(dir.path().join("__recovery"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(
+            sidecars.len(),
+            1,
+            "the armed merge must leave exactly one sidecar"
+        );
+    }
+
+    // Reopening resolves the still-unconfirmed sidecar by compensating the
+    // unpublished Person effect. The target must keep its accepted Erin row,
+    // while the source keeps Frank available for a clean retry.
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        let remaining: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "recovery must resolve the sidecar; remaining: {remaining:?}"
+        );
+    }
+
+    assert_eq!(
+        count_rows(&db, "edge:Knows").await,
+        knows_before,
+        "the dropped net-zero table must be untouched by recovery"
+    );
+    assert_eq!(
+        recovery_audit_kinds(dir.path()).await,
+        vec!["RolledBack"],
+        "the pre-confirmation crash must have one exact rollback disposition"
+    );
+
+    let mut recovered_main_names =
+        collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    recovered_main_names.sort();
+    assert_eq!(
+        recovered_main_names,
+        vec!["Alice", "Bob", "Charlie", "Diana", "Erin"],
+        "rollback must preserve the accepted target row and remove only the unpublished Frank effect"
+    );
+    let mut recovered_feature_names = collect_column_strings(
+        &helpers::read_table_branch(&db, "feature", "node:Person").await,
+        "name",
+    );
+    recovered_feature_names.sort();
+    assert_eq!(
+        recovered_feature_names,
+        vec!["Alice", "Bob", "Charlie", "Diana", "Frank"],
+        "rollback must not consume or alter the source delta"
+    );
+
+    // The compensated merge remains retryable. The clean retry must publish
+    // Frank alongside Erin, while continuing to suppress the net-zero table.
+    let outcome = db.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(
+        outcome,
+        omnigraph::db::MergeOutcome::Merged,
+        "a compensated source delta must be published by the retry"
+    );
+    let mut merged_main_names =
+        collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    merged_main_names.sort();
+    assert_eq!(
+        merged_main_names,
+        vec!["Alice", "Bob", "Charlie", "Diana", "Erin", "Frank"],
+        "the retry must combine the target and source Person deltas"
+    );
+    assert_eq!(
+        count_rows(&db, "edge:Knows").await,
+        knows_before,
+        "edge:Knows must stay at its fork content across the whole sequence"
+    );
+}

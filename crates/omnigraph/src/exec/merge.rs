@@ -348,16 +348,125 @@ struct CursorRow {
     id: String,
     signature: String,
     dataset: Dataset,
+    managed_blob_data_files: Option<std::sync::Arc<crate::blob::ManagedBlobDataFileIndex>>,
     batch: RecordBatch,
     row_index: usize,
 }
 
 impl CursorRow {
-    /// Compute this row's signature on demand. Used by the lazy adopt cursor,
-    /// where `signature` is left empty; the value is identical to the eager
-    /// `signature` field the three-way cursor populates.
-    fn compute_signature(&self) -> Result<String> {
-        row_signature(&self.batch, self.row_index)
+    fn row_address(&self) -> Result<u64> {
+        let row_addresses = self
+            .batch
+            .column_by_name("_rowaddr")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::manifest(
+                    "branch-adopt equality scan omitted its _rowaddr column".to_string(),
+                )
+            })?;
+        if self.row_index >= row_addresses.len() || row_addresses.is_null(self.row_index) {
+            return Err(OmniError::manifest(
+                "branch-adopt equality encountered an absent _rowaddr".to_string(),
+            ));
+        }
+        Ok(row_addresses.value(self.row_index))
+    }
+
+    /// Prove that every logical value in these two rows is equal.
+    ///
+    /// This is deliberately separate from the legacy display signature used
+    /// by the general three-way merge. Adopt classification may use equality
+    /// to discard a table and complete merge lineage, so it requires a proof:
+    /// typed Arrow one-cell equality, exact nulls, exact field framing, and a
+    /// physical-object-qualified comparison for managed Blob descriptors.
+    fn adopt_values_provably_equal(&self, other: &Self) -> Result<bool> {
+        if self.row_index >= self.batch.num_rows()
+            || other.row_index >= other.batch.num_rows()
+            || self.batch.num_columns() != other.batch.num_columns()
+        {
+            return Ok(false);
+        }
+
+        let left_schema = self.batch.schema();
+        let right_schema = other.batch.schema();
+        for (left_index, left_field) in left_schema.fields().iter().enumerate() {
+            let Ok(right_index) = right_schema.index_of(left_field.name()) else {
+                return Ok(false);
+            };
+            let right_field = right_schema.field(right_index);
+            if left_field.as_ref() != right_field {
+                return Ok(false);
+            }
+            if is_lance_virtual_row_column(left_field.name()) {
+                continue;
+            }
+
+            let left_column = self.batch.column(left_index);
+            let right_column = other.batch.column(right_index);
+            let left_is_blob = self
+                .dataset
+                .schema()
+                .field(left_field.name())
+                .is_some_and(|field| field.is_blob());
+            let right_is_blob = other
+                .dataset
+                .schema()
+                .field(right_field.name())
+                .is_some_and(|field| field.is_blob());
+            if left_is_blob != right_is_blob {
+                return Ok(false);
+            }
+
+            if left_is_blob {
+                let left_data_files = self.managed_blob_data_files.as_deref().ok_or_else(|| {
+                    OmniError::manifest(
+                        "branch-adopt Blob equality omitted its data-file index".to_string(),
+                    )
+                })?;
+                let right_data_files =
+                    other.managed_blob_data_files.as_deref().ok_or_else(|| {
+                        OmniError::manifest(
+                            "branch-adopt Blob equality omitted its data-file index".to_string(),
+                        )
+                    })?;
+                let left_descriptions = left_column
+                    .as_any()
+                    .downcast_ref::<arrow_array::StructArray>()
+                    .ok_or_else(|| {
+                        OmniError::blob_integrity(format!(
+                            "Blob column '{}' did not scan as a Blob-v2 descriptor",
+                            left_field.name()
+                        ))
+                    })?;
+                let right_descriptions = right_column
+                    .as_any()
+                    .downcast_ref::<arrow_array::StructArray>()
+                    .ok_or_else(|| {
+                        OmniError::blob_integrity(format!(
+                            "Blob column '{}' did not scan as a Blob-v2 descriptor",
+                            right_field.name()
+                        ))
+                    })?;
+                if !crate::blob::persisted_blob_values_provably_equal(
+                    left_data_files,
+                    left_descriptions,
+                    self.row_index,
+                    self.row_address()?,
+                    right_data_files,
+                    right_descriptions,
+                    other.row_index,
+                    other.row_address()?,
+                    left_field.name(),
+                )? {
+                    return Ok(false);
+                }
+            } else if left_column.slice(self.row_index, 1).to_data()
+                != right_column.slice(other.row_index, 1).to_data()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Classify this exact persisted row without opening an external target.
@@ -377,11 +486,12 @@ struct OrderedTableCursor {
     current_batch: Option<RecordBatch>,
     current_row: usize,
     peeked: Option<CursorRow>,
-    /// When false, `next_row` leaves `CursorRow::signature` empty and callers
-    /// compute it on demand via `CursorRow::compute_signature`. The adopt path
-    /// uses this: new/deleted rows never need a signature comparison and would
-    /// otherwise eagerly stringify their embedding for nothing.
+    /// When false, the adopt path leaves the legacy display signature empty,
+    /// requests row addresses, and compares common rows with typed equality.
+    /// New/deleted rows therefore avoid stringifying their embeddings, while
+    /// general three-way cursors retain their existing eager signatures.
     eager_signatures: bool,
+    managed_blob_data_files: Option<std::sync::Arc<crate::blob::ManagedBlobDataFileIndex>>,
 }
 
 impl OrderedTableCursor {
@@ -389,8 +499,8 @@ impl OrderedTableCursor {
         Self::open(snapshot, table_key, true).await
     }
 
-    /// Like `from_snapshot` but leaves row signatures uncomputed (callers use
-    /// `CursorRow::compute_signature` on demand). See `eager_signatures`.
+    /// Like `from_snapshot` but equips rows for adopt-only typed equality
+    /// instead of computing legacy display signatures. See `eager_signatures`.
     async fn from_snapshot_lazy(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
         Self::open(snapshot, table_key, false).await
     }
@@ -404,20 +514,39 @@ impl OrderedTableCursor {
     }
 
     async fn from_dataset(dataset: Option<Dataset>, eager_signatures: bool) -> Result<Self> {
+        let managed_blob_data_files = if eager_signatures {
+            None
+        } else if let Some(dataset) = &dataset {
+            Some(std::sync::Arc::new(
+                crate::blob::ManagedBlobDataFileIndex::from_dataset(dataset)?,
+            ))
+        } else {
+            None
+        };
         let stream = if let Some(ds) = &dataset {
             crate::instrumentation::record_ordered_cursor_scan(
                 KEYED_WRITE_MAX_ROWS,
                 KEYED_WRITE_MAX_BYTES,
             );
             Some(Box::pin(
-                crate::table_store::TableStore::scan_stream_bounded(
+                crate::table_store::TableStore::scan_stream_with(
                     ds,
                     None,
                     None,
                     Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
                     true,
-                    KEYED_WRITE_MAX_ROWS,
-                    KEYED_WRITE_MAX_BYTES,
+                    |scanner| {
+                        if !eager_signatures {
+                            // Adopt-only Blob equality qualifies descriptor
+                            // numbers by the immutable data file owning this
+                            // exact physical row. General three-way scans keep
+                            // their existing projection and semantics.
+                            scanner.with_row_address();
+                        }
+                        scanner.batch_size(KEYED_WRITE_MAX_ROWS);
+                        scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+                        Ok(())
+                    },
                 )
                 .await?,
             ))
@@ -432,6 +561,7 @@ impl OrderedTableCursor {
             current_row: 0,
             peeked: None,
             eager_signatures,
+            managed_blob_data_files,
         })
     }
 
@@ -467,6 +597,7 @@ impl OrderedTableCursor {
                         id: row_id_at(batch, row_index)?,
                         signature,
                         dataset,
+                        managed_blob_data_files: self.managed_blob_data_files.clone(),
                         batch: batch.clone(),
                         row_index,
                     }));
@@ -1302,10 +1433,11 @@ async fn compute_adopt_delta(
                 needs_update = true;
             }
             (Some(base), Some(src)) => {
-                // Present on both — compute signatures lazily (the only case
-                // that needs them) to tell a changed row from an unchanged one.
-                // New/deleted rows above skip the embedding stringify entirely.
-                if src.compute_signature()? != base.compute_signature()? {
+                // Present on both — use typed/null-aware equality to distinguish
+                // a changed row from an unchanged one. New/deleted rows above
+                // never pay for comparison, and this adopt path never builds
+                // the legacy display-string signature.
+                if !src.adopt_values_provably_equal(base)? {
                     // Changed on source → upsert.
                     upsert_writer
                         .push_row(src, &materializer, external_preflight)
@@ -1381,7 +1513,7 @@ async fn collect_adopt_blob_selection(
                 source.include_blob_selection(blob_selection)?;
             }
             (Some(base), Some(source)) => {
-                if source.compute_signature()? != base.compute_signature()? {
+                if !source.adopt_values_provably_equal(base)? {
                     source.include_blob_selection(blob_selection)?;
                 }
             }
@@ -1760,6 +1892,20 @@ fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
         );
     }
     Ok(values.join("\u{1f}"))
+}
+
+/// Lance virtual columns carried by merge scans but excluded from graph-value
+/// equality. Near-miss user properties such as `_row_id` are ordinary data and
+/// must be compared.
+fn is_lance_virtual_row_column(name: &str) -> bool {
+    matches!(
+        name,
+        "_rowid"
+            | "_rowaddr"
+            | "_rowoffset"
+            | "_row_created_at_version"
+            | "_row_last_updated_at_version"
+    )
 }
 
 /// Operation-wide budget for the scalar delta retained by merge validation.
@@ -2198,12 +2344,12 @@ async fn classify_adopt(
     table_key: &str,
     target_active: Option<&str>,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
-) -> Result<CandidateTableState> {
+) -> Result<Option<CandidateTableState>> {
     let Some(source_entry) = source_snapshot.entry(table_key) else {
         // Source has no such table — nothing to adopt or validate.
-        return Ok(CandidateTableState::AdoptSourceState {
+        return Ok(Some(CandidateTableState::AdoptSourceState {
             validation_delta: None,
-        });
+        }));
     };
     let target_entry = target_snapshot.entry(table_key);
     ensure_merge_identity_compatible(
@@ -2222,10 +2368,10 @@ async fn classify_adopt(
             try_proven_pure_insert_adopt(target_db, table_key, base_snapshot, source_snapshot)
                 .await?
     {
-        return Ok(CandidateTableState::AdoptPureInserts(proven));
+        return Ok(Some(CandidateTableState::AdoptPureInserts(proven)));
     }
 
-    classify_general_adopt(
+    let candidate = classify_general_adopt(
         target_db,
         catalog,
         base_snapshot,
@@ -2234,7 +2380,15 @@ async fn classify_adopt(
         advances_head,
         external_preflight,
     )
-    .await
+    .await?;
+
+    Ok(keep_publishing_candidate(
+        candidate,
+        target_active,
+        source_entry,
+        target_entry,
+        table_key,
+    ))
 }
 
 /// Classify the general adopt route after the pure-insert proof was either
@@ -2274,16 +2428,285 @@ async fn classify_general_adopt(
     }
 }
 
+/// What publishing a table's adopted source state does to `__manifest`.
+///
+/// An empty delta does not imply an empty publish: source and target can hold
+/// the same content at different Lance versions. Planning purely lets
+/// classification drop a table whose registration is already stored, which the
+/// registry guard would otherwise reject (#473).
+#[must_use = "the adopt plan decides whether this table is a merge candidate"]
+enum AdoptPublish {
+    /// The planned registration is field-for-field the stored entry.
+    Nothing,
+    /// A pointer switch onto a lineage the target can already read.
+    Pointer(crate::db::SubTableUpdate),
+    /// The target holds no ref for this table yet; publication forks one. The
+    /// only arm that touches storage.
+    Fork {
+        source_branch: String,
+        target_branch: String,
+    },
+}
+
+/// Plan what adopting the source's table state publishes, without an effect.
+///
+/// Reaching a branch-bearing arm means the delta was empty: the HEAD-advancing
+/// case is classified [`CandidateTableState::AdoptWithDelta`] and published by
+/// [`publish_adopted_delta`].
+fn plan_adopted_source_state(
+    target_active: Option<&str>,
+    source_entry: &crate::db::SubTableEntry,
+    target_entry: Option<&crate::db::SubTableEntry>,
+    table_key: &str,
+) -> AdoptPublish {
+    let identity = source_entry.identity;
+    let planned = match (target_active, source_entry.table_branch.as_deref()) {
+        // Source on main — pointer switch to its version. The target reads the
+        // same lineage whether it sits on main or on a branch.
+        (None, None) | (Some(_), None) => crate::db::SubTableUpdate {
+            identity,
+            table_key: table_key.to_string(),
+            table_version: source_entry.table_version,
+            table_branch: None,
+            row_count: source_entry.row_count,
+            version_metadata: source_entry.version_metadata.clone(),
+        },
+        // Source on a branch, target on main — the target keeps its own
+        // version and metadata; only the row count comes from the source.
+        (None, Some(_)) => crate::db::SubTableUpdate {
+            identity,
+            table_key: table_key.to_string(),
+            table_version: target_entry
+                .map(|entry| entry.table_version)
+                .unwrap_or(source_entry.table_version),
+            table_branch: None,
+            row_count: source_entry.row_count,
+            version_metadata: target_entry
+                .map(|entry| entry.version_metadata.clone())
+                .unwrap_or_else(|| source_entry.version_metadata.clone()),
+        },
+        (Some(target_branch), Some(source_branch)) => {
+            let Some(owned) =
+                target_entry.filter(|entry| entry.table_branch.as_deref() == Some(target_branch))
+            else {
+                // A fork registers a ref the target lacks, so it is never a
+                // no-op.
+                return AdoptPublish::Fork {
+                    source_branch: source_branch.to_string(),
+                    target_branch: target_branch.to_string(),
+                };
+            };
+            crate::db::SubTableUpdate {
+                identity,
+                table_key: table_key.to_string(),
+                table_version: owned.table_version,
+                table_branch: Some(target_branch.to_string()),
+                row_count: source_entry.row_count,
+                version_metadata: owned.version_metadata.clone(),
+            }
+        }
+    };
+
+    if target_entry.is_some_and(|current| reregisters_current_entry(&planned, current)) {
+        return AdoptPublish::Nothing;
+    }
+    AdoptPublish::Pointer(planned)
+}
+
+/// Whether a planned registration is field-for-field the stored entry.
+///
+/// `table_path` is absent from [`crate::db::SubTableUpdate`] by design: a
+/// pointer switch never moves a table, so the path cannot differ.
+fn reregisters_current_entry(
+    planned: &crate::db::SubTableUpdate,
+    current: &crate::db::SubTableEntry,
+) -> bool {
+    planned.identity == current.identity
+        && planned.table_version == current.table_version
+        && planned.table_branch == current.table_branch
+        && planned.row_count == current.row_count
+        && planned.version_metadata == current.version_metadata
+}
+
+/// Keep a classified candidate only if publishing it changes `__manifest`.
+///
+/// Dropping it here gives the same disposition the manifest-equal tables get
+/// before classification. Only an empty validation delta qualifies: a
+/// non-empty one is the evaluator's RI / uniqueness / cardinality input and is
+/// still checked even when the publish is a pointer switch.
+fn keep_publishing_candidate(
+    candidate: CandidateTableState,
+    target_active: Option<&str>,
+    source_entry: &crate::db::SubTableEntry,
+    target_entry: Option<&crate::db::SubTableEntry>,
+    table_key: &str,
+) -> Option<CandidateTableState> {
+    let publishes_nothing = matches!(
+        candidate,
+        CandidateTableState::AdoptSourceState {
+            validation_delta: None
+        }
+    ) && matches!(
+        plan_adopted_source_state(target_active, source_entry, target_entry, table_key),
+        AdoptPublish::Nothing
+    );
+    if publishes_nothing {
+        return None;
+    }
+    Some(candidate)
+}
+
+#[cfg(test)]
+mod adopt_plan_tests {
+    use super::*;
+
+    /// Build a `TableVersionMetadata` without touching storage. The type is
+    /// crate-private with private fields, so the derived `Deserialize` is the
+    /// only in-crate constructor available to a unit test.
+    fn metadata(manifest_path: &str) -> crate::db::manifest::TableVersionMetadata {
+        serde_json::from_value(serde_json::json!({
+            "manifest_path": manifest_path,
+            "manifest_size": null,
+            "e_tag": null,
+            "naming_scheme": null,
+        }))
+        .expect("construct table version metadata")
+    }
+
+    fn entry(
+        version: u64,
+        branch: Option<&str>,
+        row_count: u64,
+        manifest_path: &str,
+    ) -> crate::db::SubTableEntry {
+        crate::db::SubTableEntry {
+            identity: crate::db::manifest::TableIdentity::new(3, 12).unwrap(),
+            table_key: "edge:Knows".to_string(),
+            table_path: "edges/0000000000000003-000000000000000c".to_string(),
+            table_version: version,
+            table_branch: branch.map(ToOwned::to_owned),
+            row_count,
+            version_metadata: metadata(manifest_path),
+        }
+    }
+
+    /// The #473 shape: the source advanced two Lance versions on a branch and
+    /// came back to the target's content. The plan must be `Nothing`.
+    ///
+    /// This pins the classification layer specifically. The publisher's
+    /// widened registry guard also lets the redundant registration through, so
+    /// no integration test can tell the two layers apart and a revert of this
+    /// one would otherwise go unnoticed.
+    #[test]
+    fn net_zero_source_on_a_branch_plans_nothing() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(4, Some("b0"), 3, "manifest-v4");
+        assert!(matches!(
+            plan_adopted_source_state(None, &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Nothing
+        ));
+    }
+
+    #[test]
+    fn identical_state_on_main_plans_nothing() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(2, None, 3, "manifest-v2");
+        assert!(matches!(
+            plan_adopted_source_state(None, &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Nothing
+        ));
+    }
+
+    #[test]
+    fn target_owned_branch_table_with_equal_rows_plans_nothing() {
+        let target = entry(5, Some("target"), 3, "manifest-v5");
+        let source = entry(7, Some("source"), 3, "manifest-v7");
+        assert!(matches!(
+            plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Nothing
+        ));
+    }
+
+    /// Source on main while the target sits on a branch whose table still
+    /// points at main. The planned pointer equals what is stored, so there is
+    /// nothing to publish.
+    #[test]
+    fn source_on_main_matching_a_branch_target_plans_nothing() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(2, None, 3, "manifest-v2");
+        assert!(matches!(
+            plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Nothing
+        ));
+    }
+
+    #[test]
+    fn source_on_main_ahead_of_a_branch_target_plans_a_pointer() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(5, None, 6, "manifest-v5");
+        assert!(matches!(
+            plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Pointer(_)
+        ));
+    }
+
+    /// Row counts differing means content differs, so the table must still be
+    /// published even though the version and branch would match.
+    #[test]
+    fn differing_row_count_plans_a_pointer() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(4, Some("b0"), 4, "manifest-v4");
+        assert!(matches!(
+            plan_adopted_source_state(None, &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Pointer(_)
+        ));
+    }
+
+    #[test]
+    fn advanced_source_on_main_plans_a_pointer() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(3, None, 4, "manifest-v3");
+        assert!(matches!(
+            plan_adopted_source_state(None, &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Pointer(_)
+        ));
+    }
+
+    #[test]
+    fn absent_target_entry_plans_a_pointer() {
+        let source = entry(4, Some("b0"), 3, "manifest-v4");
+        assert!(matches!(
+            plan_adopted_source_state(None, &source, None, "edge:Knows"),
+            AdoptPublish::Pointer(_)
+        ));
+    }
+
+    /// A target branch that does not own the table has no ref to compare, so
+    /// the publish forks one. This arm can never be a no-op.
+    #[test]
+    fn unowned_target_branch_plans_a_fork() {
+        let target = entry(2, None, 3, "manifest-v2");
+        let source = entry(4, Some("source"), 3, "manifest-v4");
+        assert!(matches!(
+            plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Fork { .. }
+        ));
+    }
+}
+
 /// Adopt the source's table state without applying a row delta: a pointer
-/// switch (source/target share lineage) or a branch fork. The HEAD-advancing
-/// delta case is classified [`CandidateTableState::AdoptWithDelta`] and
-/// published by [`publish_adopted_delta`], so reaching the branch-bearing arms
-/// here means the delta was empty.
+/// switch (source/target share lineage) or a branch fork, as planned by
+/// [`plan_adopted_source_state`].
+///
+/// `target_active` is threaded in rather than re-read. Re-reading agrees today
+/// only because the merge's coordinator swap and its restore bracket both
+/// calls; taking it as an argument makes agreement a property of the signature.
 async fn publish_adopted_source_state(
     target_db: &Omnigraph,
     source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
     table_key: &str,
+    target_active: Option<&str>,
 ) -> Result<crate::db::SubTableUpdate> {
     let source_entry = source_snapshot
         .entry(table_key)
@@ -2295,84 +2718,40 @@ async fn publish_adopted_source_state(
         Some(source_entry.identity),
         target_entry.map(|entry| entry.identity),
     )?;
-    let identity = source_entry.identity;
 
-    let target_active = target_db.active_branch().await;
-    match (
-        target_active.as_deref(),
-        source_entry.table_branch.as_deref(),
-    ) {
-        // Both on main — pointer switch is safe (same lineage, version columns valid)
-        (None, None) => Ok(crate::db::SubTableUpdate {
-            identity,
-            table_key: table_key.to_string(),
-            table_version: source_entry.table_version,
-            table_branch: None,
-            row_count: source_entry.row_count,
-            version_metadata: source_entry.version_metadata.clone(),
-        }),
-        // Source on main, target on branch — pointer switch to main version
-        // (target reads from main, same lineage)
-        (Some(_target_branch), None) => Ok(crate::db::SubTableUpdate {
-            identity,
-            table_key: table_key.to_string(),
-            table_version: source_entry.table_version,
-            table_branch: None,
-            row_count: source_entry.row_count,
-            version_metadata: source_entry.version_metadata.clone(),
-        }),
-        // Source on branch, target on main, empty delta — adopt source's
-        // version by a pointer switch (the non-empty case is `AdoptWithDelta`).
-        (None, Some(_source_branch)) => Ok(crate::db::SubTableUpdate {
-            identity,
-            table_key: table_key.to_string(),
-            table_version: target_entry
-                .map(|e| e.table_version)
-                .unwrap_or(source_entry.table_version),
-            table_branch: None,
-            row_count: source_entry.row_count,
-            version_metadata: target_entry
-                .map(|entry| entry.version_metadata.clone())
-                .unwrap_or_else(|| source_entry.version_metadata.clone()),
-        }),
-        // Both on branches
-        (Some(target_branch), Some(source_branch)) => {
-            if target_entry.and_then(|entry| entry.table_branch.as_deref()) == Some(target_branch) {
-                // Target already owns this table, empty delta — pointer switch
-                // onto its own lineage (the non-empty case is `AdoptWithDelta`).
-                Ok(crate::db::SubTableUpdate {
-                    identity,
-                    table_key: table_key.to_string(),
-                    table_version: target_entry.unwrap().table_version,
-                    table_branch: Some(target_branch.to_string()),
-                    row_count: source_entry.row_count,
-                    version_metadata: target_entry.unwrap().version_metadata.clone(),
-                })
-            } else {
-                // Target doesn't own this table yet — fork from source state.
-                // This creates the target branch on the sub-table dataset.
-                let full_path = format!("{}/{}", target_db.uri(), source_entry.table_path);
-                let ds = target_db
-                    .fork_dataset_from_entry_state(
-                        table_key,
-                        source_entry.identity,
-                        &full_path,
-                        Some(source_branch),
-                        source_entry.table_version,
-                        target_branch,
-                    )
-                    .await?;
-                let state = target_db.storage().table_state(&full_path, &ds).await?;
-                Ok(crate::db::SubTableUpdate {
-                    identity,
-                    table_key: table_key.to_string(),
-                    table_version: state.version,
-                    table_branch: Some(target_branch.to_string()),
-                    row_count: state.row_count,
-                    version_metadata: state.version_metadata,
-                })
-            }
+    match plan_adopted_source_state(target_active, source_entry, target_entry, table_key) {
+        AdoptPublish::Pointer(update) => Ok(update),
+        AdoptPublish::Fork {
+            source_branch,
+            target_branch,
+        } => {
+            let full_path = format!("{}/{}", target_db.uri(), source_entry.table_path);
+            let ds = target_db
+                .fork_dataset_from_entry_state(
+                    table_key,
+                    source_entry.identity,
+                    &full_path,
+                    Some(&source_branch),
+                    source_entry.table_version,
+                    &target_branch,
+                )
+                .await?;
+            let state = target_db.storage().table_state(&full_path, &ds).await?;
+            Ok(crate::db::SubTableUpdate {
+                identity: source_entry.identity,
+                table_key: table_key.to_string(),
+                table_version: state.version,
+                table_branch: Some(target_branch),
+                row_count: state.row_count,
+                version_metadata: state.version_metadata,
+            })
         }
+        // Classification drops a table whose adopt publishes nothing, so this
+        // arm means the candidate set and the plan disagree — an engine bug,
+        // not a caller error.
+        AdoptPublish::Nothing => Err(OmniError::manifest_internal(format!(
+            "branch merge table '{table_key}' publishes nothing and must not be a merge candidate"
+        ))),
     }
 }
 
@@ -3506,7 +3885,7 @@ impl Omnigraph {
             let has_blob = schema_has_blob(&schema_for_table_key(catalog, table_key)?)?;
             if !has_blob {
                 if same_manifest_state(base_entry, target_entry) {
-                    let candidate = classify_adopt(
+                    if let Some(candidate) = classify_adopt(
                         self,
                         catalog,
                         base_snapshot,
@@ -3516,8 +3895,10 @@ impl Omnigraph {
                         target_active.as_deref(),
                         &empty_external_preflight,
                     )
-                    .await?;
-                    candidates.insert(table_key.clone(), candidate);
+                    .await?
+                    {
+                        candidates.insert(table_key.clone(), candidate);
+                    }
                 } else if let Some(staged) = stage_streaming_table_merge(
                     self,
                     table_key,
@@ -3647,7 +4028,7 @@ impl Omnigraph {
                             "branch merge Blob proof for '{table_key}' lost its HEAD-advancing classification"
                         )));
                     }
-                    match blob_pure_insert_histories.remove(table_key) {
+                    let classified = match blob_pure_insert_histories.remove(table_key) {
                         Some(proven) => match finalize_proven_pure_insert_adopt(
                             self,
                             table_key,
@@ -3682,6 +4063,21 @@ impl Omnigraph {
                             )
                             .await?
                         }
+                    };
+                    // Blob-bearing tables reach the same net-zero shape, so
+                    // they share the one candidate rule.
+                    match source_entry {
+                        Some(source_entry) => keep_publishing_candidate(
+                            classified,
+                            target_active.as_deref(),
+                            source_entry,
+                            target_entry,
+                            table_key,
+                        ),
+                        // A blob adopt proof is only attempted for a table the
+                        // source carries, so this arm is unreachable; keep the
+                        // classified candidate rather than inventing a refusal.
+                        None => Some(classified),
                     }
                 } else {
                     classify_adopt(
@@ -3696,7 +4092,9 @@ impl Omnigraph {
                     )
                     .await?
                 };
-                candidates.insert(table_key.clone(), candidate);
+                if let Some(candidate) = candidate {
+                    candidates.insert(table_key.clone(), candidate);
+                }
                 continue;
             }
 
@@ -4165,6 +4563,7 @@ impl Omnigraph {
                             source_snapshot,
                             target_snapshot,
                             table_key,
+                            target_active.as_deref(),
                         )
                         .await?
                     }
