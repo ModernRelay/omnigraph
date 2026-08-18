@@ -1141,7 +1141,11 @@ async fn plan_proven_pure_insert_chunks(
         .await?;
     let mut chunk_rows = Vec::new();
     let mut observed_rows = 0_u64;
-    while let Some(batch) = stream.try_next().await.map_err(OmniError::datafusion)? {
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(OmniError::datafusion_internal)?
+    {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -3063,7 +3067,11 @@ async fn next_exact_staged_chunk(
         let batch = match carry.take() {
             Some(batch) => batch,
             None => loop {
-                match stream.try_next().await.map_err(OmniError::datafusion)? {
+                match stream
+                    .try_next()
+                    .await
+                    .map_err(OmniError::datafusion_internal)?
+                {
                     Some(batch) if batch.num_rows() > 0 => break batch,
                     Some(_) => continue,
                     None => {
@@ -3206,7 +3214,11 @@ async fn commit_keyed_stream_chunks(
 
     let mut has_extra_rows = carry.as_ref().is_some_and(|batch| batch.num_rows() > 0);
     while !has_extra_rows {
-        match stream.try_next().await.map_err(OmniError::datafusion)? {
+        match stream
+            .try_next()
+            .await
+            .map_err(OmniError::datafusion_internal)?
+        {
             Some(batch) => has_extra_rows = batch.num_rows() > 0,
             None => break,
         }

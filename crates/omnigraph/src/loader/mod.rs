@@ -2025,7 +2025,7 @@ pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> 
         // Treat as URI. Bound builder scratch before Lance copies the string;
         // policy/scheme/containment validation remains operation-wide after
         // last-write-wins folding.
-        crate::blob::validate_external_blob_uri_raw_limit(value)?;
+        crate::blob::validate_external_blob_uri_builder_input(value)?;
         builder.push_uri(value).map_err(OmniError::storage)
     }
 }
@@ -4042,6 +4042,15 @@ node Doc {
                 actual,
             }) if resource == "external Blob URI bytes"
                 && actual == crate::blob::EXTERNAL_BLOB_URI_MAX_BYTES + 1
+        ));
+
+        let mut builder = BlobArrayBuilder::new(1);
+        assert!(matches!(
+            append_blob_value(&mut builder, ""),
+            Err(OmniError::ExternalBlobPolicy { uri, reason })
+                if uri == "<redacted>"
+                    && reason
+                        == "external Blob URI must be non-empty and contain no surrounding whitespace"
         ));
     }
 

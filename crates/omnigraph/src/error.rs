@@ -4,6 +4,8 @@ pub use omnigraph_storage::{StorageFailure, StorageFailureKind};
 
 pub type Result<T> = std::result::Result<T, OmniError>;
 
+const STORAGE_MESSAGE_PREFIX: &str = "storage: ";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestErrorKind {
     BadRequest,
@@ -323,6 +325,7 @@ impl From<omnigraph_storage::StorageError> for OmniError {
         match error {
             omnigraph_storage::StorageError::Internal(message) => Self::manifest_internal(message),
             omnigraph_storage::StorageError::Backend(failure) => Self::Storage(failure),
+            omnigraph_storage::StorageError::Io { failure, .. } => Self::Storage(failure),
             omnigraph_storage::StorageError::ResourceLimit {
                 resource,
                 limit,
@@ -343,17 +346,13 @@ impl OmniError {
     /// choose storage, domain, or engine-internal semantics.
     pub fn storage(error: lance::Error) -> Self {
         let kind = classify_lance_error(&error);
-        Self::Storage(StorageFailure::new(kind, format!("storage: {error}")))
+        Self::classified_storage(kind, error)
     }
 
     /// Convert a Lance failure while retaining the operation's historical
     /// context. The resulting message is already complete.
     pub fn storage_context(context: impl std::fmt::Display, error: lance::Error) -> Self {
-        let kind = classify_lance_error(&error);
-        Self::Storage(StorageFailure::new(
-            kind,
-            format!("storage: {context}: {error}"),
-        ))
+        Self::storage(error).with_context(context)
     }
 
     /// Classify an engine-owned Namespace condition without first wrapping it
@@ -361,7 +360,7 @@ impl OmniError {
     /// `storage: <Namespace error>` diagnostic at those call sites.
     pub(crate) fn storage_namespace(error: lance_namespace::NamespaceError) -> Self {
         let kind = classify_namespace_code(error.code());
-        Self::Storage(StorageFailure::new(kind, format!("storage: {error}")))
+        Self::classified_storage(kind, error)
     }
 
     pub fn storage_failure(&self) -> Option<&StorageFailure> {
@@ -379,11 +378,27 @@ impl OmniError {
 
     /// Preserve typed storage evidence carried through DataFusion execution;
     /// otherwise retain the user query/execution category.
-    pub(crate) fn datafusion(error: datafusion::error::DataFusionError) -> Self {
+    pub fn datafusion(error: datafusion::error::DataFusionError) -> Self {
         match find_storage_source_kind(&error, 0) {
-            Some(kind) => Self::Storage(StorageFailure::new(kind, format!("storage: {error}"))),
+            Some(kind) => Self::classified_storage(kind, error),
             None => Self::DataFusion(error.to_string()),
         }
+    }
+
+    /// Convert a DataFusion failure from an engine-owned scan or write path.
+    /// Typed storage evidence is retained when available; an opaque execution
+    /// failure remains an unknown storage failure because no user query owns
+    /// these adapters.
+    pub(crate) fn datafusion_internal(error: datafusion::error::DataFusionError) -> Self {
+        let kind = find_storage_source_kind(&error, 0).unwrap_or(StorageFailureKind::Unknown);
+        Self::classified_storage(kind, error)
+    }
+
+    fn classified_storage(kind: StorageFailureKind, message: impl std::fmt::Display) -> Self {
+        Self::Storage(StorageFailure::new(
+            kind,
+            format!("{STORAGE_MESSAGE_PREFIX}{message}"),
+        ))
     }
 
     /// Add operation context without discarding an existing typed category.
@@ -392,9 +407,9 @@ impl OmniError {
             Self::Storage(mut failure) => {
                 let message = failure
                     .message
-                    .strip_prefix("storage: ")
+                    .strip_prefix(STORAGE_MESSAGE_PREFIX)
                     .unwrap_or(&failure.message);
-                failure.message = format!("storage: {context}: {message}");
+                failure.message = format!("{STORAGE_MESSAGE_PREFIX}{context}: {message}");
                 Self::Storage(failure)
             }
             Self::Manifest(mut error) => {
@@ -543,84 +558,69 @@ impl OmniError {
     }
 }
 fn classify_lance_error(error: &lance::Error) -> StorageFailureKind {
-    classify_lance_error_at_depth(error, 0)
+    find_storage_source_kind(error, 0).unwrap_or(StorageFailureKind::Unknown)
 }
 
-fn classify_lance_error_at_depth(error: &lance::Error, depth: usize) -> StorageFailureKind {
-    if depth >= omnigraph_storage::MAX_STORAGE_SOURCE_DEPTH {
-        return StorageFailureKind::Unknown;
+fn classify_engine_storage_source<'a>(
+    source: &'a (dyn std::error::Error + 'static),
+) -> std::ops::ControlFlow<StorageFailureKind, Option<&'a (dyn std::error::Error + 'static)>> {
+    use std::ops::ControlFlow::{Break, Continue};
+
+    if let Some(error) = source.downcast_ref::<lance::Error>() {
+        return match error {
+            lance::Error::Timeout { .. } => Break(StorageFailureKind::Transient),
+            lance::Error::DiskCapExceeded { .. }
+            | lance::Error::InvalidInput { .. }
+            | lance::Error::InvalidTableLocation { .. }
+            | lance::Error::InvalidRef { .. }
+            | lance::Error::NotSupported { .. }
+            | lance::Error::FieldNotFound { .. }
+            | lance::Error::Unprocessable { .. } => Break(StorageFailureKind::Configuration),
+            lance::Error::DatasetNotFound { .. }
+            | lance::Error::NotFound { .. }
+            | lance::Error::RefNotFound { .. }
+            | lance::Error::VersionNotFound { .. }
+            | lance::Error::IndexNotFound { .. } => Break(StorageFailureKind::NotFound),
+            lance::Error::DatasetAlreadyExists { .. }
+            | lance::Error::CommitConflict { .. }
+            | lance::Error::IncompatibleTransaction { .. }
+            | lance::Error::RetryableCommitConflict { .. }
+            | lance::Error::TooMuchWriteContention { .. }
+            | lance::Error::RefConflict { .. }
+            | lance::Error::VersionConflict { .. }
+            | lance::Error::Fenced { .. } => Break(StorageFailureKind::Precondition),
+            lance::Error::CorruptFile { .. }
+            | lance::Error::SchemaMismatch { .. }
+            | lance::Error::Internal { .. }
+            | lance::Error::Arrow { .. }
+            | lance::Error::Schema { .. } => Break(StorageFailureKind::Permanent),
+            lance::Error::Execution { .. }
+            | lance::Error::Index { .. }
+            | lance::Error::Cleanup { .. }
+            | lance::Error::Cloned { .. }
+            | lance::Error::PrerequisiteFailed { .. }
+            | lance::Error::Stop => Break(StorageFailureKind::Unknown),
+            lance::Error::IO { source, .. } | lance::Error::External { source } => {
+                Continue(Some(source.as_ref()))
+            }
+            lance::Error::Wrapped { error, .. } => Continue(Some(error.as_ref())),
+            lance::Error::Namespace { source, .. } => Continue(Some(source.as_ref())),
+        };
     }
-    match error {
-        lance::Error::Timeout { .. } => StorageFailureKind::Transient,
-        lance::Error::DiskCapExceeded { .. }
-        | lance::Error::InvalidInput { .. }
-        | lance::Error::InvalidTableLocation { .. }
-        | lance::Error::InvalidRef { .. }
-        | lance::Error::NotSupported { .. }
-        | lance::Error::FieldNotFound { .. }
-        | lance::Error::Unprocessable { .. } => StorageFailureKind::Configuration,
-        lance::Error::DatasetNotFound { .. }
-        | lance::Error::NotFound { .. }
-        | lance::Error::RefNotFound { .. }
-        | lance::Error::VersionNotFound { .. }
-        | lance::Error::IndexNotFound { .. } => StorageFailureKind::NotFound,
-        lance::Error::DatasetAlreadyExists { .. }
-        | lance::Error::CommitConflict { .. }
-        | lance::Error::IncompatibleTransaction { .. }
-        | lance::Error::RetryableCommitConflict { .. }
-        | lance::Error::TooMuchWriteContention { .. }
-        | lance::Error::RefConflict { .. }
-        | lance::Error::VersionConflict { .. }
-        | lance::Error::Fenced { .. } => StorageFailureKind::Precondition,
-        lance::Error::CorruptFile { .. }
-        | lance::Error::SchemaMismatch { .. }
-        | lance::Error::Internal { .. }
-        | lance::Error::Arrow { .. }
-        | lance::Error::Schema { .. } => StorageFailureKind::Permanent,
-        lance::Error::Execution { .. }
-        | lance::Error::Index { .. }
-        | lance::Error::Cleanup { .. }
-        | lance::Error::Cloned { .. }
-        | lance::Error::PrerequisiteFailed { .. }
-        | lance::Error::Stop => StorageFailureKind::Unknown,
-        lance::Error::IO { source, .. } | lance::Error::External { source } => {
-            find_storage_source_kind(source.as_ref(), depth + 1)
-                .unwrap_or(StorageFailureKind::Unknown)
-        }
-        lance::Error::Wrapped { error, .. } => find_storage_source_kind(error.as_ref(), depth + 1)
-            .unwrap_or(StorageFailureKind::Unknown),
-        lance::Error::Namespace { source, .. } => source
-            .downcast_ref::<lance_namespace::NamespaceError>()
-            .map(|error| classify_namespace_code(error.code()))
-            .or_else(|| find_storage_source_kind(source.as_ref(), depth + 1))
-            .unwrap_or(StorageFailureKind::Unknown),
+    if let Some(error) = source.downcast_ref::<lance_namespace::NamespaceError>() {
+        return Break(classify_namespace_code(error.code()));
     }
+    Continue(None)
 }
 
-/// The engine's one bounded typed-source walker. `Some(Unknown)` means a
-/// recognized storage wrapper carried insufficient evidence; `None` means no
-/// storage-owned type was found before the shared depth bound.
+/// `Some(Unknown)` means a recognized storage wrapper carried insufficient
+/// evidence; `None` means no storage-owned type was found before the shared
+/// depth bound.
 fn find_storage_source_kind(
     source: &(dyn std::error::Error + 'static),
     depth: usize,
 ) -> Option<StorageFailureKind> {
-    if depth >= omnigraph_storage::MAX_STORAGE_SOURCE_DEPTH {
-        return None;
-    }
-    if let Some(error) = source.downcast_ref::<lance::Error>() {
-        return Some(classify_lance_error_at_depth(error, depth));
-    }
-    if let Some(error) = source.downcast_ref::<object_store::Error>() {
-        return Some(omnigraph_storage::classify_object_store_error_at_depth(
-            error, depth,
-        ));
-    }
-    if let Some(error) = source.downcast_ref::<std::io::Error>() {
-        return Some(omnigraph_storage::classify_io_error_at_depth(error, depth));
-    }
-    source
-        .source()
-        .and_then(|inner| find_storage_source_kind(inner, depth + 1))
+    omnigraph_storage::find_storage_source_kind_with(source, depth, classify_engine_storage_source)
 }
 
 fn classify_namespace_code(code: lance_namespace::ErrorCode) -> StorageFailureKind {
@@ -936,6 +936,28 @@ mod tests {
         ));
         assert_eq!(
             arrow_wrapped.storage_failure().map(|failure| failure.kind),
+            Some(StorageFailureKind::Transient)
+        );
+
+        let internal =
+            datafusion::error::DataFusionError::Execution("engine-owned scan failed".to_string());
+        let internal_text = internal.to_string();
+        let internal = OmniError::datafusion_internal(internal);
+        assert_eq!(
+            internal.storage_failure().map(|failure| failure.kind),
+            Some(StorageFailureKind::Unknown)
+        );
+        assert_eq!(internal.to_string(), format!("storage: {internal_text}"));
+
+        let nested = lance::Error::io_source(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "internal transport timeout",
+        )));
+        let nested = OmniError::datafusion_internal(datafusion::error::DataFusionError::External(
+            Box::new(nested),
+        ));
+        assert_eq!(
+            nested.storage_failure().map(|failure| failure.kind),
             Some(StorageFailureKind::Transient)
         );
     }
