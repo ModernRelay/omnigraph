@@ -21,7 +21,7 @@ versions at a graph manifest version, so cross-dataset reads stay snapshot-isola
 
 ```bash
 # Read a query against a past snapshot
-omnigraph read --query ./q.gq --name find --snapshot <snapshot-id> s3://bucket/graph.omni
+omnigraph query find --query ./q.gq --snapshot <snapshot-id> --store s3://bucket/graph.omni
 ```
 
 Time travel composes with branches: every branch has its own version history, and

@@ -68,10 +68,10 @@ The [query language](queries/index.md) covers `match`/`return`/`order`, and
 Branches isolate changes until you merge them — Git-style, across the whole graph:
 
 ```bash
-omnigraph branch create review/new-hires graph.omni
+omnigraph branch create review/new-hires --store graph.omni
 omnigraph load --data new-hires.jsonl --mode append --branch review/new-hires graph.omni
 # inspect the branch, then integrate it
-omnigraph branch merge review/new-hires --into main graph.omni
+omnigraph branch merge review/new-hires --into main --store graph.omni
 ```
 
 See [branches & commits](branching/index.md) and [merging](branching/merge.md).
