@@ -1254,3 +1254,91 @@ async fn change_routes_enforce_bearer_and_policy() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+/// A padded branch spelling must not bypass branch-scope policy: the engine
+/// trims branch names late, so authorizing the caller's raw string would let
+/// `branch=%20main%20` be classified by Cedar as an unprotected named branch
+/// and then resolve to protected main. The feed and baseline handlers
+/// normalize BEFORE authorization, so every spelling of main is judged as
+/// main.
+#[tokio::test(flavor = "multi_thread")]
+async fn padded_branch_spelling_cannot_bypass_change_route_policy() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        r#"
+version: 1
+groups:
+  side-readers: [act-a]
+protected_branches: [main]
+rules:
+  - id: unprotected-only
+    allow:
+      actors: { group: side-readers }
+      actions: [read, export]
+      branch_scope: unprotected
+"#,
+    )
+    .unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("act-a".to_string(), "token-a".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    // Plain main is protected: the unprotected-only rule denies it.
+    let (plain_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/changes?branch=main"))
+            .method(Method::GET)
+            .header("authorization", "Bearer token-a")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(plain_status, StatusCode::FORBIDDEN);
+
+    // The padded spelling resolves to the same protected main and must be
+    // denied identically — before normalization it was classified as an
+    // unprotected named branch and slipped through.
+    let (padded_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/changes?branch=%20main%20"))
+            .method(Method::GET)
+            .header("authorization", "Bearer token-a")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        padded_status,
+        StatusCode::FORBIDDEN,
+        "a padded spelling of main must be authorized as main"
+    );
+
+    // Baseline (export) takes its branch from the JSON body; the same padded
+    // spelling must be denied the same way.
+    let (baseline_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/changes/baseline"))
+            .method(Method::POST)
+            .header("authorization", "Bearer token-a")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"branch":" main "}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        baseline_status,
+        StatusCode::FORBIDDEN,
+        "a padded baseline branch must be authorized as main"
+    );
+}

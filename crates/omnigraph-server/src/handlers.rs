@@ -835,7 +835,7 @@ pub(crate) async fn server_export(
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<ExportRequest>,
 ) -> std::result::Result<Response, ApiError> {
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    let branch = normalize_change_branch(request.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -2760,6 +2760,20 @@ fn parse_change_feed_start(
     }
 }
 
+/// Normalize a caller-supplied change-surface branch BEFORE authorization so
+/// Cedar and the engine classify the same identity. The engine trims late
+/// (its own branch normalization), so authorizing the raw string would let a
+/// padded spelling like " main " be classified as an unprotected named branch
+/// and then resolve to protected main — a policy bypass. Empty-after-trim is
+/// a malformed request rather than an implicit main.
+fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, ApiError> {
+    let trimmed = branch.unwrap_or("main").trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::bad_request("branch name cannot be empty"));
+    }
+    Ok(trimmed.to_string())
+}
+
 #[utoipa::path(
     get,
     path = "/changes",
@@ -2791,7 +2805,7 @@ pub(crate) async fn server_changes_feed(
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), CHANGE_FEED_PARAMS)?;
-    let branch = params.branch.clone().unwrap_or_else(|| "main".to_string());
+    let branch = normalize_change_branch(params.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -2866,7 +2880,7 @@ pub(crate) async fn server_changes_baseline(
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<api::ChangeBaselineRequest>,
 ) -> std::result::Result<Response, ApiError> {
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    let branch = normalize_change_branch(request.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
