@@ -631,6 +631,7 @@ async fn vector_column_trainable(
 pub(super) struct IndexWorkStatus {
     pub(super) needs_commit: bool,
     pub(super) pending: Vec<PendingIndex>,
+    pub(super) vector_layouts: Vec<VectorIndexLayout>,
 }
 
 /// Returns the declared scalar/vector index work that
@@ -769,9 +770,11 @@ pub(super) async fn index_work_status_on_dataset_for_catalog(
             table_key
         )));
     };
+    let vector_layouts = vector_index_layouts_on_dataset(db, catalog, table_key, ds).await?;
     Ok(IndexWorkStatus {
         needs_commit: work.needs_commit(),
         pending: work.pending,
+        vector_layouts,
     })
 }
 
@@ -1393,6 +1396,117 @@ pub struct PendingIndex {
     pub table_key: String,
     pub column: String,
     pub reason: String,
+}
+
+/// Physical layout of a built vector index, surfaced on optimize stats so
+/// coverage answers "can this index prune", not just "does an index exist"
+/// (#486). A mono-partition IVF index over a large table reports complete
+/// coverage while every `nearest()` reads the full index payload; delta
+/// `optimize_indices` folds never re-partition, so without this signal the
+/// state is invisible to anyone watching coverage.
+#[derive(Debug, Clone)]
+pub struct VectorIndexLayout {
+    pub table_key: String,
+    pub column: String,
+    pub index_name: String,
+    /// Best partition count across the index's delta segments (display
+    /// summary; the degenerate flag is computed per segment, not from this).
+    pub partitions: u64,
+    pub indexed_rows: u64,
+    /// Worst rows-per-partition across delta segments — the honest prune
+    /// signal, since Lance searches each delta segment independently and a
+    /// good later segment cannot repair a bad earlier one.
+    pub max_rows_per_partition: u64,
+    /// True when some segment averages more than
+    /// [`DEGENERATE_VECTOR_ROWS_PER_PARTITION`] rows per partition, i.e. a
+    /// nearest() against it reads a partition so large the index is
+    /// functionally a flat scan. Catches both the mono-partition case and the
+    /// under-partitioned case (8 partitions over 852k rows).
+    pub degenerate: bool,
+}
+
+/// Below this many rows per partition a scan of the partition is trivially
+/// cheap; above it, the partition is so large that probing it approaches a
+/// flat read of the segment. Healthy IVF sizing targets ~sqrt(N) rows per
+/// partition, so 4096 leaves generous slack before the flag fires.
+pub(crate) const DEGENERATE_VECTOR_ROWS_PER_PARTITION: u64 = 4096;
+
+/// Per segment, because Lance searches delta segments independently: one
+/// degenerate segment forces its full payload onto every query no matter how
+/// well-partitioned its siblings are.
+fn vector_layout_is_degenerate(per_segment: &[(u64, u64)]) -> bool {
+    per_segment
+        .iter()
+        .any(|(partitions, rows)| rows / partitions.max(&1) > DEGENERATE_VECTOR_ROWS_PER_PARTITION)
+}
+
+/// Collect [`VectorIndexLayout`]s for every declared vector column on a node
+/// table that already has a built index. Edge tables have no vector columns.
+pub(super) async fn vector_index_layouts_on_dataset(
+    db: &Omnigraph,
+    catalog: &Catalog,
+    table_key: &str,
+    ds: &SnapshotHandle,
+) -> Result<Vec<VectorIndexLayout>> {
+    let Some(type_name) = table_key.strip_prefix("node:") else {
+        return Ok(Vec::new());
+    };
+    let Some(node_type) = catalog.node_types.get(type_name) else {
+        return Ok(Vec::new());
+    };
+    let mut layouts = Vec::new();
+    for index_cols in &node_type.indices {
+        if index_cols.len() != 1 {
+            continue;
+        }
+        let prop_name = &index_cols[0];
+        let Some(prop_type) = node_type.properties.get(prop_name) else {
+            continue;
+        };
+        if !matches!(
+            node_prop_index_kind(prop_type),
+            Some(NodePropIndexKind::Vector)
+        ) {
+            continue;
+        }
+        if let Some((index_name, indexed_rows, per_segment)) =
+            db.storage().vector_index_layout(ds, prop_name).await?
+        {
+            layouts.push(VectorIndexLayout {
+                table_key: table_key.to_string(),
+                column: prop_name.clone(),
+                index_name,
+                partitions: per_segment.iter().map(|(p, _)| *p).max().unwrap_or(0),
+                indexed_rows,
+                max_rows_per_partition: per_segment
+                    .iter()
+                    .map(|(p, r)| r / p.max(&1))
+                    .max()
+                    .unwrap_or(0),
+                degenerate: vector_layout_is_degenerate(&per_segment),
+            });
+        }
+    }
+    Ok(layouts)
+}
+
+#[cfg(test)]
+mod vector_layout_tests {
+    use super::{DEGENERATE_VECTOR_ROWS_PER_PARTITION, vector_layout_is_degenerate};
+
+    #[test]
+    fn degenerate_boundary() {
+        let floor = DEGENERATE_VECTOR_ROWS_PER_PARTITION;
+        assert!(!vector_layout_is_degenerate(&[(1, floor)]));
+        assert!(vector_layout_is_degenerate(&[(1, floor + 1)]));
+        // The #432 incident shape: 8 partitions over 852k rows must flag.
+        assert!(vector_layout_is_degenerate(&[(8, 852_000)]));
+        // Healthy sizing: ~sqrt(N) partitions stays quiet.
+        assert!(!vector_layout_is_degenerate(&[(923, 852_000)]));
+        // One bad delta segment cannot hide behind a good later one.
+        assert!(vector_layout_is_degenerate(&[(1, 100_000), (64, 5_000)]));
+        assert!(!vector_layout_is_degenerate(&[(1, 0)]));
+    }
 }
 
 pub(super) async fn build_indices_on_dataset(

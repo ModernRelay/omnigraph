@@ -3778,6 +3778,76 @@ impl TableStore {
         Self::has_vector_index_on(ds, column).await
     }
 
+    /// `(index_name, total_indexed_rows, per_segment)` for the column's vector
+    /// index, or `None` when the column has no vector index. `per_segment` is
+    /// one `(partitions, rows)` pair per delta segment, zipped from
+    /// `indices[]` and `num_indexed_rows_per_delta`: Lance searches delta
+    /// segments independently, so prune capability is per segment and any
+    /// summary that collapses them can hide a bad one. Statistics missing any
+    /// expected field is an error, not a silent skip — `lance_surface_guards`
+    /// pins the shape.
+    pub(crate) async fn vector_index_layout_on(
+        ds: &Dataset,
+        column: &str,
+    ) -> Result<Option<(String, u64, Vec<(u64, u64)>)>> {
+        let indices = Self::user_indices_for_column(ds, column).await?;
+        let Some(index) = indices.iter().find(|index| {
+            index
+                .index_details
+                .as_ref()
+                .map(|details| IndexDetails(details.clone()).is_vector())
+                .unwrap_or(false)
+        }) else {
+            return Ok(None);
+        };
+        let raw = ds.index_statistics(&index.name).await.map_err(|e| {
+            OmniError::Lance(format!(
+                "index_statistics on '{}' ('{}'): {}",
+                index.name, column, e
+            ))
+        })?;
+        let stats: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            OmniError::Lance(format!(
+                "index_statistics on '{}' returned unparseable JSON: {}",
+                index.name, e
+            ))
+        })?;
+        let indexed_rows = stats["num_indexed_rows"].as_u64().ok_or_else(|| {
+            OmniError::Lance(format!(
+                "index_statistics on '{}' missing num_indexed_rows: {}",
+                index.name, stats
+            ))
+        })?;
+        let segment_partitions: Vec<u64> = stats["indices"]
+            .as_array()
+            .map(|segments| {
+                segments
+                    .iter()
+                    .filter_map(|s| s["num_partitions"].as_u64())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let segment_rows: Vec<u64> = stats["num_indexed_rows_per_delta"]
+            .as_array()
+            .map(|rows| rows.iter().filter_map(|r| r.as_u64()).collect())
+            .unwrap_or_default();
+        if segment_partitions.is_empty()
+            || segment_partitions.iter().any(|p| *p == 0)
+            || segment_rows.len() != segment_partitions.len()
+        {
+            return Err(OmniError::Lance(format!(
+                "index_statistics on '{}' did not expose aligned num_partitions / \
+                 num_indexed_rows_per_delta: {}",
+                index.name, stats
+            )));
+        }
+        let per_segment = segment_partitions
+            .into_iter()
+            .zip(segment_rows)
+            .collect::<Vec<_>>();
+        Ok(Some((index.name.clone(), indexed_rows, per_segment)))
+    }
+
     pub(crate) async fn has_vector_index_on(ds: &Dataset, column: &str) -> Result<bool> {
         let indices = Self::user_indices_for_column(ds, column).await?;
         Ok(indices.iter().any(|index| {

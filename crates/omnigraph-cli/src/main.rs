@@ -978,6 +978,14 @@ async fn main() -> Result<()> {
                             "column": p.column,
                             "reason": p.reason,
                         })).collect::<Vec<_>>(),
+                        "vector_index_layouts": s.vector_index_layouts.iter().map(|v| serde_json::json!({
+                            "column": v.column,
+                            "index_name": v.index_name,
+                            "partitions": v.partitions,
+                            "indexed_rows": v.indexed_rows,
+                            "max_rows_per_partition": v.max_rows_per_partition,
+                            "degenerate": v.degenerate,
+                        })).collect::<Vec<_>>(),
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
@@ -996,6 +1004,19 @@ async fn main() -> Result<()> {
                     }
                     for p in &s.pending_indexes {
                         println!("    ↳ index pending on '{}': {}", p.column, p.reason);
+                    }
+                    for v in &s.vector_index_layouts {
+                        if v.degenerate {
+                            println!(
+                                "    ↳ DEGENERATE vector index on '{}': {} partition(s) over {} rows ({} rows/partition worst segment) — cannot prune; delta optimize will not re-partition (#485)",
+                                v.column, v.partitions, v.indexed_rows, v.max_rows_per_partition
+                            );
+                        } else {
+                            println!(
+                                "    ↳ vector index on '{}': {} partition(s) / {} rows",
+                                v.column, v.partitions, v.indexed_rows
+                            );
+                        }
                     }
                 }
             }
