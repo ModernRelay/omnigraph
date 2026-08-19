@@ -69,7 +69,7 @@ end-to-end benchmark: one instrument, two profiles
 ├── the RUN RECORD = the run spec + the measurements
 │   ├── persists ··· the run spec (fixture · workload · conditions)
 │   │                · the SUT (source commit · build profile · engine configuration)
-│   │                · the invocation timestamp
+│   │                · the invocation id · the invocation timestamp
 │   │                · backend identity · machine specification
 │   │                · dataset-builder identity (version · parameters · fetch digests)
 │   │                · raw result rows (one per repetition)
@@ -81,8 +81,9 @@ end-to-end benchmark: one instrument, two profiles
 │   │                sweeps and comparisons run in numbers; never simulates faults
 │   ├── real S3 ···· truth: scheduled, budget-capped subset; distributions
 │   │                and trend, never single-run headlines
-│   └── cross-check  counts × per-request latency ⇒ predicted wall-clock,
-│                    reconciled against observed; deviation = a finding
+│   └── cross-check  physical attempts × per-request latency ⇒ predicted
+│                    wall-clock (logical-only counts: a stated lower bound);
+│                    deviation beyond fan-out = a finding
 ├── ADDING A CASE = definition, not wiring
 │   ├── new point ······ declarative case definition (levels per factor);
 │   │                    the definition is its own registration
@@ -130,7 +131,7 @@ In introduction order; each entry depends only on plain English or entries above
 - **Profile**: a canonical region of the instrument's space of run specs, given a name so it can be invoked without reciting factor levels. Two profiles are defined: the **micro profile** (single-operation synthetic workload, per-phase attribution on) attributes cost to mechanisms; the **realistic profile** (scheduled realistic workload, named backend) measures what users feel. Both drive the public surface. Per-phase attribution in the micro profile is served through that same surface by the engine's phase-timing exposure; while that exposure is unshipped, the harness's in-process access is an implementation interim, not a different instrument. A new profile is a definition, not a new instrument.
 - **Run**: one execution of the end-to-end benchmark, under one profile.
 - **System under test (SUT)**: what the run measures: the engine's source commit, build profile, and engine configuration (feature flags and enabled techniques). Deliberately outside the run spec: the spec describes the experiment, the SUT is the subject. Equal specs with different SUTs compare systems (a fix verdict, a regression); equal SUTs across a sweep compare scaling.
-- **Run record**: the persisted description of one run: its run spec plus the measurements produced. One record holds one invocation; its repetitions are rows inside the record, never separate records, so nothing is overwritten by repeating a measurement. The citation target for every published number, and immutable once cited. This is the reproducibility contract: a stranger holding the record can rebuild the run. The run spec doubles as the results table's ***natural key*** (a key formed from the data's own attributes rather than assigned): records with equal specs are directly comparable and form one series over time; spec plus SUT plus invocation timestamp identifies one record uniquely, and the invocation timestamp is a persisted field of the record.
+- **Run record**: the persisted description of one run: its run spec plus the measurements produced. One record holds one invocation; its repetitions are rows inside the record, never separate records, so nothing is overwritten by repeating a measurement. The citation target for every published number, and immutable once cited. This is the reproducibility contract: a stranger holding the record can rebuild the run. The run spec doubles as the results table's ***natural key*** (a key formed from the data's own attributes rather than assigned): records with equal specs are directly comparable and form one series over time. One record is identified uniquely by spec plus SUT plus a caller-minted ***invocation id*** (a unique identifier generated when the invocation starts, so identity never rests on clock resolution); both the invocation id and the invocation timestamp are persisted fields, the id carrying identity and the timestamp carrying ordering.
 - **Sweep**: a series of runs varying one factor's level, every other factor pinned. The only shape from which a scaling claim ("cost grows with X") may be read.
 - **Showroom fixture**: a store built fresh and clean immediately before measurement. It understates the costs a production store carries, the way a showroom car understates ownership; the State class exists to forbid measuring only showrooms.
 - **Fixture-state axes (F1 to F5)**: the five history effects a real store accumulates and a showroom fixture lies about: **F1** fragmentation and aging (the same content bulk-loaded versus written as thousands of small commits), **F2** index existence and type, **F3** index freshness (rows written since the last index optimize), **F4** deletion history (deletion-vector accumulation at equal live rows), **F5** compaction recency.
@@ -156,7 +157,7 @@ The axes and sweep points live in the contract tree above (Summary); this sectio
 - **MinIO**: the repeatable rig. Real S3 request semantics at local latency, cheap enough that comparisons and sweeps run in numbers. Never simulates faults; fault injection belongs to the DST harness (RFC-032, RFC-037).
 - **Real S3**: the truth. Scheduled runs on a budget-capped scenario subset produce latency distributions and a regression trend over time, never single-run headline numbers, because a single real-network observation is weather, not climate.
 
-**Wall-clock is one measurement dimension; storage-call counts are the other, and every run records both.** The harness counts the run's storage calls per operation class, adopting RFC-031's operation vocabulary unchanged (get, put, put_part, head, list, delete, copy, rename, and the multipart operations), into the same record beside the timings. Per-run counts are a measurement column, not a gate: RFC-031's comparator remains the only pinned, gating count. What the counts buy is the cross-check per run: counts times per-request latency predict a wall-clock, reconciled against the wall-clock observed; a material deviation (hidden requests, retries, contention) is a finding in its own right, per the same-ruler precedent the RFC-031 amendment records.
+**Wall-clock is one measurement dimension; storage-call counts are the other, and every run records both.** The harness counts the run's storage calls per operation class, adopting RFC-031's operation vocabulary unchanged (get, put, put_part, head, list, delete, copy, rename, and the multipart operations) and at RFC-031's two layers: logical operations, and physical request attempts (retries and multipart fan-out make these differ). Counts land in the same record beside the timings. Per-run counts are a measurement column, not a gate: RFC-031's comparator remains the only pinned, gating count. What the counts buy is the cross-check per run: physical attempt counts times per-request latency predict a wall-clock, reconciled against the wall-clock observed, so request fan-out appears in the counts rather than masquerading as a timing deviation; a remaining material deviation (hidden requests, contention) is a finding in its own right, per the same-ruler precedent the RFC-031 amendment records.
 
 ### Answer quality: the initial step
 
