@@ -8,17 +8,17 @@
 | **Author(s)** | Azim Afroozeh |
 | **Number** | 0039 (next free: `docs/rfcs/` runs through 0038 at PR time; the number is reserved by the merge, re-check for in-flight collisions before opening the PR) |
 | **Discussion** | <link when opened> |
-| **Implementation** | harness prototype in progress (uncommitted; recorded in the harness documentation) |
+| **Implementation** | harness prototype in progress; arrives as separate PRs once this specification settles |
 
 ## Evidence status of this document
 
-**This document is design intent, not evidence.** No runs on the instrument's target path (the public surface) exist at this writing; interim-harness runs exist and are recorded in the harness documentation, not cited here. This document therefore contains zero measured claims: every number below is a design parameter or a citation of an external benchmark tradition. When target-path runs exist, published numbers enter by citation of run records (defined below), never retyped.
+**This document is design intent, not evidence.** No runs on the instrument's target path (the public surface) exist at this writing; prototype runs informed the design, and none are citable until run records land with the harness. This document therefore contains zero measured claims: every number below is a design parameter or a citation of an external benchmark tradition. When target-path runs exist, published numbers enter by citation of run records (defined below), never retyped.
 
 ## Summary
 
 Omnigraph gains its ***end-to-end benchmark***: one instrument that drives the public surface and measures both elapsed time and storage calls. Every run applies a workload to a fixture under stated conditions, measuring one system under test; that description (equivalently, one level chosen for every factor in five classes) is persisted as a run record which every published number must cite, and seven protocol rules make dishonest or irreproducible numbers invalid rather than merely unpolished. The instrument runs under two named ***profiles*** (a profile is a canonical region of the space of run specs, named so it can be invoked without reciting levels): the ***micro profile*** (single-operation synthetic workload, per-phase attribution: it attributes time to mechanisms) and the ***realistic profile*** (scheduled realistic workload against a named backend, reporting latency percentiles, throughput, answer quality, and cost: it measures what users feel). End-to-end means over the ***public surface*** (the interfaces omnigraph ships for its users, as opposed to internal seams): both profiles drive it; the micro profile simulates micro-benchmarking through the same door users enter, so its numbers carry the same request path the realistic profile's do. When a realistic number moves, the micro profile says which mechanism moved it. The two profiles are not two instruments: they share the harness, the record schema, the run-spec key, and every rule below; they differ only in factor levels.
 
-The whole contract, as one tree (axes and sweep points illustrative; the harness documentation owns the full lists):
+The whole contract, as one tree (axes and sweep points illustrative; the harness documentation, arriving with the harness PRs, owns the full lists):
 
 ```
 end-to-end benchmark: one instrument, two profiles
@@ -64,14 +64,15 @@ end-to-end benchmark: one instrument, two profiles
 │   ├── answer quality · judge-free floor: verifiable-answer correctness
 │   │                    · multi-hop completion (recall/precision@k: future work)
 │   ├── cost ··········· $/query decomposed: requests · egress · compute · tokens
-│   ├── storage calls ·· counts per class (get · put · list), DST-style, per run
+│   ├── storage calls ·· counts per RFC-031 operation class, per run
 │   └── noise residual · measured floor (A/A) · disturbance flags · per-rep spread
 ├── the RUN RECORD = the run spec + the measurements
 │   ├── persists ··· the run spec (fixture · workload · conditions)
 │   │                · the SUT (source commit · build profile · engine configuration)
+│   │                · the invocation timestamp
 │   │                · backend identity · machine specification
 │   │                · dataset-builder identity (version · parameters · fetch digests)
-│   │                · raw result rows
+│   │                · raw result rows (one per repetition)
 │   ├── cited by every published number
 │   ├── immutable once cited
 │   └── sufficient for a stranger to rebuild the run
@@ -99,8 +100,8 @@ end-to-end benchmark: one instrument, two profiles
     │                              identities never compare silently
     ├── 5 manual before automatic  a schedule is earned by understood variance,
     │                              never default
-    ├── 6 PR gates stay RFC-031's  only its pinned golden gates; this
-    │                              instrument's counts and wall-clock trend
+    ├── 6 this instrument ········ never gates, at any CI stage; gating stays
+    │                              with the counting instruments per RFC-031
     └── 7 effects clear the floor · a claimed effect exceeds the session's
                                    A/A noise floor, or reads "no detected effect"
 ```
@@ -125,11 +126,11 @@ In introduction order; each entry depends only on plain English or entries above
 - **Dataset builder**: the script that obtains the data a run measures against, by any means: generating it synthetically from a seed, downloading a published dataset, or transforming one into another. Reproducibility is the only requirement, and it is met per mode: generated data is re-derivable on demand (same builder version, same parameters, same bytes: it never needs archiving); fetched data is pinned by content digest and must land in the archive, because origins vanish and a digest that resolves to nothing is a citation to nothing. Either way, the builder's identity (version, parameters, and the digests of anything fetched) fully determines the bytes and lands in the run record.
 - **Fixture**: the built store a run measures against, realizing the Data and State classes as actual bytes. A fixture's identity is (dataset-builder identity, its Data and State levels); a fixture built from generated data is re-derivable on demand, and one built from fetched data is reproducible through the archived, digest-pinned artifacts.
 - **Conditions**: the Environment and Protocol classes taken together: where the run executes and how it is measured.
-- **Run spec**: a run's complete specification: its fixture, its workload, and its conditions (equivalently: one level assigned to every factor). A run's spec is its identity; its serialized form is the ***point name*** (the spec flattened into one string, e.g. `m3-t8-n100k-btree-d50`). Design of experiments calls this a treatment or design point.
+- **Run spec**: a run's complete specification: its fixture, its workload, and its conditions (equivalently: one level assigned to every factor). The spec names the experiment: runs sharing a spec are repetitions of one measurement series, never overwrites of one another. Its serialized form is the ***point name*** (the spec flattened into one string, e.g. `m3-t8-n100k-btree-d50`). Design of experiments calls this a treatment or design point.
 - **Profile**: a canonical region of the instrument's space of run specs, given a name so it can be invoked without reciting factor levels. Two profiles are defined: the **micro profile** (single-operation synthetic workload, per-phase attribution on) attributes cost to mechanisms; the **realistic profile** (scheduled realistic workload, named backend) measures what users feel. Both drive the public surface. Per-phase attribution in the micro profile is served through that same surface by the engine's phase-timing exposure; while that exposure is unshipped, the harness's in-process access is an implementation interim, not a different instrument. A new profile is a definition, not a new instrument.
 - **Run**: one execution of the end-to-end benchmark, under one profile.
 - **System under test (SUT)**: what the run measures: the engine's source commit, build profile, and engine configuration (feature flags and enabled techniques). Deliberately outside the run spec: the spec describes the experiment, the SUT is the subject. Equal specs with different SUTs compare systems (a fix verdict, a regression); equal SUTs across a sweep compare scaling.
-- **Run record**: the persisted description of one run: its run spec plus the measurements produced. The citation target for every published number, and immutable once cited. This is the reproducibility contract: a stranger holding the record can rebuild the run. The run spec doubles as the results table's ***natural key*** (a key formed from the data's own attributes rather than assigned): runs with equal specs are directly comparable and form one series over time; spec plus SUT plus timestamp identifies one run uniquely.
+- **Run record**: the persisted description of one run: its run spec plus the measurements produced. One record holds one invocation; its repetitions are rows inside the record, never separate records, so nothing is overwritten by repeating a measurement. The citation target for every published number, and immutable once cited. This is the reproducibility contract: a stranger holding the record can rebuild the run. The run spec doubles as the results table's ***natural key*** (a key formed from the data's own attributes rather than assigned): records with equal specs are directly comparable and form one series over time; spec plus SUT plus invocation timestamp identifies one record uniquely, and the invocation timestamp is a persisted field of the record.
 - **Sweep**: a series of runs varying one factor's level, every other factor pinned. The only shape from which a scaling claim ("cost grows with X") may be read.
 - **Showroom fixture**: a store built fresh and clean immediately before measurement. It understates the costs a production store carries, the way a showroom car understates ownership; the State class exists to forbid measuring only showrooms.
 - **Fixture-state axes (F1 to F5)**: the five history effects a real store accumulates and a showroom fixture lies about: **F1** fragmentation and aging (the same content bulk-loaded versus written as thousands of small commits), **F2** index existence and type, **F3** index freshness (rows written since the last index optimize), **F4** deletion history (deletion-vector accumulation at equal live rows), **F5** compaction recency.
@@ -155,7 +156,7 @@ The axes and sweep points live in the contract tree above (Summary); this sectio
 - **MinIO**: the repeatable rig. Real S3 request semantics at local latency, cheap enough that comparisons and sweeps run in numbers. Never simulates faults; fault injection belongs to the DST harness (RFC-032, RFC-037).
 - **Real S3**: the truth. Scheduled runs on a budget-capped scenario subset produce latency distributions and a regression trend over time, never single-run headline numbers, because a single real-network observation is weather, not climate.
 
-**Wall-clock is one measurement dimension; storage-call counts are the other, and every run records both.** The harness counts the run's storage calls (per class: get, put, list) with the same counting technique the DST golden uses, into the same record beside the timings. Per-run counts are a measurement column, not a gate: RFC-031's comparator remains the only pinned, gating count. What the counts buy is the cross-check per run: counts times per-request latency predict a wall-clock, reconciled against the wall-clock observed; a material deviation (hidden requests, retries, contention) is a finding in its own right, per the same-ruler precedent the RFC-031 amendment records.
+**Wall-clock is one measurement dimension; storage-call counts are the other, and every run records both.** The harness counts the run's storage calls per operation class, adopting RFC-031's operation vocabulary unchanged (get, put, put_part, head, list, delete, copy, rename, and the multipart operations), into the same record beside the timings. Per-run counts are a measurement column, not a gate: RFC-031's comparator remains the only pinned, gating count. What the counts buy is the cross-check per run: counts times per-request latency predict a wall-clock, reconciled against the wall-clock observed; a material deviation (hidden requests, retries, contention) is a finding in its own right, per the same-ruler precedent the RFC-031 amendment records.
 
 ### Answer quality: the initial step
 
@@ -178,7 +179,7 @@ Each rule states what it forbids; violating it makes a number invalid, not merel
 3. **Repetitions, dispersion, controlled warmth.** Every wall-clock cell reports its repetition count and a dispersion measure (percentiles, or median with minimum and maximum); bare means are banned (the DBTest 2018 finding: a bare mean is valid only under zero variance). Every cell declares one warmth regime; mixing regimes within a cell invalidates it. A tail percentile requires a sample count that supports it (RFC-031's rule, a p95 needs at least 20 samples, governs); small-sample cells are directional evidence only, labeled so.
 4. **Identity on every number.** Every published number carries its backend identity and its machine specification; numbers from different backends or machine specifications never compare silently. Conclusions drawn only from a local backend are provisional and labeled so.
 5. **Manual before automatic.** The benchmark runs manually until its run-to-run variance is understood; only then may it earn a schedule, because automating un-understood variance automates the production of noise. All scheduling (nightly MinIO runs, the real-S3 trend series, alerting) is a separate later change gated on that understanding.
-6. **Pull-request gates stay count-based, and stay RFC-031's.** The only measurement that gates a pull request is the pinned call-count golden under RFC-031, zero-flake by construction. This instrument's per-run counts, though equally deterministic, do not gate either: they are unpinned measurement columns, and turning an unpinned measurement into a gate would recreate the golden without its review discipline. Wall-clock trends; it never gates, because timing variance on shared runners converts a gate into a lottery.
+6. **This instrument never gates.** No measurement from this instrument gates anything, at any CI stage. Wall-clock never gates because timing variance on shared runners converts a gate into a lottery; this instrument's per-run counts never gate because they are unpinned measurement columns, and turning an unpinned measurement into a gate would recreate the counting golden without its review discipline. Count-based gating belongs to the counting instruments, at the stages RFC-031 and its amendment assign them (RFC-031 states its harness is a release gate and an on-demand tool, not a per-PR gate; this RFC neither adds a gate nor moves one).
 7. **Effects clear the floor.** Every comparison-bearing claim (a fix's effect, a regression, a difference between systems) must exceed the session's noise floor by a declared margin; an effect below the floor is reported as "no detected effect", never as a small effect. The floor is itself a recorded measurement, so every effect claim carries its own denominator.
 
 ## Relation to existing instruments
