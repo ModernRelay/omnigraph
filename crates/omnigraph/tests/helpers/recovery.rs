@@ -4,7 +4,7 @@ use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use lance::Dataset;
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{GraphCommit, Omnigraph, ReadTarget, SubTableEntry};
+use omnigraph::db::{DatasetEntry, GraphCommit, Omnigraph, ReadTarget};
 use omnigraph::error::{OmniError, Result};
 use omnigraph_compiler::ir::ParamMap;
 use serde::Deserialize;
@@ -299,7 +299,7 @@ async fn assert_manifest_pins_match_lance_heads(
     for table in tables {
         let (entry, lance_head) = entry_and_lance_head(&db, &uri, table).await?;
         assert_eq!(
-            entry.table_version, lance_head,
+            entry.published_dataset_version, lance_head,
             "manifest pin for {} on {:?} must match Lance HEAD after roll-forward",
             table.table_key, table.branch,
         );
@@ -372,14 +372,14 @@ async fn assert_non_main_did_not_move_main(
         let Some(expected) = table.expected_main_manifest_pin else {
             continue;
         };
-        let entry = main.entry(&table.table_key).ok_or_else(|| {
+        let entry = main.dataset(&table.table_key).ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "main snapshot has no entry for {}",
                 table.table_key,
             ))
         })?;
         assert_eq!(
-            entry.table_version, expected,
+            entry.published_dataset_version, expected,
             "non-main recovery for {} on {:?} must not move main's manifest pin",
             table.table_key, table.branch,
         );
@@ -519,11 +519,11 @@ async fn entry_and_lance_head(
     db: &Omnigraph,
     root_uri: &str,
     table: &TableExpectation,
-) -> Result<(SubTableEntry, u64)> {
+) -> Result<(DatasetEntry, u64)> {
     let branch = table.branch.as_deref().unwrap_or("main");
     let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await?;
     let entry = snapshot
-        .entry(&table.table_key)
+        .dataset(&table.table_key)
         .ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "snapshot for branch {branch} has no entry for {}",
@@ -535,12 +535,12 @@ async fn entry_and_lance_head(
     Ok((entry, lance_head))
 }
 
-async fn lance_head_for_entry(root_uri: &str, entry: &SubTableEntry) -> Result<u64> {
-    let table_uri = format!("{}/{}", root_uri.trim_end_matches('/'), entry.table_path);
+async fn lance_head_for_entry(root_uri: &str, entry: &DatasetEntry) -> Result<u64> {
+    let table_uri = format!("{}/{}", root_uri.trim_end_matches('/'), entry.dataset_path);
     let ds = Dataset::open(&table_uri)
         .await
         .map_err(|err| OmniError::Lance(err.to_string()))?;
-    let ds = match entry.table_branch.as_deref() {
+    let ds = match entry.native_dataset_branch.as_deref() {
         Some(branch) if branch != "main" => ds
             .checkout_branch(branch)
             .await

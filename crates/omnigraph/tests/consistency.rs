@@ -41,11 +41,11 @@ async fn snapshot_returns_stale_data_after_write() {
     let snap_after = snapshot_main(&db).await.unwrap();
 
     // Old snapshot should still see 4 persons
-    let ds_before = snap_before.open("node:Person").await.unwrap();
+    let ds_before = snap_before.open_dataset("node:Person").await.unwrap();
     assert_eq!(ds_before.count_rows(None).await.unwrap(), 4);
 
     // New snapshot should see 5 persons
-    let ds_after = snap_after.open("node:Person").await.unwrap();
+    let ds_after = snap_after.open_dataset("node:Person").await.unwrap();
     assert_eq!(ds_after.count_rows(None).await.unwrap(), 5);
 
     // Verify Eve is NOT in old snapshot's data
@@ -93,11 +93,11 @@ async fn load_append_rejects_existing_id_without_update() {
     .unwrap();
 
     let before = snapshot_main(&db).await.unwrap();
-    let before_manifest = before.version();
+    let before_manifest = before.graph_manifest_version();
     let before_table = before
-        .entry("node:Person")
+        .dataset("node:Person")
         .expect("Person entry before strict conflict")
-        .table_version;
+        .published_dataset_version;
 
     let err = load_jsonl(
         &db,
@@ -107,24 +107,27 @@ async fn load_append_rejects_existing_id_without_update() {
     .await
     .unwrap_err();
     match err {
-        OmniError::KeyConflict { table_key, key } => {
-            assert_eq!(table_key, "node:Person");
-            assert_eq!(key.as_deref(), Some("Alice"));
+        OmniError::KeyConflict {
+            type_key,
+            entity_id,
+        } => {
+            assert_eq!(type_key, "node:Person");
+            assert_eq!(entity_id.as_deref(), Some("Alice"));
         }
         other => panic!("strict append must return typed KeyConflict, got {other:?}"),
     }
 
     let after = snapshot_main(&db).await.unwrap();
     assert_eq!(
-        after.version(),
+        after.graph_manifest_version(),
         before_manifest,
         "rejected strict insert must not publish a graph version"
     );
     assert_eq!(
         after
-            .entry("node:Person")
+            .dataset("node:Person")
             .expect("Person entry after strict conflict")
-            .table_version,
+            .published_dataset_version,
         before_table,
         "rejected strict insert must not advance the Person table"
     );
@@ -184,13 +187,13 @@ async fn load_keyed_write_row_cap_excludes_strict_overwrite() {
         .await
         .unwrap();
     let before = snapshot_main(&over).await.unwrap();
-    let before_manifest = before.version();
-    let entry = before.entry("node:Thing").unwrap();
-    let before_table = entry.table_version;
+    let before_manifest = before.graph_manifest_version();
+    let entry = before.dataset("node:Thing").unwrap();
+    let before_table = entry.published_dataset_version;
     let table_uri = format!(
         "{}/{}",
         over.uri().trim_end_matches('/'),
-        entry.table_path.trim_start_matches('/')
+        entry.dataset_path.trim_start_matches('/')
     );
     let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
     let error = load_jsonl(&over, &jsonl(LIMIT + 1), LoadMode::Append)
@@ -203,14 +206,17 @@ async fn load_keyed_write_row_cap_excludes_strict_overwrite() {
                 ref resource,
                 limit: 8192,
                 actual: 8193,
-            } if resource == "keyed rows for node:Thing"
+            } if resource == "keyed entities for node:Thing"
         ),
         "one-over load must return the typed keyed-row limit, got {error:?}"
     );
     let after = snapshot_main(&over).await.unwrap();
-    assert_eq!(after.version(), before_manifest);
+    assert_eq!(after.graph_manifest_version(), before_manifest);
     assert_eq!(
-        after.entry("node:Thing").unwrap().table_version,
+        after
+            .dataset("node:Thing")
+            .unwrap()
+            .published_dataset_version,
         before_table
     );
     assert_eq!(
@@ -249,13 +255,13 @@ node Thing {
         .await
         .unwrap();
     let before = snapshot_main(&db).await.unwrap();
-    let before_manifest = before.version();
-    let entry = before.entry("node:Thing").unwrap();
-    let before_table = entry.table_version;
+    let before_manifest = before.graph_manifest_version();
+    let entry = before.dataset("node:Thing").unwrap();
+    let before_table = entry.published_dataset_version;
     let table_uri = format!(
         "{}/{}",
         db.uri().trim_end_matches('/'),
-        entry.table_path.trim_start_matches('/')
+        entry.dataset_path.trim_start_matches('/')
     );
     let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
 
@@ -270,17 +276,20 @@ node Thing {
                 ref resource,
                 limit: LIMIT,
                 actual,
-            } if (resource == "keyed bytes for node:Thing"
-                || resource == "keyed parsed value bytes for node:Thing")
+            } if (resource == "keyed entity bytes for node:Thing"
+                || resource == "keyed parsed entity bytes for node:Thing")
                 && actual > LIMIT
         ),
         "wide load must return the typed keyed-byte limit, got {error:?}"
     );
 
     let after = snapshot_main(&db).await.unwrap();
-    assert_eq!(after.version(), before_manifest);
+    assert_eq!(after.graph_manifest_version(), before_manifest);
     assert_eq!(
-        after.entry("node:Thing").unwrap().table_version,
+        after
+            .dataset("node:Thing")
+            .unwrap()
+            .published_dataset_version,
         before_table
     );
     assert_eq!(
@@ -307,14 +316,18 @@ async fn assert_lazy_external_blob_rejection_is_effect_free(
     case: &str,
 ) {
     let after = snapshot_branch(db, "feature").await.unwrap();
-    assert_eq!(after.version(), before_manifest, "{case}: manifest moved");
     assert_eq!(
-        after.entry(table_key).unwrap().table_version,
+        after.graph_manifest_version(),
+        before_manifest,
+        "{case}: manifest moved"
+    );
+    assert_eq!(
+        after.dataset(table_key).unwrap().published_dataset_version,
         before_table,
         "{case}: feature table pointer moved"
     );
     assert_eq!(
-        after.entry(table_key).unwrap().table_branch,
+        after.dataset(table_key).unwrap().native_dataset_branch,
         None,
         "{case}: rejection must not publish a deferred table fork"
     );
@@ -346,7 +359,7 @@ async fn assert_lazy_external_blob_rejection_is_effect_free(
 /// are read. None may create a lazy branch ref, move Lance HEAD or graph
 /// visibility, or arm recovery. Linux CI also watches the sparse source for
 /// `IN_ACCESS`, proving the oversized payload was never read. The same owner
-/// pins the generic external-URI cell boundary independently of keyed rows:
+/// pins the generic external-URI cell boundary independently of keyed entities:
 /// exact-limit Overwrite succeeds and a cross-table one-over Overwrite is
 /// typed and effect-free before HEAD.
 #[tokio::test]
@@ -400,17 +413,17 @@ node Attachment {
         .unwrap();
     db.branch_create("feature").await.unwrap();
     let before = snapshot_branch(&db, "feature").await.unwrap();
-    let before_manifest = before.version();
-    let entry = before.entry("node:Document").unwrap();
-    let before_table = entry.table_version;
+    let before_manifest = before.graph_manifest_version();
+    let entry = before.dataset("node:Document").unwrap();
+    let before_table = entry.published_dataset_version;
     assert_eq!(
-        entry.table_branch, None,
+        entry.native_dataset_branch, None,
         "precondition: feature still inherits main's table version lazily"
     );
     let table_uri = format!(
         "{}/{}",
         db.uri().trim_end_matches('/'),
-        entry.table_path.trim_start_matches('/')
+        entry.dataset_path.trim_start_matches('/')
     );
     let before_dataset = Dataset::open(&table_uri).await.unwrap();
     let before_head = before_dataset.version().version;
@@ -585,12 +598,12 @@ node Attachment {
         })
     );
     let cumulative_before = snapshot_branch(&db, "feature").await.unwrap();
-    let attachment_entry = cumulative_before.entry("node:Attachment").unwrap();
-    let attachment_table = attachment_entry.table_version;
+    let attachment_entry = cumulative_before.dataset("node:Attachment").unwrap();
+    let attachment_table = attachment_entry.published_dataset_version;
     let attachment_table_uri = format!(
         "{}/{}",
         db.uri().trim_end_matches('/'),
-        attachment_entry.table_path.trim_start_matches('/')
+        attachment_entry.dataset_path.trim_start_matches('/')
     );
     let attachment_head = Dataset::open(&attachment_table_uri)
         .await
@@ -728,19 +741,19 @@ node Attachment {
         .unwrap();
     overflow.branch_create("feature").await.unwrap();
     let overflow_before = snapshot_branch(&overflow, "feature").await.unwrap();
-    let overflow_manifest = overflow_before.version();
+    let overflow_manifest = overflow_before.graph_manifest_version();
     let mut overflow_tables = Vec::new();
     for table_key in ["node:Document", "node:Attachment"] {
-        let entry = overflow_before.entry(table_key).unwrap();
+        let entry = overflow_before.dataset(table_key).unwrap();
         let table_uri = format!(
             "{}/{}",
             overflow.uri().trim_end_matches('/'),
-            entry.table_path.trim_start_matches('/')
+            entry.dataset_path.trim_start_matches('/')
         );
         overflow_tables.push((
             table_key,
             table_uri.clone(),
-            entry.table_version,
+            entry.published_dataset_version,
             Dataset::open(&table_uri).await.unwrap().version().version,
         ));
     }
@@ -838,11 +851,16 @@ node Thing {
     for (writer, result) in &same_results {
         match result {
             Ok(_) => assert_eq!(*writer, winner),
-            Err(OmniError::KeyConflict { table_key, key }) => {
-                assert_eq!(table_key, "node:Thing");
+            Err(OmniError::KeyConflict {
+                type_key,
+                entity_id,
+            }) => {
+                assert_eq!(type_key, "node:Thing");
                 assert!(
-                    key.as_deref().is_none_or(|key| key == "SAME"),
-                    "writer {writer} reported the wrong conflicting key: {key:?}"
+                    entity_id
+                        .as_deref()
+                        .is_none_or(|entity_id| entity_id == "SAME"),
+                    "writer {writer} reported the wrong conflicting entity id: {entity_id:?}"
                 );
             }
             Err(other) => {
@@ -1067,17 +1085,17 @@ node Thing {
         db.branch_create("feature").await.unwrap();
 
         let before = snapshot_branch(&db, "feature").await.unwrap();
-        let before_manifest = before.version();
-        let entry = before.entry("node:Thing").unwrap();
-        let before_table = entry.table_version;
+        let before_manifest = before.graph_manifest_version();
+        let entry = before.dataset("node:Thing").unwrap();
+        let before_table = entry.published_dataset_version;
         assert_eq!(
-            entry.table_branch, None,
+            entry.native_dataset_branch, None,
             "precondition: feature inherits the empty main table lazily"
         );
         let table_uri = format!(
             "{}/{}",
             db.uri().trim_end_matches('/'),
-            entry.table_path.trim_start_matches('/')
+            entry.dataset_path.trim_start_matches('/')
         );
         let before_dataset = Dataset::open(&table_uri).await.unwrap();
         let before_head = before_dataset.version().version;
@@ -1097,22 +1115,25 @@ node Thing {
         assert!(
             matches!(
                 error,
-                OmniError::KeyConflict { ref table_key, ref key }
-                    if table_key == "node:Thing" && key.as_deref() == Some("DUP")
+                OmniError::KeyConflict {
+                    ref type_key,
+                    ref entity_id
+                }
+                    if type_key == "node:Thing" && entity_id.as_deref() == Some("DUP")
             ),
             "load mode {mode:?} must return typed physical-id conflict, got {error:?}"
         );
 
         let after = snapshot_branch(&db, "feature").await.unwrap();
         assert_eq!(
-            after.version(),
+            after.graph_manifest_version(),
             before_manifest,
             "load mode {mode:?} must not publish the feature manifest"
         );
-        let after_entry = after.entry("node:Thing").unwrap();
-        assert_eq!(after_entry.table_version, before_table);
+        let after_entry = after.dataset("node:Thing").unwrap();
+        assert_eq!(after_entry.published_dataset_version, before_table);
         assert_eq!(
-            after_entry.table_branch, None,
+            after_entry.native_dataset_branch, None,
             "load mode {mode:?} must not publish a deferred table fork"
         );
         let after_dataset = Dataset::open(&table_uri).await.unwrap();

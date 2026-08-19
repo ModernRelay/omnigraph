@@ -918,9 +918,9 @@ The implementation landed in this order:
    synchronous barrier and recovery classifications, and require the two §6.4
    triggers before replacing Optimize's bounded adapter.
 
-The close-out intentionally narrows `TableStore`, `TableStorage`, the raw table
+The close-out intentionally narrows `TableStore`, `TableStorage`, the raw dataset
 handle cache, `GraphCoordinator`, and `ManifestCoordinator` to crate visibility;
-public `Snapshot::open` now yields a read-only table facade and safe scan builder
+public `Snapshot::open_dataset` now yields a read-only dataset facade and safe scan builder
 instead of Lance's writable `Dataset` / plan-exposing `Scanner`. That is a downstream Rust
 source break and therefore lands on the v0.9 line, where registry publication
 resumes; it has no CLI, wire, or storage-format effect. SDK callers use the

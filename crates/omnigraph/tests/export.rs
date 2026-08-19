@@ -175,7 +175,7 @@ fn collect_u64_key_rows(batches: &[RecordBatch]) -> Vec<(u64, String)> {
 
 async fn assert_exact_id_primary_key(db: &Omnigraph, table_key: &str) {
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let dataset = snapshot.open(table_key).await.unwrap();
+    let dataset = snapshot.open_dataset(table_key).await.unwrap();
     let primary_key = dataset
         .schema()
         .unenforced_primary_key()
@@ -229,8 +229,8 @@ async fn export_jsonl_round_trips_branch_snapshot() {
         .map(|commit| commit.graph_commit_id)
         .collect::<HashSet<_>>();
 
-    let main_jsonl = db.export_jsonl("main", &[], &[]).await.unwrap();
-    let feature_jsonl = db.export_jsonl("feature", &[], &[]).await.unwrap();
+    let main_jsonl = db.export_jsonl("main", &[]).await.unwrap();
+    let feature_jsonl = db.export_jsonl("feature", &[]).await.unwrap();
 
     let imported_main_dir = tempfile::tempdir().unwrap();
     let imported_feature_dir = tempfile::tempdir().unwrap();
@@ -333,11 +333,8 @@ node Document {
     load_jsonl(db.as_ref(), &wide, LoadMode::Append)
         .await
         .unwrap();
-    let expected = db.export_jsonl("main", &[], &[]).await.unwrap();
-    let cut = db
-        .capture_served_export_cut("main", &[], &[])
-        .await
-        .unwrap();
+    let expected = db.export_jsonl("main", &[]).await.unwrap();
+    let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
     let mut chunks = Vec::new();
     let (cut, result) = cut
         .write_chunks(|chunk| {
@@ -396,7 +393,7 @@ async fn export_jsonl_round_trips_typed_u64_key_and_rejects_id_mismatch() {
     );
     assert_exact_id_primary_key(&source, "node:Counter").await;
 
-    let exported = source.export_jsonl("main", &[], &[]).await.unwrap();
+    let exported = source.export_jsonl("main", &[]).await.unwrap();
     let mut exported_keys = Vec::new();
     let mut mismatched_rows = Vec::new();
     for line in exported.lines() {
@@ -488,16 +485,16 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
             matches!(
                 duplicate,
                 OmniError::KeyConflict {
-                    table_key: ref conflicted_table,
-                    key: Some(ref key)
-                } if conflicted_table == table_key && key == canonical_id
+                    type_key: ref conflicted_type,
+                    entity_id: Some(ref entity_id)
+                } if conflicted_type == table_key && entity_id == canonical_id
             ),
             "post-rebuild append must conflict on canonical temporal id {canonical_id}: {duplicate}"
         );
         assert_eq!(count_rows(&source, table_key).await, 1);
     }
 
-    let exported = source.export_jsonl("main", &[], &[]).await.unwrap();
+    let exported = source.export_jsonl("main", &[]).await.unwrap();
     let rows = exported
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -605,9 +602,9 @@ async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed()
         matches!(
             duplicate,
             OmniError::KeyConflict {
-                ref table_key,
-                key: Some(ref key)
-            } if table_key == "node:Rounded" && key == "16777216"
+                ref type_key,
+                entity_id: Some(ref entity_id)
+            } if type_key == "node:Rounded" && entity_id == "16777216"
         ),
         "a later same-key append must conflict on the canonical id, not duplicate: {duplicate}"
     );
@@ -873,7 +870,7 @@ async fn export_jsonl_preserves_explicit_ids_for_non_key_graphs() {
         .await
         .unwrap();
 
-    let exported = db.export_jsonl("main", &[], &[]).await.unwrap();
+    let exported = db.export_jsonl("main", &[]).await.unwrap();
 
     let imported_dir = tempfile::tempdir().unwrap();
     let imported = Omnigraph::init(imported_dir.path().to_str().unwrap(), NOTE_SCHEMA)
@@ -984,7 +981,7 @@ node Document {
     // Export is descriptor-first for external references: reproducing the
     // stored URI must not depend on the caller-owned target still existing.
     std::fs::remove_file(&external_path).unwrap();
-    let exported = db.export_jsonl("main", &[], &[]).await.unwrap();
+    let exported = db.export_jsonl("main", &[]).await.unwrap();
     let rows = exported
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())

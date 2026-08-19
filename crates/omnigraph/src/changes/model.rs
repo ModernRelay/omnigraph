@@ -16,9 +16,9 @@ use serde::Serialize;
 use crate::db::commit_graph::GraphCommit;
 
 /// Default number of entity changes per bounded page.
-pub const COMMIT_CHANGES_DEFAULT_ROWS: usize = 1_000;
+pub const COMMIT_CHANGES_DEFAULT_CHANGES: usize = 1_000;
 /// Public ceiling on entity changes per bounded page.
-pub const COMMIT_CHANGES_MAX_ROWS: usize = 8_192;
+pub const COMMIT_CHANGES_MAX_CHANGES: usize = 8_192;
 /// Default per-page serialized-byte PACKING target — how many small changes
 /// share one page, not a wall a single change must fit under. A change whose two
 /// images exceed the remaining budget is delivered on its own page (forward
@@ -102,8 +102,7 @@ impl ChangeOpKind {
 
 /// Opaque graph-scoped type identity plus the graph-schema name. The `id`
 /// survives a supported rename and changes after drop/re-add; it is never a
-/// retained table-key compatibility selector, dataset, path, or incarnation
-/// identifier.
+/// dataset, path, or incarnation identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GraphTypeRef {
     pub id: String,
@@ -171,7 +170,7 @@ impl From<&GraphCommit> for ChangeCause {
             graph_commit_id: commit.graph_commit_id.clone(),
             parent_commit_id: commit.parent_commit_id.clone(),
             merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
-            authored_branch: commit.manifest_branch.clone(),
+            authored_branch: commit.graph_branch.clone(),
             actor_id: commit.actor_id.clone(),
             authored_at: commit.created_at,
         }

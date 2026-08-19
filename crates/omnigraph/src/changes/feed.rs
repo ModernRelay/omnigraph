@@ -15,9 +15,9 @@ use super::enumerate::{
 };
 use super::model::{
     CHANGE_FEED_DEFAULT_COMMITS_PER_POLL, CHANGE_FEED_MAX_COMMITS_PER_POLL,
-    COMMIT_CHANGES_DEFAULT_BYTES, COMMIT_CHANGES_DEFAULT_ROWS, ChangeCause, ChangeFeedContinuation,
-    ChangeFeedPage, ChangeFeedPosition, ChangeFeedRequest, ChangeFeedStart, GraphChangeBlock,
-    GraphEntityChange,
+    COMMIT_CHANGES_DEFAULT_BYTES, COMMIT_CHANGES_DEFAULT_CHANGES, ChangeCause,
+    ChangeFeedContinuation, ChangeFeedPage, ChangeFeedPosition, ChangeFeedRequest, ChangeFeedStart,
+    GraphChangeBlock, GraphEntityChange,
 };
 use super::token::{
     self, BranchScopeV1, FEED_PURPOSE, FeedCursorV1, FeedPageTokenV1, KIND_FEED_CURSOR,
@@ -213,7 +213,9 @@ pub(crate) async fn poll(
     cut: &ChangeFeedCut,
     request: &ChangeFeedRequest,
 ) -> Result<ChangeFeedPage> {
-    let max_changes = request.max_changes.unwrap_or(COMMIT_CHANGES_DEFAULT_ROWS);
+    let max_changes = request
+        .max_changes
+        .unwrap_or(COMMIT_CHANGES_DEFAULT_CHANGES);
     let max_bytes = request.max_bytes.unwrap_or(COMMIT_CHANGES_DEFAULT_BYTES);
     enumerate::validate_change_page_limits(max_changes, max_bytes)?;
     let max_commits = request
@@ -439,8 +441,8 @@ async fn commit_snapshot(root_uri: &str, cut: &ChangeFeedCut, commit_id: &str) -
     })?;
     let snapshot = ManifestCoordinator::snapshot_at(
         root_uri,
-        commit.manifest_branch.as_deref(),
-        commit.manifest_version,
+        commit.graph_branch.as_deref(),
+        commit.graph_manifest_version,
     )
     .await?;
     // The cut was captured earlier; this reopen happens later and lock-free by
@@ -451,7 +453,7 @@ async fn commit_snapshot(root_uri: &str, cut: &ChangeFeedCut, commit_id: &str) -
     // commit as that branch's head; fail closed otherwise rather than emit
     // another branch's rows as this commit's changes. Main cannot undergo
     // branch-name ABA, but the check is structural and harmless there.
-    if snapshot.graph_head(commit.manifest_branch.as_deref()) != Some(commit_id) {
+    if snapshot.graph_head(commit.graph_branch.as_deref()) != Some(commit_id) {
         return Err(OmniError::manifest(format!(
             "change feed commit '{commit_id}' has no persisted native-branch incarnation witness at the reopened snapshot; the branch was deleted and recreated during the poll"
         )));

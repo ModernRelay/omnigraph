@@ -62,7 +62,7 @@ fn help_groups_commands_by_capability() {
 }
 
 #[test]
-fn graph_vocabulary_help_preserves_ingest_and_export_compatibility_topology() {
+fn graph_vocabulary_help_exposes_only_canonical_export_selection() {
     let root_help = stdout_string(&output_success(cli().arg("--help")));
     assert!(
         !root_help
@@ -72,13 +72,21 @@ fn graph_vocabulary_help_preserves_ingest_and_export_compatibility_topology() {
     );
 
     let ingest_help = stdout_string(&output_success(cli().arg("ingest").arg("--help")));
-    assert!(ingest_help.contains("compatibility alias for load"));
+    assert!(ingest_help.contains("Deprecated permissive loader"));
     assert!(ingest_help.contains("--from"));
     assert!(ingest_help.contains("--mode"));
 
     let export_help = stdout_string(&output_success(cli().arg("export").arg("--help")));
     assert!(export_help.contains("--type"));
-    assert!(export_help.contains("--table"));
+    assert!(!export_help.contains("--table"));
+
+    let removed_table_selector =
+        output_failure(cli().arg("export").arg("--table").arg("node:Person"));
+    assert!(
+        String::from_utf8_lossy(&removed_table_selector.stderr)
+            .contains("unexpected argument '--table'"),
+        "removed export selector must fail at argument parsing: {removed_table_selector:?}"
+    );
 
     let load_help = stdout_string(&output_success(cli().arg("load").arg("--help")));
     assert!(load_help.contains("existing entities"));
@@ -303,8 +311,8 @@ fn schema_apply_json_renames_type_and_updates_snapshot() {
         .unwrap()
         .block_on(db.snapshot_of(ReadTarget::branch("main")))
         .unwrap();
-    assert!(snapshot.entry("node:Human").is_some());
-    assert!(snapshot.entry("node:Person").is_none());
+    assert!(snapshot.dataset("node:Human").is_some());
+    assert!(snapshot.dataset("node:Person").is_none());
 }
 
 #[test]
@@ -352,7 +360,7 @@ fn schema_apply_json_adds_index_for_existing_property() {
             .await
             .unwrap();
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-        let dataset = snapshot.open("node:Person").await.unwrap();
+        let dataset = snapshot.open_dataset("node:Person").await.unwrap();
         dataset.load_indices().await.unwrap().len()
     });
 
@@ -378,7 +386,7 @@ fn schema_apply_json_adds_index_for_existing_property() {
             .await
             .unwrap();
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-        let dataset = snapshot.open("node:Person").await.unwrap();
+        let dataset = snapshot.open_dataset("node:Person").await.unwrap();
         dataset.load_indices().await.unwrap().len()
     });
     // iss-848: `schema apply` records the `@index` intent but defers the physical

@@ -758,7 +758,7 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
     .await
     .unwrap();
     let expected = db
-        .export_jsonl("feature", &["Person".to_string()], &[])
+        .export_jsonl("feature", &["Person".to_string()])
         .await
         .unwrap();
     drop(db);
@@ -791,7 +791,6 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
                     serde_json::to_vec(&ExportRequest {
                         branch: Some("feature".to_string()),
                         type_names: vec!["Person".to_string()],
-                        table_keys: Vec::new(),
                     })
                     .unwrap(),
                 ))
@@ -819,7 +818,6 @@ fn export_request(type_names: Vec<String>) -> Request<Body> {
             serde_json::to_vec(&ExportRequest {
                 branch: Some("main".to_string()),
                 type_names,
-                table_keys: Vec::new(),
             })
             .unwrap(),
         ))
@@ -842,6 +840,89 @@ async fn export_invalid_filter_refuses_before_success_headers() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
     assert!(error.error.contains("unknown export type 'Missing'"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_json_rejections_preserve_typed_statuses_before_streaming() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/export"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"branch":"main","type_names":[],"table_keys":["node:Person"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The JSON extractor rejects the retired field before the handler can
+    // capture a cut or emit streaming success headers, and the route projects
+    // that rejection into its documented error contract.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_ne!(
+        response.headers().get("content-type").unwrap(),
+        "application/x-ndjson; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+    assert!(error.error.contains("unknown field `table_keys`"));
+
+    let wrong_content_type = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/export"))
+                .method(Method::POST)
+                .header("content-type", "text/plain")
+                .body(Body::from(r#"{"branch":"main","type_names":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong_content_type.status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    assert_eq!(
+        wrong_content_type.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let body = to_bytes(wrong_content_type.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+    assert!(error.error.contains("Content-Type"));
+
+    // The router's ordinary JSON-body ceiling is 1 MiB. Whitespace remains a
+    // valid JSON prefix, so this proves the byte cap wins before syntax parsing.
+    let oversized = app
+        .oneshot(
+            Request::builder()
+                .uri(g("/export"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(vec![b' '; 2 * 1024 * 1024]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        oversized.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let body = to_bytes(oversized.into_body(), usize::MAX).await.unwrap();
+    let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+    assert!(error.error.contains("length limit"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -896,10 +977,10 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn snapshot_route_returns_manifest_dataset_version() {
+async fn snapshot_route_returns_graph_and_published_dataset_versions() {
     let (temp, app) = app_for_loaded_graph().await;
     let graph = graph_path(temp.path());
-    let expected_manifest_version = manifest_dataset_version(&graph).await;
+    let expected_graph_manifest_version = manifest_dataset_version(&graph).await;
 
     let (snapshot_status, snapshot_body) = json_response(
         &app,
@@ -912,16 +993,42 @@ async fn snapshot_route_returns_manifest_dataset_version() {
     .await;
 
     assert_eq!(snapshot_status, StatusCode::OK);
-    assert_eq!(snapshot_body["branch"], "main");
+    assert_eq!(snapshot_body["graph_branch"], "main");
     assert_eq!(
-        snapshot_body["manifest_version"].as_u64().unwrap(),
-        expected_manifest_version
+        snapshot_body["graph_manifest_version"].as_u64().unwrap(),
+        expected_graph_manifest_version
     );
     assert_eq!(
         snapshot_body["internal_schema_version"].as_u64().unwrap(),
         u64::from(omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
     );
-    assert!(snapshot_body["tables"].is_array());
+    let datasets = snapshot_body["datasets"]
+        .as_array()
+        .expect("datasets array");
+    let person = datasets
+        .iter()
+        .find(|dataset| dataset["type_name"] == "Person")
+        .expect("Person dataset");
+    assert_eq!(person["entity_kind"], "node");
+    assert!(person["dataset_path"].is_string());
+    assert!(person["published_dataset_version"].is_u64());
+    assert!(person["native_dataset_branch"].is_null());
+    assert_eq!(person["entity_count"], 4);
+    for retired in [
+        "table_key",
+        "table_path",
+        "table_version",
+        "table_branch",
+        "row_count",
+    ] {
+        assert!(person.get(retired).is_none(), "retired field {retired}");
+    }
+    let knows = datasets
+        .iter()
+        .find(|dataset| dataset["type_name"] == "Knows")
+        .expect("Knows dataset");
+    assert_eq!(knows["entity_kind"], "edge");
+    assert_eq!(knows["entity_count"], 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -954,8 +1061,10 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     assert_eq!(body["branch_created"], true);
     assert_eq!(body["mode"], "merge");
     assert_eq!(body["actor_id"], "act-andrew");
-    assert_eq!(body["tables"][0]["table_key"], "node:Person");
-    assert_eq!(body["tables"][0]["rows_loaded"], 2);
+    assert_eq!(body["nodes"][0]["name"], "Person");
+    assert_eq!(body["nodes"][0]["entities_loaded"], 2);
+    assert_eq!(body["edges"], json!([]));
+    assert_eq!(body["total_entities"], 2);
     let receipt_commit_id = body["commit"]["graph_commit_id"]
         .as_str()
         .expect("effectful ingest must return a commit receipt")
@@ -966,7 +1075,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
         .snapshot_of(ReadTarget::branch("feature-ingest"))
         .await
         .unwrap();
-    let person_ds = snapshot.open("node:Person").await.unwrap();
+    let person_ds = snapshot.open_dataset("node:Person").await.unwrap();
     assert_eq!(person_ds.count_rows(None).await.unwrap(), 5);
     let head = db
         .list_commits(Some("feature-ingest"))
@@ -1247,8 +1356,9 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
     assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
     assert!(error.error.contains("merge conflict"));
     assert!(error.merge_conflicts.iter().any(|conflict| {
-        conflict.table_key == "node:Person"
-            && conflict.row_id.as_deref() == Some("Alice")
+        conflict.entity_kind == omnigraph_server::api::EntityKindOutput::Node
+            && conflict.type_name == "Person"
+            && conflict.entity_id.as_deref() == Some("Alice")
             && conflict.kind == omnigraph_server::api::MergeConflictKindOutput::DivergentUpdate
     }));
 }
@@ -1490,7 +1600,9 @@ async fn load_endpoint_loads_into_existing_branch() {
     let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(body["branch"], "main");
-    assert_eq!(body["tables"][0]["table_key"], "node:Person");
+    assert_eq!(body["nodes"][0]["name"], "Person");
+    assert_eq!(body["nodes"][0]["entities_loaded"], 1);
+    assert_eq!(body["total_entities"], 1);
     body["commit"]["graph_commit_id"]
         .as_str()
         .expect("effectful JSON load must return a commit receipt");
@@ -1537,20 +1649,20 @@ async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
     );
     let output: GraphBatchLoadOutput = serde_json::from_slice(&body).unwrap();
     assert_eq!(output.branch, "main");
-    assert_eq!(output.total_rows, 3);
+    assert_eq!(output.total_entities, 3);
     let receipt = output
         .commit
         .as_ref()
         .expect("effectful NDJSON load must return a commit receipt");
     assert!(
-        receipt.manifest_branch.is_none(),
-        "main is represented by the absence of a native manifest branch"
+        receipt.graph_branch.is_none(),
+        "main is represented by the absence of graph branch metadata"
     );
     assert_eq!(
         output
             .nodes
             .iter()
-            .map(|entry| (entry.name.as_str(), entry.rows_loaded))
+            .map(|entry| (entry.name.as_str(), entry.entities_loaded))
             .collect::<Vec<_>>(),
         [("Company", 1), ("Person", 1)]
     );
@@ -1558,7 +1670,7 @@ async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
         output
             .edges
             .iter()
-            .map(|entry| (entry.name.as_str(), entry.rows_loaded))
+            .map(|entry| (entry.name.as_str(), entry.entities_loaded))
             .collect::<Vec<_>>(),
         [("WorksAt", 1)]
     );
@@ -1572,7 +1684,7 @@ async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert_eq!(
         snapshot
-            .open("node:Person")
+            .open_dataset("node:Person")
             .await
             .unwrap()
             .count_rows(None)
@@ -1582,7 +1694,7 @@ async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
     );
     assert_eq!(
         snapshot
-            .open("node:Company")
+            .open_dataset("node:Company")
             .await
             .unwrap()
             .count_rows(None)
@@ -1592,7 +1704,7 @@ async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
     );
     assert_eq!(
         snapshot
-            .open("edge:WorksAt")
+            .open_dataset("edge:WorksAt")
             .await
             .unwrap()
             .count_rows(None)
@@ -1612,7 +1724,7 @@ async fn invalid_raw_graph_batch_has_no_effect() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .open("node:Person")
+        .open_dataset("node:Person")
         .await
         .unwrap()
         .count_rows(None)
@@ -1646,7 +1758,7 @@ async fn invalid_raw_graph_batch_has_no_effect() {
         db.snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
-            .open("node:Person")
+            .open_dataset("node:Person")
             .await
             .unwrap()
             .count_rows(None)
@@ -2451,15 +2563,16 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
     )
     .await;
     assert_eq!(snapshot_status, StatusCode::OK);
-    let person_rows = snapshot_body["tables"]
+    let person_rows = snapshot_body["datasets"]
         .as_array()
-        .and_then(|tables| {
-            tables
-                .iter()
-                .find(|t| t["table_key"].as_str() == Some("node:Person"))
+        .and_then(|datasets| {
+            datasets.iter().find(|dataset| {
+                dataset["entity_kind"].as_str() == Some("node")
+                    && dataset["type_name"].as_str() == Some("Person")
+            })
         })
-        .and_then(|t| t["row_count"].as_u64())
-        .expect("snapshot must include node:Person row_count");
+        .and_then(|dataset| dataset["entity_count"].as_u64())
+        .expect("snapshot must include Person entity_count");
     assert_eq!(
         person_rows,
         SEED_PERSON_ROWS + N as u64,
@@ -2568,7 +2681,7 @@ async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() 
             .expect("strict OCC loser must include structured read-set authority");
         assert_eq!(conflict.member, "graph_head:main");
         assert_ne!(conflict.actual, conflict.expected);
-        assert!(error.manifest_conflict.is_none());
+        assert!(error.published_dataset_version_conflict.is_none());
         assert!(error.recovery_required.is_none());
     }
 }
@@ -2671,24 +2784,25 @@ query insert_c($name: String) {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let lookup_count = |table_key: &str| -> u64 {
-        body["tables"]
+    let lookup_count = |type_name: &str| -> u64 {
+        body["datasets"]
             .as_array()
-            .and_then(|tables| {
-                tables
-                    .iter()
-                    .find(|t| t["table_key"].as_str() == Some(table_key))
+            .and_then(|datasets| {
+                datasets.iter().find(|dataset| {
+                    dataset["entity_kind"].as_str() == Some("node")
+                        && dataset["type_name"].as_str() == Some(type_name)
+                })
             })
-            .and_then(|t| t["row_count"].as_u64())
-            .unwrap_or_else(|| panic!("snapshot missing {}", table_key))
+            .and_then(|dataset| dataset["entity_count"].as_u64())
+            .unwrap_or_else(|| panic!("snapshot missing node type {type_name}"))
     };
     assert_eq!(
-        lookup_count("node:Person"),
+        lookup_count("Person"),
         SEED_PERSONS + PER_TYPE as u64,
         "Person row count after concurrent inserts",
     );
     assert_eq!(
-        lookup_count("node:Company"),
+        lookup_count("Company"),
         SEED_COMPANIES + PER_TYPE as u64,
         "Company row count after concurrent inserts",
     );
@@ -2898,7 +3012,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
             .as_array()
             .expect("commit list")
             .iter()
-            .max_by_key(|commit| commit["manifest_version"].as_u64().unwrap())
+            .max_by_key(|commit| commit["graph_manifest_version"].as_u64().unwrap())
             .expect("loaded graph has at least one commit")["graph_commit_id"]
             .as_str()
             .unwrap()

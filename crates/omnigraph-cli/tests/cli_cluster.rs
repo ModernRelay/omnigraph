@@ -499,7 +499,7 @@ fn cluster_import_json_bootstraps_missing_state() {
     assert_eq!(json["state_observations"]["locked"], false);
     assert_eq!(json["state_observations"]["lock_acquired"], true);
     assert!(json["state_observations"]["acquired_lock_id"].is_string());
-    assert!(json["observations"]["graph.knowledge"]["manifest_version"].is_number());
+    assert!(json["observations"]["graph.knowledge"]["graph_manifest_version"].is_number());
     assert_eq!(
         json["resource_statuses"]["graph.knowledge"]["status"],
         "applied"
@@ -1049,7 +1049,7 @@ fn optimize_resolves_a_cluster_graph_by_id() {
     );
     let payload = parse_stdout_json(&out);
     assert!(
-        payload["tables"].as_array().is_some(),
+        payload["datasets"].as_array().is_some(),
         "optimize did not run against the resolved cluster graph: {payload}"
     );
 }
@@ -1086,7 +1086,7 @@ fn optimize_auto_uses_the_sole_cluster_graph() {
             .arg("--json"),
     );
     assert!(
-        parse_stdout_json(&out)["tables"].as_array().is_some(),
+        parse_stdout_json(&out)["datasets"].as_array().is_some(),
         "optimize should auto-resolve the sole cluster graph"
     );
 }
@@ -1251,7 +1251,7 @@ fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
             .arg("--json"),
     );
     assert!(
-        parse_stdout_json(&out)["tables"].as_array().is_some(),
+        parse_stdout_json(&out)["datasets"].as_array().is_some(),
         "optimize should resolve via the ledger despite degraded catalog payloads"
     );
 }

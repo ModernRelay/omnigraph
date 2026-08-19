@@ -9,14 +9,14 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | Command | Purpose |
 |---|---|
 | `init [--force] --schema <pg> <URI>` | initialize a graph. Strict mode refuses a URI with `__manifest` or any schema artifact. `--force` may replace orphan schema artifacts only after proving no `__manifest` exists; it never overwrites an initialized graph or purges its Lance datasets (start cluster configs from the [cluster.md](../clusters/index.md) quick-start) |
-| `load` | strict bounded graph-level NDJSON ingestion, local or remote. Remote loads send raw `application/x-ndjson` to `/load/ndjson`; embedded loads call the same strict engine boundary. One file is one ordinary graph transaction and succeeds only after its manifest commit is visible. `--data <path>` and `--mode overwrite\|append\|merge` are **required**. Without `--from` the target branch must exist; `--from <base>` forks a missing `--branch` from `<base>` first |
-| `ingest` | deprecated compatibility loader retaining the historical permissive parser and JSON `/ingest` route (defaults: `--from main --mode merge`); new integrations should use strict graph-batch `load`; prints a one-line warning to stderr |
+| `load` | strict bounded graph-level NDJSON ingestion, local or remote. Remote loads send raw `application/x-ndjson` to `/load/ndjson`; embedded loads call the same strict engine boundary. One file is one ordinary graph transaction and succeeds only after its graph-manifest commit is visible. `--data <path>` and `--mode overwrite\|append\|merge` are **required**. Without `--from` the target branch must exist; `--from <base>` forks a missing `--branch` from `<base>` first |
+| `ingest` | deprecated loader retaining its permissive parser, JSON `/ingest` route, and branch defaults (`--from main --mode merge`); its output uses the current canonical vocabulary. New integrations should use strict graph-batch `load`; prints a one-line warning to stderr |
 | `query <name>` (alias: `read`) | run a read query. **Catalog lane** (default): `<name>` is a stored query invoked **by name** from the served catalog (served-only — address with `--server`/`--profile`; the verb asserts the query is a read). **Ad-hoc lane**: with `--query <path>` or `-e`/`--query-string <GQ>`, runs that source (the positional `<name>` then selects which query in it). No positional graph URI — address via `--store`/`--server`/`--profile`. `read` is the deprecated previous name (one-line stderr warning) |
 | `mutate <name>` (alias: `change`) | run a mutation query; same catalog (by-name, served-only, verb asserts mutation) / ad-hoc (`--query`/`-e`) lanes as `query`. `--if-commit <id>` makes the write conditional (compare-and-swap): it runs only if the branch head commit (from a `query --json` response or `commit list`) still equals `<id>`; a lost race exits with code 4 and, with `--json`, the structured `precondition_failure` body — re-read and decide again. Remote conditional writes use a dedicated capability route, so an older server fails with 404 before execution instead of ignoring the condition. `change` is the deprecated previous name (one-line stderr warning) |
 | `blob get \| stat ENTITY TYPE ID PROPERTY` | read one logical node/edge Blob cell. `get` streams raw managed bytes to stdout or `--out`; `stat` performs descriptor-only metadata output. Accepts `--store`, `--server` + `--graph`, or a store/server profile/default, but no positional graph URI or `--cluster`. See [Blob read commands](#blob-read-commands) |
 | `alias <name> [args]` | invoke an operator alias — a read-only personal binding (under `aliases:` in `~/.omnigraph/config.yaml`) to a stored query on a named server (replaces the removed `--alias` flag; stored mutations are rejected before execution) |
 | `snapshot` | print current snapshot (per-dataset version + entity count) |
-| `export` | dump to JSONL on stdout (`--type T`, `--table K` filters) |
+| `export` | dump to JSONL on stdout (`--type T` filters) |
 | `branch create \| list \| delete \| merge` | branching ops. `merge --delete-branch` deletes the source branch after a successful merge (its own `branch_delete` policy check; a refusal is a stderr warning, not a failure — see [merge](../branching/merge.md)) |
 | `commit list \| show \| changes` | inspect commit graph. `list` is newest-first; `--branch <name>` lists that branch's reachable history, omitted = `main`. `changes <commit_id>` prints the exact entity changes vs the first parent (filters `--kind`/`--type`/`--op`, repeatable); it auto-paginates incrementally instead of buffering the whole diff, unless `--page-token` fetches one exact page |
 | `changes poll \| baseline` | follow the change feed. `poll` starts from `--cursor` or `--start now\|beginning\|after:<commit_id>`, incrementally consumes page tokens, and prints the terminal durable cursor only after the final page; `baseline` (POSIX-only until a write-through Windows replace exists) streams an exact entity snapshot to `--out` and prints the `snapshot_commit_id` + `resume_cursor` handshake only after the snapshot and namespace replacement are durable |
@@ -35,8 +35,8 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 
 Effectful `load`, `ingest`, and `mutate` commands include a `commit` object in
 their `--json` output. It is the exact graph commit published by that write,
-with `graph_commit_id`, the compatibility fields `manifest_branch` and
-`manifest_version`, parent ids, actor, and creation
+with `graph_commit_id`, `graph_branch`, `graph_manifest_version`, parent ids,
+actor, and creation
 time—not a later lookup of the branch head. A successful mutation that matches
 no entities publishes nothing and returns `"commit": null`.
 
@@ -135,7 +135,7 @@ Fields that do not apply are omitted rather than emitted as JSON null. A null
 cell returns the typed not-found failure; it is not an external value or a
 managed value of size zero. Remote stat uses HEAD and never retries with GET or
 follows the external redirect. Treat `resolved_snapshot` as opaque: a live
-branch normally produces a synthetic manifest witness, not a commit ULID, and
+branch normally produces a synthetic graph-manifest witness, not a commit ULID, and
 the ETag suffix may differ after copying the same graph to another store. An
 explicit `--snapshot ID` remains separately and exactly echoed as
 `target.snapshot`.

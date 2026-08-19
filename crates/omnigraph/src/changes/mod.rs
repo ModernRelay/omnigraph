@@ -6,11 +6,11 @@ pub(crate) mod token;
 
 pub use model::{
     CHANGE_FEED_DEFAULT_COMMITS_PER_POLL, CHANGE_FEED_MAX_COMMITS_PER_POLL,
-    COMMIT_CHANGES_DEFAULT_BYTES, COMMIT_CHANGES_DEFAULT_ROWS, COMMIT_CHANGES_MAX_BYTES,
-    COMMIT_CHANGES_MAX_ROWS, ChangeBaseline, ChangeCause, ChangeEntityKind, ChangeFeedContinuation,
-    ChangeFeedPage, ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart,
-    ChangeOpKind, CommitChangesPage, EntityEndpoints, EntityImage, GraphChangeBlock,
-    GraphEntityChange, GraphTypeRef,
+    COMMIT_CHANGES_DEFAULT_BYTES, COMMIT_CHANGES_DEFAULT_CHANGES, COMMIT_CHANGES_MAX_BYTES,
+    COMMIT_CHANGES_MAX_CHANGES, ChangeBaseline, ChangeCause, ChangeEntityKind,
+    ChangeFeedContinuation, ChangeFeedPage, ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope,
+    ChangeFeedStart, ChangeOpKind, CommitChangesPage, EntityEndpoints, EntityImage,
+    GraphChangeBlock, GraphEntityChange, GraphTypeRef,
 };
 
 use std::collections::{BTreeMap, HashSet};
@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashSet};
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 
 use self::row_compare::{OrderedRows, RawRow, rows_equal, user_schema_fingerprint};
-use crate::db::SubTableEntry;
+use crate::db::DatasetEntry;
 use crate::db::manifest::{Snapshot, TableIdentity};
 use crate::error::{OmniError, Result};
 use crate::storage_layer::{SnapshotHandle, TableStorage};
@@ -47,13 +47,24 @@ pub struct Endpoints {
 
 #[derive(Debug, Clone)]
 pub struct EntityChange {
-    pub table_key: String,
     pub kind: EntityKind,
     pub type_name: String,
     pub id: String,
     pub op: ChangeOp,
-    pub manifest_version: u64,
+    pub published_dataset_version: u64,
     pub endpoints: Option<Endpoints>,
+}
+
+impl EntityChange {
+    /// Canonical qualified graph type key derived from the authoritative kind
+    /// and type name (for example, `node:Person`).
+    pub fn type_key(&self) -> String {
+        let prefix = match self.kind {
+            EntityKind::Node => "node",
+            EntityKind::Edge => "edge",
+        };
+        format!("{prefix}:{}", self.type_name)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -73,9 +84,9 @@ pub struct ChangeStats {
 
 #[derive(Debug, Clone)]
 pub struct ChangeSet {
-    pub from_version: u64,
-    pub to_version: u64,
-    pub branch: Option<String>,
+    pub from_graph_manifest_version: u64,
+    pub to_graph_manifest_version: u64,
+    pub graph_branch: Option<String>,
     pub changes: Vec<EntityChange>,
     pub stats: ChangeStats,
 }
@@ -127,17 +138,17 @@ impl ChangeFilter {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TableChangeInterval<'a> {
     pub(crate) identity: TableIdentity,
-    pub(crate) from: Option<&'a SubTableEntry>,
-    pub(crate) to: Option<&'a SubTableEntry>,
+    pub(crate) from: Option<&'a DatasetEntry>,
+    pub(crate) to: Option<&'a DatasetEntry>,
 }
 
 impl<'a> TableChangeInterval<'a> {
-    fn table_key(&self) -> &'a str {
+    fn type_key(&self) -> &'a str {
         &self
             .to
             .or(self.from)
             .expect("a changed interval has at least one endpoint")
-            .table_key
+            .type_key
     }
 }
 
@@ -152,11 +163,11 @@ pub(crate) fn changed_table_intervals<'a>(
     to: &'a Snapshot,
 ) -> Vec<TableChangeInterval<'a>> {
     let mut by_identity =
-        BTreeMap::<TableIdentity, (Option<&'a SubTableEntry>, Option<&'a SubTableEntry>)>::new();
-    for entry in from.entries() {
+        BTreeMap::<TableIdentity, (Option<&'a DatasetEntry>, Option<&'a DatasetEntry>)>::new();
+    for entry in from.datasets() {
         by_identity.entry(entry.identity).or_default().0 = Some(entry);
     }
-    for entry in to.entries() {
+    for entry in to.datasets() {
         by_identity.entry(entry.identity).or_default().1 = Some(entry);
     }
 
@@ -167,8 +178,8 @@ pub(crate) fn changed_table_intervals<'a>(
         })
         .collect::<Vec<_>>();
     intervals.sort_by(|left, right| {
-        left.table_key()
-            .cmp(right.table_key())
+        left.type_key()
+            .cmp(right.type_key())
             .then_with(|| left.identity.cmp(&right.identity))
     });
     intervals
@@ -201,7 +212,7 @@ pub(crate) async fn diff_snapshots(
         let table_key = &to_entry
             .or(from_entry)
             .expect("identity came from one snapshot")
-            .table_key;
+            .type_key;
         debug_assert!(
             from_entry
                 .into_iter()
@@ -242,12 +253,15 @@ pub(crate) async fn diff_snapshots(
             (None, None) => continue,
         };
 
+        let fallback_published_dataset_version = to_entry
+            .or(from_entry)
+            .expect("identity came from one snapshot")
+            .published_dataset_version;
         for mut c in table_changes {
-            c.table_key = table_key.clone();
             c.kind = kind;
             c.type_name = type_name.to_string();
-            if c.manifest_version == 0 {
-                c.manifest_version = to.version();
+            if c.published_dataset_version == 0 {
+                c.published_dataset_version = fallback_published_dataset_version;
             }
             changes.push(c);
         }
@@ -255,27 +269,28 @@ pub(crate) async fn diff_snapshots(
 
     let stats = compute_stats(&changes);
     Ok(ChangeSet {
-        from_version: from.version(),
-        to_version: to.version(),
-        branch,
+        from_graph_manifest_version: from.graph_manifest_version(),
+        to_graph_manifest_version: to.graph_manifest_version(),
+        graph_branch: branch,
         changes,
         stats,
     })
 }
 
-fn same_state(a: Option<&SubTableEntry>, b: Option<&SubTableEntry>) -> bool {
+fn same_state(a: Option<&DatasetEntry>, b: Option<&DatasetEntry>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => {
-            a.table_version == b.table_version && a.table_branch == b.table_branch
+            a.published_dataset_version == b.published_dataset_version
+                && a.native_dataset_branch == b.native_dataset_branch
         }
         _ => false,
     }
 }
 
-fn same_lineage(from: Option<&SubTableEntry>, to: Option<&SubTableEntry>) -> bool {
+fn same_lineage(from: Option<&DatasetEntry>, to: Option<&DatasetEntry>) -> bool {
     match (from, to) {
-        (Some(f), Some(t)) => f.table_branch == t.table_branch,
+        (Some(f), Some(t)) => f.native_dataset_branch == t.native_dataset_branch,
         _ => false,
     }
 }
@@ -300,13 +315,13 @@ fn compute_stats(changes: &[EntityChange]) -> ChangeStats {
 
 async fn diff_table_same_lineage(
     table_store: &TableStore,
-    from_entry: &SubTableEntry,
-    to_entry: &SubTableEntry,
+    from_entry: &DatasetEntry,
+    to_entry: &DatasetEntry,
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
-    let vf = from_entry.table_version;
-    let vt = to_entry.table_version;
+    let vf = from_entry.published_dataset_version;
+    let vt = to_entry.published_dataset_version;
     let storage: &dyn TableStorage = table_store;
     let to_ds = storage.open_snapshot_at_entry(to_entry).await?;
 
@@ -373,8 +388,8 @@ async fn diff_table_same_lineage(
 
 async fn diff_table_cross_branch(
     table_store: &TableStore,
-    from_entry: &SubTableEntry,
-    to_entry: &SubTableEntry,
+    from_entry: &DatasetEntry,
+    to_entry: &DatasetEntry,
     is_edge: bool,
     filter: &ChangeFilter,
     type_name: &str,
@@ -463,7 +478,7 @@ async fn diff_table_cross_branch(
 
 async fn diff_table_added(
     table_store: &TableStore,
-    to_entry: &SubTableEntry,
+    to_entry: &DatasetEntry,
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
@@ -475,7 +490,7 @@ async fn diff_table_added(
 
 async fn diff_table_removed(
     table_store: &TableStore,
-    from_entry: &SubTableEntry,
+    from_entry: &DatasetEntry,
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
@@ -490,7 +505,7 @@ async fn diff_table_removed(
 /// `OrderedRows` shares the enumerator's scan shape so there is one row reader.
 async fn drain_all_rows(
     table_store: &TableStore,
-    entry: &SubTableEntry,
+    entry: &DatasetEntry,
     op: ChangeOp,
     is_edge: bool,
 ) -> Result<Vec<EntityChange>> {
@@ -594,7 +609,6 @@ fn extract_rows(batches: &[RecordBatch]) -> Vec<ScannedRow> {
 /// deleted-set path, which classify by id membership and never compare images).
 fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> EntityChange {
     EntityChange {
-        table_key: String::new(),
         kind: if is_edge {
             EntityKind::Edge
         } else {
@@ -603,7 +617,7 @@ fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> Enti
         type_name: String::new(),
         id: row.id.clone(),
         op,
-        manifest_version: row.change_version.unwrap_or(0),
+        published_dataset_version: row.change_version.unwrap_or(0),
         endpoints: if is_edge {
             Some(Endpoints {
                 src: row.src.clone().unwrap_or_default(),
@@ -634,7 +648,6 @@ fn entity_change_from_raw(raw: &RawRow, op: ChangeOp, is_edge: bool) -> EntityCh
         .filter(|array| array.is_valid(0))
         .map(|array| array.value(0));
     EntityChange {
-        table_key: String::new(),
         kind: if is_edge {
             EntityKind::Edge
         } else {
@@ -643,7 +656,7 @@ fn entity_change_from_raw(raw: &RawRow, op: ChangeOp, is_edge: bool) -> EntityCh
         type_name: String::new(),
         id: raw.id.clone(),
         op,
-        manifest_version: change_version.unwrap_or(0),
+        published_dataset_version: change_version.unwrap_or(0),
         endpoints: if is_edge {
             Some(Endpoints {
                 src: string_col("src").unwrap_or_default(),

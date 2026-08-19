@@ -933,7 +933,7 @@ impl Omnigraph {
         // CAS. Branch is threaded explicitly — no coordinator swap.
         let mut staging = MutationStaging::default();
 
-        // Lower + validate up front so the touched-table set is known before
+        // Lower + validate up front so the touched-dataset set is known before
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
         let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
@@ -1079,7 +1079,7 @@ impl Omnigraph {
     ///
     /// Hoisted out of [`Self::execute_named_mutation`] so the caller can
     /// inspect the IR before execution — specifically to compute the
-    /// touched-table set (see [`Self::touched_table_keys`]) for up-front
+    /// touched-dataset set (see [`Self::touched_table_keys`]) for up-front
     /// write-queue acquisition. Performs the same find → typecheck → lower
     /// → D₂ checks that execution previously did inline, so error behavior
     /// is unchanged.

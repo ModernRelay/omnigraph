@@ -283,7 +283,7 @@ where
         return Ok(SchemaApplyResult {
             supported: true,
             applied: false,
-            manifest_version: db.version().await,
+            graph_manifest_version: db.version().await,
             steps: plan.steps,
         });
     }
@@ -421,7 +421,7 @@ where
                 // happens AFTER the manifest publish:
                 //   * Soft: nothing — the prior dataset version
                 //     retains the dropped column; reads at
-                //     snapshot_at_version(pre_drop) still see it.
+                //     snapshot_at_graph_manifest_version(pre_drop) still see it.
                 //   * Hard: run cleanup_old_versions on the dataset
                 //     post-publish, removing the prior version (and
                 //     reclaiming any fragments unique to it). After
@@ -432,13 +432,13 @@ where
                 }
                 if matches!(mode, DropMode::Hard) {
                     let source_table_key = renamed_tables.get(&table_key).unwrap_or(&table_key);
-                    let entry = snapshot.entry(source_table_key).ok_or_else(|| {
+                    let entry = snapshot.dataset(source_table_key).ok_or_else(|| {
                         OmniError::manifest(format!(
                             "missing source table '{}' for hard property drop targeting '{}'",
                             source_table_key, table_key
                         ))
                     })?;
-                    let full_uri = format!("{}/{}", db.root_uri, entry.table_path);
+                    let full_uri = format!("{}/{}", db.root_uri, entry.dataset_path);
                     hard_cleanup_targets.push((table_key.clone(), full_uri));
                 }
                 rewritten_tables.insert(table_key);
@@ -471,13 +471,13 @@ where
                     changed_edge_tables = true;
                 }
                 if matches!(mode, DropMode::Hard) {
-                    let entry = snapshot.entry(&table_key).ok_or_else(|| {
+                    let entry = snapshot.dataset(&table_key).ok_or_else(|| {
                         OmniError::manifest(format!(
                             "missing table '{}' for hard type drop",
                             table_key
                         ))
                     })?;
-                    let full_uri = format!("{}/{}", db.root_uri, entry.table_path);
+                    let full_uri = format!("{}/{}", db.root_uri, entry.dataset_path);
                     hard_cleanup_targets.push((table_key.clone(), full_uri));
                 }
                 dropped_tables.insert(table_key);
@@ -494,7 +494,7 @@ where
     let mut table_registrations =
         BTreeMap::<String, (crate::db::manifest::TableIdentity, String)>::new();
     let mut table_updates =
-        BTreeMap::<crate::db::manifest::TableIdentity, crate::db::SubTableUpdate>::new();
+        BTreeMap::<crate::db::manifest::TableIdentity, crate::db::DatasetUpdate>::new();
     let mut table_tombstones = BTreeMap::<crate::db::manifest::TableIdentity, (String, u64)>::new();
 
     // Pre-mint every table transaction before recovery is armed. Existing
@@ -547,16 +547,16 @@ where
             continue;
         }
         let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
-        let entry = snapshot.entry(source_table_key).ok_or_else(|| {
+        let entry = snapshot.dataset(source_table_key).ok_or_else(|| {
             OmniError::manifest(format!(
                 "missing source table '{}' for schema apply recovery plan targeting '{}'",
                 source_table_key, table_key
             ))
         })?;
-        if entry.table_branch.is_some() {
+        if entry.native_dataset_branch.is_some() {
             return Err(OmniError::manifest_internal(format!(
                 "schema apply expected main-owned table '{}', found branch {:?}",
-                source_table_key, entry.table_branch
+                source_table_key, entry.native_dataset_branch
             )));
         }
         let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
@@ -567,13 +567,13 @@ where
                 source_table_key, entry.identity, table_key, identity
             )));
         }
-        let planned = pre_minted_schema_transaction(entry.table_version);
+        let planned = pre_minted_schema_transaction(entry.published_dataset_version);
         recovery_pins.push(crate::db::manifest::SidecarTablePin {
             identity,
             table_key: table_key.clone(),
-            table_path: db.storage().dataset_uri(&entry.table_path),
-            expected_version: entry.table_version,
-            post_commit_pin: entry.table_version + 1,
+            table_path: db.storage().dataset_uri(&entry.dataset_path),
+            expected_version: entry.published_dataset_version,
+            post_commit_pin: entry.published_dataset_version + 1,
             confirmed_version: None,
             table_branch: None,
         });
@@ -589,7 +589,7 @@ where
         recovery_slots.push(crate::db::manifest::RecoveryTableUpdateSlot {
             identity,
             table_key: table_key.clone(),
-            expected_version: entry.table_version,
+            expected_version: entry.published_dataset_version,
             table_branch: None,
             confirmed: None,
         });
@@ -613,7 +613,7 @@ where
     }
     let mut sidecar_renames = Vec::<crate::db::manifest::SidecarTableRename>::new();
     for (target_table_key, source_table_key) in &renamed_tables {
-        let source_entry = snapshot.entry(source_table_key).ok_or_else(|| {
+        let source_entry = snapshot.dataset(source_table_key).ok_or_else(|| {
             OmniError::manifest(format!(
                 "missing source table '{}' for schema rename when building recovery sidecar",
                 source_table_key
@@ -629,18 +629,21 @@ where
         }
         let canonical_target_path =
             crate::db::manifest::table_path_for_identity(target_table_key, desired_identity)?;
-        if canonical_target_path != source_entry.table_path {
+        if canonical_target_path != source_entry.dataset_path {
             return Err(OmniError::manifest_internal(format!(
                 "schema rename '{}' -> '{}' would change physical path '{}' to '{}'",
-                source_table_key, target_table_key, source_entry.table_path, canonical_target_path
+                source_table_key,
+                target_table_key,
+                source_entry.dataset_path,
+                canonical_target_path
             )));
         }
         sidecar_renames.push(crate::db::manifest::SidecarTableRename {
             identity: desired_identity,
             expected_table_key: source_table_key.clone(),
-            expected_version: source_entry.table_version,
+            expected_version: source_entry.published_dataset_version,
             table_key: target_table_key.clone(),
-            table_path: source_entry.table_path.clone(),
+            table_path: source_entry.dataset_path.clone(),
         });
     }
     let mut sidecar_tombstones: Vec<crate::db::manifest::SidecarTombstone> = Vec::new();
@@ -651,13 +654,13 @@ where
     // reachable until cleanup. No Phase B write happens for these
     // tables; the recovery sidecar is purely the manifest delta.
     for dropped_table_key in &dropped_tables {
-        let entry = snapshot.entry(dropped_table_key).ok_or_else(|| {
+        let entry = snapshot.dataset(dropped_table_key).ok_or_else(|| {
             OmniError::manifest(format!(
                 "missing table '{}' for soft drop when building recovery sidecar",
                 dropped_table_key
             ))
         })?;
-        let tombstone_version = entry.table_version.saturating_add(1);
+        let tombstone_version = entry.published_dataset_version.saturating_add(1);
         sidecar_tombstones.push(crate::db::manifest::SidecarTombstone {
             identity: entry.identity,
             table_key: dropped_table_key.clone(),
@@ -675,8 +678,8 @@ where
     // is graph-global (including metadata-only changes and hard drops), so a
     // rewrite-only subset is not a sufficient envelope.
     let schema_apply_queue_keys: Vec<(String, Option<String>)> = snapshot
-        .entries()
-        .map(|entry| (entry.table_key.clone(), entry.table_branch.clone()))
+        .datasets()
+        .map(|entry| (entry.type_key.clone(), entry.native_dataset_branch.clone()))
         .collect();
     // The outer `apply_schema` holds the schema-control serialization key from
     // before sentinel creation through sentinel release. Per-table guards here
@@ -752,20 +755,20 @@ where
     // and reuse them below: reopening after this ownership check would create a
     // needless second HEAD observation and blur the pre-arm boundary.
     let mut existing_heads = HashMap::<String, SnapshotHandle>::new();
-    for entry in snapshot.entries() {
-        let dataset_uri = db.storage().dataset_uri(&entry.table_path);
+    for entry in snapshot.datasets() {
+        let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
         let head = db
             .storage()
-            .open_dataset_head(&dataset_uri, entry.table_branch.as_deref())
+            .open_dataset_head(&dataset_uri, entry.native_dataset_branch.as_deref())
             .await?;
         db.ensure_existing_effect_baseline(
-            &entry.table_key,
-            entry.table_branch.as_deref(),
-            entry.table_version,
+            &entry.type_key,
+            entry.native_dataset_branch.as_deref(),
+            entry.published_dataset_version,
             &head,
         )
         .await?;
-        existing_heads.insert(entry.table_key.clone(), head);
+        existing_heads.insert(entry.type_key.clone(), head);
     }
 
     // Only added types are first-touch paths. Rename targets deliberately reuse
@@ -889,12 +892,12 @@ where
             table_registrations.insert(table_key.clone(), (identity, table_path));
             table_updates.insert(
                 identity,
-                crate::db::SubTableUpdate {
+                crate::db::DatasetUpdate {
                     identity,
-                    table_key: table_key.clone(),
-                    table_version: state.version,
-                    table_branch: None,
-                    row_count: state.row_count,
+                    type_key: table_key.clone(),
+                    published_dataset_version: state.version,
+                    native_dataset_branch: None,
+                    entity_count: state.row_count,
                     version_metadata: state.version_metadata,
                 },
             );
@@ -908,7 +911,7 @@ where
                 continue;
             }
             let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
-            let entry = snapshot.entry(source_table_key).ok_or_else(|| {
+            let entry = snapshot.dataset(source_table_key).ok_or_else(|| {
                 OmniError::manifest(format!(
                     "missing source table '{}' for schema apply targeting '{}'",
                     source_table_key, table_key
@@ -930,7 +933,7 @@ where
                 property_renames.get(table_key),
             )
             .await?;
-            let dataset_uri = db.storage().dataset_uri(&entry.table_path);
+            let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
             // Reuse the handle that was opened and pin-checked before arming;
             // reopening here would introduce a second HEAD observation.
             let existing = source_ds;
@@ -967,12 +970,12 @@ where
             let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
             table_updates.insert(
                 identity,
-                crate::db::SubTableUpdate {
+                crate::db::DatasetUpdate {
                     identity,
-                    table_key: table_key.clone(),
-                    table_version: state.version,
-                    table_branch: None,
-                    row_count: state.row_count,
+                    type_key: table_key.clone(),
+                    published_dataset_version: state.version,
+                    native_dataset_branch: None,
+                    entity_count: state.row_count,
                     version_metadata: state.version_metadata,
                 },
             );
@@ -1005,7 +1008,7 @@ where
             }));
         }
         for (target_table_key, source_table_key) in &renamed_tables {
-            let source_entry = snapshot.entry(source_table_key).ok_or_else(|| {
+            let source_entry = snapshot.dataset(source_table_key).ok_or_else(|| {
                 OmniError::manifest(format!(
                     "missing source table '{}' for schema rename publication",
                     source_table_key
@@ -1015,7 +1018,7 @@ where
                 source_entry.identity,
                 crate::db::manifest::TableVersionExpectation {
                     table_key: source_table_key.clone(),
-                    table_version: source_entry.table_version,
+                    table_version: source_entry.published_dataset_version,
                 },
             );
             manifest_changes.push(ManifestChange::RenameTable(
@@ -1023,7 +1026,7 @@ where
                     identity: source_entry.identity,
                     expected_table_key: source_table_key.clone(),
                     table_key: target_table_key.clone(),
-                    table_path: source_entry.table_path.clone(),
+                    table_path: source_entry.dataset_path.clone(),
                 },
             ));
         }
@@ -1035,13 +1038,13 @@ where
                 .ok_or_else(|| {
                     OmniError::manifest_internal(format!(
                         "missing SchemaApply expected version for '{}'",
-                        update.table_key
+                        update.type_key
                     ))
                 })?;
             let expected_table_key = renamed_tables
-                .get(&update.table_key)
+                .get(&update.type_key)
                 .cloned()
-                .unwrap_or_else(|| update.table_key.clone());
+                .unwrap_or_else(|| update.type_key.clone());
             expected_versions.insert(
                 update.identity,
                 crate::db::manifest::TableVersionExpectation {
@@ -1115,7 +1118,7 @@ where
             ),
         );
         let PublishedSnapshot {
-            manifest_version,
+            graph_manifest_version,
             ..
         } = db
             .coordinator
@@ -1149,7 +1152,7 @@ where
         if changed_edge_tables {
             db.invalidate_graph_index().await;
         }
-        Ok::<u64, OmniError>(manifest_version)
+        Ok::<u64, OmniError>(graph_manifest_version)
     }
     .await;
 
@@ -1202,7 +1205,7 @@ where
     Ok(SchemaApplyResult {
         supported: true,
         applied: true,
-        manifest_version,
+        graph_manifest_version: manifest_version,
         steps: plan.steps,
     })
 }

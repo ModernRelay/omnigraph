@@ -332,7 +332,7 @@ pub(crate) async fn observe_declared_graphs(
                     graph_uri: &graph_uri,
                     observed_at: &observed_at,
                     exists: false,
-                    manifest_version: None,
+                    graph_manifest_version: None,
                     schema_digest: None,
                     desired_schema_digest: &graph.schema_digest,
                     schema_matches_desired: Some(false),
@@ -399,7 +399,7 @@ pub(crate) async fn observe_declared_graphs(
                         graph_uri: &graph_uri,
                         observed_at: &observed_at,
                         exists: true,
-                        manifest_version: Some(observation.manifest_version),
+                        graph_manifest_version: Some(observation.graph_manifest_version),
                         schema_digest: Some(observation.schema_digest.as_str()),
                         desired_schema_digest: &graph.schema_digest,
                         schema_matches_desired: Some(schema_matches),
@@ -435,7 +435,7 @@ pub(crate) async fn observe_declared_graphs(
                         graph_uri: &graph_uri,
                         observed_at: &observed_at,
                         exists: true,
-                        manifest_version: None,
+                        graph_manifest_version: None,
                         schema_digest: None,
                         desired_schema_digest: &graph.schema_digest,
                         schema_matches_desired: None,
@@ -480,7 +480,7 @@ pub(crate) async fn preview_schema_migration(
 }
 
 pub(crate) struct LiveGraphObservation {
-    manifest_version: u64,
+    graph_manifest_version: u64,
     schema_digest: String,
 }
 
@@ -494,7 +494,7 @@ pub(crate) async fn observe_live_graph(graph_uri: &str) -> Result<LiveGraphObser
         .map_err(|err| err.to_string())?;
     let schema_source = db.schema_source();
     Ok(LiveGraphObservation {
-        manifest_version: snapshot.version(),
+        graph_manifest_version: snapshot.graph_manifest_version(),
         schema_digest: sha256_hex(schema_source.as_bytes()),
     })
 }
@@ -504,7 +504,7 @@ pub(crate) struct GraphObservationJson<'a> {
     graph_uri: &'a str,
     observed_at: &'a str,
     exists: bool,
-    manifest_version: Option<u64>,
+    graph_manifest_version: Option<u64>,
     schema_digest: Option<&'a str>,
     desired_schema_digest: &'a str,
     schema_matches_desired: Option<bool>,
@@ -518,7 +518,7 @@ pub(crate) fn graph_observation_json(observation: GraphObservationJson<'_>) -> s
         "graph_uri": observation.graph_uri,
         "observed_at": observation.observed_at,
         "exists": observation.exists,
-        "manifest_version": observation.manifest_version,
+        "graph_manifest_version": observation.graph_manifest_version,
         "schema_digest": observation.schema_digest,
         "desired_schema_digest": observation.desired_schema_digest,
         "schema_matches_desired": observation.schema_matches_desired,

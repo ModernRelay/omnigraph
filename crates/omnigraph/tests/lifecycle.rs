@@ -97,12 +97,12 @@ async fn init_creates_graph() {
         6,
         "fresh graphs must use the restored pre-WAL v6 manifest format"
     );
-    assert!(snap.entry("node:Person").is_some());
-    assert!(snap.entry("node:Company").is_some());
-    assert!(snap.entry("edge:Knows").is_some());
-    assert!(snap.entry("edge:WorksAt").is_some());
+    assert!(snap.dataset("node:Person").is_some());
+    assert!(snap.dataset("node:Company").is_some());
+    assert!(snap.dataset("edge:Knows").is_some());
+    assert!(snap.dataset("edge:WorksAt").is_some());
     for table_key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
-        let dataset = snap.open(table_key).await.unwrap();
+        let dataset = snap.open_dataset(table_key).await.unwrap();
         let primary_key = dataset
             .schema()
             .unenforced_primary_key()
@@ -202,7 +202,7 @@ node Document {
             .snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
-            .entry("node:Document")
+            .dataset("node:Document")
             .is_some()
     );
 }
@@ -228,8 +228,8 @@ async fn open_reads_existing_graph() {
     assert_eq!(db.catalog().node_types.len(), 2);
     assert_eq!(db.catalog().edge_types.len(), 2);
     let snap = snapshot_main(&db).await.unwrap();
-    assert!(snap.entry("node:Person").is_some());
-    assert!(snap.entry("edge:Knows").is_some());
+    assert!(snap.dataset("node:Person").is_some());
+    assert!(snap.dataset("edge:Knows").is_some());
     assert_eq!(db.catalog().type_id("Person"), Some(person_type_id));
     assert_eq!(
         db.catalog().property_id("Person", "name"),
@@ -576,7 +576,7 @@ async fn comment_only_schema_edit_keeps_schema_state_valid() {
     fs::write(dir.path().join("_schema.pg"), commented).unwrap();
 
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert!(snapshot.entry("node:Person").is_some());
+    assert!(snapshot.dataset("node:Person").is_some());
 }
 
 #[tokio::test]
@@ -593,7 +593,7 @@ async fn snapshot_version_is_pinned() {
     let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     let snap1 = snapshot_main(&db).await.unwrap();
-    let v1 = snap1.version();
+    let v1 = snap1.graph_manifest_version();
 
     omnigraph::loader::load_jsonl(
         &db,
@@ -604,9 +604,9 @@ async fn snapshot_version_is_pinned() {
     .unwrap();
 
     let snap2 = snapshot_main(&db).await.unwrap();
-    assert!(snap2.version() > v1);
+    assert!(snap2.graph_manifest_version() > v1);
 
-    assert_eq!(snap1.version(), v1);
+    assert_eq!(snap1.graph_manifest_version(), v1);
 }
 
 /// Regression for the `Omnigraph::init` re-init footgun (MR-668

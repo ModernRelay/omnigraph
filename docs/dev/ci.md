@@ -45,6 +45,9 @@
     at the fingerprint-independent boundary. This prevents an unchanged
     neighbour from inheriting a removed legacy row's transition marker while
     preserving fail-closed review for actual text/fingerprint rewrites.
+    The v0.10 contract cutover closes compatibility aliases completely: exact
+    base removals are allowed, new/moved/reintroduced aliases fail the
+    comparison, and any surviving current-tree alias fails the job.
   - CI does not regenerate `openapi.json`; intentional API changes regenerate
     and commit it locally.
   - The post-merge/tag/manual **V5 ↔ V6 Format Fence** builds the immutable
@@ -79,19 +82,11 @@ cargo run -p omnigraph-vocabulary-guard --locked -- \
 
 The inventory must already exist at `BASE_SHA`; absence is a failed precondition,
 not a bootstrap signal. Public-Rust extraction can be cold and substrate-sized;
-reuse its target directory. For this vocabulary migration only, additionally
-run the explicit structural proof below. It removes only OpenAPI `description`
-and `summary` presentation fields before comparing the trees; route, method,
-schema, property, required, enum, status, header, default, and request changes
-still fail. This opt-in is migration evidence, not a permanent API-evolution
-gate:
-
-```bash
-cargo run -p omnigraph-vocabulary-guard --locked -- \
-  check --surface openapi --presentation-only --base "$BASE_SHA" \
-  --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
-  --openapi openapi.json
-```
+reuse its target directory. The optional `--presentation-only` OpenAPI mode is
+evidence only for a copy-only migration: it strips `description` and `summary`
+before comparison and rejects every structural change. Do not run or claim
+that proof for a deliberately breaking wire-contract change; use the exact
+generated-spec diff and boundary tests instead.
 
 - **AWS feature build job**: `cargo build/test -p omnigraph-server --features aws` on ubuntu-latest.
 - **Windows binary build job**: `cargo build --release --locked -p omnigraph-cli -p omnigraph-server` on windows-latest with smoke checks for `omnigraph.exe version`, `omnigraph-server.exe --help`, and PowerShell installer syntax.

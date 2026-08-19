@@ -344,7 +344,7 @@ O(history) scan to discover it.
 
 ### 6.2 History
 
-`snapshot_at_version`, commit resolution, change feeds, and audit continue to
+`snapshot_at_graph_manifest_version`, commit resolution, change feeds, and audit continue to
 read immutable journal/lineage state at the requested manifest version. A heads-format
 manifest version contains the heads as they stood at that version, but the
 journal remains the normative explanation of how the state arose.

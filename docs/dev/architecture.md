@@ -86,7 +86,7 @@ flowchart TB
     lance_layer -- bytes --> object_store
 ```
 
-The write-side storage seam is enforced: supported data-table write effects route
+The write-side storage seam is enforced: supported data-dataset write effects route
 through the sealed `TableStorage` staging surface, with Optimize as the documented
 bounded maintenance exception. Read, capability, and statistics surfaces are not
 yet one complete substrate trait; that planner-facing boundary remains roadmap.
@@ -142,7 +142,7 @@ flowchart TB
 
     subgraph idx[graph index]
         gi[GraphIndex<br/>CSR/CSC built per query<br/>scoped to traversed edges]:::l2
-        rc[RuntimeCache LRU=8<br/>keyed by edge-table identity]:::l2
+        rc[RuntimeCache LRU=8<br/>keyed by edge-dataset identity]:::l2
     end
 
     subgraph io[Lance I/O]
@@ -168,18 +168,18 @@ flowchart TB
 
 The engine binds the compiler IR to Lance. It owns multi-dataset coordination,
 the graph topology index, the per-query staging accumulator, and the
-snapshot/manifest read path. Lance graph-dataset access has an explicit split:
+snapshot/graph-manifest read path. Lance graph-dataset access has an explicit split:
 one process-wide `ObjectStoreRegistry` pools graph-dataset object-store clients;
-each graph handle owns a cached data-table `Session`; mutable-tip control
+each graph handle owns a cached data-dataset `Session`; mutable-tip control
 datasets use a zero-cache control `Session` that shares only the registry. A
-coordinator open or full refresh decodes manifest state and graph lineage from
+coordinator open or full refresh decodes graph-manifest state and graph lineage from
 one coherent `__manifest` scan.
 
 Code paths:
 
 - Read entry: `Omnigraph::query` at `crates/omnigraph/src/exec/query.rs:7`
 - Mutation entry: `Omnigraph::mutate` at `crates/omnigraph/src/exec/mutation.rs:511`
-- Manifest publish: `GraphCoordinator::commit_changes_with_intent_and_expected`
+- Graph-manifest publish: `GraphCoordinator::commit_changes_with_intent_and_expected`
   gates the exact writer path and delegates to
   `ManifestCoordinator::commit_changes_with_lineage_and_precondition`
 - Graph index: `crates/omnigraph/src/graph_index/`
@@ -192,24 +192,24 @@ Mutations inside `mutate_as` and every bulk-load mode go through `MutationStagin
 a per-query in-memory accumulator. No Lance HEAD advance happens during
 op execution. The attempt captures one native branch identity, exact graph head,
 accepted schema identity/catalog, and base snapshot. At end-of-query it stages
-one exact Lance transaction per touched table outside the effect gates, then
-acquires the root-shared schema → branch → sorted-table gates and revalidates the
-complete authority before arming recovery or advancing any table HEAD.
+one exact Lance transaction per touched dataset outside the effect gates, then
+acquires the root-shared schema → branch → sorted-dataset gates and revalidates the
+complete authority before arming recovery or advancing any dataset HEAD.
 
 ```
-op-1 (insert/update) → push RecordBatch → MutationStaging.pending[table]
+op-1 (insert/update) → push RecordBatch → MutationStaging.pending[dataset]
 op-2 (insert/update) → read committed via Lance + pending via DataFusion
                        MemTable (read-your-writes) → push batch
 op-N → push batch
 ─── end of query ────────────────────────────────────────────────
-stage_all: concat batches → one exact stage_* transaction per table (no HEAD move)
-commit_all: acquire schema → branch → sorted-table gates
+stage_all: concat batches → one exact stage_* transaction per dataset (no HEAD move)
+commit_all: acquire schema → branch → sorted-dataset gates
             → reject a new recovery intent → revalidate the complete branch token
-            → arm identity-bearing v9 recovery → commit_staged per table
-publisher: publish pre-minted lineage under the exact native-branch/head + table precondition
+            → arm identity-bearing v9 recovery → commit_staged per dataset
+publisher: publish pre-minted lineage under the exact native-branch/head + dataset precondition
 ```
 
-A failed op leaves Lance HEAD untouched on the staged tables. If authority
+A failed op leaves Lance HEAD untouched on the staged datasets. If authority
 changes before effects, insert-only mutations and Append/Merge loads discard the
 whole attempt and fully reprepare with a bounded retry; Update/Delete/Overwrite
 returns `ReadSetChanged`. After any physical effect, any later error returns
@@ -279,8 +279,8 @@ flowchart LR
         manual[called manually<br/>or from optimize]:::now
     end
 
-    subgraph roadmap[Roadmap - manifest reconciler]
-        rec[Reconciler<br/>observes manifest]:::future
+    subgraph roadmap[Roadmap - graph-manifest reconciler]
+        rec[Reconciler<br/>observes graph manifest]:::future
         diff[coverage diff<br/>fragments − fragment_bitmap]:::future
         wp[worker pool<br/>builds index segments]:::future
     end
@@ -293,10 +293,10 @@ flowchart LR
 Today, physical indexes are built explicitly via `ensure_indices`/`optimize`;
 schema apply, mutation, and load only record intent or publish their exact data
 effects and never build indexes inline. EnsureIndices batches every missing
-BTREE, FTS, and full-table vector artifact for one table into one staged Lance
+BTREE, FTS, and full-dataset vector artifact for one dataset into one staged Lance
 `CreateIndex` transaction. Its identity-bearing v9 recovery intent captures exact
 branch/schema authority, fixed original and rollback lineage, the complete
-manifest delta, and first-touch ref ownership before publication. Optimize is
+graph-manifest delta, and first-touch ref ownership before publication. Optimize is
 separate: its compaction/index-coverage fold uses a bounded payload inside the
 same v9 identity envelope within the single-writer-process recovery boundary.
 Reads degrade gracefully when index coverage is missing or
@@ -306,7 +306,7 @@ the same explicit convergence path.
 
 The supported SDK graph-write set is closed first by Rust visibility: raw
 `TableStore` / `TableStorage`, handle-cache, and coordinator surfaces are
-crate-private. Public snapshot tables expose reads rather than a writable Lance
+crate-private. Public snapshot datasets expose reads rather than a writable Lance
 `Dataset`; their scan facade withholds Lance's raw `Scanner` and physical plan,
 which can otherwise reveal the dataset embedded in a scan execution node.
 `crates/omnigraph/tests/forbidden_apis.rs` then provides defense in depth by
@@ -330,14 +330,14 @@ flowchart LR
     pol[Cedar policy gate<br/>per request]:::l2
     wl[WorkloadController<br/>per-actor admission]:::l2
     eng[engine API<br/>Arc&lt;Omnigraph&gt;]:::l2
-    wq[WriteQueueManager<br/>root-scoped schema → branch → table gates]:::l2
+    wq[WriteQueueManager<br/>root-scoped schema → branch → dataset gates]:::l2
 
     cli -.-> eng
     srv_in --> auth --> pol --> wl --> eng
     eng --> wq
 ```
 
-The server applies Cedar policy at the HTTP boundary today. The roadmap, called out in [docs/dev/invariants.md](invariants.md) as a known gap, is to push policy into the planner as predicates. After Cedar, mutating handlers go through `WorkloadController` (per-actor admission cap + byte budget; PR 2 / MR-686) before reaching the engine. Every handle for one canonical graph root shares an `Arc<WriteQueueManager>` in-process. RFC-022-enrolled mutation/load attempts prepare outside the effect gates, then acquire the exclusive root schema gate, the target branch-effect gate, and sorted `(table, branch)` gates and hold them through publish. The root schema gate means enrolled effect windows on one graph currently serialize even across different branches; readers remain ungated, and pre-effect parsing, validation, and fragment staging can overlap. The branch gate preserves the complete per-branch validation authority, while table gates protect each concrete Lance effect and legacy adapter. These gates prevent same-process races and impose one deadlock-free order; the exact publisher precondition and durable recovery intent remain the correctness authorities, and the gates are not a cross-process lock. See [docs/user/server.md](../user/operations/server.md) "Per-actor admission control" and [docs/dev/writes.md](writes.md). The CLI bypasses the HTTP layer (and admission) and calls the engine API directly.
+The server applies Cedar policy at the HTTP boundary today. The roadmap, called out in [docs/dev/invariants.md](invariants.md) as a known gap, is to push policy into the planner as predicates. After Cedar, mutating handlers go through `WorkloadController` (per-actor admission cap + byte budget; PR 2 / MR-686) before reaching the engine. Every handle for one canonical graph root shares an `Arc<WriteQueueManager>` in-process. RFC-022-enrolled mutation/load attempts prepare outside the effect gates, then acquire the exclusive root schema gate, the target branch-effect gate, and sorted `(dataset, branch)` gates and hold them through graph-manifest publication. The root schema gate means enrolled effect windows on one graph currently serialize even across different branches; readers remain ungated, and pre-effect parsing, validation, and fragment staging can overlap. The branch gate preserves the complete per-branch validation authority, while dataset gates protect each concrete Lance effect and legacy adapter. These gates prevent same-process races and impose one deadlock-free order; the exact publisher precondition and durable recovery intent remain the correctness authorities, and the gates are not a cross-process lock. See [docs/user/server.md](../user/operations/server.md) "Per-actor admission control" and [docs/dev/writes.md](writes.md). The CLI bypasses the HTTP layer (and admission) and calls the engine API directly.
 
 Code paths:
 
@@ -355,16 +355,16 @@ Throughout the docs, capabilities are split into:
 
 ## Concurrency model
 
-- **MVCC**: every Lance write bumps a per-dataset version; the OmniGraph manifest version coordinates which sub-table versions are visible together.
+- **MVCC**: every Lance write bumps a per-dataset version; the graph-manifest version coordinates which published dataset versions are visible together.
 - **Snapshot isolation**: a query holds one `Snapshot` for its lifetime; concurrent writes don't leak in.
-- **Cross-branch isolation**: Lance copy-on-write keeps branch data independent, and readers never acquire write gates. Enrolled writer preparation can overlap across branches, but their effect/publish windows currently share one exclusive root schema gate before the branch/table gates, so those windows serialize in-process even for different branches.
+- **Cross-branch isolation**: Lance copy-on-write keeps branch data independent, and readers never acquire write gates. Enrolled writer preparation can overlap across branches, but their effect/publish windows currently share one exclusive root schema gate before the branch/dataset gates, so those windows serialize in-process even for different branches.
 - **Operation-local control capture**: branch merge retains the exact
-  source/target manifest `Dataset` probe handles and probes them before a
-  full-capture fallback; native branch create/delete capture fresh manifest/ref
-  authority once after the complete schema → branch → table gate envelope.
-  Neither path treats a cached mutable tip as commit authority, and the manifest
+  source/target graph-manifest `Dataset` probe handles and probes them before a
+  full-capture fallback; native branch create/delete capture fresh graph-manifest/ref
+  authority once after the complete schema → branch → dataset gate envelope.
+  Neither path treats a cached mutable tip as commit authority, and the graph-manifest
   publisher still performs a fresh CAS-time authority load.
-- **Per-query staging**: `mutate_as` and every `load` mode accumulate their work in an in-memory `MutationStaging`; `stage_all` prepares exact per-table transactions without moving HEAD. At commit, the root schema → branch → sorted-table gates protect complete-token revalidation, v9 recovery arming (with the retained `protocol_v3` mutation/load payload), zero-retry table effects, and one atomic manifest publish. A mid-query failure leaves Lance HEAD untouched on staged tables. (MR-794 / RFC-022; pre-v0.4.0 used a `__run__<id>` staging branch + Run state machine, removed in MR-771.)
+- **Per-query staging**: `mutate_as` and every `load` mode accumulate their work in an in-memory `MutationStaging`; `stage_all` prepares exact per-dataset transactions without moving HEAD. At commit, the root schema → branch → sorted-dataset gates protect complete-token revalidation, v9 recovery arming (with the retained `protocol_v3` mutation/load payload), zero-retry dataset effects, and one atomic graph-manifest publish. A mid-query failure leaves Lance HEAD untouched on staged datasets. (MR-794 / RFC-022; pre-v0.4.0 used a `__run__<id>` staging branch + Run state machine, removed in MR-771.)
 - **Schema-apply lock**: `__schema_apply_lock__` system branch serializes schema migrations.
 - **Fail-points** (`failpoints` cargo feature): `failpoints::maybe_fail("operation.step")?` in `branch_create`, publish, etc., for deterministic failure injection in tests.
 
@@ -372,7 +372,7 @@ Throughout the docs, capabilities are split into:
 
 - `omnigraph-compiler` — schema and query grammars, catalog, IR, lowering, type checker, lint, migration planner, OpenAI-style embedding client.
 - `omnigraph-storage` — the shared local/S3 control-object storage implementation and concrete backend handle used below the engine/cluster split.
-- `omnigraph` (engine; package `omnigraph-engine` — published on crates.io through 0.8.0, currently paused, see [versioning.md](versioning.md)) — the Lance-backed runtime: manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client.
+- `omnigraph` (engine; package `omnigraph-engine` — published on crates.io through 0.8.0, currently paused, see [versioning.md](versioning.md)) — the Lance-backed runtime: graph manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client.
 - `omnigraph-policy` — Cedar policy compilation and engine-facing enforcement.
 - `omnigraph-api-types` — shared HTTP wire DTOs used by the server and CLI.
 - `omnigraph-cluster` — cluster config validation, planning, persisted state-lock ownership, state, and apply.

@@ -53,7 +53,7 @@ use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 #[cfg(test)]
 use lance::dataset::{WhenMatched, WhenNotMatched};
 
-use crate::db::{Snapshot, SubTableEntry};
+use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
     ExternalBlobPreflight, StagedTransactionIdentity, StagedWrite, TableState, TableStore,
@@ -417,7 +417,7 @@ pub enum ForkOutcome<D> {
 pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     // ── Snapshot opens (no HEAD advance) ────────────────────────────────
 
-    async fn open_snapshot_at_entry(&self, entry: &SubTableEntry) -> Result<SnapshotHandle>;
+    async fn open_snapshot_at_entry(&self, entry: &DatasetEntry) -> Result<SnapshotHandle>;
 
     async fn open_snapshot_at_table(
         &self,
@@ -806,7 +806,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
 #[async_trait]
 impl TableStorage for TableStore {
-    async fn open_snapshot_at_entry(&self, entry: &SubTableEntry) -> Result<SnapshotHandle> {
+    async fn open_snapshot_at_entry(&self, entry: &DatasetEntry) -> Result<SnapshotHandle> {
         self.open_at_entry(entry).await.map(SnapshotHandle::new)
     }
 

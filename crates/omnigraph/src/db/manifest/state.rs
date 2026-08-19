@@ -16,20 +16,20 @@ use super::{
 };
 
 #[derive(Debug, Clone)]
-pub struct SubTableEntry {
+pub struct DatasetEntry {
     pub(crate) identity: TableIdentity,
-    pub table_key: String,
-    pub table_path: String,
-    pub table_version: u64,
-    pub table_branch: Option<String>,
-    pub row_count: u64,
+    pub type_key: String,
+    pub dataset_path: String,
+    pub published_dataset_version: u64,
+    pub native_dataset_branch: Option<String>,
+    pub entity_count: u64,
     pub(crate) version_metadata: TableVersionMetadata,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct ManifestState {
     pub(super) version: u64,
-    pub(super) entries: Vec<SubTableEntry>,
+    pub(super) entries: Vec<DatasetEntry>,
     /// Exact materialized `graph_head:<branch>` values from this SAME manifest
     /// version. Keeping the head beside the table snapshot prevents a
     /// manifest-only refresh from leaving coarse write authority split between
@@ -52,8 +52,8 @@ struct TableTombstoneEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GraphLineageRow {
     pub(crate) graph_commit_id: String,
-    pub(crate) manifest_branch: Option<String>,
-    pub(crate) manifest_version: u64,
+    pub(crate) graph_branch: Option<String>,
+    pub(crate) graph_manifest_version: u64,
     pub(crate) parent_commit_id: Option<String>,
     pub(crate) merged_parent_commit_id: Option<String>,
     pub(crate) actor_id: Option<String>,
@@ -62,8 +62,9 @@ pub(crate) struct GraphLineageRow {
 
 /// JSON payload of a `graph_commit` row's `metadata` column. The immutable
 /// commit fields that have no dedicated manifest column live here; the mutable
-/// ones (`graph_commit_id`, `manifest_branch`, `manifest_version`) reuse
-/// `object_id` / `table_branch` / `table_version`.
+/// graph-facing values (`graph_commit_id`, `graph_branch`,
+/// `graph_manifest_version`) reuse the persisted manifest columns `object_id`,
+/// `table_branch`, and `table_version`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct GraphCommitMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,7 +93,7 @@ pub(crate) fn graph_head_object_id(branch: Option<&str>) -> String {
 #[derive(Debug, Clone)]
 struct ManifestScan {
     table_registrations: HashMap<TableIdentity, TableRegistration>,
-    version_entries: Vec<SubTableEntry>,
+    version_entries: Vec<DatasetEntry>,
     tombstones: Vec<TableTombstoneEntry>,
     /// Graph-lineage `graph_commit` rows, collected in the SAME pass only when
     /// the caller asked (`collect_lineage`). Empty on the table-state read hot
@@ -199,14 +200,15 @@ fn manifest_state_from_scan(version: u64, scan: ManifestScan) -> Result<Manifest
 pub(super) fn assemble_manifest_state(
     version: u64,
     registrations: HashMap<TableIdentity, TableRegistration>,
-    version_entries: Vec<SubTableEntry>,
+    version_entries: Vec<DatasetEntry>,
     tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
     graph_heads: HashMap<String, String>,
 ) -> Result<ManifestState> {
-    let mut latest_versions = HashMap::<TableIdentity, SubTableEntry>::new();
+    let mut latest_versions = HashMap::<TableIdentity, DatasetEntry>::new();
     for entry in version_entries {
         match latest_versions.get(&entry.identity) {
-            Some(existing) if existing.table_version >= entry.table_version => {}
+            Some(existing)
+                if existing.published_dataset_version >= entry.published_dataset_version => {}
             _ => {
                 latest_versions.insert(entry.identity, entry);
             }
@@ -223,39 +225,39 @@ pub(super) fn assemble_manifest_state(
         }
     }
 
-    let mut entries: Vec<SubTableEntry> = latest_versions
+    let mut entries: Vec<DatasetEntry> = latest_versions
         .into_values()
         .filter(|entry| {
             tombstone_map
                 .get(&entry.identity)
-                .map(|tombstone_version| *tombstone_version < entry.table_version)
+                .map(|tombstone_version| *tombstone_version < entry.published_dataset_version)
                 .unwrap_or(true)
         })
         .map(|mut entry| {
             let registration = registrations.get(&entry.identity).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "manifest missing table row for identity {} (version row alias '{}')",
-                    entry.identity, entry.table_key
+                    entry.identity, entry.type_key
                 ))
             })?;
-            entry.table_key = registration.table_key.clone();
-            entry.table_path = registration.table_path.clone();
+            entry.type_key = registration.table_key.clone();
+            entry.dataset_path = registration.table_path.clone();
             Ok(entry)
         })
         .collect::<Result<Vec<_>>>()?;
 
     let mut aliases = HashMap::<String, TableIdentity>::new();
     for entry in &entries {
-        if let Some(existing) = aliases.insert(entry.table_key.clone(), entry.identity) {
+        if let Some(existing) = aliases.insert(entry.type_key.clone(), entry.identity) {
             if existing != entry.identity {
                 return Err(OmniError::manifest_internal(format!(
                     "manifest has two live table identities ({existing} and {}) bound to alias '{}'",
-                    entry.identity, entry.table_key
+                    entry.identity, entry.type_key
                 )));
             }
         }
     }
-    entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
+    entries.sort_by(|a, b| a.type_key.cmp(&b.type_key));
     Ok(ManifestState {
         version,
         entries,
@@ -271,7 +273,7 @@ pub(super) fn assemble_manifest_state(
 // tests"), so this stays `#[cfg(test)]` too — otherwise it is dead code in
 // non-test builds.
 #[cfg(test)]
-pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<SubTableEntry>> {
+pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<DatasetEntry>> {
     let scan = read_manifest_scan(dataset, false).await?;
     let registrations = scan.table_registrations;
     scan.version_entries
@@ -283,8 +285,8 @@ pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<SubTa
                     entry.identity
                 ))
             })?;
-            entry.table_key = registration.table_key.clone();
-            entry.table_path = registration.table_path.clone();
+            entry.type_key = registration.table_key.clone();
+            entry.dataset_path = registration.table_path.clone();
             Ok(entry)
         })
         .collect()
@@ -297,7 +299,7 @@ pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<SubTa
 /// projects every piece it needs out of this single result.
 pub(super) struct PublishScan {
     pub(super) table_registrations: HashMap<TableIdentity, TableRegistration>,
-    pub(super) version_entries: Vec<SubTableEntry>,
+    pub(super) version_entries: Vec<DatasetEntry>,
     pub(super) tombstones: Vec<((TableIdentity, u64), ())>,
     pub(super) lineage_rows: Vec<GraphLineageRow>,
     /// Exact `graph_head:<branch>` rows keyed by the branch suffix (`main` for
@@ -347,12 +349,12 @@ fn decode_graph_commit_row(
         })?;
     Ok(GraphLineageRow {
         graph_commit_id: object_ids.value(row).to_string(),
-        manifest_branch: if branches.is_null(row) {
+        graph_branch: if branches.is_null(row) {
             None
         } else {
             Some(branches.value(row).to_string())
         },
-        manifest_version: required_u64(versions, row, "table_version")?,
+        graph_manifest_version: required_u64(versions, row, "table_version")?,
         parent_commit_id: commit_meta.parent_commit_id,
         merged_parent_commit_id: commit_meta.merged_parent_commit_id,
         actor_id: commit_meta.actor_id,
@@ -513,13 +515,13 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
                     } else {
                         Some(branches.value(row).to_string())
                     };
-                    version_entries.push(SubTableEntry {
+                    version_entries.push(DatasetEntry {
                         identity,
-                        table_key: table_key.clone(),
-                        table_path: String::new(),
-                        table_version,
-                        table_branch,
-                        row_count,
+                        type_key: table_key.clone(),
+                        dataset_path: String::new(),
+                        published_dataset_version: table_version,
+                        native_dataset_branch: table_branch,
+                        entity_count: row_count,
                         version_metadata: TableVersionMetadata::from_json_str(metadata.value(row))?,
                     });
                 }
@@ -579,9 +581,10 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
     }
 
     version_entries.sort_by(|a, b| {
-        a.identity
-            .cmp(&b.identity)
-            .then(a.table_version.cmp(&b.table_version))
+        a.identity.cmp(&b.identity).then(
+            a.published_dataset_version
+                .cmp(&b.published_dataset_version),
+        )
     });
     for tombstone in &tombstones {
         let registration = table_registrations
@@ -677,15 +680,15 @@ pub(crate) async fn read_graph_lineage(
 }
 
 /// The current head of a branch's lineage: the [`GraphLineageRow`] with the
-/// greatest `(manifest_version, created_at, graph_commit_id)`. This is the same
+/// greatest `(graph_manifest_version, created_at, graph_commit_id)`. This is the same
 /// ordering the commit-graph cache uses to pick its head (`should_replace_head`)
 /// — kept in one place so the publisher's per-attempt parent resolution and the
 /// cache agree by construction. `None` only for a graph with no commits yet
 /// (a parentless genesis).
 pub(crate) fn head_lineage_row(rows: &[GraphLineageRow]) -> Option<&GraphLineageRow> {
     rows.iter().max_by(|a, b| {
-        a.manifest_version
-            .cmp(&b.manifest_version)
+        a.graph_manifest_version
+            .cmp(&b.graph_manifest_version)
             .then_with(|| a.created_at.cmp(&b.created_at))
             .then_with(|| a.graph_commit_id.cmp(&b.graph_commit_id))
     })
@@ -736,8 +739,8 @@ pub(crate) fn graph_lineage_row_parts(
             object_id: commit.graph_commit_id.clone(),
             object_type: OBJECT_TYPE_GRAPH_COMMIT,
             metadata: commit_metadata,
-            table_version: Some(commit.manifest_version),
-            table_branch: commit.manifest_branch.clone(),
+            table_version: Some(commit.graph_manifest_version),
+            table_branch: commit.graph_branch.clone(),
         },
         // The head row reuses `metadata` for its pointer payload.
         GraphLineageRowPart {
@@ -751,7 +754,7 @@ pub(crate) fn graph_lineage_row_parts(
 }
 
 pub(super) fn entries_to_batch(
-    entries: &[SubTableEntry],
+    entries: &[DatasetEntry],
     version_metadata: &HashMap<TableIdentity, String>,
     genesis_lineage: &[GraphLineageRowPart],
 ) -> Result<RecordBatch> {
@@ -769,15 +772,18 @@ pub(super) fn entries_to_batch(
     for entry in entries {
         object_ids.push(table_object_id(entry.identity));
         object_types.push(OBJECT_TYPE_TABLE.to_string());
-        locations.push(Some(entry.table_path.clone()));
+        locations.push(Some(entry.dataset_path.clone()));
         metadata.push(None);
-        table_keys.push(entry.table_key.clone());
+        table_keys.push(entry.type_key.clone());
         table_identities.push(Some(entry.identity));
         table_versions.push(None);
         table_branches.push(None);
         row_counts.push(None);
 
-        object_ids.push(version_object_id(entry.identity, entry.table_version));
+        object_ids.push(version_object_id(
+            entry.identity,
+            entry.published_dataset_version,
+        ));
         object_types.push(OBJECT_TYPE_TABLE_VERSION.to_string());
         locations.push(None);
         metadata.push(Some(
@@ -787,15 +793,15 @@ pub(super) fn entries_to_batch(
                 .ok_or_else(|| {
                     OmniError::manifest_internal(format!(
                         "missing initial version metadata for {}",
-                        entry.table_key
+                        entry.type_key
                     ))
                 })?,
         ));
-        table_keys.push(entry.table_key.clone());
+        table_keys.push(entry.type_key.clone());
         table_identities.push(Some(entry.identity));
-        table_versions.push(Some(entry.table_version));
-        table_branches.push(entry.table_branch.clone());
-        row_counts.push(Some(entry.row_count));
+        table_versions.push(Some(entry.published_dataset_version));
+        table_branches.push(entry.native_dataset_branch.clone());
+        row_counts.push(Some(entry.entity_count));
     }
 
     // Genesis graph-lineage rows ride the init write so a fresh graph carries

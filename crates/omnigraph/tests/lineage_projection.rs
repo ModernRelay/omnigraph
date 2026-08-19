@@ -190,8 +190,8 @@ async fn graph_lineage_lives_only_in_manifest() {
     let resolved_main_snapshot = main.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let resolved_main_commit = main.get_commit(resolved_main_head.as_str()).await.unwrap();
     assert_eq!(
-        resolved_main_commit.manifest_version,
-        resolved_main_snapshot.version(),
+        resolved_main_commit.graph_manifest_version,
+        resolved_main_snapshot.graph_manifest_version(),
         "without intervening physical-only maintenance, main's resolved snapshot and head \
          lineage must come from one manifest version"
     );
@@ -224,8 +224,8 @@ async fn graph_lineage_lives_only_in_manifest() {
         .await
         .unwrap();
     assert_eq!(
-        resolved_feature_commit.manifest_version,
-        resolved_feature_snapshot.version(),
+        resolved_feature_commit.graph_manifest_version,
+        resolved_feature_snapshot.graph_manifest_version(),
         "without intervening physical-only maintenance, feature's resolved snapshot and head \
          lineage must come from one manifest version"
     );

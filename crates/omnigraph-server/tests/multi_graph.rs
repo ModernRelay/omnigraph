@@ -127,13 +127,13 @@ async fn concurrent_branch_ops_morphological_matrix() {
         } else {
             let error: ErrorOutput = serde_json::from_slice(&sa.body).unwrap();
             let conflict = error
-                .manifest_conflict
-                .expect("merge 409 must include manifest_conflict");
+                .published_dataset_version_conflict
+                .expect("merge 409 must include published dataset version conflict");
             assert_eq!(
-                conflict.table_key, "node:Person",
-                "[{}] conflict table",
-                cell
+                conflict.entity_kind,
+                omnigraph_server::api::EntityKindOutput::Node
             );
+            assert_eq!(conflict.type_name, "Person", "[{cell}] conflict type");
             h.assert_persons("main", cell, &["FrankD-celld"], &["EveD-celld"])
                 .await;
         }
@@ -347,13 +347,13 @@ async fn concurrent_branch_ops_morphological_matrix() {
         } else {
             let error: ErrorOutput = serde_json::from_slice(&sa.body).unwrap();
             let conflict = error
-                .manifest_conflict
-                .expect("merge 409 must include manifest_conflict");
+                .published_dataset_version_conflict
+                .expect("merge 409 must include published dataset version conflict");
             assert_eq!(
-                conflict.table_key, "node:Person",
-                "[{}] conflict table",
-                cell
+                conflict.entity_kind,
+                omnigraph_server::api::EntityKindOutput::Node
             );
+            assert_eq!(conflict.type_name, "Person", "[{cell}] conflict type");
             h.assert_persons("main", cell, &["Steve-cellk"], &["Rita-cellk"])
                 .await;
         }
@@ -378,15 +378,16 @@ async fn concurrent_branch_ops_morphological_matrix() {
         assert_eq!(r.status(), StatusCode::OK, "[{}] reopen snapshot", cell);
         let body = to_bytes(r.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        let person_rows = v["tables"]
+        let person_rows = v["datasets"]
             .as_array()
-            .and_then(|tables| {
-                tables
-                    .iter()
-                    .find(|t| t["table_key"].as_str() == Some("node:Person"))
+            .and_then(|datasets| {
+                datasets.iter().find(|dataset| {
+                    dataset["entity_kind"].as_str() == Some("node")
+                        && dataset["type_name"].as_str() == Some("Person")
+                })
             })
-            .and_then(|t| t["row_count"].as_u64())
-            .expect("reopen snapshot must include node:Person row_count");
+            .and_then(|dataset| dataset["entity_count"].as_u64())
+            .expect("reopen snapshot must include Person entity_count");
         let expected_rows = if sa.status == StatusCode::OK { 6 } else { 5 };
         assert_eq!(
             person_rows, expected_rows,
@@ -499,7 +500,6 @@ async fn served_export_process_queue_budget_refuses_then_releases() {
                 serde_json::to_vec(&ExportRequest {
                     branch: Some("main".to_string()),
                     type_names: Vec::new(),
-                    table_keys: Vec::new(),
                 })
                 .unwrap(),
             ))

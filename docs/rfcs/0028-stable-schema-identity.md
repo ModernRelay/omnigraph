@@ -81,7 +81,7 @@ That gap is already load-bearing for four independent drafts:
 - [RFC-023](0023-key-conflict-fencing.md) must preserve the key contract across
   table and field renames;
 - [RFC-024](0024-durable-table-heads.md) needs a head key that does not change
-  when the public table name changes and a token that detects table ABA;
+  when the public graph type name changes and a token that detects dataset ABA;
 - [RFC-025](0025-checkpoint-retention.md) must bind retained table versions to
   the intended logical table lifetime;
 - [RFC-026](0026-memwal-streaming-ingest.md) must keep logical stream lifecycle
@@ -228,15 +228,16 @@ The incarnation is not any of:
 - a Lance dataset version;
 - a Lance field ID;
 - a native branch `BranchIdentifier`, manifest e-tag, or timestamp;
-- a table path or public `table_key`;
+- a dataset path or the internal persisted `table_key` alias;
 - a graph commit ID.
 
 Those physical tokens remain necessary for exact effect ownership and ref ABA.
 They are compared alongside, not substituted for, logical incarnation.
 
 In particular, a supported type rename preserves the existing physical
-dataset, table path, Lance history, type ID, and table incarnation. The manifest
-changes only the current public alias for that identity. A property change in
+dataset, dataset path, Lance history, type ID, and table incarnation. The graph manifest
+changes the persisted `table_key` alias for that identity while public surfaces
+project the new graph type name. A property change in
 the same apply may still advance the existing Lance dataset, but a type rename
 is never implemented as name-derived rematerialization. Only an accepted schema
 event that explicitly starts a new logical table lifetime may change the
@@ -351,8 +352,8 @@ Manifest v5 therefore stores `stable_table_id` and `table_incarnation_id` on
 every table registration, version, and tombstone row. Both are nonzero and
 required for table rows; graph-lineage rows leave them null. The pair is the
 table coordinate for registration lookup, version reduction, tombstone scope,
-OCC, and recovery ownership. `table_key` remains the current public alias and a
-diagnostic field; it is not object identity.
+OCC, and recovery ownership. `table_key` remains an internal persisted alias and
+physical diagnostic field; it is not object identity.
 
 Object IDs and initial physical paths are name-independent:
 

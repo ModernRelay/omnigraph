@@ -80,7 +80,7 @@ async fn server_opens_s3_graph_directly_and_serves_snapshot_and_read() {
     )
     .await;
     assert_eq!(snapshot_status, StatusCode::OK);
-    assert!(snapshot_body["tables"].is_array());
+    assert!(snapshot_body["datasets"].is_array());
 
     let read = ReadRequest {
         query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
@@ -224,7 +224,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     )
     .await;
     assert_eq!(load_status, StatusCode::OK, "{load_body}");
-    assert_eq!(load_body["tables"][0]["rows_loaded"], 1, "{load_body}");
+    assert_eq!(load_body["nodes"][0]["entities_loaded"], 1, "{load_body}");
 
     let graph_uri = format!("{root}/graphs/knowledge.omni");
     let reopened = Omnigraph::open(&graph_uri).await.unwrap();

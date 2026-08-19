@@ -1212,7 +1212,7 @@ fn gather_cost_inputs(
     coverage: crate::table_store::IndexCoverage,
     csr_cached: bool,
 ) -> Option<ExpandCostInputs> {
-    let edge_entry = snapshot.entry(&format!("edge:{}", edge_type))?;
+    let edge_entry = snapshot.dataset(&format!("edge:{}", edge_type))?;
     let edge_def = catalog.edge_types.get(edge_type)?;
     // Match the indexed path's cross-type one-hop cap so the cost estimate
     // reflects what actually runs (see `cost_effective_hops`).
@@ -1226,11 +1226,11 @@ fn gather_cost_inputs(
         // Both requires from_type == to_type (typecheck T22).
         Direction::Both => &edge_def.from_type,
     };
-    let src_entry = snapshot.entry(&format!("node:{}", src_type))?;
+    let src_entry = snapshot.dataset(&format!("node:{}", src_type))?;
     Some(ExpandCostInputs {
         frontier_rows,
-        edge_count: edge_entry.row_count,
-        src_node_count: src_entry.row_count,
+        edge_count: edge_entry.entity_count,
+        src_node_count: src_entry.entity_count,
         effective_max_hops,
         max_hops_cap: expand_indexed_max_hops(),
         max_frontier_cap: expand_indexed_max_frontier(),
@@ -1346,7 +1346,7 @@ async fn execute_expand(
     // dataset. Single-hop by typecheck (T23), so the multi-hop cost model
     // does not apply.
     if let Some(binding) = edge_binding {
-        let edge_ds = snapshot.open_dataset(&edge_table_key).await?;
+        let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
         return execute_expand_bound(
             wide,
             snapshot,
@@ -1425,7 +1425,7 @@ async fn execute_expand(
     // Leaning indexed: open the edge dataset once, confirm real coverage, and
     // (unless forced) re-decide with it. The opened dataset is threaded into the
     // indexed path so it is never opened twice.
-    let edge_ds = snapshot.open_dataset(&edge_table_key).await?;
+    let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
     // An undirected traversal scans BOTH endpoint columns; price it by the
     // worst coverage of the columns it will actually probe (a degraded dst
     // index must not be masked by a healthy src index).
@@ -2194,7 +2194,7 @@ async fn hydrate_nodes(
     }
 
     let table_key = format!("node:{}", type_name);
-    let ds = snapshot.open_dataset(&table_key).await?;
+    let ds = snapshot.open_lance_dataset(&table_key).await?;
 
     // `id IN (ids)` AND any pushable destination filters, as a structured Expr.
     let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
@@ -2454,7 +2454,7 @@ async fn execute_node_scan(
     search_mode: &SearchMode,
 ) -> Result<RecordBatch> {
     let table_key = format!("node:{}", type_name);
-    let ds = snapshot.open_dataset(&table_key).await?;
+    let ds = snapshot.open_lance_dataset(&table_key).await?;
 
     let node_type = &catalog.node_types[type_name];
 

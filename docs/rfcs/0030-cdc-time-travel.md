@@ -150,16 +150,17 @@ The required durable authority already exists:
   snapshots, including table creation, removal, rename, and cross-lineage ID
   comparison.
 
-Two current names must not be allowed to overstate their meaning:
+Two version names require precise scope:
 
 - `GraphCommit.created_at` is minted before table effects and remains fixed
   across retries and recovery. Public CDC calls it **`authored_at`**, not
   `committed_at` or `published_at`. Renaming the persisted column is unnecessary
   and would create a format change.
-- `EntityChange.manifest_version` currently mixes table-local row-version
-  stamps with a graph-manifest fallback. A graph feed does not carry this field
-  forward. Commit cause belongs on the block; physical table versions remain
-  implementation details.
+- Before v0.10, `EntityChange.manifest_version` mixed dataset-local row-version
+  stamps with a graph-manifest-sounding name. The low-level snapshot diff now
+  calls this `published_dataset_version`; a graph feed does not carry the field
+  forward. Commit cause belongs on the block, while physical dataset versions
+  remain implementation details of feed delivery.
 
 ## 3. Public semantic model
 

@@ -591,8 +591,14 @@ fn embed_seed_fills_missing_and_preserves_existing_vectors_by_default() {
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["mode"], "fill_missing");
-    assert_eq!(payload["embedded_rows"], 1);
-    assert_eq!(payload["selected_rows"], 2);
+    assert_eq!(payload["embedded_records"], 1);
+    assert_eq!(payload["selected_records"], 2);
+    for retired in ["rows", "selected_rows", "embedded_rows", "cleaned_rows"] {
+        assert!(
+            payload.get(retired).is_none(),
+            "retired key {retired} leaked"
+        );
+    }
 
     let embedded = read_embedded_rows(temp.path().join("build/seed.embedded.jsonl"));
     assert_eq!(
@@ -632,7 +638,7 @@ fn embed_clean_removes_selected_embeddings() {
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["mode"], "clean");
-    assert_eq!(payload["cleaned_rows"], 1);
+    assert_eq!(payload["cleaned_records"], 1);
 
     let embedded = read_embedded_rows(temp.path().join("build/seed.embedded.jsonl"));
     assert!(embedded[0]["data"].get("embedding").is_none());
@@ -656,8 +662,8 @@ fn embed_select_reembeds_only_matching_rows() {
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["mode"], "reembed_selected");
-    assert_eq!(payload["embedded_rows"], 1);
-    assert_eq!(payload["selected_rows"], 1);
+    assert_eq!(payload["embedded_records"], 1);
+    assert_eq!(payload["selected_records"], 1);
 
     let embedded = read_embedded_rows(temp.path().join("build/seed.embedded.jsonl"));
     assert!(embedded[0]["data"].get("embedding").is_none());
@@ -685,8 +691,8 @@ fn embed_seed_preserves_non_entity_rows() {
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["rows"], 3);
-    assert_eq!(payload["embedded_rows"], 1);
+    assert_eq!(payload["records"], 3);
+    assert_eq!(payload["embedded_records"], 1);
 
     let embedded = read_embedded_rows(temp.path().join("build/seed.embedded.jsonl"));
     assert_eq!(embedded.len(), 3);
@@ -714,7 +720,16 @@ fn optimize_json_succeeds_on_local_graph() {
 
     let output = output_success(cli().arg("optimize").arg("--json").arg(&graph));
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(payload["tables"].as_array().is_some());
+    assert!(payload.get("tables").is_none());
+    let person = payload["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|dataset| dataset["type_key"] == "node:Person")
+        .unwrap();
+    let pending = person["pending_indexes"].as_array().unwrap();
+    assert!(pending.iter().any(|index| index["property"] == "embedding"));
+    assert!(pending.iter().all(|index| index.get("column").is_none()));
 
     let human = stdout_string(&output_success(cli().arg("optimize").arg(&graph)));
     assert!(human.contains(" datasets"), "{human}");
@@ -857,14 +872,14 @@ fn repair_json_reports_noop_on_clean_graph() {
 
     assert_eq!(payload["confirm"], false);
     assert_eq!(payload["force"], false);
-    assert_eq!(payload["manifest_version"], Value::Null);
-    let tables = payload["tables"].as_array().unwrap();
-    assert_eq!(tables.len(), 4);
-    assert!(
-        tables
-            .iter()
-            .all(|table| { table["classification"] == "no_drift" && table["action"] == "no_op" })
-    );
+    assert_eq!(payload["graph_manifest_version"], Value::Null);
+    assert!(payload.get("manifest_version").is_none());
+    assert!(payload.get("tables").is_none());
+    let datasets = payload["datasets"].as_array().unwrap();
+    assert_eq!(datasets.len(), 4);
+    assert!(datasets.iter().all(|dataset| {
+        dataset["classification"] == "no_drift" && dataset["action"] == "no_op"
+    }));
 
     let human = stdout_string(&output_success(cli().arg("repair").arg(&graph)));
     assert!(human.contains("preview mode, 4 datasets"), "{human}");
@@ -889,12 +904,12 @@ fn repair_confirm_json_refuses_suspicious_drift_with_nonzero_exit_then_force_suc
             .arg(&graph),
     );
     let refused_payload: Value = serde_json::from_slice(&refused.stdout).unwrap();
-    assert_eq!(refused_payload["manifest_version"], Value::Null);
-    let person = refused_payload["tables"]
+    assert_eq!(refused_payload["graph_manifest_version"], Value::Null);
+    let person = refused_payload["datasets"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|table| table["table_key"] == "node:Person")
+        .find(|dataset| dataset["type_key"] == "node:Person")
         .unwrap();
     assert_eq!(person["classification"], "suspicious");
     assert_eq!(person["action"], "refused");
@@ -914,17 +929,17 @@ fn repair_confirm_json_refuses_suspicious_drift_with_nonzero_exit_then_force_suc
             .arg(&graph),
     );
     let forced_payload: Value = serde_json::from_slice(&forced.stdout).unwrap();
-    let forced_manifest = forced_payload["manifest_version"].as_u64().unwrap();
+    let forced_manifest = forced_payload["graph_manifest_version"].as_u64().unwrap();
     assert!(forced_manifest > graph_manifest_before);
-    let person = forced_payload["tables"]
+    let person = forced_payload["datasets"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|table| table["table_key"] == "node:Person")
+        .find(|dataset| dataset["type_key"] == "node:Person")
         .unwrap();
     assert_eq!(person["classification"], "suspicious");
     assert_eq!(person["action"], "forced");
-    assert_eq!(person["manifest_version"], table_manifest_before);
+    assert_eq!(person["published_dataset_version"], table_manifest_before);
     assert_eq!(person["lance_head_version"], table_head_before);
     assert_eq!(manifest_dataset_version(&graph), forced_manifest);
 }
@@ -1468,12 +1483,34 @@ fn load_json_outputs_summary_for_main_branch() {
 
     assert_eq!(payload["branch"], "main");
     assert_eq!(payload["mode"], "overwrite");
-    assert_eq!(payload["nodes_loaded"], 6);
-    assert_eq!(payload["edges_loaded"], 5);
-    assert_eq!(payload["node_types_loaded"], 2);
-    assert_eq!(payload["edge_types_loaded"], 2);
+    for removed in [
+        "nodes_loaded",
+        "edges_loaded",
+        "node_types_loaded",
+        "edge_types_loaded",
+    ] {
+        assert!(
+            payload.get(removed).is_none(),
+            "removed key {removed} leaked"
+        );
+    }
+    assert_eq!(payload["total_entities"], 11);
+    assert_eq!(
+        payload["nodes"],
+        serde_json::json!([
+            {"name": "Company", "entities_loaded": 2},
+            {"name": "Person", "entities_loaded": 4}
+        ])
+    );
+    assert_eq!(
+        payload["edges"],
+        serde_json::json!([
+            {"name": "Knows", "entities_loaded": 3},
+            {"name": "WorksAt", "entities_loaded": 2}
+        ])
+    );
     assert!(payload["commit"]["graph_commit_id"].is_string());
-    assert!(payload["commit"]["manifest_version"].is_number());
+    assert!(payload["commit"]["graph_manifest_version"].is_number());
 
     let commits = parse_stdout_json(&output_success(
         cli().arg("commit").arg("list").arg(&graph).arg("--json"),
@@ -1523,7 +1560,7 @@ fn load_into_feature_branch_with_merge_mode_succeeds() {
 
     assert!(stdout.contains("branch feature"));
     assert!(stdout.contains("with merge"));
-    assert!(stdout.contains("1 nodes across 1 node types"));
+    assert!(stdout.contains("1 entities across 1 node types and 0 edge types"));
 }
 
 #[test]
@@ -1914,7 +1951,7 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(payload["affected_nodes"], 1);
     assert_eq!(payload["affected_edges"], 0);
     assert!(payload["commit"]["graph_commit_id"].is_string());
-    assert!(payload["commit"]["manifest_version"].is_number());
+    assert!(payload["commit"]["graph_manifest_version"].is_number());
 
     let verify = output_success(
         cli()
@@ -2561,7 +2598,14 @@ fn cleanup_against_local_scope_executes_with_confirm() {
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(payload["tables"].as_array().is_some(), "{payload}");
+    assert!(payload.get("tables").is_none());
+    let datasets = payload["datasets"].as_array().unwrap();
+    assert_eq!(datasets.len(), 4, "{payload}");
+    assert!(
+        datasets
+            .iter()
+            .all(|dataset| dataset["type_key"].is_string())
+    );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("omnigraph cleanup →"), "stderr: {stderr}");
 
@@ -2634,15 +2678,15 @@ fn branch_merge_defaults_target_to_main() {
             .arg("--json"),
     );
     let snapshot: Value = serde_json::from_slice(&snapshot_output.stdout).unwrap();
-    let person_row_count = snapshot["tables"]
+    let person_entity_count = snapshot["datasets"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|table| table["table_key"] == "node:Person")
-        .unwrap()["row_count"]
+        .find(|dataset| dataset["entity_kind"] == "node" && dataset["type_name"] == "Person")
+        .unwrap()["entity_count"]
         .as_u64()
         .unwrap();
-    assert_eq!(person_row_count, 5);
+    assert_eq!(person_entity_count, 5);
 }
 
 #[test]
@@ -2828,7 +2872,7 @@ fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
 }
 
 #[test]
-fn snapshot_json_returns_manifest_version_and_tables() {
+fn snapshot_json_returns_graph_version_and_datasets() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
@@ -2837,16 +2881,30 @@ fn snapshot_json_returns_manifest_version_and_tables() {
     let output = output_success(cli().arg("snapshot").arg(&graph).arg("--json"));
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(payload["branch"], "main");
+    assert_eq!(payload["graph_branch"], "main");
+    assert!(payload.get("branch").is_none());
+    assert!(payload.get("manifest_version").is_none());
+    assert!(payload.get("tables").is_none());
     assert_eq!(
-        payload["manifest_version"].as_u64().unwrap(),
+        payload["graph_manifest_version"].as_u64().unwrap(),
         manifest_dataset_version(&graph)
     );
     assert_eq!(
         payload["internal_schema_version"].as_u64().unwrap(),
         u64::from(omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
     );
-    assert!(payload["tables"].as_array().unwrap().len() >= 4);
+    let datasets = payload["datasets"].as_array().unwrap();
+    assert!(datasets.len() >= 4);
+    let person = datasets
+        .iter()
+        .find(|dataset| dataset["entity_kind"] == "node" && dataset["type_name"] == "Person")
+        .unwrap();
+    assert!(person["dataset_path"].as_str().is_some());
+    assert!(person["published_dataset_version"].is_number());
+    assert!(
+        person["native_dataset_branch"].is_null() || person["native_dataset_branch"].is_string()
+    );
+    assert_eq!(person["entity_count"], 4);
 }
 
 #[test]
@@ -2864,7 +2922,7 @@ fn snapshot_resolves_uri_from_store_scope() {
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["branch"], "main");
+    assert_eq!(payload["graph_branch"], "main");
 }
 
 #[test]
@@ -2924,7 +2982,9 @@ fn commit_show_accepts_long_uri_flag() {
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
     assert_eq!(payload["graph_commit_id"], commit_id);
-    assert!(payload["manifest_version"].as_u64().unwrap() >= 1);
+    assert!(payload["graph_manifest_version"].as_u64().unwrap() >= 1);
+    assert!(payload.get("manifest_branch").is_none());
+    assert!(payload.get("manifest_version").is_none());
 
     let human = stdout_string(&output_success(
         cli()

@@ -43,20 +43,20 @@ modes, and no coherent notion of "the state of the graph at commit X."
 
 **The solution.** OmniGraph is a typed property-graph engine built as a
 *coordination layer* over many [Lance](https://lance.org) datasets — one
-columnar, versioned, branchable dataset per node/edge type — with one manifest
-table (`__manifest`) making multi-dataset changes visible atomically. On top of
+columnar, versioned, branchable dataset per node/edge type — with one graph-manifest
+dataset (`__manifest`) making multi-dataset changes visible atomically. On top of
 that substrate it adds:
 
 1. **Git-style branches and commits across the whole graph.** Every publish
    appends to a commit DAG; branches fork lazily (copy-on-write via Lance);
-   merges are three-way at the row level with typed conflicts. Branches *are*
+   merges are three-way at the entity level with typed conflicts. Branches *are*
    the multi-query transaction model — there is deliberately no cross-query
    `BEGIN`/`COMMIT`.
 2. **One unified write protocol (RFC-022, implemented).** Every graph-visible
    write — mutation, bulk load, schema apply, branch merge, index build —
    follows one state machine: prepare against a pinned authority token, arm a
    durable recovery intent, apply exact physical effects, publish exactly one
-   manifest CAS. Within the documented single-writer-process recovery boundary,
+   graph-manifest CAS. Within the documented single-writer-process recovery boundary,
    a crash leaves enough durable evidence for a later quiesced read-write open
    to converge the fixed outcome all-or-nothing.
 3. **Multi-modal querying in one runtime.** A `.gq` query can combine vector
@@ -145,17 +145,17 @@ re-derivation* on every call (cost grows with history instead of the working
 set). The commit graph, the compiled catalog, the CSR topology index, and the
 handle cache are all derived views engineered under this rule.
 
-### 5. Graph visibility is manifest-atomic
+### 5. Graph visibility is graph-manifest-atomic
 
 Lance commits are per dataset. Graph-level atomicity is manufactured: one
-`__manifest` update flips every touched sub-table version visible together.
-No write path may make a subset of touched tables visible as a graph commit,
-and any writer that can advance a Lance HEAD before manifest publish must carry
+`__manifest` update flips every touched dataset version visible together.
+No write path may make a subset of touched datasets visible as a graph commit,
+and any writer that can advance a Lance HEAD before graph-manifest publication must carry
 a durable recovery intent covering the gap.
 
 ### 6. Branches are the transaction model
 
-Per-query writes are atomic at the manifest boundary. Anything larger — a batch
+Per-query writes are atomic at the graph-manifest boundary. Anything larger — a batch
 of related changes, an agent's proposal, a risky migration — is a branch:
 isolated, diffable, mergeable, discardable. This replaces cross-query
 `BEGIN`/`COMMIT` deliberately (deny-listed), because branches give the same
@@ -285,9 +285,9 @@ A graph is one directory (or S3 prefix). Details: [storage.md](../user/concepts/
 
 ```
 graph-root/
-  __manifest/                      # the coordination table (a Lance dataset itself)
-  nodes/{stable-id}-{incarnation}/ # one dataset per node-table lifetime
-  edges/{stable-id}-{incarnation}/ # one dataset per edge-table lifetime
+  __manifest/                      # the coordination dataset
+  nodes/{stable-id}-{incarnation}/ # one dataset per node-type lifetime
+  edges/{stable-id}-{incarnation}/ # one dataset per edge-type lifetime
   _graph_commit_recoveries.lance/  # internal crash-recovery audit log
   __recovery/{ulid}.json           # transient recovery sidecars (empty at steady state)
   __init_claim.json                # transient init ownership (absent at steady state)
@@ -295,14 +295,14 @@ graph-root/
 ```
 
 `__manifest` is the load-bearing object. Its rows describe, per branch, which
-version of each identity-paired sub-table is published (`table_version` rows,
+version of each identity-paired dataset is published (`table_version` rows,
 minus tombstones scoped to the same stable ID + incarnation), **and** — since
 internal schema v4 (RFC-013 Phase 7) — the graph
 commit lineage itself: one immutable `graph_commit` row per commit (ULID id,
 parents, merge parents, actor, timestamp) plus one mutable `graph_head:<branch>`
 pointer per branch. Lineage rows are written *in the same merge-insert commit*
-as the table-version rows, so a graph commit and its lineage land at one
-manifest version atomically — there is no second write to fail between. The
+as the `table_version` rows, so a graph commit and its lineage land at one
+graph-manifest version atomically — there is no second write to fail between. The
 in-memory `CommitGraph` is a pure projection of these rows (invariant 15 in
 action; the former `_graph_commits.lance` tables are retired).
 
@@ -313,11 +313,11 @@ Two mechanisms make concurrent publishes safe:
   landing the same row — **row-level CAS**. Without it, Lance's transparent
   rebase would admit silent duplicates from racing publishers.
 - Same-branch writers all touch the shared `graph_head:<branch>` row, so even
-  commits to *disjoint tables* contend there: one wins and the other's exact
+  commits to *disjoint datasets* contend there: one wins and the other's exact
   publish precondition fails. Only a writer whose semantics permit it may then
   discard the whole effect-free attempt and reprepare from fresh authority; the
   publisher never re-parents a prepared intent. This closes the
-  disjoint-table-fork race and yields a linear per-branch chain (pinned by the
+  disjoint-dataset-fork race and yields a linear per-branch chain (pinned by the
   N-writer convergence tests).
 
 The internal manifest schema is stamped
@@ -343,10 +343,10 @@ The path (details: [execution.md](execution.md)):
    ordering).
 3. **Topology, if needed.** If the pipeline traverses, build or fetch a CSR/CSC
    `GraphIndex` **scoped to exactly the edge types the query touches** —
-   never the whole catalog. The cache key is each edge table's physical
-   identity `(stable table ID, incarnation ID, table_key, version, branch,
+   never the whole catalog. The cache key is each edge dataset's physical
+   identity `(stable dataset ID, incarnation ID, table_key, version, branch,
    e_tag)`, so a lazy-fork branch whose
-   edge tables physically *are* main's reuses main's built index instead of
+   edge datasets physically *are* main's reuses main's built index instead of
    cold-scanning.
 4. **Execute.** Scans push structured filters down to Lance (BTREE/FTS/vector
    indexes accelerate what they cover; correctness never depends on coverage —
@@ -379,22 +379,22 @@ is the story.
 
 ### The problem being solved
 
-Lance has no multi-dataset atomic commit. A graph write touching three tables
-makes three independent Lance commits plus one manifest publish — four durable
+Lance has no multi-dataset atomic commit. A graph write touching three datasets
+makes three independent Lance commits plus one graph-manifest publish — four durable
 operations, any prefix of which can survive a crash. Meanwhile other writers
 race on the same branch, schema state can change under a prepared plan, and a
-first write to a branch may need to *create* the per-table Lance fork it is
+first write to a branch may need to *create* the per-dataset Lance fork it is
 writing to. The unified protocol makes all of this safe with one state machine:
 
 ```
 recovery barrier                    # never write over an unresolved crash
   → prepare pinned base + read set  # capture (branch identity, exact graph head,
-  → stage effects (no HEAD moves)   #  schema identity, table pins); validate everything
-  → acquire ordered gates           # schema → branch → sorted tables (process-local)
+  → stage effects (no HEAD moves)   #  schema identity, dataset pins); validate everything
+  → acquire ordered gates           # schema → branch → sorted datasets (process-local)
   → revalidate the complete token   # or restart / typed conflict — never rebase a stale plan
   → arm durable recovery intent     # __recovery/{ulid}.json, before any durable effect
   → apply exact physical effects    # commit_staged with pre-minted identities, zero retries
-  → publish ONE __manifest CAS      # entire graph delta + lineage, exact precondition
+  → publish ONE graph-manifest CAS  # entire graph delta + lineage, exact precondition
   → finalize (delete sidecar)
 ```
 
@@ -411,28 +411,28 @@ cardinality.
 The **D₂ rule** keeps this unambiguous: one mutation query is constructive
 (insert/update) XOR destructive (delete), enforced at parse time. This is a
 deliberate boundary, not scaffolding — allowing mixing would require an
-in-query delete view, pending-batch pruning, and per-table two-commit ordering
+in-query delete view, pending-batch pruning, and per-dataset two-commit ordering
 in the hot path. Compose mixed work as two mutations, or a branch for one
 atomic commit.
 
 At end-of-query, `stage_all` prepares exactly one staged Lance transaction per
-touched table (exact-`id` fenced strict insert or upsert / deletion-vector
-delete / overwrite), still without moving HEAD. A keyed Mutation/Load table
-above 8,192 rows or 32 MiB fails here with `ResourceLimitExceeded`, before
+touched dataset (exact-`id` fenced strict insert or upsert / deletion-vector
+delete / overwrite), still without moving HEAD. A keyed Mutation/Load dataset
+above 8,192 entities or 32 MiB fails here with `ResourceLimitExceeded`, before
 recovery arm. Bare Lance Append is not a production graph-write route. External
 Blob URI cells on keyed Append/Merge are size-summed before payload reads and
 materialized under the same 32 MiB ceiling because Lance merge-insert has no
 `WriteParams` hook; Overwrite retains external references. Then the gates are
 acquired, the full authority token revalidated, the identity-bearing v9
-recovery envelope armed, tables committed with
+recovery envelope armed, datasets committed with
 their exact pre-minted transaction identities and **zero transparent conflict
 retries**, and the pre-minted lineage published under the exact
-native-branch/head + table-version precondition.
+native-branch/head + published-dataset-version precondition.
 
 Pure keyed insertions also leave a durable, inductive proof link in Lance
 history: `omnigraph.insert_absence = "v1"`. StrictInsert mints it only after
 the exact target-ID preflight; an all-new Upsert may mint it only when Lance's
-completed statistics prove one attempt inserted every row and changed/skipped
+completed statistics prove one attempt inserted every input entity and changed/skipped
 nothing. Upsert certification is optional—an unfamiliar shape disables the
 optimization, not the logical write. The marker is accepted only with an exact
 parent, filtered insertion-only `Update`, full nested schema field-ID preorder,
@@ -448,14 +448,14 @@ Failure semantics are typed by *when* the failure happens:
   Update/Delete/Overwrite (and branch merge) return `ReadSetChanged` (HTTP 409)
   — a stale plan is never rebased onto a moved base. A pre-existing or
   effect-free concurrent strict same-key match is terminal `KeyConflict`
-  (HTTP 409) only after a fresh manifest-visible probe finds an attempted ID;
+  (HTTP 409) only after a fresh graph-manifest-visible probe finds an attempted ID;
   a broad storage conflict without that exact match becomes an internal
   `ReadSetChanged`, causing bounded full strict-mode reprepare rather than a
   false duplicate. An effect-free upsert conflict likewise reprepares the
   entire operation and reruns validation. Those
   effect-free key outcomes are Mutation/Load `protocol_v3` behavior;
   BranchMerge retains its armed `protocol_v4` chain and returns
-  `RecoveryRequired` for any chunk conflict, even before its first owned table
+  `RecoveryRequired` for any chunk conflict, even before its first owned dataset
   effect.
 - **After any effect**: any later error returns `RecoveryRequired` (HTTP 503)
   and leaves the sidecar authoritative. This is deliberately *not* a retry
@@ -481,13 +481,13 @@ writer describes its physical effects to the shared coordinator:
 
 | Writer | Sidecar schema | Physical shape |
 |---|---|---|
-| Mutation / Load | v9 (`protocol_v3` payload) | one exact staged transaction per touched table |
-| Branch merge | v9 (`protocol_v4` payload) | new and changed keyed rows use actual chunks capped at 8,192 rows / 32 MiB in a pre-minted exact-`id` strict-insert/upsert chain, capped at 1,024 logical data transactions per table; deletes and pointer-only deltas are recorded too. Exact recovery scans at most 1,026 versions so one legacy index tail and one compensating restore remain classifiable; current merges build no indexes inline |
-| Schema apply | v9 (`protocol_v7` payload) | exact `Overwrite` per rewritten table + strict read-version-zero `Create` per new type; a pure rename retains its existing identity/path/version. The payload also carries the schema registration/rename/tombstone delta (a metadata-only apply has an empty effect set but still arms — schema staging is durable state) |
-| EnsureIndices | v9 (`protocol_v8` payload) | one pre-minted *mixed* CreateIndex transaction per table (every missing BTREE + FTS + full-table vector together) |
+| Mutation / Load | v9 (`protocol_v3` payload) | one exact staged transaction per touched dataset |
+| Branch merge | v9 (`protocol_v4` payload) | new and changed keyed entities use actual chunks capped at 8,192 entities / 32 MiB in a pre-minted exact-`id` strict-insert/upsert chain, capped at 1,024 logical data transactions per dataset; deletes and pointer-only deltas are recorded too. Exact recovery scans at most 1,026 versions so one legacy index tail and one compensating restore remain classifiable; current merges build no indexes inline |
+| Schema apply | v9 (`protocol_v7` payload) | exact `Overwrite` per rewritten dataset + strict read-version-zero `Create` per new type; a pure rename retains its existing identity/path/version. The payload also carries the schema registration/rename/tombstone delta (a metadata-only apply has an empty effect set but still arms — schema staging is durable state) |
+| EnsureIndices | v9 (`protocol_v8` payload) | one pre-minted *mixed* CreateIndex transaction per dataset (every missing BTREE + FTS + full-dataset vector together) |
 | Optimize | v9 (bounded payload) | compaction + index folds have **no** public caller-controlled Lance transaction identity, so Optimize keeps looser, bounded provenance inside the identity-bearing envelope: one graph-wide sidecar pinning the complete productive set, one monotonic batch CAS for visibility. Exact provenance is trigger-gated on upstream API + distributed fencing |
 
-First-touch tables (a branch's first write to a table) follow
+First-touch datasets (a branch's first write to a dataset) follow
 **sidecar-before-ref** ordering: the recovery intent that names the
 `(table_path, target ref)` is durable *before* the Lance ref exists, so an
 orphaned fork is always attributable and reclaimable, and reclaim/cleanup treat
@@ -496,7 +496,7 @@ any pending claim as a hard stop.
 ### Gates, and what they are not
 
 Every handle for one canonical graph root shares a process-local
-`WriteQueueManager`: schema gate → branch gate → sorted table gates, one
+`WriteQueueManager`: schema gate → branch gate → sorted dataset gates, one
 deadlock-free order used by writers, healers, and the recovery sweep alike.
 These gates prevent same-process races and reduce publisher retries. **They are
 not distributed locks.** Cross-process safety comes from the publisher's exact
@@ -512,13 +512,14 @@ Recovery is part of the commit protocol, not an afterthought (invariant 5).
 Full mechanics: [writes.md](writes.md) "Open-time recovery sweep".
 
 The lifecycle every staged writer follows: **Phase A** write the sidecar
-(before any independently durable effect) → **Phase B** apply per-table
+(before any independently durable effect) → **Phase B** apply per-dataset
 effects, then atomically *confirm* the exact achieved versions/identities into
-the sidecar → **Phase C** publish the manifest → **Phase D** delete the
+the sidecar → **Phase C** publish the graph manifest → **Phase D** delete the
 sidecar. The Phase-B confirmation is the commit point of this recovery WAL:
 
-- Crash **before confirmation** → roll back: restore each table to its
-  manifest pin, then publish the restored state so `manifest == HEAD` converges
+- Crash **before confirmation** → roll back: restore each dataset to its
+  published-version pin, then publish the restored state so every published
+  dataset version converges with its dataset HEAD
   with *no residual drift* (this symmetry is what lets a failed-then-retried
   operation succeed instead of failing one version higher each time).
 - Crash **after confirmation** → roll forward, but only under the captured
@@ -532,7 +533,7 @@ The exactness is the security property. Recovery never adopts a foreign commit
 that happens to sit at the expected version; never reparents a prepared write
 onto a newer branch winner; preserves a disjoint foreign winner while
 compensating only owned effects; and **fails closed** when a foreign commit
-buries an owned effect on the same table (restoring through someone else's
+buries an owned effect on the same dataset (restoring through someone else's
 data is the one thing it will never do). Every completed action lands an
 internal audit row in `_graph_commit_recoveries.lance` (no public CLI query for
 it yet — a known gap).
@@ -545,16 +546,16 @@ When recovery runs:
   restart. Rollback-requiring sidecars defer to the next read-write open
   (a background reconciler for that residual is **(roadmap)**).
 - **Read-only open** repairs nothing, but refuses to serve a torn
-  schema-apply state (fixed manifest outcome visible, schema identity not yet
+  schema-apply state (fixed graph-manifest outcome visible, schema identity not yet
   live) rather than lying.
 
 All active writers emit an identity-bearing schema-v9 envelope. Historical
 payload field names such as `protocol_v3`, `protocol_v4`, `protocol_v7`, and
 `protocol_v8` describe retained per-writer payload shapes, not older active
-envelopes. A pre-v9 file without explicit table identity is refused; recovery
+envelopes. A pre-v9 file without explicit dataset identity is refused; recovery
 never infers ownership from an alias or path.
 
-Ahead-of-manifest drift *not* covered by any sidecar is never silently
+Ahead-of-graph-manifest drift *not* covered by any sidecar is never silently
 adopted: writers refuse it and point at `omnigraph repair`, which classifies it
 explicitly — verified maintenance drift (`ReserveFragments`/`Rewrite`) publishes
 with `--confirm`; anything semantic requires `--force --confirm` after
@@ -567,9 +568,9 @@ deliberate review.
 ### Branch mechanics
 
 A graph branch is logically one row set in `__manifest` (`BranchContents` is
-the single authority); physically, per-table Lance forks materialize **lazily**
+the single authority); physically, per-dataset Lance forks materialize **lazily**
 on first write — a fresh branch costs O(1) regardless of graph size, and its
-unwritten tables physically *are* the parent's (which is why the read path's
+unwritten datasets physically *are* the parent's (which is why the read path's
 cache keys use physical identity, and why cross-branch index reuse is free).
 
 Branch create/delete are *control operations*, not graph commits: they emit no
@@ -583,9 +584,9 @@ applied to metadata: when the logical target is fully derivable from one
 existing authority, a reconciler beats a sidecar — and it degrades to a no-op
 if Lance later closes the physical gap.
 
-After the complete schema → branch → table gate envelope is held, each control
-uses one operation-local manifest/namespace capture. It does not refresh the
-handle-local coordinator before and after table-gate acquisition. A successful
+After the complete schema → branch → dataset gate envelope is held, each control
+uses one operation-local graph-manifest/namespace capture. It does not refresh the
+handle-local coordinator before and after dataset-gate acquisition. A successful
 ref transition explicitly invalidates derived read caches so a reused branch
 name cannot inherit stale handles or topology from its prior incarnation.
 
@@ -593,9 +594,9 @@ name cannot inherit stale handles or topology from its prior incarnation.
 
 Every publish appends one `graph_commit` row (ULID, parents, actor) and moves
 `graph_head:<branch>` — atomically with the data, as described in
-[Anatomy](#anatomy-of-a-graph-on-disk). Time travel (`snapshot_at_version`,
+[Anatomy](#anatomy-of-a-graph-on-disk). Time travel (`snapshot_at_graph_manifest_version`,
 `entity_at`, historical queries, diffs via `diff_between`/`diff_commits`) reads
-older manifest states; retention is governed by `cleanup` (see
+older graph-manifest states; retention is governed by `cleanup` (see
 [Maintenance](#maintenance-optimize-cleanup-repair)). Checkpoint-pinned
 retention — named snapshots as authoritative retention roots — is
 **(draft RFC-025)**.
@@ -603,7 +604,7 @@ retention — named snapshots as authoritative retention roots — is
 ### Three-way merge
 
 `branch_merge` computes the merge base from captured commit IDs and publishes
-one atomic manifest update. Its general route classifies row-by-row against
+one atomic graph-manifest update. Its general route classifies entity-by-entity against
 immutable base/source/target snapshots (ordered cursor merge, batched staging
 writer). A proven insertion-only descendant instead verifies every contiguous
 v1 certificate in the complete source-history interval: exact parent and UUID,
@@ -620,7 +621,7 @@ the new row and column are dispositioned.
 The contract under concurrency: **"merge the captured source commit," never
 "substitute whatever source is latest."** A source advance after capture is
 fine; a target change is `ReadSetChanged`. Merge's identity-bearing v9 recovery envelope
-pre-mints each table's exact ordered transaction chain, so recovery proves a
+pre-mints each dataset's exact ordered transaction chain, so recovery proves a
 contiguous prefix of *this merge's* commits rather than inferring ownership
 from version arithmetic.
 
@@ -654,12 +655,12 @@ physical intent (`@index`, `@embed`). The compiler produces a typed catalog;
 a linter (`OG-XXX-NNN` codes) gates footguns. `schema plan` diffs the accepted
 schema against the proposal and produces a migration plan; `schema apply`
 executes it under the `__schema_apply_lock__` system branch, as a first-class
-RFC-022 writer (identity-bearing v9 envelope — the fixed manifest outcome lands *before* schema
+RFC-022 writer (identity-bearing v9 envelope — the fixed graph-manifest outcome lands *before* schema
 staging is promoted, and capture-time coherence means readers can never observe
-the manifest-before-catalog window on a live handle).
+the graph-manifest-before-catalog window on a live handle).
 
 Applies are metadata-only wherever possible — adding an `@index` or widening an
-enum bumps no table version. Destructive or narrowing changes are refused
+enum bumps no published dataset version. Destructive or narrowing changes are refused
 (`OG-MF-106`) rather than lossy.
 
 **Storage versioning is strict single-version** (the strand model,
@@ -677,11 +678,11 @@ is how you ship a silent misread or carry migration code you don't need.
 
 Internal schema v5 introduced [RFC-028](../rfcs/0028-stable-schema-identity.md):
 accepted SchemaIR v2 owns one graph identity domain and monotonic allocator;
-type/property IDs survive explicit renames, while drop/re-add mints a new table
-identity and incarnation. Manifest rows, paths, OCC, and recovery carry that
+type/property IDs survive explicit renames, while drop/re-add mints a new dataset
+identity and incarnation. Graph-manifest rows, paths, OCC, and recovery carry that
 identity pair instead of reconstructing ownership from a mutable name. The
 currently served v6 format preserves that identity model and adds RFC-023:
-every graph table declares exact non-null physical `id` as Lance's unenforced
+every graph dataset declares exact non-null physical `id` as Lance's unenforced
 PK from creation, and every production insert/upsert uses the filter-bearing
 keyed adapter. Moving from v5 to v6 is rebuild-only; the genuine cross-version
 binary rebuild/refusal run passed on 2026-07-15.
@@ -725,7 +726,7 @@ materialization, correct reads at any coverage*:
   kind (enum/orderable scalar → BTREE, free-text String → FTS, Vector → vector
   ANN). Writes never build indexes inline — mutation/load/schema-apply publish
   only their exact data effects. `ensure_indices` materializes every missing
-  artifact for a table in **one** staged mixed CreateIndex transaction (the v9
+  artifact for a dataset in **one** staged mixed CreateIndex transaction (the v9
   envelope retains the `protocol_v8` payload field); `optimize` separately
   folds new fragments into existing indexes.
   Reads are correct under partial coverage (Lance unions indexed and scan
@@ -739,25 +740,25 @@ materialization, correct reads at any coverage*:
   an `ensure_embeddings`-style reconciler — an embedding is derived state, same
   class as an index — is **(draft RFC-015 / RFC-012 phase)**.
 - **Topology.** The CSR/CSC graph index is built per query, scoped to
-  traversed edge types, cached by physical table identity, reused across
+  traversed edge types, cached by physical dataset identity, reused across
   lazy-fork branches. Never persisted, never authoritative.
 
 ---
 
 ## Maintenance: optimize, cleanup, repair
 
-- **`optimize`** compacts fragments and folds index coverage across all tables
-  with bounded parallelism and **one graph visibility envelope**: one
+- **`optimize`** compacts fragments and folds index coverage across all datasets
+  with bounded parallelism and **one graph-visibility envelope**: one
   identity-bearing v9 sidecar with bounded maintenance provenance pins the
   complete productive set before any HEAD moves, and one
-  monotonic manifest CAS publishes everything together — two changed tables
+  monotonic graph-manifest CAS publishes everything together — two changed datasets
   become visible atomically, a no-work run leaves no trace. It also compacts
   `__manifest` itself (physical-only, no graph commit), which is what keeps
   write/read cost flat in history on a periodically-optimized graph.
 - **`cleanup`** is version GC: explicit `--keep`/`--older-than` cutoffs derived
   from Lance's actual version lists, floored by live lazy-branch inheritance
   and recovery needs, refusing on pending sidecars or uncovered drift (GC must
-  never outrun the recovery barrier). Internal-table version GC is not yet
+  never outrun the recovery barrier). Internal-dataset version GC is not yet
   wired in **(deferred — needs the cleanup-resurrection watermark)**, so
   `__manifest/_versions/` grows until explicit cleanup.
 - **`repair`** is the human-in-the-loop path for uncovered drift, described in
@@ -805,7 +806,7 @@ What is guaranteed, from strongest to most bounded:
    order writers, healers, and recovery; readers are never gated; capture-time
    coherence protects snapshot/catalog pairs.
 3. **Cross-process, failure-free non-destructive commit arbitration** — an
-   individual fenced table transaction plus the publisher's exact CAS
+   individual fenced dataset transaction plus the publisher's exact CAS
    precondition admits one same-key winner; losers get typed conflicts
    (`KeyConflict`/`ReadSetChanged`/`RecoveryRequired`), never silent key merge.
    This does not make recovery beside a live foreign writer safe. Concurrent
@@ -873,13 +874,13 @@ on the proposer.)
 - **A custom WAL / transaction manager / buffer pool.** Lance owns durability
   primitives. Our recovery sidecars are *intents over Lance commits*, not a
   parallel log of data. High-rate bounded graph batches reuse the shared
-  ordinary Load transaction and are acknowledged only after manifest visibility;
+  ordinary Load transaction and are acknowledged only after graph-manifest visibility;
   [RFC-026's MemWAL path was rejected](wal-removal.md).
 - **Mixed constructive/destructive single mutations (D₂).** Keeps in-query
-  read-your-writes unambiguous and each table at one commit per query; the
+  read-your-writes unambiguous and each dataset at one commit per query; the
   alternative buys an in-query delete-view machine in the hot path.
 - **Inline index/embedding builds on the write path.** Expensive derived state
-  converges from manifest state (reconciler shape); a network call or index
+  converges from graph-manifest state (reconciler shape); a network call or index
   retrain in the commit path is deny-listed.
 - **Placeholder nodes for orphan edges** and any silent integrity weakening.
   Integrity failures are loud, pre-publish.
@@ -904,12 +905,12 @@ The always-current shipped-vs-roadmap ledger is
 this section is the orientation summary, not the authority.
 
 **Solid and shipped:** the unified write protocol with exact per-writer
-recovery (RFC-022 implemented 2026-07-13, across PRs #343–#353); manifest-atomic
-multi-table publish with lineage-in-CAS; branches/commits/time-travel/merge
+recovery (RFC-022 implemented 2026-07-13, across PRs #343–#353); graph-manifest-atomic
+multi-dataset publish with lineage-in-CAS; branches/commits/time-travel/merge
 with typed conflicts; the strict-strand storage model; unified Δ-scoped
 validation; engine-wide Cedar; cluster control plane and
 cluster-only serving; the warm read-path cost contract; sealed write surface;
-the full failpoint/recovery test lattice; stable schema identity and table
+the full failpoint/recovery test lattice; stable schema identity and backing-dataset
 incarnation (RFC-028, introduced in internal schema v5).
 
 **Explicitly bounded:** Optimize's v9 recovery envelope (bounded maintenance
@@ -939,11 +940,11 @@ resource budgets.
 | **R1: Destructive recovery beside a live foreign process.** Lance restore orphans concurrent commits; no conditional ref primitives; gates are process-local. | High | Documented single-writer-process support boundary; exact ownership prevents false adoption; distributed fence (lease on the schema-apply lock branch) is the sketched close **(roadmap)**. Do not promote multi-process write topologies before it exists. |
 | **R2: Lance substrate churn.** Minor releases can change behavior that OmniGraph depends on, even without changing the public type surface. | High | Pin one audited release, review every intervening upstream commit, keep findings in [lance.md](lance.md), run the surface guards first, and use `cargo test --workspace --locked` as the alignment gate. |
 | **R3: RFC-023 consumes a route-dependent pinned-Lance key-filter primitive.** Lance's filter emission and filtered/unfiltered resolution remain directional on RC.1 (revalidated 2026-07-17). | Medium | v6 closes production insertion-bearing routes through exact-`id`, forced-v2 filtered staging and source-guards bare Append; the adapter verifies the emitted field-ID filter and effect-aware recovery refuses ambiguity. Guards pin both conflict orders so any upstream symmetry/route change forces an audit. Historical beta.21 release evidence passed the 1M forced-v2 50 ms median / 256 MiB max-RSS thresholds (29 ms / 243,875,840 bytes). |
-| **R4: Manifest fold cost grows with commit count.** Current-state resolution folds history. | Medium | `optimize` compacts internal tables (keeps periodically-optimized graphs flat — cost-gated every PR). RFC-024 Gate A found flat exact-BTREE scan work at width 10, including observable/reconcilable uncovered tails, but rejected the format because representative RustFS 20→80 uncompacted cold reads/bytes (34→94 / 61,947→121,592) and compacted byte terms grow. RFC-024 is research-blocked; v6 retains the journal fold and internal-table *cleanup* remains deferred behind the resurrection watermark. |
+| **R4: Graph-manifest fold cost grows with commit count.** Current-state resolution folds history. | Medium | `optimize` compacts internal datasets (keeps periodically-optimized graphs flat — cost-gated every PR). RFC-024 Gate A found flat exact-BTREE scan work at width 10, including observable/reconcilable uncovered tails, but rejected the format because representative RustFS 20→80 uncompacted cold reads/bytes (34→94 / 61,947→121,592) and compacted byte terms grow. RFC-024 is research-blocked; v6 retains the journal fold and internal-dataset *cleanup* remains deferred behind the resurrection watermark. |
 | **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 introduced stable IDs/incarnation as durable authority; v6 preserves them. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
-| **R6: Merge cost at divergence** — full-width classification and history-growing manifest folds. | Medium | Coherent coordinator scans plus retained probe handles reduced the pre-slice measured depth-5/depth-80 baseline from 59/651 manifest reads to 40/410 and cap the common fast-forward route at three internal opens and three scans, but the uncompacted-history slope remains. `merge_cost.rs` keeps both facts visible; O(delta) merge is blocked on a real deletion-delta source **(RFC-027)**; fragment adoption is **(draft RFC-0001)**. |
-| **R7: Small-request ingestion amplification.** Every graph batch is one ordinary graph transaction and therefore pays the manifest publication cost. | Medium | Batch logical graph NDJSON up to the ordinary Load bounds. The public path stays graph-first, uses the shared Load transaction, and acknowledges only after the graph commit is visible. The rejected MemWAL design and its measured failure are recorded in [wal-removal.md](wal-removal.md). |
-| **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed table above 8,192 rows / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive row/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
+| **R6: Merge cost at divergence** — full-width classification and history-growing graph-manifest folds. | Medium | Coherent coordinator scans plus retained probe handles reduced the pre-slice measured depth-5/depth-80 baseline from 59/651 graph-manifest reads to 40/410 and cap the common fast-forward route at three internal opens and three scans, but the uncompacted-history slope remains. `merge_cost.rs` keeps both facts visible; O(delta) merge is blocked on a real deletion-delta source **(RFC-027)**; fragment adoption is **(draft RFC-0001)**. |
+| **R7: Small-request ingestion amplification.** Every graph batch is one ordinary graph transaction and therefore pays the graph-manifest publication cost. | Medium | Batch logical graph NDJSON up to the ordinary Load bounds. The public path stays graph-first, uses the shared Load transaction, and acknowledges only after the graph commit is visible. The rejected MemWAL design and its measured failure are recorded in [wal-removal.md](wal-removal.md). |
+| **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed dataset above 8,192 entities / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive entity/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
 | **R9: Local-FS conditional-write emulation** (`write_text_if_match` check-then-act gap). | Low | All current callers sit behind the cluster lock protocol; S3 uses true conditional puts; close before admitting any lock-free caller. |
 | **R10: Doc/spec drift as the system grows** — this document included. | Low | Maintenance contract (same-PR doc updates, `check-agents-md.sh` link CI, "don't lie" stale markers); this canon defers to area docs by construction. |
 

@@ -538,7 +538,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
             .as_array()
             .expect("commit list")
             .iter()
-            .max_by_key(|commit| commit["manifest_version"].as_u64().unwrap())
+            .max_by_key(|commit| commit["graph_manifest_version"].as_u64().unwrap())
             .expect("loaded graph has at least one commit")["graph_commit_id"]
             .as_str()
             .unwrap()

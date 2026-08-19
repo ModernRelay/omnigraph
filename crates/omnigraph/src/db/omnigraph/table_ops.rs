@@ -46,20 +46,20 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     let branch = normalize_branch_name(branch)?;
     let snapshot = db.snapshot_for_branch(branch.as_deref()).await?;
     let entry = snapshot
-        .entry(table_key)
+        .dataset(table_key)
         .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(table_key)))?;
-    let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+    let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
     let ds = db
         .storage()
         .open_dataset_head(&full_path, table_branch)
         .await?;
     let state = db.storage().table_state(&full_path, &ds).await?;
-    let update = crate::db::SubTableUpdate {
+    let update = crate::db::DatasetUpdate {
         identity: entry.identity,
-        table_key: table_key.to_string(),
-        table_version: state.version,
-        table_branch: table_branch.map(str::to_string),
-        row_count: state.row_count,
+        type_key: table_key.to_string(),
+        published_dataset_version: state.version,
+        native_dataset_branch: table_branch.map(str::to_string),
+        entity_count: state.row_count,
         version_metadata: state.version_metadata,
     };
     let mut expected = crate::db::manifest::ExpectedTableVersions::new();
@@ -67,7 +67,7 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
         entry.identity,
         crate::db::manifest::TableVersionExpectation {
             table_key: table_key.to_string(),
-            table_version: entry.table_version,
+            table_version: entry.published_dataset_version,
         },
     );
     commit_prepared_updates_on_branch_with_expected(
@@ -120,7 +120,7 @@ pub(super) async fn ensure_indices_for_branch(
     // root yet; its artifacts must be staged after sidecar -> ref creation.
     for type_name in catalog.node_types.keys() {
         let table_key = format!("node:{}", type_name);
-        let Some(entry) = snapshot.entry(&table_key) else {
+        let Some(entry) = snapshot.dataset(&table_key) else {
             continue;
         };
         // Match the processing loop's branch filter: when running on a
@@ -129,12 +129,12 @@ pub(super) async fn ensure_indices_for_branch(
         // would force NoMovement on recovery and trigger an all-or-
         // nothing rollback of legitimately-committed work on the
         // feature-branch tables.
-        if active_branch.is_some() && entry.table_branch.is_none() {
+        if active_branch.is_some() && entry.native_dataset_branch.is_none() {
             continue;
         }
-        let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        let first_touch =
-            active_branch.is_some() && entry.table_branch.as_deref() != active_branch.as_deref();
+        let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
+        let first_touch = active_branch.is_some()
+            && entry.native_dataset_branch.as_deref() != active_branch.as_deref();
         let ds = if first_touch {
             // The inherited owner's HEAD may advance independently after this
             // graph branch was cut. Plan from the exact inherited snapshot, not
@@ -154,8 +154,8 @@ pub(super) async fn ensure_indices_for_branch(
                 identity: entry.identity,
                 table_key: table_key.clone(),
                 table_path: full_path,
-                expected_version: entry.table_version,
-                post_commit_pin: entry.table_version + 1,
+                expected_version: entry.published_dataset_version,
+                post_commit_pin: entry.published_dataset_version + 1,
                 confirmed_version: None,
                 table_branch: active_branch.clone(),
             });
@@ -179,9 +179,9 @@ pub(super) async fn ensure_indices_for_branch(
             } else {
                 planned_transactions.insert(
                     entry.identity,
-                    pre_minted_index_transaction(entry.table_version),
+                    pre_minted_index_transaction(entry.published_dataset_version),
                 );
-                first_touch_source_versions.insert(entry.identity, entry.table_version);
+                first_touch_source_versions.insert(entry.identity, entry.published_dataset_version);
                 first_touch_sources.insert(table_key.clone(), ds);
             }
             work_by_table.insert(table_key, work);
@@ -189,15 +189,15 @@ pub(super) async fn ensure_indices_for_branch(
     }
     for edge_name in catalog.edge_types.keys() {
         let table_key = format!("edge:{}", edge_name);
-        let Some(entry) = snapshot.entry(&table_key) else {
+        let Some(entry) = snapshot.dataset(&table_key) else {
             continue;
         };
-        if active_branch.is_some() && entry.table_branch.is_none() {
+        if active_branch.is_some() && entry.native_dataset_branch.is_none() {
             continue;
         }
-        let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        let first_touch =
-            active_branch.is_some() && entry.table_branch.as_deref() != active_branch.as_deref();
+        let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
+        let first_touch = active_branch.is_some()
+            && entry.native_dataset_branch.as_deref() != active_branch.as_deref();
         let ds = if first_touch {
             db.storage().open_snapshot_at_entry(entry).await?
         } else {
@@ -211,8 +211,8 @@ pub(super) async fn ensure_indices_for_branch(
                 identity: entry.identity,
                 table_key: table_key.clone(),
                 table_path: full_path,
-                expected_version: entry.table_version,
-                post_commit_pin: entry.table_version + 1,
+                expected_version: entry.published_dataset_version,
+                post_commit_pin: entry.published_dataset_version + 1,
                 confirmed_version: None,
                 table_branch: active_branch.clone(),
             });
@@ -236,9 +236,9 @@ pub(super) async fn ensure_indices_for_branch(
             } else {
                 planned_transactions.insert(
                     entry.identity,
-                    pre_minted_index_transaction(entry.table_version),
+                    pre_minted_index_transaction(entry.published_dataset_version),
                 );
-                first_touch_source_versions.insert(entry.identity, entry.table_version);
+                first_touch_source_versions.insert(entry.identity, entry.published_dataset_version);
                 first_touch_sources.insert(table_key.clone(), ds);
             }
             work_by_table.insert(table_key, work);
@@ -267,37 +267,44 @@ pub(super) async fn ensure_indices_for_branch(
     let live_snapshot = db.revalidate_write_txn(&txn).await?;
 
     for pin in &recovery_pins {
-        let prepared_entry = snapshot.entry(&pin.table_key).ok_or_else(|| {
+        let prepared_entry = snapshot.dataset(&pin.table_key).ok_or_else(|| {
             OmniError::manifest_conflict(format!(
-                "table '{}' disappeared from the prepared index plan",
-                pin.table_key,
+                "{} disappeared from the prepared index plan",
+                crate::error::dataset_subject(&pin.table_key),
             ))
         })?;
-        let live_entry = live_snapshot.entry(&pin.table_key).ok_or_else(|| {
+        let prepared_binding = format!(
+            "{}:{}:{}",
+            prepared_entry.dataset_path,
+            prepared_entry
+                .native_dataset_branch
+                .as_deref()
+                .unwrap_or("main"),
+            pin.expected_version,
+        );
+        let live_entry = live_snapshot.dataset(&pin.table_key).ok_or_else(|| {
             OmniError::manifest_read_set_changed(
-                format!("table_head:{}", pin.table_key),
-                Some(pin.expected_version.to_string()),
+                format!("dataset_binding:{}", pin.identity),
+                Some(prepared_binding.clone()),
                 None,
             )
         })?;
-        if live_entry.table_version != pin.expected_version
+        if live_entry.published_dataset_version != pin.expected_version
             || live_entry.identity != pin.identity
-            || live_entry.table_path != prepared_entry.table_path
-            || live_entry.table_branch != prepared_entry.table_branch
+            || live_entry.dataset_path != prepared_entry.dataset_path
+            || live_entry.native_dataset_branch != prepared_entry.native_dataset_branch
         {
             return Err(OmniError::manifest_read_set_changed(
-                format!("table_head:{}", pin.table_key),
+                format!("dataset_binding:{}", pin.identity),
+                Some(prepared_binding),
                 Some(format!(
                     "{}:{}:{}",
-                    prepared_entry.table_path,
-                    prepared_entry.table_branch.as_deref().unwrap_or("main"),
-                    pin.expected_version,
-                )),
-                Some(format!(
-                    "{}:{}:{}",
-                    live_entry.table_path,
-                    live_entry.table_branch.as_deref().unwrap_or("main"),
-                    live_entry.table_version,
+                    live_entry.dataset_path,
+                    live_entry
+                        .native_dataset_branch
+                        .as_deref()
+                        .unwrap_or("main"),
+                    live_entry.published_dataset_version,
                 )),
             ));
         }
@@ -391,7 +398,7 @@ pub(super) async fn ensure_indices_for_branch(
             let mut confirmed_ref_identifiers = HashMap::new();
             for pin in &recovery_pins {
                 let table_key = pin.table_key.clone();
-                let entry = snapshot.entry(&table_key).ok_or_else(|| {
+                let entry = snapshot.dataset(&table_key).ok_or_else(|| {
                     OmniError::manifest(missing_graph_type_at_snapshot(&table_key))
                 })?;
                 let full_path = pin.table_path.clone();
@@ -412,8 +419,8 @@ pub(super) async fn ensure_indices_for_branch(
                                 &table_key,
                                 pin.identity,
                                 &full_path,
-                                entry.table_branch.as_deref(),
-                                entry.table_version,
+                                entry.native_dataset_branch.as_deref(),
+                                entry.published_dataset_version,
                                 active_branch,
                                 crate::db::MutationOpKind::SchemaRewrite,
                                 true,
@@ -479,12 +486,12 @@ pub(super) async fn ensure_indices_for_branch(
                         .insert(pin.identity, db.storage().branch_identifier(&ds).await?);
                 }
                 let state = db.storage().table_state(&full_path, &ds).await?;
-                updates.push(crate::db::SubTableUpdate {
+                updates.push(crate::db::DatasetUpdate {
                     identity: pin.identity,
-                    table_key,
-                    table_version: state.version,
-                    table_branch: resolved_branch,
-                    row_count: state.row_count,
+                    type_key: table_key,
+                    published_dataset_version: state.version,
+                    native_dataset_branch: resolved_branch,
+                    entity_count: state.row_count,
                     version_metadata: state.version_metadata,
                 });
                 crate::failpoints::maybe_fail(
@@ -728,8 +735,8 @@ async fn plan_index_work_node(
                         });
                     } else {
                         work.pending.push(PendingIndex {
-                            table_key: table_key.to_string(),
-                            column: prop_name.clone(),
+                            type_key: table_key.to_string(),
+                            property: prop_name.clone(),
                             reason: "property has no non-null vectors to train on yet".to_string(),
                         });
                     }
@@ -818,7 +825,7 @@ pub(crate) struct OpenedForMutation {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeferredTableFork {
-    pub(crate) source_entry: crate::db::SubTableEntry,
+    pub(crate) source_entry: crate::db::DatasetEntry,
     pub(crate) target_branch: String,
 }
 
@@ -882,9 +889,9 @@ pub(super) async fn open_for_mutation_on_branch(
         }
     };
     let entry = snapshot
-        .entry(table_key)
+        .dataset(table_key)
         .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(table_key)))?;
-    let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+    let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
 
     // Collapse #1 (RFC-013 step 3b): a non-strict op (Insert/Merge) on the txn's
     // own branch needs no dataset open for ACCUMULATION — the only thing the
@@ -904,11 +911,13 @@ pub(super) async fn open_for_mutation_on_branch(
     if txn.is_some() && !op_kind.strict_pre_stage_version_check() {
         match resolved_branch.as_deref() {
             // Non-strict, table already on the active branch → no open, no fork.
-            Some(active_branch) if entry.table_branch.as_deref() == Some(active_branch) => {
+            Some(active_branch)
+                if entry.native_dataset_branch.as_deref() == Some(active_branch) =>
+            {
                 return Ok(OpenedForMutation {
                     identity: entry.identity,
                     handle: None,
-                    expected_version: entry.table_version,
+                    expected_version: entry.published_dataset_version,
                     full_path,
                     table_branch: Some(active_branch.to_string()),
                     deferred_fork: None,
@@ -919,7 +928,7 @@ pub(super) async fn open_for_mutation_on_branch(
                 return Ok(OpenedForMutation {
                     identity: entry.identity,
                     handle: None,
-                    expected_version: entry.table_version,
+                    expected_version: entry.published_dataset_version,
                     full_path,
                     table_branch: None,
                     deferred_fork: None,
@@ -935,16 +944,19 @@ pub(super) async fn open_for_mutation_on_branch(
         None => {
             let ds = db.storage().open_dataset_head(&full_path, None).await?;
             if op_kind.strict_pre_stage_version_check() {
-                if txn.is_some() && ds.version() != entry.table_version {
+                if txn.is_some() && ds.version() != entry.published_dataset_version {
                     return Err(OmniError::manifest_read_set_changed(
-                        format!("table_head:{table_key}"),
-                        Some(entry.table_version.to_string()),
+                        format!("published_dataset_version:{table_key}"),
+                        Some(entry.published_dataset_version.to_string()),
                         Some(ds.version().to_string()),
                     ));
                 }
                 if txn.is_none() {
-                    db.storage()
-                        .ensure_expected_version(&ds, table_key, entry.table_version)?;
+                    db.storage().ensure_expected_version(
+                        &ds,
+                        table_key,
+                        entry.published_dataset_version,
+                    )?;
                 }
             }
             let version = ds.version();
@@ -963,12 +975,12 @@ pub(super) async fn open_for_mutation_on_branch(
             // the inherited source entry now; `commit_all` creates the target
             // ref after its v9 sidecar is durable, then commits this transaction
             // onto the new ref. Legacy writers retain the eager fork path below.
-            if txn.is_some() && entry.table_branch.as_deref() != Some(active_branch) {
+            if txn.is_some() && entry.native_dataset_branch.as_deref() != Some(active_branch) {
                 let ds = db.storage().open_snapshot_at_entry(entry).await?;
                 return Ok(OpenedForMutation {
                     identity: entry.identity,
                     handle: Some(ds),
-                    expected_version: entry.table_version,
+                    expected_version: entry.published_dataset_version,
                     full_path,
                     table_branch: Some(active_branch.to_string()),
                     deferred_fork: Some(DeferredTableFork {
@@ -982,8 +994,8 @@ pub(super) async fn open_for_mutation_on_branch(
                 table_key,
                 entry.identity,
                 &full_path,
-                entry.table_branch.as_deref(),
-                entry.table_version,
+                entry.native_dataset_branch.as_deref(),
+                entry.published_dataset_version,
                 active_branch,
                 op_kind,
                 txn.is_some(),
@@ -1022,7 +1034,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             if op_kind.strict_pre_stage_version_check() {
                 if occ_enrolled && ds.version() != entry_version {
                     return Err(OmniError::manifest_read_set_changed(
-                        format!("table_head:{table_key}"),
+                        format!("published_dataset_version:{table_key}"),
                         Some(entry_version.to_string()),
                         Some(ds.version().to_string()),
                     ));
@@ -1042,19 +1054,19 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             // conflict, not an orphan. (A zombie fork is never in the manifest,
             // so this only fires for a live concurrent fork.)
             let live = db.snapshot_for_branch(Some(active_branch)).await?;
-            if let Some(entry) = live.entry(table_key) {
-                if entry.table_branch.as_deref() == Some(active_branch) {
+            if let Some(entry) = live.dataset(table_key) {
+                if entry.native_dataset_branch.as_deref() == Some(active_branch) {
                     return if occ_enrolled {
                         Err(OmniError::manifest_read_set_changed(
-                            format!("table_head:{table_key}"),
+                            format!("published_dataset_version:{table_key}"),
                             Some(entry_version.to_string()),
-                            Some(entry.table_version.to_string()),
+                            Some(entry.published_dataset_version.to_string()),
                         ))
                     } else {
-                        Err(OmniError::manifest_expected_version_mismatch(
+                        Err(OmniError::published_dataset_version_mismatch(
                             table_key,
                             entry_version,
-                            entry.table_version,
+                            entry.published_dataset_version,
                         ))
                     };
                 }
@@ -1174,9 +1186,9 @@ pub(crate) async fn classify_fork_ref(
     match fresh {
         Ok(snap) => {
             let placed = snap
-                .entries()
+                .datasets()
                 .find(|entry| entry.identity == identity)
-                .map(|e| e.table_branch.as_deref() == Some(branch))
+                .map(|e| e.native_dataset_branch.as_deref() == Some(branch))
                 .unwrap_or(false);
             if placed {
                 ForkRefStatus::Legitimate
@@ -1233,7 +1245,7 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
     let canonical_full_path = db.storage().dataset_uri(&canonical_path);
     if full_path != canonical_full_path {
         return Err(OmniError::manifest_read_set_changed(
-            format!("fork_target_path:{identity}"),
+            format!("fork_target_dataset_path:{identity}"),
             Some(canonical_full_path),
             Some(full_path.to_string()),
         ));
@@ -1272,19 +1284,19 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
                 .await
                 .ok()
                 .and_then(|s| {
-                    s.entries()
+                    s.datasets()
                         .find(|entry| entry.identity == identity)
-                        .map(|entry| entry.table_version)
+                        .map(|entry| entry.published_dataset_version)
                 })
                 .unwrap_or(source_version);
             if current_operation_id.is_some() {
                 return Err(OmniError::manifest_read_set_changed(
-                    format!("table_head:{table_key}"),
+                    format!("published_dataset_version:{table_key}"),
                     Some(source_version.to_string()),
                     Some(actual.to_string()),
                 ));
             }
-            return Err(OmniError::manifest_expected_version_mismatch(
+            return Err(OmniError::published_dataset_version_mismatch(
                 table_key,
                 source_version,
                 actual,
@@ -1336,11 +1348,11 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
         crate::storage_layer::ForkOutcome::RefAlreadyExists => {
             let live = db.fresh_snapshot_for_branch(Some(active_branch)).await?;
             let actual = live
-                .entries()
+                .datasets()
                 .find(|entry| entry.identity == identity)
-                .map(|entry| entry.table_version)
+                .map(|entry| entry.published_dataset_version)
                 .unwrap_or(source_version);
-            Err(OmniError::manifest_expected_version_mismatch(
+            Err(OmniError::published_dataset_version_mismatch(
                 table_key,
                 source_version,
                 actual,
@@ -1379,16 +1391,16 @@ pub(super) async fn reopen_for_mutation(
 }
 
 /// A declared index the builder could not materialize on this pass. Today the
-/// only such case is a vector (IVF) column with no trainable vectors yet
+/// only such case is a vector (IVF) property with no trainable vectors yet
 /// (KMeans needs >=1 vector), e.g. the load-before-embed window. Reported, not
-/// fatal: a later `ensure_indices`/`optimize` retries once the column is
+/// fatal: a later `ensure_indices`/`optimize` retries once the property is
 /// buildable, and reads stay correct via brute-force meanwhile. Surfacing
 /// pending index *status* rather than failing the operation is the database
 /// norm (Postgres `indisvalid`, LanceDB `list_indices`).
 #[derive(Debug, Clone)]
 pub struct PendingIndex {
-    pub table_key: String,
-    pub column: String,
+    pub type_key: String,
+    pub property: String,
     pub reason: String,
 }
 
@@ -1456,9 +1468,9 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
 async fn prepare_updates_for_commit(
     db: &Omnigraph,
     branch: Option<&str>,
-    updates: &[crate::db::SubTableUpdate],
+    updates: &[crate::db::DatasetUpdate],
     txn: Option<&crate::db::WriteTxn>,
-) -> Result<Vec<crate::db::SubTableUpdate>> {
+) -> Result<Vec<crate::db::DatasetUpdate>> {
     if updates.is_empty() {
         return Ok(Vec::new());
     }
@@ -1482,27 +1494,27 @@ async fn prepare_updates_for_commit(
     let mut prepared = Vec::with_capacity(updates.len());
 
     for update in updates {
-        let Some(entry) = snapshot.entry(&update.table_key) else {
+        let Some(entry) = snapshot.dataset(&update.type_key) else {
             return Err(OmniError::manifest(missing_graph_type_at_snapshot(
-                &update.table_key,
+                &update.type_key,
             )));
         };
 
         let mut prepared_update = update.clone();
-        if prepared_update.row_count > 0 {
-            let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+        if prepared_update.entity_count > 0 {
+            let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
             // Strict version check is correct here: this runs INSIDE
             // the publisher commit path, after `commit_staged` already
-            // advanced Lance HEAD to `prepared_update.table_version`.
+            // advanced Lance HEAD to `prepared_update.published_dataset_version`.
             // The check is a defense-in-depth assertion that the
             // dataset state matches what we just committed; not the
             // pre-stage race the op-kind policy targets.
             let mut ds = reopen_for_mutation(
                 db,
-                &prepared_update.table_key,
+                &prepared_update.type_key,
                 &full_path,
-                prepared_update.table_branch.as_deref(),
-                prepared_update.table_version,
+                prepared_update.native_dataset_branch.as_deref(),
+                prepared_update.published_dataset_version,
                 crate::db::MutationOpKind::SchemaRewrite,
             )
             .await?;
@@ -1511,11 +1523,10 @@ async fn prepare_updates_for_commit(
             // build_indices; a later ensure_indices/optimize materializes it.
             // Legacy merge/test callers must not fail on it; enrolled
             // mutation/load callers returned before this block.
-            let _pending =
-                build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
+            let _pending = build_indices_on_dataset(db, &prepared_update.type_key, &mut ds).await?;
             let state = db.storage().table_state(&full_path, &ds).await?;
-            prepared_update.table_version = state.version;
-            prepared_update.row_count = state.row_count;
+            prepared_update.published_dataset_version = state.version;
+            prepared_update.entity_count = state.row_count;
             prepared_update.version_metadata = state.version_metadata;
         }
 
@@ -1528,11 +1539,12 @@ async fn prepare_updates_for_commit(
 #[cfg(test)]
 async fn commit_prepared_updates(
     db: &Omnigraph,
-    updates: &[crate::db::SubTableUpdate],
+    updates: &[crate::db::DatasetUpdate],
     actor_id: Option<&str>,
 ) -> Result<u64> {
     let PublishedSnapshot {
-        manifest_version, ..
+        graph_manifest_version: manifest_version,
+        ..
     } = db
         .coordinator
         .write()
@@ -1545,12 +1557,13 @@ async fn commit_prepared_updates(
 #[cfg(feature = "failpoints")]
 async fn commit_prepared_updates_with_expected(
     db: &Omnigraph,
-    updates: &[crate::db::SubTableUpdate],
+    updates: &[crate::db::DatasetUpdate],
     expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
     actor_id: Option<&str>,
 ) -> Result<u64> {
     let PublishedSnapshot {
-        manifest_version, ..
+        graph_manifest_version: manifest_version,
+        ..
     } = db
         .coordinator
         .write()
@@ -1564,7 +1577,7 @@ async fn commit_prepared_updates_with_expected(
 pub(super) async fn commit_prepared_updates_on_branch_with_expected(
     db: &Omnigraph,
     branch: Option<&str>,
-    updates: &[crate::db::SubTableUpdate],
+    updates: &[crate::db::DatasetUpdate],
     expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
     actor_id: Option<&str>,
 ) -> Result<u64> {
@@ -1605,7 +1618,8 @@ pub(super) async fn commit_prepared_updates_on_branch_with_expected(
         }
     };
     let PublishedSnapshot {
-        manifest_version, ..
+        graph_manifest_version: manifest_version,
+        ..
     } = coordinator
         .commit_updates_with_actor_with_expected(updates, expected_table_versions, actor_id)
         .await?;
@@ -1617,7 +1631,7 @@ pub(super) async fn commit_prepared_updates_on_branch_with_expected(
 #[cfg(test)]
 pub(super) async fn commit_updates(
     db: &mut Omnigraph,
-    updates: &[crate::db::SubTableUpdate],
+    updates: &[crate::db::DatasetUpdate],
 ) -> Result<u64> {
     db.ensure_schema_apply_not_locked("write commit").await?;
     let current_branch = db
@@ -1632,11 +1646,11 @@ pub(super) async fn commit_updates(
 
 /// Commit updates with a publisher-level OCC fence. The
 /// `expected_table_versions` map asserts the manifest's pre-write per-table
-/// versions; mismatches surface as `ManifestConflictDetails::ExpectedVersionMismatch`.
+/// versions; mismatches surface as `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
 pub(super) async fn commit_updates_on_branch_with_expected(
     db: &Omnigraph,
     branch: Option<&str>,
-    updates: &[crate::db::SubTableUpdate],
+    updates: &[crate::db::DatasetUpdate],
     expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
     actor_id: Option<&str>,
     txn: &crate::db::WriteTxn,
@@ -1730,8 +1744,8 @@ mod classify_fork_ref_tests {
     /// (the same path the engine uses) so the test forges against the real ref.
     async fn node_path(db: &Omnigraph, branch: &str, table_key: &str) -> String {
         let snap = db.snapshot_for_branch(Some(branch)).await.unwrap();
-        let entry = snap.entry(table_key).unwrap();
-        format!("{}/{}", db.root_uri, entry.table_path)
+        let entry = snap.dataset(table_key).unwrap();
+        format!("{}/{}", db.root_uri, entry.dataset_path)
     }
 
     #[tokio::test]
@@ -1754,8 +1768,8 @@ mod classify_fork_ref_tests {
         .await
         .unwrap();
         let feature_snapshot = db.snapshot_for_branch(Some("feature")).await.unwrap();
-        let company_identity = feature_snapshot.entry("node:Company").unwrap().identity;
-        let person_identity = feature_snapshot.entry("node:Person").unwrap().identity;
+        let company_identity = feature_snapshot.dataset("node:Company").unwrap().identity;
+        let person_identity = feature_snapshot.dataset("node:Person").unwrap().identity;
         assert_eq!(
             classify_fork_ref(&db, "node:Company", company_identity, "feature", None,).await,
             ForkRefStatus::Legitimate,
@@ -1797,13 +1811,13 @@ mod classify_fork_ref_tests {
         let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
             .await
             .unwrap();
-        let old_identity = db.snapshot().await.entry("node:Person").unwrap().identity;
+        let old_identity = db.snapshot().await.dataset("node:Person").unwrap().identity;
 
         db.apply_schema("node Company { name: String @key }\n")
             .await
             .unwrap();
         db.apply_schema(SCHEMA).await.unwrap();
-        let new_entry = db.snapshot().await.entry("node:Person").unwrap().clone();
+        let new_entry = db.snapshot().await.dataset("node:Person").unwrap().clone();
         let new_identity = new_entry.identity;
         assert_ne!(old_identity, new_identity);
 
@@ -1828,7 +1842,7 @@ mod classify_fork_ref_tests {
             "a live placement under the reused alias belongs only to the new incarnation"
         );
 
-        let full_path = db.storage().dataset_uri(&new_entry.table_path);
+        let full_path = db.storage().dataset_uri(&new_entry.dataset_path);
         let before = db
             .storage()
             .open_dataset_head(&full_path, Some("feature"))
@@ -1841,7 +1855,7 @@ mod classify_fork_ref_tests {
             old_identity,
             &full_path,
             None,
-            new_entry.table_version,
+            new_entry.published_dataset_version,
             "feature",
             None,
         )

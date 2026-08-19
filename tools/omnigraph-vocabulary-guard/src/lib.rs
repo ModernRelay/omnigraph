@@ -483,6 +483,7 @@ fn check_at_root(root: &Path, options: &CheckOptions) -> Result<CheckReport, Gua
             &current_inventory,
         )?;
         compare_surface_classification_sets(surface, &base_inventory, &current_inventory)?;
+        ensure_no_current_compatibility_aliases(surface, &current_inventory)?;
         current_count += current_observations.len();
         base_count += base_observations.len();
     }
@@ -491,6 +492,25 @@ fn check_at_root(root: &Path, options: &CheckOptions) -> Result<CheckReport, Gua
         current_occurrences: current_count,
         base_occurrences: base_count,
     })
+}
+
+fn ensure_no_current_compatibility_aliases(
+    surface: &str,
+    current: &[InventoryRow],
+) -> Result<(), GuardError> {
+    let aliases = current
+        .iter()
+        .filter(|row| row.surface == surface && row.classification == "compatibility_alias")
+        .map(|row| row.occurrence_id.as_str())
+        .collect::<Vec<_>>();
+    if aliases.is_empty() {
+        Ok(())
+    } else {
+        Err(GuardError::Check(format!(
+            "current tree retains retired compatibility_alias occurrence(s): [{}]",
+            aliases.join(", ")
+        )))
+    }
 }
 
 pub fn resolve_tool_executable(root: &Path, executable: &Path) -> PathBuf {
@@ -720,13 +740,11 @@ fn compare_surface_classification_sets(
 
     let base_aliases = ids(base, "compatibility_alias");
     let current_aliases = ids(current, "compatibility_alias");
-    if base_aliases != current_aliases {
+    if !current_aliases.is_subset(&base_aliases) {
         let added: Vec<_> = current_aliases.difference(&base_aliases).cloned().collect();
-        let removed: Vec<_> = base_aliases.difference(&current_aliases).cloned().collect();
         return Err(GuardError::Check(format!(
-            "compatibility_alias occurrence set changed; added [{}], removed [{}]",
-            added.join(", "),
-            removed.join(", ")
+            "new or moved compatibility_alias occurrence(s): [{}]",
+            added.join(", ")
         )));
     }
     Ok(())
@@ -2617,16 +2635,67 @@ mod tests {
     }
 
     #[test]
-    fn merge_base_check_requires_compatibility_alias_set_equality() {
+    fn merge_base_check_allows_compatibility_alias_removal() {
         let base_spec = minimal_spec(&[("base", "compatibility table")]);
         let repo = TestRepo::with_reviewed_base(&base_spec, |_| "compatibility_alias");
         repo.write_current(
             &minimal_spec(&[("base", "ordinary compatibility object")]),
             |_| unreachable!(),
         );
+        check_repo(&repo).expect("removing a compatibility alias is convergence");
+    }
+
+    #[test]
+    fn merge_base_check_requires_complete_compatibility_alias_retirement() {
+        let spec = minimal_spec(&[("base", "compatibility table")]);
+        let repo = TestRepo::with_reviewed_base(&spec, |_| "compatibility_alias");
+        repo.write_current(&spec, |_| "compatibility_alias");
         assert_error_contains(
             check_repo(&repo),
-            "compatibility_alias occurrence set changed",
+            "current tree retains retired compatibility_alias occurrence",
+        );
+    }
+
+    #[test]
+    fn merge_base_check_rejects_new_or_moved_compatibility_alias() {
+        let base_spec = minimal_spec(&[("base", "ordinary compatibility object")]);
+        let repo = TestRepo::with_reviewed_base(&base_spec, |_| unreachable!());
+        repo.write_current(
+            &minimal_spec(&[("base", "compatibility table")]),
+            |_| "compatibility_alias",
+        );
+        assert_error_contains(
+            check_repo(&repo),
+            "new or moved compatibility_alias occurrence",
+        );
+
+        let base_spec = minimal_spec(&[
+            ("kept", "compatibility table"),
+            ("other", "ordinary compatibility object"),
+        ]);
+        let repo = TestRepo::with_reviewed_base(&base_spec, |observation| {
+            if observation.boundary.contains("kept") {
+                "compatibility_alias"
+            } else {
+                "physical_storage"
+            }
+        });
+        repo.write_current(
+            &minimal_spec(&[
+                ("kept", "ordinary compatibility object"),
+                ("other", "compatibility table"),
+            ]),
+            |observation| {
+                if observation.boundary.contains("other") {
+                    "compatibility_alias"
+                } else {
+                    "physical_storage"
+                }
+            },
+        );
+        assert_error_contains(
+            check_repo(&repo),
+            "new or moved compatibility_alias occurrence",
         );
     }
 

@@ -53,8 +53,8 @@ pub(crate) struct Violation {
 impl Violation {
     pub(crate) fn into_merge_conflict(self) -> MergeConflict {
         MergeConflict {
-            table_key: self.table_key,
-            row_id: self.row_id,
+            type_key: self.table_key,
+            entity_id: self.row_id,
             kind: self.kind,
             message: self.message,
         }
@@ -315,8 +315,8 @@ impl<'a> CommittedState<'a> {
         let Some(committed) = self.committed else {
             return Ok(None);
         };
-        match committed.entry(table_key) {
-            Some(_) => Ok(Some(committed.open_dataset(table_key).await?)),
+        match committed.dataset(table_key) {
+            Some(_) => Ok(Some(committed.open_lance_dataset(table_key).await?)),
             None => Ok(None),
         }
     }
@@ -334,7 +334,7 @@ impl<'a> CommittedState<'a> {
         let Some(committed) = self.committed else {
             return Ok(None);
         };
-        let Some(_entry) = committed.entry(table_key) else {
+        let Some(_entry) = committed.dataset(table_key) else {
             return Ok(None);
         };
         match self.live {
@@ -342,15 +342,15 @@ impl<'a> CommittedState<'a> {
                 // `CommittedState::write` is constructed only after WriteTxn
                 // schema validation, so use the unchecked manifest refresh to
                 // avoid another full contract read while retaining live branch
-                // authority. Snapshot::open follows the entry's actual
-                // `table_branch` and pinned version (including inheritance).
+                // authority. `Snapshot::open_lance_dataset` follows the entry's
+                // actual native dataset branch and pinned version (including inheritance).
                 let live = db.fresh_snapshot_for_branch_unchecked(branch).await?;
-                match live.entry(table_key) {
-                    Some(_) => Ok(Some(live.open_dataset(table_key).await?)),
+                match live.dataset(table_key) {
+                    Some(_) => Ok(Some(live.open_lance_dataset(table_key).await?)),
                     None => Ok(None),
                 }
             }
-            None => Ok(Some(committed.open_dataset(table_key).await?)),
+            None => Ok(Some(committed.open_lance_dataset(table_key).await?)),
         }
     }
 
@@ -573,7 +573,7 @@ pub(crate) async fn overwrite_removed_ids(
     table_key: &str,
     change: &TableChange,
 ) -> Result<Vec<String>> {
-    if base.entry(table_key).is_none() {
+    if base.dataset(table_key).is_none() {
         return Ok(Vec::new());
     }
     let mut new_ids: HashSet<String> = HashSet::new();
@@ -585,7 +585,7 @@ pub(crate) async fn overwrite_removed_ids(
             }
         }
     }
-    let ds = base.open_dataset(table_key).await?;
+    let ds = base.open_lance_dataset(table_key).await?;
     let mut removed = Vec::new();
     for batch in &scan_all(&ds, &["id"]).await? {
         let column = string_col(batch, "id")?;

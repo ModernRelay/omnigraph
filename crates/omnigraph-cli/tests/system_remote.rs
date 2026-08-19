@@ -103,8 +103,8 @@ query insert_person($name: String, $age: I32) {
             .arg(GRAPH_ID)
             .arg("--json"),
     ));
-    assert_eq!(snapshot["branch"], "main");
-    assert_eq!(snapshot["tables"], local_snapshot["tables"]);
+    assert_eq!(snapshot["graph_branch"], "main");
+    assert_eq!(snapshot["datasets"], local_snapshot["datasets"]);
 
     let local_read = parse_stdout_json(&output_success(
         cli()
@@ -157,7 +157,7 @@ query insert_person($name: String, $age: I32) {
     ));
     assert_eq!(change_payload["affected_nodes"], 1);
     assert!(change_payload["commit"]["graph_commit_id"].is_string());
-    assert!(change_payload["commit"]["manifest_version"].is_number());
+    assert!(change_payload["commit"]["graph_manifest_version"].is_number());
 
     let query_source = fs::read_to_string(fixture("test.gq")).unwrap();
     let http_read = client
@@ -714,21 +714,23 @@ query add_friend($from: String, $to: String) {
         cli().arg("snapshot").arg(&imported_graph).arg("--json"),
     ));
     assert_eq!(
-        snapshot["tables"]
+        snapshot["datasets"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|table| table["table_key"] == "node:Person")
-            .unwrap()["row_count"],
+            .find(|dataset| {
+                dataset["entity_kind"] == "node" && dataset["type_name"] == "Person"
+            })
+            .unwrap()["entity_count"],
         5
     );
     assert_eq!(
-        snapshot["tables"]
+        snapshot["datasets"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|table| table["table_key"] == "edge:Knows")
-            .unwrap()["row_count"],
+            .find(|dataset| { dataset["entity_kind"] == "edge" && dataset["type_name"] == "Knows" })
+            .unwrap()["entity_count"],
         4
     );
 
@@ -779,10 +781,11 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["base_branch"], "main");
     assert_eq!(ingest_payload["branch_created"], true);
     assert!(ingest_payload["commit"]["graph_commit_id"].is_string());
-    assert!(ingest_payload["commit"]["manifest_version"].is_number());
+    assert!(ingest_payload["commit"]["graph_manifest_version"].is_number());
     assert_eq!(ingest_payload["mode"], "merge");
-    assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
-    assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
+    assert_eq!(ingest_payload["nodes"][0]["name"], "Person");
+    assert_eq!(ingest_payload["nodes"][0]["entities_loaded"], 2);
+    assert_eq!(ingest_payload["total_entities"], 2);
 
     let feature_snapshot = parse_stdout_json(&output_success(
         cli()
@@ -795,7 +798,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
             .arg("feature-ingest")
             .arg("--json"),
     ));
-    assert_eq!(feature_snapshot["branch"], "feature-ingest");
+    assert_eq!(feature_snapshot["graph_branch"], "feature-ingest");
 
     let zoe = parse_stdout_json(&output_success(
         cli()
@@ -874,9 +877,11 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
     assert_eq!(payload["branch"], "feature-load");
     assert_eq!(payload["base_branch"], "main");
     assert_eq!(payload["branch_created"], true);
-    assert_eq!(payload["nodes_loaded"], 1);
+    assert_eq!(payload["nodes"][0]["name"], "Person");
+    assert_eq!(payload["nodes"][0]["entities_loaded"], 1);
+    assert_eq!(payload["total_entities"], 1);
     assert!(payload["commit"]["graph_commit_id"].is_string());
-    assert!(payload["commit"]["manifest_version"].is_number());
+    assert!(payload["commit"]["graph_manifest_version"].is_number());
 
     let snapshot = parse_stdout_json(&output_success(
         cli()
@@ -889,7 +894,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
             .arg("feature-load")
             .arg("--json"),
     ));
-    assert_eq!(snapshot["branch"], "feature-load");
+    assert_eq!(snapshot["graph_branch"], "feature-load");
 }
 
 #[test]
@@ -939,8 +944,9 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
     assert_eq!(ingest_payload["base_branch"], "missing-base");
     assert_eq!(ingest_payload["branch_created"], false);
     assert_eq!(ingest_payload["mode"], "merge");
-    assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
-    assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
+    assert_eq!(ingest_payload["nodes"][0]["name"], "Person");
+    assert_eq!(ingest_payload["nodes"][0]["entities_loaded"], 2);
+    assert_eq!(ingest_payload["total_entities"], 2);
 
     let bob = parse_stdout_json(&output_success(
         cli()
@@ -1018,7 +1024,7 @@ query insert_person($name: String, $age: I32) {
             .arg(GRAPH_ID)
             .arg("--json"),
     ));
-    assert_eq!(snapshot["branch"], "main");
+    assert_eq!(snapshot["graph_branch"], "main");
 
     // bruno cannot change protected main (team-write-unprotected only).
     let denied_main_change = output_failure(

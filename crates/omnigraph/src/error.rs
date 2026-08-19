@@ -15,15 +15,15 @@ pub enum ManifestErrorKind {
 /// concurrency-control failure rather than parse a string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestConflictDetails {
-    /// A caller-supplied per-table expected version did not match the
-    /// manifest's current latest non-tombstoned version for that table.
-    ExpectedVersionMismatch {
-        table_key: String,
-        expected: u64,
-        actual: u64,
+    /// A caller-supplied expected published dataset version did not match the
+    /// manifest's current latest non-tombstoned version for that dataset.
+    PublishedDatasetVersionMismatch {
+        type_key: String,
+        expected_published_dataset_version: u64,
+        actual_published_dataset_version: u64,
     },
     /// A logical authority value captured during write preparation changed
-    /// before the manifest visibility decision. Unlike a touched-table
+    /// before the manifest visibility decision. Unlike a touched-dataset
     /// version mismatch, this may name a read-only dependency such as the
     /// target branch's graph head or schema identity.
     ReadSetChanged {
@@ -33,7 +33,7 @@ pub enum ManifestConflictDetails {
     },
     /// Lance's row-level CAS rejected the publish because a concurrent writer
     /// landed a row with the same `object_id`. Distinct from
-    /// `ExpectedVersionMismatch`: the caller's expectations (if any) still
+    /// `PublishedDatasetVersionMismatch`: the caller's expectations (if any) still
     /// hold against the new manifest state, so the publisher will retry.
     RowLevelCasContention,
 }
@@ -63,8 +63,8 @@ impl ManifestError {
 
 #[derive(Debug, Clone)]
 pub struct MergeConflict {
-    pub table_key: String,
-    pub row_id: Option<String>,
+    pub type_key: String,
+    pub entity_id: Option<String>,
     pub kind: MergeConflictKind,
     pub message: String,
 }
@@ -105,8 +105,8 @@ pub(crate) fn missing_graph_type_at_snapshot(table_key: &str) -> String {
     )
 }
 
-fn format_key_conflict(table_key: &str) -> String {
-    format!("{} already has this id", graph_type_subject(table_key))
+fn format_key_conflict(type_key: &str) -> String {
+    format!("{} already has this id", graph_type_subject(type_key))
 }
 
 fn merge_conflict_kind_label(kind: MergeConflictKind) -> &'static str {
@@ -125,9 +125,9 @@ fn format_merge_conflicts(conflicts: &[MergeConflict]) -> String {
     conflicts
         .iter()
         .map(|conflict| {
-            let subject = graph_type_subject(&conflict.table_key);
+            let subject = graph_type_subject(&conflict.type_key);
             let kind = merge_conflict_kind_label(conflict.kind);
-            match conflict.row_id.as_deref() {
+            match conflict.entity_id.as_deref() {
                 Some(id) => format!("{subject}, entity id '{id}' ({kind}): {}", conflict.message),
                 None => format!("{subject} ({kind}): {}", conflict.message),
             }
@@ -144,8 +144,8 @@ pub enum OmniError {
     Lance(String),
     /// A graph-snapshot-pinned Lance dataset version was reclaimed by cleanup. Kept typed at
     /// the common opener so historical APIs never infer retention from error text.
-    #[error("historical published dataset version {version} was reclaimed")]
-    HistoricalVersionReclaimed { version: u64 },
+    #[error("historical published dataset version {published_dataset_version} was reclaimed")]
+    HistoricalVersionReclaimed { published_dataset_version: u64 },
 
     /// Lance rejected a stale transaction as semantically retryable. Kept
     /// typed at the storage boundary so RFC-023 can distinguish an
@@ -166,13 +166,12 @@ pub enum OmniError {
     /// before any effect from this attempt became visible.  This is distinct
     /// from a stale read set: retrying the same strict insert must not silently
     /// turn it into an upsert.
-    #[error("{}", format_key_conflict(table_key))]
+    #[error("{}", format_key_conflict(type_key))]
     KeyConflict {
-        table_key: String,
+        type_key: String,
         /// Exact id observed by pinned preflight or the required fresh probe
-        /// after an effect-free substrate conflict. Optional on the wire only
-        /// for backward compatibility with older producers.
-        key: Option<String>,
+        /// after an effect-free substrate conflict.
+        entity_id: Option<String>,
     },
     /// A write was rejected before recovery was armed because its bounded
     /// physical plan would exceed an explicit safety ceiling. This is a
@@ -343,10 +342,10 @@ impl From<omnigraph_storage::StorageError> for OmniError {
 }
 
 impl OmniError {
-    pub fn key_conflict(table_key: impl Into<String>, key: impl Into<String>) -> Self {
+    pub fn key_conflict(type_key: impl Into<String>, entity_id: impl Into<String>) -> Self {
         Self::KeyConflict {
-            table_key: table_key.into(),
-            key: Some(key.into()),
+            type_key: type_key.into(),
+            entity_id: Some(entity_id.into()),
         }
     }
 
@@ -408,24 +407,24 @@ impl OmniError {
         Self::Manifest(ManifestError::new(ManifestErrorKind::Internal, message))
     }
 
-    pub fn manifest_expected_version_mismatch(
-        table_key: impl Into<String>,
-        expected: u64,
-        actual: u64,
+    pub fn published_dataset_version_mismatch(
+        type_key: impl Into<String>,
+        expected_published_dataset_version: u64,
+        actual_published_dataset_version: u64,
     ) -> Self {
-        let table_key = table_key.into();
+        let type_key = type_key.into();
         let message = format!(
             "stale view of {}: expected published dataset version {} but current is {} — refresh and retry",
-            dataset_subject(&table_key),
-            expected,
-            actual
+            dataset_subject(&type_key),
+            expected_published_dataset_version,
+            actual_published_dataset_version
         );
         Self::Manifest(
             ManifestError::new(ManifestErrorKind::Conflict, message).with_details(
-                ManifestConflictDetails::ExpectedVersionMismatch {
-                    table_key,
-                    expected,
-                    actual,
+                ManifestConflictDetails::PublishedDatasetVersionMismatch {
+                    type_key,
+                    expected_published_dataset_version,
+                    actual_published_dataset_version,
                 },
             ),
         )
@@ -493,18 +492,21 @@ mod tests {
         );
         assert_eq!(
             OmniError::KeyConflict {
-                table_key: "edge:Knows".to_string(),
-                key: None,
+                type_key: "edge:Knows".to_string(),
+                entity_id: None,
             }
             .to_string(),
             "edge type 'Knows' already has this id"
         );
         assert_eq!(
-            OmniError::HistoricalVersionReclaimed { version: 7 }.to_string(),
+            OmniError::HistoricalVersionReclaimed {
+                published_dataset_version: 7
+            }
+            .to_string(),
             "historical published dataset version 7 was reclaimed"
         );
         assert_eq!(
-            OmniError::manifest_expected_version_mismatch("node:Person", 6, 7).to_string(),
+            OmniError::published_dataset_version_mismatch("node:Person", 6, 7).to_string(),
             "stale view of dataset for node type 'Person': expected published dataset version 6 but current is 7 — refresh and retry"
         );
     }
@@ -512,8 +514,8 @@ mod tests {
     #[test]
     fn merge_conflict_display_does_not_leak_struct_field_debug_syntax() {
         let error = OmniError::MergeConflicts(vec![MergeConflict {
-            table_key: "node:Person".to_string(),
-            row_id: Some("p1".to_string()),
+            type_key: "node:Person".to_string(),
+            entity_id: Some("p1".to_string()),
             kind: MergeConflictKind::DivergentUpdate,
             message: "divergent update for id 'p1'".to_string(),
         }]);

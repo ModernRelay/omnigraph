@@ -1,6 +1,6 @@
 // Both the read namespace (BranchManifestNamespace) and the write namespace
 // (StagedTableNamespace) are now test-only contract validation. Reads open
-// sub-tables directly by location+version (SubTableEntry::open, Fix 2), and
+// sub-tables directly by location+version (DatasetEntry::open, Fix 2), and
 // writes open the table head directly by URI (TableStore::open_dataset_head,
 // RFC-013 step 3a), so nothing in production routes through the Lance namespace
 // anymore. These impls are retained only to validate the LanceNamespace
@@ -31,7 +31,7 @@ use super::metadata::{
     TableVersionMetadata, namespace_version_metadata, parse_namespace_version_request,
 };
 use super::publisher::GraphNamespacePublisher;
-use super::state::{ManifestState, SubTableEntry, read_manifest_entries, read_manifest_state};
+use super::state::{DatasetEntry, ManifestState, read_manifest_entries, read_manifest_state};
 
 #[derive(Debug, Clone)]
 struct BranchManifestNamespace {
@@ -60,7 +60,7 @@ impl BranchManifestNamespace {
         read_manifest_state(&dataset).await
     }
 
-    async fn version_entries(&self) -> Result<Vec<SubTableEntry>> {
+    async fn version_entries(&self) -> Result<Vec<DatasetEntry>> {
         let dataset = self.dataset().await?;
         read_manifest_entries(&dataset).await
     }
@@ -190,7 +190,7 @@ impl LanceNamespace for BranchManifestNamespace {
         let entry = state
             .entries
             .into_iter()
-            .find(|entry| entry.table_key == table_key);
+            .find(|entry| entry.type_key == table_key);
         let entry = entry.ok_or_else(|| {
             LanceNamespaceError::namespace_source(Box::new(NamespaceError::TableNotFound {
                 message: format!("table {} not found", table_key),
@@ -198,14 +198,14 @@ impl LanceNamespace for BranchManifestNamespace {
         })?;
         let table_uri = table_uri_for_path(
             &self.root_uri,
-            &entry.table_path,
-            entry.table_branch.as_deref(),
+            &entry.dataset_path,
+            entry.native_dataset_branch.as_deref(),
         );
 
         Ok(DescribeTableResponse {
-            table: Some(entry.table_key.clone()),
+            table: Some(entry.type_key.clone()),
             namespace: Some(Vec::new()),
-            version: Some(entry.table_version as i64),
+            version: Some(entry.published_dataset_version as i64),
             location: Some(table_uri.clone()),
             table_uri: request.with_table_uri.unwrap_or(false).then_some(table_uri),
             schema: None,
@@ -231,7 +231,7 @@ impl LanceNamespace for BranchManifestNamespace {
         if state
             .entries
             .iter()
-            .any(|entry| entry.table_key == table_key)
+            .any(|entry| entry.type_key == table_key)
         {
             Ok(())
         } else {
@@ -253,11 +253,11 @@ impl LanceNamespace for BranchManifestNamespace {
             .await
             .map_err(|e| LanceNamespaceError::namespace_source(Box::new(e)))?
             .into_iter()
-            .filter(|entry| entry.table_key == table_key)
+            .filter(|entry| entry.type_key == table_key)
             .map(|entry| {
                 entry
                     .version_metadata
-                    .to_namespace_version(entry.table_version)
+                    .to_namespace_version(entry.published_dataset_version)
             })
             .collect();
 
@@ -292,7 +292,7 @@ impl LanceNamespace for BranchManifestNamespace {
             .await
             .map_err(|e| LanceNamespaceError::namespace_source(Box::new(e)))?
             .into_iter()
-            .find(|entry| entry.table_key == table_key && entry.table_version == version)
+            .find(|entry| entry.type_key == table_key && entry.published_dataset_version == version)
             .ok_or_else(|| {
                 LanceNamespaceError::namespace_source(Box::new(
                     NamespaceError::TableVersionNotFound {
@@ -304,7 +304,7 @@ impl LanceNamespace for BranchManifestNamespace {
         Ok(DescribeTableVersionResponse::new(
             entry
                 .version_metadata
-                .to_namespace_version(entry.table_version),
+                .to_namespace_version(entry.published_dataset_version),
         ))
     }
 

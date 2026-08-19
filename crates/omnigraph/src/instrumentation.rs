@@ -41,7 +41,7 @@ use crate::storage::{ListDirBounds, StorageAdapter};
 pub struct QueryIoProbes {
     pub manifest_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     /// Attached to the per-table data opens a query performs (the cache-miss
-    /// path in `SubTableEntry::open`). Lets a cost test assert how many tables
+    /// path in `DatasetEntry::open`). Lets a cost test assert how many tables
     /// a query actually opened — N on a cold read, 0 on a warm repeat once the
     /// handle cache (Fix 3) serves them.
     pub table_wrapper: Option<Arc<dyn WrappingObjectStore>>,
@@ -651,7 +651,7 @@ pub(crate) async fn open_dataset(
             if matches!(version, VersionResolution::At(_)) =>
         {
             OmniError::HistoricalVersionReclaimed {
-                version: match version {
+                published_dataset_version: match version {
                     VersionResolution::At(version) => version,
                     VersionResolution::Latest => 0,
                 },

@@ -32,9 +32,9 @@ async fn node_table_uri(db: &Omnigraph, type_name: &str) -> String {
     let table_key = format!("node:{type_name}");
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let table_path = &snapshot
-        .entry(&table_key)
+        .dataset(&table_key)
         .unwrap_or_else(|| panic!("live manifest has no registration for {table_key}"))
-        .table_path;
+        .dataset_path;
     format!(
         "{}/{}",
         db.uri().trim_end_matches('/'),
@@ -44,10 +44,10 @@ async fn node_table_uri(db: &Omnigraph, type_name: &str) -> String {
 
 async fn person_manifest_and_head(db: &Omnigraph, root: &str) -> (u64, u64, String) {
     let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let entry = snap.entry("node:Person").unwrap();
-    let full = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
+    let entry = snap.dataset("node:Person").unwrap();
+    let full = format!("{}/{}", root.trim_end_matches('/'), entry.dataset_path);
     let head = Dataset::open(&full).await.unwrap().version().version;
-    (entry.table_version, head, full)
+    (entry.published_dataset_version, head, full)
 }
 
 async fn add_person_fragments(db: &mut Omnigraph) {
@@ -112,13 +112,13 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
     // table — nothing to compact anywhere.
     assert_eq!(stats.len(), 5);
     for s in &stats {
-        assert_eq!(s.fragments_removed, 0, "{} should not remove", s.table_key);
-        assert_eq!(s.fragments_added, 0, "{} should not add", s.table_key);
+        assert_eq!(s.fragments_removed, 0, "{} should not remove", s.type_key);
+        assert_eq!(s.fragments_added, 0, "{} should not add", s.type_key);
     }
     // `__manifest` is present and reported as a no-op on an empty graph.
     let s = stats
         .iter()
-        .find(|s| s.table_key == "__manifest")
+        .find(|s| s.type_key == "__manifest")
         .expect("optimize stats missing internal table __manifest");
     assert!(
         !s.committed,
@@ -148,17 +148,17 @@ async fn optimize_after_load_then_again_is_idempotent() {
         assert_eq!(
             s.fragments_removed, 0,
             "{} re-optimize should be no-op",
-            s.table_key
+            s.type_key
         );
         assert_eq!(
             s.fragments_added, 0,
             "{} re-optimize should be no-op",
-            s.table_key
+            s.type_key
         );
         assert!(
             !s.committed,
             "{} re-optimize should not commit a new version",
-            s.table_key
+            s.type_key
         );
     }
     let commits_after = db.list_commits(None).await.unwrap();
@@ -209,7 +209,7 @@ async fn optimize_compacts_internal_tables() {
     // and compacts.
     let manifest_stats = stats
         .iter()
-        .find(|s| s.table_key == "__manifest")
+        .find(|s| s.type_key == "__manifest")
         .expect("optimize stats missing internal table __manifest");
     assert!(
         manifest_stats.committed,
@@ -226,7 +226,7 @@ async fn optimize_compacts_internal_tables() {
     assert!(
         !stats
             .iter()
-            .any(|s| s.table_key == "_graph_commits" || s.table_key == "_graph_commit_actors"),
+            .any(|s| s.type_key == "_graph_commits" || s.type_key == "_graph_commit_actors"),
         "no commit-graph datasets exist after Phase B — optimize must not report them"
     );
 
@@ -430,7 +430,7 @@ node Doc {
     // Precondition: the appended fragment is unindexed.
     {
         let snap = snapshot_main(&db).await.unwrap();
-        let ds = snap.open("node:Doc").await.unwrap();
+        let ds = snap.open_dataset("node:Doc").await.unwrap();
         assert!(
             ds.has_unindexed_fragments().await.unwrap(),
             "appended fragment should be unindexed before optimize"
@@ -442,7 +442,7 @@ node Doc {
     // Postcondition: optimize_indices folded the appended fragment in, so every
     // index covers every fragment and `rank` reports fully Indexed.
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Doc").await.unwrap();
+    let ds = snap.open_dataset("node:Doc").await.unwrap();
     assert!(
         !ds.has_unindexed_fragments().await.unwrap(),
         "optimize must extend index coverage to all fragments"
@@ -469,7 +469,7 @@ node Doc {
 async fn optimize_compacts_blob_table_alongside_plain_table() {
     async fn assert_doc_blobs(db: &Omnigraph, expected: &[(String, Option<Vec<u8>>)]) {
         let snapshot = snapshot_main(db).await.unwrap();
-        let table = snapshot.open("node:Doc").await.unwrap();
+        let table = snapshot.open_dataset("node:Doc").await.unwrap();
         let mut scanner = table.scan();
         scanner.project(&["slug", "content"]).unwrap();
         scanner.blob_handling(BlobHandling::AllBinary);
@@ -589,11 +589,11 @@ node Tag {\n    slug: String @key\n}\n";
 
     let doc = stats
         .iter()
-        .find(|s| s.table_key == "node:Doc")
+        .find(|s| s.type_key == "node:Doc")
         .expect("Doc stat present");
     let tag = stats
         .iter()
-        .find(|s| s.table_key == "node:Tag")
+        .find(|s| s.type_key == "node:Tag")
         .expect("Tag stat present");
     // Lance 10's null/empty-safe blob-v2 compaction uses the ordinary path.
     assert_eq!(doc.skipped, None, "blob table must no longer be skipped");
@@ -674,7 +674,7 @@ async fn optimize_publishes_compaction_to_manifest_so_schema_apply_succeeds() {
     let stats = db.optimize().await.unwrap();
     let person = stats
         .iter()
-        .find(|s| s.table_key == "node:Person")
+        .find(|s| s.type_key == "node:Person")
         .expect("Person stat present");
     assert!(
         person.committed,
@@ -684,9 +684,9 @@ async fn optimize_publishes_compaction_to_manifest_so_schema_apply_succeeds() {
     // After optimize, the manifest's recorded table_version must equal the actual
     // Lance HEAD — optimize published its compaction, so there is no drift.
     let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let entry = snap.entry("node:Person").unwrap();
-    let manifest_version = entry.table_version;
-    let full = format!("{}/{}", root, entry.table_path);
+    let entry = snap.dataset("node:Person").unwrap();
+    let manifest_version = entry.published_dataset_version;
+    let full = format!("{}/{}", root, entry.dataset_path);
     let lance_head = Dataset::open(&full).await.unwrap().version().version;
     assert_eq!(
         manifest_version, lance_head,
@@ -724,11 +724,11 @@ async fn optimize_skips_preexisting_manifest_head_drift() {
     let stats = db.optimize().await.unwrap();
     let person = stats
         .iter()
-        .find(|s| s.table_key == "node:Person")
+        .find(|s| s.type_key == "node:Person")
         .expect("Person stat present");
     assert_eq!(person.skipped, Some(SkipReason::DriftNeedsRepair));
     assert!(!person.committed);
-    assert_eq!(person.manifest_version, Some(manifest_before));
+    assert_eq!(person.published_dataset_version, Some(manifest_before));
     assert_eq!(person.lance_head_version, Some(head_before));
 
     let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
@@ -761,18 +761,18 @@ async fn repair_preview_reports_verified_maintenance_drift_without_healing() {
         })
         .await
         .unwrap();
-    assert_eq!(stats.manifest_version, None);
+    assert_eq!(stats.graph_manifest_version, None);
     let person = stats
-        .tables
+        .datasets
         .iter()
-        .find(|s| s.table_key == "node:Person")
+        .find(|s| s.type_key == "node:Person")
         .expect("Person repair stat present");
     assert_eq!(
         person.classification,
         RepairClassification::VerifiedMaintenance
     );
     assert_eq!(person.action, RepairAction::Preview);
-    assert_eq!(person.manifest_version, manifest_before);
+    assert_eq!(person.published_dataset_version, manifest_before);
     assert_eq!(person.lance_head_version, head_before);
     assert!(
         person
@@ -808,13 +808,13 @@ async fn repair_confirm_heals_verified_maintenance_drift() {
         .await
         .unwrap();
     assert!(
-        stats.manifest_version.is_some(),
+        stats.graph_manifest_version.is_some(),
         "confirmed repair should publish one manifest commit"
     );
     let person = stats
-        .tables
+        .datasets
         .iter()
-        .find(|s| s.table_key == "node:Person")
+        .find(|s| s.type_key == "node:Person")
         .expect("Person repair stat present");
     assert_eq!(
         person.classification,
@@ -856,11 +856,11 @@ async fn repair_refuses_raw_delete_without_force() {
         })
         .await
         .unwrap();
-    assert_eq!(stats.manifest_version, None);
+    assert_eq!(stats.graph_manifest_version, None);
     let person = stats
-        .tables
+        .datasets
         .iter()
-        .find(|s| s.table_key == "node:Person")
+        .find(|s| s.type_key == "node:Person")
         .expect("Person repair stat present");
     assert_eq!(person.classification, RepairClassification::Suspicious);
     assert_eq!(person.action, RepairAction::Refused);
@@ -900,9 +900,9 @@ async fn repair_force_heals_suspicious_drift() {
         .await
         .unwrap();
     let person = stats
-        .tables
+        .datasets
         .iter()
-        .find(|s| s.table_key == "node:Person")
+        .find(|s| s.type_key == "node:Person")
         .expect("Person repair stat present");
     assert_eq!(person.classification, RepairClassification::Suspicious);
     assert_eq!(person.action, RepairAction::Forced);
@@ -1286,12 +1286,12 @@ async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
 
     db.branch_create("feature").await.unwrap();
     let feature_before = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
-    let feature_person = feature_before.entry("node:Person").unwrap();
+    let feature_person = feature_before.dataset("node:Person").unwrap();
     assert_eq!(
-        feature_person.table_branch, None,
+        feature_person.native_dataset_branch, None,
         "precondition: Person must still be inherited lazily from main"
     );
-    let pinned_main_version = feature_person.table_version;
+    let pinned_main_version = feature_person.published_dataset_version;
     let feature_people_before = count_rows_branch(&db, "feature", "node:Person").await;
 
     // Move main far enough that keep=1 would collect the version inherited by
@@ -1301,9 +1301,9 @@ async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     assert!(
         pinned_main_version < main_person_version.saturating_sub(1),
         "precondition: lazy-branch pin must fall outside keep=1 retention"
@@ -1387,9 +1387,9 @@ async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
         .snapshot_of(ReadTarget::branch("feature"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     add_person_fragments(&mut db).await;
 
     // Simulate damage created by an older cleanup implementation: raw Lance
@@ -1681,8 +1681,11 @@ async fn index_build_tolerates_null_vector_rows() {
     .expect("load rows with null embeddings");
 
     let before = snapshot_main(&db).await.unwrap();
-    let before_manifest_version = before.version();
-    let before_table_version = before.entry("node:Doc").unwrap().table_version;
+    let before_manifest_version = before.graph_manifest_version();
+    let before_table_version = before
+        .dataset("node:Doc")
+        .unwrap()
+        .published_dataset_version;
 
     // Must not abort: the untrainable vector column is deferred, while id,
     // slug (FTS), and n (BTREE) are built together in one table transaction.
@@ -1691,8 +1694,8 @@ async fn index_build_tolerates_null_vector_rows() {
         .await
         .expect("ensure_indices must not abort when a vector column has no trainable vectors yet");
     assert_eq!(pending.len(), 1, "only the null vector index is pending");
-    assert_eq!(pending[0].table_key, "node:Doc");
-    assert_eq!(pending[0].column, "embedding");
+    assert_eq!(pending[0].type_key, "node:Doc");
+    assert_eq!(pending[0].property, "embedding");
     assert_eq!(
         pending[0].reason,
         "property has no non-null vectors to train on yet"
@@ -1700,16 +1703,16 @@ async fn index_build_tolerates_null_vector_rows() {
 
     let after = snapshot_main(&db).await.unwrap();
     assert_eq!(
-        after.entry("node:Doc").unwrap().table_version,
+        after.dataset("node:Doc").unwrap().published_dataset_version,
         before_table_version + 1,
         "all buildable indexes for one table must land in one CreateIndex transaction"
     );
     assert_eq!(
-        after.version(),
+        after.graph_manifest_version(),
         before_manifest_version + 1,
         "one reconciliation publishes exactly one graph commit"
     );
-    let ds = after.open("node:Doc").await.unwrap();
+    let ds = after.open_dataset("node:Doc").await.unwrap();
     assert!(ds.has_btree_index("id").await.unwrap());
     assert!(ds.has_fts_index("slug").await.unwrap());
     assert!(ds.has_btree_index("n").await.unwrap());
@@ -1745,7 +1748,7 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     // Precondition: `rank` is declared @index but unbuilt -> reads degrade.
     {
         let snap = snapshot_main(&db).await.unwrap();
-        let ds = snap.open("node:Doc").await.unwrap();
+        let ds = snap.open_dataset("node:Doc").await.unwrap();
         assert!(
             matches!(
                 ds.index_coverage("rank").await.unwrap(),
@@ -1759,7 +1762,7 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
 
     // Postcondition: optimize's reconciler materialized the declared index.
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Doc").await.unwrap();
+    let ds = snap.open_dataset("node:Doc").await.unwrap();
     assert!(ds.has_btree_index("id").await.unwrap());
     assert!(ds.has_fts_index("slug").await.unwrap());
     assert!(ds.has_btree_index("rank").await.unwrap());
@@ -1802,7 +1805,7 @@ async fn optimize_materializes_index_after_type_rename() {
     // Post-rename the renamed table's declared rank index is unbuilt (deferred).
     {
         let snap = snapshot_main(&db).await.unwrap();
-        let ds = snap.open("node:Item").await.unwrap();
+        let ds = snap.open_dataset("node:Item").await.unwrap();
         assert!(
             matches!(
                 ds.index_coverage("rank").await.unwrap(),
@@ -1815,7 +1818,7 @@ async fn optimize_materializes_index_after_type_rename() {
     db.optimize().await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Item").await.unwrap();
+    let ds = snap.open_dataset("node:Item").await.unwrap();
     assert_eq!(
         ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,

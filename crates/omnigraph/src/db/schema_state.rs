@@ -247,50 +247,50 @@ pub(crate) fn validate_schema_ir_against_snapshot(
     }
 
     let mut manifest_by_identity = BTreeMap::<TableIdentity, String>::new();
-    for entry in snapshot.entries() {
-        let Some((expected_identity, expected_path)) = expected_by_alias.get(&entry.table_key)
+    for entry in snapshot.datasets() {
+        let Some((expected_identity, expected_path)) = expected_by_alias.get(&entry.type_key)
         else {
             return Err(schema_manifest_conflict(format!(
                 "manifest v{} contains live table '{}' that is absent from accepted SchemaIR",
-                snapshot.version(),
-                entry.table_key
+                snapshot.graph_manifest_version(),
+                entry.type_key
             )));
         };
         if entry.identity != *expected_identity {
             return Err(schema_manifest_conflict(format!(
                 "manifest v{} table '{}' has identity {}, but accepted SchemaIR requires {}",
-                snapshot.version(),
-                entry.table_key,
+                snapshot.graph_manifest_version(),
+                entry.type_key,
                 entry.identity,
                 expected_identity
             )));
         }
-        if entry.table_path != *expected_path {
+        if entry.dataset_path != *expected_path {
             return Err(schema_manifest_conflict(format!(
                 "manifest v{} table '{}' has non-canonical path '{}', expected '{}' for identity {}",
-                snapshot.version(),
-                entry.table_key,
-                entry.table_path,
+                snapshot.graph_manifest_version(),
+                entry.type_key,
+                entry.dataset_path,
                 expected_path,
                 expected_identity
             )));
         }
-        if let Some(previous) = manifest_by_identity.insert(entry.identity, entry.table_key.clone())
+        if let Some(previous) = manifest_by_identity.insert(entry.identity, entry.type_key.clone())
         {
             return Err(schema_manifest_conflict(format!(
                 "manifest v{} aliases '{previous}' and '{}' to the same table identity {}",
-                snapshot.version(),
-                entry.table_key,
+                snapshot.graph_manifest_version(),
+                entry.type_key,
                 entry.identity
             )));
         }
     }
 
     for (table_key, (identity, _)) in expected_by_alias {
-        if snapshot.entry(&table_key).is_none() {
+        if snapshot.dataset(&table_key).is_none() {
             return Err(schema_manifest_conflict(format!(
                 "accepted SchemaIR table '{table_key}' with identity {identity} is missing from manifest v{}",
-                snapshot.version()
+                snapshot.graph_manifest_version()
             )));
         }
     }
@@ -566,7 +566,7 @@ pub(crate) async fn recover_schema_state_files(
         warn!(
             "recovery: SchemaApply sidecar present; completing schema-staging rename so the \
              manifest-drift sweep's roll-forward sees the new catalog (manifest v{})",
-            snapshot.version()
+            snapshot.graph_manifest_version()
         );
         complete_staging_rename(root_uri, storage.as_ref()).await?;
         return Ok(SchemaStateRecovery::CompletedStagingRename {
@@ -599,7 +599,7 @@ pub(crate) async fn recover_schema_state_files(
         validate_current_source_matches(&selected_state, &live_shape)?;
         warn!(
             "completing partial schema-file rename (manifest v{})",
-            snapshot.version()
+            snapshot.graph_manifest_version()
         );
         complete_staging_rename(root_uri, storage.as_ref()).await?;
         return Ok(SchemaStateRecovery::CompletedStagingRename {
@@ -629,28 +629,28 @@ pub(crate) async fn recover_schema_state_files(
     let live_keys = expected_table_keys(&live_shape);
     let staging_keys = expected_table_keys(&staging_shape);
     let actual_keys: BTreeSet<String> = snapshot
-        .entries()
-        .map(|entry| entry.table_key.clone())
+        .datasets()
+        .map(|entry| entry.type_key.clone())
         .collect();
 
     if live_keys == staging_keys {
         return Err(schema_lock_conflict(format!(
             "found schema staging files but cannot disambiguate pre- vs post-commit crash: live and staging schemas imply identical table sets (likely a property-only migration). Inspect _schema.pg.staging vs _schema.pg manually and either remove the staging files (to keep the live schema) or replace _schema.pg with the staging file (to apply the new schema). Manifest version: v{}",
-            snapshot.version()
+            snapshot.graph_manifest_version()
         )));
     }
 
     if actual_keys == live_keys {
         warn!(
             "schema apply crashed before manifest commit; removing staging files and keeping live schema (manifest v{})",
-            snapshot.version()
+            snapshot.graph_manifest_version()
         );
         cleanup_staging_files(root_uri, storage.as_ref()).await?;
         Ok(SchemaStateRecovery::CleanedStaging)
     } else if actual_keys == staging_keys {
         warn!(
             "schema apply crashed after manifest commit; completing schema-file rename (manifest v{})",
-            snapshot.version()
+            snapshot.graph_manifest_version()
         );
         complete_staging_rename(root_uri, storage.as_ref()).await?;
         Ok(SchemaStateRecovery::CompletedStagingRename {

@@ -111,8 +111,8 @@ async fn lazy_target_ref_only_fast_forward_uses_pin_after_main_advances() {
     main.branch_create("source").await.unwrap();
     main.branch_create("target").await.unwrap();
     let target_before = snapshot_branch(&main, "target").await.unwrap();
-    let target_person_before = target_before.entry("node:Person").unwrap().clone();
-    assert_eq!(target_person_before.table_branch, None);
+    let target_person_before = target_before.dataset("node:Person").unwrap().clone();
+    assert_eq!(target_person_before.native_dataset_branch, None);
 
     main.load(
         "main",
@@ -123,7 +123,11 @@ async fn lazy_target_ref_only_fast_forward_uses_pin_after_main_advances() {
     .unwrap();
     let main_after = snapshot_main(&main).await.unwrap();
     assert!(
-        main_after.entry("node:Person").unwrap().table_version > target_person_before.table_version,
+        main_after
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version
+            > target_person_before.published_dataset_version,
         "fixture must advance the inherited native main ref beyond the lazy target pin"
     );
 
@@ -328,11 +332,11 @@ async fn append_only_fast_forward_merge_uses_bounded_fenced_insert_chain() {
         .unwrap();
 
     let base_snapshot = snapshot_main(&main).await.unwrap();
-    let base_entry = base_snapshot.entry("node:Person").unwrap();
+    let base_entry = base_snapshot.dataset("node:Person").unwrap();
     let person_uri = format!(
         "{}/{}",
         main.uri().trim_end_matches('/'),
-        base_entry.table_path.trim_start_matches('/')
+        base_entry.dataset_path.trim_start_matches('/')
     );
     let base_table = Dataset::open(&person_uri).await.unwrap();
     let source_table = Dataset::open(&person_uri)
@@ -345,7 +349,7 @@ async fn append_only_fast_forward_merge_uses_bounded_fenced_insert_chain() {
     let source_identifier = source_table.branch_identifier().await.unwrap();
     assert_eq!(
         source_identifier.find_referenced_version(&base_identifier),
-        Some(base_entry.table_version),
+        Some(base_entry.published_dataset_version),
         "fixture must be a native descendant of the captured merge base"
     );
 
@@ -420,11 +424,11 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
         .unwrap();
 
     let base_snapshot = snapshot_main(&main).await.unwrap();
-    let base_entry = base_snapshot.entry("node:Person").unwrap();
+    let base_entry = base_snapshot.dataset("node:Person").unwrap();
     let person_uri = format!(
         "{}/{}",
         main.uri().trim_end_matches('/'),
-        base_entry.table_path.trim_start_matches('/')
+        base_entry.dataset_path.trim_start_matches('/')
     );
     let base_identifier = Dataset::open(&person_uri)
         .await
@@ -447,7 +451,7 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
     );
     assert_eq!(
         source_identifier.find_referenced_version(&base_identifier),
-        Some(base_entry.table_version)
+        Some(base_entry.published_dataset_version)
     );
 
     let probes = MergeWriteProbes::default();
@@ -476,11 +480,11 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
     append_new_persons(&mut feature, "feature", 2).await;
 
     let base_snapshot = snapshot_main(&main).await.unwrap();
-    let base_entry = base_snapshot.entry("node:Person").unwrap();
+    let base_entry = base_snapshot.dataset("node:Person").unwrap();
     let person_uri = format!(
         "{}/{}",
         main.uri().trim_end_matches('/'),
-        base_entry.table_path.trim_start_matches('/')
+        base_entry.dataset_path.trim_start_matches('/')
     );
     let source = Dataset::open(&person_uri)
         .await
@@ -494,7 +498,7 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         .checked_sub(1)
         .expect("source fixture must have an intermediate version");
     assert!(
-        missing_version > base_entry.table_version,
+        missing_version > base_entry.published_dataset_version,
         "fixture needs at least two source transactions above the merge base"
     );
     let versions_dir = std::path::Path::new(&person_uri)
@@ -748,18 +752,23 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
     }
 
     let before = snapshot_main(&main).await.unwrap();
-    let before_manifest = before.version();
+    let before_manifest = before.graph_manifest_version();
     let before_commits = main.list_commits(Some("main")).await.unwrap().len();
     let mut before_tables = Vec::new();
     for table_key in ["node:Alpha", "node:Beta"] {
-        let entry = before.entry(table_key).unwrap();
+        let entry = before.dataset(table_key).unwrap();
         let table_uri = format!(
             "{}/{}",
             main.uri().trim_end_matches('/'),
-            entry.table_path.trim_start_matches('/')
+            entry.dataset_path.trim_start_matches('/')
         );
         let head = Dataset::open(&table_uri).await.unwrap().version().version;
-        before_tables.push((table_key.to_string(), table_uri, entry.table_version, head));
+        before_tables.push((
+            table_key.to_string(),
+            table_uri,
+            entry.published_dataset_version,
+            head,
+        ));
     }
 
     let probes = MergeWriteProbes::default();
@@ -793,7 +802,11 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
     );
 
     let after = snapshot_main(&main).await.unwrap();
-    assert_eq!(after.version(), before_manifest, "main manifest moved");
+    assert_eq!(
+        after.graph_manifest_version(),
+        before_manifest,
+        "main manifest moved"
+    );
     assert_eq!(
         main.list_commits(Some("main")).await.unwrap().len(),
         before_commits,
@@ -801,7 +814,7 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
     );
     for (table_key, table_uri, table_version, head) in before_tables {
         assert_eq!(
-            after.entry(&table_key).unwrap().table_version,
+            after.dataset(&table_key).unwrap().published_dataset_version,
             table_version,
             "{table_key} manifest pointer moved"
         );

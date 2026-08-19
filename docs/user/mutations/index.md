@@ -62,7 +62,7 @@ every member of a composite key is immutable during an update. See the
 
 A concurrent same-key conflict has effect-aware handling. If no dataset effect
 from the attempt landed, strict insert is rechecked against fresh
-manifest-visible state and returns terminal `key_conflict` only when one of its
+graph-manifest-visible state and returns terminal `key_conflict` only when one of its
 attempted IDs now exists. A generic storage conflict with no exact match is
 never mislabeled as a duplicate: the engine discards the whole strict attempt
 and performs a bounded reprepare without changing it to upsert. Upsert likewise

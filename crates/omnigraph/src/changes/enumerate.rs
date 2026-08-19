@@ -38,10 +38,10 @@ pub(crate) fn validate_change_page_limits(max_changes: usize, max_bytes: u64) ->
             "change page limit must be greater than zero",
         ));
     }
-    if max_changes > super::model::COMMIT_CHANGES_MAX_ROWS {
+    if max_changes > super::model::COMMIT_CHANGES_MAX_CHANGES {
         return Err(OmniError::resource_limit(
-            "commit_changes_page_rows",
-            super::model::COMMIT_CHANGES_MAX_ROWS as u64,
+            "commit_changes_page_changes",
+            super::model::COMMIT_CHANGES_MAX_CHANGES as u64,
             max_changes as u64,
         ));
     }
@@ -304,25 +304,25 @@ async fn plan_intervals(
     let mut parent_branches: BTreeSet<String> = BTreeSet::new();
     let mut child_branches: BTreeSet<String> = BTreeSet::new();
     for interval in intervals {
-        let table_key = interval.table_key();
+        let table_key = interval.type_key();
         match (interval.from, interval.to) {
             (None, Some(added)) => {
-                if added.row_count > 0 {
+                if added.entity_count > 0 {
                     return Err(schema_boundary(graph_commit_id, table_key));
                 }
             }
             (Some(removed), None) => {
-                if removed.row_count > 0 {
+                if removed.entity_count > 0 {
                     return Err(schema_boundary(graph_commit_id, table_key));
                 }
             }
             (Some(from), Some(to)) => {
                 let from_dataset = store.open_at_entry_verified(from).await?;
                 let to_dataset = store.open_at_entry_verified(to).await?;
-                if let Some(branch) = from.table_branch.as_deref() {
+                if let Some(branch) = from.native_dataset_branch.as_deref() {
                     parent_branches.insert(branch.to_string());
                 }
-                if let Some(branch) = to.table_branch.as_deref() {
+                if let Some(branch) = to.native_dataset_branch.as_deref() {
                     child_branches.insert(branch.to_string());
                 }
                 if user_schema_fingerprint(&from_dataset) != user_schema_fingerprint(&to_dataset) {
@@ -380,7 +380,7 @@ async fn reprove_named_branch_heads(
         let fresh = crate::db::manifest::ManifestCoordinator::snapshot_at(
             store.root_uri(),
             Some(branch),
-            snapshot.version(),
+            snapshot.graph_manifest_version(),
         )
         .await?;
         if fresh.graph_head(Some(branch)) != snapshot.graph_head(Some(branch)) {
@@ -532,7 +532,7 @@ pub(crate) async fn enumerate_commit_changes(
 
     if !resume_seen {
         return Err(cursor_rejected(
-            "change continuation no longer names a changed table of this commit",
+            "change continuation no longer names a changed graph type in this commit",
         ));
     }
     Ok(CommitEnumeration::Complete)

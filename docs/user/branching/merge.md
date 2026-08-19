@@ -83,9 +83,9 @@ all-or-nothing. The conflict kinds are:
 | `CardinalityViolation` | The merged result would violate an edge cardinality constraint. |
 | `ValueConstraintViolation` | The merged result would violate a value constraint (enum/range). |
 
-Each conflict carries the compatibility fields `table_key` and `row_id` (when
-applicable), plus the kind and a message. Resolve conflicts by reconciling the
-two branches — typically by making
+Each conflict carries `entity_kind`, `type_name`, and `entity_id` (when
+applicable), plus the conflict kind and a message. Resolve conflicts by
+reconciling the two branches — typically by making
 the conflicting change on one side and re-merging.
 
 See [branches & commits](index.md) for the branch and commit-DAG model, and

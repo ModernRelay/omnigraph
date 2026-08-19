@@ -299,7 +299,7 @@ pub async fn manifest_dataset_version(graph: &Path) -> u64 {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version()
+        .graph_manifest_version()
 }
 
 pub fn s3_test_graph_uri(suite: &str) -> Option<String> {
@@ -735,15 +735,16 @@ pub mod matrix {
             assert_eq!(r.status(), StatusCode::OK, "snapshot {} failed", branch);
             let body = to_bytes(r.into_body(), usize::MAX).await.unwrap();
             let v: Value = serde_json::from_slice(&body).unwrap();
-            v["tables"]
+            v["datasets"]
                 .as_array()
-                .and_then(|tables| {
-                    tables
-                        .iter()
-                        .find(|t| t["table_key"].as_str() == Some("node:Person"))
+                .and_then(|datasets| {
+                    datasets.iter().find(|dataset| {
+                        dataset["entity_kind"].as_str() == Some("node")
+                            && dataset["type_name"].as_str() == Some("Person")
+                    })
                 })
-                .and_then(|t| t["row_count"].as_u64())
-                .unwrap_or_else(|| panic!("snapshot {} missing node:Person", branch))
+                .and_then(|dataset| dataset["entity_count"].as_u64())
+                .unwrap_or_else(|| panic!("snapshot {branch} missing node type Person"))
         }
 
         /// True iff the named Person exists on `branch`. Uses the

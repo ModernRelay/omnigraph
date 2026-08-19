@@ -126,7 +126,7 @@ async fn composite_flow_canonical_lifecycle() {
 
     // After: feature has 4 + Eve + Frank = 6 Persons.
     let snap = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
-    let person_ds = snap.open("node:Person").await.unwrap();
+    let person_ds = snap.open_dataset("node:Person").await.unwrap();
     assert_eq!(
         person_ds.count_rows(None).await.unwrap(),
         6,
@@ -220,7 +220,7 @@ async fn composite_flow_canonical_lifecycle() {
 
     // Capture the pre-merge main snapshot for time-travel verification later.
     let snapshot_pre_merge = snapshot_main(&db).await.unwrap();
-    let pre_merge_version = snapshot_pre_merge.version();
+    let pre_merge_version = snapshot_pre_merge.graph_manifest_version();
 
     // ─────────────────────────────────────────────────────────────────
     // Step 7: branch_merge feature → main, verify merge result + audit.
@@ -275,12 +275,15 @@ async fn composite_flow_canonical_lifecycle() {
     );
 
     // ─────────────────────────────────────────────────────────────────
-    // Step 9: snapshot_at_version(pre_merge_version) — verify time-travel
+    // Step 9: snapshot_at_graph_manifest_version(pre_merge_version) — verify time-travel
     // still sees the pre-merge state (4 Persons on main, no Eve/Frank).
     // ─────────────────────────────────────────────────────────────────
-    let pre_merge_snapshot = db.snapshot_at_version(pre_merge_version).await.unwrap();
+    let pre_merge_snapshot = db
+        .snapshot_at_graph_manifest_version(pre_merge_version)
+        .await
+        .unwrap();
     let pre_merge_persons = pre_merge_snapshot
-        .open("node:Person")
+        .open_dataset("node:Person")
         .await
         .unwrap()
         .count_rows(None)
@@ -297,10 +300,10 @@ async fn composite_flow_canonical_lifecycle() {
     // Lance HEAD), indices stay valid and queryable, and a post-optimize
     // strict write commits.
     //
-    // This step used to carry a "Known limitation": `optimize_all_tables`
+    // This step used to carry a "Known limitation": `optimize_all_datasets`
     // ran Lance `compact_files` without publishing the new version to
     // `__manifest`, so the manifest pin lagged the Lance HEAD and the next
-    // strict write / schema apply failed with `ExpectedVersionMismatch`
+    // strict write / schema apply failed with `PublishedDatasetVersionMismatch`
     // ("stale view … refresh and retry") — so post-optimize mutations were
     // deliberately omitted here. optimize now publishes the compacted
     // version, and this flow exercises exactly that previously-failing
@@ -560,7 +563,7 @@ async fn composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh() {
 ///   feat-a → main, main's table_branch entries for Person and Knows
 ///   must reflect the rewrite-on-active path; the second merge needs
 ///   them to compute its diff correctly.
-/// - **Time-travel through merge DAG**: snapshot_at_version at three
+/// - **Time-travel through merge DAG**: snapshot_at_graph_manifest_version at three
 ///   distinct points (pre-feat-a-merge, post-feat-a-merge-pre-helen,
 ///   pre-feat-b-merge) must each return the right historical state
 ///   without bleed-through from later commits.
@@ -858,9 +861,12 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // historical query accidentally resolves against current indices
     // instead of the snapshot's frozen index state).
     // ─────────────────────────────────────────────────────────────────
-    let pre_a_snap = db.snapshot_at_version(pre_merge_a_version).await.unwrap();
+    let pre_a_snap = db
+        .snapshot_at_graph_manifest_version(pre_merge_a_version)
+        .await
+        .unwrap();
     let pre_a_persons = pre_a_snap
-        .open("node:Person")
+        .open_dataset("node:Person")
         .await
         .unwrap()
         .count_rows(None)
@@ -871,7 +877,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
         "time-travel to pre-merge-a must show exactly 6 Persons (dataset-direct)"
     );
     let pre_a_knows = pre_a_snap
-        .open("edge:Knows")
+        .open_dataset("edge:Knows")
         .await
         .unwrap()
         .count_rows(None)
@@ -922,9 +928,12 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // Step 15: time-travel to pre-merge-b-version. Reads must show
     // post-feat-a-merge state (Eve, Grace, Helen present) but NOT Frank.
     // ─────────────────────────────────────────────────────────────────
-    let pre_b_snap = db.snapshot_at_version(pre_merge_b_version).await.unwrap();
+    let pre_b_snap = db
+        .snapshot_at_graph_manifest_version(pre_merge_b_version)
+        .await
+        .unwrap();
     let pre_b_persons = pre_b_snap
-        .open("node:Person")
+        .open_dataset("node:Person")
         .await
         .unwrap()
         .count_rows(None)

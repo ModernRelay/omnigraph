@@ -28,8 +28,8 @@ async fn s3_compatible_graph_lifecycle_works() {
 
     let mut reopened = Omnigraph::open(&uri).await.unwrap();
     let snapshot = reopened.snapshot_of("main").await.unwrap();
-    assert!(snapshot.entry("node:Person").is_some());
-    assert!(snapshot.entry("edge:Knows").is_some());
+    assert!(snapshot.dataset("node:Person").is_some());
+    assert!(snapshot.dataset("edge:Knows").is_some());
 
     let alice = query_main(
         &mut reopened,

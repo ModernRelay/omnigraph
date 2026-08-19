@@ -460,7 +460,7 @@ pub(crate) fn precondition_failed_cli(
             error: message,
             code: None,
             merge_conflicts: Vec::new(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,

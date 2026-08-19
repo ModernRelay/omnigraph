@@ -7,7 +7,7 @@
 | Commit graph dirs (retired) | `_graph_commits.lance` / `_graph_commit_actors.lance` | retired in Phase B; lineage lives in `__manifest` (`graph_commit` / `graph_head` rows) since RFC-013 Phase 7. A graph this binary creates has neither. |
 | Recovery audit dir | `_graph_commit_recoveries.lance` | internal exact record of completed crash-recovery actions; no public CLI query yet |
 | BranchMerge logical data-transaction ceiling | `MAX_BRANCH_MERGE_DATA_TRANSACTIONS = 1024` | maximum strict-insert/upsert/delete transactions one dataset may arm in a `protocol_v4` chain; a larger plan fails before sidecar arm |
-| Exact recovery history-scan ceiling | `MAX_EFFECT_IDENTITY_SCAN_VERSIONS = 1026` | bounded schema-v9 transaction-history classification: 1,024 logical BranchMerge data transactions plus headroom for one allowed derived `CreateIndex` tail and one compensating `Restore`. Recovery can crash after the restore but before manifest publication, so both extra versions must remain classifiable; a longer history fails closed as unverifiable rather than causing an unbounded scan |
+| Exact recovery history-scan ceiling | `MAX_EFFECT_IDENTITY_SCAN_VERSIONS = 1026` | bounded schema-v9 transaction-history classification: 1,024 logical BranchMerge data transactions plus headroom for one allowed derived `CreateIndex` tail and one compensating `Restore`. Recovery can crash after the restore but before graph-manifest publication, so both extra versions must remain classifiable; a longer history fails closed as unverifiable rather than causing an unbounded scan |
 | Run branch prefix (legacy, removed) | `__run__` | pre-v0.4.0 Run state machine; no longer a reserved name. A graph still carrying `__run__*` branches is sub-v4 and refused on open (rebuild via export/import). |
 | Schema apply lock | `__schema_apply_lock__` | schema apply |
 | Manifest publisher retry budget | `PUBLISHER_RETRY_BUDGET = 5` | manifest publish |
@@ -47,7 +47,7 @@
 
 **Expand traversal dispatch.** With `OMNIGRAPH_TRAVERSAL_MODE` unset, the engine
 chooses the indexed (per-hop BTREE) vs CSR (whole-graph in-memory) path with a
-cost model over cheap manifest counts (frontier size, |E|, source-vertex count,
+cost model over cheap graph-manifest counts (frontier size, |E|, source-vertex count,
 hops) plus the index-coverage signal: the indexed path is preferred when its
 frontier-relative work beats building the CSR (≈ when `hops × frontier` is a
 small fraction of the source-vertex set), and CSR is preferred for dense/deep

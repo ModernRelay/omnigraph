@@ -833,6 +833,15 @@ async fn extended_state_json_status_surfaces_statuses() {
         out.resource_statuses["graph.knowledge"].status,
         ResourceLifecycleStatus::Applied
     );
+    assert_eq!(
+        out.observations["graph.knowledge"]["graph_manifest_version"],
+        12
+    );
+    assert!(
+        out.observations["graph.knowledge"]
+            .get("manifest_version")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1174,7 +1183,7 @@ async fn import_missing_state_creates_state_with_graph_observation() {
             .map(String::as_str),
         Some(sha256_hex(SCHEMA.as_bytes()).as_str())
     );
-    assert!(out.observations["graph.knowledge"]["manifest_version"].is_number());
+    assert!(out.observations["graph.knowledge"]["graph_manifest_version"].is_number());
     assert_eq!(
         out.observations["graph.knowledge"]["schema_matches_desired"],
         true
@@ -1256,7 +1265,7 @@ async fn refresh_existing_minimal_state_increments_revision_and_updates_cas() {
 }
 
 #[tokio::test]
-async fn refresh_records_live_schema_digest_and_manifest_version() {
+async fn refresh_records_live_schema_digest_and_graph_manifest_version() {
     let dir = fixture();
     init_derived_graph(dir.path()).await;
     let state_dir = dir.path().join(CLUSTER_STATE_DIR);
@@ -1274,7 +1283,7 @@ async fn refresh_records_live_schema_digest_and_manifest_version() {
         out.observations["graph.knowledge"]["schema_digest"],
         sha256_hex(SCHEMA.as_bytes())
     );
-    assert!(out.observations["graph.knowledge"]["manifest_version"].is_u64());
+    assert!(out.observations["graph.knowledge"]["graph_manifest_version"].is_u64());
 }
 
 #[tokio::test]
@@ -1692,8 +1701,11 @@ async fn external_blob_policy_allow_to_deny_restores_historical_state_without_gr
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap();
-    let before_manifest_version = before.version();
-    let before_table_version = before.entry("node:Person").unwrap().table_version;
+    let before_graph_manifest_version = before.graph_manifest_version();
+    let before_table_version = before
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
 
     // Rollback preparation must be performed by the 0.10 control plane: remove
     // the field entirely (so 0.9 can parse desired config) and re-apply deny.
@@ -1713,9 +1725,15 @@ async fn external_blob_policy_allow_to_deny_restores_historical_state_without_gr
 
     let after = Omnigraph::open_read_only(&graph_uri).await.unwrap();
     let after = after.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert_eq!(after.version(), before_manifest_version);
     assert_eq!(
-        after.entry("node:Person").unwrap().table_version,
+        after.graph_manifest_version(),
+        before_graph_manifest_version
+    );
+    assert_eq!(
+        after
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
         before_table_version
     );
     assert!(recovery_sidecars(dir.path()).is_empty());
@@ -3437,7 +3455,7 @@ query seed($name: String) {
             release: Some(release_rx),
         };
         export_db
-            .export_jsonl_to_writer("main", &[], &[], &mut writer)
+            .export_jsonl_to_writer("main", &[], &mut writer)
             .await
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)

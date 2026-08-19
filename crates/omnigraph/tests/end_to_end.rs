@@ -65,19 +65,19 @@ async fn load_populates_all_types() {
     let snap = snapshot_main(&db).await.unwrap();
 
     // 4 persons
-    let person_ds = snap.open("node:Person").await.unwrap();
+    let person_ds = snap.open_dataset("node:Person").await.unwrap();
     assert_eq!(person_ds.count_rows(None).await.unwrap(), 4);
 
     // 2 companies
-    let company_ds = snap.open("node:Company").await.unwrap();
+    let company_ds = snap.open_dataset("node:Company").await.unwrap();
     assert_eq!(company_ds.count_rows(None).await.unwrap(), 2);
 
     // 3 Knows edges
-    let knows_ds = snap.open("edge:Knows").await.unwrap();
+    let knows_ds = snap.open_dataset("edge:Knows").await.unwrap();
     assert_eq!(knows_ds.count_rows(None).await.unwrap(), 3);
 
     // 2 WorksAt edges
-    let works_at_ds = snap.open("edge:WorksAt").await.unwrap();
+    let works_at_ds = snap.open_dataset("edge:WorksAt").await.unwrap();
     assert_eq!(works_at_ds.count_rows(None).await.unwrap(), 2);
 }
 
@@ -281,7 +281,7 @@ async fn append_adds_rows() {
     load_jsonl(&db, batch2, LoadMode::Append).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Person").await.unwrap();
+    let ds = snap.open_dataset("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 2);
 }
 
@@ -299,7 +299,7 @@ async fn load_from_file_works() {
         .unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Person").await.unwrap();
+    let ds = snap.open_dataset("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 4);
 }
 
@@ -318,7 +318,7 @@ async fn signals_fixture_loads_correctly() {
     let snap = snapshot_main(&db).await.unwrap();
 
     // Verify some types have data
-    let company_ds = snap.open("node:Company").await.unwrap();
+    let company_ds = snap.open_dataset("node:Company").await.unwrap();
     assert!(company_ds.count_rows(None).await.unwrap() > 0);
 
     // Verify node IDs are @key values (slug)
@@ -764,7 +764,7 @@ async fn mutation_delete_node_cascades_edges() {
     // Verify no edges reference Alice
     let snap = snapshot_main(&db).await.unwrap();
     for edge_key in &["edge:Knows", "edge:WorksAt"] {
-        let ds = snap.open(edge_key).await.unwrap();
+        let ds = snap.open_dataset(edge_key).await.unwrap();
         let batches: Vec<arrow_array::RecordBatch> = ds
             .scan()
             .try_into_stream()
@@ -975,7 +975,7 @@ async fn blob_load_base64_inline() {
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Document").await.unwrap();
+    let ds = snap.open_dataset("node:Document").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 2);
 }
 
@@ -1381,7 +1381,11 @@ async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots(
     // extension/PK metadata entry, but remove the graph property-lifetime
     // marker that this release starts writing on newly created/rebuilt fields.
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let table_path = snapshot.entry("node:Document").unwrap().table_path.clone();
+    let table_path = snapshot
+        .dataset("node:Document")
+        .unwrap()
+        .dataset_path
+        .clone();
     let mut table = lance::Dataset::open(dir.path().join(table_path).to_string_lossy().as_ref())
         .await
         .unwrap();
@@ -1434,7 +1438,7 @@ async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots(
     .await
     .unwrap();
     let current = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let current_table = current.open("node:Document").await.unwrap();
+    let current_table = current.open_dataset("node:Document").await.unwrap();
     assert!(
         !current_table
             .schema()
@@ -1485,7 +1489,7 @@ async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots(
     .await
     .unwrap();
     let rebuilt = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let rebuilt_table = rebuilt.open("node:Document").await.unwrap();
+    let rebuilt_table = rebuilt.open_dataset("node:Document").await.unwrap();
     let expected_property_id = db
         .catalog()
         .node_property_id("Document", "content")
@@ -1604,7 +1608,7 @@ async fn blob_scan_with_descriptions_on_nonempty_dataset() {
 
     // Open the dataset directly and try BlobsDescriptions
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Document").await.unwrap();
+    let ds = snap.open_dataset("node:Document").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
 
     // BlobsDescriptions works without filter
@@ -1664,7 +1668,7 @@ node Person {
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Person").await.unwrap();
+    let ds = snap.open_dataset("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
 }
 
@@ -1705,7 +1709,7 @@ node Measurement {
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Measurement").await.unwrap();
+    let ds = snap.open_dataset("node:Measurement").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
 }
 
@@ -1769,7 +1773,7 @@ node Order {
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Order").await.unwrap();
+    let ds = snap.open_dataset("node:Order").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
 }
 
@@ -1968,7 +1972,7 @@ edge WorksAt: Person -> Company @card(0..1)
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("edge:WorksAt").await.unwrap();
+    let ds = snap.open_dataset("edge:WorksAt").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
 }
 
@@ -2361,13 +2365,16 @@ async fn append_mode_manifest_row_count_is_total() {
     load_jsonl(&db, extra, LoadMode::Append).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
-    let entry = snap.entry("node:Person").unwrap();
+    let entry = snap.dataset("node:Person").unwrap();
     // Must be total rows (4 + 1 = 5), not just the appended batch size (1)
-    assert_eq!(entry.row_count, 5);
+    assert_eq!(entry.entity_count, 5);
 
     // Verify actual dataset count matches manifest
-    let ds = snap.open("node:Person").await.unwrap();
-    assert_eq!(ds.count_rows(None).await.unwrap() as u64, entry.row_count);
+    let ds = snap.open_dataset("node:Person").await.unwrap();
+    assert_eq!(
+        ds.count_rows(None).await.unwrap() as u64,
+        entry.entity_count
+    );
 }
 
 // ─── Regression: cardinality violation must not commit manifest ───────────────
@@ -2468,7 +2475,7 @@ async fn ensure_indices_does_not_error_on_repeated_call() {
 
     // Data should still be queryable after index operations
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Person").await.unwrap();
+    let ds = snap.open_dataset("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 4);
 }
 

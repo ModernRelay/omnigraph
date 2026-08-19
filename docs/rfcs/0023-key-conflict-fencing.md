@@ -1088,7 +1088,7 @@ and failed to open that branch-local version. Both records, including the
 nonzero verifier result, are preserved in
 `rfc023-invalid-series-snapshot-reopen-20260715T094810Z.jsonl`; neither is an
 acceptance trial and neither is replaced or reused. The verifier was changed to
-scan the exact read-only `SnapshotTable` already returned by OmniGraph's pinned
+scan the exact read-only `SnapshotDataset` already returned by OmniGraph's pinned
 snapshot.
 
 The second attempted paired series used seeds `2302001..2302005` for 10K and

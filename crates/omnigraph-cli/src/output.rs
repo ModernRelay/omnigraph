@@ -3,13 +3,13 @@
 
 use super::*;
 
-pub(crate) fn graph_type_subject(table_key: &str) -> String {
-    if let Some(type_name) = table_key.strip_prefix("node:") {
+pub(crate) fn graph_type_subject(type_key: &str) -> String {
+    if let Some(type_name) = type_key.strip_prefix("node:") {
         format!("node type '{type_name}'")
-    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+    } else if let Some(type_name) = type_key.strip_prefix("edge:") {
         format!("edge type '{type_name}'")
     } else {
-        format!("dataset '{table_key}'")
+        format!("dataset '{type_key}'")
     }
 }
 
@@ -22,10 +22,9 @@ pub(crate) struct LoadOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) base_branch: Option<String>,
     pub(crate) branch_created: bool,
-    pub(crate) nodes_loaded: usize,
-    pub(crate) edges_loaded: usize,
-    pub(crate) node_types_loaded: usize,
-    pub(crate) edge_types_loaded: usize,
+    pub(crate) nodes: Vec<GraphBatchDeclarationOutput>,
+    pub(crate) edges: Vec<GraphBatchDeclarationOutput>,
+    pub(crate) total_entities: usize,
     pub(crate) commit: Option<CommitOutput>,
 }
 
@@ -40,10 +39,9 @@ pub(crate) fn load_output_from_graph_batch(
         mode,
         base_branch: output.base_branch.clone(),
         branch_created: output.branch_created,
-        nodes_loaded: output.nodes.iter().map(|entry| entry.rows_loaded).sum(),
-        edges_loaded: output.edges.iter().map(|entry| entry.rows_loaded).sum(),
-        node_types_loaded: output.nodes.len(),
-        edge_types_loaded: output.edges.len(),
+        nodes: output.nodes.clone(),
+        edges: output.edges.clone(),
+        total_entities: output.total_entities,
         commit: output.commit.clone(),
     }
 }
@@ -61,16 +59,38 @@ pub(crate) fn load_output_from_receipt(
     receipt: &omnigraph::loader::LoadReceipt,
 ) -> LoadOutput {
     let result = &receipt.result;
+    let mut nodes = result
+        .nodes_loaded
+        .iter()
+        .map(|(name, entities_loaded)| GraphBatchDeclarationOutput {
+            name: name.clone(),
+            entities_loaded: *entities_loaded,
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut edges = result
+        .edges_loaded
+        .iter()
+        .map(|(name, entities_loaded)| GraphBatchDeclarationOutput {
+            name: name.clone(),
+            entities_loaded: *entities_loaded,
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| left.name.cmp(&right.name));
+    let total_entities = nodes
+        .iter()
+        .chain(&edges)
+        .map(|entry| entry.entities_loaded)
+        .sum();
     LoadOutput {
         uri: uri.to_string(),
         branch: branch.to_string(),
         mode,
         base_branch: result.base_branch.clone(),
         branch_created: result.branch_created,
-        nodes_loaded: result.nodes_loaded.values().sum(),
-        edges_loaded: result.edges_loaded.values().sum(),
-        node_types_loaded: result.nodes_loaded.len(),
-        edge_types_loaded: result.edges_loaded.len(),
+        nodes,
+        edges,
+        total_entities,
         commit: Some(omnigraph_api_types::commit_output(&receipt.commit)),
     }
 }
@@ -87,7 +107,7 @@ pub(crate) fn print_schema_apply_human(output: &SchemaApplyOutput) {
     println!("schema apply for {}", output.uri);
     println!("supported: {}", if output.supported { "yes" } else { "no" });
     println!("applied: {}", if output.applied { "yes" } else { "no" });
-    println!("graph_manifest_version: {}", output.manifest_version);
+    println!("graph_manifest_version: {}", output.graph_manifest_version);
     if output.steps.is_empty() {
         println!("no schema changes");
         return;
@@ -475,14 +495,13 @@ pub(crate) fn finish_cluster_force_unlock(output: &ForceUnlockOutput, json: bool
 
 pub(crate) fn print_load_human(payload: &LoadOutput) {
     println!(
-        "loaded {} on branch {} with {}: {} nodes across {} node types, {} edges across {} edge types",
+        "loaded {} on branch {} with {}: {} entities across {} node types and {} edge types",
         payload.uri,
         payload.branch,
         payload.mode,
-        payload.nodes_loaded,
-        payload.node_types_loaded,
-        payload.edges_loaded,
-        payload.edge_types_loaded
+        payload.total_entities,
+        payload.nodes.len(),
+        payload.edges.len()
     );
     if payload.branch_created {
         if let Some(base) = &payload.base_branch {
@@ -493,7 +512,8 @@ pub(crate) fn print_load_human(payload: &LoadOutput) {
 
 pub(crate) fn print_ingest_human(output: &IngestOutput) {
     println!(
-        "ingested {} into branch {} from {} with {} ({})",
+        "ingested {} entities from {} into branch {} from {} with {} ({})",
+        output.total_entities,
         output.uri,
         output.branch,
         output.base_branch.as_deref().unwrap_or("main"),
@@ -504,11 +524,16 @@ pub(crate) fn print_ingest_human(output: &IngestOutput) {
             "branch exists"
         }
     );
-    for table in &output.tables {
+    for declaration in &output.nodes {
         println!(
-            "{}: {} entities loaded",
-            graph_type_subject(&table.table_key),
-            table.rows_loaded
+            "node type '{}': {} entities loaded",
+            declaration.name, declaration.entities_loaded
+        );
+    }
+    for declaration in &output.edges {
+        println!(
+            "edge type '{}': {} entities loaded",
+            declaration.name, declaration.entities_loaded
         );
     }
     if let Some(actor_id) = &output.actor_id {
@@ -753,9 +778,9 @@ pub(crate) fn render_annotations(
 pub(crate) fn print_embed_human(output: &EmbedOutput) {
     println!(
         "embedded {} records (selected {}, cleaned {}) from {} -> {} [{} {}d]",
-        output.embedded_rows,
-        output.selected_rows,
-        output.cleaned_rows,
+        output.embedded_records,
+        output.selected_records,
+        output.cleaned_records,
         output.input,
         output.output,
         output.mode,
@@ -764,21 +789,22 @@ pub(crate) fn print_embed_human(output: &EmbedOutput) {
 }
 
 pub(crate) fn print_snapshot_human(
-    branch: &str,
-    manifest_version: u64,
+    graph_branch: &str,
+    graph_manifest_version: u64,
     internal_schema_version: u32,
-    entries: &[SnapshotTableOutput],
+    entries: &[SnapshotDatasetOutput],
 ) {
-    println!("graph_branch: {}", branch);
-    println!("graph_manifest_version: {}", manifest_version);
+    println!("graph_branch: {}", graph_branch);
+    println!("graph_manifest_version: {}", graph_manifest_version);
     println!("internal_schema_version: {}", internal_schema_version);
     for entry in entries {
         println!(
-            "{} published_dataset_version={} native_dataset_branch={} entities={}",
-            graph_type_subject(&entry.table_key),
-            entry.table_version,
-            entry.table_branch.as_deref().unwrap_or("main"),
-            entry.row_count
+            "{} type '{}' published_dataset_version={} native_dataset_branch={} entities={}",
+            entry.entity_kind.as_str(),
+            entry.type_name,
+            entry.published_dataset_version,
+            entry.native_dataset_branch.as_deref().unwrap_or("main"),
+            entry.entity_count
         );
     }
 }
@@ -838,12 +864,12 @@ pub(crate) fn print_change_human(output: &ChangeOutput) {
 
 pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
     for commit in commits {
-        let branch = commit.manifest_branch.as_deref().unwrap_or("main");
+        let branch = commit.graph_branch.as_deref().unwrap_or("main");
         println!(
             "{} graph_branch={} graph_manifest_version={}{}",
             commit.graph_commit_id,
             branch,
-            commit.manifest_version,
+            commit.graph_manifest_version,
             commit
                 .actor_id
                 .as_deref()
@@ -857,9 +883,9 @@ pub(crate) fn print_commit_human(commit: &CommitOutput) {
     println!("graph_commit_id: {}", commit.graph_commit_id);
     println!(
         "graph_branch: {}",
-        commit.manifest_branch.as_deref().unwrap_or("main")
+        commit.graph_branch.as_deref().unwrap_or("main")
     );
-    println!("graph_manifest_version: {}", commit.manifest_version);
+    println!("graph_manifest_version: {}", commit.graph_manifest_version);
     if let Some(parent_commit_id) = &commit.parent_commit_id {
         println!("parent_commit_id: {}", parent_commit_id);
     }
@@ -1523,7 +1549,7 @@ mod tests {
     };
 
     #[test]
-    fn graph_type_subject_hides_internal_table_key_syntax() {
+    fn graph_type_subject_hides_type_key_syntax() {
         assert_eq!(graph_type_subject("node:Person"), "node type 'Person'");
         assert_eq!(graph_type_subject("edge:Knows"), "edge type 'Knows'");
         assert_eq!(graph_type_subject("__manifest"), "dataset '__manifest'");
@@ -1542,7 +1568,7 @@ mod tests {
 
     fn change(id: &str) -> omnigraph_api_types::EntityChangeOutput {
         omnigraph_api_types::EntityChangeOutput {
-            kind: omnigraph_api_types::ChangeEntityKind::Node,
+            kind: omnigraph_api_types::EntityKindOutput::Node,
             r#type: omnigraph_api_types::ChangeTypeOutput {
                 id: "type-public".to_string(),
                 name: "Person".to_string(),

@@ -993,7 +993,7 @@ impl Omnigraph {
 
         let entry = resolved_target
             .snapshot
-            .entry(&resolved_cell.table_key)
+            .dataset(&resolved_cell.table_key)
             .ok_or_else(|| {
                 OmniError::manifest(format!(
                     "{} type '{}' is unavailable at the selected target",
@@ -1013,13 +1013,13 @@ impl Omnigraph {
                 resolved_cell.table_incarnation_id
             )));
         }
-        let expected_table_version = entry.table_version;
+        let expected_table_version = entry.published_dataset_version;
         let stable_table_id = entry.identity.stable_table_id;
         let table_incarnation_id = entry.identity.table_incarnation_id;
 
         crate::failpoints::maybe_fail(crate::failpoints::names::BLOB_READ_POST_CAPTURE)?;
 
-        let dataset = Arc::new(if entry.table_branch.is_some() {
+        let dataset = Arc::new(if entry.native_dataset_branch.is_some() {
             // Local filesystems provide no manifest e-tag, so the ordinary
             // live-read cache key cannot distinguish delete/recreate ABA at the
             // same named branch and numeric table version. Blob reads need a
@@ -1029,7 +1029,7 @@ impl Omnigraph {
         } else {
             resolved_target
                 .snapshot
-                .open_dataset(&resolved_cell.table_key)
+                .open_lance_dataset(&resolved_cell.table_key)
                 .await?
         });
         let actual_table_version = dataset.version().version;
@@ -1042,7 +1042,7 @@ impl Omnigraph {
                 expected_table_version
             )));
         }
-        if entry.table_branch.is_some() {
+        if entry.native_dataset_branch.is_some() {
             // A named Lance branch can be deleted and recreated at the same
             // path and numeric version. Neither V6 graph entries nor Lance's
             // local manifest e-tag persist a branch-incarnation witness strong
@@ -1135,7 +1135,7 @@ impl Omnigraph {
                 let live_cell = resolve_blob_cell(&live_catalog, &cell)?;
                 let live_entry = live_target
                     .snapshot
-                    .entry(&live_cell.table_key)
+                    .dataset(&live_cell.table_key)
                     .ok_or_else(|| {
                         OmniError::manifest(format!(
                             "{} type '{}' is unavailable at the current branch head",
@@ -1146,8 +1146,8 @@ impl Omnigraph {
                 if live_cell.stable_table_id != resolved_cell.stable_table_id
                     || live_cell.table_incarnation_id != resolved_cell.table_incarnation_id
                     || live_cell.stable_property_id != resolved_cell.stable_property_id
-                    || live_entry.table_version != entry.table_version
-                    || live_entry.table_branch != entry.table_branch
+                    || live_entry.published_dataset_version != entry.published_dataset_version
+                    || live_entry.native_dataset_branch != entry.native_dataset_branch
                     || live_entry.version_metadata != entry.version_metadata
                 {
                     return Err(OmniError::manifest(format!(

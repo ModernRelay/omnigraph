@@ -44,10 +44,10 @@ pub(crate) struct EmbedArgs {
 pub(crate) struct EmbedOutput {
     pub input: String,
     pub output: String,
-    pub rows: usize,
-    pub selected_rows: usize,
-    pub embedded_rows: usize,
-    pub cleaned_rows: usize,
+    pub records: usize,
+    pub selected_records: usize,
+    pub embedded_records: usize,
+    pub cleaned_records: usize,
     pub mode: &'static str,
     pub dimension: usize,
     pub model: String,
@@ -209,10 +209,10 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
     };
 
     let mut line = String::new();
-    let mut rows = 0usize;
-    let mut selected_rows = 0usize;
-    let mut embedded_rows = 0usize;
-    let mut cleaned_rows = 0usize;
+    let mut records = 0usize;
+    let mut selected_records = 0usize;
+    let mut embedded_records = 0usize;
+    let mut cleaned_records = 0usize;
 
     loop {
         line.clear();
@@ -224,11 +224,11 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
         if raw.is_empty() {
             continue;
         }
-        rows += 1;
-        let mut row = parse_row(raw, rows)?;
+        records += 1;
+        let mut row = parse_row(raw, records)?;
         let selected = row_matches_selection(&row, &job.type_filter, &job.selectors);
         if selected {
-            selected_rows += 1;
+            selected_records += 1;
         }
 
         if let Some(type_spec) = row
@@ -242,7 +242,7 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
                             .data_mut()
                             .is_some_and(|data| data.remove(&type_spec.target).is_some())
                     {
-                        cleaned_rows += 1;
+                        cleaned_records += 1;
                     }
                 }
                 EmbedMode::ReembedAll => {
@@ -254,7 +254,7 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
                             client.as_ref().unwrap(),
                         )
                         .await?;
-                        embedded_rows += 1;
+                        embedded_records += 1;
                     }
                 }
                 EmbedMode::FillMissing => {
@@ -272,7 +272,7 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
                             client.as_ref().unwrap(),
                         )
                         .await?;
-                        embedded_rows += 1;
+                        embedded_records += 1;
                     }
                 }
             }
@@ -288,10 +288,10 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
     Ok(EmbedOutput {
         input: job.input.display().to_string(),
         output: job.output.display().to_string(),
-        rows,
-        selected_rows,
-        embedded_rows,
-        cleaned_rows,
+        records,
+        selected_records,
+        embedded_records,
+        cleaned_records,
         mode: job.mode.as_str(!job.selectors.is_empty()),
         dimension: job.spec.dimension,
         // The embedding model is resolved solely from the provider config; the
