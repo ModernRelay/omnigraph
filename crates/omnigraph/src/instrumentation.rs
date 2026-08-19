@@ -213,6 +213,11 @@ pub(crate) enum MergeTimingPhase {
     OuterPrepare,
     ProvenInsertHistory,
     ProvenInsertPlanScan,
+    /// The general route's per-table three-way ordered walk (base, source,
+    /// and target cursors) plus merged-row staging into the temp table — one
+    /// interval per table, disjoint from the keyed publish loop. The proven
+    /// insert-only route bypasses the walk and records nothing here.
+    TableWalk,
     CandidateValidation,
     FinalRevalidation,
     RecoveryArm,
@@ -226,11 +231,61 @@ pub(crate) enum MergeTimingPhase {
 }
 
 impl MergeTimingPhase {
-    const COUNT: usize = 13;
+    const COUNT: usize = 14;
 
     const fn index(self) -> usize {
         self as usize
     }
+
+    /// Every phase, in recording (index) order. Kept next to `COUNT` so adding
+    /// a phase updates both or fails the exhaustiveness of `name`.
+    const ALL: [MergeTimingPhase; MergeTimingPhase::COUNT] = [
+        MergeTimingPhase::OuterPrepare,
+        MergeTimingPhase::ProvenInsertHistory,
+        MergeTimingPhase::ProvenInsertPlanScan,
+        MergeTimingPhase::TableWalk,
+        MergeTimingPhase::CandidateValidation,
+        MergeTimingPhase::FinalRevalidation,
+        MergeTimingPhase::RecoveryArm,
+        MergeTimingPhase::PhysicalPublish,
+        MergeTimingPhase::KeyedStage,
+        MergeTimingPhase::KeyedCommit,
+        MergeTimingPhase::RecoveryConfirm,
+        MergeTimingPhase::ManifestPublish,
+        MergeTimingPhase::RecoveryCleanup,
+        MergeTimingPhase::OuterRestoreRefresh,
+    ];
+
+    /// Stable diagnostic name (the variant name) for out-of-crate readouts.
+    const fn name(self) -> &'static str {
+        match self {
+            MergeTimingPhase::OuterPrepare => "OuterPrepare",
+            MergeTimingPhase::ProvenInsertHistory => "ProvenInsertHistory",
+            MergeTimingPhase::ProvenInsertPlanScan => "ProvenInsertPlanScan",
+            MergeTimingPhase::TableWalk => "TableWalk",
+            MergeTimingPhase::CandidateValidation => "CandidateValidation",
+            MergeTimingPhase::FinalRevalidation => "FinalRevalidation",
+            MergeTimingPhase::RecoveryArm => "RecoveryArm",
+            MergeTimingPhase::PhysicalPublish => "PhysicalPublish",
+            MergeTimingPhase::KeyedStage => "KeyedStage",
+            MergeTimingPhase::KeyedCommit => "KeyedCommit",
+            MergeTimingPhase::RecoveryConfirm => "RecoveryConfirm",
+            MergeTimingPhase::ManifestPublish => "ManifestPublish",
+            MergeTimingPhase::RecoveryCleanup => "RecoveryCleanup",
+            MergeTimingPhase::OuterRestoreRefresh => "OuterRestoreRefresh",
+        }
+    }
+}
+
+/// One diagnostic merge phase's accumulated elapsed time, in microseconds, as
+/// returned by [`MergeWriteProbes::merge_timing_snapshot`]. `total_us` sums
+/// every recorded interval; `max_us` is the largest single interval (per-table
+/// phases record one interval per table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeTimingReading {
+    pub phase: &'static str,
+    pub total_us: u64,
+    pub max_us: u64,
 }
 
 #[derive(Clone, Default)]
@@ -381,6 +436,12 @@ impl MergeWriteProbes {
     pub fn proven_insert_plan_scan_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::ProvenInsertPlanScan)
     }
+    pub fn table_walk_total_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::TableWalk)
+    }
+    pub fn table_walk_max_us(&self) -> u64 {
+        self.merge_timing_max_us(MergeTimingPhase::TableWalk)
+    }
     pub fn candidate_validation_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::CandidateValidation)
     }
@@ -416,6 +477,22 @@ impl MergeWriteProbes {
     }
     pub fn outer_restore_refresh_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::OuterRestoreRefresh)
+    }
+
+    /// Snapshot every diagnostic merge-timing phase (name, total, max in
+    /// microseconds), in recording order. The out-of-crate readout door for
+    /// benchmarks that install probes via [`with_merge_write_probes`]; the
+    /// per-phase accessors above remain the in-crate test surface. Purely
+    /// observational — reads the same relaxed counters the accessors read.
+    pub fn merge_timing_snapshot(&self) -> Vec<MergeTimingReading> {
+        MergeTimingPhase::ALL
+            .into_iter()
+            .map(|phase| MergeTimingReading {
+                phase: phase.name(),
+                total_us: self.merge_timing_total_us(phase),
+                max_us: self.merge_timing_max_us(phase),
+            })
+            .collect()
     }
 }
 
@@ -781,5 +858,20 @@ impl StorageAdapter for CountingStorageAdapter {
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
         self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.delete_prefix(prefix_uri).await
+    }
+}
+
+#[cfg(test)]
+mod merge_timing_phase_tests {
+    use super::*;
+
+    /// `ALL` must list every phase in recording (index) order: the snapshot
+    /// readout iterates `ALL` and pairs each entry with the counter at its
+    /// index, so a reordered or missing entry would silently misattribute.
+    #[test]
+    fn all_lists_every_phase_in_index_order() {
+        for (i, phase) in MergeTimingPhase::ALL.into_iter().enumerate() {
+            assert_eq!(phase.index(), i);
+        }
     }
 }

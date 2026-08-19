@@ -17,7 +17,7 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
 **Version surveyed:** 0.10.0
-**Workspace crates:** `omnigraph-compiler`, `omnigraph-storage` (shared control-object storage), `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`
+**Workspace crates:** `omnigraph-compiler`, `omnigraph-storage` (shared control-object storage), `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`, `omnigraph-bench` (branch-merge micro-benchmark harness, internal instrument)
 **Storage substrate:** Lance 10.0.0 (columnar, versioned, branchable; crates.io release)
 **License:** MIT
 **Toolchain:** Rust stable, edition 2024
@@ -123,6 +123,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | CI / release workflows | [docs/dev/ci.md](docs/dev/ci.md) |
 | Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/dev/branch-protection.md](docs/dev/branch-protection.md) |
 | Constants & tunables cheat sheet | [docs/user/reference/constants.md](docs/user/reference/constants.md) |
+| Benchmark harness (RFC 0039 micro profile: merge wall-clock, phases, storage calls; `scripts/generate_merge_bench_fixtures.py` generates the merge-bench v1 fixtures) | [crates/omnigraph-bench/README.md](crates/omnigraph-bench/README.md) |
 | RFC process — public contribution and maintainer design-series tracks | [docs/rfcs/README.md](docs/rfcs/README.md) |
 | Per-version release notes | [docs/releases/](docs/releases/) |
 

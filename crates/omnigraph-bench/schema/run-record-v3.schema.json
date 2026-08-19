@@ -1,0 +1,386 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "omnigraph-bench/run-record-v3.schema.json",
+  "title": "omnigraph-bench run record, version 3",
+  "description": "The normative field list of a v3 run record (RFC 0039: 'the field list is normative, not illustrative: a record missing any field is invalid'). The harness validates every record against this file on write and diff validates on read. The in-crate validator interprets the subset of JSON Schema used here: type, properties, required, items, enum, minItems, additionalProperties (false only). Struct-derived objects are closed (additionalProperties false) so a struct field added without its schema counterpart fails validation; the deliberately open objects say why in their description.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "record_version",
+    "point_name",
+    "point_name_format",
+    "profile",
+    "instrument_access",
+    "invocation_id",
+    "session_id",
+    "invocation_unix_seconds",
+    "run_spec",
+    "sut",
+    "machine",
+    "results"
+  ],
+  "properties": {
+    "record_version": { "type": "integer", "enum": [3] },
+    "point_name": { "type": "string" },
+    "point_name_format": { "type": "integer", "enum": [1] },
+    "profile": { "type": "string", "enum": ["micro"] },
+    "instrument_access": { "type": "string" },
+    "label": { "type": "string" },
+    "invocation_id": { "type": "string" },
+    "session_id": { "type": "string" },
+    "invocation_unix_seconds": { "type": "integer" },
+    "run_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["data", "state", "workload", "environment", "protocol"],
+      "properties": {
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provenance", "tables", "rows_per_table", "column_shape", "payload_bytes"],
+          "properties": {
+            "provenance": { "type": "string", "enum": ["synthetic", "corpus-derived"] },
+            "tables": { "type": "integer" },
+            "rows_per_table": { "type": "integer" },
+            "column_shape": { "type": "string" },
+            "payload_bytes": { "type": "integer" }
+          }
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "fragmentation",
+            "index_existence",
+            "index_freshness",
+            "deletion_history",
+            "compaction_recency",
+            "builder_version",
+            "generation",
+            "base_load_commits"
+          ],
+          "properties": {
+            "fragmentation": { "type": "string" },
+            "index_existence": { "type": "string" },
+            "index_freshness": { "type": "string" },
+            "deletion_history": { "type": "string" },
+            "compaction_recency": { "type": "string" },
+            "builder_version": { "type": "integer" },
+            "generation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["tables", "rows", "payload_bytes", "diverged_tables", "deltas"],
+              "properties": {
+                "tables": { "type": "integer" },
+                "rows": { "type": "integer" },
+                "payload_bytes": { "type": "integer" },
+                "diverged_tables": { "type": "integer" },
+                "deltas": { "type": "array", "items": { "type": "integer" }, "minItems": 1 }
+              }
+            },
+            "base_load_commits": { "type": "integer" },
+            "fixture_name": { "type": "string" },
+            "fixture_manifest": {
+              "type": "object",
+              "description": "The fixture's fixture-manifest.json embedded verbatim; deliberately open — its shape is owned by the fixture manifest version, which evolves independently of the record schema."
+            }
+          }
+        },
+        "workload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scenario",
+            "merge_kind",
+            "arrival",
+            "delta_rows_per_side",
+            "delta_split_per_side",
+            "diverged_tables"
+          ],
+          "properties": {
+            "scenario": { "type": "string", "enum": ["m3", "m5"] },
+            "merge_kind": { "type": "string" },
+            "arrival": {
+              "type": "string",
+              "enum": ["unscheduled single-shot", "scheduled steady", "scheduled bursty"]
+            },
+            "delta_rows_per_side": { "type": "integer" },
+            "delta_split_per_side": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["updates", "deletes", "inserts"],
+              "properties": {
+                "updates": { "type": "integer" },
+                "deletes": { "type": "integer" },
+                "inserts": { "type": "integer" }
+              }
+            },
+            "diverged_tables": { "type": "integer" }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["backend", "root_uri_scheme", "warmth"],
+          "properties": {
+            "backend": { "type": "string" },
+            "root_uri_scheme": { "type": "string" },
+            "s3_endpoint": { "type": "string" },
+            "warmth": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["regime", "warmup_reps_discarded", "detail"],
+              "properties": {
+                "regime": {
+                  "type": "string",
+                  "enum": ["cold", "warm", "post-invalidation", "uncontrolled-v2"]
+                },
+                "warmup_reps_discarded": { "type": "integer" },
+                "detail": { "type": "string" }
+              }
+            }
+          }
+        },
+        "protocol": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["instrument", "attribution", "repetitions", "timer", "rep_independence"],
+          "properties": {
+            "instrument": { "type": "string" },
+            "attribution": { "type": "string", "enum": ["per-phase on", "off"] },
+            "repetitions": { "type": "integer" },
+            "timer": { "type": "string" },
+            "rep_independence": { "type": "string" }
+          }
+        }
+      }
+    },
+    "sut": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_commit", "build_profile", "build_opt_level", "engine_configuration"],
+      "properties": {
+        "source_commit": { "type": "string" },
+        "build_profile": { "type": "string", "enum": ["release"] },
+        "build_opt_level": { "type": "string" },
+        "engine_configuration": {
+          "type": "object",
+          "description": "Every OMNIGRAPH_* environment variable at run time, as a string map; deliberately open — the key set is whatever flags the engine grows."
+        }
+      }
+    },
+    "machine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch", "os_version", "cpu_model", "storage_class"],
+      "properties": {
+        "os": { "type": "string" },
+        "arch": { "type": "string" },
+        "os_version": { "type": "string" },
+        "cpu_model": { "type": "string" },
+        "physical_cores": { "type": "integer" },
+        "logical_cores": { "type": "integer" },
+        "memory_bytes": { "type": "integer" },
+        "storage_class": { "type": "string", "enum": ["ssd", "rotational", "unknown"] }
+      }
+    },
+    "results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wall_clock_ms",
+        "phases",
+        "merge_outcome",
+        "verified_rows_table0",
+        "fixture_build_seconds",
+        "write_path",
+        "storage_calls"
+      ],
+      "properties": {
+        "wall_clock_ms": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["p50", "p95", "min", "max", "mean", "tail_support", "reps"],
+          "properties": {
+            "p50": { "type": "number" },
+            "p95": { "type": "number" },
+            "min": { "type": "number" },
+            "max": { "type": "number" },
+            "mean": { "type": "number" },
+            "tail_support": { "type": "string", "enum": ["supported", "directional"] },
+            "reps": { "type": "array", "items": { "type": "number" }, "minItems": 1 }
+          }
+        },
+        "phases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["phase", "total_us_p50", "total_us_max", "max_single_us", "per_rep_total_us"],
+            "properties": {
+              "phase": { "type": "string" },
+              "total_us_p50": { "type": "integer" },
+              "total_us_max": { "type": "integer" },
+              "max_single_us": { "type": "integer" },
+              "per_rep_total_us": { "type": "array", "items": { "type": "integer" } }
+            }
+          }
+        },
+        "merge_outcome": { "type": "string", "enum": ["Merged"] },
+        "verified_rows_table0": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["table_key", "expected", "actual"],
+          "properties": {
+            "table_key": { "type": "string" },
+            "expected": { "type": "integer" },
+            "actual": { "type": "integer" }
+          }
+        },
+        "fixture_build_seconds": { "type": "number" },
+        "write_path": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stage_merge_insert_calls",
+            "stage_merge_insert_rows",
+            "stage_known_present_update_calls",
+            "stage_known_present_update_rows",
+            "stage_fenced_insert_calls",
+            "stage_fenced_insert_rows",
+            "strict_insert_preflight_calls"
+          ],
+          "properties": {
+            "stage_merge_insert_calls": { "type": "array", "items": { "type": "integer" } },
+            "stage_merge_insert_rows": { "type": "array", "items": { "type": "integer" } },
+            "stage_known_present_update_calls": { "type": "array", "items": { "type": "integer" } },
+            "stage_known_present_update_rows": { "type": "array", "items": { "type": "integer" } },
+            "stage_fenced_insert_calls": { "type": "array", "items": { "type": "integer" } },
+            "stage_fenced_insert_rows": { "type": "array", "items": { "type": "integer" } },
+            "strict_insert_preflight_calls": { "type": "array", "items": { "type": "integer" } }
+          }
+        },
+        "storage_calls": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scope",
+            "layer",
+            "physical_attempts",
+            "physical_attempts_note",
+            "concurrency_witness",
+            "concurrency_witness_note",
+            "cumulative_request_time_logical_us",
+            "cumulative_request_time_physical_us",
+            "cumulative_request_time_note",
+            "latency_calibration",
+            "latency_calibration_note",
+            "manifest_store",
+            "table_store",
+            "control_plane"
+          ],
+          "properties": {
+            "scope": { "type": "string" },
+            "layer": { "type": "string", "enum": ["logical-operations", "physical-request-attempts"] },
+            "physical_attempts": {
+              "type": ["object", "null"],
+              "description": "Always null at the current seam; deliberately open — the shape belongs to the future seam that observes HTTP-level attempts, and closes when one populates it."
+            },
+            "physical_attempts_note": { "type": "string" },
+            "concurrency_witness": { "type": ["array", "null"], "items": { "type": "integer" } },
+            "concurrency_witness_note": { "type": "string" },
+            "cumulative_request_time_logical_us": { "type": ["array", "null"], "items": { "type": "integer" } },
+            "cumulative_request_time_physical_us": { "type": ["array", "null"], "items": { "type": "integer" } },
+            "cumulative_request_time_note": { "type": "string" },
+            "latency_calibration": {
+              "type": ["object", "null"],
+              "description": "Always null until a calibration is measured; deliberately open — the calibration's shape belongs to the measurement that produces it."
+            },
+            "latency_calibration_note": { "type": "string" },
+            "manifest_store": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "get",
+                  "put",
+                  "put_part",
+                  "head",
+                  "list",
+                  "delete",
+                  "copy",
+                  "rename",
+                  "put_multipart",
+                  "multipart_complete",
+                  "multipart_abort"
+                ],
+                "properties": {
+                  "get": { "type": "integer" },
+                  "put": { "type": "integer" },
+                  "put_part": { "type": "integer" },
+                  "head": { "type": "integer" },
+                  "list": { "type": "integer" },
+                  "delete": { "type": "integer" },
+                  "copy": { "type": "integer" },
+                  "rename": { "type": "integer" },
+                  "put_multipart": { "type": "integer" },
+                  "multipart_complete": { "type": "integer" },
+                  "multipart_abort": { "type": "integer" }
+                }
+              }
+            },
+            "table_store": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "get",
+                  "put",
+                  "put_part",
+                  "head",
+                  "list",
+                  "delete",
+                  "copy",
+                  "rename",
+                  "put_multipart",
+                  "multipart_complete",
+                  "multipart_abort"
+                ],
+                "properties": {
+                  "get": { "type": "integer" },
+                  "put": { "type": "integer" },
+                  "put_part": { "type": "integer" },
+                  "head": { "type": "integer" },
+                  "list": { "type": "integer" },
+                  "delete": { "type": "integer" },
+                  "copy": { "type": "integer" },
+                  "rename": { "type": "integer" },
+                  "put_multipart": { "type": "integer" },
+                  "multipart_complete": { "type": "integer" },
+                  "multipart_abort": { "type": "integer" }
+                }
+              }
+            },
+            "control_plane": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["read", "exists", "list", "mutation"],
+                "properties": {
+                  "read": { "type": "integer" },
+                  "exists": { "type": "integer" },
+                  "list": { "type": "integer" },
+                  "mutation": { "type": "integer" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
