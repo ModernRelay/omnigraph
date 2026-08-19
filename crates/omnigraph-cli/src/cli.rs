@@ -188,14 +188,14 @@ pub(crate) enum Command {
         /// Without this flag a missing branch is an error, never a fork.
         #[arg(long)]
         from: Option<String>,
-        /// How existing rows are handled: overwrite | append | merge.
+        /// How existing entities are handled: overwrite | append | merge.
         /// Required — overwrite is destructive, so there is no default.
         #[arg(long)]
         mode: CliLoadMode,
         #[arg(long)]
         json: bool,
     },
-    /// Deprecated loader-compatible ingestion command (defaults: --mode merge, --from main)
+    /// Indefinitely supported compatibility alias for load (defaults: --mode merge, --from main)
     #[command(hide = true)]
     Ingest {
         /// Graph URI
@@ -273,19 +273,19 @@ pub(crate) enum Command {
         uri: String,
         /// Replace orphan schema artifacts only after proving that the URI
         /// has no `__manifest`. Without this flag, init refuses a URI that
-        /// already holds a manifest or any schema artifact. This flag never
+        /// already holds a graph manifest or any schema artifact. This flag never
         /// overwrites an initialized graph or purges its Lance datasets.
         #[arg(long)]
         force: bool,
     },
-    /// Compact small Lance fragments in every table of the graph
+    /// Compact small Lance fragments in every backing dataset of the graph
     Optimize {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Classify and explicitly repair manifest/head drift
+    /// Classify and explicitly repair graph-manifest/Lance-HEAD drift
     Repair {
         /// Graph URI
         uri: Option<String>,
@@ -300,11 +300,11 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Remove old Lance versions from every table of the graph (destructive)
+    /// Remove old Lance versions from every backing dataset of the graph (destructive)
     Cleanup {
         /// Graph URI
         uri: Option<String>,
-        /// Number of recent versions to keep per table. Either `--keep` or
+        /// Number of recent versions to keep per dataset. Either `--keep` or
         /// `--older-than` (or both) must be set.
         #[arg(long)]
         keep: Option<u32>,
@@ -650,8 +650,8 @@ pub(crate) enum SchemaCommand {
         json: bool,
         /// Allow destructive (data-loss) schema changes.
         ///
-        /// Without this flag, drops are "soft": the column or table
-        /// is removed from the current manifest version but prior
+        /// Without this flag, drops are "soft": the property or type
+        /// is removed from the current graph-manifest version but prior
         /// versions are retained, so `snapshot_at_version(pre_drop)`
         /// can still read the dropped data until `omnigraph cleanup`
         /// runs. With this flag, drops are "hard": `cleanup_old_versions`

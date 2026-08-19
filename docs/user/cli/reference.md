@@ -15,7 +15,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `mutate <name>` (alias: `change`) | run a mutation query; same catalog (by-name, served-only, verb asserts mutation) / ad-hoc (`--query`/`-e`) lanes as `query`. `--if-commit <id>` makes the write conditional (compare-and-swap): it runs only if the branch head commit (from a `query --json` response or `commit list`) still equals `<id>`; a lost race exits with code 4 and, with `--json`, the structured `precondition_failure` body — re-read and decide again. Remote conditional writes use a dedicated capability route, so an older server fails with 404 before execution instead of ignoring the condition. `change` is the deprecated previous name (one-line stderr warning) |
 | `blob get \| stat ENTITY TYPE ID PROPERTY` | read one logical node/edge Blob cell. `get` streams raw managed bytes to stdout or `--out`; `stat` performs descriptor-only metadata output. Accepts `--store`, `--server` + `--graph`, or a store/server profile/default, but no positional graph URI or `--cluster`. See [Blob read commands](#blob-read-commands) |
 | `alias <name> [args]` | invoke an operator alias — a read-only personal binding (under `aliases:` in `~/.omnigraph/config.yaml`) to a stored query on a named server (replaces the removed `--alias` flag; stored mutations are rejected before execution) |
-| `snapshot` | print current snapshot (per-table version + row count) |
+| `snapshot` | print current snapshot (per-dataset version + entity count) |
 | `export` | dump to JSONL on stdout (`--type T`, `--table K` filters) |
 | `branch create \| list \| delete \| merge` | branching ops. `merge --delete-branch` deletes the source branch after a successful merge (its own `branch_delete` policy check; a refusal is a stderr warning, not a failure — see [merge](../branching/merge.md)) |
 | `commit list \| show \| changes` | inspect commit graph. `list` is newest-first; `--branch <name>` lists that branch's reachable history, omitted = `main`. `changes <commit_id>` prints the exact entity changes vs the first parent (filters `--kind`/`--type`/`--op`, repeatable); it auto-paginates incrementally instead of buffering the whole diff, unless `--page-token` fetches one exact page |
@@ -23,8 +23,8 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `schema plan \| apply \| show (alias: get)` | migrations. `apply` refuses a cluster-managed graph (one whose storage is inside a cluster) and points at `cluster apply` — those graphs evolve through the cluster ledger, not a direct apply |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
 | `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state; `apply` converges resources, graph creation, schema updates, and approved graph deletion; `status` reads the state ledger; `refresh`/`import` update local state from read-only graph observations; `force-unlock <LOCK_ID>` removes only the exact held local lock |
-| `optimize` | non-destructive Lance compaction + index reconciliation (blob-bearing tables use the normal path; tables with uncovered drift are skipped and `--json` reports `skipped`) |
-| `repair [--confirm] [--force]` | preview or explicitly publish uncovered manifest/head drift. `--confirm` heals verified maintenance drift and exits non-zero if suspicious/unverifiable drift is refused; `--force --confirm` publishes suspicious/unverifiable drift after operator review |
+| `optimize` | non-destructive Lance compaction + index reconciliation (blob-bearing datasets use the normal path; datasets with uncovered drift are skipped and `--json` reports `skipped`) |
+| `repair [--confirm] [--force]` | preview or explicitly publish uncovered drift between a dataset's published and Lance HEAD versions. `--confirm` heals verified maintenance drift and exits non-zero if suspicious/unverifiable drift is refused; `--force --confirm` publishes suspicious/unverifiable drift after operator review |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC (`--confirm` to execute; also needs `--yes` against a non-local `s3://` target — see *Write diagnostics & destructive confirmation*) |
 | `embed` | offline JSONL embedding pipeline |
 | `policy validate \| test \| explain` | Cedar tooling against a cluster's applied policies (`--cluster <dir>`; `--graph <id>` picks a graph's bundle when several apply). `test` takes `--tests <file>`; `explain` takes `--actor`/`--action`/`--branch`/`--target-branch` |
@@ -35,9 +35,10 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 
 Effectful `load`, `ingest`, and `mutate` commands include a `commit` object in
 their `--json` output. It is the exact graph commit published by that write,
-with `graph_commit_id`, manifest branch/version, parent ids, actor, and creation
+with `graph_commit_id`, the compatibility fields `manifest_branch` and
+`manifest_version`, parent ids, actor, and creation
 time—not a later lookup of the branch head. A successful mutation that matches
-no rows publishes nothing and returns `"commit": null`.
+no entities publishes nothing and returns `"commit": null`.
 
 ## Command capabilities
 
@@ -73,7 +74,7 @@ omnigraph blob stat ENTITY TYPE ID PROPERTY
 
 `ENTITY` is `node` or `edge`; `TYPE` and `PROPERTY` are names in the current
 accepted graph schema. The selector remains graph-level. It never exposes a
-Lance table, dataset, physical row address, or per-table lane.
+Lance dataset, physical row address, or per-dataset lane.
 
 Both commands have `any` capability but are scoped-only: use `--store URI` or
 `--server NAME_OR_URL --graph ID`, a store/server `--profile`, or the

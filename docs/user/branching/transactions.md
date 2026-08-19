@@ -4,9 +4,9 @@ OmniGraph does not have `BEGIN` / `COMMIT` / `ROLLBACK`. Branches do that job. T
 
 The architectural rule lives in [`docs/dev/invariants.md`](../../dev/invariants.md):
 
-> **Mutations publish at one boundary.** A `mutate_as` or `load` operation
-> accumulates constructive writes, commits each touched table at the end, then
-> publishes one manifest update.
+In practice, a `mutate_as` or `load` operation accumulates constructive writes,
+commits each touched dataset at the end, and then publishes one graph-manifest
+update.
 
 If you need to coordinate multiple queries atomically, you fork a branch, run mutations on it, and merge when you're satisfied. If something goes wrong, you delete the branch.
 
@@ -16,10 +16,10 @@ Two primitives, two scopes:
 
 | Scope | Primitive | Atomic? | Failure mode |
 |---|---|---|---|
-| **One `.gq` query** (any number of statements inside) | The query itself — handled by the publisher's atomic manifest commit | Yes — all statements land together or none of them do | The publisher never publishes; target unchanged |
+| **One `.gq` query** (any number of statements inside) | The query itself — handled by the publisher's atomic graph-manifest commit | Yes — all statements land together or none of them do | The publisher never publishes; target unchanged |
 | **Many queries that must succeed together** | Branches: `branch_create` → run N queries on the branch → `branch_merge` | Yes — the merge is a single atomic publish | Drop the branch (`branch_delete`); main is unaffected |
 
-Snapshot isolation is per-query — every read inside one query sees one consistent manifest version. Two concurrent queries on the same branch see independent snapshots. Mutation/load and branch merge capture the target branch head as coarse OCC authority, so a prepared plan is never silently reparented after another graph commit. Merge additionally pins the exact source commit it classified; a later source advance is not substituted into the prepared result.
+Snapshot isolation is per-query — every read inside one query sees one consistent graph manifest version. Two concurrent queries on the same branch see independent snapshots. Mutation/load and branch merge capture the target branch head as coarse OCC authority, so a prepared plan is never silently reparented after another graph commit. Merge additionally pins the exact source commit it classified; a later source advance is not substituted into the prepared result.
 
 ## Comparison with `BEGIN` / `COMMIT`
 
@@ -107,7 +107,7 @@ Properties:
 - Each query on the branch is its own publisher commit — so they're individually atomic. Per-query CAS works on branches just like on main.
 - The branch lives on disk. Process crash mid-workflow? Re-open and resume.
 - Multiple agents can work on different branches in parallel without blocking each other.
-- The merge is a three-way merge at the row level. Conflicts surface as structured merge-conflict kinds (`DivergentInsert`, `DivergentUpdate`, `DeleteVsUpdate`, …) so callers can handle them programmatically.
+- The merge is a three-way merge at the entity level. Conflicts surface as structured merge-conflict kinds (`DivergentInsert`, `DivergentUpdate`, `DeleteVsUpdate`, …) so callers can handle them programmatically.
 
 ### 4. Coordinating multiple agents
 
@@ -127,7 +127,7 @@ omnigraph change --branch agent-b/work … graph.omni
 omnigraph branch merge agent-b/work --into main graph.omni
 ```
 
-Each agent sees a consistent snapshot of `main` at the time it forked. The first merge to `main` lands as a fast-forward (or a no-op if no concurrent change). The second merge runs three-way: rows touched by both branches surface as `MergeConflict`s for the caller to resolve.
+Each agent sees a consistent snapshot of `main` at the time it forked. The first merge to `main` lands as a fast-forward (or a no-op if no concurrent change). The second merge runs three-way: entities touched by both branches surface as `MergeConflict`s for the caller to resolve.
 
 This is the workflow agentic loops are designed around: **branches are the unit of "an agent's working set."**
 
@@ -138,7 +138,7 @@ This is the workflow agentic loops are designed around: **branches are the unit 
 | Single query fails mid-flight | Publisher never publishes; target unchanged | Read the error, decide whether to retry |
 | Branch authority changes before physical effects | Retryable inserts/loads fully reprepare; strict writes return `read_set_conflict` | For a surfaced strict conflict, refresh and retry deliberately |
 | Authority changes after a physical effect | The write returns `recovery_required` and leaves its durable sidecar | Resolve recovery by read-write reopen/server restart before retrying |
-| An overlapping recovery intent remains unresolved before effects | The write returns `recovery_required` with that intent's operation id and does not advance a table | Resolve recovery by read-write reopen/server restart before retrying |
+| An overlapping recovery intent remains unresolved before effects | The write returns `recovery_required` with that intent's operation id and does not advance a dataset | Resolve recovery by read-write reopen/server restart before retrying |
 | Branch with N successful mutations, then merge fails (three-way conflict) | Each individual mutation already committed on the branch; merge surfaces `MergeConflicts` | Inspect, decide whether to keep working on the branch, abandon it (`branch_delete`), or resolve and re-merge |
 | Process crashes mid-branch-workflow | Each completed mutation on the branch is durable | Re-open the graph, continue where you left off |
 

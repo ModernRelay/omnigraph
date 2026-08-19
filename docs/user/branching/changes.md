@@ -2,11 +2,11 @@
 
 Diffing two read targets uses a three-level algorithm:
 
-1. **Manifest diff**: skip sub-tables whose `(table_version, table_branch)` is unchanged.
+1. **Graph-manifest diff**: skip datasets whose legacy `(table_version, table_branch)` fields are unchanged.
 2. **Lineage check**:
    - Same branch lineage → fast path: use the per-row `_row_last_updated_at_version` column to classify Insert/Update/Delete.
    - Different lineages → ID-based streaming comparison.
-3. **Row-level diff**: streaming, no full materialization.
+3. **Entity-level diff**: streaming, no full materialization.
 
 ## Public API
 
@@ -25,10 +25,10 @@ ChangeSet { from_version, to_version, branch?, changes[], stats }
 
 ## Ordering
 
-Changed table lifetimes are grouped in ascending graph-visible `table_key`
-order, with immutable table identity as the hidden tie-breaker when one alias
+Changed dataset lifetimes are grouped in ascending graph-visible `table_key`
+order, with immutable dataset identity as the hidden tie-breaker when one alias
 names multiple lifetimes across the compared snapshots. Entity order within one
-table is not a public guarantee; callers that need their own total order must
+dataset is not a public guarantee; callers that need their own total order must
 sort the returned changes explicitly.
 
 ## Commit changes: exact per-commit entity diffs
@@ -43,14 +43,14 @@ vocabulary only:
   parent; the merged parent rides along for DAG-aware callers),
   `authored_branch` (the branch the commit originally landed on), `actor_id`,
   and `authored_at` — authorship time in Unix epoch microseconds, minted
-  before table effects and stable across retries. It is deliberately not a
+  before dataset effects and stable across retries. It is deliberately not a
   commit or publication timestamp.
 - Changes carry `kind` (node | edge), `type` (`id` — an opaque graph type
   identity that survives a supported rename and changes after drop/re-add —
   plus `name`), the logical `id`, `op`, and exact logical images: an insert
   has only `after`, an update exact `before` **and** `after`, a delete only
   `before`. Edge images embed `endpoints: {from, to}` per image.
-- No response ever exposes tables, datasets, incarnations, physical versions,
+- No response ever exposes backing datasets, incarnations, physical versions,
   fragments, or row addresses.
 
 Order within a block is frozen: nodes before edges, then opaque type
@@ -75,7 +75,7 @@ The embedded API exposes the bounded `commit_changes_page` primitive directly.
 
 The parentless genesis commit has no diff (409, `parentless_commit`):
 bootstrap from a baseline instead. A commit whose parent/child pair crosses a
-schema change (a property add/drop rewriting a table, or dropping a type that
+schema change (a property add/drop rewriting a dataset, or dropping a type that
 still holds data) is refused (409, `schema_boundary`) rather than guessed —
 schema evolution is never synthesized into entity changes.
 
@@ -114,7 +114,7 @@ omnigraph changes poll --cursor <cursor> --json      # resume durably
 
 ## Change baselines
 
-A cursor is not a retention lease: `cleanup` may reclaim table versions a
+A cursor is not a retention lease: `cleanup` may reclaim dataset versions a
 retained commit pins. When the feed can no longer continue contiguously it
 returns **410** with `change_feed_gap` (`cursor`,
 `first_unreadable_commit_id`); direct diffs of a reclaimed commit return the

@@ -911,7 +911,7 @@ impl PolicyRequest {
 // pins (see MR-722 design refinements comment, 2026-05-17).
 
 /// Resource scope for a policy decision. Branch-grained on purpose —
-/// per-type / per-row granularity is owned by the query-layer (MR-725).
+/// per-type / per-entity granularity is owned by the query-layer (MR-725).
 ///
 /// The variants map to today's `(branch, target_branch)` pair convention
 /// in [`PolicyRequest`]. Each writer in the engine picks the variant

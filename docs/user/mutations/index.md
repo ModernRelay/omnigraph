@@ -10,8 +10,8 @@ query onboard($name: String, $title: String) {
 }
 ```
 
-An edge type is inserted the same way — its endpoint columns are just
-properties in the assignment block (`insert WorksAt { person: $p, org: $o }`).
+An edge type is inserted the same way — its endpoint fields are supplied in the
+assignment block (`insert WorksAt { person: $p, org: $o }`).
 
 ## Statements
 
@@ -22,7 +22,7 @@ properties in the assignment block (`insert WorksAt { person: $p, org: $o }`).
 `<value>` is a literal, `$param`, or `now()`.
 
 On a blob-bearing type, an update materializes and rewrites blob payloads only
-for the rows matched by its predicate, including blobs the update does not
+for the entities matched by its predicate, including blobs the update does not
 change. This keeps correctness independent of physical index state, but adds
 read/write I/O proportional to the matched blob bytes; use selective update
 predicates for large blobs.
@@ -41,46 +41,46 @@ physical effects may be discarded and fully revalidated with a bounded
 internal retry. A load in `append` mode remains strict insert through such a
 retry; it never changes mode. Strict Update/Delete/Overwrite operations instead
 return a structured read-set conflict. This branch-wide token is deliberately
-conservative: a change to a different table can invalidate a prepared strict
+conservative: a change to a different node or edge type can invalidate a prepared strict
 write because constraints may have read it.
 
-Every node and edge table is keyed physically by `id`. The storage transaction
+Every node and edge dataset is keyed physically by `id`. The storage transaction
 for an insertion or upsert carries an exact-`id` conflict filter:
 
 - a keyed node `insert` is an upsert by its derived `id`;
 - generated-ID node and edge inserts are strict inserts;
 - `load --mode append` is strict insert: an existing `id` returns structured
-  `key_conflict` and the existing row is unchanged;
+  `key_conflict` and the existing entity is unchanged;
 - `load --mode merge` is upsert: an existing `id` is updated.
 
 For a node with `@key`, the derived `id` represents the complete typed key
-tuple, not only its first property. Single-column keys use the canonical scalar
+tuple, not only its first property. Single-property keys use the canonical scalar
 spelling; composite keys use a JSON array of canonical scalar strings in stable
 property-identity order. The same renderer is shared by mutation and load, and
 every member of a composite key is immutable during an update. See the
 [schema language](../schema/index.md#table-layout) for the exact scalar rules.
 
-A concurrent same-key conflict has effect-aware handling. If no table effect
+A concurrent same-key conflict has effect-aware handling. If no dataset effect
 from the attempt landed, strict insert is rechecked against fresh
 manifest-visible state and returns terminal `key_conflict` only when one of its
 attempted IDs now exists. A generic storage conflict with no exact match is
 never mislabeled as a duplicate: the engine discards the whole strict attempt
 and performs a bounded reprepare without changing it to upsert. Upsert likewise
 discards the whole attempt and reruns preparation and validation. If an earlier
-table already advanced, or the engine cannot prove the attempt effect-free, it
+dataset already advanced, or the engine cannot prove the attempt effect-free, it
 returns `recovery_required` and retains the recovery intent. No partial attempt
 is retried around unresolved state.
 
-Keyed mutation and load tables use one storage transaction per graph commit.
-Each table's accumulated strict-insert or upsert input is limited to 8,192 rows
+Keyed mutation and load datasets use one storage transaction per graph commit.
+Each dataset's accumulated strict-insert or upsert input is limited to 8,192 entities
 and 32 MiB of staged Arrow memory. An update also streams its predicate matches
-against the table's remaining budget after pending rows are counted and
-same-query pending IDs shadow committed rows; stored Blob size is checked before
+against the dataset's remaining budget after pending entities are counted and
+same-query pending IDs shadow committed entities; stored Blob size is checked before
 its payload is read. Exceeding either limit returns HTTP **413** with structured
 `resource_limit` details before the recovery intent is armed, with no durable
 effect. Submit a larger incremental load as explicit chunks—
 each chunk is a separate atomic graph commit. `--mode overwrite` escapes the
-keyed row ceiling (a whole-table replacement is not row-capped), but **not**
+keyed-entity ceiling (a whole-dataset replacement is not entity-capped), but **not**
 the strict-input Arrow preflight: every strict load mode, Overwrite included,
 refuses a batch whose projected Arrow allocation exceeds 32 MiB with typed
 `strict_input_arrow_bytes` before any durable effect. A bulk replacement
@@ -98,7 +98,7 @@ deny-only in this phase; use a configured cluster server or the embedded builder
 to supply graph-level allow bases.
 
 If the synchronous barrier finds an unresolved overlapping recovery intent, or
-if a conflict is discovered after a Lance table effect is durable, the request
+if a conflict is discovered after a Lance dataset effect is durable, the request
 returns `recovery_required` with an operation id. Do not immediately retry that
 request; reopen the graph read-write (or restart the server) so the durable
 recovery intent is resolved first.
@@ -130,8 +130,8 @@ there first.
    and **zero effect** — re-read the branch and decide again.
 
 The precondition is branch-scoped: **any** commit to the branch invalidates
-an outstanding id, including writes to unrelated rows or tables. A 412 does
-not necessarily mean the rows you care about changed — it means *something*
+an outstanding id, including writes to unrelated entities or types. A 412 does
+not necessarily mean the entities you care about changed — it means *something*
 did, and your knowledge can no longer be proven current. Under concurrent
 writers this produces occasional rejections between operations that do not
 truly conflict; the re-read-and-retry loop is the intended handling, and its
@@ -166,7 +166,7 @@ This does not expand OmniGraph's documented write topology. The branch gate is
 process-local and destructive recovery is currently supported only with one
 live writer process. A foreign writer in the unsupported distributed topology
 can still win after the local pre-effect check; the exact publisher prevents a
-silent lost update, but because table effects may already be durable the loser
+silent lost update, but because dataset effects may already be durable the loser
 returns `recovery_required` (HTTP 503), not 412. Do not deploy multiple writer
 processes as a way to obtain distributed CAS until the distributed fence in
 the recovery roadmap exists.
@@ -183,7 +183,7 @@ Run two separate queries instead — the inserts/updates first, then the deletes
 Each query is still atomic on its own. This is a deliberate rule: inserts,
 updates, and deletes all stage and commit through the same path, but keeping a
 single query to one kind means its read-your-writes stays unambiguous (a read
-within the query never has to reconcile rows you inserted against rows you
+within the query never has to reconcile entities you inserted against entities you
 deleted in the same query). If you need the inserts/updates and deletes to land
 as **one** atomic commit, run them on a branch and merge it.
 
@@ -200,7 +200,7 @@ The file is strict graph-level NDJSON: each nonblank line is one
 `{"type":"<Node>","data":{...}}` or
 `{"edge":"<Edge>","from":"<src-id>","to":"<dst-id>","data":{...}}`
 envelope. `data` defaults to `{}`, and one file may mix declarations without
-exposing any table or dataset selector. Local and remote `load` use the same
+exposing any physical dataset selector. Local and remote `load` use the same
 parser and one graph transaction; see [the CLI guide](../cli/index.md) and the
 [raw HTTP route](../operations/server.md#bounded-graph-batch-ingestion).
 `omnigraph ingest` remains only as a deprecated loader-compatible command for

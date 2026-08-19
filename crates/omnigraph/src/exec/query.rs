@@ -97,7 +97,7 @@ impl Omnigraph {
         Ok((result, head))
     }
 
-    /// Run a named query against the graph as it existed at a prior manifest version.
+    /// Run a named query against the graph as it existed at a prior graph-manifest version.
     ///
     /// Compiles the query normally, builds a temporary (non-cached) graph index
     /// if traversal is needed, and executes against the historical snapshot.

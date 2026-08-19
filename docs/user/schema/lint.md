@@ -25,11 +25,11 @@ The chassis defines ten families. Today only DS and MF have emitted codes. The r
 
 | Code | Family | Tier | Default severity | Meaning |
 |---|---|---|---|---|
-| `OG-DS-101` | Destructive | destructive | error | drop graph type with rows (reserved; not yet emitted) |
-| `OG-DS-102` | Destructive | destructive | error | drop node type with rows |
-| `OG-DS-103` | Destructive | destructive | error | drop edge type with rows |
-| `OG-DS-104` | Destructive | destructive | error | drop property with rows |
-| `OG-DS-105` | Destructive | destructive | error | drop populated vector column (reserved) |
+| `OG-DS-101` | Destructive | destructive | error | drop populated graph type (reserved; not yet emitted) |
+| `OG-DS-102` | Destructive | destructive | error | drop populated node type |
+| `OG-DS-103` | Destructive | destructive | error | drop populated edge type |
+| `OG-DS-104` | Destructive | destructive | error | drop a property from a populated type |
+| `OG-DS-105` | Destructive | destructive | error | drop populated vector property (reserved) |
 | `OG-MF-103` | Maybe-fail | validated | error | add required property without `@default` to populated type |
 | `OG-MF-104` | Maybe-fail | validated | error | tighten nullable to non-nullable (reserved) |
 | `OG-MF-106` | Maybe-fail | destructive | error | property type change (incl. enum narrowing / variant rename / enum↔String; pure enum *widening* plans as a supported `ExtendEnum` step instead) |

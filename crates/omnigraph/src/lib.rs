@@ -34,7 +34,7 @@ pub use changes::EntityKind;
 pub use table_store::IndexCoverage;
 
 /// Result of one mutation together with the exact commit published by it.
-/// `commit` is absent when the mutation changed no rows and published nothing.
+/// `commit` is absent when the mutation changed no entities and published nothing.
 #[derive(Debug, Clone)]
 pub struct MutationReceipt {
     pub result: omnigraph_compiler::result::MutationResult,

@@ -1,7 +1,7 @@
 # Snapshots & Time Travel
 
-Every read in OmniGraph happens against a **snapshot** — a consistent, cross-table
-view of the graph at one manifest version. A query holds one snapshot for its whole
+Every read in OmniGraph happens against a **snapshot** — a consistent, cross-dataset
+view of the graph at one graph manifest version. A query holds one snapshot for its whole
 lifetime, so it never sees a partial write from a concurrent commit (see
 [transactions](transactions.md)).
 
@@ -10,12 +10,12 @@ lifetime, so it never sees a partial write from a concurrent commit (see
 - **Current head** — by default a read targets the current head of the bound branch.
 - **By snapshot id** — read a branch or a specific snapshot id (`--snapshot` on
   `omnigraph read`).
-- **By version** — reconstruct a historical snapshot from any past manifest version.
+- **By version** — reconstruct a historical snapshot from any past graph manifest version.
 - **Single entity** — look up one entity at a past version without building a full
   snapshot (cheaper when you only need one node or edge).
 
-Snapshots are cheap to build: a snapshot is just the set of visible sub-table
-versions at a manifest version, so cross-table reads stay snapshot-isolated.
+Snapshots are cheap to build: a snapshot is just the set of visible dataset
+versions at a graph manifest version, so cross-dataset reads stay snapshot-isolated.
 
 ## CLI
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::branch_control::list_branch_contents;
-use crate::error::{OmniError, Result};
+use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
 use datafusion::logical_expr::Expr;
 use lance::Dataset;
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
@@ -157,19 +157,19 @@ pub struct Snapshot {
     /// pinned manifest version (see `ManifestState::graph_heads`). Carried so
     /// a read can report the commit id of the world it was served from —
     /// resolving the head separately (e.g. via `CommitGraph`) could pair this
-    /// snapshot's tables with a different version's head.
+    /// snapshot's datasets with a different version's head.
     graph_heads: HashMap<String, String>,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
-    /// `Omnigraph::resolved_target` for live Branch reads so table opens reuse
+    /// `Omnigraph::resolved_target` for live Branch reads so dataset opens reuse
     /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
     /// snapshots, time-travel / Snapshot-id reads, and directly-built test
     /// snapshots, which fall back to a plain open.
     read_caches: Option<Arc<crate::runtime_cache::ReadCaches>>,
 }
 
-/// Read-only view of one table pinned by a [`Snapshot`].
+/// Read-only view of one backing dataset pinned by a [`Snapshot`].
 ///
-/// The underlying Lance [`Dataset`] is deliberately private: a snapshot table
+/// The underlying Lance [`Dataset`] is deliberately private: a snapshot dataset
 /// can scan rows and inspect read metadata, but it cannot reach Lance's
 /// mutating APIs or advance a table HEAD outside OmniGraph's coordinated write
 /// path.
@@ -269,14 +269,14 @@ impl SnapshotTable {
         Self { dataset }
     }
 
-    /// Build a read-only scanner over this pinned table version.
+    /// Build a read-only scanner over this pinned dataset version.
     pub fn scan(&self) -> SnapshotScanner {
         SnapshotScanner {
             scanner: self.dataset.scan(),
         }
     }
 
-    /// Count rows in this pinned table version, optionally with a filter.
+    /// Count physical rows in this pinned dataset version, optionally with a filter.
     pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
         self.dataset
             .count_rows(filter)
@@ -284,17 +284,17 @@ impl SnapshotTable {
             .map_err(|error| OmniError::Lance(error.to_string()))
     }
 
-    /// Lance schema of this pinned table version.
+    /// Lance schema of this pinned dataset version.
     pub fn schema(&self) -> &LanceSchema {
         self.dataset.schema()
     }
 
-    /// Lance manifest version of this pinned table.
+    /// Lance version of this pinned dataset.
     pub fn version(&self) -> u64 {
         self.dataset.version().version
     }
 
-    /// Read-only physical index metadata for this pinned table version.
+    /// Read-only physical index metadata for this pinned dataset version.
     pub async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         self.dataset
             .load_indices()
@@ -312,17 +312,17 @@ impl SnapshotTable {
         crate::table_store::TableStore::has_unindexed_fragments(&self.dataset).await
     }
 
-    /// Whether this table has a user BTREE index on `column`.
+    /// Whether this dataset has a user BTREE index on physical `column`.
     pub async fn has_btree_index(&self, column: &str) -> Result<bool> {
         crate::table_store::TableStore::has_btree_index_on(&self.dataset, column).await
     }
 
-    /// Whether this table has a user full-text index on `column`.
+    /// Whether this dataset has a user full-text index on physical `column`.
     pub async fn has_fts_index(&self, column: &str) -> Result<bool> {
         crate::table_store::TableStore::has_fts_index_on(&self.dataset, column).await
     }
 
-    /// Whether this table has a user vector index on `column`.
+    /// Whether this dataset has a user vector index on physical `column`.
     pub async fn has_vector_index(&self, column: &str) -> Result<bool> {
         crate::table_store::TableStore::has_vector_index_on(&self.dataset, column).await
     }
@@ -330,7 +330,7 @@ impl SnapshotTable {
 
 impl Snapshot {
     /// Exact `graph_head:<branch>` commit id from this snapshot's own pinned
-    /// manifest version (`None` = main). Absent on a branch with no commits.
+    /// graph-manifest version (`None` = main). Absent on a branch with no commits.
     ///
     /// This exact row is write authority when present. A fresh named branch has
     /// no materialized row yet; callers that need its effective inherited
@@ -399,7 +399,8 @@ impl Snapshot {
         Ok(())
     }
 
-    /// Open a sub-table dataset at its pinned version. With read caches present
+    /// Open a backing dataset at its pinned version using the retained
+    /// `table_key` compatibility selector. With read caches present
     /// (live Branch reads), reuse a held handle through the cache (0 open IO on a
     /// warm repeat) and the shared `Session`; otherwise plain-open (Fix 2).
     pub async fn open(&self, table_key: &str) -> Result<SnapshotTable> {
@@ -414,7 +415,7 @@ impl Snapshot {
         let entry = self
             .entries
             .get(table_key)
-            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+            .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(table_key)))?;
         match &self.read_caches {
             Some(caches) => {
                 let location = table_uri_for_path(
@@ -439,18 +440,18 @@ impl Snapshot {
     }
 
     /// Attach per-graph read caches (shared `Session` + handle cache) so this
-    /// snapshot's table opens reuse handles and the session. Set by
+    /// snapshot's dataset opens reuse handles and the session. Set by
     /// `Omnigraph::resolved_target` for live Branch reads only.
     pub(crate) fn set_read_caches(&mut self, caches: Arc<crate::runtime_cache::ReadCaches>) {
         self.read_caches = Some(caches);
     }
 
-    /// Manifest version this snapshot was taken from.
+    /// Graph-manifest version this snapshot was taken from.
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    /// Look up a sub-table entry by key.
+    /// Look up backing-dataset metadata by the retained table-key selector.
     pub fn entry(&self, table_key: &str) -> Option<&SubTableEntry> {
         self.entries.get(table_key)
     }
@@ -1219,7 +1220,7 @@ impl ManifestCoordinator {
         read_graph_lineage(&dataset).await
     }
 
-    /// Current manifest version.
+    /// Current graph-manifest version.
     pub fn version(&self) -> u64 {
         self.dataset.version().version
     }

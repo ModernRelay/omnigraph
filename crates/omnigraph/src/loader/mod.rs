@@ -22,7 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::db::Omnigraph;
-use crate::error::{OmniError, Result};
+use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
 use crate::exec::staging::{MutationStaging, PendingMode};
 use crate::storage_layer::KEYED_WRITE_MAX_BYTES;
 
@@ -116,7 +116,7 @@ impl Omnigraph {
     }
 
     #[deprecated(
-        note = "use `load_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+        note = "use `load_as` with an explicit `base` for new integrations; the ingest family is kept indefinitely for compatibility"
     )]
     pub async fn ingest(
         &self,
@@ -129,12 +129,13 @@ impl Omnigraph {
         self.ingest_as(branch, from, data, mode, None).await
     }
 
-    /// Deprecated shim over the unified `load_as`. Preserves the historical
+    /// Indefinitely supported compatibility shim over the unified `load_as`.
+    /// Preserves the historical
     /// ingest contract exactly: `from: None` means fork from `main`, and the
     /// base branch is recorded in the result even when the target branch
     /// already existed (no fork happened).
     #[deprecated(
-        note = "use `load_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+        note = "use `load_as` with an explicit `base` for new integrations; the ingest family is kept indefinitely for compatibility"
     )]
     pub async fn ingest_as(
         &self,
@@ -151,7 +152,7 @@ impl Omnigraph {
     }
 
     #[deprecated(
-        note = "use `load_file_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+        note = "use `load_file_as` with an explicit `base` for new integrations; the ingest family is kept indefinitely for compatibility"
     )]
     pub async fn ingest_file(
         &self,
@@ -165,7 +166,7 @@ impl Omnigraph {
     }
 
     #[deprecated(
-        note = "use `load_file_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+        note = "use `load_file_as` with an explicit `base` for new integrations; the ingest family is kept indefinitely for compatibility"
     )]
     pub async fn ingest_file_as(
         &self,
@@ -241,7 +242,7 @@ impl Omnigraph {
     /// [`Self::load_as`], this boundary rejects duplicate JSON members,
     /// unknown or physical fields, noncanonical supplied ids, and compatibility
     /// coercions. Omitted ids retain ordinary loader semantics: node `@key`
-    /// values derive canonical ids and other rows receive generated ids. The
+    /// values derive canonical ids and other entities receive generated ids. The
     /// operation otherwise uses the same transaction, validation, recovery,
     /// and graph-level publication path as the ordinary loader.
     pub async fn load_graph_batch_as(
@@ -673,14 +674,14 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let table_key = format!("node:{}", type_name);
         let _entry = snapshot
             .entry(&table_key)
-            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+            .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         prepared_nodes.push((type_name.clone(), table_key, vec![batch], loaded_count));
     }
     for (type_name, rows) in strict_nodes {
         let table_key = format!("node:{type_name}");
         let _entry = snapshot
             .entry(&table_key)
-            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {table_key}")))?;
+            .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
         let loaded_count = batch.num_rows();
         prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
@@ -724,14 +725,14 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let table_key = format!("edge:{}", edge_name);
         let _entry = snapshot
             .entry(&table_key)
-            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+            .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         prepared_edges.push((edge_name.clone(), table_key, vec![batch], loaded_count));
     }
     for (edge_name, rows) in strict_edges {
         let table_key = format!("edge:{edge_name}");
         let _entry = snapshot
             .entry(&table_key)
-            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {table_key}")))?;
+            .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
         let loaded_count = batch.num_rows();
         prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
@@ -1117,7 +1118,7 @@ fn parse_strict_graph_rows<R: BufRead>(
             JsonValue::Object(envelope) => envelope,
             _ => {
                 return Err(OmniError::manifest(format!(
-                    "line {line_number}: graph batch row must be one JSON object"
+                    "line {line_number}: graph batch record must be one JSON object"
                 )));
             }
         };
@@ -1180,7 +1181,7 @@ fn parse_strict_graph_rows<R: BufRead>(
             }
             _ => {
                 return Err(OmniError::manifest(format!(
-                    "line {line_number}: graph batch row must contain exactly one of 'type' or 'edge'"
+                    "line {line_number}: graph batch record must contain exactly one of 'type' or 'edge'"
                 )));
             }
         }
@@ -1220,7 +1221,7 @@ fn take_required_string(
             "line {line_number}: graph batch field '{field}' must be a string, got {value}"
         ))),
         None => Err(OmniError::manifest(format!(
-            "line {line_number}: graph batch row requires field '{field}'"
+            "line {line_number}: graph batch record requires field '{field}'"
         ))),
     }
 }
@@ -1255,7 +1256,7 @@ fn account_keyed_json_row(
     entry.0 = entry
         .0
         .checked_add(1)
-        .ok_or_else(|| OmniError::manifest_internal("keyed parsed row count overflow"))?;
+        .ok_or_else(|| OmniError::manifest_internal("keyed input entity count overflow"))?;
     if entry.0 > crate::storage_layer::KEYED_WRITE_MAX_ROWS {
         return Err(OmniError::resource_limit(
             format!("keyed rows for {table_key}"),
@@ -1268,7 +1269,7 @@ fn account_keyed_json_row(
             u64::try_from(structural_string_bytes)
                 .map_err(|_| OmniError::manifest_internal("keyed string bytes exceed u64"))?,
         )
-        .ok_or_else(|| OmniError::manifest_internal("keyed parsed row bytes overflow"))?;
+        .ok_or_else(|| OmniError::manifest_internal("keyed input entity bytes overflow"))?;
     entry.1 = entry
         .1
         .checked_add(row_bytes)
@@ -1567,7 +1568,7 @@ pub(crate) fn normalize_strict_json_rows(
 ) -> Result<RecordBatch> {
     if rows.is_empty() {
         return Err(OmniError::manifest_internal(
-            "strict row normalization requires at least one row",
+            "strict entity normalization requires at least one entity",
         ));
     }
     if let Some(type_name) = table_key.strip_prefix("node:") {
@@ -1805,7 +1806,7 @@ fn optional_row_id<'a>(
     match object.get("id") {
         Some(JsonValue::String(value)) => Ok(Some(value)),
         Some(value) => Err(OmniError::manifest(format!(
-            "strict row for {type_name} field 'id' must be a string, got {value}"
+            "input entity of type '{type_name}' field 'id' must be a string, got {value}"
         ))),
         None => Ok(None),
     }
@@ -1819,13 +1820,13 @@ fn validate_required_row_string<'a>(
     match object.get(field) {
         Some(JsonValue::String(value)) => Ok(value),
         Some(JsonValue::Null) => Err(OmniError::manifest(format!(
-            "strict row for {type_name} requires non-null string field '{field}'"
+            "input entity of type '{type_name}' requires non-null string field '{field}'"
         ))),
         Some(value) => Err(OmniError::manifest(format!(
-            "strict row for {type_name} field '{field}' must be a string, got {value}"
+            "input entity of type '{type_name}' field '{field}' must be a string, got {value}"
         ))),
         None => Err(OmniError::manifest(format!(
-            "strict row for {type_name} requires explicit field '{field}'"
+            "input entity of type '{type_name}' requires explicit field '{field}'"
         ))),
     }
 }
@@ -2947,7 +2948,7 @@ pub(crate) fn canonical_scalar_key(array: &ArrayRef, row: usize) -> Result<Optio
         let value = a.value(row);
         if !value.is_finite() {
             return Err(OmniError::manifest(format!(
-                "scalar key: non-finite Float32 value {value} cannot identify a row"
+                "scalar key: non-finite Float32 value {value} cannot identify an entity"
             )));
         }
         return Ok(Some(if value == 0.0 {
@@ -2960,7 +2961,7 @@ pub(crate) fn canonical_scalar_key(array: &ArrayRef, row: usize) -> Result<Optio
         let value = a.value(row);
         if !value.is_finite() {
             return Err(OmniError::manifest(format!(
-                "scalar key: non-finite Float64 value {value} cannot identify a row"
+                "scalar key: non-finite Float64 value {value} cannot identify an entity"
             )));
         }
         return Ok(Some(if value == 0.0 {

@@ -13,9 +13,9 @@ use super::typecheck::{
 
 /// A compiled query's conservative graph access set and result shape.
 ///
-/// `reads` is conservative: every table the supported execution path may
-/// inspect is present. `writes` is the exact set of tables the mutation may
-/// change. Both sets are sorted and deduplicated for deterministic consumers.
+/// `reads` is conservative: every graph type the supported execution path may
+/// inspect is present. `writes` is the exact set of graph types the mutation
+/// may change. Both sets are sorted and deduplicated for deterministic consumers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueryOperationDescriptor {
     pub result: Vec<QueryResultFieldDescriptor>,

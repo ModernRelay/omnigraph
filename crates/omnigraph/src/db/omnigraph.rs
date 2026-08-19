@@ -24,7 +24,7 @@ use omnigraph_compiler::{
 use ulid::Ulid;
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, ResolvedCommitRange};
-use crate::error::{OmniError, Result};
+use crate::error::{OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
 use crate::storage::{
     StorageAdapter, StorageKind, join_uri, normalize_root_uri, storage_for_uri,
@@ -1948,8 +1948,10 @@ impl Omnigraph {
             .map_err(|error| OmniError::Lance(error.to_string()))?;
         if head < expected_version {
             return Err(OmniError::manifest_internal(format!(
-                "table '{}' Lance HEAD version {} is behind manifest version {}",
-                table_key, head, expected_version,
+                "{} is at Lance HEAD version {}, behind published dataset version {}",
+                dataset_subject(table_key),
+                head,
+                expected_version,
             )));
         }
         if head == expected_version {
@@ -1974,23 +1976,30 @@ impl Omnigraph {
                     return Err(OmniError::recovery_required(
                         owner.operation_id.clone(),
                         format!(
-                            "table '{}' has Lance HEAD version {} ahead of manifest version {}; \
+                            "{} is at Lance HEAD version {}, ahead of published dataset version {}; \
                              the pending recovery operation owns this drift",
-                            table_key, head, expected_version,
+                            dataset_subject(table_key),
+                            head,
+                            expected_version,
                         ),
                     ));
                 }
                 Err(OmniError::manifest_conflict(format!(
-                    "table '{}' has Lance HEAD version {} ahead of manifest version {}; \
+                    "{} is at Lance HEAD version {}, ahead of published dataset version {}; \
                      run `omnigraph repair` before writing",
-                    table_key, head, expected_version,
+                    dataset_subject(table_key),
+                    head,
+                    expected_version,
                 )))
             }
             Err(list_error) => Err(OmniError::manifest_conflict(format!(
-                "table '{}' has Lance HEAD version {} ahead of manifest version {}; could not \
+                "{} is at Lance HEAD version {}, ahead of published dataset version {}; could not \
                  classify the drift (sidecar listing failed: {}); run `omnigraph repair`, or \
                  reopen the graph read-write if repair reports a pending recovery sidecar",
-                table_key, head, expected_version, list_error,
+                dataset_subject(table_key),
+                head,
+                expected_version,
+                list_error,
             ))),
         }
     }
@@ -2557,7 +2566,9 @@ impl Omnigraph {
         export::entity_at_target(self, target, table_key, id).await
     }
 
-    /// Read one entity at a specific manifest version via time travel (on-demand enrichment).
+    /// Read one entity at a specific graph-manifest version via time travel
+    /// (on-demand enrichment). `table_key` is the retained compatibility
+    /// selector for its node or edge type.
     pub async fn entity_at(
         &self,
         table_key: &str,
@@ -2567,7 +2578,7 @@ impl Omnigraph {
         export::entity_at(self, table_key, id, version).await
     }
 
-    /// Create a Snapshot at any historical manifest version.
+    /// Create a Snapshot at any historical graph-manifest version.
     pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
         self.ensure_schema_state_valid().await?;
         self.coordinator
@@ -2625,25 +2636,25 @@ impl Omnigraph {
         table_ops::graph_index_for_resolved(self, resolved, edge_types).await
     }
 
-    /// Ensure BTree scalar indices exist on key columns.
-    /// Idempotent — Lance skips if index already exists.
+    /// Ensure every declared BTREE, full-text, and vector index exists.
+    /// Idempotent — Lance skips indexes that already exist.
     ///
-    /// Plans from one manifest/schema token, then revalidates under the final
-    /// schema → branch → table gates. Existing target refs must still have live
-    /// Lance HEAD equal to their manifest pin; uncovered drift is refused with
+    /// Plans from one graph-manifest/schema token, then revalidates under the final
+    /// schema → branch → sorted dataset gates. Existing target refs must still have live
+    /// Lance HEAD equal to their published dataset version; uncovered drift is refused with
     /// explicit `omnigraph repair` guidance instead of being silently folded.
     /// The verified handle is reused for index effects and the resulting
-    /// versions are committed back to the manifest.
+    /// versions are published through the graph manifest.
     ///
     /// On named branches, indexing preserves lazy branching:
-    /// unbranched subtables keep inheriting `main`, while subtables inherited
+    /// unbranched datasets keep inheriting `main`, while datasets inherited
     /// from an ancestor branch remain inherited when no index work is needed.
     /// When real index work exists they are forked into the active branch only
     /// after the recovery sidecar is durable.
     /// Returns the declared indexes that could not be materialized on this
-    /// pass (today: vector columns with no trainable vectors yet). They are
+    /// pass (today: vector properties with no trainable vectors yet). They are
     /// deferred, not errors; a later `ensure_indices`/`optimize` builds them
-    /// once the column is trainable. Reads stay correct (brute-force) meanwhile.
+    /// once the property is trainable. Reads stay correct (brute-force) meanwhile.
     pub async fn ensure_indices(&self) -> Result<Vec<PendingIndex>> {
         table_ops::ensure_indices(self).await
     }
@@ -2670,12 +2681,12 @@ impl Omnigraph {
     }
 
     /// Compact small Lance fragments into fewer larger ones across every
-    /// node + edge table on `main`. See [`optimize`] for details.
+    /// backing dataset for a node or edge type on `main`. See [`optimize`] for details.
     pub async fn optimize(&self) -> Result<Vec<optimize::TableOptimizeStats>> {
         optimize::optimize_all_tables(self).await
     }
 
-    /// Classify and explicitly repair uncovered manifest/head drift. See
+    /// Classify and explicitly repair uncovered graph-manifest/Lance-HEAD drift. See
     /// [`repair`] for the distinction between safe maintenance drift and
     /// suspicious/unverifiable drift.
     pub async fn repair(&self, options: repair::RepairOptions) -> Result<repair::RepairStats> {

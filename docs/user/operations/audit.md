@@ -34,9 +34,9 @@ omnigraph commit list graph.omni
 System-initiated writes use reserved actor ids. Rollback and legacy recovery
 commits use `omnigraph:recovery`, while an exact v9 writer roll-forward
 preserves the interrupted writer's original commit id and actor. Exact recovery actions and
-per-table outcomes are stored in the internal
-`_graph_commit_recoveries.lance` audit table; the CLI does not currently expose
-that table, so `commit list` alone is not a complete recovery log.
+per-dataset outcomes are stored in the internal
+`_graph_commit_recoveries.lance` audit dataset; the CLI does not currently expose
+that dataset, so `commit list` alone is not a complete recovery log.
 
 ## What is tracked
 

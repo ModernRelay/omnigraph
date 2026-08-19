@@ -17,7 +17,7 @@ Vectors are stored L2-normalized as `FixedSizeList(Float32, dim)`. Embedding
 values must be finite — a vector containing NaN/Inf, or an all-zero vector
 (no direction under cosine distance), is rejected at the client boundary
 rather than persisted; the requested output dimension is driven by
-the target column width and sent as Gemini `outputDimensionality` / OpenAI `dimensions`.
+the target Vector property's width and sent as Gemini `outputDimensionality` / OpenAI `dimensions`.
 
 ## Configuration (cluster)
 
@@ -43,7 +43,7 @@ normalized to that typed ref. The server resolves `${ENV_VAR}` only when it
 boots from the applied cluster ledger, so `cluster validate`, `plan`, and
 `apply` do not need provider secrets. Inline API keys are rejected. `mock`
 needs no key. Vector dimensions stay schema-driven by the target `Vector(N)`
-column.
+property.
 
 Direct (`--store`) access, embedded callers, and the offline
 `omnigraph embed` pipeline use environment configuration unless they inject an
@@ -80,7 +80,7 @@ The default zero-config path is OpenRouter: set `OPENROUTER_API_KEY` and run. Re
 
 Mark a Vector property with `@embed("source_text_property")`. This is a **catalog annotation** consumed by the
 query typechecker and linter: it records which String property is the embedding source and lets
-`nearest($v, "string")` auto-embed a query string for comparison against that vector column.
+`nearest($v, "string")` auto-embed a query string for comparison against that vector property.
 
 Optionally record the model that produced the stored vectors:
 `@embed("source_text_property", model="openai/text-embedding-3-large")`. When a model is recorded, a
@@ -100,11 +100,11 @@ offline `omnigraph embed` pipeline below. (Ingest-time execution of `@embed` is 
 Operates on **JSONL files** (not on a graph), using the same resolved provider config. Three modes (mutually
 exclusive):
 
-- (default) `fill_missing` — only embed rows whose target field is empty
+- (default) `fill_missing` — only embed records whose target field is empty
 - `--reembed-all` — overwrite all
 - `--clean` — strip embeddings
 
-Inputs are either a single seed manifest YAML or `--input/--output/--spec`. Selectors `--type T`, `--select T:field=value` filter rows. Streams JSONL → JSONL.
+Inputs are either a single seed manifest YAML or `--input/--output/--spec`. Selectors `--type T`, `--select T:field=value` filter records. Streams JSONL → JSONL.
 
 ## Migration
 

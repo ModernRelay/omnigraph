@@ -34,37 +34,37 @@ pub const OG_DS_101: DiagnosticCode = DiagnosticCode {
     family: Family::DS,
     tier: SafetyTier::Destructive,
     default_severity: Severity::Error,
-    short: "drop graph type with rows",
+    short: "drop populated graph type",
 };
 
-/// Drop a node type that has rows.
+/// Drop a populated node type.
 pub const OG_DS_102: DiagnosticCode = DiagnosticCode {
     code: "OG-DS-102",
     family: Family::DS,
     tier: SafetyTier::Destructive,
     default_severity: Severity::Error,
-    short: "drop node type with rows",
+    short: "drop populated node type",
 };
 
-/// Drop an edge type that has rows.
+/// Drop a populated edge type.
 pub const OG_DS_103: DiagnosticCode = DiagnosticCode {
     code: "OG-DS-103",
     family: Family::DS,
     tier: SafetyTier::Destructive,
     default_severity: Severity::Error,
-    short: "drop edge type with rows",
+    short: "drop populated edge type",
 };
 
-/// Drop a property (column) that has data.
+/// Drop a property from a populated type.
 pub const OG_DS_104: DiagnosticCode = DiagnosticCode {
     code: "OG-DS-104",
     family: Family::DS,
     tier: SafetyTier::Destructive,
     default_severity: Severity::Error,
-    short: "drop property with rows",
+    short: "drop property from populated type",
 };
 
-/// Reserved: dropping a populated vector / embedding column. Distinct
+/// Reserved: dropping a populated vector / embedding property. Distinct
 /// from a normal property drop because it invalidates downstream
 /// `nearest()` / `@embed` references.
 pub const OG_DS_105: DiagnosticCode = DiagnosticCode {
@@ -72,13 +72,13 @@ pub const OG_DS_105: DiagnosticCode = DiagnosticCode {
     family: Family::DS,
     tier: SafetyTier::Destructive,
     default_severity: Severity::Error,
-    short: "drop populated vector column",
+    short: "drop populated vector property",
 };
 
-// ─── Maybe-fail (MF) — data-dependent; may fail on existing rows ────────────
+// ─── Maybe-fail (MF) — data-dependent; may fail on existing entities ──────────
 
 /// Add a required (non-nullable) property to a populated type without
-/// `@default`. Existing rows have no value to fill in.
+/// `@default`. Existing entities have no value to fill in.
 pub const OG_MF_103: DiagnosticCode = DiagnosticCode {
     code: "OG-MF-103",
     family: Family::MF,
@@ -87,7 +87,7 @@ pub const OG_MF_103: DiagnosticCode = DiagnosticCode {
     short: "add required property without @default to populated type",
 };
 
-/// Tighten nullable to non-nullable. May fail on existing null rows.
+/// Tighten nullable to non-nullable. May fail on existing entities with null.
 /// Reserved for a follow-up that wires the validated-tier scan; not
 /// emitted in v0.
 pub const OG_MF_104: DiagnosticCode = DiagnosticCode {
@@ -186,6 +186,15 @@ mod tests {
         assert_eq!(lookup("OG-DS-104"), Some(&OG_DS_104));
         assert_eq!(lookup("OG-MF-103"), Some(&OG_MF_103));
         assert!(lookup("OG-XX-999").is_none());
+    }
+
+    #[test]
+    fn destructive_short_text_uses_graph_vocabulary() {
+        assert_eq!(OG_DS_101.short, "drop populated graph type");
+        assert_eq!(OG_DS_102.short, "drop populated node type");
+        assert_eq!(OG_DS_103.short, "drop populated edge type");
+        assert_eq!(OG_DS_104.short, "drop property from populated type");
+        assert_eq!(OG_DS_105.short, "drop populated vector property");
     }
 
     #[test]

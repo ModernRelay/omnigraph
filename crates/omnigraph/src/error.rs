@@ -80,15 +80,71 @@ pub enum MergeConflictKind {
     ValueConstraintViolation,
 }
 
+pub(crate) fn graph_type_subject(table_key: &str) -> String {
+    if let Some(type_name) = table_key.strip_prefix("node:") {
+        format!("node type '{type_name}'")
+    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+        format!("edge type '{type_name}'")
+    } else {
+        format!("dataset '{table_key}'")
+    }
+}
+
+pub(crate) fn dataset_subject(table_key: &str) -> String {
+    if table_key.starts_with("node:") || table_key.starts_with("edge:") {
+        format!("dataset for {}", graph_type_subject(table_key))
+    } else {
+        format!("dataset '{table_key}'")
+    }
+}
+
+pub(crate) fn missing_graph_type_at_snapshot(table_key: &str) -> String {
+    format!(
+        "{} does not exist at this snapshot",
+        graph_type_subject(table_key)
+    )
+}
+
+fn format_key_conflict(table_key: &str) -> String {
+    format!("{} already has this id", graph_type_subject(table_key))
+}
+
+fn merge_conflict_kind_label(kind: MergeConflictKind) -> &'static str {
+    match kind {
+        MergeConflictKind::DivergentInsert => "divergent_insert",
+        MergeConflictKind::DivergentUpdate => "divergent_update",
+        MergeConflictKind::DeleteVsUpdate => "delete_vs_update",
+        MergeConflictKind::OrphanEdge => "orphan_edge",
+        MergeConflictKind::UniqueViolation => "unique_violation",
+        MergeConflictKind::CardinalityViolation => "cardinality_violation",
+        MergeConflictKind::ValueConstraintViolation => "value_constraint_violation",
+    }
+}
+
+fn format_merge_conflicts(conflicts: &[MergeConflict]) -> String {
+    conflicts
+        .iter()
+        .map(|conflict| {
+            let subject = graph_type_subject(&conflict.table_key);
+            let kind = merge_conflict_kind_label(conflict.kind);
+            match conflict.row_id.as_deref() {
+                Some(id) => format!("{subject}, entity id '{id}' ({kind}): {}", conflict.message),
+                None => format!("{subject} ({kind}): {}", conflict.message),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[derive(Debug, Error)]
 pub enum OmniError {
     #[error("{0}")]
     Compiler(#[from] omnigraph_compiler::error::CompilerError),
     #[error("storage: {0}")]
     Lance(String),
-    /// A manifest-pinned Lance version was reclaimed by cleanup. Kept typed at
+    /// A graph-snapshot-pinned Lance dataset version was reclaimed by cleanup. Kept typed at
     /// the common opener so historical APIs never infer retention from error text.
-    #[error("historical table version {version} was reclaimed")]
+    #[error("historical published dataset version {version} was reclaimed")]
     HistoricalVersionReclaimed { version: u64 },
 
     /// Lance rejected a stale transaction as semantically retryable. Kept
@@ -103,14 +159,14 @@ pub enum OmniError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Manifest(ManifestError),
-    #[error("merge conflicts: {0:?}")]
+    #[error("merge conflicts: {}", format_merge_conflicts(.0))]
     MergeConflicts(Vec<MergeConflict>),
-    /// A strict keyed insert found that the logical row id already exists in
-    /// the pinned table image, or lost a concurrent exact-id insertion race
+    /// A strict keyed insert found that the logical entity id already exists in
+    /// the pinned dataset image, or lost a concurrent exact-id insertion race
     /// before any effect from this attempt became visible.  This is distinct
     /// from a stale read set: retrying the same strict insert must not silently
     /// turn it into an upsert.
-    #[error("key conflict in table '{table_key}'")]
+    #[error("{}", format_key_conflict(table_key))]
     KeyConflict {
         table_key: String,
         /// Exact id observed by pinned preflight or the required fresh probe
@@ -140,7 +196,7 @@ pub enum OmniError {
     #[error("branch '{branch}' not found")]
     BranchNotFound { branch: String },
     /// A change page or feed can no longer be reconstructed contiguously:
-    /// cleanup reclaimed a table version one of its commits pins. Recovery is
+    /// cleanup reclaimed a published dataset version one of its commits pins. Recovery is
     /// the exact baseline handshake, never a retried continuation.
     #[error("change feed gap at commit '{first_unreadable_commit_id}'")]
     ChangeFeedGap {
@@ -153,7 +209,7 @@ pub enum OmniError {
     CommitHasNoParent { graph_commit_id: String },
     /// The two exact snapshots of a first-parent edge do not share a provably
     /// identical logical user schema for one paired type lifetime (or the
-    /// table set changed with data present). Entity diff refuses rather than
+    /// graph type set changed with data present). Entity diff refuses rather than
     /// guessing; schema evolution is not synthesized into entity changes.
     #[error(
         "entity changes for commit '{graph_commit_id}' cross an unprovable schema boundary at type '{type_name}'"
@@ -174,7 +230,7 @@ pub enum OmniError {
     /// or a misleading malformed-request response.
     #[error("external blob source '{uri}' is unavailable: {reason}")]
     ExternalBlobSource { uri: String, reason: String },
-    /// Persisted table or Blob state contradicted the logical Blob contract.
+    /// Persisted dataset or Blob state contradicted the logical Blob contract.
     /// This is a typed integrity failure rather than a generic storage string so
     /// callers never reinterpret corrupt identity, metadata, or descriptors as
     /// null or ordinary absence.
@@ -240,8 +296,8 @@ pub enum OmniError {
         source: Box<OmniError>,
     },
     /// Physical graph initialization returned an error and the follow-up exact
-    /// genesis probe failed, so the engine cannot prove which table or
-    /// manifest Creates committed. Cleanup and retry are unsafe until an
+    /// genesis probe failed, so the engine cannot prove which dataset or
+    /// graph-manifest Creates committed. Cleanup and retry are unsafe until an
     /// operator has inspected the root. Both typed causes are retained because
     /// they describe different failure boundaries.
     #[error(
@@ -359,8 +415,10 @@ impl OmniError {
     ) -> Self {
         let table_key = table_key.into();
         let message = format!(
-            "stale view of '{}': expected manifest table version {} but current is {} — refresh and retry",
-            table_key, expected, actual
+            "stale view of {}: expected published dataset version {} but current is {} — refresh and retry",
+            dataset_subject(&table_key),
+            expected,
+            actual
         );
         Self::Manifest(
             ManifestError::new(ManifestErrorKind::Conflict, message).with_details(
@@ -420,5 +478,49 @@ impl OmniError {
             operation_id: operation_id.into(),
             reason: reason.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MergeConflict, MergeConflictKind, OmniError};
+
+    #[test]
+    fn graph_facing_error_display_uses_logical_subjects() {
+        assert_eq!(
+            OmniError::key_conflict("node:Person", "p1").to_string(),
+            "node type 'Person' already has this id"
+        );
+        assert_eq!(
+            OmniError::KeyConflict {
+                table_key: "edge:Knows".to_string(),
+                key: None,
+            }
+            .to_string(),
+            "edge type 'Knows' already has this id"
+        );
+        assert_eq!(
+            OmniError::HistoricalVersionReclaimed { version: 7 }.to_string(),
+            "historical published dataset version 7 was reclaimed"
+        );
+        assert_eq!(
+            OmniError::manifest_expected_version_mismatch("node:Person", 6, 7).to_string(),
+            "stale view of dataset for node type 'Person': expected published dataset version 6 but current is 7 — refresh and retry"
+        );
+    }
+
+    #[test]
+    fn merge_conflict_display_does_not_leak_struct_field_debug_syntax() {
+        let error = OmniError::MergeConflicts(vec![MergeConflict {
+            table_key: "node:Person".to_string(),
+            row_id: Some("p1".to_string()),
+            kind: MergeConflictKind::DivergentUpdate,
+            message: "divergent update for id 'p1'".to_string(),
+        }]);
+        assert_eq!(
+            error.to_string(),
+            "merge conflicts: node type 'Person', entity id 'p1' (divergent_update): divergent update for id 'p1'"
+        );
+        assert!(!error.to_string().contains("table_key"));
     }
 }

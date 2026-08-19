@@ -140,11 +140,11 @@ responsibilities:
 | Layer | Question it answers | Where it fires |
 |---|---|---|
 | **Engine-layer (coarse)** | Can this actor invoke this action against this branch / branch-transition? | The policy gate at the head of every `_as` writer; one Cedar decision per call. |
-| **Query-layer (fine)** | For the rows / types this action actually touches, which can the actor see or modify? | Per-row predicates pushed into the query plan. **Not yet implemented.** |
+| **Query-layer (fine)** | For the entities and types this action actually touches, which can the actor see or modify? | Per-entity predicates pushed into the query plan. **Not yet implemented.** |
 
 The engine-layer gate keeps its resource scope deliberately at branch
 granularity (graph, branch, target branch, branch transition).
-Per-type and per-row authority is the query-layer's job; conflating them
+Per-type and per-entity authority is the query-layer's job; conflating them
 in the engine-layer scope would create two places per-type policy could be
 evaluated and a drift surface between them.
 

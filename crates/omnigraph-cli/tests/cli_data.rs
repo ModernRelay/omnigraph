@@ -603,6 +603,16 @@ fn embed_seed_fills_missing_and_preserves_existing_vectors_by_default() {
         embedded[1]["data"]["embedding"],
         serde_json::json!([0.1, 0.2])
     );
+
+    let human = stdout_string(&output_success(
+        cli()
+            .env("OMNIGRAPH_EMBEDDINGS_MOCK", "1")
+            .arg("embed")
+            .arg("--seed")
+            .arg(&seed),
+    ));
+    assert!(human.contains("embedded 1 records (selected 2, cleaned 0)"));
+    assert!(!human.contains("embedded 1 rows"));
 }
 
 #[test]
@@ -691,12 +701,29 @@ fn optimize_json_succeeds_on_local_graph() {
     // local path still resolves and runs embedded.
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    init_graph(&graph);
+    let schema = temp.path().join("schema.pg");
+    fs::write(
+        &schema,
+        fs::read_to_string(fixture("test.pg"))
+            .unwrap()
+            .replace("age: I32?", "age: I32?\n    embedding: Vector(4)? @index"),
+    )
+    .unwrap();
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
     load_fixture(&graph);
 
     let output = output_success(cli().arg("optimize").arg("--json").arg(&graph));
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(payload["tables"].as_array().is_some());
+
+    let human = stdout_string(&output_success(cli().arg("optimize").arg(&graph)));
+    assert!(human.contains(" datasets"), "{human}");
+    assert!(human.contains("node type 'Person'"), "{human}");
+    assert!(
+        human.contains("index pending on property 'embedding': property has no non-null vectors"),
+        "{human}"
+    );
+    assert!(!human.contains("node:Person"), "{human}");
 }
 
 #[test]
@@ -838,6 +865,11 @@ fn repair_json_reports_noop_on_clean_graph() {
             .iter()
             .all(|table| { table["classification"] == "no_drift" && table["action"] == "no_op" })
     );
+
+    let human = stdout_string(&output_success(cli().arg("repair").arg(&graph)));
+    assert!(human.contains("preview mode, 4 datasets"), "{human}");
+    assert!(human.contains("node type 'Person'"), "{human}");
+    assert!(!human.contains("node:Person"), "{human}");
 }
 
 #[test]
@@ -2532,6 +2564,16 @@ fn cleanup_against_local_scope_executes_with_confirm() {
     assert!(payload["tables"].as_array().is_some(), "{payload}");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("omnigraph cleanup →"), "stderr: {stderr}");
+
+    let human = stdout_string(&output_success(
+        cli()
+            .arg("cleanup")
+            .arg("--keep")
+            .arg("1")
+            .arg("--confirm")
+            .arg(&graph),
+    ));
+    assert!(human.contains("across 4 datasets"), "{human}");
 }
 
 #[test]
@@ -2826,7 +2868,7 @@ fn snapshot_resolves_uri_from_store_scope() {
 }
 
 #[test]
-fn snapshot_human_output_includes_branch_and_table_summaries() {
+fn snapshot_human_output_uses_graph_and_dataset_vocabulary() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
@@ -2835,14 +2877,17 @@ fn snapshot_human_output_includes_branch_and_table_summaries() {
     let output = output_success(cli().arg("snapshot").arg(&graph));
     let stdout = stdout_string(&output);
 
-    assert!(stdout.contains("branch: main"));
-    assert!(stdout.contains("manifest_version:"));
+    assert!(stdout.contains("graph_branch: main"));
+    assert!(stdout.contains("graph_manifest_version:"));
     assert!(stdout.contains(&format!(
         "internal_schema_version: {}",
         omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
     )));
-    assert!(stdout.contains("node:Person v"));
-    assert!(stdout.contains("edge:Knows v"));
+    assert!(stdout.contains("node type 'Person' published_dataset_version="));
+    assert!(stdout.contains("edge type 'Knows' published_dataset_version="));
+    assert!(stdout.contains("native_dataset_branch="));
+    assert!(stdout.contains("entities="));
+    assert!(!stdout.contains("node:Person"));
 }
 
 #[test]
@@ -2859,6 +2904,14 @@ fn commit_show_accepts_long_uri_flag() {
         .unwrap()
         .to_string();
 
+    let list_human = stdout_string(&output_success(cli().arg("commit").arg("list").arg(&graph)));
+    assert!(list_human.contains("graph_branch="), "{list_human}");
+    assert!(
+        list_human.contains("graph_manifest_version="),
+        "{list_human}"
+    );
+    assert!(!list_human.contains(" branch="), "{list_human}");
+
     let output = output_success(
         cli()
             .arg("commit")
@@ -2872,6 +2925,18 @@ fn commit_show_accepts_long_uri_flag() {
 
     assert_eq!(payload["graph_commit_id"], commit_id);
     assert!(payload["manifest_version"].as_u64().unwrap() >= 1);
+
+    let human = stdout_string(&output_success(
+        cli()
+            .arg("commit")
+            .arg("show")
+            .arg("--uri")
+            .arg(&graph)
+            .arg(&commit_id),
+    ));
+    assert!(human.contains("graph_branch:"));
+    assert!(human.contains("graph_manifest_version:"));
+    assert!(!human.contains("manifest_branch:"));
 }
 
 #[test]

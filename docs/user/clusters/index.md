@@ -71,7 +71,7 @@ disposition; `converged: true` means there is nothing left to do — re-running
 `apply` is always safe and idempotent.
 
 Load data through the normal graph plane (the control plane manages
-*definitions*, not rows):
+*definitions*, not entities):
 
 ```bash
 omnigraph load --data seed.jsonl company-brain/graphs/knowledge.omni
@@ -307,7 +307,7 @@ its resolved target to stderr (suppress with `--quiet`).
 ## What the control plane does not do (yet)
 
 - **No hot reload** — applied changes serve on the next restart.
-- **No data operations** — rows move through `omnigraph load / ingest /
+- **No data operations** — entities move through `omnigraph load / ingest /
   mutate` against the graph roots, with branches and merges as usual.
 - **Stored-query exposure is all-or-nothing per cluster** — every applied
   query is listed and invokable (subject to Cedar `invoke_query`); per-query

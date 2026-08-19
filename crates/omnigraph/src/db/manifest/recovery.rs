@@ -550,8 +550,8 @@ pub(crate) struct SidecarTableRename {
 pub(crate) struct SidecarTombstone {
     pub identity: super::TableIdentity,
     pub table_key: String,
-    /// Manifest version at which this table was active before the
-    /// tombstone — required by the publisher's CAS pre-check.
+    /// Version marker for this tombstone, set one greater than the graph type's
+    /// last published dataset version and used by the publisher's CAS pre-check.
     pub tombstone_version: u64,
 }
 

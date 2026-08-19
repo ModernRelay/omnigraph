@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::missing_graph_type_at_snapshot;
 
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
     let (resolved, catalog) = db.capture_current_read_view().await?;
@@ -46,7 +47,7 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     let snapshot = db.snapshot_for_branch(branch.as_deref()).await?;
     let entry = snapshot
         .entry(table_key)
-        .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+        .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(table_key)))?;
     let full_path = format!("{}/{}", db.root_uri, entry.table_path);
     let ds = db
         .storage()
@@ -391,7 +392,7 @@ pub(super) async fn ensure_indices_for_branch(
             for pin in &recovery_pins {
                 let table_key = pin.table_key.clone();
                 let entry = snapshot.entry(&table_key).ok_or_else(|| {
-                    OmniError::manifest(format!("no manifest entry for {}", table_key))
+                    OmniError::manifest(missing_graph_type_at_snapshot(&table_key))
                 })?;
                 let full_path = pin.table_path.clone();
                 let first_touch = first_touch_source_versions.contains_key(&pin.identity);
@@ -729,7 +730,7 @@ async fn plan_index_work_node(
                         work.pending.push(PendingIndex {
                             table_key: table_key.to_string(),
                             column: prop_name.clone(),
-                            reason: "column has no non-null vectors to train on yet".to_string(),
+                            reason: "property has no non-null vectors to train on yet".to_string(),
                         });
                     }
                 }
@@ -882,7 +883,7 @@ pub(super) async fn open_for_mutation_on_branch(
     };
     let entry = snapshot
         .entry(table_key)
-        .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+        .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(table_key)))?;
     let full_path = format!("{}/{}", db.root_uri, entry.table_path);
 
     // Collapse #1 (RFC-013 step 3b): a non-strict op (Insert/Merge) on the txn's
@@ -1482,9 +1483,8 @@ async fn prepare_updates_for_commit(
 
     for update in updates {
         let Some(entry) = snapshot.entry(&update.table_key) else {
-            return Err(OmniError::manifest(format!(
-                "no manifest entry for {}",
-                update.table_key
+            return Err(OmniError::manifest(missing_graph_type_at_snapshot(
+                &update.table_key,
             )));
         };
 

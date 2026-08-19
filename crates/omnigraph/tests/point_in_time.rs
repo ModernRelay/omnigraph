@@ -206,7 +206,7 @@ async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation(
     assert!(
         error
             .to_string()
-            .contains("no manifest entry for node:Person"),
+            .contains("node type 'Person' does not exist at this snapshot"),
         "unexpected cross-incarnation refusal: {error}"
     );
 }

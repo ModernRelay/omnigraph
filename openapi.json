@@ -746,7 +746,7 @@
           "branches"
         ],
         "summary": "Create a new branch.",
-        "description": "Forks `name` off of `from` (defaults to `main`). The new branch shares\ntable data with its parent until it is mutated. Returns 409 if `name`\nalready exists.",
+        "description": "Forks `name` off of `from` (defaults to `main`). The new branch shares\nbacking dataset data with its parent until it is mutated. Returns 409 if `name`\nalready exists.",
         "operationId": "cluster_createBranch",
         "parameters": [
           {
@@ -929,7 +929,7 @@
             }
           },
           "413": {
-            "description": "Merge row, byte, or recovery-chain ceiling exceeded before effects",
+            "description": "Merge entity, byte, or recovery-chain ceiling exceeded before effects",
             "content": {
               "application/json": {
                 "schema": {
@@ -1154,7 +1154,7 @@
             }
           },
           "413": {
-            "description": "Keyed write exceeds the per-commit row or byte ceiling",
+            "description": "Keyed write exceeds the per-commit entity or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -1371,7 +1371,7 @@
             }
           },
           "413": {
-            "description": "Requested limit exceeds the public row ceiling",
+            "description": "Requested limit exceeds the public change ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -1439,7 +1439,7 @@
         },
         "responses": {
           "200": {
-            "description": "NDJSON entity snapshot pinned at one captured commit. Every preceding record is one type-keyed entity row (the load/export NDJSON shape); the FINAL record is the ChangeBaselineRecord envelope — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.",
+            "description": "NDJSON entity snapshot pinned at one captured commit. Every preceding record is one type-keyed entity record (the load/export NDJSON shape); the FINAL record is the ChangeBaselineRecord envelope — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.",
             "content": {
               "application/x-ndjson": {
                 "schema": {
@@ -1532,7 +1532,7 @@
           "commits"
         ],
         "summary": "List commits, most recent first.",
-        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract — newest first by (manifest version, created-at, commit id) — and\na future `cursor`/`limit` pagination will be keyset-based on that same\norder. Read-only.",
+        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract — newest first by (graph-manifest version, created-at, commit id) — and\na future `cursor`/`limit` pagination will be keyset-based on that same\norder. Read-only.",
         "operationId": "cluster_listCommits",
         "parameters": [
           {
@@ -1601,7 +1601,7 @@
           "commits"
         ],
         "summary": "Get a single commit.",
-        "description": "Returns the commit's manifest version, parent commit(s), and creation\nmetadata. Read-only.",
+        "description": "Returns the commit's graph-manifest version, parent commit(s), and creation\nmetadata. Read-only.",
         "operationId": "cluster_getCommit",
         "parameters": [
           {
@@ -1817,7 +1817,7 @@
             }
           },
           "413": {
-            "description": "Requested limit exceeds the public row ceiling",
+            "description": "Requested limit exceeds the public change ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -1860,7 +1860,7 @@
           "queries"
         ],
         "summary": "Stream the contents of a branch as NDJSON.",
-        "description": "Emits one JSON object per line (`application/x-ndjson`). Filter with\n`type_names` (node/edge type names) and/or `table_keys`; both empty\nstreams the entire branch. Suitable for large exports — the response is\nstreamed, not buffered. Read-only.",
+        "description": "Emits one JSON object per line (`application/x-ndjson`). Filter with\n`type_names` (node/edge type names) and/or the retained table-key\ncompatibility selectors in `table_keys`; both empty streams the entire\nbranch. Suitable for large exports — the response is streamed, not\nbuffered. Read-only.",
         "operationId": "cluster_export",
         "parameters": [
           {
@@ -2049,7 +2049,7 @@
             }
           },
           "413": {
-            "description": "Load input or external Blob admission exceeds a bounded per-operation row or byte ceiling",
+            "description": "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -2103,7 +2103,7 @@
           "mutations"
         ],
         "summary": "Compatibility-load NDJSON data through a JSON envelope.",
-        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` strictly inserts\nabsent ids, and `overwrite` replaces table contents. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.\n\nThe legacy `POST /ingest` route has identical semantics and is kept as a\ndeprecated alias.",
+        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting entities: `merge` upserts by id (default), `append` strictly inserts\nabsent ids, and `overwrite` replaces type data. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.\n\nThe legacy `POST /ingest` route has identical semantics and is kept as a\ndeprecated alias.",
         "operationId": "cluster_load",
         "parameters": [
           {
@@ -2178,7 +2178,7 @@
             }
           },
           "413": {
-            "description": "Load input or external Blob admission exceeds a bounded per-operation row or byte ceiling",
+            "description": "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -2270,7 +2270,7 @@
           {
             "name": "mode",
             "in": "query",
-            "description": "How existing rows are handled. Defaults to `merge`.",
+            "description": "How existing entities are handled. Defaults to `merge`.",
             "required": false,
             "schema": {
               "oneOf": [
@@ -2495,7 +2495,7 @@
             }
           },
           "413": {
-            "description": "Keyed write exceeds the per-commit row or byte ceiling",
+            "description": "Keyed write exceeds the per-commit entity or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -2642,7 +2642,7 @@
             }
           },
           "413": {
-            "description": "Keyed write exceeds the per-commit row or byte ceiling",
+            "description": "Keyed write exceeds the per-commit entity or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -2853,7 +2853,7 @@
             }
           },
           "413": {
-            "description": "Stored keyed mutation exceeds the per-commit row or byte ceiling",
+            "description": "Stored keyed mutation exceeds the per-commit entity or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -3035,7 +3035,7 @@
             }
           },
           "413": {
-            "description": "Stored keyed mutation exceeds the per-commit row or byte ceiling",
+            "description": "Stored keyed mutation exceeds the per-commit entity or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -3255,7 +3255,7 @@
           "schema"
         ],
         "summary": "Read the current schema source.",
-        "description": "Returns the project's schema as a single string in `.pg` source form.\nUseful for clients that want to introspect available types and tables\nbefore constructing GQ queries. Read-only.",
+        "description": "Returns the project's schema as a single string in `.pg` source form.\nUseful for clients that want to introspect available types and properties\nbefore constructing GQ queries. Read-only.",
         "operationId": "cluster_getSchema",
         "parameters": [
           {
@@ -3313,7 +3313,7 @@
           "mutations"
         ],
         "summary": "Apply a schema migration.",
-        "description": "Cluster-backed servers reject this route with `409 Conflict`; operators\nmust apply schema changes through `omnigraph cluster apply` and restart.\n\nDiffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop column, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
+        "description": "Cluster-backed servers reject this route with `409 Conflict`; operators\nmust apply schema changes through `omnigraph cluster apply` and restart.\n\nDiffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop property, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
         "operationId": "cluster_applySchema",
         "parameters": [
           {
@@ -3411,7 +3411,7 @@
           "snapshots"
         ],
         "summary": "Read the current snapshot of a branch.",
-        "description": "Returns the manifest version plus per-table metadata (path, version, row\ncount) for every table on the branch. Defaults to `main` when `branch` is\nomitted. Read-only.",
+        "description": "Returns the graph-manifest version plus per-dataset metadata (path,\npublished dataset version, entity count) for every backing dataset on the\nbranch. Defaults to `main` when `branch` is omitted. Read-only.",
         "operationId": "cluster_getSnapshot",
         "parameters": [
           {
@@ -3437,7 +3437,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Database snapshot",
+            "description": "Graph snapshot",
             "content": {
               "application/json": {
                 "schema": {
@@ -3779,7 +3779,7 @@
           "authored_at": {
             "type": "integer",
             "format": "int64",
-            "description": "Authorship time as Unix epoch microseconds — minted before table\neffects and stable across retries; deliberately not labeled a commit or\npublication time.",
+            "description": "Authorship time as Unix epoch microseconds — minted before dataset\neffects and stable across retries; deliberately not labeled a commit or\npublication time.",
             "example": 1714000000000000
           },
           "authored_branch": {
@@ -4084,7 +4084,7 @@
       },
       "ChangeTypeOutput": {
         "type": "object",
-        "description": "Graph-scoped type identity. `id` is opaque: it survives a supported rename\nand changes after drop/re-add. It is never a table, dataset, or path\nidentifier.",
+        "description": "Graph-scoped type identity. `id` is opaque: it survives a supported rename\nand changes after drop/re-add. It is never a retained table-key\ncompatibility selector, dataset, or path identifier.",
         "required": [
           "id",
           "name"
@@ -4324,7 +4324,7 @@
               },
               {
                 "$ref": "#/components/schemas/ManifestConflictOutput",
-                "description": "Set when the conflict is a publisher CAS rejection\n(`ManifestConflictDetails::ExpectedVersionMismatch`). The caller's\npre-write view of `table_key` was at version `expected` but the\nmanifest is now at `actual`. Refresh and retry."
+                "description": "Set when the conflict is a publisher CAS rejection\n(`ManifestConflictDetails::ExpectedVersionMismatch`). The caller's\npre-write view of `table_key` was at published dataset version\n`expected`, but the graph manifest now publishes `actual`. Refresh and retry."
               }
             ]
           },
@@ -4363,7 +4363,7 @@
               },
               {
                 "$ref": "#/components/schemas/RecoveryRequiredOutput",
-                "description": "Set when an overlapping durable recovery intent must be resolved before\nretry. Its table effects may or may not have started."
+                "description": "Set when an overlapping durable recovery intent must be resolved before\nretry. Its dataset effects may or may not have started."
               }
             ]
           },
@@ -4374,7 +4374,7 @@
               },
               {
                 "$ref": "#/components/schemas/ResourceLimitOutput",
-                "description": "Set when the request must be split into smaller graph commits. The\nrejected attempt has no durable sidecar and no table effect."
+                "description": "Set when the request must be split into smaller graph commits. The\nrejected attempt has no durable sidecar and no dataset effect."
               }
             ]
           }
@@ -4395,7 +4395,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Restrict the export to these table keys. Empty exports all tables."
+            "description": "Restrict the export using retained table-key compatibility selectors.\nEmpty exports all node and edge types."
           },
           "type_names": {
             "type": "array",
@@ -4426,7 +4426,7 @@
       },
       "GraphBatchDeclarationOutput": {
         "type": "object",
-        "description": "One logical declaration touched by a graph-batch load.\n\nThis deliberately carries the accepted-schema name, not the backing\nmanifest table key, dataset path, or Lance identity.",
+        "description": "One logical declaration touched by a graph-batch load.\n\nThis deliberately carries the accepted-schema name, not the backing\nretained table-key compatibility selector, dataset path, or Lance identity.",
         "required": [
           "name",
           "rows_loaded"
@@ -4649,7 +4649,7 @@
               },
               {
                 "$ref": "#/components/schemas/LoadMode",
-                "description": "How existing rows are handled. Defaults to `merge`."
+                "description": "How existing entities are handled. Defaults to `merge`."
               }
             ]
           }
@@ -4714,7 +4714,7 @@
       },
       "KeyConflictOutput": {
         "type": "object",
-        "description": "A strict insert rejected because `key` already names a row in the keyed\ngraph table.  The operation is effect-free when this output is returned;\npartial or ambiguous attempts surface `recovery_required` instead.",
+        "description": "A strict insert rejected because `key` already names an entity in the\nselected node or edge type. The operation is effect-free when this output is returned;\npartial or ambiguous attempts surface `recovery_required` instead.",
         "required": [
           "table_key"
         ],
@@ -4770,7 +4770,7 @@
       },
       "ManifestConflictOutput": {
         "type": "object",
-        "description": "Structured details for a publisher-level OCC failure. Surfaces alongside\nHTTP 409 when a write was rejected because the caller's pre-write view of\none table's manifest version was stale relative to the current head. The\nexpected/actual fields tell the client which table to refresh.",
+        "description": "Structured details for a publisher-level OCC failure. Surfaces alongside\nHTTP 409 when a write was rejected because the caller's pre-write view of\none backing dataset's published version was stale relative to the current\nhead. The expected/actual fields tell the client which dataset to refresh.",
         "required": [
           "table_key",
           "expected",
@@ -5073,7 +5073,7 @@
       },
       "ReadSetConflictOutput": {
         "type": "object",
-        "description": "Structured authority mismatch for a prepared write. Values are\nstrings because members include optional graph commit ids and future\nauthority tokens, not only numeric table versions.",
+        "description": "Structured authority mismatch for a prepared write. Values are\nstrings because members include optional graph commit ids and future\nauthority tokens, not only numeric published dataset versions.",
         "required": [
           "member"
         ],
@@ -5190,7 +5190,7 @@
         "properties": {
           "allow_data_loss": {
             "type": "boolean",
-            "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, making the prior column data unreachable\nafter the apply. Matches the CLI's `--allow-data-loss` flag.\nDefaults to `false` (drops remain reversible via time travel)."
+            "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, making the prior property data unreachable\nafter the apply. Matches the CLI's `--allow-data-loss` flag.\nDefaults to `false` (drops remain reversible via time travel)."
           },
           "schema_source": {
             "type": "string",

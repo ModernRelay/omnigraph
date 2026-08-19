@@ -51,7 +51,7 @@ You can also check versions before you hit a refusal:
 If the graph's stamp is **higher** than the binary's, the binary is too old —
 upgrade omnigraph rather than rebuilding the graph.
 
-If the refusal says `__manifest` has the current manifest layout but **no
+If the refusal says `__manifest` has the current graph-manifest layout but **no
 internal-schema stamp at all**, the graph is not a genuine pre-stamp store. It
 may be an `omnigraph init` from an older binary interrupted between creating
 `__manifest` and writing its separate stamp commit, or the stamp metadata may
@@ -67,9 +67,9 @@ known-good backup.
 
 | Preserved | Not preserved |
 |---|---|
-| All node and edge rows | Commit history (the graph DAG starts fresh) |
-| Vector columns (embeddings round-trip verbatim) | Branches (export is a single-branch snapshot) |
-| Blob columns | Snapshot/time-travel history of the old graph |
+| All node and edge entities | Commit history (the graph DAG starts fresh) |
+| Vector properties (embeddings round-trip verbatim) | Branches (export is a single-branch snapshot) |
+| Blob properties | Snapshot/time-travel history of the old graph |
 | The schema (re-applied at `init`) | |
 
 The rebuilt graph is a faithful copy of the exported branch's **current state**.
@@ -99,8 +99,8 @@ omnigraph snapshot s3://bucket/graph-v2.omni     # internal_schema_version is cu
 omnigraph version                                 # confirms the binary's served version
 ```
 
-`omnigraph export` writes a full JSONL snapshot (one row per node/edge, all
-columns including vectors and blobs) of the chosen branch (default `main`; pass
+`omnigraph export` writes a full JSONL snapshot (one record per node or edge, all
+properties including vectors and blobs) of the chosen branch (default `main`; pass
 `--branch` for another) to stdout. `omnigraph load --mode overwrite` replaces the
 target graph's contents with that snapshot.
 
@@ -113,7 +113,7 @@ server, or write the export through an embedded `Omnigraph` handle with an
 
 Once you have verified the rebuilt graph, retire the old one. If you rebuilt
 through a storage-format boundary, the target must be a different URI: keep the
-source root intact until row/vector/blob verification and fleet cutover are
+source root intact until entity/vector/blob verification and fleet cutover are
 complete. Do not use force-init to turn the old root into the new format.
 
 ## Notes
@@ -146,10 +146,10 @@ write-time validation strictness.
 
 ### What changed on disk (internal schema v4)
 
-- **Graph commit lineage now lives in the `__manifest` table.** Commits, parents,
+- **Graph commit lineage now lives in the `__manifest` graph-manifest dataset.** Commits, parents,
   merge parents, per-branch heads, and the authoring actor are stored as
   `graph_commit` / `graph_head` rows, written in the **same atomic commit** as the
-  table-version rows of a graph publish. Previously a crash in a narrow window
+  dataset-version rows (encoded as `table_version`) of a graph publish. Previously a crash in a narrow window
   could leave a published version with no matching history entry; that window no
   longer exists.
 - **Two internal datasets are retired.** `_graph_commits.lance` and
@@ -163,8 +163,8 @@ write-time validation strictness.
   window: upgrade every binary that touches a graph together, then rebuild.
 
 If you have tooling that inspects `__manifest` directly, note that it now holds
-three kinds of rows (table versions, commits, branch heads) rather than one —
-filter by row kind instead of assuming every row is a table version.
+  three kinds of rows (dataset versions, commits, branch heads) rather than one —
+  filter by row kind instead of assuming every row is a dataset version.
 
 ### Stricter validation — pre-flight your pipelines
 
@@ -176,8 +176,8 @@ gaps will now fail loudly at write time:
 - **Enum constraints are enforced on branch merge** (previously only on load and
   mutation).
 - **Cross-version uniqueness**: inserting a `@unique` value that collides with a
-  different, already-committed row is rejected on load and mutation (previously
-  only merges caught it). Re-upserting the *same* row — same key — is still an
+  different, already-committed entity is rejected on load and mutation (previously
+  only merges caught it). Re-upserting the *same* entity — same key — is still an
   update, not a violation.
 - **Duplicate keys within one input batch are rejected**: the same `@key` value
   twice in one load file is an error. The same id across *separate* batches or
@@ -187,8 +187,8 @@ gaps will now fail loudly at write time:
   spellings that denote the same typed value are accepted, and edge endpoints
   are rewritten by their declared node endpoint type. An ambiguous old-ID
   mapping is refused rather than guessed.
-- **Overwrite loads validate the new image per table**: an edges-only overwrite
-  resolves referential integrity against the retained node tables, and orphan
+- **Overwrite loads validate the new image per type**: an edges-only overwrite
+  resolves referential integrity against the retained node types, and orphan
   edges are rejected.
 
 Pre-flight recipe: before upgrading a production writer, run your ingest with a
@@ -201,7 +201,7 @@ omnigraph load --data batch.jsonl --mode merge \
   --branch preflight --from main s3://bucket/graph-v2.omni
 ```
 
-Rows violating the stricter checks fail the load with a typed error naming the
+Entities violating the stricter checks fail the load with a typed error naming the
 constraint; fix the data (or the constraint) and re-run. Nothing is partially
 applied — a failed load publishes no commit.
 
@@ -217,8 +217,8 @@ reports `internal_schema_version`.
 Internal schema v5 activates RFC-028 stable schema identity. Accepted type and
 property IDs are allocated inside one graph identity domain and survive
 supported renames; dropping and later recreating a declaration starts a new
-logical lifetime. The `__manifest` journal keys table registrations, versions,
-and tombstones by stable table ID plus incarnation, and initial table paths are
+logical lifetime. The `__manifest` journal keys dataset registrations, versions,
+and tombstones by stable table ID plus incarnation, and initial dataset paths are
 derived from that pair rather than a mutable type name.
 
 V5 was never released. It is documented here only so a maintainer can recognize
@@ -232,7 +232,7 @@ deliberately mints a new identity domain; identity continuity across
 export/import is not claimed.
 
 Tooling that reads `__manifest` directly must treat `stable_table_id` and
-`table_incarnation_id` as the table coordinate. `table_key` remains the current
+`table_incarnation_id` as the dataset coordinate. `table_key` remains the current
 human-readable alias and can change during a type rename. A pure rename keeps
 the same physical dataset path and Lance version.
 
@@ -243,12 +243,12 @@ stable identity model introduced by v5. Every newly created node and edge
 dataset declares exactly its non-null physical `id` field as Lance's
 unenforced primary key. Production graph inserts and upserts then use an
 exact-`id` filter-bearing transaction route; a bare Lance Append is not used for
-keyed graph rows.
+keyed graph entities.
 
 The user-visible load modes are now deliberately distinct:
 
 - `--mode append` means **strict insert**. If an `id` already exists, the load
-  returns `KeyConflict` and does not update that row. An effect-free concurrent
+  returns `KeyConflict` and does not update that entity. An effect-free concurrent
   same-key winner has the same result.
 - `--mode merge` means **upsert**. Existing IDs are updated; new IDs are
   inserted. If a retryable conflict occurs before any effect, the engine
@@ -266,20 +266,20 @@ phase; use a configured cluster server or an embedded handle for such an import.
 
 This format cannot be obtained by adding metadata to a live v4 or development
 v5 root. Lance's filtered/unfiltered conflict behavior is directional, so every
-table image and every writer must cross the boundary together. For a released
+dataset image and every writer must cross the boundary together. For a released
 v4 graph, quiesce writers, export with the latest 0.8.x binary, initialize a
 **different** root with the current 0.10.x binary, load the export, verify the v6
 stamp and data, then cut the whole fleet over. A development v5 root must be
 exported with the exact source build that wrote it. The current binary refuses
 both older roots, and the old binary must never write the new v6 root.
 
-The v6 load checks the export for duplicate logical IDs before any table effect.
+The v6 load checks the export for duplicate logical IDs before any dataset effect.
 Older bare-Append workloads could contain a committed collision; do not resolve
 one by silently choosing a winner during upgrade. A duplicate-bearing load
 fails atomically and leaves the separately initialized v6 target as a valid
 empty graph; do not serve that target, discard it, repair the source/export,
 and restart the rebuild into another clean root. Keep the source root intact
-until the rebuilt graph has passed row/vector/blob checks.
+until the rebuilt graph has passed entity/vector/blob checks.
 
 ### Repairing duplicate IDs found during the v6 rebuild
 
@@ -288,7 +288,7 @@ winner from export order. Repair the **exported snapshot**, not Lance files or
 the old graph root. Run this procedure independently for every branch snapshot
 you intend to preserve.
 
-A duplicate is scoped to one logical table:
+A duplicate is scoped to one logical node or edge type:
 
 - node key: `["node", <node type>, <data.id>]`;
 - edge key: `["edge", <edge type>, <data.id>]`.
@@ -321,7 +321,7 @@ former. Preserve the source root, raw export, checksum, old/new binary versions,
 and branch name until the rollback window has closed. Do not run `repair`,
 `cleanup`, or a hand-written Lance mutation against the old root.
 
-#### 2. Detect every duplicate table key
+#### 2. Detect every duplicate entity key
 
 The following scan requires `jq` and an external `sort`. It streams the export;
 only `sort` needs spill space. The encoded keys keep arbitrary UTF-8 IDs and
@@ -337,7 +337,7 @@ jq -rc '
     elif ((.edge? | type) == "string" and (.data.id? | type) == "string") then
       ["edge", .edge, .data.id]
     else
-      error("invalid export row: expected a node or edge with string data.id")
+      error("invalid export record: expected a node or edge with string data.id")
     end;
   logical_key | @base64
 ' graph.raw.jsonl |
@@ -347,8 +347,8 @@ jq -rc '
 
 If the pipeline exits nonzero, discard its partial output and stop; malformed
 JSON or a missing/string-invalid `data.id` is not a clean duplicate scan.
-An empty `duplicate-keys.b64` means this snapshot has no duplicate table keys.
-If it is non-empty, generate a reviewable report containing every physical row
+An empty `duplicate-keys.b64` means this snapshot has no duplicate entity keys.
+If it is non-empty, generate a reviewable report containing every exported record
 for every affected key:
 
 ```bash
@@ -361,7 +361,7 @@ jq --rawfile duplicates duplicate-keys.b64 -c '
     elif ((.edge? | type) == "string" and (.data.id? | type) == "string") then
       ["edge", .edge, .data.id]
     else
-      error("invalid export row")
+      error("invalid export record")
     end;
   ($duplicates | split("\n") | map(select(length > 0)) |
     reduce .[] as $key ({}; .[$key] = true)) as $duplicate_keys
@@ -382,28 +382,28 @@ deterministic transformation. Keep a decision ledger beside it containing the
 key, evidence, chosen action, resulting IDs, every edge rewrite, and reviewer.
 For each group, choose one of these domain decisions:
 
-- **One real entity or relationship:** consolidate the rows into exactly one
-  canonical row. Resolve every differing property explicitly. Byte-identical
-  rows still require a recorded “keep one” decision.
+- **One real entity or relationship:** consolidate the records into exactly one
+  canonical entity record. Resolve every differing property explicitly. Byte-identical
+  records still require a recorded “keep one” decision.
 - **Multiple real entities:** keep one ID and mint stable new application IDs
   for the others. Before remapping a node, inspect `schema.pg` for that node
   type. If it declares `@key`, choose replacement values for the complete key
-  tuple and write every component to its property. The safest repaired row
+  tuple and write every component to its property. The safest repaired record
   omits `data.id` and lets the loader derive the canonical physical ID; any
   incident edge must then use that derived ID. If the repair tooling writes
   `data.id` explicitly, use the exact encoding documented under
-  [schema table layout](../schema/index.md#table-layout): the canonical scalar
+  [schema type and dataset layout](../schema/index.md#table-layout): the canonical scalar
   string for one key component, or the JSON-array string for a composite key.
   If the node has no declared `@key`, update only `data.id`. Then
-  update every incident edge row's `from` or `to` whose edge schema points to
+  update every incident edge entity's `from` or `to` whose edge schema points to
   that node type. A matching text ID in another node type must not be rewritten
   automatically.
-- **Erroneous row:** remove it, and remove or redirect incident edges only when
+- **Erroneous entity:** remove its record, and remove or redirect incident edges only when
   the application contract says they belonged to that erroneous entity.
 - **Duplicate edge ID:** consolidate the relationship or mint new edge IDs.
   Edge endpoint IDs change only if the corresponding node decision requires it.
 
-Never use “first row”, “last row”, lexical order, `sort -u`, or an old commit's
+Never use “first record”, “last record”, lexical order, `sort -u`, or an old commit's
 apparent arrival order as evidence. The export is a snapshot, not an authority
 for which racing write was intended. Prefer the upstream system of record,
 domain timestamps with documented semantics, or human review. If the graph is
@@ -445,7 +445,7 @@ to heal the initialized empty target with `append` or `merge`.
 
 Compare the repaired input with the v6 re-export semantically. This helper
 preserves arbitrary-size JSON integers, canonicalizes object-key order, and
-lets external `sort` compare the complete row multisets:
+lets external `sort` compare the complete record multisets:
 
 ```bash
 set -euo pipefail
@@ -467,7 +467,7 @@ cmp repaired.semantic.jsonl canonical.semantic.jsonl
 
 Also rerun the duplicate detector against `graph.canonical.jsonl` into a new
 `canonical-duplicate-keys.b64`, execute the application's integrity queries,
-compare per-table row counts, check vectors, and verify blob content. A matching
+compare per-type entity counts, check vectors, and verify blob content. A matching
 external Blob URI proves only that the reference round-tripped; read or checksum
 the referenced object from the new fleet's credentials before cutover.
 
@@ -500,7 +500,7 @@ canonicalize_jsonl graph.final.jsonl > final.production.semantic.jsonl
 cmp canonical.production.semantic.jsonl final.production.semantic.jsonl
 ```
 
-The last comparison is semantic and does not assume that scan/export row order
+The last comparison is semantic and does not assume that scan/export record order
 is a storage contract. Cut the whole fleet or cluster configuration over only
 after it and the application checks pass. Never serve the failed empty target
 or the disposable validation root. Keep the old root and all repair evidence
@@ -553,7 +553,7 @@ Complete steps 1–4 for every declared graph and create a reviewed
 `rebuilt-graphs.tsv` with exactly one tab-separated row per `graphs:` key:
 `<graph-id><TAB><canonical-export-path>`. Check set equality between its graph
 IDs and the config; missing, extra, or repeated IDs are a stop condition. Load
-and semantically re-export every row into the roots created by `cluster apply`:
+and semantically re-export every record into the roots created by `cluster apply`:
 
 ```bash
 set -euo pipefail
@@ -600,7 +600,7 @@ while IFS=$'\t' read -r graph_id canonical_export ||
 done < rebuilt-graphs.tsv
 ```
 
-For every graph, also rerun the duplicate detector, compare per-table counts,
+For every graph, also rerun the duplicate detector, compare per-type entity counts,
 read vectors and blobs, and run its application integrity queries. One graph
 passing does not qualify the cluster. After every graph and catalog resource
 passes, refresh the ledger from live observations and capture the final state

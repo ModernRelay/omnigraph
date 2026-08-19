@@ -1,7 +1,7 @@
-//! Explicit repair for uncovered manifest/head drift.
+//! Explicit repair for uncovered published-dataset/Lance-HEAD drift.
 //!
 //! Recovery sidecars handle deterministic crash residuals automatically. This
-//! module is for the different case: a table's Lance HEAD is ahead of the
+//! module is for the different case: a dataset's Lance HEAD is ahead of the
 //! version recorded in `__manifest` and there is no sidecar encoding writer
 //! intent. `repair` classifies that uncovered drift from Lance transactions and
 //! only auto-publishes maintenance-only drift when the operator confirms.
@@ -21,11 +21,11 @@ pub struct RepairOptions {
     pub force: bool,
 }
 
-/// Classification of a table's manifest/head state.
+/// Classification of a dataset's graph-manifest/Lance-HEAD state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RepairClassification {
-    /// Lance HEAD equals the manifest pin.
+    /// Lance HEAD equals the published dataset version.
     NoDrift,
     /// Every uncovered Lance transaction is maintenance-only (`Rewrite` or
     /// `ReserveFragments`), so publishing the HEAD is content-preserving.
@@ -55,7 +55,7 @@ impl std::fmt::Display for RepairClassification {
     }
 }
 
-/// What repair did for a table.
+/// What repair did for a backing dataset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RepairAction {
@@ -91,11 +91,13 @@ impl std::fmt::Display for RepairAction {
     }
 }
 
-/// Per-table repair outcome.
+/// Per-dataset repair outcome.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TableRepairStats {
+    /// Retained table-key compatibility identifier for the backing dataset.
     pub table_key: String,
+    /// Published dataset version before repair.
     pub manifest_version: u64,
     pub lance_head_version: u64,
     pub classification: RepairClassification,
@@ -109,7 +111,7 @@ pub struct TableRepairStats {
 #[non_exhaustive]
 pub struct RepairStats {
     pub tables: Vec<TableRepairStats>,
-    /// New graph manifest version if repair published any table pins.
+    /// New graph-manifest version if repair published any dataset pins.
     pub manifest_version: Option<u64>,
 }
 
@@ -205,8 +207,10 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
 
         if lance_head_version < manifest_version {
             return Err(OmniError::manifest_internal(format!(
-                "table '{}' Lance HEAD version {} is behind manifest version {}",
-                table_key, lance_head_version, manifest_version
+                "{} is at Lance HEAD version {}, behind published dataset version {}",
+                dataset_subject(&table_key),
+                lance_head_version,
+                manifest_version
             )));
         }
 

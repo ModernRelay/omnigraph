@@ -62,6 +62,47 @@ fn help_groups_commands_by_capability() {
 }
 
 #[test]
+fn graph_vocabulary_help_preserves_ingest_and_export_compatibility_topology() {
+    let root_help = stdout_string(&output_success(cli().arg("--help")));
+    assert!(
+        !root_help
+            .lines()
+            .any(|line| line.trim_start().starts_with("ingest")),
+        "the compatibility command must remain hidden from root help:\n{root_help}"
+    );
+
+    let ingest_help = stdout_string(&output_success(cli().arg("ingest").arg("--help")));
+    assert!(ingest_help.contains("compatibility alias for load"));
+    assert!(ingest_help.contains("--from"));
+    assert!(ingest_help.contains("--mode"));
+
+    let export_help = stdout_string(&output_success(cli().arg("export").arg("--help")));
+    assert!(export_help.contains("--type"));
+    assert!(export_help.contains("--table"));
+
+    let load_help = stdout_string(&output_success(cli().arg("load").arg("--help")));
+    assert!(load_help.contains("existing entities"));
+    assert!(!load_help.contains("existing rows"));
+
+    let optimize_help = stdout_string(&output_success(cli().arg("optimize").arg("--help")));
+    assert!(optimize_help.contains("backing dataset"));
+
+    let cleanup_help = stdout_string(&output_success(cli().arg("cleanup").arg("--help")));
+    assert!(cleanup_help.contains("backing dataset"));
+    assert!(cleanup_help.contains("per dataset"));
+
+    let embed_help = stdout_string(&output_success(cli().arg("embed").arg("--help")));
+    assert!(embed_help.contains("matching records"));
+    assert!(!embed_help.contains("matching entities"));
+
+    let schema_apply_help = stdout_string(&output_success(
+        cli().arg("schema").arg("apply").arg("--help"),
+    ));
+    assert!(schema_apply_help.contains("property or type"));
+    assert!(schema_apply_help.contains("graph-manifest version"));
+}
+
+#[test]
 fn init_creates_graph_successfully_on_missing_local_directory() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -221,6 +262,7 @@ fn schema_apply_human_reports_noop() {
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("applied: no"));
+    assert!(stdout.contains("graph_manifest_version:"));
     assert!(stdout.contains("no schema changes"));
 }
 

@@ -117,7 +117,7 @@ impl BaselineOutLock {
 /// replaced `--out` after our atomic persist yields a different inode, so the
 /// caller can refuse to print a resume cursor that no longer pairs with the
 /// installed snapshot. Content-free: the baseline file deliberately carries
-/// only snapshot rows (the handshake goes to stdout), so identity — not a
+/// only snapshot records (the handshake goes to stdout), so identity — not a
 /// terminal marker — is the correct witness.
 #[cfg(unix)]
 fn installed_file_is_current(installed: &fs::File, path: &std::path::Path) -> Result<bool> {
@@ -371,7 +371,7 @@ async fn main() -> Result<()> {
         } => {
             // stderr so `--json` consumers reading stdout are unaffected.
             eprintln!(
-                "warning: `omnigraph ingest` is deprecated and will be removed in a future release; \
+                "warning: `omnigraph ingest` is a deprecated compatibility alias kept indefinitely; \
                  use strict graph-batch `omnigraph load --from <base> --mode <mode>` for new integrations \
                  (ingest defaults: --from main --mode merge)"
             );
@@ -1311,20 +1311,24 @@ async fn main() -> Result<()> {
                 });
                 print_json(&value)?;
             } else {
-                println!("optimize {} — {} tables", uri, stats.len());
+                println!("optimize {} — {} datasets", uri, stats.len());
                 for s in &stats {
+                    let subject = graph_type_subject(&s.table_key);
                     if let Some(reason) = s.skipped {
-                        println!("  {:<40} skipped ({reason})", s.table_key);
+                        println!("  {subject:<40} skipped ({reason})");
                     } else if s.committed {
                         println!(
                             "  {:<40} frags {} → {} ✓",
-                            s.table_key, s.fragments_removed, s.fragments_added
+                            subject, s.fragments_removed, s.fragments_added
                         );
                     } else {
-                        println!("  {:<40} no-op", s.table_key);
+                        println!("  {subject:<40} no-op");
                     }
                     for p in &s.pending_indexes {
-                        println!("    ↳ index pending on '{}': {}", p.column, p.reason);
+                        println!(
+                            "    ↳ index pending on property '{}': {}",
+                            p.column, p.reason
+                        );
                     }
                 }
             }
@@ -1374,7 +1378,7 @@ async fn main() -> Result<()> {
             } else {
                 let mode = if confirm { "confirm" } else { "preview" };
                 println!(
-                    "repair {} — {} mode, {} tables",
+                    "repair {} — {} mode, {} datasets",
                     uri,
                     mode,
                     stats.tables.len()
@@ -1397,7 +1401,7 @@ async fn main() -> Result<()> {
                         .unwrap_or_default();
                     println!(
                         "  {:<40} {:<12} {:<22} {}{}{}",
-                        s.table_key,
+                        graph_type_subject(&s.table_key),
                         s.action.as_str(),
                         s.classification.as_str(),
                         drift,
@@ -1411,7 +1415,7 @@ async fn main() -> Result<()> {
             }
             if refused_count > 0 {
                 bail!(
-                    "repair refused {} suspicious or unverifiable table(s); review the preview \
+                    "repair refused {} suspicious or unverifiable dataset(s); review the preview \
                      output and rerun with --force --confirm only if publishing that drift is \
                      intentional",
                     refused_count
@@ -1486,13 +1490,13 @@ async fn main() -> Result<()> {
             } else {
                 let total_bytes: u64 = stats.iter().map(|s| s.bytes_removed).sum();
                 let total_versions: u64 = stats.iter().map(|s| s.old_versions_removed).sum();
-                let failed: Vec<&str> = stats
+                let failed: Vec<String> = stats
                     .iter()
                     .filter(|s| s.error.is_some())
-                    .map(|s| s.table_key.as_str())
+                    .map(|s| graph_type_subject(&s.table_key))
                     .collect();
                 println!(
-                    "cleanup {} ({}) — removed {} versions ({} bytes) across {} tables",
+                    "cleanup {} ({}) — removed {} versions ({} bytes) across {} datasets",
                     uri,
                     policy_desc,
                     total_versions,
@@ -1501,7 +1505,7 @@ async fn main() -> Result<()> {
                 );
                 if !failed.is_empty() {
                     println!(
-                        "  {} table(s) failed and will be retried on the next cleanup: {}",
+                        "  {} dataset(s) failed and will be retried on the next cleanup: {}",
                         failed.len(),
                         failed.join(", ")
                     );
