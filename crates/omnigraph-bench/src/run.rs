@@ -412,6 +412,41 @@ fn run_root(
 
 /// Open the store with the engine's public counting decorator on the
 /// control-plane `StorageAdapter`, returning the handle plus the counter.
+/// Non-vacuous row check, run for EVERY repetition (warm-ups included — the
+/// README's guard contract): the merged target must hold exactly the planned
+/// row count on the first diverged table, or the repetition (and with it the
+/// whole run) is refused. Callers place this AFTER the measured window's
+/// storage counters are captured: the verification reads must never ride a
+/// merge window's tallies (they are wiped by the next rep's pre-merge reset).
+async fn verify_merged_rows(
+    db: &Omnigraph,
+    target: &str,
+    plan: &FixturePlan,
+    rep: usize,
+) -> BenchResult<RowCheck> {
+    let table_key = fixture::table_key(0);
+    let expected = plan.expected_rows_after_merge(0);
+    let actual = db
+        .snapshot_of(ReadTarget::branch(target))
+        .await?
+        .open(&table_key)
+        .await?
+        .count_rows(None)
+        .await?;
+    if actual != expected {
+        return Err(format!(
+            "rep {rep}: post-merge row count on {table_key} is {actual}, expected {expected}; \
+             the merge did not apply the planned delta — refusing to record"
+        )
+        .into());
+    }
+    Ok(RowCheck {
+        table_key,
+        expected,
+        actual,
+    })
+}
+
 async fn open_counting(root: &str) -> BenchResult<(Omnigraph, Arc<StorageReadCounts>)> {
     let inner = storage_for_uri(root)?;
     let (adapter, counts) = CountingStorageAdapter::new(inner);
@@ -598,7 +633,9 @@ async fn run_one_body(
     let mut storage_table: Vec<crate::counting::CallCounts> = Vec::with_capacity(args.reps);
     let mut storage_control: Vec<ControlCalls> = Vec::with_capacity(args.reps);
     let mut fixture_seconds = build_started.elapsed().as_secs_f64();
-    let mut last_target = String::new();
+    // Every rep is row-checked in the loop; the record persists the last
+    // measured rep's check (all reps passed, or the run refused above).
+    let mut row_check: Option<RowCheck> = None;
 
     let rep_base = args.internal_cold_rep.unwrap_or(0);
     let total_reps = warmup + args.reps;
@@ -670,8 +707,10 @@ async fn run_one_body(
             outcome,
             duration_ms(elapsed)
         );
-        last_target = tgt;
         if !measured {
+            // Warm-up reps get the same row check; its reads are wiped by the
+            // next rep's pre-merge counter reset, so no tally is polluted.
+            let _ = verify_merged_rows(&db, &tgt, plan, rep).await?;
             continue;
         }
         if phase_names.is_empty() {
@@ -711,24 +750,10 @@ async fn run_one_body(
             control_snapshot(&control_counts),
         ));
         wall_ms.push(duration_ms(elapsed));
-    }
-
-    // Non-vacuous row check on the first diverged table of the last target.
-    let table_key = fixture::table_key(0);
-    let expected = plan.expected_rows_after_merge(0);
-    let actual = db
-        .snapshot_of(ReadTarget::branch(&last_target))
-        .await?
-        .open(&table_key)
-        .await?
-        .count_rows(None)
-        .await?;
-    if actual != expected {
-        return Err(format!(
-            "post-merge row count on {table_key} is {actual}, expected {expected}; \
-             the merge did not apply the planned delta — refusing to record"
-        )
-        .into());
+        // Measured reps run the row check HERE, after the merge window's
+        // counters were captured above, so the verification reads never ride
+        // a measured tally (and are wiped by the next rep's reset).
+        row_check = Some(verify_merged_rows(&db, &tgt, plan, rep).await?);
     }
 
     let phases: Vec<PhaseStats> = phase_names
@@ -747,11 +772,8 @@ async fn run_one_body(
         wall_clock_ms: wall_stats(&wall_ms),
         phases,
         merge_outcome: "Merged".to_string(),
-        verified_rows_table0: RowCheck {
-            table_key,
-            expected,
-            actual,
-        },
+        verified_rows_table0: row_check
+            .ok_or("no measured repetition ran; nothing to record (reps must be >= 1)")?,
         fixture_build_seconds: fixture_seconds,
         write_path,
         storage_calls: Some(StorageCalls {

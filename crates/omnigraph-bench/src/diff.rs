@@ -379,6 +379,21 @@ fn print_floor_cell_warnings(floor: &NoiseFloor, a: &RunRecord, b: &RunRecord, o
 /// a compared pair: one unsupported side already makes the p95 row
 /// directional — it never prints as a clean percentile. The row carries the
 /// short marker; [`print_pair`] prints the explanation once as a note.
+/// The floor entry applicable to a compared pair. A noise floor is per point
+/// (per cell, RFC 0039 rule 7), so a cross-point comparison gets NO floor:
+/// a "no detected effect"/"not claimable" label minted from either side's
+/// cell would be an unsupported claim for the pair.
+fn floor_entry_for_pair<'f>(
+    f: &'f NoiseFloor,
+    a: &RunRecord,
+    b: &RunRecord,
+) -> Option<&'f FloorPoint> {
+    if a.point_name != b.point_name {
+        return None;
+    }
+    f.points.get(&a.point_name)
+}
+
 fn tail_marker(a: &RunRecord, b: &RunRecord) -> &'static str {
     if a.results.wall_clock_ms.tail_support == "supported"
         && b.results.wall_clock_ms.tail_support == "supported"
@@ -581,16 +596,20 @@ fn print_pair(
         .unwrap_or_else(crate::record::default_margin);
     let floor_point: Option<&FloorPoint> = floor.and_then(|f| {
         print_floor_cell_warnings(f, a, b, out);
-        let hit = f
-            .points
-            .get(&a.point_name)
-            .or_else(|| f.points.get(&b.point_name));
+        let hit = floor_entry_for_pair(f, a, b);
         if hit.is_none() {
-            out.note(&format!(
-                "the noise floor has no entry for point {} — wall/phase deltas print \
-                 unlabeled; rerun `run --aa` on this point for a floor.",
-                a.point_name
-            ));
+            if a.point_name == b.point_name {
+                out.note(&format!(
+                    "the noise floor has no entry for point {} — wall/phase deltas print \
+                     unlabeled; rerun `run --aa` on this point for a floor.",
+                    a.point_name
+                ));
+            } else {
+                out.note(
+                    "cross-point comparison: a noise floor is per point (per cell, RFC 0039 \
+                     rule 7), so no floor applies — wall/phase deltas print unlabeled.",
+                );
+            }
         }
         hit
     });
