@@ -24,16 +24,19 @@
 use std::io::Write;
 
 use color_eyre::Result;
-use color_eyre::eyre::bail;
+use color_eyre::eyre::{bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent};
 use omnigraph_api_types::{
     BlobReadQuery, BlobStatOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
-    BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest,
-    CommitListOutput, CommitOutput, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
-    GraphListResponse, IngestOutput, IngestRequest, InvokeStoredQueryRequest, QueryRequest,
-    ReadOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
-    ingest_receipt_output, read_output, schema_apply_output, snapshot_payload,
+    BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeBaselineOutput,
+    ChangeBaselineRecord, ChangeBaselineRequest, ChangeEntityKind, ChangeFeedOutput,
+    ChangeOpOutput, ChangeOutput, ChangeRequest, CommitChangesOutput, CommitListOutput,
+    CommitOutput, ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse,
+    IngestOutput, IngestRequest, InvokeStoredQueryRequest, QueryRequest, ReadOutput,
+    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, change_baseline_output,
+    change_feed_output, change_scope, commit_changes_output, commit_output, ingest_receipt_output,
+    read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::header::{CONTENT_RANGE, RANGE};
@@ -423,6 +426,215 @@ impl GraphClient {
             GraphClient::Embedded { uri, .. } => {
                 let db = Omnigraph::open(uri).await?;
                 Ok(commit_output(&db.get_commit(commit_id).await?))
+            }
+        }
+    }
+
+    /// Fetch one bounded page of a commit's entity diff. Auto-pagination is
+    /// deliberately owned by the command output loop, which emits each page
+    /// before fetching the next one instead of rebuilding an unbounded result.
+    pub(crate) async fn commit_changes_page(
+        &self,
+        commit_id: &str,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        filter: &ChangeFilterArgs<'_>,
+    ) -> Result<CommitChangesOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                let limit_value = limit.map(|limit| limit.to_string());
+                let mut query = Vec::new();
+                if let Some(page_token) = page_token {
+                    query.push(("page_token", page_token));
+                }
+                if let Some(limit) = limit_value.as_deref() {
+                    query.push(("limit", limit));
+                }
+                let filter_pairs = filter.query_pairs();
+                query.extend(
+                    filter_pairs
+                        .iter()
+                        .map(|(name, value)| (*name, value.as_str())),
+                );
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["commits", commit_id, "changes"], &query)?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Omnigraph::open(uri).await?;
+                let scope = change_scope(filter.kinds, filter.types, filter.ops);
+                let page = db
+                    .commit_changes_page(commit_id, &scope, page_token, limit, None)
+                    .await?;
+                Ok(commit_changes_output(&page))
+            }
+        }
+    }
+
+    /// Fetch one bounded page of a captured feed poll. The caller continues
+    /// with `next_page_token`; this method never aggregates pages in memory.
+    pub(crate) async fn poll_changes_page(
+        &self,
+        branch: Option<&str>,
+        cursor: Option<&str>,
+        start: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        filter: &ChangeFilterArgs<'_>,
+    ) -> Result<ChangeFeedOutput> {
+        // A page token continues one poll and supersedes the start position.
+        let (cursor, start) = if page_token.is_some() {
+            (None, None)
+        } else {
+            (cursor, start)
+        };
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                let limit_value = limit.map(|limit| limit.to_string());
+                let mut query = Vec::new();
+                if let Some(branch) = branch {
+                    query.push(("branch", branch));
+                }
+                if let Some(cursor) = cursor {
+                    query.push(("cursor", cursor));
+                }
+                if let Some(start) = start {
+                    query.push(("start", start));
+                }
+                if let Some(page_token) = page_token {
+                    query.push(("page_token", page_token));
+                }
+                if let Some(limit) = limit_value.as_deref() {
+                    query.push(("limit", limit));
+                }
+                let filter_pairs = filter.query_pairs();
+                query.extend(
+                    filter_pairs
+                        .iter()
+                        .map(|(name, value)| (*name, value.as_str())),
+                );
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["changes"], &query)?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Omnigraph::open(uri).await?;
+                let position = if let Some(token) = page_token {
+                    omnigraph::changes::ChangeFeedPosition::PageToken(token.to_string())
+                } else if let Some(cursor) = cursor {
+                    omnigraph::changes::ChangeFeedPosition::Cursor(cursor.to_string())
+                } else {
+                    omnigraph::changes::ChangeFeedPosition::Start(parse_change_feed_start(
+                        start.unwrap_or("now"),
+                    )?)
+                };
+                let page = db
+                    .poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+                        branch: branch.map(str::to_string),
+                        position,
+                        scope: change_scope(filter.kinds, filter.types, filter.ops),
+                        max_changes: limit,
+                        max_bytes: None,
+                        max_commits: None,
+                    })
+                    .await?;
+                Ok(change_feed_output(&page))
+            }
+        }
+    }
+
+    /// Capture a change baseline: stream the snapshot records into `writer`
+    /// and return the terminal handshake. The terminal record itself is NOT
+    /// written to `writer` — a stream that ends without one is an error, so a
+    /// usable cursor never outlives a broken snapshot.
+    pub(crate) async fn change_baseline<W: Write>(
+        &self,
+        branch: Option<&str>,
+        filter: &ChangeFilterArgs<'_>,
+        writer: &mut W,
+    ) -> Result<ChangeBaselineOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                let request = apply_bearer_token(
+                    http.request(
+                        Method::POST,
+                        remote_url(base_url, &["changes", "baseline"], &[])?,
+                    ),
+                    token.as_deref(),
+                )
+                .json(&ChangeBaselineRequest {
+                    branch: branch.map(str::to_string),
+                    kind: filter.kinds.to_vec(),
+                    r#type: filter.types.to_vec(),
+                    op: filter.ops.to_vec(),
+                });
+                let mut response = request.send().await?;
+                let status = response.status();
+                if !status.is_success() {
+                    let text = response.text().await?;
+                    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+                        bail!(error.error);
+                    }
+                    bail!("server returned {}: {}", status, text);
+                }
+                // Hold back the most recent complete line while streaming: at
+                // EOF it must be the terminal handshake record. Everything
+                // before it is snapshot data.
+                let mut pending: Vec<u8> = Vec::new();
+                let mut held: Option<Vec<u8>> = None;
+                while let Some(chunk) = response.chunk().await? {
+                    pending.extend_from_slice(&chunk);
+                    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                        let mut line: Vec<u8> = pending.drain(..=newline).collect();
+                        line.pop();
+                        if let Some(previous) = held.replace(line) {
+                            writer.write_all(&previous)?;
+                            writer.write_all(b"\n")?;
+                        }
+                    }
+                }
+                writer.flush()?;
+                if !pending.is_empty() {
+                    bail!("baseline stream ended mid-record — no usable cursor");
+                }
+                let terminal =
+                    held.ok_or_else(|| eyre!("baseline stream carried no terminal record"))?;
+                let record: ChangeBaselineRecord =
+                    serde_json::from_slice(&terminal).map_err(|_| {
+                        eyre!("baseline stream ended without a terminal record — no usable cursor")
+                    })?;
+                Ok(record.baseline)
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Omnigraph::open(uri).await?;
+                let scope = change_scope(filter.kinds, filter.types, filter.ops);
+                let baseline = db
+                    .capture_change_baseline(branch.unwrap_or("main"), &scope, writer)
+                    .await?;
+                writer.flush()?;
+                Ok(change_baseline_output(&baseline))
             }
         }
     }
@@ -1187,6 +1399,45 @@ fn validate_content_range(
         bail!("Blob server returned an inconsistent Content-Range");
     }
     Ok(())
+}
+
+/// Shared spelling of the change-surface filters across the three verbs; one
+/// translation (`change_scope`) is used by the embedded arm and the server.
+pub(crate) struct ChangeFilterArgs<'a> {
+    pub kinds: &'a [ChangeEntityKind],
+    pub types: &'a [String],
+    pub ops: &'a [ChangeOpOutput],
+}
+
+impl ChangeFilterArgs<'_> {
+    fn query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = Vec::new();
+        for kind in self.kinds {
+            pairs.push(("kind", kind.as_str().to_string()));
+        }
+        for type_name in self.types {
+            pairs.push(("type", type_name.clone()));
+        }
+        for op in self.ops {
+            pairs.push(("op", op.as_str().to_string()));
+        }
+        pairs
+    }
+}
+
+/// The embedded arm's twin of the served start-mode parser.
+fn parse_change_feed_start(start: &str) -> Result<omnigraph::changes::ChangeFeedStart> {
+    match start {
+        "now" => Ok(omnigraph::changes::ChangeFeedStart::Now),
+        "beginning" => Ok(omnigraph::changes::ChangeFeedStart::Beginning),
+        other => other
+            .strip_prefix("after:")
+            .filter(|commit_id| !commit_id.is_empty())
+            .map(|commit_id| {
+                omnigraph::changes::ChangeFeedStart::AfterCommit(commit_id.to_string())
+            })
+            .ok_or_else(|| eyre!("start must be now | beginning | after:<commit_id>")),
+    }
 }
 
 #[cfg(test)]

@@ -506,7 +506,7 @@ async fn test_branch_namespace_lists_and_describes_versions() {
     let request =
         version_metadata.to_create_table_version_request("node:Person", person_version, 1, None);
     namespace.create_table_version(request).await.unwrap();
-    let _ = mc.refresh_for_live_read().await.unwrap();
+    let _ = mc.refresh_for_live_read(|_| true).await.unwrap();
 
     let versions = namespace
         .list_table_versions(ListTableVersionsRequest {
@@ -591,7 +591,7 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
     // omnigraph's manifest stays authoritative: refresh ignores the direct
     // `person_ds.append` above (it was never manifest-published), so the row
     // count stays 0 and the version is unchanged.
-    let _ = mc.refresh_for_live_read().await.unwrap();
+    let _ = mc.refresh_for_live_read(|_| true).await.unwrap();
     assert_eq!(mc.version(), graph_manifest_version);
     assert_eq!(
         mc.snapshot().entry("node:Person").unwrap().table_version,
@@ -859,7 +859,7 @@ async fn test_refresh_observes_external_publish_without_mutating_existing_snapsh
         0
     );
 
-    let _ = reader.refresh_for_live_read().await.unwrap();
+    let _ = reader.refresh_for_live_read(|_| true).await.unwrap();
     assert!(reader.version() > manifest_version);
     assert_eq!(
         reader

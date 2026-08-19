@@ -826,3 +826,66 @@ async fn four_version_chain_insert_update_delete() {
     let cur_names = collect_column_strings(current.batches(), "p.name");
     assert!(!cur_names.contains(&"Eve".to_string()));
 }
+
+// ─── Retention: reclaimed pinned versions are typed ─────────────────────────
+
+/// Regression (test-first for the typed opener): a manifest-pinned Lance
+/// version that cleanup has reclaimed must surface as the typed
+/// `HistoricalVersionReclaimed` error, never as a generic storage string a
+/// caller would have to parse.
+#[tokio::test]
+async fn historical_read_of_reclaimed_version_is_typed() {
+    use lance::Dataset;
+    use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
+    use omnigraph::db::ReadTarget;
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let v1 = version_main(&db).await.unwrap();
+
+    // Sanity: the historical entity read works while the version is retained.
+    let alice = db.entity_at("node:Person", "Alice", v1).await.unwrap();
+    assert!(alice.is_some(), "Alice should exist at v1");
+
+    // Advance the Person table so v1's pin becomes an old Lance version…
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+    )
+    .await
+    .unwrap();
+
+    // …then reclaim every pre-current Person version directly.
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let person_path = &snapshot.entry("node:Person").unwrap().table_path;
+    let person_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        person_path.trim_start_matches('/')
+    );
+    let person = Dataset::open(&person_uri).await.unwrap();
+    let removed = cleanup_old_versions(
+        &person,
+        CleanupPolicy {
+            before_version: Some(person.version().version),
+            delete_unverified: true,
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        removed.old_versions > 0,
+        "precondition: history was reclaimed"
+    );
+
+    let err = db.entity_at("node:Person", "Alice", v1).await.unwrap_err();
+    assert!(
+        matches!(err, OmniError::HistoricalVersionReclaimed { .. }),
+        "expected the typed reclaimed-version error, got: {err:?}"
+    );
+}

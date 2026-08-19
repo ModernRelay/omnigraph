@@ -86,6 +86,11 @@ pub enum OmniError {
     Compiler(#[from] omnigraph_compiler::error::CompilerError),
     #[error("storage: {0}")]
     Lance(String),
+    /// A manifest-pinned Lance version was reclaimed by cleanup. Kept typed at
+    /// the common opener so historical APIs never infer retention from error text.
+    #[error("historical table version {version} was reclaimed")]
+    HistoricalVersionReclaimed { version: u64 },
+
     /// Lance rejected a stale transaction as semantically retryable. Kept
     /// typed at the storage boundary so RFC-023 can distinguish an
     /// effect-free key fence from an arbitrary I/O or execution failure
@@ -121,6 +126,41 @@ pub enum OmniError {
         resource: String,
         limit: u64,
         actual: u64,
+    },
+    /// A change continuation (page token or feed cursor) failed decoding or
+    /// names a different scope — graph, commit, branch incarnation, filter, or
+    /// continuation kind. Kept typed so callers can tell a caller-side
+    /// continuation bug from a retention gap without parsing text.
+    #[error("change cursor rejected: {reason}")]
+    ChangeCursorRejected { reason: String },
+    /// A logical graph branch named by the caller does not exist. Minted only
+    /// at the branch-ref lookup boundary, before physical table work, so HTTP
+    /// change routes can return a fixed graph-vocabulary 404 without treating
+    /// an arbitrary storage `NotFound` as branch absence.
+    #[error("branch '{branch}' not found")]
+    BranchNotFound { branch: String },
+    /// A change page or feed can no longer be reconstructed contiguously:
+    /// cleanup reclaimed a table version one of its commits pins. Recovery is
+    /// the exact baseline handshake, never a retried continuation.
+    #[error("change feed gap at commit '{first_unreadable_commit_id}'")]
+    ChangeFeedGap {
+        cursor: Option<String>,
+        first_unreadable_commit_id: String,
+    },
+    /// The parentless genesis commit has no entity diff; callers bootstrap
+    /// from an exact baseline instead of receiving invented inserts.
+    #[error("commit '{graph_commit_id}' has no first parent; bootstrap from an exact baseline")]
+    CommitHasNoParent { graph_commit_id: String },
+    /// The two exact snapshots of a first-parent edge do not share a provably
+    /// identical logical user schema for one paired type lifetime (or the
+    /// table set changed with data present). Entity diff refuses rather than
+    /// guessing; schema evolution is not synthesized into entity changes.
+    #[error(
+        "entity changes for commit '{graph_commit_id}' cross an unprovable schema boundary at type '{type_name}'"
+    )]
+    ChangeSchemaBoundary {
+        graph_commit_id: String,
+        type_name: String,
     },
     /// A caller attempted to admit an external Blob URI that is malformed or
     /// outside this graph handle's immutable base allowlist. The URI must be a

@@ -10974,6 +10974,319 @@ node Document {
     );
 }
 
+/// A change-feed poll captures its cut, then reopens each commit's per-branch
+/// manifest snapshot lock-free. Deleting and recreating the polled branch in
+/// that window reuses the physical path and numeric manifest version, so the
+/// in-poll incarnation re-prove must reject the stale cut instead of emitting
+/// the replacement branch's rows under the captured commit's label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn change_feed_poll_refuses_delete_recreate_aba_after_cut_capture() {
+    use omnigraph::changes::{
+        ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart,
+    };
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let schema = r#"
+node Document {
+    title: String @key
+    content: String
+}
+"#;
+    let setup = Omnigraph::init(&uri, schema).await.unwrap();
+    load_jsonl(
+        &setup,
+        r#"{"type":"Document","data":{"title":"aba","content":"base"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    setup.branch_create("feature").await.unwrap();
+    setup
+        .load(
+            "feature",
+            r#"{"type":"Document","data":{"title":"aba","content":"old"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    drop(setup);
+
+    let reader = Omnigraph::open(&uri).await.unwrap();
+    let control = Omnigraph::open(&uri).await.unwrap();
+    let old_entry = control
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .entry("node:Document")
+        .unwrap()
+        .clone();
+
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::CHANGE_FEED_POST_CAPTURE);
+    // Poll from the beginning so the feature-authored commit is reopened; its
+    // snapshot is what the ABA retargets.
+    let request = ChangeFeedRequest {
+        branch: Some("feature".to_string()),
+        position: ChangeFeedPosition::Start(ChangeFeedStart::Beginning),
+        scope: ChangeFeedScope::default(),
+        max_changes: None,
+        max_bytes: None,
+        max_commits: None,
+    };
+    let poll_task = tokio::spawn(async move { reader.poll_change_feed(request).await });
+    rendezvous.wait_until_reached().await;
+
+    // Keep the parked poll releasable even if a control-plane op fails.
+    let replacement = async {
+        control.branch_delete("feature").await?;
+        control.branch_create("feature").await?;
+        control
+            .load(
+                "feature",
+                r#"{"type":"Document","data":{"title":"aba","content":"new"}}"#,
+                LoadMode::Merge,
+            )
+            .await?;
+        control.snapshot_of(ReadTarget::branch("feature")).await
+    }
+    .await;
+    rendezvous.release();
+
+    let new_snapshot = replacement.expect("delete/recreate replacement must complete");
+    let new_entry = new_snapshot.entry("node:Document").unwrap();
+    assert_eq!(
+        new_entry.table_version, old_entry.table_version,
+        "the regression must exercise same-version branch ABA"
+    );
+
+    let error = poll_task
+        .await
+        .unwrap()
+        .expect_err("the stale cut must never emit the replacement branch's rows");
+    assert!(
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+                    && manifest
+                        .message
+                        .contains("has no persisted native-branch incarnation witness")
+        ),
+        "in-poll branch ABA must fail with the incarnation refusal, got {error:?}"
+    );
+}
+
+/// The feed re-proves each commit's manifest head (`commit_snapshot`), but then
+/// opens the per-table datasets SEPARATELY by (branch path, numeric version). A
+/// branch delete/recreate AFTER the head proof but before the table open would
+/// retarget the physical open to the replacement branch's rows. Two witnesses
+/// close that second window: `open_at_entry_verified`'s per-table e_tag
+/// comparison (defense-in-depth; exercised here — on local FS the synthetic
+/// e_tag changes on recreation, so this arm fires first) and the logical
+/// post-open `reprove_named_branch_heads` (exercised by the e_tag-less twin
+/// below). The `CHANGE_FEED_POST_CAPTURE` test above covers the first window
+/// (pre-`commit_snapshot`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn change_feed_poll_refuses_delete_recreate_aba_before_table_open() {
+    use omnigraph::changes::{
+        ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart,
+    };
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let schema = r#"
+node Document {
+    title: String @key
+    content: String
+}
+"#;
+    let setup = Omnigraph::init(&uri, schema).await.unwrap();
+    // Isolate a SINGLE commit (the feature-authored one) so its manifest head is
+    // proven BEFORE the failpoint and only the per-table open can catch the ABA;
+    // start after the base commit so a later commit's `commit_snapshot` (the
+    // first-window guard) is not the one that catches it.
+    let base = setup
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Document","data":{"title":"aba","content":"base"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    let base_commit_id = base.commit.graph_commit_id.clone();
+    setup.branch_create("feature").await.unwrap();
+    setup
+        .load(
+            "feature",
+            r#"{"type":"Document","data":{"title":"aba","content":"old"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    drop(setup);
+
+    let reader = Omnigraph::open(&uri).await.unwrap();
+    let control = Omnigraph::open(&uri).await.unwrap();
+    let old_entry = control
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .entry("node:Document")
+        .unwrap()
+        .clone();
+
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::CHANGE_FEED_PRE_TABLE_OPEN);
+    let request = ChangeFeedRequest {
+        branch: Some("feature".to_string()),
+        position: ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(base_commit_id)),
+        scope: ChangeFeedScope::default(),
+        max_changes: None,
+        max_bytes: None,
+        max_commits: None,
+    };
+    let poll_task = tokio::spawn(async move { reader.poll_change_feed(request).await });
+    rendezvous.wait_until_reached().await;
+
+    let replacement = async {
+        control.branch_delete("feature").await?;
+        control.branch_create("feature").await?;
+        control
+            .load(
+                "feature",
+                r#"{"type":"Document","data":{"title":"aba","content":"new"}}"#,
+                LoadMode::Merge,
+            )
+            .await?;
+        control.snapshot_of(ReadTarget::branch("feature")).await
+    }
+    .await;
+    rendezvous.release();
+
+    let new_snapshot = replacement.expect("delete/recreate replacement must complete");
+    let new_entry = new_snapshot.entry("node:Document").unwrap();
+    assert_eq!(
+        new_entry.table_version, old_entry.table_version,
+        "the regression must exercise same-version branch ABA"
+    );
+
+    let error = poll_task
+        .await
+        .unwrap()
+        .expect_err("the retargeted table open must not emit the replacement branch's rows");
+    assert!(
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+                    && manifest
+                        .message
+                        .contains("has no persisted native-branch incarnation witness")
+        ),
+        "in-poll table-open ABA must fail with the incarnation refusal, got {error:?}"
+    );
+}
+
+/// The second ABA window on a store that persists NO table e_tags. The
+/// `CHANGE_FEED_SKIP_ETAG_WITNESS` seam disables `open_at_entry_verified`'s
+/// e_tag comparison (the arm the previous cell exercises), so only the LOGICAL
+/// post-open witness — `reprove_named_branch_heads`'s fresh manifest reopen
+/// comparing `graph_head` at the pinned version — can catch the
+/// delete/recreate. An e_tag is not a sufficient native-branch incarnation
+/// witness (a store may persist none, and content equality is not identity),
+/// so this cell pins that the logical witness alone fails the poll closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn change_feed_poll_refuses_table_open_aba_without_etag_witness() {
+    use omnigraph::changes::{
+        ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart,
+    };
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let schema = r#"
+node Document {
+    title: String @key
+    content: String
+}
+"#;
+    let setup = Omnigraph::init(&uri, schema).await.unwrap();
+    let base = setup
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Document","data":{"title":"aba","content":"base"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    let base_commit_id = base.commit.graph_commit_id.clone();
+    setup.branch_create("feature").await.unwrap();
+    setup
+        .load(
+            "feature",
+            r#"{"type":"Document","data":{"title":"aba","content":"old"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    drop(setup);
+
+    let reader = Omnigraph::open(&uri).await.unwrap();
+    let control = Omnigraph::open(&uri).await.unwrap();
+
+    // Simulate an e_tag-less store for the whole poll: the per-table e_tag
+    // comparison is skipped, exactly as on a store whose persisted version
+    // metadata carries no e_tag.
+    let _skip_etag =
+        omnigraph::failpoints::ScopedFailPoint::new(names::CHANGE_FEED_SKIP_ETAG_WITNESS, "return");
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::CHANGE_FEED_PRE_TABLE_OPEN);
+    let request = ChangeFeedRequest {
+        branch: Some("feature".to_string()),
+        position: ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(base_commit_id)),
+        scope: ChangeFeedScope::default(),
+        max_changes: None,
+        max_bytes: None,
+        max_commits: None,
+    };
+    let poll_task = tokio::spawn(async move { reader.poll_change_feed(request).await });
+    rendezvous.wait_until_reached().await;
+
+    let replacement = async {
+        control.branch_delete("feature").await?;
+        control.branch_create("feature").await?;
+        control
+            .load(
+                "feature",
+                r#"{"type":"Document","data":{"title":"aba","content":"new"}}"#,
+                LoadMode::Merge,
+            )
+            .await
+    }
+    .await;
+    rendezvous.release();
+    replacement.expect("delete/recreate replacement must complete");
+
+    let error = poll_task
+        .await
+        .unwrap()
+        .expect_err("without an e_tag witness the logical post-open re-prove must still refuse");
+    assert!(
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+                    && manifest
+                        .message
+                        .contains("after the per-table opens")
+        ),
+        "the logical post-open witness must produce the incarnation refusal, got {error:?}"
+    );
+}
+
 async fn setup_diverged_merge_branches(dir: &tempfile::TempDir) -> (String, usize) {
     let uri = dir.path().to_str().unwrap().to_string();
     let db = helpers::init_and_load(dir).await;

@@ -14,6 +14,17 @@ pub(crate) fn maybe_fail(_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Boolean behavior seam: true when the named failpoint is configured (any
+/// action). Unlike [`maybe_fail`], it injects no error — a test uses it to
+/// flip a code path into a configuration that cannot be reached naturally on
+/// the local test substrate (e.g. simulating an object store that persists no
+/// table e_tags). Always false without the `failpoints` feature.
+pub(crate) fn is_enabled(_name: &str) -> bool {
+    #[cfg(feature = "failpoints")]
+    fail::fail_point!(_name, |_| true);
+    false
+}
+
 /// Failpoint that injects a *retryable* `RowLevelCasContention` `OmniError` — the
 /// typed conflict the manifest publisher's outer retry treats as retryable
 /// (`is_retryable_publish_conflict`). Used to drive the publisher's
@@ -92,6 +103,24 @@ pub mod names {
     /// but has not opened the selected Lance table version yet. Tests replace
     /// a named branch here to prove a live read fails rather than retargeting.
     pub const BLOB_READ_POST_CAPTURE: &str = "blob_read.post_capture";
+    /// A change-feed poll has captured its cut, but has not reopened any
+    /// commit's per-branch manifest snapshot yet. Tests delete and recreate a
+    /// named branch here to prove the poll fails closed rather than emitting the
+    /// replacement branch's rows under the captured commit's label.
+    pub const CHANGE_FEED_POST_CAPTURE: &str = "change_feed.post_capture";
+    /// A change-feed poll has reopened and re-proven a commit's manifest
+    /// snapshot, but has not yet opened the per-table datasets it names. Tests
+    /// delete and recreate a named branch here to prove the physical table open
+    /// re-proves the branch incarnation (via the manifest e_tag) rather than
+    /// reading the replacement branch's rows at the same path and version.
+    pub const CHANGE_FEED_PRE_TABLE_OPEN: &str = "change_feed.pre_table_open";
+    /// Behavior seam (`is_enabled`), not an error injection: simulates a store
+    /// whose persisted table version metadata carries no e_tag, so
+    /// `open_at_entry_verified` cannot use its e_tag comparison. Tests combine
+    /// it with `CHANGE_FEED_PRE_TABLE_OPEN` + a branch delete/recreate to prove
+    /// the LOGICAL post-open head re-prove still refuses the replacement —
+    /// the e_tag is defense-in-depth, not the load-bearing witness.
+    pub const CHANGE_FEED_SKIP_ETAG_WITNESS: &str = "change_feed.skip_etag_witness";
     pub const CLEANUP_RECONCILE_FORK: &str = "cleanup.reconcile_fork";
     /// After cleanup's fast empty-sidecar probe, before it acquires the closed
     /// schema/branch/table GC gate set and performs the authoritative recheck.

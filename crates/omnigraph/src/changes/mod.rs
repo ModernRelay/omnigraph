@@ -1,12 +1,26 @@
+pub(crate) mod enumerate;
+pub(crate) mod feed;
+pub mod model;
+pub(crate) mod row_compare;
+pub(crate) mod token;
+
+pub use model::{
+    CHANGE_FEED_DEFAULT_COMMITS_PER_POLL, CHANGE_FEED_MAX_COMMITS_PER_POLL,
+    COMMIT_CHANGES_DEFAULT_BYTES, COMMIT_CHANGES_DEFAULT_ROWS, COMMIT_CHANGES_MAX_BYTES,
+    COMMIT_CHANGES_MAX_ROWS, ChangeBaseline, ChangeCause, ChangeEntityKind, ChangeFeedContinuation,
+    ChangeFeedPage, ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart,
+    ChangeOpKind, CommitChangesPage, EntityEndpoints, EntityImage, GraphChangeBlock,
+    GraphEntityChange, GraphTypeRef,
+};
+
 use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
-use arrow_cast::display::array_value_to_string;
-use lance::dataset::scanner::ColumnOrdering;
 
+use self::row_compare::{OrderedRows, RawRow, rows_equal, user_schema_fingerprint};
 use crate::db::SubTableEntry;
 use crate::db::manifest::{Snapshot, TableIdentity};
-use crate::error::Result;
+use crate::error::{OmniError, Result};
 use crate::storage_layer::{SnapshotHandle, TableStorage};
 use crate::table_store::TableStore;
 
@@ -172,6 +186,10 @@ pub(crate) async fn diff_snapshots(
     to: &Snapshot,
     filter: &ChangeFilter,
     branch: Option<String>,
+    // Graph-vocabulary identity of the `to` side, used only to name a
+    // cross-branch schema boundary. `None`/empty when the target is a raw
+    // snapshot with no resolved commit.
+    to_commit_id: Option<String>,
 ) -> Result<ChangeSet> {
     let mut changes = Vec::new();
 
@@ -209,7 +227,16 @@ pub(crate) async fn diff_snapshots(
             }
             // Cross-branch path: streaming ID-based diff
             (Some(from), Some(to)) => {
-                diff_table_cross_branch(table_store, from, to, is_edge, filter).await?
+                diff_table_cross_branch(
+                    table_store,
+                    from,
+                    to,
+                    is_edge,
+                    filter,
+                    type_name,
+                    to_commit_id.as_deref().unwrap_or_default(),
+                )
+                .await?
             }
             // Unreachable: `same_state` above already skipped absent-on-both-sides tables.
             (None, None) => continue,
@@ -350,80 +377,82 @@ async fn diff_table_cross_branch(
     to_entry: &SubTableEntry,
     is_edge: bool,
     filter: &ChangeFilter,
+    type_name: &str,
+    to_commit_id: &str,
 ) -> Result<Vec<EntityChange>> {
-    let storage: &dyn TableStorage = table_store;
-    let from_ds = storage.open_snapshot_at_entry(from_entry).await?;
-    let to_ds = storage.open_snapshot_at_entry(to_entry).await?;
+    // Stream both snapshots id-ordered and merge them, using the SAME typed
+    // row-equality that the per-commit enumerator uses (`row_compare`). The
+    // former display-string signature rendered null and `""` identically and
+    // skipped every `_row_`-prefixed column, so a `""`↔null flip or a legal
+    // `_row_notes` change was silently dropped; typed Arrow comparison keeps
+    // them distinct and only skips the five reserved virtual columns.
+    let from_dataset = table_store.open_at_entry(from_entry).await?;
+    let to_dataset = table_store.open_at_entry(to_entry).await?;
 
-    let from_rows = scan_all_rows_ordered(storage, &from_ds, is_edge).await?;
-    let to_rows = scan_all_rows_ordered(storage, &to_ds, is_edge).await?;
+    // Schema-boundary gate, symmetric with the per-commit enumerator. The typed
+    // row equality below walks the left row's fields, so it is only sound when
+    // both sides share one user schema. Today no two branch lifetimes of one
+    // table can diverge in user schema (schema apply requires a graph with only
+    // main, so a branch cannot be evolved separately), which is why this gate
+    // does not fire on any supported operation. It is load-bearing for future
+    // branch-scoped schema evolution: it turns a divergent-schema pair into a
+    // loud typed refusal instead of a silently dropped update (extra column on
+    // the right) or a `manifest_internal` error (extra column on the left).
+    if user_schema_fingerprint(&from_dataset) != user_schema_fingerprint(&to_dataset) {
+        return Err(OmniError::ChangeSchemaBoundary {
+            graph_commit_id: to_commit_id.to_string(),
+            type_name: type_name.to_string(),
+        });
+    }
+
+    let mut from = OrderedRows::open(from_dataset, None).await?;
+    let mut to = OrderedRows::open(to_dataset, None).await?;
 
     let mut changes = Vec::new();
-    let mut fi = 0;
-    let mut ti = 0;
-
-    while fi < from_rows.len() || ti < to_rows.len() {
-        let from_id = from_rows.get(fi).map(|r| r.id.as_str());
-        let to_id = to_rows.get(ti).map(|r| r.id.as_str());
-
+    loop {
+        let from_id = from.peek().await?.map(|row| row.id.clone());
+        let to_id = to.peek().await?.map(|row| row.id.clone());
         match (from_id, to_id) {
-            (Some(fid), Some(tid)) if fid < tid => {
-                // ID only in from → Delete
+            (None, None) => break,
+            // ID only in from → Delete
+            (Some(_), None) => {
+                let row = from.pop().await?.expect("peeked row present");
                 if filter.wants_op(ChangeOp::Delete) {
-                    changes.push(entity_change_from_row(
-                        &from_rows[fi],
-                        ChangeOp::Delete,
-                        is_edge,
-                    ));
+                    changes.push(entity_change_from_raw(&row, ChangeOp::Delete, is_edge));
                 }
-                fi += 1;
+            }
+            // ID only in to → Insert
+            (None, Some(_)) => {
+                let row = to.pop().await?.expect("peeked row present");
+                if filter.wants_op(ChangeOp::Insert) {
+                    changes.push(entity_change_from_raw(&row, ChangeOp::Insert, is_edge));
+                }
+            }
+            (Some(fid), Some(tid)) if fid < tid => {
+                let row = from.pop().await?.expect("peeked row present");
+                if filter.wants_op(ChangeOp::Delete) {
+                    changes.push(entity_change_from_raw(&row, ChangeOp::Delete, is_edge));
+                }
             }
             (Some(fid), Some(tid)) if fid > tid => {
-                // ID only in to → Insert
+                let row = to.pop().await?.expect("peeked row present");
                 if filter.wants_op(ChangeOp::Insert) {
-                    changes.push(entity_change_from_row(
-                        &to_rows[ti],
-                        ChangeOp::Insert,
-                        is_edge,
-                    ));
+                    changes.push(entity_change_from_raw(&row, ChangeOp::Insert, is_edge));
                 }
-                ti += 1;
             }
+            // Same ID — typed structural comparison, Blob-descriptor aware. The
+            // managed-Blob identity is qualified by the immutable data-file UUID,
+            // which is globally unique, so cross-branch equality is sound without
+            // a scope hint.
             (Some(_), Some(_)) => {
-                // Same ID — check signature
-                if from_rows[fi].signature != to_rows[ti].signature
-                    && filter.wants_op(ChangeOp::Update)
+                let left = from.pop().await?.expect("peeked row present");
+                let right = to.pop().await?.expect("peeked row present");
+                if filter.wants_op(ChangeOp::Update)
+                    && !rows_equal(from.dataset(), &left, to.dataset(), &right).await?
                 {
-                    changes.push(entity_change_from_row(
-                        &to_rows[ti],
-                        ChangeOp::Update,
-                        is_edge,
-                    ));
+                    changes.push(entity_change_from_raw(&right, ChangeOp::Update, is_edge));
                 }
-                fi += 1;
-                ti += 1;
             }
-            (Some(_), None) => {
-                if filter.wants_op(ChangeOp::Delete) {
-                    changes.push(entity_change_from_row(
-                        &from_rows[fi],
-                        ChangeOp::Delete,
-                        is_edge,
-                    ));
-                }
-                fi += 1;
-            }
-            (None, Some(_)) => {
-                if filter.wants_op(ChangeOp::Insert) {
-                    changes.push(entity_change_from_row(
-                        &to_rows[ti],
-                        ChangeOp::Insert,
-                        is_edge,
-                    ));
-                }
-                ti += 1;
-            }
-            (None, None) => break,
         }
     }
 
@@ -441,13 +470,7 @@ async fn diff_table_added(
     if !filter.wants_op(ChangeOp::Insert) {
         return Ok(Vec::new());
     }
-    let storage: &dyn TableStorage = table_store;
-    let ds = storage.open_snapshot_at_entry(to_entry).await?;
-    let rows = scan_all_rows_ordered(storage, &ds, is_edge).await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| entity_change_from_row(&r, ChangeOp::Insert, is_edge))
-        .collect())
+    drain_all_rows(table_store, to_entry, ChangeOp::Insert, is_edge).await
 }
 
 async fn diff_table_removed(
@@ -459,13 +482,25 @@ async fn diff_table_removed(
     if !filter.wants_op(ChangeOp::Delete) {
         return Ok(Vec::new());
     }
-    let storage: &dyn TableStorage = table_store;
-    let ds = storage.open_snapshot_at_entry(from_entry).await?;
-    let rows = scan_all_rows_ordered(storage, &ds, is_edge).await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| entity_change_from_row(&r, ChangeOp::Delete, is_edge))
-        .collect())
+    drain_all_rows(table_store, from_entry, ChangeOp::Delete, is_edge).await
+}
+
+/// Enumerate every row of one table snapshot as the given op. Used for an
+/// added table (all inserts) or a removed one (all deletes); the streamed
+/// `OrderedRows` shares the enumerator's scan shape so there is one row reader.
+async fn drain_all_rows(
+    table_store: &TableStore,
+    entry: &SubTableEntry,
+    op: ChangeOp,
+    is_edge: bool,
+) -> Result<Vec<EntityChange>> {
+    let dataset = table_store.open_at_entry(entry).await?;
+    let mut rows = OrderedRows::open(dataset, None).await?;
+    let mut changes = Vec::new();
+    while let Some(row) = rows.pop().await? {
+        changes.push(entity_change_from_raw(&row, op, is_edge));
+    }
+    Ok(changes)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -479,23 +514,6 @@ async fn scan_with_filter(
 ) -> Result<Vec<ScannedRow>> {
     let batches = storage.scan(ds, Some(cols), Some(filter_sql), None).await?;
     Ok(extract_rows(&batches))
-}
-
-/// Scan all rows ordered by id, projecting id (+ src/dst for edges) + all columns for signature.
-async fn scan_all_rows_ordered(
-    storage: &dyn TableStorage,
-    ds: &SnapshotHandle,
-    is_edge: bool,
-) -> Result<Vec<ScannedRow>> {
-    let batches = storage
-        .scan(
-            ds,
-            None,
-            None,
-            Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
-        )
-        .await?;
-    Ok(extract_rows_with_signature(&batches, is_edge))
 }
 
 /// Compute deleted IDs: scan id at from and to, set-difference.
@@ -541,7 +559,6 @@ struct ScannedRow {
     id: String,
     src: Option<String>,
     dst: Option<String>,
-    signature: String,
     change_version: Option<u64>,
 }
 
@@ -563,7 +580,6 @@ fn extract_rows(batches: &[RecordBatch]) -> Vec<ScannedRow> {
                 id: ids.value(i).to_string(),
                 src: srcs.map(|a| a.value(i).to_string()),
                 dst: dsts.map(|a| a.value(i).to_string()),
-                signature: String::new(),
                 change_version: batch
                     .column_by_name("_row_last_updated_at_version")
                     .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
@@ -574,52 +590,8 @@ fn extract_rows(batches: &[RecordBatch]) -> Vec<ScannedRow> {
     rows
 }
 
-fn extract_rows_with_signature(batches: &[RecordBatch], is_edge: bool) -> Vec<ScannedRow> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let ids = batch
-            .column_by_name("id")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let Some(ids) = ids else { continue };
-        let srcs = if is_edge {
-            batch
-                .column_by_name("src")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        } else {
-            None
-        };
-        let dsts = if is_edge {
-            batch
-                .column_by_name("dst")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        } else {
-            None
-        };
-        for i in 0..ids.len() {
-            let mut values = Vec::with_capacity(batch.num_columns());
-            for (field, col) in batch.schema().fields().iter().zip(batch.columns()) {
-                if field.name().starts_with("_row_") {
-                    continue;
-                }
-                if let Ok(v) = array_value_to_string(col.as_ref(), i) {
-                    values.push(v);
-                }
-            }
-            rows.push(ScannedRow {
-                id: ids.value(i).to_string(),
-                src: srcs.map(|a| a.value(i).to_string()),
-                dst: dsts.map(|a| a.value(i).to_string()),
-                signature: values.join("\x1f"),
-                change_version: batch
-                    .column_by_name("_row_last_updated_at_version")
-                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-                    .map(|versions| versions.value(i)),
-            });
-        }
-    }
-    rows
-}
-
+/// Build a change from a scanned key row (same-lineage inserts/updates and the
+/// deleted-set path, which classify by id membership and never compare images).
 fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> EntityChange {
     EntityChange {
         table_key: String::new(),
@@ -636,6 +608,46 @@ fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> Enti
             Some(Endpoints {
                 src: row.src.clone().unwrap_or_default(),
                 dst: row.dst.clone().unwrap_or_default(),
+            })
+        } else {
+            None
+        },
+    }
+}
+
+/// Build a change from a typed comparison row (the cross-branch path and the
+/// added/removed enumerations). Endpoints and the change version are read
+/// directly from the one-row slice; a missing version leaves 0, which
+/// `diff_snapshots` fills with the destination snapshot version.
+fn entity_change_from_raw(raw: &RawRow, op: ChangeOp, is_edge: bool) -> EntityChange {
+    let string_col = |name: &str| -> Option<String> {
+        raw.slice
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .filter(|array| array.is_valid(0))
+            .map(|array| array.value(0).to_string())
+    };
+    let change_version = raw
+        .slice
+        .column_by_name("_row_last_updated_at_version")
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .filter(|array| array.is_valid(0))
+        .map(|array| array.value(0));
+    EntityChange {
+        table_key: String::new(),
+        kind: if is_edge {
+            EntityKind::Edge
+        } else {
+            EntityKind::Node
+        },
+        type_name: String::new(),
+        id: raw.id.clone(),
+        op,
+        manifest_version: change_version.unwrap_or(0),
+        endpoints: if is_edge {
+            Some(Endpoints {
+                src: string_col("src").unwrap_or_default(),
+                dst: string_col("dst").unwrap_or_default(),
             })
         } else {
             None

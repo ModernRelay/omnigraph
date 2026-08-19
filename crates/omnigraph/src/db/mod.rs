@@ -17,6 +17,7 @@ pub use omnigraph::{
     TableRepairStats,
 };
 pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph::{export_blob_values, logical_row_image};
 
 use crate::error::{OmniError, Result};
 

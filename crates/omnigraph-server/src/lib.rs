@@ -122,8 +122,11 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_branch_merge,
         handlers::server_commit_list,
         handlers::server_commit_show,
+        handlers::server_commit_changes,
+        handlers::server_changes_feed,
+        handlers::server_changes_baseline,
     ),
-    components(schemas(api::BlobEntityKind)),
+    components(schemas(api::BlobEntityKind, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
     modifiers(&SecurityAddon),
 )]
 pub struct ApiDoc;
@@ -296,8 +299,8 @@ struct OpenedGraph {
 pub struct ApiError {
     status: StatusCode,
     code: Option<ErrorCode>,
-    message: String,
-    merge_conflicts: Vec<api::MergeConflictOutput>,
+    message: Box<str>,
+    merge_conflicts: Box<[api::MergeConflictOutput]>,
     manifest_conflict: Option<Box<api::ManifestConflictOutput>>,
     read_set_conflict: Option<Box<api::ReadSetConflictOutput>>,
     key_conflict: Option<Box<api::KeyConflictOutput>>,
@@ -306,6 +309,8 @@ pub struct ApiError {
     external_blob_source: Option<Box<api::ExternalBlobSourceOutput>>,
     recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
     precondition_failure: Option<Box<api::PreconditionFailureOutput>>,
+    change_feed_gap: Option<Box<api::ChangeFeedGapOutput>>,
+    change_diff_refusal: Option<Box<api::ChangeDiffRefusalOutput>>,
 }
 
 impl AppState {
@@ -636,8 +641,8 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             code: Some(ErrorCode::Unauthorized),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -646,6 +651,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -653,8 +660,8 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             code: Some(ErrorCode::Forbidden),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -663,6 +670,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -670,8 +679,8 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: Some(ErrorCode::BadRequest),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -680,6 +689,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -687,8 +698,8 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             code: Some(ErrorCode::NotFound),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -697,6 +708,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -708,8 +721,8 @@ impl ApiError {
         Self {
             status: StatusCode::METHOD_NOT_ALLOWED,
             code: Some(ErrorCode::MethodNotAllowed),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -718,6 +731,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -725,8 +740,8 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -735,6 +750,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -742,8 +759,8 @@ impl ApiError {
         Self {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             code: Some(ErrorCode::BadRequest),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -752,6 +769,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -763,8 +782,9 @@ impl ApiError {
             // adding the structured wire fields below.
             message: format!(
                 "blob range [{start}, {end}) is not satisfiable for a value of length {length}"
-            ),
-            merge_conflicts: Vec::new(),
+            )
+            .into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -773,6 +793,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -784,8 +806,8 @@ impl ApiError {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
             code: Some(ErrorCode::Conflict),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -794,6 +816,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -801,8 +825,8 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: Some(ErrorCode::Internal),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -811,7 +835,23 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
+    }
+
+    /// The HTTP status this error maps to. Test-only: production reads the
+    /// status through `IntoResponse`.
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// The human-readable message body, used by tests to assert the wire
+    /// contract does not leak substrate detail.
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 
     /// HTTP 424 Failed Dependency for an external Blob source that passed the
@@ -823,8 +863,8 @@ impl ApiError {
         Self {
             status: StatusCode::FAILED_DEPENDENCY,
             code: None,
-            message,
-            merge_conflicts: Vec::new(),
+            message: message.into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -833,6 +873,8 @@ impl ApiError {
             external_blob_source: Some(Box::new(api::ExternalBlobSourceOutput { uri, reason })),
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -844,8 +886,8 @@ impl ApiError {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             code: Some(ErrorCode::TooManyRequests),
-            message: message.into(),
-            merge_conflicts: Vec::new(),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -854,6 +896,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -872,8 +916,8 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
-            message: summarize_merge_conflicts(&conflicts),
-            merge_conflicts: conflicts,
+            message: summarize_merge_conflicts(&conflicts).into_boxed_str(),
+            merge_conflicts: conflicts.into_boxed_slice(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -882,6 +926,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -889,8 +935,8 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
-            message,
-            merge_conflicts: Vec::new(),
+            message: message.into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: Some(Box::new(details)),
             read_set_conflict: None,
             key_conflict: None,
@@ -899,6 +945,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -906,8 +954,8 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
-            message,
-            merge_conflicts: Vec::new(),
+            message: message.into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: Some(Box::new(details)),
             key_conflict: None,
@@ -916,6 +964,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -923,8 +973,8 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
-            message,
-            merge_conflicts: Vec::new(),
+            message: message.into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: Some(Box::new(details)),
@@ -933,6 +983,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -940,8 +992,8 @@ impl ApiError {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code: Some(ErrorCode::BadRequest),
-            message,
-            merge_conflicts: Vec::new(),
+            message: message.into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -950,6 +1002,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -960,8 +1014,8 @@ impl ApiError {
             // `recovery_required` field carries the new meaning while older
             // clients continue to deserialize the otherwise familiar body.
             code: None,
-            message,
-            merge_conflicts: Vec::new(),
+            message: message.into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -970,6 +1024,8 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
             precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
         }
     }
 
@@ -981,8 +1037,8 @@ impl ApiError {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
             code: None,
-            message,
-            merge_conflicts: Vec::new(),
+            message: message.into_boxed_str(),
+            merge_conflicts: Box::default(),
             manifest_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
@@ -991,6 +1047,56 @@ impl ApiError {
             external_blob_source: None,
             recovery_required: None,
             precondition_failure: Some(Box::new(details)),
+            change_feed_gap: None,
+            change_diff_refusal: None,
+        }
+    }
+
+    /// HTTP 410 Gone — retained history can no longer reconstruct a change
+    /// continuation. `code` stays unset ([`ErrorCode`] is closed); the
+    /// `change_feed_gap` detail is the machine-readable discriminator and the
+    /// baseline handshake is the only recovery.
+    fn change_feed_gap(cursor: Option<String>, first_unreadable_commit_id: String) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            code: None,
+            message: format!("change feed gap at commit '{first_unreadable_commit_id}'")
+                .into_boxed_str(),
+            merge_conflicts: Box::default(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+            change_feed_gap: Some(Box::new(api::ChangeFeedGapOutput {
+                cursor,
+                first_unreadable_commit_id,
+            })),
+            change_diff_refusal: None,
+        }
+    }
+
+    /// HTTP 409 Conflict — a well-formed entity-diff request this commit
+    /// cannot satisfy (parentless genesis or an unprovable schema boundary).
+    fn change_diff_refusal(message: String, details: api::ChangeDiffRefusalOutput) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: Some(ErrorCode::Conflict),
+            message: message.into_boxed_str(),
+            merge_conflicts: Box::default(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: Some(Box::new(details)),
         }
     }
 
@@ -1055,6 +1161,55 @@ impl ApiError {
                     actual,
                 },
             ),
+            // Change paths rewrite this into a typed feed gap before it can
+            // escape; anywhere else a reclaimed pinned version is an internal
+            // retention surprise, not a caller error.
+            OmniError::HistoricalVersionReclaimed { version } => {
+                Self::internal(format!("historical table version {version} was reclaimed"))
+            }
+            // Caller-side continuation fault (decode, checksum, or scope). The
+            // "change cursor rejected: " prefix is a stable contract so raw
+            // HTTP clients can tell it from a genuine retention gap.
+            OmniError::ChangeCursorRejected { reason } => {
+                Self::bad_request(format!("change cursor rejected: {reason}"))
+            }
+            OmniError::BranchNotFound { branch } => {
+                Self::not_found(format!("branch '{branch}' not found"))
+            }
+            // Retention loss under a change continuation: 410 with the
+            // structured resume hint. Recovery is the baseline handshake.
+            OmniError::ChangeFeedGap {
+                cursor,
+                first_unreadable_commit_id,
+            } => Self::change_feed_gap(cursor, first_unreadable_commit_id),
+            // Well-formed entity-diff requests this commit cannot satisfy:
+            // 409 with the structured refusal reason.
+            err @ OmniError::CommitHasNoParent { .. } => {
+                let OmniError::CommitHasNoParent { graph_commit_id } = &err else {
+                    unreachable!()
+                };
+                let details = api::ChangeDiffRefusalOutput {
+                    reason: api::ChangeDiffRefusalReason::ParentlessCommit,
+                    graph_commit_id: graph_commit_id.clone(),
+                    type_name: None,
+                };
+                Self::change_diff_refusal(err.to_string(), details)
+            }
+            err @ OmniError::ChangeSchemaBoundary { .. } => {
+                let OmniError::ChangeSchemaBoundary {
+                    graph_commit_id,
+                    type_name,
+                } = &err
+                else {
+                    unreachable!()
+                };
+                let details = api::ChangeDiffRefusalOutput {
+                    reason: api::ChangeDiffRefusalReason::SchemaBoundary,
+                    graph_commit_id: graph_commit_id.clone(),
+                    type_name: Some(type_name.clone()),
+                };
+                Self::change_diff_refusal(err.to_string(), details)
+            }
             OmniError::RecoveryRequired {
                 operation_id,
                 reason,
@@ -1153,9 +1308,9 @@ impl IntoResponse for ApiError {
             self.status,
             headers,
             Json(ErrorOutput {
-                error: self.message,
+                error: self.message.into(),
                 code: self.code,
-                merge_conflicts: self.merge_conflicts,
+                merge_conflicts: self.merge_conflicts.into_vec(),
                 manifest_conflict: self.manifest_conflict.map(|d| *d),
                 read_set_conflict: self.read_set_conflict.map(|d| *d),
                 key_conflict: self.key_conflict.map(|d| *d),
@@ -1164,6 +1319,8 @@ impl IntoResponse for ApiError {
                 external_blob_source: self.external_blob_source.map(|d| *d),
                 recovery_required: self.recovery_required.map(|d| *d),
                 precondition_failure: self.precondition_failure.map(|d| *d),
+                change_feed_gap: self.change_feed_gap.map(|d| *d),
+                change_diff_refusal: self.change_diff_refusal.map(|d| *d),
             }),
         )
             .into_response()
@@ -1173,6 +1330,75 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod api_error_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn change_feed_gap_is_typed_410() {
+        let response = ApiError::from_omni(OmniError::ChangeFeedGap {
+            cursor: Some("opaque-cursor".to_string()),
+            first_unreadable_commit_id: "01JTESTGAP".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, None, "ErrorCode stays closed; the detail rides");
+        let gap = error.change_feed_gap.expect("structured feed gap");
+        assert_eq!(gap.cursor.as_deref(), Some("opaque-cursor"));
+        assert_eq!(gap.first_unreadable_commit_id, "01JTESTGAP");
+    }
+
+    #[tokio::test]
+    async fn change_diff_refusal_is_typed_409() {
+        for (err, reason, type_name) in [
+            (
+                OmniError::CommitHasNoParent {
+                    graph_commit_id: "01JTESTROOT".to_string(),
+                },
+                api::ChangeDiffRefusalReason::ParentlessCommit,
+                None,
+            ),
+            (
+                OmniError::ChangeSchemaBoundary {
+                    graph_commit_id: "01JTESTROOT".to_string(),
+                    type_name: "Person".to_string(),
+                },
+                api::ChangeDiffRefusalReason::SchemaBoundary,
+                Some("Person".to_string()),
+            ),
+        ] {
+            let response = ApiError::from_omni(err).into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            let refusal = error.change_diff_refusal.expect("structured refusal");
+            assert_eq!(refusal.reason, reason);
+            assert_eq!(refusal.graph_commit_id, "01JTESTROOT");
+            assert_eq!(refusal.type_name, type_name);
+        }
+    }
+
+    #[tokio::test]
+    async fn change_cursor_rejections_are_stable_400s() {
+        let response = ApiError::from_omni(OmniError::ChangeCursorRejected {
+            reason: "invalid change feed cursor checksum".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error.error.starts_with("change cursor rejected: "),
+            "the 400 prefix is a stable contract: {}",
+            error.error
+        );
+    }
 
     #[tokio::test]
     async fn recovery_required_503_omits_closed_error_code() {
@@ -1532,6 +1758,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/branches/merge", post(server_branch_merge))
         .route("/commits", get(server_commit_list))
         .route("/commits/{commit_id}", get(server_commit_show))
+        .route("/commits/{commit_id}/changes", get(server_commit_changes))
+        .route("/changes", get(server_changes_feed))
+        .route("/changes/baseline", post(server_changes_baseline))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,

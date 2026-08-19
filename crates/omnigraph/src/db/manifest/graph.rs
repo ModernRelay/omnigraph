@@ -11,7 +11,10 @@ use omnigraph_compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
 
-use super::layout::{manifest_uri, open_manifest_dataset_with_session};
+use super::layout::{
+    manifest_uri, open_manifest_dataset_with_identifier_with_session,
+    open_manifest_dataset_with_session,
+};
 use super::metadata::TableVersionMetadata;
 use super::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, current_stamp_entry, guard_stamp};
 use super::state::{
@@ -161,7 +164,7 @@ pub(super) async fn open_exact_genesis_manifest(
     control_session: &Arc<lance::session::Session>,
 ) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_MANIFEST_CREATE_PROBE)?;
-    let (dataset, known_state, lineage_rows) =
+    let (dataset, known_state, lineage_rows, _) =
         open_manifest_graph_with_lineage(root_uri, None, control_session).await?;
 
     // `read_manifest_state_and_lineage` intentionally folds head rows into a
@@ -242,24 +245,39 @@ pub(super) async fn open_manifest_graph(
     root_uri: &str,
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
-) -> Result<(Dataset, ManifestState)> {
-    let dataset =
-        open_manifest_dataset_with_session(root_uri.trim_end_matches('/'), branch, control_session)
-            .await?;
+) -> Result<(
+    Dataset,
+    ManifestState,
+    lance::dataset::refs::BranchIdentifier,
+)> {
+    let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
+        root_uri.trim_end_matches('/'),
+        branch,
+        control_session,
+    )
+    .await?;
     let known_state = read_manifest_state(&dataset).await?;
-    Ok((dataset, known_state))
+    Ok((dataset, known_state, branch_identifier))
 }
 
 pub(super) async fn open_manifest_graph_with_lineage(
     root_uri: &str,
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
-) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
-    let dataset =
-        open_manifest_dataset_with_session(root_uri.trim_end_matches('/'), branch, control_session)
-            .await?;
+) -> Result<(
+    Dataset,
+    ManifestState,
+    Vec<GraphLineageRow>,
+    lance::dataset::refs::BranchIdentifier,
+)> {
+    let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
+        root_uri.trim_end_matches('/'),
+        branch,
+        control_session,
+    )
+    .await?;
     let (known_state, lineage_rows) = read_manifest_state_and_lineage(&dataset).await?;
-    Ok((dataset, known_state, lineage_rows))
+    Ok((dataset, known_state, lineage_rows, branch_identifier))
 }
 
 pub(super) async fn snapshot_state_at(

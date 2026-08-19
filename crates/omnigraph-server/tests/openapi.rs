@@ -206,6 +206,9 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches/merge",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
+    "/graphs/{graph_id}/commits/{commit_id}/changes",
+    "/graphs/{graph_id}/changes",
+    "/graphs/{graph_id}/changes/baseline",
 ];
 
 #[test]
@@ -234,6 +237,285 @@ fn openapi_has_no_unexpected_paths() {
             "unexpected path in OpenAPI spec: {path}"
         );
     }
+}
+
+#[test]
+fn openapi_commit_changes_is_get_with_page_token_params() {
+    let doc = openapi_json();
+    let op = &doc["paths"]["/graphs/{graph_id}/commits/{commit_id}/changes"]["get"];
+    assert!(op.is_object(), "the commit changes route is a GET");
+    let params: Vec<&str> = op["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|param| param["name"].as_str().unwrap())
+        .collect();
+    for expected in ["commit_id", "page_token", "limit", "kind", "type", "op"] {
+        assert!(
+            params.contains(&expected),
+            "missing param {expected}: {params:?}"
+        );
+    }
+    // Caller byte limits and feed-only continuations never ride the finite
+    // commit diff.
+    for forbidden in ["max_bytes", "cursor", "start"] {
+        assert!(
+            !params.contains(&forbidden),
+            "param {forbidden} must not exist on the commit diff"
+        );
+    }
+    let responses = op["responses"].as_object().unwrap();
+    // No 403: a forbidden commit is indistinguishable from an unknown one (404),
+    // so the finite commit diff cannot be a commit-existence oracle.
+    for code in [
+        "200", "400", "401", "404", "409", "410", "413", "500", "503",
+    ] {
+        assert!(responses.contains_key(code), "missing response {code}");
+    }
+    assert!(
+        !responses.contains_key("403"),
+        "the commit diff must not advertise 403 (existence oracle)"
+    );
+}
+
+#[test]
+fn openapi_change_feed_is_get_with_cursor_and_start() {
+    let doc = openapi_json();
+    let op = &doc["paths"]["/graphs/{graph_id}/changes"]["get"];
+    assert!(op.is_object(), "the change feed route is a GET");
+    let params: Vec<&str> = op["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|param| param["name"].as_str().unwrap())
+        .collect();
+    for expected in [
+        "branch",
+        "cursor",
+        "start",
+        "page_token",
+        "limit",
+        "kind",
+        "type",
+        "op",
+    ] {
+        assert!(
+            params.contains(&expected),
+            "missing param {expected}: {params:?}"
+        );
+    }
+    assert!(
+        !params.contains(&"max_bytes"),
+        "caller byte limits never ride the feed"
+    );
+    let responses = op["responses"].as_object().unwrap();
+    for code in [
+        "200", "400", "401", "403", "404", "409", "410", "413", "500", "503",
+    ] {
+        assert!(responses.contains_key(code), "missing response {code}");
+    }
+}
+
+#[test]
+fn openapi_change_baseline_is_streaming_post() {
+    let doc = openapi_json();
+    let op = &doc["paths"]["/graphs/{graph_id}/changes/baseline"]["post"];
+    assert!(op.is_object(), "the baseline handshake is a POST");
+    let ok = &op["responses"]["200"];
+    assert!(
+        ok["content"]["application/x-ndjson"].is_object(),
+        "the baseline streams NDJSON: {ok}"
+    );
+    for code in ["400", "401", "403", "404", "413", "500", "503"] {
+        assert!(
+            op["responses"].as_object().unwrap().contains_key(code),
+            "missing response {code}"
+        );
+    }
+}
+
+/// Spec-side vocabulary gate: no change-surface schema may declare a physical
+/// storage property, and no change route may accept a caller byte limit.
+#[test]
+fn openapi_change_schemas_reject_storage_vocabulary() {
+    const FORBIDDEN_PROPERTIES: &[&str] = &[
+        "table_key",
+        "stable_table_id",
+        "table_incarnation_id",
+        "manifest_version",
+        "table_version",
+        "table_branch",
+        "table_path",
+        "row_addr",
+        "part",
+        "commit_complete",
+        "change_index",
+        "max_bytes",
+    ];
+
+    fn assert_schema_clean(name: &str, value: &serde_json::Value) {
+        if let Some(properties) = value.get("properties").and_then(|v| v.as_object()) {
+            for (property, nested) in properties {
+                assert!(
+                    !FORBIDDEN_PROPERTIES.contains(&property.as_str()),
+                    "schema {name} declares forbidden property '{property}'"
+                );
+                assert_schema_clean(name, nested);
+            }
+        }
+        for key in ["items", "additionalProperties"] {
+            if let Some(nested) = value.get(key) {
+                assert_schema_clean(name, nested);
+            }
+        }
+    }
+
+    let doc = openapi_json();
+    let schemas = doc["components"]["schemas"].as_object().unwrap();
+    let mut change_schemas = 0;
+    for (name, schema) in schemas {
+        if name.starts_with("Change")
+            || name.starts_with("CommitChanges")
+            || name.starts_with("EntityChange")
+        {
+            change_schemas += 1;
+            assert_schema_clean(name, schema);
+        }
+    }
+    assert!(change_schemas >= 10, "the change schemas are registered");
+
+    for path in [
+        "/graphs/{graph_id}/commits/{commit_id}/changes",
+        "/graphs/{graph_id}/changes",
+    ] {
+        let params = doc["paths"][path]["get"]["parameters"].as_array().unwrap();
+        assert!(
+            params
+                .iter()
+                .all(|param| param["name"].as_str() != Some("max_bytes")),
+            "{path} must not accept a caller byte limit"
+        );
+    }
+}
+
+/// Reachability form of the vocabulary gate: walk every schema component
+/// TRANSITIVELY referenced by the change operations (responses, request
+/// bodies, and parameters — error envelopes included) and require every
+/// reachable schema to be free of physical storage properties. The name-prefix
+/// gate above cannot see a generic component (e.g. a shared error envelope)
+/// pulled in by reference; this walk closes that hole — the change routes now
+/// reference the graph-vocabulary `ChangeErrorOutput` projection instead of
+/// the generic error envelope whose conflict details carry storage keys.
+/// Also pins that the baseline's NDJSON success response declares a schema
+/// (the terminal `ChangeBaselineRecord` handshake) so generated clients can
+/// discover the cursor contract.
+#[test]
+fn openapi_change_operations_reach_only_graph_vocabulary_schemas() {
+    const FORBIDDEN_PROPERTIES: &[&str] = &[
+        "table_key",
+        "stable_table_id",
+        "table_incarnation_id",
+        "manifest_version",
+        "table_version",
+        "table_branch",
+        "table_path",
+        "row_addr",
+    ];
+
+    fn collect_refs(value: &serde_json::Value, refs: &mut std::collections::BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(reference) = map.get("$ref").and_then(|v| v.as_str())
+                    && let Some(name) = reference.rsplit('/').next()
+                {
+                    refs.insert(name.to_string());
+                }
+                for nested in map.values() {
+                    collect_refs(nested, refs);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for nested in items {
+                    collect_refs(nested, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_properties_clean(name: &str, value: &serde_json::Value) {
+        if let Some(properties) = value.get("properties").and_then(|v| v.as_object()) {
+            for (property, nested) in properties {
+                assert!(
+                    !FORBIDDEN_PROPERTIES.contains(&property.as_str()),
+                    "schema '{name}', reachable from a change operation, declares \
+                     forbidden storage property '{property}'"
+                );
+                assert_properties_clean(name, nested);
+            }
+        }
+        for key in ["items", "additionalProperties", "allOf", "oneOf", "anyOf"] {
+            if let Some(nested) = value.get(key) {
+                assert_properties_clean(name, nested);
+            }
+        }
+    }
+
+    let doc = openapi_json();
+    let schemas = doc["components"]["schemas"].as_object().unwrap();
+    let change_paths: Vec<(&String, &serde_json::Value)> = doc["paths"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path.contains("/changes"))
+        .collect();
+    assert_eq!(
+        change_paths.len(),
+        3,
+        "the three change routes are registered: {change_paths:?}"
+    );
+
+    let mut frontier = std::collections::BTreeSet::new();
+    for (_, operations) in &change_paths {
+        collect_refs(operations, &mut frontier);
+    }
+    let mut reachable = std::collections::BTreeSet::new();
+    while let Some(name) = frontier.pop_first() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        let Some(schema) = schemas.get(&name) else {
+            continue;
+        };
+        let mut nested = std::collections::BTreeSet::new();
+        collect_refs(schema, &mut nested);
+        for reference in nested {
+            if !reachable.contains(&reference) {
+                frontier.insert(reference);
+            }
+        }
+    }
+    assert!(
+        reachable.contains("ChangeErrorOutput"),
+        "change routes reference the graph-vocabulary error projection: {reachable:?}"
+    );
+    assert!(
+        !reachable.contains("ErrorOutput"),
+        "the generic error envelope (whose conflict details carry storage keys) \
+         must not be reachable from a change operation: {reachable:?}"
+    );
+    for name in &reachable {
+        if let Some(schema) = schemas.get(name) {
+            assert_properties_clean(name, schema);
+        }
+    }
+
+    let baseline_content = &doc["paths"]["/graphs/{graph_id}/changes/baseline"]["post"]["responses"]
+        ["200"]["content"]["application/x-ndjson"];
+    assert!(
+        baseline_content.get("schema").is_some(),
+        "the baseline NDJSON success response declares the terminal-record schema"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +924,22 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "CommitOutput",
     "ErrorCode",
     "ErrorOutput",
+    "ChangeFeedGapOutput",
+    "ChangeEntityKind",
+    "ChangeOpOutput",
+    "ChangeTypeOutput",
+    "ChangeEndpointsOutput",
+    "ChangeImageOutput",
+    "EntityChangeOutput",
+    "ChangeCauseOutput",
+    "CommitChangesOutput",
+    "ChangeBlockOutput",
+    "ChangeFeedOutput",
+    "ChangeBaselineRequest",
+    "ChangeBaselineOutput",
+    "ChangeBaselineRecord",
+    "ChangeDiffRefusalOutput",
+    "ChangeDiffRefusalReason",
     "BlobRangeOutput",
     "ExternalBlobSourceOutput",
     "ExportRequest",
@@ -891,6 +1189,31 @@ fn error_output_schema_has_expected_fields() {
     assert!(props.contains_key("external_blob_source"));
     assert!(props.contains_key("recovery_required"));
     assert!(props.contains_key("precondition_failure"));
+}
+
+#[test]
+fn change_error_output_schema_matches_every_change_route_detail() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["ChangeErrorOutput"];
+    let props = schema["properties"].as_object().unwrap();
+    for field in [
+        "error",
+        "code",
+        "resource_limit",
+        "recovery_required",
+        "change_feed_gap",
+        "change_diff_refusal",
+    ] {
+        assert!(
+            props.contains_key(field),
+            "missing change error field {field}"
+        );
+    }
+    assert_eq!(
+        props.len(),
+        6,
+        "change errors must not grow generic storage-conflict details: {props:?}"
+    );
 }
 
 #[test]
@@ -1153,6 +1476,9 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/branches/merge", "post"),
         ("/graphs/{graph_id}/commits", "get"),
         ("/graphs/{graph_id}/commits/{commit_id}", "get"),
+        ("/graphs/{graph_id}/commits/{commit_id}/changes", "get"),
+        ("/graphs/{graph_id}/changes", "get"),
+        ("/graphs/{graph_id}/changes/baseline", "post"),
     ];
 
     for (path, method) in protected_paths {
@@ -1629,6 +1955,9 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches/merge",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
+    "/graphs/{graph_id}/commits/{commit_id}/changes",
+    "/graphs/{graph_id}/changes",
+    "/graphs/{graph_id}/changes/baseline",
 ];
 
 async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {

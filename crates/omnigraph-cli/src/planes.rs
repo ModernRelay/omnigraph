@@ -13,7 +13,8 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use crate::cli::{
-    BlobCommand, Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand, SchemaCommand,
+    BlobCommand, ChangesCommand, Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand,
+    SchemaCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,7 +178,17 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // `cluster apply`/`approve` attribute an actor — the other read-only
         // control verbs (status/plan/validate, policy, queries) never read it.
         ScopeFlag::As => match capability {
-            Any => !matches!(cmd, Command::Blob { .. }),
+            // `--as` names an actor for a direct/`--store` WRITE; a served write
+            // resolves the actor from its token. The read commands (`query`,
+            // `changes`, `commit`, `blob`) attribute no actor on either surface,
+            // so accepting `--as` there is a silent no-op — reject it instead.
+            Any => !matches!(
+                cmd,
+                Command::Blob { .. }
+                    | Command::Changes { .. }
+                    | Command::Commit { .. }
+                    | Command::Query { .. }
+            ),
             Control => matches!(
                 cmd,
                 Command::Cluster {
@@ -237,6 +248,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Export { .. }
         | Command::Blob { .. }
         | Command::Commit { .. }
+        | Command::Changes { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
             command: SchemaCommand::Show { .. } | SchemaCommand::Apply { .. },
@@ -294,6 +306,10 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             BlobCommand::Stat { .. } => "blob stat",
         },
         Command::Commit { .. } => "commit",
+        Command::Changes { command } => match command {
+            ChangesCommand::Poll { .. } => "changes poll",
+            ChangesCommand::Baseline { .. } => "changes baseline",
+        },
         Command::Query { .. } => "query",
         Command::Mutate { .. } => "mutate",
         Command::Alias { .. } => "alias",
@@ -434,7 +450,7 @@ mod tests {
         let rows = [
             (
                 parse(&["omnigraph", "query", "q"]),
-                [true, false, true, true, true, true],
+                [true, false, true, true, false, true],
             ),
             (
                 parse(&[
@@ -451,6 +467,22 @@ mod tests {
             (
                 parse(&["omnigraph", "graphs", "list"]),
                 [true, false, false, false, false, true],
+            ),
+            // The change surfaces are ordinary data-plane verbs: served or
+            // embedded, never cluster-addressed. Like every read, they reject
+            // `--as` (5th column false) — a served read resolves the actor from
+            // its token and an embedded read attributes none.
+            (
+                parse(&["omnigraph", "commit", "changes", "some-commit"]),
+                [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "changes", "poll"]),
+                [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "changes", "baseline", "--out", "b.jsonl"]),
+                [true, false, true, true, false, true],
             ),
             (
                 parse(&["omnigraph", "optimize", "g.omni"]),

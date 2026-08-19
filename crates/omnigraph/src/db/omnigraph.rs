@@ -41,6 +41,7 @@ mod table_ops;
 
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
+pub(crate) use export::{export_blob_values, logical_row_image};
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
@@ -204,6 +205,22 @@ pub struct Omnigraph {
     coordinator: Arc<tokio::sync::RwLock<GraphCoordinator>>,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
+    /// Warm change-feed cut for this handle's bound branch. A cut (head,
+    /// witness, genesis, lineage projection, forward child index) is a PURE
+    /// projection of `__manifest`, so it is exactly valid while the manifest
+    /// incarnation is unchanged — including the named ref's captured
+    /// BranchIdentifier, which distinguishes same-source delete/recreate — the
+    /// same probe the warm poll already pays.
+    /// Without this, every poll re-cloned the full commit map and re-walked to
+    /// genesis: O(total history) CPU/allocation per poll even when caught up.
+    /// Keyed by the incarnation; a stale entry misses and rebuilds, so this is
+    /// a non-authoritative hint per invariant 15.
+    feed_cut_cache: tokio::sync::RwLock<
+        Option<(
+            crate::db::manifest::ManifestIncarnation,
+            Arc<crate::changes::feed::ChangeFeedCut>,
+        )>,
+    >,
     /// Per-graph read caches: one shared Lance `Session` plus the held-`Dataset`
     /// handle cache, handed to live-Branch-read snapshots (via
     /// `resolved_target`) so table opens reuse handles (0 IO on a warm repeat)
@@ -536,6 +553,7 @@ impl Omnigraph {
             // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session.clone()),
             runtime_cache: RuntimeCache::default(),
+            feed_cut_cache: tokio::sync::RwLock::new(None),
             read_caches: Arc::new(crate::runtime_cache::ReadCaches {
                 session,
                 handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
@@ -691,6 +709,7 @@ impl Omnigraph {
             // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session.clone()),
             runtime_cache: RuntimeCache::default(),
+            feed_cut_cache: tokio::sync::RwLock::new(None),
             read_caches: Arc::new(crate::runtime_cache::ReadCaches {
                 session,
                 handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
@@ -1673,6 +1692,11 @@ impl Omnigraph {
     async fn invalidate_read_caches(&self) {
         self.runtime_cache.invalidate_all().await;
         self.read_caches.handles.invalidate_all().await;
+        // Hygiene, like the caches above: the incarnation key already makes a
+        // stale feed cut miss, but a same-branch refresh clears it so an
+        // e_tag-less substrate cannot serve a recreated branch's projection
+        // under a coincidentally-matching key.
+        *self.feed_cut_cache.write().await = None;
     }
 
     /// Re-read the handle-local coordinator state from storage AND run
@@ -2258,6 +2282,7 @@ impl Omnigraph {
             &to_resolved.snapshot,
             filter,
             to_resolved.branch.clone().or(from_resolved.branch.clone()),
+            to_resolved.graph_commit_id.clone(),
         )
         .await
     }
@@ -2301,6 +2326,224 @@ impl Omnigraph {
             &to_snap.snapshot,
             filter,
             to_snap.branch.clone().or(from_snap.branch.clone()),
+            to_snap.graph_commit_id.clone(),
+        )
+        .await
+    }
+
+    /// One bounded, deterministic page of the exact entity changes a graph
+    /// commit made relative to its first parent, in graph vocabulary with
+    /// exact before/after images. The parentless genesis commit has no diff;
+    /// unprovable schema boundaries and reclaimed history return typed errors.
+    pub async fn commit_changes_page(
+        &self,
+        commit_id: &str,
+        scope: &crate::changes::ChangeFeedScope,
+        page_token: Option<&str>,
+        max_changes: Option<usize>,
+        max_bytes: Option<u64>,
+    ) -> Result<crate::changes::CommitChangesPage> {
+        use crate::changes::token;
+
+        let max_changes = max_changes.unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_ROWS);
+        let max_bytes = max_bytes.unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_BYTES);
+        crate::changes::enumerate::validate_change_page_limits(max_changes, max_bytes)?;
+
+        let map_gap = |error| match error {
+            // A finite commit diff has no durable FEED cursor — recovery is the
+            // baseline handshake — so `ChangeFeedGap.cursor` is None here. (It
+            // previously carried the incoming `commit-page` page token, a
+            // different token kind than the feed cursor this field holds
+            // elsewhere; the kind-tagged decoder rejected it, but it was still a
+            // wrong-typed value in the wire contract.)
+            OmniError::HistoricalVersionReclaimed { .. } => OmniError::ChangeFeedGap {
+                cursor: None,
+                first_unreadable_commit_id: commit_id.to_string(),
+            },
+            error => error,
+        };
+
+        let coord = self.coordinator.read().await;
+        let commit = coord.resolve_commit(&SnapshotId::new(commit_id)).await?;
+        let Some(parent_id) = commit.parent_commit_id.clone() else {
+            return Err(OmniError::CommitHasNoParent {
+                graph_commit_id: commit.graph_commit_id,
+            });
+        };
+        let child = coord
+            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
+                commit.graph_commit_id.clone(),
+            )))
+            .await
+            .map_err(&map_gap)?;
+        let parent = coord
+            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(parent_id)))
+            .await
+            .map_err(&map_gap)?;
+        drop(coord);
+
+        let graph_identity = self.schema_view.load().schema_identity_domain.clone();
+        let filter_digest = token::filter_digest(scope);
+        let resume = page_token
+            .map(|encoded| {
+                let decoded = token::decode_commit_page_token(encoded)?;
+                if decoded.graph_identity != token::hashed_identity(&graph_identity)
+                    || decoded.commit_id != commit_id
+                {
+                    return Err(token::cursor_rejected(
+                        "commit changes page token does not match this graph and commit",
+                    ));
+                }
+                if decoded.filter_digest != filter_digest {
+                    return Err(token::cursor_rejected(
+                        "commit changes page token was minted for a different filter scope",
+                    ));
+                }
+                Ok(crate::changes::enumerate::ContinuationKey {
+                    type_id: decoded.type_id,
+                    position: decoded.position,
+                    operation_rank: decoded.operation_rank,
+                    change_index: decoded.change_index,
+                })
+            })
+            .transpose()?;
+
+        let mut budget = crate::changes::enumerate::PageBudget::new(max_changes, max_bytes);
+        let mut changes = Vec::new();
+        let outcome = crate::changes::enumerate::enumerate_commit_changes(
+            &self.table_store,
+            &parent.snapshot,
+            &child.snapshot,
+            &graph_identity,
+            commit_id,
+            scope,
+            resume.as_ref(),
+            &mut budget,
+            &mut changes,
+        )
+        .await
+        .map_err(map_gap)?;
+
+        let next_page_token = match outcome {
+            crate::changes::enumerate::CommitEnumeration::Complete => None,
+            crate::changes::enumerate::CommitEnumeration::Truncated(key) => {
+                Some(token::encode_token(&token::CommitPageTokenV1 {
+                    version: token::TOKEN_VERSION,
+                    kind: token::KIND_COMMIT_PAGE.to_string(),
+                    graph_identity: token::hashed_identity(&graph_identity),
+                    commit_id: commit_id.to_string(),
+                    filter_digest,
+                    type_id: key.type_id,
+                    position: key.position,
+                    operation_rank: key.operation_rank,
+                    change_index: key.change_index,
+                })?)
+            }
+            crate::changes::enumerate::CommitEnumeration::Exhausted { required_bytes } => {
+                // A fresh page could not admit even one change: the single
+                // change is larger than the byte ceiling. Never truncate the
+                // image or fall back to keys-only output.
+                return Err(OmniError::resource_limit(
+                    "commit_changes_page_bytes",
+                    max_bytes,
+                    required_bytes,
+                ));
+            }
+        };
+
+        Ok(crate::changes::CommitChangesPage {
+            block: crate::changes::GraphChangeBlock {
+                cause: crate::changes::ChangeCause::from(&commit),
+                changes,
+            },
+            next_page_token,
+        })
+    }
+
+    /// One poll of the durable first-parent change feed. The durable cursor in
+    /// the result advances only over complete commits; the server persists no
+    /// consumer state, so any handle or process can resume from the caller's
+    /// cursor.
+    pub async fn poll_change_feed(
+        &self,
+        request: crate::changes::ChangeFeedRequest,
+    ) -> Result<crate::changes::ChangeFeedPage> {
+        let branch = request
+            .branch
+            .as_deref()
+            .filter(|branch| *branch != "main")
+            .map(str::to_string);
+        // Warm same-branch capture, mirroring `resolve_target_inner`: a poll of
+        // the branch this handle is already bound to reuses the warm coordinator
+        // (no cold manifest open, no lineage re-fold), so a caught-up poll's cost
+        // does not grow with commit history. A different branch, or a stale
+        // probe, falls back to the cold open / write-lock refresh.
+        let requested = branch.as_deref();
+        let cut =
+            {
+                let coord = self.coordinator.read().await;
+                if requested == coord.current_branch() {
+                    let held = coord.manifest_incarnation();
+                    if coord.probe_latest_incarnation().await?.matches(&held) {
+                        // The cut is a pure projection of the manifest, so while
+                        // the incarnation (including the named BranchIdentifier)
+                        // is unchanged the cached cut is exactly valid — a
+                        // caught-up poll then pays O(1) CPU instead of re-cloning
+                        // the whole lineage projection and re-walking to genesis
+                        // on every poll.
+                        let cached = self.feed_cut_cache.read().await.as_ref().and_then(
+                            |(incarnation, cut)| {
+                                (incarnation == &held && cut.branch.as_deref() == requested)
+                                    .then(|| Arc::clone(cut))
+                            },
+                        );
+                        match cached {
+                            Some(cut) => cut,
+                            None => {
+                                let cut = Arc::new(coord.build_change_feed_cut().await?);
+                                *self.feed_cut_cache.write().await = Some((held, Arc::clone(&cut)));
+                                cut
+                            }
+                        }
+                    } else {
+                        drop(coord);
+                        let mut coord = self.coordinator.write().await;
+                        if requested == coord.current_branch() {
+                            let held = coord.manifest_incarnation();
+                            let mut refreshed = false;
+                            if !coord.probe_latest_incarnation().await?.matches(&held) {
+                                coord.refresh_for_live_read().await?;
+                                refreshed = true;
+                            }
+                            let refreshed_incarnation = coord.manifest_incarnation();
+                            let cut = Arc::new(coord.build_change_feed_cut().await?);
+                            drop(coord);
+                            if refreshed {
+                                self.invalidate_read_caches().await;
+                            }
+                            *self.feed_cut_cache.write().await =
+                                Some((refreshed_incarnation, Arc::clone(&cut)));
+                            cut
+                        } else {
+                            Arc::new(coord.capture_change_cut(requested).await?)
+                        }
+                    }
+                } else {
+                    Arc::new(coord.capture_change_cut(requested).await?)
+                }
+            };
+        // The cut is captured; every per-commit snapshot reopen inside `poll`
+        // happens after this and lock-free. Tests delete/recreate the polled
+        // branch here to prove `commit_snapshot`'s incarnation re-prove fails
+        // closed instead of emitting a replacement branch's rows.
+        crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_POST_CAPTURE)?;
+        let graph_identity = self.schema_view.load().schema_identity_domain.clone();
+        crate::changes::feed::poll(
+            self.uri(),
+            &self.table_store,
+            &graph_identity,
+            &cut,
+            &request,
         )
         .await
     }
@@ -2351,6 +2594,20 @@ impl Omnigraph {
         writer: &mut W,
     ) -> Result<()> {
         export::export_jsonl_to_writer(self, branch, type_names, table_keys, writer).await
+    }
+
+    /// The change-feed baseline handshake: stream one exact data-only entity
+    /// snapshot pinned at a coherently captured branch head into `writer` and
+    /// return that head's commit id plus the cursor that resumes the feed
+    /// immediately after it. A failed export returns `Err` — a usable cursor
+    /// never outlives a broken snapshot.
+    pub async fn capture_change_baseline<W: Write>(
+        &self,
+        branch: &str,
+        scope: &crate::changes::ChangeFeedScope,
+        writer: &mut W,
+    ) -> Result<crate::changes::ChangeBaseline> {
+        export::capture_change_baseline(self, branch, scope, writer).await
     }
 
     // ─── Graph index ──────────────────────────────────────────────────────
@@ -2530,26 +2787,28 @@ impl Omnigraph {
         }
 
         // Dependency detection reads ONLY each surviving branch's manifest
-        // `table_branch` entries, so take the manifest-only snapshot. A full
-        // `snapshot_of` resolve would additionally load the commit-lineage
-        // projection and re-read + re-validate the schema contract PER BRANCH —
-        // O(branches x history) I/O that made deletion time out on large
-        // graphs — and its per-foreign-branch schema validation could wedge
-        // deletion of an unrelated branch behind another branch's schema
-        // drift. This operation's own schema was already validated under the
-        // schema gate above.
+        // `table_branch` entries. The schema-control gate held by the caller
+        // serializes native branch create/delete, while the target branch and
+        // table gates prevent a writer from creating new target-owned state.
+        // An ordinary write to a surviving branch can only replace an inherited
+        // target fork with that branch's own fork, so a concurrent write can
+        // make this check conservatively stale-true, never stale-false. The
+        // candidate branch's native incarnation is therefore not part of this
+        // proof and must not add two discarded BranchContents reads per branch.
+        // General coordinator/OCC/feed opens retain the coherent incarnation
+        // capture required by RFC-030.
         for other_branch in branches
             .iter()
             .filter(|candidate| candidate.as_str() != branch)
         {
-            let snapshot = self
-                .fresh_snapshot_for_branch_unchecked(
-                    Self::normalize_branch_name(other_branch)?.as_deref(),
-                )
-                .await?;
-            if snapshot
-                .entries()
-                .any(|entry| entry.table_branch.as_deref() == Some(branch))
+            let candidate_branch = Self::normalize_branch_name(other_branch)?;
+            if crate::db::manifest::ManifestCoordinator::branch_depends_on_delete_target_under_control_gates(
+                self.uri(),
+                candidate_branch.as_deref(),
+                branch,
+                &self.control_session(),
+            )
+            .await?
             {
                 return Err(OmniError::manifest_conflict(format!(
                     "cannot delete branch '{}' because branch '{}' still depends on it",

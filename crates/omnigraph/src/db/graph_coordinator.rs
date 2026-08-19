@@ -258,8 +258,9 @@ impl GraphCoordinator {
         self.manifest.captured_probe()
     }
 
-    /// Lance-native identity of the active `__manifest` branch. Stable across
-    /// commits; changes when a named branch is deleted and recreated.
+    /// Lance-native identity captured with this coordinator's active
+    /// `__manifest` state. Stable across commits; changes when a named branch
+    /// is deleted and recreated.
     pub(crate) async fn branch_identifier(&self) -> Result<lance::dataset::refs::BranchIdentifier> {
         self.manifest.branch_identifier().await
     }
@@ -306,7 +307,17 @@ impl GraphCoordinator {
     /// completes every required read before installing either new view, so a
     /// failure cannot leave replacement rows paired with stale branch lineage.
     pub(crate) async fn refresh_for_live_read(&mut self) -> Result<()> {
-        if let Some(lineage_rows) = self.manifest.refresh_for_live_read().await? {
+        // Disjoint field borrows: the membership probe reads `commit_graph`
+        // while `manifest` is mutably borrowed. The lineage projection is
+        // refreshed whenever the durable branch head is a commit it does not
+        // already contain — a foreign handle's commit must never leave a new
+        // head paired with a stale commit map.
+        let commit_graph = &self.commit_graph;
+        if let Some(lineage_rows) = self
+            .manifest
+            .refresh_for_live_read(|head| commit_graph.get_commit(head).is_some())
+            .await?
+        {
             self.commit_graph.replace_from_manifest_rows(lineage_rows);
         }
         Ok(())
@@ -481,6 +492,28 @@ impl GraphCoordinator {
                     commit.manifest_version,
                 )
                 .await?;
+                // The reopen above is keyed only by (manifest branch, numeric
+                // version). A named branch deleted and recreated at the same
+                // numeric version between this handle's commit resolution and
+                // the reopen would resolve REPLACEMENT state under the
+                // commit's label — and a warm handle can hold the old commit
+                // in its lineage projection long after the recreation. Every
+                // commit is written as the head of its own manifest version,
+                // so the reopened snapshot must still name it as that branch's
+                // graph head (the same structural proof the feed's
+                // commit_snapshot performs); fail closed otherwise. Main
+                // cannot undergo branch-name ABA, but the check is structural
+                // and harmless there.
+                if snapshot.graph_head(commit.manifest_branch.as_deref())
+                    != Some(commit.graph_commit_id.as_str())
+                {
+                    return Err(OmniError::manifest(format!(
+                        "commit '{}' has no persisted native-branch incarnation \
+                         witness at the reopened snapshot; the branch was deleted \
+                         and recreated since this handle resolved it",
+                        commit.graph_commit_id
+                    )));
+                }
                 Ok(ResolvedTarget {
                     requested: target.clone(),
                     branch: commit.manifest_branch.clone(),
@@ -534,6 +567,102 @@ impl GraphCoordinator {
             .head_commit_id()
             .await
             .map(|id| id.map(SnapshotId::new))
+    }
+
+    /// Capture one coherent change-feed cut of a branch: its lineage head, its
+    /// branch-incarnation witness, its first-parent genesis, and the full
+    /// commit projection — all from ONE branch-pinned coordinator open, so a
+    /// concurrent commit cannot split the head from the chain it tops.
+    /// Capture a change-feed cut by COLD-opening the requested branch. Used
+    /// only when the requested branch differs from this handle's warm
+    /// coordinator; the common same-branch poll uses [`Self::build_change_feed_cut`]
+    /// on the already-warm coordinator (no manifest re-open or lineage re-fold).
+    pub(crate) async fn capture_change_cut(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<crate::changes::feed::ChangeFeedCut> {
+        let other = match branch {
+            Some(branch) => {
+                GraphCoordinator::open_branch_with_session(
+                    self.root_uri(),
+                    branch,
+                    Arc::clone(&self.storage),
+                    &self.manifest.control_session(),
+                )
+                .await?
+            }
+            None => {
+                GraphCoordinator::open_with_session(
+                    self.root_uri(),
+                    Arc::clone(&self.storage),
+                    &self.manifest.control_session(),
+                )
+                .await?
+            }
+        };
+        other.build_change_feed_cut().await
+    }
+
+    /// Build a change-feed cut from THIS coordinator's current state. When the
+    /// coordinator is the warm handle already bound to the polled branch, this
+    /// performs no cold manifest open and no lineage re-fold — `load_commits`
+    /// reads the in-memory projection and uses the branch identifier captured
+    /// with that projection — so a caught-up poll's cost does not grow with
+    /// commit history and cannot pair old lineage with a replacement witness.
+    pub(crate) async fn build_change_feed_cut(
+        &self,
+    ) -> Result<crate::changes::feed::ChangeFeedCut> {
+        let head = self.effective_graph_head().await?.ok_or_else(|| {
+            OmniError::manifest_internal("branch has no lineage head; genesis is always published")
+        })?;
+        // Main cannot be deleted/recreated, so a fixed witness suffices; a
+        // named ref's Lance-native identifier changes on delete/recreate and
+        // fences cursor ABA. This is the identifier captured with the head and
+        // lineage above, never a fresh ref read that could name a replacement.
+        let witness = match self.current_branch() {
+            None => crate::changes::token::hashed_identity("branch:main"),
+            Some(_) => {
+                let identifier = self.branch_identifier().await?;
+                let encoded = serde_json::to_string(&identifier).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to encode Lance branch identifier: {error}"
+                    ))
+                })?;
+                crate::changes::token::hashed_identity(&encoded)
+            }
+        };
+        let commits: std::collections::HashMap<String, GraphCommit> = self
+            .load_commits()
+            .await?
+            .into_iter()
+            .map(|commit| (commit.graph_commit_id.clone(), commit))
+            .collect();
+        // One walk finds genesis AND builds the forward first-parent child
+        // index (chain member → its unique on-chain child), so a poll can walk
+        // FORWARD from its cursor bounded by its commit ceiling instead of
+        // cloning the whole unread backlog, and on-chain validation is O(1).
+        let mut first_parent_children = std::collections::HashMap::with_capacity(commits.len());
+        let mut genesis = head.clone();
+        loop {
+            let commit = commits.get(&genesis).ok_or_else(|| {
+                OmniError::manifest_internal(format!("lineage chain is missing commit '{genesis}'"))
+            })?;
+            match &commit.parent_commit_id {
+                Some(parent) => {
+                    first_parent_children.insert(parent.clone(), genesis.clone());
+                    genesis = parent.clone();
+                }
+                None => break,
+            }
+        }
+        Ok(crate::changes::feed::ChangeFeedCut {
+            branch: self.bound_branch.clone(),
+            head,
+            witness,
+            genesis,
+            commits,
+            first_parent_children,
+        })
     }
 
     #[cfg(test)]

@@ -542,6 +542,83 @@ async fn policy_authorizes_omitted_commit_list_branch_as_main() {
     assert_eq!(omitted_body, explicit_body);
 }
 
+/// A direct commit diff resolves the commit across ALL branches before it
+/// authorizes the commit's branch, so a 403-vs-404 split would be a graph-wide
+/// commit-existence oracle: an actor without read on a branch could confirm a
+/// commit exists on it. A known-but-forbidden commit must return the same 404
+/// as an unknown commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+
+    // Author a commit on an UNPROTECTED branch the read grant does not cover.
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    let receipt = db
+        .load_with_receipt(
+            "feature",
+            r#"{"type":"Person","data":{"name":"feature-only","age":40}}"#,
+            omnigraph::loader::LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let feature_commit = receipt.commit.graph_commit_id.clone();
+    drop(db);
+
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_PROTECTED_READ_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("act-bruno".to_string(), "team-token".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    // act-bruno may read main (protected) but NOT feature. Diffing a commit that
+    // lives on feature must look exactly like diffing a commit that does not
+    // exist at all.
+    let (forbidden_status, forbidden_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!("/commits/{feature_commit}/changes")))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    let unknown_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let (unknown_status, unknown_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!("/commits/{unknown_id}/changes")))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(
+        forbidden_status,
+        StatusCode::NOT_FOUND,
+        "a known-but-forbidden commit must not be distinguishable from unknown by status"
+    );
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    let forbidden: ErrorOutput = serde_json::from_value(forbidden_body).unwrap();
+    let unknown: ErrorOutput = serde_json::from_value(unknown_body).unwrap();
+    assert_eq!(
+        forbidden.code, unknown.code,
+        "forbidden and unknown must share the same error code"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() {
     let temp = init_loaded_graph().await;
@@ -1083,5 +1160,185 @@ async fn policy_decision_parity_branch_merge_team_denied() {
     assert!(
         matches!(sdk, ParityDecision::Deny) && matches!(http, ParityDecision::Deny),
         "SDK={sdk:?} HTTP={http:?} — should both Deny",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_routes_enforce_bearer_and_policy() {
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-bruno", "team-token"), ("act-ragnor", "admin-token")],
+        POLICY_YAML,
+    )
+    .await;
+
+    // Every change surface requires a bearer.
+    for (uri, method) in [
+        (g("/changes?start=now"), Method::GET),
+        (g("/changes/baseline"), Method::POST),
+    ] {
+        let request = Request::builder()
+            .uri(uri)
+            .method(method)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // A read-scoped actor may poll the feed and diff commits…
+    let (status, feed) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/changes?start=beginning"))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let commit_id = feed["blocks"]
+        .as_array()
+        .and_then(|blocks| blocks.last())
+        .map(|block| {
+            block["cause"]["graph_commit_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .expect("history has blocks");
+    let (status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!("/commits/{commit_id}/changes")))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // …but a baseline is a full data export and needs the export action.
+    let (status, forbidden) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/changes/baseline"))
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"branch":"main"}"#))
+            .unwrap(),
+    )
+    .await;
+    let forbidden: ErrorOutput = serde_json::from_value(forbidden).unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        forbidden.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden)
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/changes/baseline"))
+                .method(Method::POST)
+                .header("authorization", "Bearer admin-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"branch":"main"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// A padded branch spelling must not bypass branch-scope policy: the engine
+/// trims branch names late, so authorizing the caller's raw string would let
+/// `branch=%20main%20` be classified by Cedar as an unprotected named branch
+/// and then resolve to protected main. The feed and baseline handlers
+/// normalize BEFORE authorization, so every spelling of main is judged as
+/// main.
+#[tokio::test(flavor = "multi_thread")]
+async fn padded_branch_spelling_cannot_bypass_change_route_policy() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        r#"
+version: 1
+groups:
+  side-readers: [act-a]
+protected_branches: [main]
+rules:
+  - id: unprotected-only
+    allow:
+      actors: { group: side-readers }
+      actions: [read, export]
+      branch_scope: unprotected
+"#,
+    )
+    .unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("act-a".to_string(), "token-a".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    // Plain main is protected: the unprotected-only rule denies it.
+    let (plain_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/changes?branch=main"))
+            .method(Method::GET)
+            .header("authorization", "Bearer token-a")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(plain_status, StatusCode::FORBIDDEN);
+
+    // The padded spelling resolves to the same protected main and must be
+    // denied identically — before normalization it was classified as an
+    // unprotected named branch and slipped through.
+    let (padded_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/changes?branch=%20main%20"))
+            .method(Method::GET)
+            .header("authorization", "Bearer token-a")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        padded_status,
+        StatusCode::FORBIDDEN,
+        "a padded spelling of main must be authorized as main"
+    );
+
+    // Baseline (export) takes its branch from the JSON body; the same padded
+    // spelling must be denied the same way.
+    let (baseline_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/changes/baseline"))
+            .method(Method::POST)
+            .header("authorization", "Bearer token-a")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"branch":" main "}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        baseline_status,
+        StatusCode::FORBIDDEN,
+        "a padded baseline branch must be authorized as main"
     );
 }

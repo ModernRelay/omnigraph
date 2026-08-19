@@ -2,7 +2,7 @@
 type: spec
 title: "RFC-030 — Graph change feed and retained-history contract"
 description: Defines graph-vocabulary commit diffs and a graph change feed with bounded page tokens, durable cursors, and no public storage-table machinery.
-status: draft
+status: implemented
 tags: [eng, rfc, cdc, change-feed, time-travel, provenance, lineage, audit, omnigraph]
 timestamp: 2026-08-05
 owner: OmniGraph maintainers
@@ -10,7 +10,8 @@ owner: OmniGraph maintainers
 
 # RFC-030: Graph change feed and retained-history contract
 
-**Status:** Draft
+**Status:** Implemented for C0–C3. The §4.4 ordering, client-pagination, and
+continuation-size gates are closed as recorded in §14. C4+ remain design-stage.
 
 **Date:** 2026-08-05
 
@@ -48,7 +49,8 @@ Two public surfaces share one private adjacent-commit enumerator:
 
 A page token and feed cursor are deliberately separate. The token means
 "continue this response." The cursor means "resume the durable feed after this
-complete commit." Normal SDK/CLI usage consumes page tokens automatically.
+complete commit." The CLI consumes page tokens automatically without retaining
+earlier pages; raw HTTP and page-level engine clients continue explicitly.
 
 The implementation reuses the coordinator we already have:
 
@@ -239,9 +241,22 @@ the CDC order and is not a cross-branch cursor.
 
 ### 3.3 Graph-level filtering
 
-Filters may select graph concepts—node/edge kind, opaque graph type identity or
-name, and operation. They may not select a Lance dataset, table alias/path,
-native branch, fragment, or physical version.
+Filters may select graph concepts—node/edge kind, type name, and operation.
+Type filtering is **by name only**: the opaque graph type identity carried on
+every emitted change is a stable, rename-safe display and join key, not a filter
+dimension. A supplied opaque type ID therefore matches nothing rather than
+filtering by identity; select the current type name instead. Filters may not
+select a Lance dataset, table alias/path, native branch, fragment, or physical
+version.
+
+Name-only filtering is a **deliberate v1 scope decision**, not a drafting
+correction: it narrows the earlier ID-or-name draft, so an identity-scoped
+subscription does not follow a supported type rename — a consumer that must
+survive renames filters by nothing (full feed) and joins on the emitted opaque
+identity client-side. If rename-stable server-side filtering becomes a
+requirement, the sanctioned extension is an explicit ID filter dimension
+carried through engine scope, cursor digest, HTTP, CLI, and baseline together;
+partial support is not.
 
 Page tokens and feed cursors bind the canonical filter and image contract.
 Reusing either with a different scope fails with its corresponding typed scope
@@ -389,20 +404,47 @@ The total event order inside a block is
 incarnation identity may locate data internally but is not part of the public
 ordering contract or continuation payload.
 
-Raw HTTP may return `next_page_token`; SDK and CLI helpers consume it
-automatically and stream or spool the block within explicit bounds. In a feed,
-intermediate pages carry no advanced durable cursor. The terminal page returns
-the cursor after that complete commit, so a caller never checkpoints a partial
-block by mistake.
+Raw HTTP may return `next_page_token`; the CLI consumes it automatically and
+renders each page before fetching the next one. It retains at most one bounded
+page plus one open split-block cause (and one indivisible change while encoding),
+not the complete result. Page-level engine/HTTP consumers continue explicitly.
+In a feed, intermediate pages carry no advanced durable cursor. The terminal
+page returns the cursor after that complete commit, so a caller never
+checkpoints a partial block by mistake.
 
-The byte ceiling is chosen at least as large as OmniGraph's maximum legal
-logical row image. If historical or blob-backed data still produces one image
-larger than that ceiling, the request fails with a typed resource-limit error;
-it does not truncate the image or silently switch to keys-only output.
+The per-page byte ceiling is a PACKING target — how many small changes share a
+page — never a wall a single legal change must fit under. An `Update` serializes
+two row images and managed Blobs inline as base64, so one legal committed change
+can exceed the ceiling. Such a change is delivered on its own page (forward
+progress: it is emitted solo even when it exceeds the remaining budget, and the
+cursor advances past it), so no legal committed change is ever un-crossable. The
+enumerator never truncates an image or switches to keys-only output. *(Amended
+from the original "fails with a typed resource-limit error": that made a legal
+managed-Blob update a permanent poison commit no page token or feed cursor could
+cross. The resource-limit error is retained only for a zero-capacity request,
+which validation already rejects.)*
 
 The implementation must prove the ordering path is bounded. It may use Lance's
 ordered scan or a bounded merge, but it may not sort an unbounded graph commit
 in memory or depend on unspecified concurrent scan order.
+
+OmniGraph obtains Lance's public scanner plan and executes every ordered scan
+with spilling enabled, an explicit 150 MiB memory pool and an explicit 100 GiB
+scratch quota in that Lance execution context. OmniGraph creates a fresh
+context for each ordered execution instead of using Lance's session cache, so
+a quota breach cannot poison a later scan; concurrent scans each own the
+envelope. This is deliberately a per-execution bound rather than a
+process-global admission controller. The disk manager accounts completed spill
+writes, so concurrent in-flight writes can overshoot the quota. If
+`LANCE_BYPASS_SPILLING` disables that guarantee, the scan refuses before plan
+execution. This bounds resident sort state and gives scratch a fixed quota; it does not make
+the operation cheap. The sort remains O(N log N), reads the full projected
+table (including embeddings), may consume substantial local scratch, and has
+full-input time to first row. Each sorter input is hard-capped at 37.5 MiB so an
+approximate scanner batch cannot exceed the pool before it can spill. One row
+and one logical change remain indivisible allocations; a row above the cap, or
+pool/quota exhaustion, returns a typed error without a partial page. This is
+not a general process-OOM guarantee.
 
 ## 5. Continuation contracts
 
@@ -415,9 +457,18 @@ continuation key. It contains no durable consumer position and is not accepted
 as a feed cursor.
 
 The token does not expose table aliases/IDs, dataset paths, Lance versions, or
-row addresses. Private placement is re-derived after validation. A page token
-is useful to raw HTTP clients that must resume interrupted bounded work; normal
-CLI and SDK calls auto-fetch it.
+row addresses. Private placement is re-derived after validation. Its encoded
+form is capped at 4 KiB. Logical IDs up to 256 UTF-8 bytes are carried exactly,
+preserving the ordinary `id > last_id` seek. A longer legal ID is represented
+by a canonical at-most-64-byte UTF-8 prefix plus SHA-256. On that exceptional
+resume path the immutable commit is rescanned from the prefix until exactly one
+matching digest and operation is proven, then enumeration resumes after the
+resolved full ID; zero or multiple matches are a typed rejection. This retains
+support for already-legal long IDs without an unbounded query parameter or a
+new write-time ID limit.
+
+A page token is useful to raw HTTP and page-level engine clients that resume
+bounded work explicitly; the CLI auto-fetches it while streaming output.
 
 ### 5.2 Durable feed cursor
 
@@ -635,7 +686,8 @@ Extend existing owners before adding a new test silo: `changes.rs`,
 - New commits arriving between pages do not enter the captured cut.
 - Oversized single commits split and replay exactly under row, byte, and
   commits-scanned ceilings.
-- SDK/CLI helpers consume page tokens automatically; the feed exposes no
+- CLI auto-pagination emits each bounded page before fetching the next; raw
+  HTTP and page-level engine clients continue explicitly. The feed exposes no
   advanced durable cursor before the terminal page.
 - Sparse filters stop at the commits-scanned bound.
 - Reopen and another process can resume from the caller's cursor with no server
@@ -753,7 +805,7 @@ must return to this RFC's format audit before landing.
 |---|---|---|
 | C0 — foundation correction | Graph type-lifetime pairing with deterministic graph-semantic ordering; O(1) adjacent first-parent validation; Lance surface guards; remove speculative binary lifting | No new public API or persisted state; physical placement remains private |
 | C1 — private enumerator | Internal graph commit blocks with exact logical images, exact-end insert/update adapter, complete delete fallback, bounded page positions, typed gaps, and schema-compatibility refusal | Engine-only correctness before wire commitment |
-| C2 — finite commit entity diff | Graph-vocabulary DTO, exact commit-vs-first-parent diff, next-page token, bounded SDK/CLI auto-pagination, HTTP/OpenAPI, authorization, docs, and parity tests | Useful audit/inspection surface without a durable feed protocol |
+| C2 — finite commit entity diff | Graph-vocabulary DTO, exact commit-vs-first-parent diff, bounded next-page token, page-level engine/HTTP APIs, bounded streaming CLI auto-pagination, HTTP/OpenAPI, authorization, docs, and parity tests | Useful audit/inspection surface without a durable feed protocol |
 | C3 — public entity feed | First-parent feed cursor plus exact snapshot/cursor baseline and at-least-once consumer contract | Useful caller-owned feed within a proven compatible schema |
 | C4 — entity history | Newest-first history derived from the same per-commit enumerator, with separate backward continuation domains | Investigation surface; no new storage authority |
 | C5 — publication time, optional | Derived `published_at` and possibly a measured as-of-time selector | Lands only after its semantics and cold-history cost pass §7 |
@@ -786,3 +838,173 @@ whose cost is justified by C1.
     captured together; a bare head ID is not a safe bootstrap.
 12. Format: no bump for the entity feed; revisit before persisting any new
     history authority.
+
+---
+
+## 14. Implementation amendment (2026-08-15)
+
+C0 through C3 shipped on the surveyed contract. Details frozen by the
+implementation, recorded here so later phases inherit them:
+
+- **v1 derivation is the exact ordered-merge authority path only.** No
+  row-version candidate pruning and no transaction-interval no-delete proof
+  shipped; both remain the sanctioned optimizations of §4.2/§4.3. The cost
+  instrument (`changes_cost.rs`) pins the O(table-extent) scan term as a
+  growing tripwire that the pruning slice must flip to a flat assertion, and
+  pins bounded per-page opens, Blob-lazy payload work, data-flat caught-up
+  polls, and the one-manifest-snapshot-per-commit backlog term.
+- **Typed structural equality** uses Arrow logical equality on one-row
+  slices for non-Blob user columns and physical descriptor identity with an
+  exact payload tie-break for Blob columns. Float comparison is bitwise.
+  Managed Blob descriptor fields (`position`/`size`/`blob_id`) are resolved by
+  Lance RELATIVE to the owning data file, so the identity is qualified with that
+  data file's **immutable path** — the globally-unique v4 UUID Lance mints for
+  every data file, resolved I/O-free from the row's fragment via the Blob
+  column's field id. A fragment id is NOT a sufficient qualifier: it resets to 0
+  on Overwrite and is branch-local, so a same-length Blob-only update after
+  compaction, an Overwrite, or on a different branch could reuse a colliding
+  fragment id plus local descriptor coordinates and be misread as unchanged —
+  silently dropped from the diff and feed. A data-file path never repeats
+  (compaction, Overwrite, and per-branch writes each mint a new UUID), so one
+  comparator is correct for same-lineage, cross-branch, and post-Overwrite pairs
+  with no scope hint. External references resolve by URI independently of
+  placement, so their identity stays source-independent. The same comparator is
+  the merge classifier's row equality, so the CDC diff/feed and three-way merge
+  cannot drift (a display-string signature was not injective for nested Arrow
+  values — `["a, b"]` and `["a","b"]` rendered identically and a real change was
+  dropped).
+- **Strict schema gate:** paired lifetimes must share one user-schema
+  fingerprint (name-keyed Arrow type + nullability + stable property marker +
+  Blob marker; the five reserved Lance virtual columns excluded); a non-empty
+  added or removed lifetime refuses the commit; empty ones emit nothing. The
+  gate ignores the request filter — a boundary is a property of the commit
+  pair. The gate runs over ALL changed intervals before any emission, on
+  every page.
+- **Continuations:** three payload kinds (commit page token, feed cursor,
+  feed page token) share one checksummed opaque envelope with kind and
+  version tags; every cross-use, corruption, scope, witness, or digest
+  mismatch is one typed rejection surfaced as a stable-prefix 400. The commit
+  page token also binds the filter digest. The feed cursor binds the hashed
+  graph identity domain, the first-parent genesis, `changes/forward`, the
+  fixed-size digest of the normalized branch scope plus its Lance-native
+  incarnation witness (main uses a fixed witness), the filter digest, and the
+  last complete commit. In-commit
+  continuation positions are keyed by the PUBLISHED opaque type identity —
+  the same key that orders emission — so a token's decodable payload carries
+  no numeric table or incarnation component (the appended SHA-256 is
+  integrity, not encryption), honoring §4.4's payload exclusion literally.
+- **Continuations bind position, not page bounds.** §5.1 lists "enforced
+  bounds" among a page token's bindings; v1 deliberately deviates: tokens
+  bind identity, scope, and position, while row limits stay per-request
+  (server-clamped) and byte ceilings stay server-owned. Replaying one token
+  is therefore position-stable — the continuation resumes at exactly the same
+  event — but not page-size-stable. Binding bounds would reject legitimate
+  client reconfiguration (a smaller limit on retry after a timeout, an SDK
+  default change) without any correctness gain, since resume position is
+  limit-independent.
+- **Feed stop rules:** a mid-block page carries only a page token and its
+  block rides partially with its cause; a boundary page carries the cursor
+  plus a `caught_up` flag; an unreadable or boundary-refused commit surfaces
+  its typed error only as the FIRST commit of a poll, otherwise the page ends
+  atomically at the previous boundary and the next poll surfaces it. Commits
+  examined per poll are bounded (128 default / 512 ceiling, server-owned).
+- **Baseline framing:** the served handshake streams over the bounded export
+  transport and appends exactly one terminal `{"baseline": …}` NDJSON record,
+  sent only after every snapshot record succeeded. The snapshot honors kind
+  and type-name scope; `op` binds only the cursor. Baselines require the
+  `export` policy action; the diff and feed require `read`, with the commit
+  diff authorizing against the commit's authored branch because it returns
+  row images.
+- **Strict wire hygiene:** the change routes reject unknown query parameters
+  outright, and two vocabulary gates (response-walk and OpenAPI-walk) keep
+  physical storage vocabulary structurally absent from the contract.
+- **Known dependency for retention semantics:** historical snapshots resolve
+  by checking out `__manifest` at the commit's manifest version, so retained
+  manifest version history is a readability participant alongside table
+  versions. Bringing internal tables into `cleanup` must account for this
+  before reclaiming manifest versions.
+- **Review-round hardening (shipped).** A conformance review surfaced further
+  correctness, security, and cost issues, now fixed on the change surfaces: a
+  cross-branch net diff byte-compares managed-Blob columns (branch-local
+  fragment ids no longer alias different bytes as equal); the feed re-proves each
+  reopened commit's branch incarnation (a delete/recreate mid-poll can no longer
+  emit a replacement branch's rows under the captured commit's label); a legal
+  committed change is delivered on its own page rather than poisoning the feed
+  (the §4.4 amendment above); a direct commit diff returns 404 for a
+  known-but-forbidden commit (no commit-existence oracle); change-route errors
+  are projected to graph vocabulary (no physical path / table-key leak); a bare
+  object miss is no longer misclassified as reclaimed history; a caught-up
+  same-branch poll reuses the warm coordinator (no per-poll O(history) manifest
+  fold); the finite commit-diff gap carries no feed cursor; and `--as` is
+  rejected on the read commands. A cross-branch schema-fingerprint gate is added
+  as defense-in-depth for a future branch-scoped-schema-evolution capability
+  (unreachable today, since schema apply requires a graph with only main).
+  **Owned acceptance gates closed:** ordered scans now use Lance's public plan
+  executor with explicit spill memory/scratch ceilings and a forced-spill
+  regression; CLI auto-pagination renders each bounded page before fetching the
+  next; and page tokens use a fixed ceiling plus the exact-or-prefix/digest
+  logical position described in §5.1. The remaining O(N log N) full-scan cost,
+  local spill I/O, and approximate decoded-batch size are explicit operational
+  costs, not unbounded resident-state gaps.
+- **§4.4 boundedness obligation discharged.** The enumerator streams the merge
+  and applies page limits before building any delta-wide `Vec`. Its two
+  `order_by` inputs still plan as single-partition `SortExec`s on pinned Lance
+  10.0.0, but OmniGraph does not call the default unbounded scanner executor:
+  it executes the public plan with spilling enabled, a 150 MiB `FairSpillPool`
+  and a 100 GiB `DiskManager` quota in a fresh Lance execution context.
+  Concurrent scans each own the envelope, and in-flight spill writes can
+  overshoot the quota; neither value is claimed as a process-global ceiling. An ambient
+  `LANCE_BYPASS_SPILLING` causes a refusal instead of silently weakening the
+  contract. This one chokepoint also bounds branch merge, finite diff, and
+  export, which share the ordered scan. See
+  [merge-complexity.md](../dev/merge-complexity.md) for the source-level cost
+  audit and retained caveats.
+- **Second review round (shipped).** A second independent review found three
+  correctness gaps and four polish items, now fixed:
+  - **Managed-Blob identity is the immutable data-file path, not the fragment
+    id** (see the corrected "Typed structural equality" bullet above). The
+    fragment-id qualifier closed same-lineage collisions but still aliased a
+    same-length Blob update across an Overwrite (fragment id resets to 0) — a
+    reachable silent data-loss gap. The data-file-path qualifier closes it and
+    subsumes the earlier cross-branch scope hint, so the enum that carried it is
+    gone.
+  - **Merge classification uses the shared typed comparator.** The three-way
+    branch-merge classifier compared rows by `array_value_to_string`, which is
+    not injective for nested Arrow values, so a genuine list change was
+    classified as a no-op and silently dropped. It now routes through the same
+    `rows_equal` the CDC diff/feed uses.
+  - **The feed re-proves branch incarnation at the per-table open (second
+    window).** `commit_snapshot` re-proves the manifest head, but `plan_intervals`
+    then opens each per-table dataset separately by (branch path, version); a
+    delete/recreate between the head proof and the table open could retarget the
+    open to the replacement branch. The per-table open now bypasses the warm
+    cache and requires the reopened dataset's manifest e_tag to match the
+    entry's recorded incarnation, failing closed otherwise.
+  - **Backlog CPU term made observable (F4).** A poll clones the whole backlog
+    into its first-parent chain (`chain_after`), which grows with the backlog
+    independently of the manifest/data IO counters. A `feed_commits_visited`
+    probe now surfaces it through `changes_cost.rs`, so the bounded-visit fix
+    (a warm forward-child projection — the B1 follow-up) is measurable rather
+    than a silent regression surface.
+  - **Baseline durability, filter scope, and human output (F5–F7).** The
+    baseline install now propagates a parent-directory fsync failure instead of
+    swallowing it (no cursor prints for a rename that is not durable); §3.3 is
+    amended to name-only type filtering (the opaque id is a display/join key,
+    not a filter dimension); and human change output distinguishes an
+    endpoint-moving update (`old -> old => new -> new`), a JSON null (`<null>`),
+    the literal string `null`, an empty string, and an absent key.
+- **Final acceptance hardening (shipped).** The last RFC-owned review gates are
+  closed in the implementation that advances this record to `implemented`:
+  - a warm coordinator now captures the named Lance `BranchIdentifier` with its
+    manifest projection and includes it in freshness matching, so a same-source
+    delete/recreate cannot pair old lineage with a replacement witness;
+  - the solo-oversized forward-progress exception is page-wide, not reset at
+    each commit, so a positive byte remainder cannot make a later commit exceed
+    the packing target again;
+  - change-route errors use a graph-vocabulary allowlist, unknown resource
+    names and physical/integrity failures collapse to a fixed 500, and an exact
+    branch-ref miss has its own safe 404 variant;
+  - continuation keys and encoded tokens are bounded as specified in §5.1; and
+  - CLI auto-pagination incrementally renders the historical aggregate output
+    shape, retaining only the current page/open split block and withholding the
+    durable cursor until the terminal page.

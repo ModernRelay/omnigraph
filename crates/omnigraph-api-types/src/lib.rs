@@ -327,6 +327,266 @@ pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
 }
 
+/// Logical entity namespace of one change. Graph vocabulary only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeEntityKind {
+    Node,
+    Edge,
+}
+
+impl ChangeEntityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Edge => "edge",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "node" => Some(Self::Node),
+            "edge" => Some(Self::Edge),
+            _ => None,
+        }
+    }
+}
+
+/// Logical operation of one change. Ordering rank is frozen:
+/// insert before update before delete within one entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeOpOutput {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl ChangeOpOutput {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "insert" => Some(Self::Insert),
+            "update" => Some(Self::Update),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// Graph-scoped type identity. `id` is opaque: it survives a supported rename
+/// and changes after drop/re-add. It is never a table, dataset, or path
+/// identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeTypeOutput {
+    pub id: String,
+    pub name: String,
+}
+
+/// Edge endpoints as graph references. Endpoints belong to each image, so an
+/// endpoint-moving update has distinct before and after endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeEndpointsOutput {
+    pub from: String,
+    pub to: String,
+}
+
+/// One exact logical entity image, decoded with the commit-era schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeImageOutput {
+    /// Exact logical property values; user-schema keys verbatim.
+    pub properties: Value,
+    /// Present for edge images only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<ChangeEndpointsOutput>,
+}
+
+/// One entity change. Cause is stated once on the enclosing block, never here.
+/// An insert carries only `after`, an update exact `before` and `after`, a
+/// delete only `before`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct EntityChangeOutput {
+    pub kind: ChangeEntityKind,
+    pub r#type: ChangeTypeOutput,
+    pub id: String,
+    pub op: ChangeOpOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<ChangeImageOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<ChangeImageOutput>,
+}
+
+/// The commit cause of one change block, stated once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeCauseOutput {
+    pub graph_commit_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_parent_commit_id: Option<String>,
+    /// The branch the commit originally landed on (not the requested branch).
+    pub authored_branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    /// Authorship time as Unix epoch microseconds — minted before table
+    /// effects and stable across retries; deliberately not labeled a commit or
+    /// publication time.
+    #[schema(example = 1714000000000000i64)]
+    pub authored_at: i64,
+}
+
+/// One bounded page of the finite commit entity diff.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CommitChangesOutput {
+    pub cause: ChangeCauseOutput,
+    pub changes: Vec<EntityChangeOutput>,
+    /// Continue THIS bounded response. Absent on the final page. Never a feed
+    /// cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+/// One commit block inside a feed page.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ChangeBlockOutput {
+    pub cause: ChangeCauseOutput,
+    pub changes: Vec<EntityChangeOutput>,
+}
+
+/// One bounded feed poll result.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ChangeFeedOutput {
+    pub blocks: Vec<ChangeBlockOutput>,
+    /// Continue this poll's captured cut. Absent on a terminal page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+    /// Durable caller-owned cursor, advanced only over complete commits and
+    /// returned only on a terminal page — an interrupted poll never advances
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Present with `cursor` on a terminal page: true when the page reached
+    /// its captured head, false when more complete commits already wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caught_up: Option<bool>,
+}
+
+/// Query parameters for the finite commit entity diff.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct CommitChangesQuery {
+    /// Opaque continuation from the preceding page of this response.
+    pub page_token: Option<String>,
+    /// Maximum changes per page. Server default applies when absent; above
+    /// the public ceiling the request fails with 413.
+    pub limit: Option<usize>,
+    /// Repeatable filter: node | edge.
+    #[serde(default)]
+    pub kind: Vec<ChangeEntityKind>,
+    /// Repeatable filter: accepted-schema type name.
+    #[serde(default)]
+    pub r#type: Vec<String>,
+    /// Repeatable filter: insert | update | delete.
+    #[serde(default)]
+    pub op: Vec<ChangeOpOutput>,
+}
+
+/// Query parameters for the change feed poll.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ChangeFeedQuery {
+    /// Branch whose first-parent history is polled. Defaults to `main`.
+    pub branch: Option<String>,
+    /// Durable cursor from a prior terminal page. Mutually exclusive with
+    /// `start` and `page_token`.
+    pub cursor: Option<String>,
+    /// Explicit start mode: `now` (default) | `beginning` |
+    /// `after:<commit_id>`. Mutually exclusive with `cursor` and `page_token`.
+    pub start: Option<String>,
+    /// Continuation of one bounded poll (keeps its captured cut). Mutually
+    /// exclusive with `cursor` and `start`.
+    pub page_token: Option<String>,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub kind: Vec<ChangeEntityKind>,
+    #[serde(default)]
+    pub r#type: Vec<String>,
+    #[serde(default)]
+    pub op: Vec<ChangeOpOutput>,
+}
+
+/// Body for the change baseline handshake.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ChangeBaselineRequest {
+    /// Branch to capture. Defaults to `main`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Feed scope the resume cursor is bound to. The snapshot honors `kind`
+    /// and `type`; `op` constrains only subsequent polls.
+    #[serde(default)]
+    pub kind: Vec<ChangeEntityKind>,
+    #[serde(default)]
+    pub r#type: Vec<String>,
+    #[serde(default)]
+    pub op: Vec<ChangeOpOutput>,
+}
+
+/// Terminal payload of a baseline stream: the captured snapshot commit and
+/// the cursor that resumes the feed immediately after it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeBaselineOutput {
+    pub snapshot_commit_id: String,
+    pub resume_cursor: String,
+}
+
+/// Wire envelope of the FINAL baseline stream line: `{"baseline": {...}}`,
+/// distinguishable from snapshot records (which carry `type`/`edge` keys).
+/// Emitted exactly once, only after every snapshot record — an interrupted
+/// stream has no terminal record and therefore no usable cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeBaselineRecord {
+    pub baseline: ChangeBaselineOutput,
+}
+
+/// Error envelope for the read-only change surfaces (`…/changes`,
+/// `…/changes/baseline`, `…/commits/{commit_id}/changes`): a wire-compatible
+/// projection of [`ErrorOutput`] restricted to the graph-vocabulary details
+/// those routes can produce after their error projection. The write-path
+/// conflict shapes (key / manifest / merge / read-set), which carry physical
+/// storage identifiers, are structurally absent, so storage vocabulary is
+/// unreachable from the change operations' schema graph. Servers serialize
+/// [`ErrorOutput`]; every field a change route can populate appears here with
+/// the same name and meaning, and absent optionals are wire-compatible.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ChangeErrorOutput {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<ErrorCode>,
+    /// Set when a requested limit exceeds a public ceiling, or a single change
+    /// exceeds the poll's own byte ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_limit: Option<ResourceLimitOutput>,
+    /// Set with HTTP 503 when the graph has a durable recovery intent that
+    /// must be resolved before the requested change read can proceed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_required: Option<RecoveryRequiredOutput>,
+    /// Set with HTTP 410 when retained history can no longer reconstruct a
+    /// change continuation. Recover via the baseline handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_feed_gap: Option<ChangeFeedGapOutput>,
+    /// Set with HTTP 409 when a commit entity diff is refused (parentless
+    /// commit or an unprovable schema boundary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadRequest {
     /// GQ query source. May declare one or more named queries; pick one with
@@ -876,6 +1136,41 @@ pub struct PreconditionFailureOutput {
     pub actual: Option<String>,
 }
 
+/// A change continuation can no longer be reconstructed from retained history
+/// (HTTP 410). Recovery is the baseline handshake; retrying the same cursor
+/// cannot succeed. `code` stays unset: [`ErrorCode`] is closed and this
+/// additive detail is the machine-readable discriminator (the same rolling
+/// contract as `external_blob_source`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ChangeFeedGapOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub first_unreadable_commit_id: String,
+}
+
+/// Why a well-formed entity-diff request was refused (HTTP 409).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeDiffRefusalReason {
+    /// The commit has no first parent; bootstrap from a baseline instead.
+    ParentlessCommit,
+    /// The parent/child pair crosses an unprovable schema boundary.
+    SchemaBoundary,
+    /// A reason added by a newer server; treat like a schema boundary.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A well-formed entity-diff request this commit cannot satisfy (HTTP 409).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ChangeDiffRefusalOutput {
+    pub reason: ChangeDiffRefusalReason,
+    pub graph_commit_id: String,
+    /// The graph type at the schema boundary, when the reason names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
@@ -920,6 +1215,14 @@ pub struct ErrorOutput {
     /// field — `ErrorCode` is a closed rolling wire contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precondition_failure: Option<PreconditionFailureOutput>,
+    /// Set with HTTP 410 when retained history can no longer reconstruct a
+    /// change continuation. Recover via the baseline handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_feed_gap: Option<ChangeFeedGapOutput>,
+    /// Set with HTTP 409 when a commit entity diff is refused (parentless
+    /// commit or an unprovable schema boundary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
 }
 
 pub fn snapshot_payload(
@@ -967,6 +1270,145 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
         merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
         actor_id: commit.actor_id.clone(),
         created_at: commit.created_at,
+    }
+}
+
+impl From<omnigraph::changes::ChangeEntityKind> for ChangeEntityKind {
+    fn from(kind: omnigraph::changes::ChangeEntityKind) -> Self {
+        match kind {
+            omnigraph::changes::ChangeEntityKind::Node => Self::Node,
+            omnigraph::changes::ChangeEntityKind::Edge => Self::Edge,
+        }
+    }
+}
+
+impl From<ChangeEntityKind> for omnigraph::changes::ChangeEntityKind {
+    fn from(kind: ChangeEntityKind) -> Self {
+        match kind {
+            ChangeEntityKind::Node => Self::Node,
+            ChangeEntityKind::Edge => Self::Edge,
+        }
+    }
+}
+
+impl From<omnigraph::changes::ChangeOpKind> for ChangeOpOutput {
+    fn from(op: omnigraph::changes::ChangeOpKind) -> Self {
+        match op {
+            omnigraph::changes::ChangeOpKind::Insert => Self::Insert,
+            omnigraph::changes::ChangeOpKind::Update => Self::Update,
+            omnigraph::changes::ChangeOpKind::Delete => Self::Delete,
+        }
+    }
+}
+
+impl From<ChangeOpOutput> for omnigraph::changes::ChangeOpKind {
+    fn from(op: ChangeOpOutput) -> Self {
+        match op {
+            ChangeOpOutput::Insert => Self::Insert,
+            ChangeOpOutput::Update => Self::Update,
+            ChangeOpOutput::Delete => Self::Delete,
+        }
+    }
+}
+
+/// Wire filter vocabulary → the engine's feed scope. Shared by the server
+/// handlers and the CLI's embedded arm so both translate identically.
+pub fn change_scope(
+    kinds: &[ChangeEntityKind],
+    type_names: &[String],
+    ops: &[ChangeOpOutput],
+) -> omnigraph::changes::ChangeFeedScope {
+    omnigraph::changes::ChangeFeedScope {
+        kinds: (!kinds.is_empty()).then(|| kinds.iter().map(|kind| (*kind).into()).collect()),
+        type_names: (!type_names.is_empty()).then(|| type_names.to_vec()),
+        ops: (!ops.is_empty()).then(|| ops.iter().map(|op| (*op).into()).collect()),
+    }
+}
+
+pub fn change_cause_output(cause: &omnigraph::changes::ChangeCause) -> ChangeCauseOutput {
+    ChangeCauseOutput {
+        graph_commit_id: cause.graph_commit_id.clone(),
+        parent_commit_id: cause.parent_commit_id.clone(),
+        merged_parent_commit_id: cause.merged_parent_commit_id.clone(),
+        authored_branch: cause
+            .authored_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_string()),
+        actor_id: cause.actor_id.clone(),
+        authored_at: cause.authored_at,
+    }
+}
+
+fn change_image_output(image: &omnigraph::changes::EntityImage) -> ChangeImageOutput {
+    ChangeImageOutput {
+        properties: Value::Object(image.properties.clone()),
+        endpoints: image
+            .endpoints
+            .as_ref()
+            .map(|endpoints| ChangeEndpointsOutput {
+                from: endpoints.from.clone(),
+                to: endpoints.to.clone(),
+            }),
+    }
+}
+
+pub fn entity_change_output(change: &omnigraph::changes::GraphEntityChange) -> EntityChangeOutput {
+    EntityChangeOutput {
+        kind: change.kind.into(),
+        r#type: ChangeTypeOutput {
+            id: change.entity_type.id.clone(),
+            name: change.entity_type.name.clone(),
+        },
+        id: change.id.clone(),
+        op: change.op.into(),
+        before: change.before.as_ref().map(change_image_output),
+        after: change.after.as_ref().map(change_image_output),
+    }
+}
+
+pub fn change_block_output(block: &omnigraph::changes::GraphChangeBlock) -> ChangeBlockOutput {
+    ChangeBlockOutput {
+        cause: change_cause_output(&block.cause),
+        changes: block.changes.iter().map(entity_change_output).collect(),
+    }
+}
+
+pub fn commit_changes_output(page: &omnigraph::changes::CommitChangesPage) -> CommitChangesOutput {
+    CommitChangesOutput {
+        cause: change_cause_output(&page.block.cause),
+        changes: page
+            .block
+            .changes
+            .iter()
+            .map(entity_change_output)
+            .collect(),
+        next_page_token: page.next_page_token.clone(),
+    }
+}
+
+pub fn change_feed_output(page: &omnigraph::changes::ChangeFeedPage) -> ChangeFeedOutput {
+    let (next_page_token, cursor, caught_up) = match &page.continuation {
+        omnigraph::changes::ChangeFeedContinuation::MidBlock { page_token } => {
+            (Some(page_token.clone()), None, None)
+        }
+        omnigraph::changes::ChangeFeedContinuation::AtBlockBoundary { cursor, caught_up } => {
+            (None, Some(cursor.clone()), Some(*caught_up))
+        }
+    };
+    ChangeFeedOutput {
+        blocks: page.blocks.iter().map(change_block_output).collect(),
+        next_page_token,
+        cursor,
+        caught_up,
+    }
+}
+
+pub fn change_baseline_output(
+    baseline: &omnigraph::changes::ChangeBaseline,
+) -> ChangeBaselineOutput {
+    ChangeBaselineOutput {
+        snapshot_commit_id: baseline.snapshot_commit_id.clone(),
+        resume_cursor: baseline.resume_cursor.clone(),
     }
 }
 

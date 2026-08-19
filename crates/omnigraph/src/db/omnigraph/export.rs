@@ -116,6 +116,29 @@ impl Omnigraph {
             _slot: slot,
         })
     }
+
+    /// Capture one served baseline handshake: the pre-minted handshake plus an
+    /// export cut PINNED at the captured head commit. The transport must emit
+    /// the terminal handshake record only after the cut's chunk stream
+    /// completed Ok, so an interrupted stream never yields a usable cursor.
+    #[doc(hidden)]
+    pub async fn capture_served_change_baseline_cut(
+        self: &Arc<Self>,
+        branch: &str,
+        scope: &crate::changes::ChangeFeedScope,
+    ) -> Result<(crate::changes::ChangeBaseline, ExportCut)> {
+        let parts = capture_baseline_parts(self, branch, scope, true).await?;
+        Ok((
+            parts.handshake,
+            ExportCut {
+                db: Arc::clone(self),
+                snapshot: parts.snapshot,
+                catalog: parts.catalog,
+                selected_tables: parts.selected_tables,
+                _slot: parts.slot,
+            },
+        ))
+    }
 }
 
 pub(super) async fn entity_at_target(
@@ -184,6 +207,119 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
         &mut emit,
     )
     .await
+}
+
+/// The baseline handshake: capture one branch head coherently, stream the
+/// data-only entity snapshot PINNED at that head into `writer`, and mint the
+/// cursor that resumes the change feed immediately after it.
+///
+/// The export-cut permit is held from before head capture until the last byte,
+/// so cleanup, schema apply, branch replacement, and root deletion cannot
+/// remove or reuse the selected coordinates mid-handshake — this closes the
+/// head-capture/export race a bare head ID plus a later export would have. A
+/// failed export returns `Err`, so a usable cursor structurally cannot outlive
+/// a broken snapshot.
+/// Everything one baseline handshake needs, captured coherently under the
+/// export-cut permit the struct retains.
+struct BaselineParts {
+    slot: crate::db::write_queue::ExportCutPermit,
+    snapshot: Snapshot,
+    catalog: Arc<Catalog>,
+    selected_tables: Vec<String>,
+    handshake: crate::changes::ChangeBaseline,
+}
+
+async fn capture_baseline_parts(
+    db: &Omnigraph,
+    branch: &str,
+    scope: &crate::changes::ChangeFeedScope,
+    heal: bool,
+) -> Result<BaselineParts> {
+    let slot = db.write_queue().try_acquire_export_cut().ok_or_else(|| {
+        OmniError::ResourceLimitExceeded {
+            resource: "stream_export_slots".to_string(),
+            limit: 1,
+            actual: 2,
+        }
+    })?;
+    if heal {
+        db.heal_pending_recovery_sidecars_outcome().await?;
+    }
+    let normalized_branch = Some(branch).filter(|branch| *branch != "main");
+    let cut = db
+        .coordinator
+        .read()
+        .await
+        .capture_change_cut(normalized_branch)
+        .await?;
+
+    // Pin the export at the captured head commit, not the live branch tip: a
+    // commit landing after the capture is outside the snapshot and arrives on
+    // the first poll from the returned cursor.
+    let (resolved, catalog) = db
+        .capture_read_view(ReadTarget::Snapshot(super::SnapshotId::new(
+            cut.head.clone(),
+        )))
+        .await?;
+    let type_names = scope.type_names.clone().unwrap_or_default();
+    let selected_tables: Vec<String> = export_table_keys(&resolved.snapshot, &type_names, &[])?
+        .into_iter()
+        .filter(|table_key| {
+            let kind = if table_key.starts_with("edge:") {
+                crate::changes::ChangeEntityKind::Edge
+            } else {
+                crate::changes::ChangeEntityKind::Node
+            };
+            scope.wants_kind(kind)
+        })
+        .collect();
+    let resume_cursor = crate::changes::feed::mint_cursor_after(
+        &db.schema_view.load().schema_identity_domain,
+        &cut,
+        scope,
+        &cut.head,
+    )?;
+    Ok(BaselineParts {
+        slot,
+        snapshot: resolved.snapshot,
+        catalog,
+        selected_tables,
+        handshake: crate::changes::ChangeBaseline {
+            snapshot_commit_id: cut.head,
+            resume_cursor,
+        },
+    })
+}
+
+/// The baseline handshake: capture one branch head coherently, stream the
+/// data-only entity snapshot PINNED at that head into `writer`, and mint the
+/// cursor that resumes the change feed immediately after it.
+///
+/// The export-cut permit is held from before head capture until the last byte,
+/// so cleanup, schema apply, branch replacement, and root deletion cannot
+/// remove or reuse the selected coordinates mid-handshake — this closes the
+/// head-capture/export race a bare head ID plus a later export would have. A
+/// failed export returns `Err`, so a usable cursor structurally cannot outlive
+/// a broken snapshot.
+pub(super) async fn capture_change_baseline<W: Write>(
+    db: &Omnigraph,
+    branch: &str,
+    scope: &crate::changes::ChangeFeedScope,
+    writer: &mut W,
+) -> Result<crate::changes::ChangeBaseline> {
+    let parts = capture_baseline_parts(db, branch, scope, false).await?;
+    let _slot = parts.slot;
+    let mut emit =
+        |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));
+    export_selected_tables(
+        db,
+        &parts.snapshot,
+        parts.catalog.as_ref(),
+        &parts.selected_tables,
+        &mut emit,
+    )
+    .await?;
+    Ok(parts.handshake)
 }
 
 async fn entity_from_snapshot(
@@ -310,7 +446,7 @@ where
         while let Some(batch) = batches
             .try_next()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
+            .map_err(crate::table_store::TableStore::ordered_scan_error)?
         {
             emit_export_rows_from_batch(catalog, table_key, &batch, None, emit).await?;
         }
@@ -337,7 +473,7 @@ where
     while let Some(batch) = batches
         .try_next()
         .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
+        .map_err(crate::table_store::TableStore::ordered_scan_error)?
     {
         for row_index in 0..batch.num_rows() {
             let row = batch.slice(row_index, 1);
@@ -364,7 +500,7 @@ where
     Ok(())
 }
 
-async fn export_blob_values(
+pub(crate) async fn export_blob_values(
     source_ds: &Dataset,
     batch: &RecordBatch,
     row_ids: &[u64],
@@ -387,6 +523,69 @@ async fn export_blob_values(
         );
     }
     Ok(values)
+}
+
+/// Convert one descriptor-scanned row into the same logical value shape used
+/// by export, materializing at most that row's Blob values.
+///
+/// A pinned Lance version is the commit-era schema authority: the image is
+/// decoded from the batch's own schema, never the live catalog, so retained
+/// commits stay readable after rename/add/drop. Only the exact reserved Lance
+/// virtual columns are excluded — a legal user property whose name merely
+/// starts with `_row` is preserved.
+pub(crate) async fn logical_row_image(
+    source_ds: &Dataset,
+    batch: &RecordBatch,
+    row: usize,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    use crate::changes::model::is_reserved_storage_system_column;
+
+    let row_batch = batch.slice(row, 1);
+    let blob_properties = row_batch
+        .schema()
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+                .map_err(|error| OmniError::Lance(error.to_string()));
+            match lance_field {
+                Ok(field) if field.is_blob() => Some(Ok(field.name.clone())),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<std::collections::HashSet<_>>>()?;
+    let blob_values = if blob_properties.is_empty() {
+        None
+    } else {
+        let row_id = row_batch
+            .column_by_name("_rowid")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| OmniError::Lance("change row is missing _rowid".to_string()))?
+            .value(0);
+        Some(export_blob_values(source_ds, &row_batch, &[row_id], &blob_properties).await?)
+    };
+
+    let mut image = serde_json::Map::new();
+    for field in row_batch
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| !is_reserved_storage_system_column(field.name()))
+    {
+        image.insert(
+            field.name().clone(),
+            export_value_for_field(
+                &row_batch,
+                field.name(),
+                0,
+                blob_values
+                    .as_ref()
+                    .and_then(|values| values.get(field.name())),
+            )?,
+        );
+    }
+    Ok(image)
 }
 
 async fn emit_export_rows_from_batch<Emit, EmitFuture>(

@@ -6,7 +6,6 @@
 //! a managed value, and malformed persisted descriptors fail before a caller
 //! can silently reinterpret them.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -911,205 +910,45 @@ impl<'a> BlobDescriptorDecoder<'a> {
             ))),
         }
     }
-}
 
-/// Immutable physical identity of the data file owning managed Blob payloads.
-///
-/// Blob descriptor fields are only meaningful relative to the immutable data
-/// file that owns them: two different files may both contain `blob_id = 1` at
-/// the same offset. Branch-adopt equality therefore qualifies the descriptor
-/// with Lance's resolved physical base URI, whether that URI denotes a dataset
-/// root or a data directory, and the data-file path.
-#[derive(Debug)]
-struct ManagedBlobDataFileIdentity {
-    resolved_base_uri: Arc<str>,
-    base_is_dataset_root: bool,
-    data_file_path: String,
-}
-
-impl ManagedBlobDataFileIdentity {
-    fn is_same_physical_file(&self, other: &Self) -> bool {
-        self.resolved_base_uri == other.resolved_base_uri
-            && self.base_is_dataset_root == other.base_is_dataset_root
-            && self.data_file_path == other.data_file_path
-    }
-}
-
-/// Adopt-only index from `(Blob column, fragment id)` to immutable data-file
-/// identity.
-///
-/// Lance's `Dataset::get_fragment` searches the manifest fragment list. Doing
-/// that for every equal managed cell makes an ordered merge walk
-/// `O(rows * fragments * Blob columns)`. Build this index once per lazy cursor
-/// instead, then each managed-cell proof performs two hash lookups and no
-/// payload I/O.
-#[derive(Debug)]
-pub(crate) struct ManagedBlobDataFileIndex {
-    by_column: HashMap<String, HashMap<u32, ManagedBlobDataFileIdentity>>,
-}
-
-impl ManagedBlobDataFileIndex {
-    pub(crate) fn from_dataset(dataset: &Dataset) -> Result<Self> {
-        let mut blob_fields = Vec::new();
-        let mut by_column = HashMap::new();
-        for field in dataset
-            .schema()
-            .fields
-            .iter()
-            .filter(|field| field.is_blob())
-        {
-            let field_id = u32::try_from(field.id).map_err(|_| {
-                OmniError::blob_integrity(format!(
-                    "managed Blob column '{}' has invalid field id {}",
-                    field.name, field.id
-                ))
-            })?;
-            blob_fields.push((field.name.clone(), field_id));
-            by_column.insert(field.name.clone(), HashMap::new());
-        }
-
-        if blob_fields.is_empty() {
-            return Ok(Self { by_column });
-        }
-
-        // Match Lance 10's `resolve_base_uri`: a shallow-cloned file's
-        // `base_id` resolves through this manifest's `base_paths`, while a
-        // locally-owned file resolves under this dataset URI. Branch manifests
-        // retain ancestry bases that no active fragment may reference, so
-        // normalize and cache only ids encountered in the active file walk.
-        let dataset_base: Arc<str> = Arc::from(crate::storage::normalize_root_uri(dataset.uri())?);
-        let mut resolved_bases = HashMap::new();
-        for fragment in dataset.get_fragments() {
-            let fragment_id = u32::try_from(fragment.id()).map_err(|_| {
-                OmniError::blob_integrity(format!(
-                    "managed Blob fragment id {} exceeds the row-address domain",
-                    fragment.id()
-                ))
-            })?;
-            for (column, field_id) in &blob_fields {
-                let Some(data_file) = fragment.data_file_for_field(*field_id) else {
-                    continue;
-                };
-                let (resolved_base_uri, base_is_dataset_root) = match data_file.base_id {
-                    Some(base_id) => match resolved_bases.get(&base_id).cloned() {
-                        Some(resolved) => resolved,
-                        None => {
-                            let base = dataset
-                                .manifest()
-                                .base_paths
-                                .get(&base_id)
-                                .ok_or_else(|| {
-                                    OmniError::blob_integrity(format!(
-                                        "managed Blob data file '{}' names missing base path {base_id}",
-                                        data_file.path
-                                    ))
-                                })?;
-                            let resolved = (
-                                Arc::<str>::from(crate::storage::normalize_root_uri(&base.path)?),
-                                base.is_dataset_root,
-                            );
-                            resolved_bases.insert(base_id, resolved.clone());
-                            resolved
-                        }
-                    },
-                    None => (Arc::clone(&dataset_base), true),
-                };
-                by_column
-                    .get_mut(column)
-                    .expect("Blob column index initialized above")
-                    .insert(
-                        fragment_id,
-                        ManagedBlobDataFileIdentity {
-                            resolved_base_uri,
-                            base_is_dataset_root,
-                            data_file_path: data_file.path.clone(),
-                        },
-                    );
-            }
-        }
-
-        Ok(Self { by_column })
-    }
-
-    fn identity(&self, row_address: u64, column: &str) -> Result<&ManagedBlobDataFileIdentity> {
-        let fragment_id = (row_address >> 32) as u32;
-        self.by_column
-            .get(column)
-            .ok_or_else(|| {
-                OmniError::blob_integrity(format!(
-                    "managed Blob equality lookup could not find column '{column}'"
-                ))
-            })?
-            .get(&fragment_id)
-            .ok_or_else(|| {
-                OmniError::blob_integrity(format!(
-                    "fragment {fragment_id} has no data file for managed Blob column '{column}'"
-                ))
-            })
-    }
-}
-
-/// Prove equality of two persisted Blob-v2 cells without reading payloads.
-///
-/// Null and external values are fully identified by their validated persisted
-/// descriptors. Managed descriptor numbers are dataset-local, so they are
-/// equal only when Lance resolves both cells to the same immutable physical
-/// object range. A relocated byte-identical payload is conservatively treated
-/// as changed; a false equality is never returned.
-pub(crate) fn persisted_blob_values_provably_equal(
-    left_data_files: &ManagedBlobDataFileIndex,
-    left_descriptions: &StructArray,
-    left_row: usize,
-    left_row_address: u64,
-    right_data_files: &ManagedBlobDataFileIndex,
-    right_descriptions: &StructArray,
-    right_row: usize,
-    right_row_address: u64,
-    column: &str,
-) -> Result<bool> {
-    let left_decoder = BlobDescriptorDecoder::try_new(left_descriptions)?;
-    let right_decoder = BlobDescriptorDecoder::try_new(right_descriptions)?;
-    let left = left_decoder.classify(left_row)?;
-    let right = right_decoder.classify(right_row)?;
-
-    match (left, right) {
-        (BlobDescriptor::Null, BlobDescriptor::Null) => Ok(true),
-        (
+    /// Canonical payload identity of one descriptor row, qualified by the
+    /// owning immutable data file. Equal identities reference identical stored
+    /// bytes, so a comparator can skip payload I/O on equality; inequality
+    /// proves nothing (compaction relocates identical bytes to a new file), so
+    /// callers must byte-compare payloads before reporting a change.
+    ///
+    /// **A managed descriptor's fields are file-relative, not global.** Lance
+    /// resolves managed (inline/packed/dedicated) bytes from the row's owning
+    /// data file, then `position`/`size`/`blob_id` within it. So the identity
+    /// must be qualified by *which* data file. It uses the file's stable path
+    /// (`data_file_path`) — a per-file v4 UUID Lance mints once and never
+    /// rewrites; compaction, `Overwrite`, and per-branch writes all produce a
+    /// NEW UUID. Unlike the numeric fragment id, this is globally unique: it
+    /// does not restart at 0 on `Overwrite` and is not branch-local, so equal
+    /// managed identities really do imply equal bytes across overwrites and
+    /// branches. External references resolve by URI independently of physical
+    /// placement, so their identity is source-independent. Null uses the
+    /// classified state, never sentinel child values, so the two physical null
+    /// encodings share one identity.
+    pub(crate) fn physical_identity(&self, row: usize, data_file_path: &str) -> Result<String> {
+        match self.classify(row)? {
+            BlobDescriptor::Null => Ok("null".to_string()),
             BlobDescriptor::External {
-                uri: left_uri,
-                offset: left_offset,
-                length: left_length,
-            },
-            BlobDescriptor::External {
-                uri: right_uri,
-                offset: right_offset,
-                length: right_length,
-            },
-        ) => Ok((left_uri, left_offset, left_length) == (right_uri, right_offset, right_length)),
-        (
-            BlobDescriptor::Managed {
-                length: left_length,
-            },
-            BlobDescriptor::Managed {
-                length: right_length,
-            },
-        ) => {
-            if left_length != right_length {
-                return Ok(false);
-            }
-            // Reject unequal descriptors before doing even the in-memory
-            // fragment lookup. Equal descriptor numbers are still not a proof:
-            // they must resolve under the same immutable data-file identity.
-            if left_descriptions.slice(left_row, 1).to_data()
-                != right_descriptions.slice(right_row, 1).to_data()
-            {
-                return Ok(false);
-            }
-            let left_identity = left_data_files.identity(left_row_address, column)?;
-            let right_identity = right_data_files.identity(right_row_address, column)?;
-            Ok(left_identity.is_same_physical_file(right_identity))
+                uri,
+                offset,
+                length,
+            } => Ok(format!(
+                "ext:{offset}:{}:{uri}",
+                length.map(|len| len.to_string()).unwrap_or_default(),
+            )),
+            BlobDescriptor::Managed { .. } => Ok(format!(
+                "mgd:{data_file_path}:{}:{}:{}:{}",
+                self.kinds.value(row),
+                self.positions.value(row),
+                self.sizes.value(row),
+                self.blob_ids.value(row),
+            )),
         }
-        _ => Ok(false),
     }
 }
 

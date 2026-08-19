@@ -835,7 +835,7 @@ pub(crate) async fn server_export(
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<ExportRequest>,
 ) -> std::result::Result<Response, ApiError> {
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    let branch = normalize_change_branch(request.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -2301,7 +2301,7 @@ async fn delete_merged_source_branch(
     ) {
         Ok(Authz::Allowed) => {}
         Ok(Authz::Denied(message)) => return Err(message),
-        Err(err) => return Err(err.message),
+        Err(err) => return Err(err.message.into()),
     }
     let actor_id = actor.map(|actor| actor.actor_id.as_ref());
     handle
@@ -2460,6 +2460,113 @@ pub(crate) fn query_params_from_json(
 }
 
 #[cfg(test)]
+mod change_route_error_tests {
+    use super::*;
+
+    #[test]
+    fn change_route_error_hides_substrate_paths() {
+        let leaky =
+            "/srv/data/graph/nodes/0000000a-0000000b.lance: No such file or directory".to_string();
+        let mapped = change_route_error(OmniError::Lance(leaky));
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !mapped.message().contains(".lance") && !mapped.message().contains("/srv/data"),
+            "change route leaked a substrate path: {}",
+            mapped.message()
+        );
+    }
+
+    #[test]
+    fn change_route_error_hides_internal_manifest_table_keys() {
+        let mapped = change_route_error(OmniError::manifest_internal(
+            "invalid table key 'node:SecretType' at internal version 7",
+        ));
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !mapped.message().contains("node:SecretType"),
+            "change route leaked an internal table key: {}",
+            mapped.message()
+        );
+    }
+
+    #[test]
+    fn change_route_error_passes_only_allowlisted_graph_errors_through() {
+        // Even Manifest::NotFound is too broad for the shared mapper. Only a
+        // route that knows which public graph resource it looked up may turn
+        // that category into a fixed 404.
+        let mapped = change_route_error(OmniError::manifest_not_found(
+            "missing /srv/private/table.lance for node:Secret",
+        ));
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!mapped.message().contains("node:Secret"));
+        let mapped = change_route_not_found(
+            OmniError::manifest_not_found("missing /srv/private/table.lance"),
+            "commit 'x' not found".to_string(),
+        );
+        assert_eq!(mapped.status(), StatusCode::NOT_FOUND);
+        assert!(mapped.message().contains("not found"));
+        assert!(!mapped.message().contains("/srv/private"));
+
+        let mapped = change_route_error(OmniError::ChangeCursorRejected {
+            reason: "token does not match this filter".to_string(),
+        });
+        assert_eq!(mapped.status(), StatusCode::BAD_REQUEST);
+        assert!(mapped.message().contains("change cursor rejected"));
+
+        let mapped = change_route_error(OmniError::BranchNotFound {
+            branch: "feature".to_string(),
+        });
+        assert_eq!(mapped.status(), StatusCode::NOT_FOUND);
+        assert_eq!(mapped.message(), "branch 'feature' not found");
+
+        let mapped = change_route_commit_lookup_error(
+            OmniError::BranchNotFound {
+                branch: "secret-feature".to_string(),
+            },
+            "commit-x",
+        );
+        assert_eq!(mapped.status(), StatusCode::NOT_FOUND);
+        assert_eq!(mapped.message(), "commit 'commit-x' not found");
+        assert!(!mapped.message().contains("secret-feature"));
+
+        // Manifest::BadRequest is intentionally NOT a pass-through category:
+        // it is used throughout the engine and may acquire physical context.
+        // The route validates its own public inputs before entering the engine.
+        let mapped = change_route_error(OmniError::manifest(
+            "bad table node:Secret at /srv/private/table.lance",
+        ));
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!mapped.message().contains("node:Secret"));
+
+        let mapped = change_route_error(OmniError::ResourceLimitExceeded {
+            resource: "table node:Secret bytes".to_string(),
+            limit: 1,
+            actual: 2,
+        });
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!mapped.message().contains("node:Secret"));
+    }
+
+    #[test]
+    fn change_route_recovery_exposes_id_but_redacts_internal_reason() {
+        let mapped = change_route_error(OmniError::RecoveryRequired {
+            operation_id: "op-public".to_string(),
+            reason: "sidecar /srv/private/recovery.json names node:Secret".to_string(),
+        });
+        assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(mapped.message().contains("recovery required"));
+        assert!(!mapped.message().contains("/srv/private"));
+        assert_eq!(
+            mapped
+                .recovery_required
+                .as_deref()
+                .map(|details| details.operation_id.as_str()),
+            Some("op-public")
+        );
+    }
+}
+
+#[cfg(test)]
 mod blob_error_tests {
     use super::*;
 
@@ -2500,4 +2607,507 @@ mod blob_error_tests {
         assert_eq!(output.error, "Blob delivery failed before response headers");
         assert!(!String::from_utf8_lossy(&body).contains("private-bucket"));
     }
+}
+
+// ─── Change surfaces ────────────────────────────────────────────────────────
+
+/// Parsed change-surface query parameters. axum's `Query<T>` cannot collect
+/// repeated keys into `Vec`s, so the change routes parse the raw query with a
+/// STRICT allow-list: an unknown parameter is a 400, never silently ignored —
+/// this is what keeps caller byte limits and physical vocabulary from ever
+/// riding the new surfaces.
+#[derive(Default)]
+pub(crate) struct ParsedChangeParams {
+    pub branch: Option<String>,
+    pub cursor: Option<String>,
+    pub start: Option<String>,
+    pub page_token: Option<String>,
+    pub limit: Option<usize>,
+    pub kinds: Vec<api::ChangeEntityKind>,
+    pub types: Vec<String>,
+    pub ops: Vec<api::ChangeOpOutput>,
+}
+
+pub(crate) const COMMIT_CHANGES_PARAMS: &[&str] = &["page_token", "limit", "kind", "type", "op"];
+pub(crate) fn parse_change_query(
+    raw: Option<&str>,
+    allowed: &[&str],
+) -> std::result::Result<ParsedChangeParams, ApiError> {
+    let mut params = ParsedChangeParams::default();
+    let Some(raw) = raw else { return Ok(params) };
+
+    fn set_single(
+        slot: &mut Option<String>,
+        name: &str,
+        value: String,
+    ) -> std::result::Result<(), ApiError> {
+        if slot.is_some() {
+            return Err(ApiError::bad_request(format!(
+                "query parameter '{name}' may appear at most once"
+            )));
+        }
+        *slot = Some(value);
+        Ok(())
+    }
+
+    for (name, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+        let name = name.as_ref();
+        if !allowed.contains(&name) {
+            return Err(ApiError::bad_request(format!(
+                "unknown query parameter '{name}'"
+            )));
+        }
+        let value = value.into_owned();
+        match name {
+            "branch" => set_single(&mut params.branch, name, value)?,
+            "cursor" => set_single(&mut params.cursor, name, value)?,
+            "start" => set_single(&mut params.start, name, value)?,
+            "page_token" => set_single(&mut params.page_token, name, value)?,
+            "limit" => {
+                let mut slot = None;
+                set_single(&mut slot, name, value)?;
+                let parsed =
+                    slot.as_deref().unwrap().parse::<usize>().map_err(|_| {
+                        ApiError::bad_request("limit must be a non-negative integer")
+                    })?;
+                if params.limit.replace(parsed).is_some() {
+                    return Err(ApiError::bad_request(
+                        "query parameter 'limit' may appear at most once",
+                    ));
+                }
+            }
+            "kind" => params
+                .kinds
+                .push(api::ChangeEntityKind::parse(&value).ok_or_else(|| {
+                    ApiError::bad_request(format!("unknown kind '{value}' (expected node | edge)"))
+                })?),
+            "type" => params.types.push(value),
+            "op" => params
+                .ops
+                .push(api::ChangeOpOutput::parse(&value).ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "unknown op '{value}' (expected insert | update | delete)"
+                    ))
+                })?),
+            _ => unreachable!("allow-list covers every match arm"),
+        }
+    }
+    Ok(params)
+}
+
+#[utoipa::path(
+    get,
+    path = "/commits/{commit_id}/changes",
+    tag = "changes",
+    operation_id = "getCommitChanges",
+    params(
+        ("commit_id" = String, Path, description = "Commit identifier"),
+        api::CommitChangesQuery,
+    ),
+    responses(
+        (status = 200, description = "Entity changes this commit made relative to its first parent, in frozen (kind, type, id, op) order with the cause stated once", body = api::CommitChangesOutput),
+        (status = 400, description = "Invalid filter or limit, or a rejected page token", body = api::ChangeErrorOutput),
+        (status = 401, description = "Unauthorized", body = api::ChangeErrorOutput),
+        // No 403: a commit the actor cannot read is indistinguishable from an
+        // unknown commit (404), so the diff is not a commit-existence oracle.
+        (status = 404, description = "Commit not found, or the actor cannot read the commit's branch", body = api::ChangeErrorOutput),
+        (status = 409, description = "Commit cannot be entity-diffed (parentless commit or schema boundary); see change_diff_refusal", body = api::ChangeErrorOutput),
+        (status = 410, description = "Required retained history is no longer readable; see change_feed_gap and capture a new baseline", body = api::ChangeErrorOutput),
+        (status = 413, description = "Requested limit exceeds the public row ceiling", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure while reading changes", body = api::ChangeErrorOutput),
+        (status = 503, description = "Recovery required before changes can be read", body = api::ChangeErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+
+/// Entity changes one commit made relative to its first parent.
+///
+/// Read-only, in graph vocabulary with exact before/after images. Bounded:
+/// a large commit continues via the opaque `page_token`.
+pub(crate) async fn server_commit_changes(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Path(CommitPath { commit_id }): Path<CommitPath>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> std::result::Result<Json<api::CommitChangesOutput>, ApiError> {
+    let params = parse_change_query(raw.as_deref(), COMMIT_CHANGES_PARAMS)?;
+    validate_change_http_limit(params.limit)?;
+    // Resolve the commit first: unlike commit-show, this response carries row
+    // images, so read authorization binds to the branch the commit landed on.
+    let db = &handle.engine;
+    let commit = db
+        .get_commit(&commit_id)
+        .await
+        .map_err(|error| change_route_commit_lookup_error(error, &commit_id))?;
+    let branch = commit
+        .manifest_branch
+        .clone()
+        .unwrap_or_else(|| "main".to_string());
+    match authorize(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some(branch),
+            target_branch: None,
+        },
+    )? {
+        Authz::Allowed => {}
+        // Do not distinguish a known-but-forbidden commit from an unknown one.
+        // The commit was resolved across all branches BEFORE this check, so a
+        // 403-vs-404 split would be a graph-wide commit-existence oracle (and,
+        // with per-branch grants, would confirm the existence of commits on a
+        // branch the actor cannot read). Collapse the denial to the exact 404
+        // an unknown commit yields.
+        Authz::Denied(_) => {
+            return Err(ApiError::not_found(format!(
+                "commit '{commit_id}' not found"
+            )));
+        }
+    }
+    let scope = api::change_scope(&params.kinds, &params.types, &params.ops);
+    let page = db
+        .commit_changes_page(
+            &commit_id,
+            &scope,
+            params.page_token.as_deref(),
+            params.limit,
+            None,
+        )
+        .await
+        .map_err(change_route_error)?;
+    Ok(Json(api::commit_changes_output(&page)))
+}
+
+fn validate_change_http_limit(limit: Option<usize>) -> std::result::Result<(), ApiError> {
+    if limit == Some(0) {
+        return Err(ApiError::bad_request(
+            "change page limit must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+/// Contextual 404 projection. `Manifest::NotFound` is a broad internal
+/// category, so its original text is never reused; the handler supplies the
+/// exact public resource spelling it attempted to resolve.
+fn change_route_not_found(error: OmniError, public_message: String) -> ApiError {
+    match error {
+        OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::NotFound => {
+            tracing::debug!(internal_error = %manifest, %public_message, "change resource not found");
+            ApiError::not_found(public_message)
+        }
+        other => change_route_error(other),
+    }
+}
+
+/// Commit lookup runs before branch authorization because the persisted commit
+/// selects the policy resource. A raced named-ref deletion can therefore fail
+/// while the engine is searching branches. Collapse that typed branch miss to
+/// the same fixed commit 404: the caller is not yet authorized to learn which
+/// otherwise-unreadable branch was involved.
+fn change_route_commit_lookup_error(error: OmniError, commit_id: &str) -> ApiError {
+    match error {
+        OmniError::BranchNotFound { branch } => {
+            tracing::debug!(%branch, %commit_id, "commit lookup branch disappeared");
+            ApiError::not_found(format!("commit '{commit_id}' not found"))
+        }
+        other => change_route_not_found(other, format!("commit '{commit_id}' not found")),
+    }
+}
+
+/// Map an engine error on a change route to the graph-only wire contract.
+///
+/// This is intentionally an allowlist. Only variants whose types guarantee
+/// graph-vocabulary fields cross the wire. Everything else — including broad
+/// `Manifest::BadRequest` / conflict categories and any future `OmniError`
+/// variant — is logged and collapsed to a fixed 500 so adding an engine error
+/// can never accidentally expose a path, dataset, table key, or sidecar.
+fn change_route_error(error: OmniError) -> ApiError {
+    match error {
+        OmniError::ResourceLimitExceeded {
+            resource,
+            limit,
+            actual,
+        } if matches!(
+            resource.as_str(),
+            "commit_changes_page_rows"
+                | "commit_changes_page_bytes"
+                | "change_feed_commits_per_poll"
+                | "change_continuation_token_encoded_bytes"
+                | "stream_export_slots"
+        ) =>
+        {
+            ApiError::from_omni(OmniError::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            })
+        }
+        safe @ (OmniError::ChangeCursorRejected { .. }
+        | OmniError::BranchNotFound { .. }
+        | OmniError::ChangeFeedGap { .. }
+        | OmniError::CommitHasNoParent { .. }
+        | OmniError::ChangeSchemaBoundary { .. }) => ApiError::from_omni(safe),
+        OmniError::RecoveryRequired {
+            operation_id,
+            reason,
+        } => {
+            tracing::warn!(%operation_id, %reason, "change route requires recovery");
+            ApiError::recovery_required(
+                "recovery required before changes can be read".to_string(),
+                operation_id,
+            )
+        }
+        other => {
+            tracing::error!(error = %other, "change route internal error");
+            ApiError::internal("internal error while reading changes")
+        }
+    }
+}
+
+pub(crate) const CHANGE_FEED_PARAMS: &[&str] = &[
+    "branch",
+    "cursor",
+    "start",
+    "page_token",
+    "limit",
+    "kind",
+    "type",
+    "op",
+];
+
+fn parse_change_feed_start(
+    start: &str,
+) -> std::result::Result<omnigraph::changes::ChangeFeedStart, ApiError> {
+    match start {
+        "now" => Ok(omnigraph::changes::ChangeFeedStart::Now),
+        "beginning" => Ok(omnigraph::changes::ChangeFeedStart::Beginning),
+        other => other
+            .strip_prefix("after:")
+            .filter(|commit_id| !commit_id.is_empty())
+            .map(|commit_id| {
+                omnigraph::changes::ChangeFeedStart::AfterCommit(commit_id.to_string())
+            })
+            .ok_or_else(|| {
+                ApiError::bad_request("start must be now | beginning | after:<commit_id>")
+            }),
+    }
+}
+
+/// Normalize a caller-supplied change-surface branch BEFORE authorization so
+/// Cedar and the engine classify the same identity. The engine trims late
+/// (its own branch normalization), so authorizing the raw string would let a
+/// padded spelling like " main " be classified as an unprotected named branch
+/// and then resolve to protected main — a policy bypass. Empty-after-trim is
+/// a malformed request rather than an implicit main.
+fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, ApiError> {
+    let trimmed = branch.unwrap_or("main").trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::bad_request("branch name cannot be empty"));
+    }
+    Ok(trimmed.to_string())
+}
+
+#[utoipa::path(
+    get,
+    path = "/changes",
+    tag = "changes",
+    operation_id = "pollChanges",
+    params(api::ChangeFeedQuery),
+    responses(
+        (status = 200, description = "Change blocks in first-parent order. The durable cursor appears only on a terminal page, advanced only over complete commits; a mid-block page carries only next_page_token", body = api::ChangeFeedOutput),
+        (status = 400, description = "Invalid start/filter combination, or a rejected cursor or page token", body = api::ChangeErrorOutput),
+        (status = 401, description = "Unauthorized", body = api::ChangeErrorOutput),
+        (status = 403, description = "Forbidden", body = api::ChangeErrorOutput),
+        (status = 404, description = "Branch not found", body = api::ChangeErrorOutput),
+        (status = 409, description = "The feed crossed an unprovable schema boundary; see change_diff_refusal", body = api::ChangeErrorOutput),
+        (status = 410, description = "Feed gap: required history was reclaimed; reset via the baseline handshake", body = api::ChangeErrorOutput),
+        (status = 413, description = "Requested limit exceeds the public row ceiling", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure while reading changes", body = api::ChangeErrorOutput),
+        (status = 503, description = "Recovery required before changes can be read", body = api::ChangeErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+
+/// Poll the change feed of one branch.
+///
+/// At-least-once: retrying a cursor may replay the complete next commit, so
+/// consumers apply blocks idempotently by `graph_commit_id` and persist the
+/// terminal cursor together with its blocks. The server holds no consumer
+/// state.
+pub(crate) async fn server_changes_feed(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
+    let params = parse_change_query(raw.as_deref(), CHANGE_FEED_PARAMS)?;
+    validate_change_http_limit(params.limit)?;
+    let branch = normalize_change_branch(params.branch.as_deref())?;
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
+
+    let position = match (params.cursor, params.start, params.page_token) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "cursor, start, and page_token are mutually exclusive",
+            ));
+        }
+        (Some(cursor), None, None) => omnigraph::changes::ChangeFeedPosition::Cursor(cursor),
+        (None, Some(start), None) => {
+            omnigraph::changes::ChangeFeedPosition::Start(parse_change_feed_start(&start)?)
+        }
+        (None, None, Some(token)) => omnigraph::changes::ChangeFeedPosition::PageToken(token),
+        // A missing cursor is never an implicit beginning.
+        (None, None, None) => {
+            omnigraph::changes::ChangeFeedPosition::Start(omnigraph::changes::ChangeFeedStart::Now)
+        }
+    };
+
+    let scope = api::change_scope(&params.kinds, &params.types, &params.ops);
+    let page = {
+        let db = &handle.engine;
+        db.poll_change_feed(omnigraph::changes::ChangeFeedRequest {
+            branch: Some(branch.clone()),
+            position,
+            scope,
+            max_changes: params.limit,
+            max_bytes: None,
+            max_commits: None,
+        })
+        .await
+        .map_err(change_route_error)?
+    };
+    Ok(Json(api::change_feed_output(&page)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/changes/baseline",
+    tag = "changes",
+    operation_id = "captureChangeBaseline",
+    request_body = api::ChangeBaselineRequest,
+    responses(
+        (status = 200, description = "NDJSON entity snapshot pinned at one captured commit. Every preceding record is one type-keyed entity row (the load/export NDJSON shape); the FINAL record is the ChangeBaselineRecord envelope — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.", body = api::ChangeBaselineRecord, content_type = "application/x-ndjson"),
+        (status = 400, description = "Invalid scope", body = api::ChangeErrorOutput),
+        (status = 401, description = "Unauthorized", body = api::ChangeErrorOutput),
+        (status = 403, description = "Forbidden", body = api::ChangeErrorOutput),
+        (status = 404, description = "Branch not found", body = api::ChangeErrorOutput),
+        (status = 413, description = "Baseline cut or transport capacity exhausted", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure while capturing the baseline", body = api::ChangeErrorOutput),
+        (status = 503, description = "Recovery required", body = api::ChangeErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+
+/// Capture a change-feed baseline: one exact entity snapshot plus the cursor
+/// that resumes the feed immediately after it.
+///
+/// A baseline is a full data export, so it requires the export action. The
+/// snapshot honors the scope's kind and type dimensions; `op` binds only the
+/// resume cursor's feed scope.
+pub(crate) async fn server_changes_baseline(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Json(request): Json<api::ChangeBaselineRequest>,
+) -> std::result::Result<Response, ApiError> {
+    let branch = normalize_change_branch(request.branch.as_deref())?;
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Export,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
+    // Reserve the bounded response transport before capturing the cut so a
+    // saturated client population can never hold graph authority while it
+    // waits for process memory (the served-export ordering).
+    let queue_lease = state
+        .export_transport
+        .reserve()
+        .await
+        .map_err(ApiError::from_omni)?;
+    let scope = api::change_scope(&request.kind, &request.r#type, &request.op);
+    let (handshake, cut) = handle
+        .engine
+        .capture_served_change_baseline_cut(&branch, &scope)
+        .await
+        .map_err(change_route_error)?;
+    let terminal_record = {
+        let mut line = serde_json::to_vec(&api::ChangeBaselineRecord {
+            baseline: api::change_baseline_output(&handshake),
+        })
+        .map_err(|error| ApiError::internal(format!("encode baseline record: {error}")))?;
+        line.push(b'\n');
+        Bytes::from(line)
+    };
+
+    let producer_queue_lease = Arc::clone(&queue_lease);
+    let (tx, body_stream) = export_transport::channel(queue_lease);
+    tokio::spawn(async move {
+        let _producer_queue_lease = producer_queue_lease;
+        let closed_tx = tx.clone();
+        let data_tx = tx.clone();
+        let export = cut.write_chunks(move |chunk| {
+            let data_tx = data_tx.clone();
+            async move {
+                data_tx
+                    .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
+                    .await
+                    .map_err(|_| {
+                        OmniError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "served baseline response closed",
+                        ))
+                    })
+            }
+        });
+        tokio::pin!(export);
+        tokio::select! {
+            biased;
+            _ = closed_tx.closed() => {
+                // Cancelling the pinned export future drops its move-only cut.
+            }
+            (cut, result) = &mut export => {
+                // The structural guarantee: the terminal handshake record is
+                // sent ONLY after every snapshot record succeeded. A failed or
+                // interrupted stream carries no usable cursor.
+                let error = match result {
+                    Ok(()) => {
+                        match tx
+                            .send(export_transport::ExportFrame::Data(terminal_record))
+                            .await
+                        {
+                            Ok(()) => None,
+                            Err(_) => Some(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "served baseline response closed",
+                            )),
+                        }
+                    }
+                    Err(error) => Some(std::io::Error::other(error.to_string())),
+                };
+                let _ = tx
+                    .send(export_transport::ExportFrame::Terminal { cut, error })
+                    .await;
+            }
+        }
+    });
+    let body = Body::from_stream(body_stream);
+    Ok((
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+        body,
+    )
+        .into_response())
 }

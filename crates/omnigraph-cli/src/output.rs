@@ -1052,13 +1052,487 @@ pub(crate) fn resolve_table_render_options() -> ReadRenderOptions {
     }
 }
 
+pub(crate) fn print_change_cause_human(cause: &omnigraph_api_types::ChangeCauseOutput) {
+    println!("commit: {}", cause.graph_commit_id);
+    println!("branch: {}", cause.authored_branch);
+    if let Some(parent_commit_id) = &cause.parent_commit_id {
+        println!("parent: {}", parent_commit_id);
+    }
+    if let Some(merged_parent_commit_id) = &cause.merged_parent_commit_id {
+        println!("merged_parent: {}", merged_parent_commit_id);
+    }
+    if let Some(actor_id) = &cause.actor_id {
+        println!("actor: {}", actor_id);
+    }
+    println!("authored_at: {}", cause.authored_at);
+}
+
+fn print_entity_change_row(change: &omnigraph_api_types::EntityChangeOutput) {
+    println!(
+        "{} {} {} {}",
+        change.op.as_str(),
+        change.kind.as_str(),
+        change.r#type.name,
+        change.id
+    );
+    // Edge endpoints (present on edge images only). An endpoint-moving update
+    // must show BOTH pairs; `after.or(before)` alone silently hid the old
+    // endpoints of a move.
+    let before_endpoints = change
+        .before
+        .as_ref()
+        .and_then(|image| image.endpoints.as_ref());
+    let after_endpoints = change
+        .after
+        .as_ref()
+        .and_then(|image| image.endpoints.as_ref());
+    if let Some(rendered) = format_endpoint_change(before_endpoints, after_endpoints) {
+        println!("  {rendered}");
+    }
+    // The before/after property values are the point of a change feed; the
+    // previous output dropped them. Show inserted/deleted values, or the
+    // changed keys of an update as `before -> after`.
+    match (&change.before, &change.after) {
+        (None, Some(after)) => print_change_properties("  +", &after.properties),
+        (Some(before), None) => print_change_properties("  -", &before.properties),
+        (Some(before), Some(after)) => print_change_property_diff(before, after),
+        (None, None) => {}
+    }
+}
+
+/// Render an edge change's endpoints for human output. An endpoint-moving
+/// update shows `old_from -> old_to => new_from -> new_to`; an insert, delete,
+/// or endpoint-preserving update shows the single pair. Nodes (no endpoints)
+/// render nothing.
+fn format_endpoint_change(
+    before: Option<&omnigraph_api_types::ChangeEndpointsOutput>,
+    after: Option<&omnigraph_api_types::ChangeEndpointsOutput>,
+) -> Option<String> {
+    match (before, after) {
+        (Some(b), Some(a)) if b.from != a.from || b.to != a.to => {
+            Some(format!("{} -> {} => {} -> {}", b.from, b.to, a.from, a.to))
+        }
+        (Some(endpoints), Some(_)) | (Some(endpoints), None) | (None, Some(endpoints)) => {
+            Some(format!("{} -> {}", endpoints.from, endpoints.to))
+        }
+        (None, None) => None,
+    }
+}
+
+/// Render one property value for human output so the ambiguous states stay
+/// distinguishable: a JSON string prints verbatim (so the literal string
+/// `"null"` prints as `null`), a JSON null prints the sentinel `<null>`, and an
+/// absent key (only one image has it) prints `<absent>` at the diff call site.
+/// The `--json` output remains the exact, machine-parseable form.
+fn render_change_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => "<null>".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The sentinel a property diff prints when a key is present in only one image.
+/// Distinct from an empty string (`""` renders empty) and from a JSON null
+/// (`<null>`), so add/drop-of-key reads differently from a value change to/from
+/// null or empty.
+const ABSENT_PROPERTY: &str = "<absent>";
+
+fn print_change_properties(marker: &str, properties: &serde_json::Value) {
+    if let Some(map) = properties.as_object() {
+        for (key, value) in map {
+            println!("{marker} {key}: {}", render_change_value(value));
+        }
+    }
+}
+
+fn print_change_property_diff(
+    before: &omnigraph_api_types::ChangeImageOutput,
+    after: &omnigraph_api_types::ChangeImageOutput,
+) {
+    let (Some(before_map), Some(after_map)) =
+        (before.properties.as_object(), after.properties.as_object())
+    else {
+        return;
+    };
+    let mut keys: Vec<&String> = before_map.keys().chain(after_map.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        let before_value = before_map.get(key);
+        let after_value = after_map.get(key);
+        if before_value != after_value {
+            let before_str = before_value
+                .map(render_change_value)
+                .unwrap_or_else(|| ABSENT_PROPERTY.to_string());
+            let after_str = after_value
+                .map(render_change_value)
+                .unwrap_or_else(|| ABSENT_PROPERTY.to_string());
+            println!("  {key}: {before_str} -> {after_str}");
+        }
+    }
+}
+
+pub(crate) fn print_commit_changes_human(page: &omnigraph_api_types::CommitChangesOutput) {
+    print_change_cause_human(&page.cause);
+    for change in &page.changes {
+        print_entity_change_row(change);
+    }
+    if let Some(next_page_token) = &page.next_page_token {
+        println!("next_page_token: {}", next_page_token);
+    }
+}
+
+/// Incremental JSON rendering for an auto-paginated finite commit diff.
+///
+/// The wire pages remain bounded, and this renderer preserves the historical
+/// aggregate JSON shape without retaining earlier pages: one cause, one open
+/// `changes` array, and each change serialized as soon as its page arrives.
+pub(crate) struct CommitChangesJsonStream<W: Write> {
+    writer: W,
+    cause: Option<omnigraph_api_types::ChangeCauseOutput>,
+    first_change: bool,
+}
+
+/// Add a fixed continuation indent to pretty JSON after each newline while
+/// leaving the first line inline with its enclosing field/array prefix.
+struct PrettyContinuation<'a, W> {
+    writer: &'a mut W,
+    indent: usize,
+    at_line_start: bool,
+}
+
+impl<W: Write> Write for PrettyContinuation<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if self.at_line_start {
+                const SPACES: &[u8] = b"        ";
+                debug_assert!(self.indent <= SPACES.len());
+                self.writer.write_all(&SPACES[..self.indent])?;
+                self.at_line_start = false;
+            }
+            match bytes[offset..].iter().position(|byte| *byte == b'\n') {
+                Some(relative) => {
+                    let end = offset + relative + 1;
+                    self.writer.write_all(&bytes[offset..end])?;
+                    self.at_line_start = true;
+                    offset = end;
+                }
+                None => {
+                    self.writer.write_all(&bytes[offset..])?;
+                    offset = bytes.len();
+                }
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+fn write_pretty_inline<W: Write, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+    continuation_indent: usize,
+) -> Result<()> {
+    let mut indented = PrettyContinuation {
+        writer,
+        indent: continuation_indent,
+        at_line_start: false,
+    };
+    serde_json::to_writer_pretty(&mut indented, value)?;
+    Ok(())
+}
+
+impl<W: Write> CommitChangesJsonStream<W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
+            writer,
+            cause: None,
+            first_change: true,
+        }
+    }
+
+    pub(crate) fn write_page(
+        &mut self,
+        page: &omnigraph_api_types::CommitChangesOutput,
+    ) -> Result<()> {
+        match &self.cause {
+            None => {
+                self.writer.write_all(b"{\n  \"cause\": ")?;
+                write_pretty_inline(&mut self.writer, &page.cause, 2)?;
+                self.writer.write_all(b",\n  \"changes\": [")?;
+                self.cause = Some(page.cause.clone());
+            }
+            Some(cause) if cause == &page.cause => {}
+            Some(_) => bail!("commit changes continuation changed its cause while auto-paginating"),
+        }
+        for change in &page.changes {
+            if !self.first_change {
+                self.writer.write_all(b",")?;
+            }
+            self.writer.write_all(b"\n    ")?;
+            write_pretty_inline(&mut self.writer, change, 4)?;
+            self.first_change = false;
+        }
+        // Make the incremental behavior real even when stdout is a pipe: a
+        // later page failure may leave a partial document, but never forces
+        // all earlier pages to remain resident in process memory.
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<W> {
+        if self.cause.is_none() {
+            bail!("commit changes auto-pagination completed without a page");
+        }
+        if self.first_change {
+            self.writer.write_all(b"]\n}\n")?;
+        } else {
+            self.writer.write_all(b"\n  ]\n}\n")?;
+        }
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+}
+
+/// Incremental human rendering for an auto-paginated finite commit diff.
+pub(crate) struct CommitChangesHumanStream {
+    cause: Option<omnigraph_api_types::ChangeCauseOutput>,
+}
+
+impl CommitChangesHumanStream {
+    pub(crate) fn new() -> Self {
+        Self { cause: None }
+    }
+
+    pub(crate) fn write_page(
+        &mut self,
+        page: &omnigraph_api_types::CommitChangesOutput,
+    ) -> Result<()> {
+        match &self.cause {
+            None => {
+                print_change_cause_human(&page.cause);
+                self.cause = Some(page.cause.clone());
+            }
+            Some(cause) if cause == &page.cause => {}
+            Some(_) => bail!("commit changes continuation changed its cause while auto-paginating"),
+        }
+        for change in &page.changes {
+            print_entity_change_row(change);
+        }
+        io::stdout().flush()?;
+        Ok(())
+    }
+}
+
+/// Incremental JSON rendering for one auto-paginated feed poll.
+///
+/// A block may straddle pages. Keeping its JSON object open lets the renderer
+/// stitch that split block while retaining only the cause of the current
+/// block; completed blocks and pages are never accumulated.
+pub(crate) struct ChangeFeedJsonStream<W: Write> {
+    writer: W,
+    started: bool,
+    current_cause: Option<omnigraph_api_types::ChangeCauseOutput>,
+    first_block: bool,
+    first_change: bool,
+}
+
+impl<W: Write> ChangeFeedJsonStream<W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
+            writer,
+            started: false,
+            current_cause: None,
+            first_block: true,
+            first_change: true,
+        }
+    }
+
+    pub(crate) fn write_page(
+        &mut self,
+        page: &omnigraph_api_types::ChangeFeedOutput,
+    ) -> Result<()> {
+        if !self.started {
+            self.writer.write_all(b"{\n  \"blocks\": [")?;
+            self.started = true;
+        }
+        for block in &page.blocks {
+            let same_block = match &self.current_cause {
+                Some(cause) if cause == &block.cause => true,
+                Some(cause) if cause.graph_commit_id == block.cause.graph_commit_id => {
+                    bail!("change-feed continuation changed the cause of a split block")
+                }
+                _ => false,
+            };
+            if !same_block {
+                if self.current_cause.is_some() {
+                    self.close_current_block()?;
+                }
+                if !self.first_block {
+                    self.writer.write_all(b",")?;
+                }
+                self.writer.write_all(b"\n    {\n      \"cause\": ")?;
+                write_pretty_inline(&mut self.writer, &block.cause, 6)?;
+                self.writer.write_all(b",\n      \"changes\": [")?;
+                self.current_cause = Some(block.cause.clone());
+                self.first_block = false;
+                self.first_change = true;
+            }
+            for change in &block.changes {
+                if !self.first_change {
+                    self.writer.write_all(b",")?;
+                }
+                self.writer.write_all(b"\n        ")?;
+                write_pretty_inline(&mut self.writer, change, 8)?;
+                self.first_change = false;
+            }
+        }
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    fn close_current_block(&mut self) -> Result<()> {
+        if self.first_change {
+            self.writer.write_all(b"]\n    }")?;
+        } else {
+            self.writer.write_all(b"\n      ]\n    }")?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self, cursor: Option<&str>, caught_up: Option<bool>) -> Result<W> {
+        if !self.started {
+            self.writer.write_all(b"{\n  \"blocks\": [")?;
+        }
+        if self.current_cause.is_some() {
+            self.close_current_block()?;
+        }
+        if self.first_block {
+            self.writer.write_all(b"]")?;
+        } else {
+            self.writer.write_all(b"\n  ]")?;
+        }
+        if let Some(cursor) = cursor {
+            self.writer.write_all(b",\n  \"cursor\": ")?;
+            serde_json::to_writer(&mut self.writer, cursor)?;
+        }
+        if let Some(caught_up) = caught_up {
+            self.writer.write_all(b",\n  \"caught_up\": ")?;
+            serde_json::to_writer(&mut self.writer, &caught_up)?;
+        }
+        self.writer.write_all(b"\n}\n")?;
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+}
+
+/// Incremental human rendering for one auto-paginated feed poll. A repeated
+/// cause at the start of a continuation page is suppressed so a split commit
+/// still reads as one block.
+pub(crate) struct ChangeFeedHumanStream {
+    current_cause: Option<omnigraph_api_types::ChangeCauseOutput>,
+    wrote_block: bool,
+}
+
+impl ChangeFeedHumanStream {
+    pub(crate) fn new() -> Self {
+        Self {
+            current_cause: None,
+            wrote_block: false,
+        }
+    }
+
+    pub(crate) fn write_page(
+        &mut self,
+        page: &omnigraph_api_types::ChangeFeedOutput,
+    ) -> Result<()> {
+        for block in &page.blocks {
+            let same_block = match &self.current_cause {
+                Some(cause) if cause == &block.cause => true,
+                Some(cause) if cause.graph_commit_id == block.cause.graph_commit_id => {
+                    bail!("change-feed continuation changed the cause of a split block")
+                }
+                _ => false,
+            };
+            if !same_block {
+                if self.wrote_block {
+                    println!();
+                }
+                print_change_cause_human(&block.cause);
+                self.current_cause = Some(block.cause.clone());
+                self.wrote_block = true;
+            }
+            for change in &block.changes {
+                print_entity_change_row(change);
+            }
+        }
+        io::stdout().flush()?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(self, cursor: Option<&str>, caught_up: Option<bool>) {
+        if !self.wrote_block {
+            println!("(no new commits)");
+        }
+        if let Some(cursor) = cursor {
+            println!();
+            println!("cursor: {cursor}");
+            if let Some(caught_up) = caught_up {
+                println!("caught_up: {caught_up}");
+            }
+        }
+    }
+}
+
+pub(crate) fn print_change_baseline_human(
+    baseline: &omnigraph_api_types::ChangeBaselineOutput,
+    out_path: &std::path::Path,
+) {
+    println!("snapshot: {}", out_path.display());
+    println!("snapshot_commit_id: {}", baseline.snapshot_commit_id);
+    println!("resume_cursor: {}", baseline.resume_cursor);
+}
+
 #[cfg(test)]
 mod tests {
     use omnigraph_compiler::schema::ast::Annotation;
     use omnigraph_compiler::schema::parser::parse_schema;
     use std::collections::BTreeMap;
 
-    use super::render_annotations;
+    use super::{ChangeFeedJsonStream, CommitChangesJsonStream, render_annotations};
+
+    fn cause(commit: &str) -> omnigraph_api_types::ChangeCauseOutput {
+        omnigraph_api_types::ChangeCauseOutput {
+            graph_commit_id: commit.to_string(),
+            parent_commit_id: Some("parent".to_string()),
+            merged_parent_commit_id: None,
+            authored_branch: "main".to_string(),
+            actor_id: Some("act-test".to_string()),
+            authored_at: 42,
+        }
+    }
+
+    fn change(id: &str) -> omnigraph_api_types::EntityChangeOutput {
+        omnigraph_api_types::EntityChangeOutput {
+            kind: omnigraph_api_types::ChangeEntityKind::Node,
+            r#type: omnigraph_api_types::ChangeTypeOutput {
+                id: "type-public".to_string(),
+                name: "Person".to_string(),
+            },
+            id: id.to_string(),
+            op: omnigraph_api_types::ChangeOpOutput::Insert,
+            before: None,
+            after: Some(omnigraph_api_types::ChangeImageOutput {
+                properties: serde_json::json!({"name": id}),
+                endpoints: None,
+            }),
+        }
+    }
 
     #[test]
     fn render_annotations_quotes_values_so_embed_round_trips() {
@@ -1089,5 +1563,177 @@ mod tests {
             "rendered @embed must re-parse: {:?}",
             parsed.err()
         );
+    }
+
+    fn endpoints(from: &str, to: &str) -> omnigraph_api_types::ChangeEndpointsOutput {
+        omnigraph_api_types::ChangeEndpointsOutput {
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    #[test]
+    fn endpoint_change_shows_both_pairs_on_a_move() {
+        // An endpoint-moving update must not hide the old endpoints — the
+        // previous `after.or(before)` printed only `a -> d`, losing `a -> b`.
+        let before = endpoints("a", "b");
+        let after = endpoints("a", "d");
+        assert_eq!(
+            super::format_endpoint_change(Some(&before), Some(&after)),
+            Some("a -> b => a -> d".to_string())
+        );
+    }
+
+    #[test]
+    fn endpoint_change_shows_single_pair_when_unchanged_or_one_sided() {
+        let ab = endpoints("a", "b");
+        // Endpoint-preserving update collapses to one pair.
+        assert_eq!(
+            super::format_endpoint_change(Some(&ab), Some(&endpoints("a", "b"))),
+            Some("a -> b".to_string())
+        );
+        // Insert (after only) and delete (before only) each show their pair.
+        assert_eq!(
+            super::format_endpoint_change(None, Some(&ab)),
+            Some("a -> b".to_string())
+        );
+        assert_eq!(
+            super::format_endpoint_change(Some(&ab), None),
+            Some("a -> b".to_string())
+        );
+        // Nodes carry no endpoints.
+        assert_eq!(super::format_endpoint_change(None, None), None);
+    }
+
+    #[test]
+    fn render_change_value_distinguishes_null_from_the_string_null() {
+        // The core F7 ambiguity: JSON null and the literal string "null" used to
+        // render identically. They must now differ.
+        let json_null = super::render_change_value(&serde_json::Value::Null);
+        let string_null = super::render_change_value(&serde_json::json!("null"));
+        assert_eq!(json_null, "<null>");
+        assert_eq!(string_null, "null");
+        assert_ne!(json_null, string_null);
+        // An empty string renders empty — distinct from null and from an absent
+        // key (`<absent>`), so the four states never collide.
+        assert_eq!(super::render_change_value(&serde_json::json!("")), "");
+        assert_ne!(
+            super::render_change_value(&serde_json::json!("")),
+            json_null
+        );
+        assert_ne!(
+            super::render_change_value(&serde_json::json!("")),
+            super::ABSENT_PROPERTY
+        );
+    }
+
+    #[test]
+    fn commit_json_stream_preserves_aggregate_shape_without_page_aggregation() {
+        let cause = cause("commit-1");
+        let first = omnigraph_api_types::CommitChangesOutput {
+            cause: cause.clone(),
+            changes: vec![change("a")],
+            next_page_token: Some("continue".to_string()),
+        };
+        let second = omnigraph_api_types::CommitChangesOutput {
+            cause,
+            changes: vec![change("b")],
+            next_page_token: None,
+        };
+
+        let mut stream = CommitChangesJsonStream::new(Vec::new());
+        stream.write_page(&first).unwrap();
+        stream.write_page(&second).unwrap();
+        let bytes = stream.finish().unwrap();
+        let expected = omnigraph_api_types::CommitChangesOutput {
+            cause: first.cause.clone(),
+            changes: vec![change("a"), change("b")],
+            next_page_token: None,
+        };
+        assert_eq!(
+            bytes,
+            format!("{}\n", serde_json::to_string_pretty(&expected).unwrap()).into_bytes(),
+            "incremental JSON remains byte-compatible with the previous pretty aggregate"
+        );
+        let rendered: omnigraph_api_types::CommitChangesOutput =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            rendered
+                .changes
+                .iter()
+                .map(|change| change.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(rendered.next_page_token.is_none());
+    }
+
+    #[test]
+    fn feed_json_stream_stitches_only_the_open_split_block() {
+        let first = omnigraph_api_types::ChangeFeedOutput {
+            blocks: vec![omnigraph_api_types::ChangeBlockOutput {
+                cause: cause("commit-1"),
+                changes: vec![change("a")],
+            }],
+            next_page_token: Some("continue".to_string()),
+            cursor: None,
+            caught_up: None,
+        };
+        let second = omnigraph_api_types::ChangeFeedOutput {
+            blocks: vec![
+                omnigraph_api_types::ChangeBlockOutput {
+                    cause: cause("commit-1"),
+                    changes: vec![change("b")],
+                },
+                omnigraph_api_types::ChangeBlockOutput {
+                    cause: cause("commit-2"),
+                    changes: vec![change("c")],
+                },
+            ],
+            next_page_token: None,
+            cursor: Some("durable".to_string()),
+            caught_up: Some(true),
+        };
+
+        let mut stream = ChangeFeedJsonStream::new(Vec::new());
+        stream.write_page(&first).unwrap();
+        stream.write_page(&second).unwrap();
+        let bytes = stream
+            .finish(second.cursor.as_deref(), second.caught_up)
+            .unwrap();
+        let expected = omnigraph_api_types::ChangeFeedOutput {
+            blocks: vec![
+                omnigraph_api_types::ChangeBlockOutput {
+                    cause: cause("commit-1"),
+                    changes: vec![change("a"), change("b")],
+                },
+                omnigraph_api_types::ChangeBlockOutput {
+                    cause: cause("commit-2"),
+                    changes: vec![change("c")],
+                },
+            ],
+            next_page_token: None,
+            cursor: Some("durable".to_string()),
+            caught_up: Some(true),
+        };
+        assert_eq!(
+            bytes,
+            format!("{}\n", serde_json::to_string_pretty(&expected).unwrap()).into_bytes(),
+            "incremental JSON remains byte-compatible with the previous pretty aggregate"
+        );
+        let rendered: omnigraph_api_types::ChangeFeedOutput =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rendered.blocks.len(), 2);
+        assert_eq!(
+            rendered.blocks[0]
+                .changes
+                .iter()
+                .map(|change| change.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(rendered.blocks[1].changes[0].id, "c");
+        assert_eq!(rendered.cursor.as_deref(), Some("durable"));
+        assert_eq!(rendered.caught_up, Some(true));
     }
 }

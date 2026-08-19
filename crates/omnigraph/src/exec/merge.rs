@@ -1,4 +1,5 @@
 use super::*;
+use crate::changes::row_compare::{RawRow, rows_equal};
 use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
@@ -346,127 +347,33 @@ struct ProvenPureInsertAdopt {
 #[derive(Debug, Clone)]
 struct CursorRow {
     id: String,
-    signature: String,
+    /// The typed comparison unit, precomputed when the cursor is eager (`None`
+    /// on the lazy adopt path, built on demand). Compared through the shared
+    /// `rows_equal` so merge and the change surfaces classify rows identically:
+    /// Arrow-typed for scalars/nested (injective, unlike a display string) and
+    /// data-file-qualified for Blob columns.
+    typed: Option<RawRow>,
     dataset: Dataset,
-    managed_blob_data_files: Option<std::sync::Arc<crate::blob::ManagedBlobDataFileIndex>>,
     batch: RecordBatch,
     row_index: usize,
 }
 
 impl CursorRow {
-    fn row_address(&self) -> Result<u64> {
-        let row_addresses = self
-            .batch
-            .column_by_name("_rowaddr")
-            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::manifest(
-                    "branch-adopt equality scan omitted its _rowaddr column".to_string(),
-                )
-            })?;
-        if self.row_index >= row_addresses.len() || row_addresses.is_null(self.row_index) {
-            return Err(OmniError::manifest(
-                "branch-adopt equality encountered an absent _rowaddr".to_string(),
-            ));
+    /// The typed comparison unit — cloned when eager, built on demand when lazy.
+    fn typed(&self) -> Result<RawRow> {
+        match &self.typed {
+            Some(typed) => Ok(typed.clone()),
+            None => RawRow::single(&self.dataset, &self.batch, self.row_index),
         }
-        Ok(row_addresses.value(self.row_index))
     }
 
-    /// Prove that every logical value in these two rows is equal.
-    ///
-    /// This is deliberately separate from the legacy display signature used
-    /// by the general three-way merge. Adopt classification may use equality
-    /// to discard a table and complete merge lineage, so it requires a proof:
-    /// typed Arrow one-cell equality, exact nulls, exact field framing, and a
-    /// physical-object-qualified comparison for managed Blob descriptors.
-    fn adopt_values_provably_equal(&self, other: &Self) -> Result<bool> {
-        if self.row_index >= self.batch.num_rows()
-            || other.row_index >= other.batch.num_rows()
-            || self.batch.num_columns() != other.batch.num_columns()
-        {
-            return Ok(false);
-        }
-
-        let left_schema = self.batch.schema();
-        let right_schema = other.batch.schema();
-        for (left_index, left_field) in left_schema.fields().iter().enumerate() {
-            let Ok(right_index) = right_schema.index_of(left_field.name()) else {
-                return Ok(false);
-            };
-            let right_field = right_schema.field(right_index);
-            if left_field.as_ref() != right_field {
-                return Ok(false);
-            }
-            if is_lance_virtual_row_column(left_field.name()) {
-                continue;
-            }
-
-            let left_column = self.batch.column(left_index);
-            let right_column = other.batch.column(right_index);
-            let left_is_blob = self
-                .dataset
-                .schema()
-                .field(left_field.name())
-                .is_some_and(|field| field.is_blob());
-            let right_is_blob = other
-                .dataset
-                .schema()
-                .field(right_field.name())
-                .is_some_and(|field| field.is_blob());
-            if left_is_blob != right_is_blob {
-                return Ok(false);
-            }
-
-            if left_is_blob {
-                let left_data_files = self.managed_blob_data_files.as_deref().ok_or_else(|| {
-                    OmniError::manifest(
-                        "branch-adopt Blob equality omitted its data-file index".to_string(),
-                    )
-                })?;
-                let right_data_files =
-                    other.managed_blob_data_files.as_deref().ok_or_else(|| {
-                        OmniError::manifest(
-                            "branch-adopt Blob equality omitted its data-file index".to_string(),
-                        )
-                    })?;
-                let left_descriptions = left_column
-                    .as_any()
-                    .downcast_ref::<arrow_array::StructArray>()
-                    .ok_or_else(|| {
-                        OmniError::blob_integrity(format!(
-                            "Blob column '{}' did not scan as a Blob-v2 descriptor",
-                            left_field.name()
-                        ))
-                    })?;
-                let right_descriptions = right_column
-                    .as_any()
-                    .downcast_ref::<arrow_array::StructArray>()
-                    .ok_or_else(|| {
-                        OmniError::blob_integrity(format!(
-                            "Blob column '{}' did not scan as a Blob-v2 descriptor",
-                            right_field.name()
-                        ))
-                    })?;
-                if !crate::blob::persisted_blob_values_provably_equal(
-                    left_data_files,
-                    left_descriptions,
-                    self.row_index,
-                    self.row_address()?,
-                    right_data_files,
-                    right_descriptions,
-                    other.row_index,
-                    other.row_address()?,
-                    left_field.name(),
-                )? {
-                    return Ok(false);
-                }
-            } else if left_column.slice(self.row_index, 1).to_data()
-                != right_column.slice(other.row_index, 1).to_data()
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+    /// Whether this row's logical value differs from `other`, via the shared
+    /// typed comparator (injective for nested values; Blob columns by immutable
+    /// data-file identity with a payload byte-compare only on a descriptor tie).
+    async fn equals(&self, other: &CursorRow) -> Result<bool> {
+        let this = self.typed()?;
+        let that = other.typed()?;
+        rows_equal(&self.dataset, &this, &other.dataset, &that).await
     }
 
     /// Classify this exact persisted row without opening an external target.
@@ -480,18 +387,26 @@ impl CursorRow {
     }
 }
 
+/// Equality of two optional cursor rows: two absent rows are equal; present vs
+/// absent differ; two present rows compare via the shared typed comparator.
+async fn cursor_rows_equal(a: Option<&CursorRow>, b: Option<&CursorRow>) -> Result<bool> {
+    match (a, b) {
+        (None, None) => Ok(true),
+        (Some(a), Some(b)) => a.equals(b).await,
+        _ => Ok(false),
+    }
+}
+
 struct OrderedTableCursor {
     stream: Option<std::pin::Pin<Box<DatasetRecordBatchStream>>>,
     dataset: Option<Dataset>,
     current_batch: Option<RecordBatch>,
     current_row: usize,
     peeked: Option<CursorRow>,
-    /// When false, the adopt path leaves the legacy display signature empty,
-    /// requests row addresses, and compares common rows with typed equality.
-    /// New/deleted rows therefore avoid stringifying their embeddings, while
-    /// general three-way cursors retain their existing eager signatures.
+    /// When false, the adopt path builds the typed comparison unit only for
+    /// common rows. New/deleted rows therefore avoid comparison work, while
+    /// general three-way cursors retain their eager typed rows.
     eager_signatures: bool,
-    managed_blob_data_files: Option<std::sync::Arc<crate::blob::ManagedBlobDataFileIndex>>,
 }
 
 impl OrderedTableCursor {
@@ -499,8 +414,8 @@ impl OrderedTableCursor {
         Self::open(snapshot, table_key, true).await
     }
 
-    /// Like `from_snapshot` but equips rows for adopt-only typed equality
-    /// instead of computing legacy display signatures. See `eager_signatures`.
+    /// Like `from_snapshot` but builds typed rows lazily for adopt-only
+    /// equality. See `eager_signatures`.
     async fn from_snapshot_lazy(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
         Self::open(snapshot, table_key, false).await
     }
@@ -514,15 +429,6 @@ impl OrderedTableCursor {
     }
 
     async fn from_dataset(dataset: Option<Dataset>, eager_signatures: bool) -> Result<Self> {
-        let managed_blob_data_files = if eager_signatures {
-            None
-        } else if let Some(dataset) = &dataset {
-            Some(std::sync::Arc::new(
-                crate::blob::ManagedBlobDataFileIndex::from_dataset(dataset)?,
-            ))
-        } else {
-            None
-        };
         let stream = if let Some(ds) = &dataset {
             crate::instrumentation::record_ordered_cursor_scan(
                 KEYED_WRITE_MAX_ROWS,
@@ -536,15 +442,14 @@ impl OrderedTableCursor {
                     Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
                     true,
                     |scanner| {
-                        if !eager_signatures {
-                            // Adopt-only Blob equality qualifies descriptor
-                            // numbers by the immutable data file owning this
-                            // exact physical row. General three-way scans keep
-                            // their existing projection and semantics.
-                            scanner.with_row_address();
-                        }
                         scanner.batch_size(KEYED_WRITE_MAX_ROWS);
                         scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+                        // Blob columns must yield DESCRIPTORS (not payloads) for
+                        // the shared typed comparator's data-file identity, and
+                        // `_rowaddr` gives the owning fragment.
+                        scanner
+                            .blob_handling(lance_core::datatypes::BlobHandling::BlobsDescriptions);
+                        scanner.with_row_address();
                         Ok(())
                     },
                 )
@@ -561,7 +466,6 @@ impl OrderedTableCursor {
             current_row: 0,
             peeked: None,
             eager_signatures,
-            managed_blob_data_files,
         })
     }
 
@@ -588,16 +492,15 @@ impl OrderedTableCursor {
                     let dataset = self.dataset.clone().ok_or_else(|| {
                         OmniError::manifest("cursor row missing source dataset".to_string())
                     })?;
-                    let signature = if self.eager_signatures {
-                        row_signature(batch, row_index)?
+                    let typed = if self.eager_signatures {
+                        Some(RawRow::single(&dataset, batch, row_index)?)
                     } else {
-                        String::new()
+                        None
                     };
                     return Ok(Some(CursorRow {
                         id: row_id_at(batch, row_index)?,
-                        signature,
+                        typed,
                         dataset,
-                        managed_blob_data_files: self.managed_blob_data_files.clone(),
                         batch: batch.clone(),
                         row_index,
                     }));
@@ -617,7 +520,9 @@ impl OrderedTableCursor {
                     self.current_batch = None;
                     return Ok(None);
                 }
-                Err(err) => return Err(OmniError::Lance(err.to_string())),
+                Err(err) => {
+                    return Err(crate::table_store::TableStore::ordered_scan_error(err));
+                }
             }
         }
     }
@@ -1425,7 +1330,7 @@ async fn compute_adopt_delta(
                 needs_update = true;
             }
             (None, Some(src)) => {
-                // New on source → strict fenced insert. No signature
+                // New on source → strict fenced insert. No comparison unit is
                 // needed — a new id is absent from base by construction.
                 append_writer
                     .push_row(src, &materializer, external_preflight)
@@ -1433,11 +1338,10 @@ async fn compute_adopt_delta(
                 needs_update = true;
             }
             (Some(base), Some(src)) => {
-                // Present on both — use typed/null-aware equality to distinguish
-                // a changed row from an unchanged one. New/deleted rows above
-                // never pay for comparison, and this adopt path never builds
-                // the legacy display-string signature.
-                if !src.adopt_values_provably_equal(base)? {
+                // Present on both — compare lazily (the only case that needs it)
+                // to tell a changed row from an unchanged one. New/deleted rows
+                // above skip building the typed unit entirely.
+                if !src.equals(base).await? {
                     // Changed on source → upsert.
                     upsert_writer
                         .push_row(src, &materializer, external_preflight)
@@ -1513,7 +1417,7 @@ async fn collect_adopt_blob_selection(
                 source.include_blob_selection(blob_selection)?;
             }
             (Some(base), Some(source)) => {
-                if !source.adopt_values_provably_equal(base)? {
+                if !source.equals(base).await? {
                     source.include_blob_selection(blob_selection)?;
                 }
             }
@@ -1582,22 +1486,23 @@ async fn stage_streaming_table_merge(
             None
         };
 
-        let base_sig = base_row.as_ref().map(|row| row.signature.as_str());
-        let source_sig = source_row.as_ref().map(|row| row.signature.as_str());
-        let target_sig = target_row.as_ref().map(|row| row.signature.as_str());
-
-        let source_changed = source_sig != base_sig;
-        let target_changed = target_sig != base_sig;
+        let source_changed = !cursor_rows_equal(source_row.as_ref(), base_row.as_ref()).await?;
+        let target_changed = !cursor_rows_equal(target_row.as_ref(), base_row.as_ref()).await?;
 
         let selection = if !source_changed {
             target_row.as_ref()
         } else if !target_changed {
             source_row.as_ref()
-        } else if source_sig == target_sig {
+        } else if cursor_rows_equal(source_row.as_ref(), target_row.as_ref()).await? {
+            // Both sides changed but agree — no conflict; target already has it.
             target_row.as_ref()
         } else {
             conflicts.push(classify_merge_conflict(
-                table_key, &next_id, base_sig, source_sig, target_sig,
+                table_key,
+                &next_id,
+                base_row.is_some(),
+                source_row.is_some(),
+                target_row.is_some(),
             ));
             None
         };
@@ -1617,7 +1522,7 @@ async fn stage_streaming_table_merge(
             // Only changed rows go to the delta (for publish). The full merged
             // table is no longer staged — validation works off this delta plus
             // the committed target via index lookups, not a full re-scan.
-            if selection.signature.as_str() != target_sig.unwrap_or("") {
+            if !cursor_rows_equal(Some(selection), target_row.as_ref()).await? {
                 delta_writer
                     .push_row(selection, &materializer, external_preflight)
                     .await?;
@@ -1686,20 +1591,21 @@ async fn collect_three_way_blob_selection(
             None
         };
 
-        let base_sig = base_row.as_ref().map(|row| row.signature.as_str());
-        let source_sig = source_row.as_ref().map(|row| row.signature.as_str());
-        let target_sig = target_row.as_ref().map(|row| row.signature.as_str());
-        let source_changed = source_sig != base_sig;
-        let target_changed = target_sig != base_sig;
+        let source_changed = !cursor_rows_equal(source_row.as_ref(), base_row.as_ref()).await?;
+        let target_changed = !cursor_rows_equal(target_row.as_ref(), base_row.as_ref()).await?;
         let selection = if !source_changed {
             target_row.as_ref()
         } else if !target_changed {
             source_row.as_ref()
-        } else if source_sig == target_sig {
+        } else if cursor_rows_equal(source_row.as_ref(), target_row.as_ref()).await? {
             target_row.as_ref()
         } else {
             conflicts.push(classify_merge_conflict(
-                table_key, &next_id, base_sig, source_sig, target_sig,
+                table_key,
+                &next_id,
+                base_row.is_some(),
+                source_row.is_some(),
+                target_row.is_some(),
             ));
             None
         };
@@ -1707,10 +1613,10 @@ async fn collect_three_way_blob_selection(
         if conflicts.len() > prior_conflict_count {
             continue;
         }
-        if let Some(selection) = selection
-            && selection.signature.as_str() != target_sig.unwrap_or("")
-        {
-            selection.include_blob_selection(blob_selection)?;
+        if let Some(selection) = selection {
+            if !cursor_rows_equal(Some(selection), target_row.as_ref()).await? {
+                selection.include_blob_selection(blob_selection)?;
+            }
         }
     }
 
@@ -1854,16 +1760,16 @@ mod table_identity_tests {
 fn classify_merge_conflict(
     table_key: &str,
     row_id: &str,
-    base_sig: Option<&str>,
-    source_sig: Option<&str>,
-    target_sig: Option<&str>,
+    base_present: bool,
+    source_present: bool,
+    target_present: bool,
 ) -> MergeConflict {
-    let (kind, message) = match (base_sig, source_sig, target_sig) {
-        (None, Some(_), Some(_)) => (
+    let (kind, message) = match (base_present, source_present, target_present) {
+        (false, true, true) => (
             MergeConflictKind::DivergentInsert,
             format!("divergent insert for id '{}'", row_id),
         ),
-        (Some(_), None, Some(_)) | (Some(_), Some(_), None) => (
+        (true, false, true) | (true, true, false) => (
             MergeConflictKind::DeleteVsUpdate,
             format!("delete/update conflict for id '{}'", row_id),
         ),
@@ -1878,34 +1784,6 @@ fn classify_merge_conflict(
         kind,
         message,
     }
-}
-
-fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
-    let mut values = Vec::with_capacity(batch.num_columns());
-    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        if field.name().starts_with("_row") {
-            continue;
-        }
-        values.push(
-            array_value_to_string(column.as_ref(), row)
-                .map_err(|e| OmniError::Lance(e.to_string()))?,
-        );
-    }
-    Ok(values.join("\u{1f}"))
-}
-
-/// Lance virtual columns carried by merge scans but excluded from graph-value
-/// equality. Near-miss user properties such as `_row_id` are ordinary data and
-/// must be compared.
-fn is_lance_virtual_row_column(name: &str) -> bool {
-    matches!(
-        name,
-        "_rowid"
-            | "_rowaddr"
-            | "_rowoffset"
-            | "_row_created_at_version"
-            | "_row_last_updated_at_version"
-    )
 }
 
 /// Operation-wide budget for the scalar delta retained by merge validation.
@@ -3781,19 +3659,26 @@ impl Omnigraph {
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
             outer_prepare_start.elapsed(),
         );
-        let merge_result = self
-            .branch_merge_on_current_target(
-                &base_snapshot,
-                &source_txn,
-                &target_txn,
-                source_branch.as_deref(),
-                target_branch.as_deref(),
-                &target_head_commit_id,
-                &source_head_commit_id,
-                is_fast_forward,
-                actor_id,
-            )
-            .await;
+        // Keep the deliberately large merge planner/publisher state out of the
+        // operation shell's generated future. The inner operation composes
+        // ordered typed comparison, Blob materialization, validation, recovery,
+        // and publication; carrying that state inline makes debug builds retain
+        // large construction/projection temporaries across the shell's guards
+        // and restore path. Boxing at this natural ownership boundary changes
+        // no scheduling or lifetime semantics; this child slot is one pointer
+        // while the inner operation runs.
+        let merge_result = Box::pin(self.branch_merge_on_current_target(
+            &base_snapshot,
+            &source_txn,
+            &target_txn,
+            source_branch.as_deref(),
+            target_branch.as_deref(),
+            &target_head_commit_id,
+            &source_head_commit_id,
+            is_fast_forward,
+            actor_id,
+        ))
+        .await;
         let outer_restore_start = std::time::Instant::now();
         if let Some(previous) = previous {
             self.restore_coordinator(previous).await;
@@ -4518,7 +4403,12 @@ impl Omnigraph {
         let recovery_operation_id = recovery
             .as_ref()
             .map(|(_, handle)| handle.operation_id.clone());
-        let post_arm_result = async {
+        // The armed publisher is a natural state-machine boundary: it owns the
+        // physical effects, confirmation, and the one manifest publication.
+        // Keep that large future out of the already broad planning/revalidation
+        // future so debug builds do not stack both generated state machines'
+        // transition storage while polling the substrate publisher.
+        let post_arm_result = Box::pin(async {
             if recovery.is_some() && !first_touch_effects.is_empty() {
                 crate::failpoints::maybe_fail(
                     crate::failpoints::names::BRANCH_MERGE_POST_SIDECAR_PRE_FORK,
@@ -4687,14 +4577,18 @@ impl Omnigraph {
                 Some(target_head_commit_id)
             );
             let manifest_publish_start = std::time::Instant::now();
-            self.commit_updates_on_branch_with_expected(
+            // The manifest publisher reaches Lance MergeInsert and DataFusion's
+            // physical planner. Erase that substrate-heavy future at the graph
+            // publication boundary instead of making this recovery envelope's
+            // generated state carry it inline.
+            Box::pin(self.commit_updates_on_branch_with_expected(
                 target_branch,
                 &updates,
                 &expected_versions,
                 actor_id,
                 target_txn,
                 merge_lineage,
-            )
+            ))
             .await?;
             crate::instrumentation::record_merge_timing(
                 crate::instrumentation::MergeTimingPhase::ManifestPublish,
@@ -4702,7 +4596,7 @@ impl Omnigraph {
             );
 
             Ok::<_, OmniError>((updates, changed_edge_tables))
-        }
+        })
         .await;
         let (_updates, changed_edge_tables) = match post_arm_result {
             Ok(result) => result,

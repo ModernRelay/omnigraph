@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use lance::Dataset;
+use lance::dataset::refs::BranchIdentifier;
 use lance_namespace::Error as LanceNamespaceError;
 
 use crate::error::{OmniError, Result};
@@ -9,6 +10,19 @@ use crate::storage::{StorageKind, join_uri, storage_kind_for_uri};
 use super::TableIdentity;
 
 const MANIFEST_DIR: &str = "__manifest";
+const BRANCH_IDENTIFIER_CAPTURE_ATTEMPTS: usize = 8;
+
+pub(super) fn branch_ref_error(error: lance::Error, branch: &str) -> OmniError {
+    match error {
+        // Only Lance's typed ref miss proves logical branch absence. A generic
+        // object miss can be the branch's manifest or another required object
+        // and must remain an internal/storage failure rather than a public 404.
+        lance::Error::RefNotFound { .. } => OmniError::BranchNotFound {
+            branch: branch.to_string(),
+        },
+        other => OmniError::Lance(other.to_string()),
+    }
+}
 
 pub(crate) fn manifest_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), MANIFEST_DIR)
@@ -40,6 +54,58 @@ pub(super) async fn open_manifest_dataset_with_session(
             .map_err(|e| OmniError::Lance(e.to_string())),
         _ => Ok(dataset),
     }
+}
+
+/// Open one manifest branch together with the exact Lance branch lifetime
+/// that selected it.
+///
+/// `checkout_branch` and `BranchContents` are separate reads. Surrounding the
+/// checkout with identifier reads prevents a concurrent delete/recreate from
+/// pairing an old checked-out dataset with the replacement branch's identity.
+/// A later recreation is harmless: the returned identifier remains the
+/// witness for this pinned dataset and the coordinator's freshness probe will
+/// observe the new identity.
+pub(super) async fn open_manifest_dataset_with_identifier_with_session(
+    root_uri: &str,
+    branch: Option<&str>,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<(Dataset, BranchIdentifier)> {
+    let uri = manifest_uri(root_uri.trim_end_matches('/'));
+    let dataset = crate::instrumentation::open_dataset(
+        &uri,
+        crate::instrumentation::VersionResolution::Latest,
+        Some(control_session),
+        crate::instrumentation::manifest_wrapper(),
+    )
+    .await?;
+    let Some(branch) = branch.filter(|branch| *branch != "main") else {
+        return Ok((dataset, BranchIdentifier::main()));
+    };
+
+    for _ in 0..BRANCH_IDENTIFIER_CAPTURE_ATTEMPTS {
+        let before = dataset
+            .branches()
+            .get_identifier(Some(branch))
+            .await
+            .map_err(|error| branch_ref_error(error, branch))?;
+        let branch_dataset = dataset
+            .checkout_branch(branch)
+            .await
+            .map_err(|error| branch_ref_error(error, branch))?;
+        let after = dataset
+            .branches()
+            .get_identifier(Some(branch))
+            .await
+            .map_err(|error| branch_ref_error(error, branch))?;
+        if before == after {
+            return Ok((branch_dataset, before));
+        }
+        tokio::task::yield_now().await;
+    }
+
+    Err(OmniError::manifest_conflict(format!(
+        "manifest branch '{branch}' changed repeatedly during coherent open; retry"
+    )))
 }
 
 fn format_table_version(version: u64) -> String {

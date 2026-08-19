@@ -41,7 +41,10 @@ use graph::{
 pub(crate) use layout::manifest_uri;
 #[cfg(test)]
 use layout::open_manifest_dataset;
-use layout::{open_manifest_dataset_with_session, table_uri_for_path};
+use layout::{
+    branch_ref_error, open_manifest_dataset_with_identifier_with_session,
+    open_manifest_dataset_with_session, table_uri_for_path,
+};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
@@ -462,11 +465,12 @@ pub(crate) struct ManifestIncarnation {
     pub(crate) version: u64,
     pub(crate) e_tag: Option<String>,
     timestamp_nanos: Option<u128>,
+    branch_identifier: lance::dataset::refs::BranchIdentifier,
 }
 
 impl ManifestIncarnation {
     pub(crate) fn matches(&self, held: &Self) -> bool {
-        if self.version != held.version {
+        if self.version != held.version || self.branch_identifier != held.branch_identifier {
             return false;
         }
         match (&self.e_tag, &held.e_tag) {
@@ -521,16 +525,30 @@ async fn probe_dataset_latest_incarnation(
                 .map_err(|e| OmniError::Lance(e.to_string()))?,
             e_tag: dataset.manifest_location().e_tag.clone(),
             timestamp_nanos: Some(dataset.manifest().timestamp_nanos),
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
         });
     }
-    let (manifest, location) = dataset
-        .latest_manifest()
+    let branch = active_branch.expect("named-branch arm checked above");
+    // A named branch's native identifier is its lifetime witness. Pair it with
+    // the branch-local latest version instead of loading the manifest body:
+    // version changes catch ordinary commits, while the identifier catches a
+    // same-source delete/recreate even when version, e-tag, and timestamp all
+    // repeat. Read the version first so a recreation between the two probes
+    // yields the replacement identifier rather than a false match to the held
+    // lifetime.
+    let version = dataset
+        .latest_version_id()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(|error| branch_ref_error(error, branch))?;
+    let branch_identifier = dataset
+        .branch_identifier()
+        .await
+        .map_err(|error| branch_ref_error(error, branch))?;
     Ok(ManifestIncarnation {
-        version: manifest.version,
-        e_tag: location.e_tag,
-        timestamp_nanos: Some(manifest.timestamp_nanos),
+        version,
+        e_tag: None,
+        timestamp_nanos: None,
+        branch_identifier,
     })
 }
 
@@ -717,6 +735,10 @@ pub(crate) struct ManifestCoordinator {
     dataset: Dataset,
     known_state: ManifestState,
     active_branch: Option<String>,
+    /// Lance-native lifetime captured coherently with `dataset` and
+    /// `known_state`. A named ref keeps this value across ordinary commits and
+    /// receives a new value after delete/recreate.
+    branch_identifier: lance::dataset::refs::BranchIdentifier,
     publisher: Arc<dyn ManifestBatchPublisher>,
 }
 
@@ -738,6 +760,7 @@ impl ManifestCoordinator {
         dataset: Dataset,
         known_state: ManifestState,
         active_branch: Option<String>,
+        branch_identifier: lance::dataset::refs::BranchIdentifier,
         publisher: Arc<dyn ManifestBatchPublisher>,
     ) -> Self {
         Self {
@@ -745,6 +768,7 @@ impl ManifestCoordinator {
             dataset,
             known_state,
             active_branch,
+            branch_identifier,
             publisher,
         }
     }
@@ -754,10 +778,18 @@ impl ManifestCoordinator {
         dataset: Dataset,
         known_state: ManifestState,
         active_branch: Option<String>,
+        branch_identifier: lance::dataset::refs::BranchIdentifier,
     ) -> Self {
         let publisher =
             Self::default_batch_publisher(root_uri, active_branch.as_deref(), dataset.session());
-        Self::from_parts(root_uri, dataset, known_state, active_branch, publisher)
+        Self::from_parts(
+            root_uri,
+            dataset,
+            known_state,
+            active_branch,
+            branch_identifier,
+            publisher,
+        )
     }
 
     fn snapshot_from_state(root_uri: &str, state: ManifestState) -> Snapshot {
@@ -833,7 +865,13 @@ impl ManifestCoordinator {
         let (dataset, known_state, lineage_rows) =
             open_exact_genesis_manifest(root, attempt, control_session).await?;
         Ok((
-            Self::from_parts_with_default_publisher(root, dataset, known_state, None),
+            Self::from_parts_with_default_publisher(
+                root,
+                dataset,
+                known_state,
+                None,
+                lance::dataset::refs::BranchIdentifier::main(),
+            ),
             lineage_rows,
         ))
     }
@@ -848,7 +886,13 @@ impl ManifestCoordinator {
         let root = root_uri.trim_end_matches('/');
         let (known_state, lineage_rows) = load_initial_manifest_state(&dataset).await?;
         Ok((
-            Self::from_parts_with_default_publisher(root, dataset, known_state, None),
+            Self::from_parts_with_default_publisher(
+                root,
+                dataset,
+                known_state,
+                None,
+                lance::dataset::refs::BranchIdentifier::main(),
+            ),
             lineage_rows,
         ))
     }
@@ -864,12 +908,14 @@ impl ManifestCoordinator {
         control_session: &Arc<lance::session::Session>,
     ) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state) = open_manifest_graph(root, None, control_session).await?;
+        let (dataset, known_state, branch_identifier) =
+            open_manifest_graph(root, None, control_session).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
             dataset,
             known_state,
             None,
+            branch_identifier,
         ))
     }
 
@@ -889,13 +935,14 @@ impl ManifestCoordinator {
         }
 
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state) =
+        let (dataset, known_state, branch_identifier) =
             open_manifest_graph(root, Some(branch), control_session).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
             dataset,
             known_state,
             Some(branch.to_string()),
+            branch_identifier,
         ))
     }
 
@@ -906,7 +953,7 @@ impl ManifestCoordinator {
     ) -> Result<(Self, Vec<GraphLineageRow>)> {
         let root = root_uri.trim_end_matches('/');
         let branch = branch.filter(|branch| *branch != "main");
-        let (dataset, known_state, lineage_rows) =
+        let (dataset, known_state, lineage_rows, branch_identifier) =
             open_manifest_graph_with_lineage(root, branch, control_session).await?;
         Ok((
             Self::from_parts_with_default_publisher(
@@ -914,6 +961,7 @@ impl ManifestCoordinator {
                 dataset,
                 known_state,
                 branch.map(str::to_string),
+                branch_identifier,
             ),
             lineage_rows,
         ))
@@ -929,6 +977,38 @@ impl ManifestCoordinator {
             root,
             snapshot_state_at(root, branch, version).await?,
         ))
+    }
+
+    /// Test whether one live graph branch still inherits a table fork from a
+    /// branch being deleted, without capturing the candidate branch's native
+    /// incarnation.
+    ///
+    /// This deliberately narrow predicate is valid only while the caller holds
+    /// branch-delete's complete control envelope: the schema-control gate, the
+    /// delete-target branch gate, and every accepted-catalog table gate for the
+    /// target. The schema gate serializes native branch create/delete in the
+    /// supported single-writer process, and an ordinary writer can only replace
+    /// an inherited `table_branch` with its own branch; it cannot make a live
+    /// branch newly inherit the held delete target. A raced write can therefore
+    /// make this snapshot conservatively report an old dependency, never hide a
+    /// new one.
+    ///
+    /// General coordinator, OCC, and live-read/feed opens must not use this
+    /// path: they need the BranchIdentifier captured with their manifest
+    /// projection to fence delete/recreate ABA.
+    pub(super) async fn branch_depends_on_delete_target_under_control_gates(
+        root_uri: &str,
+        candidate_branch: Option<&str>,
+        delete_target: &str,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<bool> {
+        let root = root_uri.trim_end_matches('/');
+        let dataset =
+            open_manifest_dataset_with_session(root, candidate_branch, control_session).await?;
+        let snapshot = Self::snapshot_from_state(root, read_manifest_state(&dataset).await?);
+        Ok(snapshot
+            .entries()
+            .any(|entry| entry.table_branch.as_deref() == Some(delete_target)))
     }
 
     /// Return a Snapshot from the known manifest state. No storage I/O.
@@ -950,27 +1030,41 @@ impl ManifestCoordinator {
 
     pub(crate) async fn refresh_with_lineage(&mut self) -> Result<Vec<GraphLineageRow>> {
         let control_session = self.dataset.session();
-        let (dataset, known_state, lineage_rows) = open_manifest_graph_with_lineage(
-            &self.root_uri,
-            self.active_branch.as_deref(),
-            &control_session,
-        )
-        .await?;
+        let (dataset, known_state, lineage_rows, branch_identifier) =
+            open_manifest_graph_with_lineage(
+                &self.root_uri,
+                self.active_branch.as_deref(),
+                &control_session,
+            )
+            .await?;
         self.dataset = dataset;
         self.known_state = known_state;
+        self.branch_identifier = branch_identifier;
         Ok(lineage_rows)
     }
 
     /// Refresh one live-read view without ever installing a manifest state
     /// whose inherited lineage projection has not also been refreshed.
     ///
-    /// Branches with an exact `graph_head` row keep the cheap state-only path.
-    /// A fresh named branch has no such row and needs the lineage fallback;
-    /// every fallible read completes before either field is replaced so a
-    /// transient lineage failure leaves the previous coordinator coherent.
-    pub(crate) async fn refresh_for_live_read(&mut self) -> Result<Option<Vec<GraphLineageRow>>> {
+    /// `projection_has_head` reports whether the caller's lineage projection
+    /// already contains a commit id. The cheap state-only path is taken ONLY
+    /// when the refreshed branch head row exists AND the projection already
+    /// knows that exact head (the manifest moved without extending this
+    /// branch's chain — e.g. a maintenance pointer publish). A head the
+    /// projection lacks means another handle or process committed, so the
+    /// lineage is re-read atomically with the state — otherwise the caller
+    /// would pair the new head with a stale commit map and every later feed
+    /// poll or head resolution on this handle would fail with a
+    /// missing-commit error and never self-heal. An absent head row (fresh
+    /// named branch) refreshes the inherited lineage, as before; every
+    /// fallible read completes before either field is replaced so a transient
+    /// lineage failure leaves the previous coordinator coherent.
+    pub(crate) async fn refresh_for_live_read(
+        &mut self,
+        projection_has_head: impl FnOnce(&str) -> bool,
+    ) -> Result<Option<Vec<GraphLineageRow>>> {
         let control_session = self.dataset.session();
-        let dataset = open_manifest_dataset_with_session(
+        let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
             &self.root_uri,
             self.active_branch.as_deref(),
             &control_session,
@@ -981,17 +1075,19 @@ impl ManifestCoordinator {
             .active_branch
             .as_deref()
             .unwrap_or(MAIN_BRANCH_HEAD_KEY);
-        let lineage_rows = if known_state.graph_heads.contains_key(branch_key) {
-            None
-        } else {
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::READ_REFRESH_POST_STATE_PRE_LINEAGE,
-            )?;
-            Some(read_graph_lineage(&dataset).await?.0)
+        let lineage_rows = match known_state.graph_heads.get(branch_key) {
+            Some(head) if projection_has_head(head) => None,
+            _ => {
+                crate::failpoints::maybe_fail(
+                    crate::failpoints::names::READ_REFRESH_POST_STATE_PRE_LINEAGE,
+                )?;
+                Some(read_graph_lineage(&dataset).await?.0)
+            }
         };
 
         self.dataset = dataset;
         self.known_state = known_state;
+        self.branch_identifier = branch_identifier;
         Ok(lineage_rows)
     }
 
@@ -1136,14 +1232,13 @@ impl ManifestCoordinator {
             .map_err(|error| OmniError::Lance(error.to_string()))
     }
 
-    /// Lance-native stable identity for the active manifest branch. Unlike a
-    /// manifest version/eTag, this remains stable across ordinary commits and
-    /// changes when a named branch is deleted and recreated (ABA protection).
+    /// Lance-native stable identity captured with the active manifest state.
+    /// Unlike a manifest version/eTag, this remains stable across ordinary
+    /// commits and changes when a named branch is deleted and recreated (ABA
+    /// protection). Returning the capture, rather than re-reading the live ref,
+    /// prevents callers from pairing old state with a replacement witness.
     pub(crate) async fn branch_identifier(&self) -> Result<lance::dataset::refs::BranchIdentifier> {
-        self.dataset
-            .branch_identifier()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        Ok(self.branch_identifier.clone())
     }
 
     /// Exact materialized `graph_head:<active-branch>` from the same pinned
@@ -1163,13 +1258,15 @@ impl ManifestCoordinator {
             version: self.version(),
             e_tag: self.dataset.manifest_location().e_tag.clone(),
             timestamp_nanos: Some(self.dataset.manifest().timestamp_nanos),
+            branch_identifier: self.branch_identifier.clone(),
         }
     }
 
     /// Latest committed manifest identity. Main cannot be deleted/recreated, so
     /// the cheap version-number probe is sufficient there. Non-main Lance
-    /// branches can be deleted and recreated with the same version number, so
-    /// load the latest manifest location and compare its e_tag / timestamp too.
+    /// branches can be deleted and recreated with the same version, e_tag, and
+    /// timestamp when both lifetimes fork the same source; the native branch
+    /// identifier is therefore part of the freshness result as well.
     pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
         probe_dataset_latest_incarnation(&self.dataset, self.active_branch.as_deref()).await
     }

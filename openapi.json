@@ -1202,6 +1202,330 @@
         ]
       }
     },
+    "/graphs/{graph_id}/changes": {
+      "get": {
+        "tags": [
+          "changes"
+        ],
+        "summary": "Poll the change feed of one branch.",
+        "description": "At-least-once: retrying a cursor may replay the complete next commit, so\nconsumers apply blocks idempotently by `graph_commit_id` and persist the\nterminal cursor together with its blocks. The server holds no consumer\nstate.",
+        "operationId": "cluster_pollChanges",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "Branch whose first-parent history is polled. Defaults to `main`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Durable cursor from a prior terminal page. Mutually exclusive with\n`start` and `page_token`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "description": "Explicit start mode: `now` (default) | `beginning` |\n`after:<commit_id>`. Mutually exclusive with `cursor` and `page_token`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page_token",
+            "in": "query",
+            "description": "Continuation of one bounded poll (keeps its captured cut). Mutually\nexclusive with `cursor` and `start`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ChangeEntityKind"
+              }
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "name": "op",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ChangeOpOutput"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Change blocks in first-parent order. The durable cursor appears only on a terminal page, advanced only over complete commits; a mid-block page carries only next_page_token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeFeedOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid start/filter combination, or a rejected cursor or page token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Branch not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The feed crossed an unprovable schema boundary; see change_diff_refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Feed gap: required history was reclaimed; reset via the baseline handshake",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Requested limit exceeds the public row ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure while reading changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Recovery required before changes can be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/changes/baseline": {
+      "post": {
+        "tags": [
+          "changes"
+        ],
+        "summary": "Capture a change-feed baseline: one exact entity snapshot plus the cursor\nthat resumes the feed immediately after it.",
+        "description": "A baseline is a full data export, so it requires the export action. The\nsnapshot honors the scope's kind and type dimensions; `op` binds only the\nresume cursor's feed scope.",
+        "operationId": "cluster_captureChangeBaseline",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeBaselineRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "NDJSON entity snapshot pinned at one captured commit. Every preceding record is one type-keyed entity row (the load/export NDJSON shape); the FINAL record is the ChangeBaselineRecord envelope — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeBaselineRecord"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Branch not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Baseline cut or transport capacity exhausted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure while capturing the baseline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Recovery required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/commits": {
       "get": {
         "tags": [
@@ -1336,6 +1660,188 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/commits/{commit_id}/changes": {
+      "get": {
+        "tags": [
+          "changes"
+        ],
+        "summary": "Entity changes one commit made relative to its first parent.",
+        "description": "Read-only, in graph vocabulary with exact before/after images. Bounded:\na large commit continues via the opaque `page_token`.",
+        "operationId": "cluster_getCommitChanges",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "commit_id",
+            "in": "path",
+            "description": "Commit identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page_token",
+            "in": "query",
+            "description": "Opaque continuation from the preceding page of this response.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum changes per page. Server default applies when absent; above\nthe public ceiling the request fails with 413.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Repeatable filter: node | edge.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ChangeEntityKind"
+              }
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Repeatable filter: accepted-schema type name.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "name": "op",
+            "in": "query",
+            "description": "Repeatable filter: insert | update | delete.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ChangeOpOutput"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Entity changes this commit made relative to its first parent, in frozen (kind, type, id, op) order with the cause stated once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitChangesOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter or limit, or a rejected page token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Commit not found, or the actor cannot read the commit's branch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Commit cannot be entity-diffed (parentless commit or schema boundary); see change_diff_refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Required retained history is no longer readable; see change_feed_gap and capture a new baseline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Requested limit exceeds the public row ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure while reading changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Recovery required before changes can be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -3176,6 +3682,335 @@
           }
         }
       },
+      "ChangeBaselineOutput": {
+        "type": "object",
+        "description": "Terminal payload of a baseline stream: the captured snapshot commit and\nthe cursor that resumes the feed immediately after it.",
+        "required": [
+          "snapshot_commit_id",
+          "resume_cursor"
+        ],
+        "properties": {
+          "resume_cursor": {
+            "type": "string"
+          },
+          "snapshot_commit_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ChangeBaselineRecord": {
+        "type": "object",
+        "description": "Wire envelope of the FINAL baseline stream line: `{\"baseline\": {...}}`,\ndistinguishable from snapshot records (which carry `type`/`edge` keys).\nEmitted exactly once, only after every snapshot record — an interrupted\nstream has no terminal record and therefore no usable cursor.",
+        "required": [
+          "baseline"
+        ],
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/ChangeBaselineOutput"
+          }
+        }
+      },
+      "ChangeBaselineRequest": {
+        "type": "object",
+        "description": "Body for the change baseline handshake.",
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch to capture. Defaults to `main`."
+          },
+          "kind": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChangeEntityKind"
+            },
+            "description": "Feed scope the resume cursor is bound to. The snapshot honors `kind`\nand `type`; `op` constrains only subsequent polls."
+          },
+          "op": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChangeOpOutput"
+            }
+          },
+          "type": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ChangeBlockOutput": {
+        "type": "object",
+        "description": "One commit block inside a feed page.",
+        "required": [
+          "cause",
+          "changes"
+        ],
+        "properties": {
+          "cause": {
+            "$ref": "#/components/schemas/ChangeCauseOutput"
+          },
+          "changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EntityChangeOutput"
+            }
+          }
+        }
+      },
+      "ChangeCauseOutput": {
+        "type": "object",
+        "description": "The commit cause of one change block, stated once.",
+        "required": [
+          "graph_commit_id",
+          "authored_branch",
+          "authored_at"
+        ],
+        "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authored_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Authorship time as Unix epoch microseconds — minted before table\neffects and stable across retries; deliberately not labeled a commit or\npublication time.",
+            "example": 1714000000000000
+          },
+          "authored_branch": {
+            "type": "string",
+            "description": "The branch the commit originally landed on (not the requested branch)."
+          },
+          "graph_commit_id": {
+            "type": "string"
+          },
+          "merged_parent_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ChangeDiffRefusalOutput": {
+        "type": "object",
+        "description": "A well-formed entity-diff request this commit cannot satisfy (HTTP 409).",
+        "required": [
+          "reason",
+          "graph_commit_id"
+        ],
+        "properties": {
+          "graph_commit_id": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/ChangeDiffRefusalReason"
+          },
+          "type_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The graph type at the schema boundary, when the reason names one."
+          }
+        }
+      },
+      "ChangeDiffRefusalReason": {
+        "type": "string",
+        "description": "Why a well-formed entity-diff request was refused (HTTP 409).",
+        "enum": [
+          "parentless_commit",
+          "schema_boundary",
+          "unknown"
+        ]
+      },
+      "ChangeEndpointsOutput": {
+        "type": "object",
+        "description": "Edge endpoints as graph references. Endpoints belong to each image, so an\nendpoint-moving update has distinct before and after endpoints.",
+        "required": [
+          "from",
+          "to"
+        ],
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          }
+        }
+      },
+      "ChangeEntityKind": {
+        "type": "string",
+        "description": "Logical entity namespace of one change. Graph vocabulary only.",
+        "enum": [
+          "node",
+          "edge"
+        ]
+      },
+      "ChangeErrorOutput": {
+        "type": "object",
+        "description": "Error envelope for the read-only change surfaces (`…/changes`,\n`…/changes/baseline`, `…/commits/{commit_id}/changes`): a wire-compatible\nprojection of [`ErrorOutput`] restricted to the graph-vocabulary details\nthose routes can produce after their error projection. The write-path\nconflict shapes (key / manifest / merge / read-set), which carry physical\nstorage identifiers, are structurally absent, so storage vocabulary is\nunreachable from the change operations' schema graph. Servers serialize\n[`ErrorOutput`]; every field a change route can populate appears here with\nthe same name and meaning, and absent optionals are wire-compatible.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "change_diff_refusal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeDiffRefusalOutput",
+                "description": "Set with HTTP 409 when a commit entity diff is refused (parentless\ncommit or an unprovable schema boundary)."
+              }
+            ]
+          },
+          "change_feed_gap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeFeedGapOutput",
+                "description": "Set with HTTP 410 when retained history can no longer reconstruct a\nchange continuation. Recover via the baseline handshake."
+              }
+            ]
+          },
+          "code": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ErrorCode"
+              }
+            ]
+          },
+          "error": {
+            "type": "string"
+          },
+          "recovery_required": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryRequiredOutput",
+                "description": "Set with HTTP 503 when the graph has a durable recovery intent that\nmust be resolved before the requested change read can proceed."
+              }
+            ]
+          },
+          "resource_limit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ResourceLimitOutput",
+                "description": "Set when a requested limit exceeds a public ceiling, or a single change\nexceeds the poll's own byte ceiling."
+              }
+            ]
+          }
+        }
+      },
+      "ChangeFeedGapOutput": {
+        "type": "object",
+        "description": "A change continuation can no longer be reconstructed from retained history\n(HTTP 410). Recovery is the baseline handshake; retrying the same cursor\ncannot succeed. `code` stays unset: [`ErrorCode`] is closed and this\nadditive detail is the machine-readable discriminator (the same rolling\ncontract as `external_blob_source`).",
+        "required": [
+          "first_unreadable_commit_id"
+        ],
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "first_unreadable_commit_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ChangeFeedOutput": {
+        "type": "object",
+        "description": "One bounded feed poll result.",
+        "required": [
+          "blocks"
+        ],
+        "properties": {
+          "blocks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChangeBlockOutput"
+            }
+          },
+          "caught_up": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present with `cursor` on a terminal page: true when the page reached\nits captured head, false when more complete commits already wait."
+          },
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Durable caller-owned cursor, advanced only over complete commits and\nreturned only on a terminal page — an interrupted poll never advances\nit."
+          },
+          "next_page_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Continue this poll's captured cut. Absent on a terminal page."
+          }
+        }
+      },
+      "ChangeImageOutput": {
+        "type": "object",
+        "description": "One exact logical entity image, decoded with the commit-era schema.",
+        "required": [
+          "properties"
+        ],
+        "properties": {
+          "endpoints": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeEndpointsOutput",
+                "description": "Present for edge images only."
+              }
+            ]
+          },
+          "properties": {
+            "description": "Exact logical property values; user-schema keys verbatim."
+          }
+        }
+      },
+      "ChangeOpOutput": {
+        "type": "string",
+        "description": "Logical operation of one change. Ordering rank is frozen:\ninsert before update before delete within one entity.",
+        "enum": [
+          "insert",
+          "update",
+          "delete"
+        ]
+      },
       "ChangeOutput": {
         "type": "object",
         "required": [
@@ -3247,6 +4082,48 @@
           }
         }
       },
+      "ChangeTypeOutput": {
+        "type": "object",
+        "description": "Graph-scoped type identity. `id` is opaque: it survives a supported rename\nand changes after drop/re-add. It is never a table, dataset, or path\nidentifier.",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "CommitChangesOutput": {
+        "type": "object",
+        "description": "One bounded page of the finite commit entity diff.",
+        "required": [
+          "cause",
+          "changes"
+        ],
+        "properties": {
+          "cause": {
+            "$ref": "#/components/schemas/ChangeCauseOutput"
+          },
+          "changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EntityChangeOutput"
+            }
+          },
+          "next_page_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Continue THIS bounded response. Absent on the final page. Never a feed\ncursor."
+          }
+        }
+      },
       "CommitListOutput": {
         "type": "object",
         "required": [
@@ -3309,6 +4186,50 @@
           }
         }
       },
+      "EntityChangeOutput": {
+        "type": "object",
+        "description": "One entity change. Cause is stated once on the enclosing block, never here.\nAn insert carries only `after`, an update exact `before` and `after`, a\ndelete only `before`.",
+        "required": [
+          "kind",
+          "type",
+          "id",
+          "op"
+        ],
+        "properties": {
+          "after": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeImageOutput"
+              }
+            ]
+          },
+          "before": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeImageOutput"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ChangeEntityKind"
+          },
+          "op": {
+            "$ref": "#/components/schemas/ChangeOpOutput"
+          },
+          "type": {
+            "$ref": "#/components/schemas/ChangeTypeOutput"
+          }
+        }
+      },
       "ErrorCode": {
         "type": "string",
         "enum": [
@@ -3336,6 +4257,28 @@
               {
                 "$ref": "#/components/schemas/BlobRangeOutput",
                 "description": "Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.\n`start..end` is half-open and `length` is the selected Blob length."
+              }
+            ]
+          },
+          "change_diff_refusal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeDiffRefusalOutput",
+                "description": "Set with HTTP 409 when a commit entity diff is refused (parentless\ncommit or an unprovable schema boundary)."
+              }
+            ]
+          },
+          "change_feed_gap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangeFeedGapOutput",
+                "description": "Set with HTTP 410 when retained history can no longer reconstruct a\nchange continuation. Recover via the baseline handshake."
               }
             ]
           },

@@ -15,7 +15,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(after_help = "\
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
-URI): query, mutate, load, blob, branch, snapshot, export, commit, schema show/apply.\n  \
+URI): query, mutate, load, blob, branch, snapshot, export, commit, changes, schema show/apply.\n  \
 served — require a server: graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
@@ -247,6 +247,11 @@ pub(crate) enum Command {
     Commit {
         #[command(subcommand)]
         command: CommitCommand,
+    },
+    /// Follow a graph's change feed
+    Changes {
+        #[command(subcommand)]
+        command: ChangesCommand,
     },
     /// Schema planning operations
     Schema {
@@ -683,6 +688,120 @@ pub(crate) enum CommitCommand {
         #[arg(long)]
         uri: Option<String>,
         commit_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the entity changes one commit made relative to its first parent
+    Changes {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        commit_id: String,
+        /// Changes per page (the server clamps at its public ceiling)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Fetch exactly one page starting at this opaque token
+        /// (auto-paginates when omitted)
+        #[arg(long)]
+        page_token: Option<String>,
+        /// Filter by entity kind (repeatable): node | edge
+        #[arg(long = "kind", value_enum)]
+        kinds: Vec<ChangeKindArg>,
+        /// Filter by type name (repeatable)
+        #[arg(long = "type")]
+        types: Vec<String>,
+        /// Filter by operation (repeatable): insert | update | delete
+        #[arg(long = "op", value_enum)]
+        ops: Vec<ChangeOpArg>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ChangeKindArg {
+    Node,
+    Edge,
+}
+
+impl From<ChangeKindArg> for omnigraph_api_types::ChangeEntityKind {
+    fn from(kind: ChangeKindArg) -> Self {
+        match kind {
+            ChangeKindArg::Node => Self::Node,
+            ChangeKindArg::Edge => Self::Edge,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ChangeOpArg {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl From<ChangeOpArg> for omnigraph_api_types::ChangeOpOutput {
+    fn from(op: ChangeOpArg) -> Self {
+        match op {
+            ChangeOpArg::Insert => Self::Insert,
+            ChangeOpArg::Update => Self::Update,
+            ChangeOpArg::Delete => Self::Delete,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ChangesCommand {
+    /// Poll the change feed of a branch. Auto-consumes page tokens and prints
+    /// the durable cursor from the terminal page.
+    Poll {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        /// Durable cursor from a previous poll or baseline
+        #[arg(long, conflicts_with = "start")]
+        cursor: Option<String>,
+        /// Start mode: now | beginning | after:<commit_id> (default now)
+        #[arg(long, conflicts_with = "cursor")]
+        start: Option<String>,
+        /// Changes per page (the server clamps at its public ceiling)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Filter by entity kind (repeatable): node | edge
+        #[arg(long = "kind", value_enum)]
+        kinds: Vec<ChangeKindArg>,
+        /// Filter by type name (repeatable)
+        #[arg(long = "type")]
+        types: Vec<String>,
+        /// Filter by operation (repeatable): insert | update | delete
+        #[arg(long = "op", value_enum)]
+        ops: Vec<ChangeOpArg>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Capture an exact entity snapshot plus its resume cursor (POSIX only).
+    /// Non-POSIX platforms fail before capture until a durable write-through
+    /// namespace replacement is available.
+    Baseline {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        /// Snapshot scope by entity kind (repeatable): node | edge
+        #[arg(long = "kind", value_enum)]
+        kinds: Vec<ChangeKindArg>,
+        /// Snapshot scope by type name (repeatable)
+        #[arg(long = "type")]
+        types: Vec<String>,
+        /// Feed scope by operation (repeatable); binds the resume cursor only
+        #[arg(long = "op", value_enum)]
+        ops: Vec<ChangeOpArg>,
+        /// Write the NDJSON snapshot here; the handshake prints to stdout
+        #[arg(long, value_name = "PATH")]
+        out: std::path::PathBuf,
         #[arg(long)]
         json: bool,
     },

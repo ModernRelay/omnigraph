@@ -471,6 +471,8 @@ pub(crate) fn precondition_failed_cli(
                 expected,
                 actual,
             }),
+            change_feed_gap: None,
+            change_diff_refusal: None,
         },
     }
 }

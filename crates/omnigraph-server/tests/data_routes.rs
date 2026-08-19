@@ -3151,3 +3151,503 @@ async fn mutate_graph_commit_precondition_issue_365() {
         "fresh branch must accept its read token on the first write: {body}"
     );
 }
+
+// ─── Commit entity changes route ────────────────────────────────────────────
+
+async fn load_commit(app: &axum::Router, ndjson: &str) -> String {
+    let request = IngestRequest {
+        branch: Some("main".to_string()),
+        from: None,
+        mode: Some(LoadMode::Merge),
+        data: ndjson.to_string(),
+    };
+    let (status, body) = json_response(
+        app,
+        Request::builder()
+            .uri(g("/load"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&request).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    body["commit"]["graph_commit_id"]
+        .as_str()
+        .expect("an effectful load returns its commit")
+        .to_string()
+}
+
+async fn get_json(app: &axum::Router, uri: String) -> (StatusCode, Value) {
+    json_response(
+        app,
+        Request::builder()
+            .uri(uri)
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_changes_pages_are_ordered_with_cause_once() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let commit_id = load_commit(
+        &app,
+        concat!(
+            r#"{"type":"Person","data":{"name":"Loaded C","age":7}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Loaded A","age":5}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Loaded B","age":6}}"#,
+        ),
+    )
+    .await;
+
+    let (status, first) = get_json(&app, g(&format!("/commits/{commit_id}/changes?limit=2"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["cause"]["graph_commit_id"], commit_id.as_str());
+    assert_eq!(first["cause"]["authored_branch"], "main");
+    assert_eq!(first["changes"][0]["id"], "Loaded A");
+    assert_eq!(first["changes"][0]["op"], "insert");
+    assert_eq!(first["changes"][0]["kind"], "node");
+    assert_eq!(first["changes"][0]["type"]["name"], "Person");
+    assert!(
+        first["changes"][0]["type"]["id"].is_string(),
+        "opaque graph type identity rides every change"
+    );
+    assert_eq!(first["changes"][1]["id"], "Loaded B");
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("a truncated block continues by page token");
+
+    let (status, second) = get_json(
+        &app,
+        g(&format!(
+            "/commits/{commit_id}/changes?limit=2&page_token={token}"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["changes"][0]["id"], "Loaded C");
+    assert!(second["next_page_token"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_changes_images_follow_op_shape() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    load_commit(&app, r#"{"type":"Person","data":{"name":"Shape","age":1}}"#).await;
+    let update_commit =
+        load_commit(&app, r#"{"type":"Person","data":{"name":"Shape","age":2}}"#).await;
+
+    let (status, page) = get_json(&app, g(&format!("/commits/{update_commit}/changes"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let change = &page["changes"][0];
+    assert_eq!(change["op"], "update");
+    assert_eq!(change["before"]["properties"]["age"], 1);
+    assert_eq!(change["after"]["properties"]["age"], 2);
+    // Edge images carry endpoints inside each image.
+    let edge_commit = load_commit(
+        &app,
+        concat!(
+            r#"{"type":"Person","data":{"name":"Shape2","age":1}}"#,
+            "\n",
+            r#"{"edge":"Knows","from":"Shape","to":"Shape2"}"#,
+        ),
+    )
+    .await;
+    let (status, page) = get_json(&app, g(&format!("/commits/{edge_commit}/changes"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let edge = page["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["kind"] == "edge")
+        .expect("the edge insert surfaces");
+    assert_eq!(edge["op"], "insert");
+    assert_eq!(edge["after"]["endpoints"]["from"], "Shape");
+    assert_eq!(edge["after"]["endpoints"]["to"], "Shape2");
+    assert!(edge["before"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_changes_filters_are_repeatable_and_strict() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let commit_id = load_commit(
+        &app,
+        concat!(
+            r#"{"type":"Person","data":{"name":"F1","age":1}}"#,
+            "\n",
+            r#"{"edge":"Knows","from":"F1","to":"Alice"}"#,
+        ),
+    )
+    .await;
+
+    let (status, nodes_only) =
+        get_json(&app, g(&format!("/commits/{commit_id}/changes?kind=node"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        nodes_only["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|change| change["kind"] == "node")
+    );
+
+    let (status, ops) = get_json(
+        &app,
+        g(&format!(
+            "/commits/{commit_id}/changes?op=insert&op=update&type=Person"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!ops["changes"].as_array().unwrap().is_empty());
+
+    // Unknown values and unknown parameters are strict 400s: a caller byte
+    // limit or physical vocabulary can never silently ride this surface.
+    for query in ["kind=table", "op=upsert", "max_bytes=1", "table_key=x"] {
+        let (status, _) = get_json(&app, g(&format!("/commits/{commit_id}/changes?{query}"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "query: {query}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_changes_limit_bounds_and_token_rejections() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let commit_id = load_commit(&app, r#"{"type":"Person","data":{"name":"Bound","age":1}}"#).await;
+
+    let (status, _) = get_json(&app, g(&format!("/commits/{commit_id}/changes?limit=0"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get_json(&app, g(&format!("/commits/{commit_id}/changes?limit=8193"))).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let (status, rejected) = get_json(
+        &app,
+        g(&format!(
+            "/commits/{commit_id}/changes?page_token=not-a-token"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        rejected["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("change cursor rejected"),
+        "a malformed token is a typed 400, never a retention gap: {rejected}"
+    );
+
+    let (status, _) = get_json(&app, g("/commits/not-a-commit/changes")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_changes_parentless_commit_is_typed_409() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (status, commits) = get_json(&app, g("/commits")).await;
+    assert_eq!(status, StatusCode::OK);
+    let genesis = commits["commits"]
+        .as_array()
+        .unwrap()
+        .last()
+        .expect("history has a genesis")["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, refusal) = get_json(&app, g(&format!("/commits/{genesis}/changes"))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        refusal["change_diff_refusal"]["reason"], "parentless_commit",
+        "{refusal}"
+    );
+    assert_eq!(refusal["change_diff_refusal"]["graph_commit_id"], genesis);
+}
+
+// ─── Change feed route ──────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_routes_report_a_missing_branch_without_storage_detail() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, feed) = get_json(&app, g("/changes?branch=missing&start=now")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(feed["error"], "branch 'missing' not found");
+    assert!(!feed.to_string().contains("_refs"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/changes/baseline"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"branch":"missing"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let baseline: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(baseline["error"], "branch 'missing' not found");
+    assert!(!baseline.to_string().contains("_refs"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_poll_advances_cursor_only_after_complete_commits() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    // `start=now` captures the head: no replay, a caught-up durable cursor.
+    let (status, now) = get_json(&app, g("/changes?start=now")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(now["blocks"].as_array().unwrap().is_empty());
+    assert_eq!(now["caught_up"], true);
+    let c0 = now["cursor"].as_str().expect("terminal page cursor");
+
+    let commit_id = load_commit(
+        &app,
+        concat!(
+            r#"{"type":"Person","data":{"name":"Feed A","age":1}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Feed B","age":2}}"#,
+        ),
+    )
+    .await;
+
+    // A mid-block page carries only a page token — no cursor to checkpoint.
+    let (status, partial) = get_json(&app, g(&format!("/changes?cursor={c0}&limit=1"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        partial["blocks"][0]["cause"]["graph_commit_id"],
+        commit_id.as_str()
+    );
+    assert_eq!(partial["blocks"][0]["changes"][0]["id"], "Feed A");
+    assert!(partial["cursor"].is_null(), "no durable cursor mid-block");
+    let token = partial["next_page_token"].as_str().expect("page token");
+
+    let (status, resumed) = get_json(&app, g(&format!("/changes?page_token={token}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resumed["blocks"][0]["changes"][0]["id"], "Feed B");
+    let c1 = resumed["cursor"].as_str().expect("boundary cursor");
+
+    let (status, caught_up) = get_json(&app, g(&format!("/changes?cursor={c1}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(caught_up["blocks"].as_array().unwrap().is_empty());
+    assert_eq!(caught_up["caught_up"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_start_beginning_replays_history() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let commit_id = load_commit(
+        &app,
+        r#"{"type":"Person","data":{"name":"Replayed","age":1}}"#,
+    )
+    .await;
+
+    let (status, page) = get_json(&app, g("/changes?start=beginning")).await;
+    assert_eq!(status, StatusCode::OK);
+    let blocks = page["blocks"].as_array().unwrap();
+    assert!(!blocks.is_empty());
+    assert_eq!(
+        blocks.last().unwrap()["cause"]["graph_commit_id"],
+        commit_id.as_str(),
+        "oldest first: the newest commit is the last block"
+    );
+    assert!(page["cursor"].is_string());
+    assert_eq!(page["caught_up"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_start_and_cursor_are_exclusive_and_validated() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (_, now) = get_json(&app, g("/changes?start=now")).await;
+    let cursor = now["cursor"].as_str().unwrap();
+
+    for query in [
+        format!("cursor={cursor}&start=beginning"),
+        format!("cursor={cursor}&page_token={cursor}"),
+        "start=later".to_string(),
+        "start=after:".to_string(),
+        "start=after:no-such-commit".to_string(),
+    ] {
+        let (status, _) = get_json(&app, g(&format!("/changes?{query}"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "query: {query}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_scope_mismatch_cursor_is_stable_400() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (_, scoped) = get_json(&app, g("/changes?start=now&op=insert")).await;
+    let cursor = scoped["cursor"].as_str().unwrap();
+
+    let (status, rejected) = get_json(&app, g(&format!("/changes?cursor={cursor}"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        rejected["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("change cursor rejected"),
+        "{rejected}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_baseline_streams_snapshot_then_terminal_cursor() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    load_commit(&app, r#"{"type":"Person","data":{"name":"Base","age":1}}"#).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/changes/baseline"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"branch": "main"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-ndjson; charset=utf-8")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    assert!(
+        lines.len() >= 2,
+        "snapshot records plus the terminal record"
+    );
+
+    // Every line but the last is a snapshot record; the FINAL line is the
+    // handshake — an interrupted stream would simply lack it.
+    let (terminal, records) = lines.split_last().unwrap();
+    for record in records {
+        let value: Value = serde_json::from_str(record).unwrap();
+        assert!(
+            value.get("baseline").is_none(),
+            "the handshake appears exactly once, at the end: {record}"
+        );
+    }
+    let terminal: Value = serde_json::from_str(terminal).unwrap();
+    let snapshot_commit = terminal["baseline"]["snapshot_commit_id"]
+        .as_str()
+        .expect("terminal record names the captured commit");
+    let resume_cursor = terminal["baseline"]["resume_cursor"]
+        .as_str()
+        .expect("terminal record carries the resume cursor");
+    assert!(
+        text.contains("Base"),
+        "the snapshot carries the loaded entity"
+    );
+
+    // A commit landing after the handshake is the first block the resumed
+    // feed yields.
+    let post_commit = load_commit(
+        &app,
+        r#"{"type":"Person","data":{"name":"PostBase","age":2}}"#,
+    )
+    .await;
+    assert_ne!(post_commit, snapshot_commit);
+    let (status, resumed) = get_json(&app, g(&format!("/changes?cursor={resume_cursor}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resumed["blocks"][0]["cause"]["graph_commit_id"],
+        post_commit.as_str()
+    );
+    assert_eq!(resumed["caught_up"], true);
+}
+
+/// The wire vocabulary gate: no change-surface response may carry physical
+/// storage vocabulary. This walks every JSON key of real commit-diff, feed,
+/// and baseline-terminal responses and rejects the forbidden set outright.
+#[tokio::test(flavor = "multi_thread")]
+async fn change_responses_carry_no_storage_vocabulary() {
+    const FORBIDDEN_KEYS: &[&str] = &[
+        "table_key",
+        "stable_table_id",
+        "table_incarnation_id",
+        "incarnation",
+        "manifest_version",
+        "table_version",
+        "table_branch",
+        "table_path",
+        "row_addr",
+        "_rowid",
+        "fragment",
+        "part",
+        "commit_complete",
+        "change_index",
+        "max_bytes",
+    ];
+
+    fn assert_clean(value: &Value, context: &str) {
+        match value {
+            Value::Object(map) => {
+                for (key, nested) in map {
+                    assert!(
+                        !FORBIDDEN_KEYS.contains(&key.as_str()),
+                        "forbidden wire key '{key}' in {context}: {value}"
+                    );
+                    assert_clean(nested, context);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    assert_clean(item, context);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (_temp, app) = app_for_loaded_graph().await;
+    let commit_id = load_commit(
+        &app,
+        concat!(
+            r#"{"type":"Person","data":{"name":"Vocab","age":1}}"#,
+            "\n",
+            r#"{"edge":"Knows","from":"Vocab","to":"Alice"}"#,
+        ),
+    )
+    .await;
+
+    let (status, page) = get_json(&app, g(&format!("/commits/{commit_id}/changes"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_clean(&page, "commit changes page");
+
+    let (status, feed) = get_json(&app, g("/changes?start=beginning")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_clean(&feed, "change feed page");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/changes/baseline"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"branch":"main"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let terminal: Value =
+        serde_json::from_str(text.lines().rfind(|line| !line.is_empty()).unwrap()).unwrap();
+    assert_clean(&terminal, "baseline terminal record");
+}
