@@ -5,6 +5,7 @@
     "contexts": [
       "Classify Changes",
       "Check AGENTS.md Links",
+      "Graph Vocabulary Guard",
       "Test omnigraph-server --features aws",
       "Format (rustfmt)",
       "Lint (clippy)"

@@ -1,0 +1,136 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Unreachable table title",
+    "version": "1"
+  },
+  "paths": {
+    "/alias": {
+      "$ref": "#/components/pathItems/Table%20Path"
+    },
+    "/tables/{row_id}": {
+      "summary": "Table route; Arrow and narrow are not row tokens.",
+      "parameters": [
+        {
+          "name": "row_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "listTableRows",
+        "responses": {
+          "200": {
+            "description": "Returns table rows and manifest_version.",
+            "headers": {
+              "X-Table-Column": {
+                "description": "Physical column header",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/CycleTable"
+                    },
+                    {
+                      "properties": {
+                        "inline-row-count": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "pathItems": {
+      "Table Path": {
+        "get": {
+          "operationId": "fetchColumn",
+          "summary": "Referenced row path item",
+          "responses": {
+            "204": {
+              "description": "No rows"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "CycleTable": {
+        "description": "A table with table siblings and sidecars.",
+        "required": [
+          "table/key~name",
+          "manifest_branch"
+        ],
+        "properties": {
+          "table/key~name": {
+            "type": "string"
+          },
+          "manifest_branch": {
+            "type": "string"
+          },
+          "expected_manifest_version": {
+            "description": "expected_manifest_version is deliberately not exact",
+            "type": "string"
+          },
+          "nextRows": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CycleTable"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Table~1Rows~0Thing"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "discriminator": {
+          "propertyName": "row_kind"
+        }
+      },
+      "Table/Rows~Thing": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "sidecar-mode",
+              "narrow",
+              "Arrow"
+            ]
+          }
+        }
+      },
+      "UnreachableTable": {
+        "description": "Unreachable table rows and columns must not be scanned.",
+        "properties": {
+          "column_count": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  }
+}

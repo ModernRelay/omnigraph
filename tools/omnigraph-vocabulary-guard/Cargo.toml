@@ -1,0 +1,21 @@
+[package]
+name = "omnigraph-vocabulary-guard"
+version = "0.10.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+clap = { workspace = true }
+pulldown-cmark = { workspace = true }
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+syn = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+walkdir = { workspace = true }
+
+[lints]
+workspace = true

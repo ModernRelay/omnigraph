@@ -2,13 +2,44 @@
 
 `.github/workflows/`:
 
-- **ci.yml**: classifies documentation-only changes, checks AGENTS/doc links, compiles default features on code changes, runs the canonical `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints` gate (one feature-superset build — omitting the features skips every failpoint test and builds a different fingerprint) on its configured post-merge/tag/manual events, tests the AWS server feature, checks the container entrypoint, and runs bucket-gated RustFS correctness suites. There is no RFC-026/MemWAL job or abandoned v7-v19 binary build.
+- **ci.yml**: classifies documentation-only changes, checks AGENTS/doc links, runs the required four-surface graph-vocabulary guard, compiles default features on code changes, runs the canonical `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints` gate (one feature-superset build — omitting the features skips every failpoint test and builds a different fingerprint) on its configured post-merge/tag/manual events, tests the AWS server feature, checks the container entrypoint, and runs bucket-gated RustFS correctness suites. There is no RFC-026/MemWAL job or abandoned v7-v19 binary build.
   - Pull requests may use reporting-only checks while the full workspace gate
     runs post-merge, on tags, or by manual dispatch. Run the canonical workspace
     test locally before merging non-trivial code. A red post-merge main is
     stop-the-line.
   - Required branch-protection contexts must always report on pull requests;
     never require a job that the workflow can skip.
+  - **Graph Vocabulary Guard** always reports, including for documentation-only
+    pull requests. It checks out full history, uses the exact pull-request base
+    SHA (the push `before` SHA for ordinary branch pushes, or the checked-out
+    commit's first parent for tag/manual runs), tests
+    `omnigraph-vocabulary-guard`, and proves an exact inventory bijection for
+    four surfaces in both trees: route-reachable OpenAPI, user-visible Rust
+    strings, rendered events in `docs/user/**/*.md`, and externally reachable
+    public Rust signatures. A missing or stale base asset fails closed. The
+    inventory lives at
+    `tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv`. G4 is
+    derived with exactly `cargo-public-api` 0.52.0 on
+    `nightly-2026-08-01`, for the default/all-features union of the seven public
+    library crates; workspace checks remain on the repository's stable pin.
+    `cargo-public-api` does not emit a unique declaration/re-export source span,
+    so each G4 row uses the owning package manifest as its stable source and the
+    complete normalized exported signature as its review boundary. The guard
+    does not invent a potentially wrong source location for aliases or
+    macro-generated items.
+    G4 always extracts both trees: Cargo `include!`, build scripts, generated
+    sources, configuration, and other transitive inputs make a path-based skip
+    predicate unsound. The job's pinned-tool and build-target caches bound the
+    cold cost, and its 45-minute timeout fails visibly instead of silently
+    accepting a stale public surface.
+    The guard rejects an unreviewed workspace library crate rather than
+    silently omitting it. It never regenerates OpenAPI; the server's existing
+    drift test remains the owner of generated-spec equality.
+    Its legacy monotonicity check first reserves exact observations that keep
+    the same non-legacy classification, then compares only the remaining rows
+    at the fingerprint-independent boundary. This prevents an unchanged
+    neighbour from inheriting a removed legacy row's transition marker while
+    preserving fail-closed review for actual text/fingerprint rewrites.
   - CI does not regenerate `openapi.json`; intentional API changes regenerate
     and commit it locally.
   - The post-merge/tag/manual **V5 ↔ V6 Format Fence** builds the immutable
@@ -16,6 +47,47 @@
     `OMNIGRAPH_V5_BIN`, and runs only
     `current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6`. The job
     fails if that exact test skips or if a broad filter matches another cell.
+
+Run the vocabulary boundary locally against the same base tip a pull request
+will use:
+
+```bash
+cargo test -p omnigraph-vocabulary-guard --locked
+git fetch origin main
+BASE_SHA=$(git rev-parse origin/main)
+for surface in openapi rust-string user-docs; do
+  cargo run -p omnigraph-vocabulary-guard --locked -- \
+    check --surface "$surface" --base "$BASE_SHA" \
+    --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
+    --openapi openapi.json
+done
+
+rustup toolchain install nightly-2026-08-01 --profile minimal
+CARGO_INSTALL_ROOT="$PWD/target/vocabulary-public-api/tool" \
+  cargo install cargo-public-api --version 0.52.0 --locked
+cargo run -p omnigraph-vocabulary-guard --locked -- \
+  check --surface public-rust --base "$BASE_SHA" \
+  --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
+  --cargo-public-api target/vocabulary-public-api/tool/bin/cargo-public-api \
+  --public-api-target-dir target/vocabulary-public-api
+```
+
+The inventory must already exist at `BASE_SHA`; absence is a failed precondition,
+not a bootstrap signal. Public-Rust extraction can be cold and substrate-sized;
+reuse its target directory. For this vocabulary migration only, additionally
+run the explicit structural proof below. It removes only OpenAPI `description`
+and `summary` presentation fields before comparing the trees; route, method,
+schema, property, required, enum, status, header, default, and request changes
+still fail. This opt-in is migration evidence, not a permanent API-evolution
+gate:
+
+```bash
+cargo run -p omnigraph-vocabulary-guard --locked -- \
+  check --surface openapi --presentation-only --base "$BASE_SHA" \
+  --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
+  --openapi openapi.json
+```
+
 - **AWS feature build job**: `cargo build/test -p omnigraph-server --features aws` on ubuntu-latest.
 - **Windows binary build job**: `cargo build --release --locked -p omnigraph-cli -p omnigraph-server` on windows-latest with smoke checks for `omnigraph.exe version`, `omnigraph-server.exe --help`, and PowerShell installer syntax.
 - **RustFS S3 integration**: starts RustFS, requires a successful readiness

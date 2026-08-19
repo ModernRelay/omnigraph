@@ -97,6 +97,124 @@ jobs:
       - name: Verify AGENTS.md ↔ docs/ cross-links
         run: bash scripts/check-agents-md.sh
 
+  graph_vocabulary_guard:
+    name: Graph Vocabulary Guard
+    # Required PR context: keep this job independent of the documentation-only
+    # classifier so it always reports. The review-owned inventory protects the
+    # OpenAPI, Rust presentation-string, user-doc, and public-Rust surfaces.
+    runs-on: ubuntu-latest
+    # A cold default + all-features rustdoc pass over all seven public library
+    # crates is substrate-sized. Keep it bounded without pretending it is a
+    # ten-minute check; the pinned-tool and build-target caches make warm runs
+    # substantially cheaper.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source and comparison history
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          # `check` reads both the inventory and openapi.json from the exact
+          # comparison commit. A shallow checkout could turn that proof into a
+          # false missing-base failure.
+          fetch-depth: 0
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Resolve vocabulary comparison base
+        id: comparison_base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+
+          zero_sha=0000000000000000000000000000000000000000
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE_SHA"
+          elif [[ "$EVENT_NAME" == "push" && "$REF_TYPE" != "tag" && "$PUSH_BEFORE_SHA" != "$zero_sha" ]]; then
+            base="$PUSH_BEFORE_SHA"
+          else
+            # Tag creation commonly reports an all-zero `before`, while a
+            # manual run has no event base. Compare both with the checked-out
+            # commit's first parent rather than inventing a mutable branch tip.
+            base="$(git rev-parse "${GITHUB_SHA}^")"
+          fi
+
+          if [[ -z "${base:-}" || "$base" == "$zero_sha" ]]; then
+            echo "::error::unable to resolve a vocabulary comparison base"
+            exit 1
+          fi
+          git cat-file -e "${base}^{commit}"
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Install public-Rust system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Restore pinned public-Rust tooling
+        id: public_rust_tool_cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.rustup/toolchains/nightly-2026-08-01-x86_64-unknown-linux-gnu
+            ~/.rustup/update-hashes/nightly-2026-08-01-x86_64-unknown-linux-gnu
+            ${{ runner.temp }}/cargo-public-api
+          key: vocabulary-public-api-${{ runner.os }}-${{ runner.arch }}-nightly-2026-08-01-cargo-public-api-0.52.0-v1
+
+      - name: Install exact public-Rust tooling
+        id: public_rust_tool
+        run: |
+          set -euo pipefail
+
+          rustup toolchain install nightly-2026-08-01 --profile minimal
+          tool_root="$RUNNER_TEMP/cargo-public-api"
+          tool="$tool_root/bin/cargo-public-api"
+          if [[ ! -x "$tool" ]] || [[ "$($tool --version)" != "cargo-public-api 0.52.0" ]]; then
+            CARGO_INSTALL_ROOT="$tool_root" \
+              cargo install cargo-public-api --version 0.52.0 --locked
+          fi
+          [[ "$($tool --version)" == "cargo-public-api 0.52.0" ]]
+          echo "binary=$tool" >> "$GITHUB_OUTPUT"
+
+      - name: Cache public-Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target/vocabulary-public-api
+          key: vocabulary-public-api-nightly-2026-08-01-v1
+
+      - name: Test vocabulary guard
+        run: cargo test -p omnigraph-vocabulary-guard --locked
+
+      - name: Check OpenAPI, Rust-string, and user-doc vocabulary
+        env:
+          BASE_SHA: ${{ steps.comparison_base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          for surface in openapi rust-string user-docs; do
+            cargo run -p omnigraph-vocabulary-guard --locked -- \
+              check --surface "$surface" --base "$BASE_SHA" \
+              --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
+              --openapi openapi.json
+          done
+
+      - name: Check public-Rust vocabulary
+        env:
+          BASE_SHA: ${{ steps.comparison_base.outputs.sha }}
+          CARGO_PUBLIC_API: ${{ steps.public_rust_tool.outputs.binary }}
+        run: |
+          tool="${CARGO_PUBLIC_API:-cargo-public-api}"
+          cargo run -p omnigraph-vocabulary-guard --locked -- \
+            check --surface public-rust --base "$BASE_SHA" \
+            --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
+            --cargo-public-api "$tool" \
+            --public-api-target-dir target/vocabulary-public-api
+
   entrypoint_test:
     name: Container Entrypoint
     runs-on: ubuntu-latest

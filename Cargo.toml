@@ -9,6 +9,7 @@ members = [
     "crates/omnigraph-cluster",
     "crates/omnigraph-policy",
     "crates/omnigraph-server",
+    "tools/omnigraph-vocabulary-guard",
 ]
 default-members = [
     "crates/omnigraph",
@@ -83,6 +84,11 @@ url = "2"
 cedar-policy = "4.9"
 sha2 = "0.10"
 subtle = "2"
+pulldown-cmark = "0.13"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "visit"] }
+walkdir = "2"
 
 [workspace.lints.clippy]
 # Nested guards often read clearer than one merged condition (Polars allows this too).
