@@ -66,10 +66,10 @@ end-to-end benchmark: one instrument, two profiles
 │   │                    · multi-hop completion
 │   │                    (recall/precision@k: future work)
 │   ├── cost ··········· $/query decomposed: requests · egress · compute · tokens
-│   ├── storage calls ·· counts per RFC-031 operation class, per layer
+│   ├── storage calls ·· counts per RFC-031 layer-specific action class
 │   │                    (logical always · physical where exposed)
-│   ├── request timing · per-layer, per-operation-class cumulative time
-│   │                    · matching calibration per layer and operation class
+│   ├── request timing · per-layer, per-action-class cumulative time
+│   │                    · matching calibration per layer-specific action class
 │   │                    · concurrency witness (physical layer, where captured:
 │   │                      max requests in flight per measured span)
 │   └── noise residual · measured floor (A/A) · disturbance flags · per-rep spread
@@ -191,12 +191,14 @@ The axes and sweep points live in the contract tree above (Summary); this sectio
 - **Real S3**: the truth. Scheduled runs on a budget-capped scenario subset produce latency distributions and a regression trend over time, never single-run headline numbers, because a single real-network observation is weather, not climate.
 
 **Wall-clock is one measurement dimension; storage-call counts are the other,
-and every run records both.** The harness counts the run's storage calls per
-operation class, adopting RFC-031's operation vocabulary unchanged (`get`,
-`put`, `put_part`, `head`, `list`, `delete`, `copy`, `rename`, and the
-multipart operations) and naming RFC-031's layer distinction explicitly:
-logical operations and physical request attempts. Retries and multipart
-fan-out make those layers differ. The logical layer is mandatory in every
+and every run records both.** The harness adopts both of RFC-031's action
+vocabularies unchanged. Logical operations use `get`, `put`, `put_part`,
+`head`, `list`, `delete`, `copy`, `rename`, and logical multipart
+complete/abort. Physical attempts use HTTP `GET`, `HEAD`, `LIST`, `PUT`,
+`POST`, and `DELETE`, refined into multipart initiation, part upload,
+completion, abort, and copy where RFC-031 does so. Retries and multipart
+fan-out make those layers and vocabularies differ; there is no implicit
+logical-to-physical class mapping. The logical layer is mandatory in every
 record; the physical layer is recorded where the backend seam exposes it, and
 a record states per layer whether it is present or absent, never silently
 conflating the two. Counts land in the same record beside the timings, as
@@ -204,10 +206,12 @@ measurement columns, not gates: RFC-031's comparator remains the only pinned,
 gating count.
 
 The cross-check compares like with like, with every operand recorded. A
-***latency calibration*** is a map keyed by `(measurement layer, RFC-031
-operation class)`, measured by the harness under the record's backend identity
-and conditions and persisted in the record. For one layer `L`, predicted
-***cumulative request time*** is
+***latency calibration*** is a map keyed by `(measurement layer,
+layer-specific action class)`: logical keys come only from RFC-031's logical
+vocabulary, and physical keys come only from its physical request vocabulary.
+It is measured by the harness under the record's backend identity and
+conditions and persisted in the record. No calibration is translated or
+shared across layers. For one layer `L`, predicted ***cumulative request time*** is
 `Σ class(count[L,class] × calibration[L,class])`. The observed side is the
 matching per-operation-class cumulative time at layer `L`; summing those cells
 produces the observed layer total. A nonzero counted class without a matching
