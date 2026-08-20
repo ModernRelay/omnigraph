@@ -68,8 +68,8 @@ end-to-end benchmark: one instrument, two profiles
 │   ├── cost ··········· $/query decomposed: requests · egress · compute · tokens
 │   ├── storage calls ·· counts per RFC-031 operation class, per layer
 │   │                    (logical always · physical where exposed)
-│   ├── request timing · per-layer observed cumulative request time (where captured)
-│   │                    · latency calibration
+│   ├── request timing · per-layer, per-operation-class cumulative time
+│   │                    · matching calibration per layer and operation class
 │   │                    · concurrency witness (physical layer, where captured:
 │   │                      max requests in flight per measured span)
 │   └── noise residual · measured floor (A/A) · disturbance flags · per-rep spread
@@ -81,7 +81,8 @@ end-to-end benchmark: one instrument, two profiles
 │   │                  record-level identity, not a factor)
 │   │                · dataset-builder identity (version · parameters · fetch digests)
 │   │                · the point-name format version
-│   │                · per-layer presence statements (counts · timing · witness)
+│   │                · per-layer presence statements (counts · calibration
+│   │                  · timing · witness)
 │   │                · directional labels (rule 3) · claim margins (rule 7)
 │   │                · the stamped fixture-manifest reference
 │   │                · raw result rows (one per repetition)
@@ -93,12 +94,13 @@ end-to-end benchmark: one instrument, two profiles
 │   │                sweeps and comparisons run in numbers; never simulates faults
 │   ├── real S3 ···· truth: scheduled, budget-capped subset; distributions
 │   │                and trend, never single-run headlines
-│   └── cross-check  attempts × latency calibration ⇒ predicted cumulative,
-│                    reconciled against observed cumulative; elapsed joins only
-│                    in serial windows, read from the concurrency witness, never
-│                    assumed (no witness ⇒ no elapsed reconciliation;
-│                    logical-only counts: a stated lower bound);
-│                    deviation = a finding (fan-out allowance when logical-only)
+│   └── cross-check  Σ class(count[layer,class] × calibration[layer,class])
+│                    ⇒ predicted cumulative time for that same layer, reconciled
+│                    against observed cumulative time; any nonzero class without
+│                    calibration makes reconciliation unavailable, never partial;
+│                    elapsed joins only in serial windows, read from the
+│                    concurrency witness (no witness ⇒ no elapsed reconciliation);
+│                    logical-only records make no physical fan-out/request claim
 ├── ADDING A CASE = definition, not wiring
 │   ├── new point ······ declarative case definition (levels per factor);
 │   │                    the definition is its own registration
@@ -126,7 +128,16 @@ end-to-end benchmark: one instrument, two profiles
 
 ## Motivation
 
-**Counting is specified and arriving; time, cost, and quality have nothing yet.** The repository's measurement foundation is storage-call counting: the DST counting golden and the calibrated real-backend ceilings (originated in PR #503 and absorbed into the in-flight contributions), both specified under RFC-031 and its in-flight amendment, give exact, deterministic, CI-gateable storage-call counts per operation once landed. This RFC builds the next layer on that foundation: the counting instruments answer "how many calls", and the end-to-end benchmark extends the same discipline to the questions users ask next: "how fast, at what throughput, at what cost, with what answer quality, on a realistic workload against a named backend". Stating the rules first, in the counting instruments' spirit of determinism and checkability, is what lets those numbers be published with the same confidence the counts already enjoy.
+**Counting is specified and arriving; time, cost, and quality have nothing yet.** The repository's measurement foundation is storage-call counting:
+[RFC-031 §11](0031-comparative-cost-harness.md#11-amendment-2026-08-16-the-counting-side-as-built)
+records the DST counting golden, the calibrated real-backend ceilings first
+explored in PR #503, their implementation evidence, and their division of
+roles. Those instruments answer "how many calls"; this RFC builds the next
+layer by applying the same discipline to the questions users ask next: "how
+fast, at what throughput, at what cost, with what answer quality, on a
+realistic workload against a named backend". Stating the rules first, in the
+counting instruments' spirit of determinism and checkability, is what lets
+those numbers be published with the same confidence the counts already enjoy.
 
 **Unstated rules, not weak systems, are what discredit benchmark numbers.** Benchmark history shows what happens without stated rules. Database benchmarking (LDBC SNB, SIGMOD 2015 and VLDB 2022; "Fair Benchmarking Considered Difficult", DBTest 2018) catalogues the same mistakes recurring for decades: drivers that hide the worst latencies, setup work left untimed, backends left unnamed, debug builds, bare averages. Agent-memory benchmarking (the public LoCoMo scoring disputes) shows where that ends: the harness decides the ranking, not the system, and every number starts a public fight. Both fields agree on the fix: write the rules down before producing numbers, so any reader can check a number against them. This RFC is that write-down, for the one instrument whose numbers leave the repository.
 
@@ -179,7 +190,50 @@ The axes and sweep points live in the contract tree above (Summary); this sectio
 - **MinIO**: the repeatable rig. Real S3 request semantics at local latency, cheap enough that comparisons and sweeps run in numbers. Never simulates faults; fault injection belongs to the DST harness (RFC-032, RFC-037).
 - **Real S3**: the truth. Scheduled runs on a budget-capped scenario subset produce latency distributions and a regression trend over time, never single-run headline numbers, because a single real-network observation is weather, not climate.
 
-**Wall-clock is one measurement dimension; storage-call counts are the other, and every run records both.** The harness counts the run's storage calls per operation class, adopting RFC-031's operation vocabulary unchanged (get, put, put_part, head, list, delete, copy, rename, and the multipart operations) and naming RFC-031's layer distinction explicitly: logical operations, and physical request attempts (retries and multipart fan-out make these differ). The logical layer is mandatory in every record; the physical layer is recorded where the backend seam exposes it, and a record states per layer whether it is present or absent, never silently conflating the two. Counts land in the same record beside the timings, as measurement columns, not gates: RFC-031's comparator remains the only pinned, gating count. What the counts buy is the cross-check per run, and the cross-check compares like with like, with every operand recorded. The prediction multiplies attempt counts by a ***latency calibration*** (the backend's per-request latency, measured by the harness and persisted in the record, so both operands of the prediction are recorded), yielding predicted ***cumulative request time*** (the sum of request durations); where the physical layer is present the attempts are physical and the prediction is direct, so request fan-out appears in the counts rather than masquerading as a timing deviation, and where only the logical layer is present the prediction (logical operation counts times the calibration) is a stated lower bound (fan-out makes observed exceed predicted), with a deviation counting as a finding only beyond that allowance. The observed side is the per-layer observed cumulative request time (the sum of that layer's recorded request durations), persisted where captured with presence or absence stated per layer, exactly like the counts. Reconciliation compares predicted cumulative time against observed cumulative time. Elapsed wall-clock joins the reconciliation only inside a ***serial window***: a ***measured span*** (one repetition's measured window) whose ***concurrency witness*** reads one, where the witness is a measurement column recording the span's maximum number of storage requests simultaneously in flight, captured at the physical layer only (logical operations have no in-flight semantics, and one logical operation can fan out into concurrent physical requests, so a logical witness would prove nothing). In a serial window cumulative is at most elapsed and the gap is attributable non-storage time (engine compute between requests); where the witness exceeds one, cumulative may exceed elapsed by up to the concurrency achieved, so only cumulative-versus-cumulative reconciles there. A single operation is not automatically serial, since the engine issues concurrent storage requests inside one operation, so serial windows are read from the witness, never assumed from the profile; a record without a physical layer carries no witness, so elapsed reconciliation is unavailable there, never assumed. A remaining material deviation (hidden requests, contention) is a finding in its own right, per the same-ruler reconciliation the in-flight RFC-031 amendment proposes.
+**Wall-clock is one measurement dimension; storage-call counts are the other,
+and every run records both.** The harness counts the run's storage calls per
+operation class, adopting RFC-031's operation vocabulary unchanged (`get`,
+`put`, `put_part`, `head`, `list`, `delete`, `copy`, `rename`, and the
+multipart operations) and naming RFC-031's layer distinction explicitly:
+logical operations and physical request attempts. Retries and multipart
+fan-out make those layers differ. The logical layer is mandatory in every
+record; the physical layer is recorded where the backend seam exposes it, and
+a record states per layer whether it is present or absent, never silently
+conflating the two. Counts land in the same record beside the timings, as
+measurement columns, not gates: RFC-031's comparator remains the only pinned,
+gating count.
+
+The cross-check compares like with like, with every operand recorded. A
+***latency calibration*** is a map keyed by `(measurement layer, RFC-031
+operation class)`, measured by the harness under the record's backend identity
+and conditions and persisted in the record. For one layer `L`, predicted
+***cumulative request time*** is
+`Σ class(count[L,class] × calibration[L,class])`. The observed side is the
+matching per-operation-class cumulative time at layer `L`; summing those cells
+produces the observed layer total. A nonzero counted class without a matching
+calibration or observed timing makes reconciliation for that entire layer
+unavailable—implementations never drop the class or substitute another
+class's calibration. Physical-layer reconciliation includes retry and
+multipart fan-out directly in its attempt counts. Logical-only reconciliation
+compares logical counts, calibrations, and timings and makes no claim about the
+number or duration of physical attempts. It therefore defines neither a
+fan-out allowance nor a hidden-physical-request finding. A material residual
+may be reported only for a layer whose complete inputs are present, and the
+finding names that layer.
+
+Elapsed wall-clock joins the reconciliation only inside a ***serial window***:
+a ***measured span*** (one repetition's measured window) whose ***concurrency
+witness*** reads one. The witness records the span's maximum number of physical
+storage requests simultaneously in flight; logical operations have no such
+witness because one logical operation can fan out into concurrent physical
+requests. In a serial window cumulative request time is at most elapsed time,
+and the gap is attributable non-storage time such as engine compute between
+requests. Where the witness exceeds one, cumulative time may exceed elapsed
+time by up to the concurrency achieved, so only cumulative-versus-cumulative
+reconciles. A single operation is not automatically serial. A record without
+the physical layer carries no witness, so elapsed reconciliation is
+unavailable rather than assumed. This is the same-ruler pattern recorded in
+[RFC-031 §11](0031-comparative-cost-harness.md#11-amendment-2026-08-16-the-counting-side-as-built).
 
 **Cost is a decomposed, priced column.** The realistic profile's cost column decomposes into storage requests, egress, compute, and, for workloads whose answers involve a language model, token spend; each component is priced against a dated price table recorded with the run, so a cost number carries its own exchange rate the way RFC-031's pricing does.
 
@@ -204,12 +258,12 @@ Each rule states what it forbids; violating a measurement rule (1 to 4, 7) makes
 3. **Repetitions, dispersion, controlled warmth.** Every wall-clock cell reports its repetition count and a dispersion measure (percentiles, or median with minimum and maximum); bare means are banned, per DBTest 2018's guidance that means reported without dispersion mislead. A cell declares its warmth level, and every repetition must actually execute under it: a cold first repetition folded into a warm cell invalidates the cell. A tail percentile requires a sample count that supports it: p95 at least 20 samples (RFC-031's rule), p99 at least 100; smaller-sample cells are directional evidence only, labeled so in the record.
 4. **Identity on every number.** Every published number carries its backend identity and its machine specification; numbers from different backends or machine specifications never compare silently. Conclusions drawn only from a local backend are provisional and labeled so.
 5. **Manual before automatic.** The benchmark runs manually until its run-to-run variance is understood; only then may it earn a schedule, because automating un-understood variance automates the production of noise. Numbers produced by a schedule that was not earned this way are unpublishable. All scheduling (nightly MinIO runs, the real-S3 trend series, alerting) is a separate later change gated on that understanding.
-6. **This instrument never gates.** No measurement from this instrument gates anything, at any CI stage. Wall-clock never gates because timing variance on shared runners converts a gate into a lottery; this instrument's per-run counts never gate because they are unpinned measurement columns, and turning an unpinned measurement into a gate would recreate the counting golden without its review discipline. Count-based gating belongs to the counting instruments, at the stages RFC-031 and its amendment assign them (RFC-031 states its harness is a release gate and an on-demand tool, not a per-PR performance gate, aside from one deliberately bounded structural guard it mandates; this RFC neither adds a gate nor moves one). The number-level consequence: a number produced by this instrument stays a valid measurement even when misused as a gate; the gate is what must be removed.
+6. **This instrument never gates.** No measurement from this instrument gates anything, at any CI stage. Wall-clock never gates because timing variance on shared runners converts a gate into a lottery; this instrument's per-run counts never gate because they are unpinned measurement columns, and turning an unpinned measurement into a gate would recreate the counting golden without its review discipline. Count-based gating belongs to the counting instruments, at the stages RFC-031 §§6 and 11 assign them (RFC-031 states its harness is a release gate and an on-demand tool, not a per-PR performance gate, aside from one deliberately bounded structural guard it mandates; this RFC neither adds a gate nor moves one). The number-level consequence: a number produced by this instrument stays a valid measurement even when misused as a gate; the gate is what must be removed.
 7. **Effects clear the floor.** Every comparison-bearing claim (a fix's effect, a regression, a difference between systems) must exceed the applicable per-metric noise floor by a declared margin, and the margin is itself persisted: a protocol-level default, or a per-claim declaration recorded beside the citation, never an after-the-fact choice. An effect below floor-plus-margin is reported as "no detected effect", never as a small effect. The floor is itself a recorded measurement, so every effect claim carries its own denominator.
 
 ## Relation to existing instruments
 
-**RFC-031 owns the counting instruments; this RFC adds only above them.** The repository has two other measurement tools: the logical-cost comparator and the real-backend qualifier (both call-counting, both owned by RFC-031 and its in-flight amendment, which this RFC adopts by name and re-specifies nothing of). Three tools produce three kinds of number, and this instrument's two profiles differ again, so measurement-bearing prose should name which tool (and, for this one, which profile) a number came from; "the benchmark" unqualified hides exactly the fact a reader needs. One term boundary is restated for visibility: RFC-037 separately uses "instrument" for one built capability inside the DST harness; that narrower, harness-internal sense is unchanged there, and this RFC's use is always the whole measurement tool. If review finds any sentence here in tension with RFC-031 or its amendment, RFC-031 wins and this RFC is the document to fix.
+**RFC-031 owns the counting instruments; this RFC adds only above them.** The repository has two other measurement tools: the logical-cost comparator and the real-backend qualifier (both call-counting, both owned by RFC-031 §§6 and 11, which this RFC adopts by name and re-specifies nothing of). Three tools produce three kinds of number, and this instrument's two profiles differ again, so measurement-bearing prose should name which tool (and, for this one, which profile) a number came from; "the benchmark" unqualified hides exactly the fact a reader needs. One term boundary is restated for visibility: RFC-037 separately uses "instrument" for one built capability inside the DST harness; that narrower, harness-internal sense is unchanged there, and this RFC's use is always the whole measurement tool. If review finds any sentence here in tension with RFC-031, RFC-031 wins and this RFC is the document to fix.
 
 ## Non-goals
 
