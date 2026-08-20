@@ -61,8 +61,9 @@ artifacts prove insufficient (§4.4).
 **Amendment note (2026-08-16).** §11 records what has been built against this
 RFC since it was drafted: two concurrent implementations of its counting idea
 (PR #503 on real backends, and a counting pass hosted on the deterministic
-simulation harness proposed in PR #507), the first measurement placing both on
-one ruler, and the division of roles that follows. Nothing in §§1-10 is
+simulation harness recorded in [RFC-0037](0037-deterministic-simulation-harness.md)),
+the first measurement placing both on one ruler, and the division of roles
+that follows. Nothing in §§1-10 is
 retracted; §11 narrows where the counting side goes next.
 
 ## 1. Why the existing instruments do not cover this
@@ -605,8 +606,9 @@ The harness must prove itself before its numbers are trusted:
 Added after the original draft. Records results from DST v1, the first
 iteration of the project's deterministic simulation testing (bench runs 001
 and 002), and from PR #503. Design authority for the hosting harness is the
-deterministic simulation RFC (PR #507, in review; like this amendment, it
-documents machinery already built and measured).
+merged [RFC-0037](0037-deterministic-simulation-harness.md) design record
+(PR #507); like this amendment, it documents machinery already built and
+measured.
 
 ### 11.1 Two implementations of the counting idea
 
