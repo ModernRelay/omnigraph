@@ -320,6 +320,90 @@ pub enum OmniError {
     InitializationClaimed { uri: String },
 }
 
+/// Cloneable, closed payload for engine-domain failures that may cross a
+/// shared DataFusion stream. Keep this list narrow: every added variant becomes
+/// part of the stream adapter's typed recovery contract.
+#[derive(Debug, Clone)]
+enum DataFusionStreamFailure {
+    Storage(StorageFailure),
+    Manifest(ManifestError),
+    ResourceLimitExceeded {
+        resource: String,
+        limit: u64,
+        actual: u64,
+    },
+    ExternalBlobPolicy {
+        uri: String,
+        reason: String,
+    },
+    ExternalBlobSource {
+        uri: String,
+        reason: String,
+    },
+    BlobIntegrity {
+        reason: String,
+    },
+}
+
+impl DataFusionStreamFailure {
+    fn into_omni_error(self) -> OmniError {
+        match self {
+            Self::Storage(failure) => OmniError::Storage(failure),
+            Self::Manifest(error) => OmniError::Manifest(error),
+            Self::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => OmniError::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            },
+            Self::ExternalBlobPolicy { uri, reason } => {
+                OmniError::ExternalBlobPolicy { uri, reason }
+            }
+            Self::ExternalBlobSource { uri, reason } => {
+                OmniError::ExternalBlobSource { uri, reason }
+            }
+            Self::BlobIntegrity { reason } => OmniError::BlobIntegrity { reason },
+        }
+    }
+}
+
+impl TryFrom<OmniError> for DataFusionStreamFailure {
+    type Error = OmniError;
+
+    fn try_from(error: OmniError) -> std::result::Result<Self, Self::Error> {
+        match error {
+            OmniError::Storage(failure) => Ok(Self::Storage(failure)),
+            OmniError::Manifest(error) => Ok(Self::Manifest(error)),
+            OmniError::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => Ok(Self::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            }),
+            OmniError::ExternalBlobPolicy { uri, reason } => {
+                Ok(Self::ExternalBlobPolicy { uri, reason })
+            }
+            OmniError::ExternalBlobSource { uri, reason } => {
+                Ok(Self::ExternalBlobSource { uri, reason })
+            }
+            OmniError::BlobIntegrity { reason } => Ok(Self::BlobIntegrity { reason }),
+            error => Err(error),
+        }
+    }
+}
+
+/// Private marker type whose concrete identity survives clone-based DataFusion
+/// sharing. Recovery trusts this carrier, never display text.
+#[derive(Debug, Clone, Error)]
+#[error("{}", .0.clone().into_omni_error())]
+struct DataFusionStreamFailureCarrier(DataFusionStreamFailure);
+
 impl From<omnigraph_storage::StorageError> for OmniError {
     fn from(error: omnigraph_storage::StorageError) -> Self {
         match error {
@@ -384,9 +468,17 @@ impl OmniError {
     }
 
     /// Recover an engine-domain error carried through an engine-produced
-    /// DataFusion stream and Lance's `External` wrapper. Every other Lance
-    /// result keeps the ordinary storage classification.
+    /// DataFusion stream and Lance's typed wrappers. Every other Lance result
+    /// keeps the ordinary storage classification.
     pub(crate) fn lance_stream(error: lance::Error) -> Self {
+        if let Some(error) = recover_datafusion_stream_failure(&error) {
+            return error;
+        }
+
+        // Preserve the pre-carrier behavior for an unsupported OmniError only
+        // when it is still the direct, owned External payload. We deliberately
+        // do not recover nested plain OmniError values: only the private
+        // structured carrier is safe to clone through shared execution paths.
         match error.into_external() {
             Ok(source) => match source.downcast::<Self>() {
                 Ok(error) => *error,
@@ -399,7 +491,12 @@ impl OmniError {
     /// Carry an engine-domain failure through a DataFusion stream without
     /// flattening its variant, storage kind, or source into display text.
     pub(crate) fn into_datafusion_external(self) -> datafusion::error::DataFusionError {
-        datafusion::error::DataFusionError::External(Box::new(self))
+        let source: Box<dyn std::error::Error + Send + Sync> =
+            match DataFusionStreamFailure::try_from(self) {
+                Ok(failure) => Box::new(DataFusionStreamFailureCarrier(failure)),
+                Err(error) => Box::new(error),
+            };
+        datafusion::error::DataFusionError::External(source)
     }
 
     /// Preserve typed storage evidence carried through DataFusion execution;
@@ -409,7 +506,7 @@ impl OmniError {
             Ok(error) => return error,
             Err(error) => error,
         };
-        match find_storage_source_kind(&error) {
+        match find_datafusion_storage_source_kind(&error) {
             Some(kind) => Self::classified_storage(kind, error),
             None => Self::DataFusion(error.to_string()),
         }
@@ -424,7 +521,8 @@ impl OmniError {
             Ok(error) => return error,
             Err(error) => error,
         };
-        let kind = find_storage_source_kind(&error).unwrap_or(StorageFailureKind::Unknown);
+        let kind =
+            find_datafusion_storage_source_kind(&error).unwrap_or(StorageFailureKind::Unknown);
         Self::classified_storage(kind, error)
     }
 
@@ -591,9 +689,71 @@ impl OmniError {
         }
     }
 }
+
+// Match the storage classifier's public eight-link contract. Its constant is
+// private to omnigraph-storage, so this independent domain-carrier walk keeps a
+// local bound rather than broadening the cross-crate API for one caller.
+const MAX_ENGINE_SOURCE_DEPTH: usize = 8;
+
+/// Recover only the private structured carrier from a bounded borrowed source
+/// walk. Borrowing is essential for multiply-owned DataFusion `Shared` errors,
+/// which cannot be consumed or downcast by ownership.
+fn recover_datafusion_stream_failure(
+    source: &(dyn std::error::Error + 'static),
+) -> Option<OmniError> {
+    let mut current = source;
+    for _ in 0..MAX_ENGINE_SOURCE_DEPTH {
+        if let Some(carrier) = current.downcast_ref::<DataFusionStreamFailureCarrier>() {
+            return Some(carrier.0.clone().into_omni_error());
+        }
+        current = next_datafusion_stream_source(current)?;
+    }
+    None
+}
+
+fn next_datafusion_stream_source<'a>(
+    source: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    if let Some(error) = source.downcast_ref::<datafusion::error::DataFusionError>() {
+        return datafusion_opaque_source(error);
+    }
+    if let Some(error) = source.downcast_ref::<lance::Error>() {
+        return lance_opaque_source(error);
+    }
+    None
+}
+
+fn datafusion_opaque_source(
+    error: &datafusion::error::DataFusionError,
+) -> Option<&(dyn std::error::Error + 'static)> {
+    match error {
+        datafusion::error::DataFusionError::External(source) => Some(source.as_ref()),
+        datafusion::error::DataFusionError::Context(_, source)
+        | datafusion::error::DataFusionError::Diagnostic(_, source) => Some(source.as_ref()),
+        datafusion::error::DataFusionError::Shared(source) => Some(source.as_ref()),
+        _ => None,
+    }
+}
+
+fn lance_opaque_source(error: &lance::Error) -> Option<&(dyn std::error::Error + 'static)> {
+    match error {
+        lance::Error::External { source } | lance::Error::IO { source, .. } => {
+            Some(source.as_ref())
+        }
+        lance::Error::Wrapped { error, .. } => Some(error.as_ref()),
+        _ => None,
+    }
+}
+
 fn recover_datafusion_engine_error(
     error: datafusion::error::DataFusionError,
 ) -> std::result::Result<OmniError, datafusion::error::DataFusionError> {
+    if let Some(error) = recover_datafusion_stream_failure(&error) {
+        return Ok(error);
+    }
+
+    // Unsupported OmniError variants retain their historical direct-External
+    // behavior, but are not recursively inferred through wrappers or strings.
     match error {
         datafusion::error::DataFusionError::External(source) => {
             match source.downcast::<OmniError>() {
@@ -607,6 +767,33 @@ fn recover_datafusion_engine_error(
 
 fn classify_lance_error(error: &lance::Error) -> StorageFailureKind {
     find_storage_source_kind(error).unwrap_or(StorageFailureKind::Unknown)
+}
+
+/// A DataFusion error is storage-owned only when its approved opaque wrappers
+/// lead to a typed storage source. Explicit query/computation variants,
+/// collections, arbitrary wrappers, and plain OmniError payloads retain their
+/// outer domain category.
+fn find_datafusion_storage_source_kind(
+    error: &datafusion::error::DataFusionError,
+) -> Option<StorageFailureKind> {
+    let mut current: &(dyn std::error::Error + 'static) = error;
+    for _ in 0..MAX_ENGINE_SOURCE_DEPTH {
+        if let Some(error) = current.downcast_ref::<datafusion::error::DataFusionError>() {
+            current = datafusion_opaque_source(error)?;
+            continue;
+        }
+        if current.is::<OmniError>() || current.is::<DataFusionStreamFailureCarrier>() {
+            return None;
+        }
+        let storage_owned = current.is::<lance::Error>()
+            || current.is::<lance_namespace::NamespaceError>()
+            || current.is::<object_store::Error>()
+            || current.is::<object_store::client::HttpError>();
+        return storage_owned
+            .then(|| find_storage_source_kind(error))
+            .flatten();
+    }
+    None
 }
 
 fn classify_engine_storage_source<'a>(
@@ -657,6 +844,15 @@ fn classify_engine_storage_source<'a>(
     }
     if let Some(error) = source.downcast_ref::<lance_namespace::NamespaceError>() {
         return Break(classify_namespace_code(error.code()));
+    }
+    if let Some(error) = source.downcast_ref::<datafusion::error::DataFusionError>() {
+        return match datafusion_opaque_source(error) {
+            Some(source) => Continue(Some(source)),
+            None => Break(StorageFailureKind::Unknown),
+        };
+    }
+    if source.is::<OmniError>() || source.is::<DataFusionStreamFailureCarrier>() {
+        return Break(StorageFailureKind::Unknown);
     }
     Continue(None)
 }
@@ -721,6 +917,21 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CyclicSource;
+
+    impl std::fmt::Display for CyclicSource {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("cyclic source")
+        }
+    }
+
+    impl std::error::Error for CyclicSource {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self)
+        }
+    }
+
     fn source_chain(
         links: usize,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -730,6 +941,112 @@ mod tests {
 
     fn assert_lance_kind(error: lance::Error, expected: StorageFailureKind) {
         assert_eq!(classify_lance_error(&error), expected, "{error}");
+    }
+
+    fn supported_stream_failures() -> Vec<OmniError> {
+        vec![
+            OmniError::Storage(StorageFailure::new(
+                StorageFailureKind::NotFound,
+                "storage: exact carried failure",
+            )),
+            OmniError::manifest_read_set_changed(
+                "branch:main",
+                Some("commit-before".to_string()),
+                Some("commit-after".to_string()),
+            ),
+            OmniError::ResourceLimitExceeded {
+                resource: "blob materialization bytes".to_string(),
+                limit: 10,
+                actual: 11,
+            },
+            OmniError::ExternalBlobPolicy {
+                uri: "s3://allowed/redacted".to_string(),
+                reason: "outside the graph allowlist".to_string(),
+            },
+            OmniError::ExternalBlobSource {
+                uri: "s3://allowed/missing".to_string(),
+                reason: "source probe timed out".to_string(),
+            },
+            OmniError::BlobIntegrity {
+                reason: "persisted descriptor contradiction".to_string(),
+            },
+        ]
+    }
+
+    fn assert_same_stream_failure(actual: OmniError, expected: OmniError) {
+        match (actual, expected) {
+            (OmniError::Storage(actual), OmniError::Storage(expected)) => {
+                assert_eq!(actual, expected);
+            }
+            (OmniError::Manifest(actual), OmniError::Manifest(expected)) => {
+                assert_eq!(actual.kind, expected.kind);
+                assert_eq!(actual.message, expected.message);
+                assert_eq!(actual.details, expected.details);
+            }
+            (
+                OmniError::ResourceLimitExceeded {
+                    resource: actual_resource,
+                    limit: actual_limit,
+                    actual,
+                },
+                OmniError::ResourceLimitExceeded {
+                    resource: expected_resource,
+                    limit: expected_limit,
+                    actual: expected_actual,
+                },
+            ) => {
+                assert_eq!(actual_resource, expected_resource);
+                assert_eq!(actual_limit, expected_limit);
+                assert_eq!(actual, expected_actual);
+            }
+            (
+                OmniError::ExternalBlobPolicy {
+                    uri: actual_uri,
+                    reason: actual_reason,
+                },
+                OmniError::ExternalBlobPolicy {
+                    uri: expected_uri,
+                    reason: expected_reason,
+                },
+            ) => {
+                assert_eq!(actual_uri, expected_uri);
+                assert_eq!(actual_reason, expected_reason);
+            }
+            (
+                OmniError::ExternalBlobSource {
+                    uri: actual_uri,
+                    reason: actual_reason,
+                },
+                OmniError::ExternalBlobSource {
+                    uri: expected_uri,
+                    reason: expected_reason,
+                },
+            ) => {
+                assert_eq!(actual_uri, expected_uri);
+                assert_eq!(actual_reason, expected_reason);
+            }
+            (
+                OmniError::BlobIntegrity {
+                    reason: actual_reason,
+                },
+                OmniError::BlobIntegrity {
+                    reason: expected_reason,
+                },
+            ) => assert_eq!(actual_reason, expected_reason),
+            (actual, expected) => {
+                panic!("stream failure changed variant: actual={actual:?}, expected={expected:?}")
+            }
+        }
+    }
+
+    fn stream_carrier_source(error: OmniError) -> Box<dyn std::error::Error + Send + Sync> {
+        match error.into_datafusion_external() {
+            datafusion::error::DataFusionError::External(source) => {
+                assert!(source.is::<DataFusionStreamFailureCarrier>());
+                source
+            }
+            error => panic!("stream failure was not carried as External: {error:?}"),
+        }
     }
 
     #[test]
@@ -1013,14 +1330,13 @@ mod tests {
                 "arrow-wrapped transport timeout",
             ))),
         ));
-        let arrow_wrapped = OmniError::datafusion(datafusion::error::DataFusionError::ArrowError(
-            Box::new(arrow_wrapped),
-            None,
+        let arrow_wrapped =
+            datafusion::error::DataFusionError::ArrowError(Box::new(arrow_wrapped), None);
+        let arrow_text = arrow_wrapped.to_string();
+        assert!(matches!(
+            OmniError::datafusion(arrow_wrapped),
+            OmniError::DataFusion(ref message) if message == &arrow_text
         ));
-        assert_eq!(
-            arrow_wrapped.storage_failure().map(|failure| failure.kind),
-            Some(StorageFailureKind::Transient)
-        );
 
         let internal =
             datafusion::error::DataFusionError::Execution("engine-owned scan failed".to_string());
@@ -1070,6 +1386,421 @@ mod tests {
     }
 
     #[test]
+    fn datafusion_stream_carrier_preserves_every_supported_failure() {
+        for (carried, expected) in supported_stream_failures()
+            .into_iter()
+            .zip(supported_stream_failures())
+        {
+            let recovered = OmniError::datafusion(carried.into_datafusion_external());
+            assert_same_stream_failure(recovered, expected);
+        }
+
+        for (carried, expected) in supported_stream_failures()
+            .into_iter()
+            .zip(supported_stream_failures())
+        {
+            let recovered = OmniError::datafusion_internal(carried.into_datafusion_external());
+            assert_same_stream_failure(recovered, expected);
+        }
+    }
+
+    #[test]
+    fn datafusion_stream_carrier_survives_context_diagnostic_and_shared() {
+        use datafusion::common::Diagnostic;
+        use datafusion::error::DataFusionError;
+        use std::sync::Arc;
+
+        let contextual = OmniError::ResourceLimitExceeded {
+            resource: "context bytes".to_string(),
+            limit: 20,
+            actual: 21,
+        };
+        let expected = OmniError::ResourceLimitExceeded {
+            resource: "context bytes".to_string(),
+            limit: 20,
+            actual: 21,
+        };
+        let contextual = DataFusionError::Context(
+            "context wrapper".to_string(),
+            Box::new(contextual.into_datafusion_external()),
+        );
+        assert_same_stream_failure(OmniError::datafusion(contextual), expected);
+
+        let diagnostic = OmniError::ExternalBlobPolicy {
+            uri: "s3://allowed/context".to_string(),
+            reason: "diagnostic policy".to_string(),
+        };
+        let expected = OmniError::ExternalBlobPolicy {
+            uri: "s3://allowed/context".to_string(),
+            reason: "diagnostic policy".to_string(),
+        };
+        let diagnostic = diagnostic
+            .into_datafusion_external()
+            .with_diagnostic(Diagnostic::new_error("diagnostic wrapper", None));
+        assert_same_stream_failure(OmniError::datafusion_internal(diagnostic), expected);
+
+        let shared = Arc::new(
+            OmniError::ExternalBlobSource {
+                uri: "s3://allowed/shared".to_string(),
+                reason: "shared source".to_string(),
+            }
+            .into_datafusion_external(),
+        );
+        let retained = Arc::clone(&shared);
+        let expected = OmniError::ExternalBlobSource {
+            uri: "s3://allowed/shared".to_string(),
+            reason: "shared source".to_string(),
+        };
+        assert_same_stream_failure(
+            OmniError::datafusion(DataFusionError::Shared(shared)),
+            expected,
+        );
+        drop(retained);
+
+        let shared = Arc::new(
+            OmniError::manifest_read_set_changed(
+                "nested-shared",
+                Some("before".to_string()),
+                Some("after".to_string()),
+            )
+            .into_datafusion_external(),
+        );
+        let retained = Arc::clone(&shared);
+        let expected = OmniError::manifest_read_set_changed(
+            "nested-shared",
+            Some("before".to_string()),
+            Some("after".to_string()),
+        );
+        let nested = DataFusionError::Context(
+            "outer context".to_string(),
+            Box::new(
+                DataFusionError::Shared(shared)
+                    .with_diagnostic(Diagnostic::new_error("inner diagnostic", None)),
+            ),
+        );
+        assert_same_stream_failure(OmniError::datafusion_internal(nested), expected);
+        drop(retained);
+    }
+
+    #[test]
+    fn datafusion_stream_carrier_survives_lance_typed_wrappers() {
+        use datafusion::common::Diagnostic;
+        use datafusion::error::DataFusionError;
+        use std::sync::Arc;
+
+        let external = OmniError::ResourceLimitExceeded {
+            resource: "external bytes".to_string(),
+            limit: 30,
+            actual: 31,
+        };
+        let expected = OmniError::ResourceLimitExceeded {
+            resource: "external bytes".to_string(),
+            limit: 30,
+            actual: 31,
+        };
+        assert_same_stream_failure(
+            OmniError::lance_stream(lance::Error::external(stream_carrier_source(external))),
+            expected,
+        );
+
+        let io = OmniError::ExternalBlobPolicy {
+            uri: "s3://allowed/io".to_string(),
+            reason: "io policy".to_string(),
+        };
+        let expected = OmniError::ExternalBlobPolicy {
+            uri: "s3://allowed/io".to_string(),
+            reason: "io policy".to_string(),
+        };
+        assert_same_stream_failure(
+            OmniError::lance_stream(lance::Error::io_source(stream_carrier_source(io))),
+            expected,
+        );
+
+        let wrapped = OmniError::BlobIntegrity {
+            reason: "wrapped integrity".to_string(),
+        };
+        let expected = OmniError::BlobIntegrity {
+            reason: "wrapped integrity".to_string(),
+        };
+        assert_same_stream_failure(
+            OmniError::lance_stream(lance::Error::wrapped(stream_carrier_source(wrapped))),
+            expected,
+        );
+
+        let contextual = DataFusionError::Context(
+            "context converted by Lance".to_string(),
+            Box::new(
+                OmniError::ExternalBlobSource {
+                    uri: "s3://allowed/lance-context".to_string(),
+                    reason: "context source".to_string(),
+                }
+                .into_datafusion_external(),
+            ),
+        );
+        let expected = OmniError::ExternalBlobSource {
+            uri: "s3://allowed/lance-context".to_string(),
+            reason: "context source".to_string(),
+        };
+        assert_same_stream_failure(
+            OmniError::lance_stream(lance::Error::from(contextual)),
+            expected,
+        );
+
+        let diagnostic = OmniError::Storage(StorageFailure::new(
+            StorageFailureKind::Transient,
+            "storage: diagnostic storage",
+        ))
+        .into_datafusion_external()
+        .with_diagnostic(Diagnostic::new_error("diagnostic converted by Lance", None));
+        let expected = OmniError::Storage(StorageFailure::new(
+            StorageFailureKind::Transient,
+            "storage: diagnostic storage",
+        ));
+        assert_same_stream_failure(
+            OmniError::lance_stream(lance::Error::from(diagnostic)),
+            expected,
+        );
+
+        let single_owner = Arc::new(
+            OmniError::BlobIntegrity {
+                reason: "single-owner shared".to_string(),
+            }
+            .into_datafusion_external(),
+        );
+        let expected = OmniError::BlobIntegrity {
+            reason: "single-owner shared".to_string(),
+        };
+        assert_same_stream_failure(
+            OmniError::lance_stream(lance::Error::from(DataFusionError::Shared(single_owner))),
+            expected,
+        );
+
+        let shared = Arc::new(
+            OmniError::Manifest(ManifestError::new(
+                ManifestErrorKind::Internal,
+                "nested multiply-owned shared",
+            ))
+            .into_datafusion_external(),
+        );
+        let retained = Arc::clone(&shared);
+        let nested = DataFusionError::Context(
+            "outer Lance context".to_string(),
+            Box::new(DataFusionError::Shared(shared)),
+        );
+        let expected = OmniError::Manifest(ManifestError::new(
+            ManifestErrorKind::Internal,
+            "nested multiply-owned shared",
+        ));
+        assert_same_stream_failure(
+            OmniError::lance_stream(lance::Error::from(nested)),
+            expected,
+        );
+        drop(retained);
+    }
+
+    #[test]
+    fn lance_top_level_multiply_owned_shared_has_a_pinned_upstream_type_loss() {
+        use datafusion::error::DataFusionError;
+        use std::sync::Arc;
+
+        let shared = Arc::new(
+            OmniError::BlobIntegrity {
+                reason: "top-level multiply-owned shared".to_string(),
+            }
+            .into_datafusion_external(),
+        );
+        let retained = Arc::clone(&shared);
+        let lance = lance::Error::from(DataFusionError::Shared(shared));
+        assert!(matches!(lance, lance::Error::Execution { .. }));
+        let lance_message = lance.to_string();
+
+        let recovered = OmniError::lance_stream(lance);
+        assert_eq!(
+            recovered.storage_failure().map(|failure| failure.kind),
+            Some(StorageFailureKind::Unknown)
+        );
+        assert_eq!(recovered.to_string(), format!("storage: {lance_message}"));
+        assert!(!matches!(recovered, OmniError::BlobIntegrity { .. }));
+        drop(retained);
+    }
+
+    #[test]
+    fn unsupported_stream_errors_keep_direct_behavior_and_fail_closed_when_nested() {
+        use datafusion::error::DataFusionError;
+        use std::sync::Arc;
+
+        let direct =
+            OmniError::Policy("direct unsupported policy".to_string()).into_datafusion_external();
+        match &direct {
+            DataFusionError::External(source) => {
+                assert!(source.is::<OmniError>());
+                assert!(!source.is::<DataFusionStreamFailureCarrier>());
+            }
+            error => panic!("unsupported failure was not External: {error:?}"),
+        }
+        assert!(matches!(
+            OmniError::datafusion(direct),
+            OmniError::Policy(ref message) if message == "direct unsupported policy"
+        ));
+
+        let nested = DataFusionError::Context(
+            "unsupported context".to_string(),
+            Box::new(
+                OmniError::Policy("nested unsupported policy".to_string())
+                    .into_datafusion_external(),
+            ),
+        );
+        assert!(matches!(
+            OmniError::datafusion(nested),
+            OmniError::DataFusion(_)
+        ));
+
+        let hidden_carrier = stream_carrier_source(OmniError::BlobIntegrity {
+            reason: "must not cross unsupported OmniError::Io".to_string(),
+        });
+        let nested_io = DataFusionError::Context(
+            "non-storage I/O domain".to_string(),
+            Box::new(DataFusionError::External(Box::new(OmniError::Io(
+                std::io::Error::new(std::io::ErrorKind::TimedOut, hidden_carrier),
+            )))),
+        );
+        assert!(recover_datafusion_stream_failure(&nested_io).is_none());
+        let nested_io_text = nested_io.to_string();
+        assert!(matches!(
+            OmniError::datafusion(nested_io),
+            OmniError::DataFusion(ref message) if message == &nested_io_text
+        ));
+
+        let shared = Arc::new(
+            OmniError::Policy("shared unsupported policy".to_string()).into_datafusion_external(),
+        );
+        let retained = Arc::clone(&shared);
+        assert!(matches!(
+            OmniError::datafusion(DataFusionError::Shared(shared)),
+            OmniError::DataFusion(_)
+        ));
+        drop(retained);
+
+        let direct_lance = OmniError::lance_stream(lance::Error::external(Box::new(
+            OmniError::Policy("direct Lance policy".to_string()),
+        )));
+        assert!(matches!(
+            direct_lance,
+            OmniError::Policy(ref message) if message == "direct Lance policy"
+        ));
+
+        let nested_lance = OmniError::lance_stream(lance::Error::io_source(Box::new(
+            OmniError::Policy("nested Lance policy".to_string()),
+        )));
+        assert_eq!(
+            nested_lance.storage_failure().map(|failure| failure.kind),
+            Some(StorageFailureKind::Unknown)
+        );
+
+        let nested_lance_io =
+            lance::Error::io_source(Box::new(OmniError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "non-storage I/O nested under Lance",
+            ))));
+        let nested_lance_io_text = nested_lance_io.to_string();
+        let nested_lance_io = OmniError::lance_stream(nested_lance_io);
+        assert_eq!(
+            nested_lance_io
+                .storage_failure()
+                .map(|failure| failure.kind),
+            Some(StorageFailureKind::Unknown)
+        );
+        assert_eq!(
+            nested_lance_io.to_string(),
+            format!("storage: {nested_lance_io_text}")
+        );
+    }
+
+    #[test]
+    fn explicit_datafusion_and_lance_conditions_block_inner_carriers() {
+        use datafusion::error::DataFusionError;
+
+        let raw_io = DataFusionError::External(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "raw DataFusion I/O has no storage owner",
+        )));
+        let raw_io_text = raw_io.to_string();
+        assert!(matches!(
+            OmniError::datafusion(raw_io),
+            OmniError::DataFusion(ref message) if message == &raw_io_text
+        ));
+
+        let collection = DataFusionError::Collection(vec![
+            OmniError::ResourceLimitExceeded {
+                resource: "hidden collection resource".to_string(),
+                limit: 40,
+                actual: 41,
+            }
+            .into_datafusion_external(),
+        ]);
+        assert!(recover_datafusion_stream_failure(&collection).is_none());
+        let collection_text = collection.to_string();
+        assert!(matches!(
+            OmniError::datafusion(collection),
+            OmniError::DataFusion(ref message) if message == &collection_text
+        ));
+
+        let lance = lance::Error::invalid_input_source(stream_carrier_source(
+            OmniError::ResourceLimitExceeded {
+                resource: "hidden Lance resource".to_string(),
+                limit: 50,
+                actual: 51,
+            },
+        ));
+        assert!(recover_datafusion_stream_failure(&lance).is_none());
+        let lance_text = lance.to_string();
+        let lance = OmniError::lance_stream(lance);
+        assert_eq!(
+            lance.storage_failure().map(|failure| failure.kind),
+            Some(StorageFailureKind::Configuration)
+        );
+        assert_eq!(lance.to_string(), format!("storage: {lance_text}"));
+    }
+
+    #[test]
+    fn datafusion_stream_carrier_walk_is_bounded_and_cycle_safe() {
+        use datafusion::error::DataFusionError;
+
+        let within_bound = (0..MAX_ENGINE_SOURCE_DEPTH - 2).fold(
+            OmniError::BlobIntegrity {
+                reason: "within source bound".to_string(),
+            }
+            .into_datafusion_external(),
+            |error, link| {
+                DataFusionError::Context(format!("approved context {link}"), Box::new(error))
+            },
+        );
+        assert!(matches!(
+            recover_datafusion_stream_failure(&within_bound),
+            Some(OmniError::BlobIntegrity { ref reason }) if reason == "within source bound"
+        ));
+
+        let beyond_bound = (0..MAX_ENGINE_SOURCE_DEPTH - 1).fold(
+            OmniError::BlobIntegrity {
+                reason: "beyond source bound".to_string(),
+            }
+            .into_datafusion_external(),
+            |error, link| {
+                DataFusionError::Context(format!("approved context {link}"), Box::new(error))
+            },
+        );
+        assert!(recover_datafusion_stream_failure(&beyond_bound).is_none());
+
+        let arbitrary_wrapper = SourceLink {
+            source: stream_carrier_source(OmniError::BlobIntegrity {
+                reason: "arbitrary wrapper".to_string(),
+            }),
+        };
+        assert!(recover_datafusion_stream_failure(&arbitrary_wrapper).is_none());
+        assert!(recover_datafusion_stream_failure(&CyclicSource).is_none());
+    }
+
+    #[test]
     fn arrow_and_blob_contradictions_are_not_storage_failures() {
         let arrow = OmniError::arrow_internal(arrow_schema::ArrowError::ComputeError(
             "invalid batch computation".to_string(),
@@ -1110,7 +1841,8 @@ mod tests {
             limit: 10,
             actual: 11,
         };
-        let carried = OmniError::lance_stream(lance::Error::external(Box::new(carried)));
+        let carried =
+            OmniError::lance_stream(lance::Error::external(stream_carrier_source(carried)));
         assert!(matches!(
             carried,
             OmniError::ResourceLimitExceeded {
