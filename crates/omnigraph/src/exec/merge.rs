@@ -3784,22 +3784,33 @@ impl Omnigraph {
                     {
                         candidates.insert(table_key.clone(), candidate);
                     }
-                } else if let Some(staged) = stage_streaming_table_merge(
-                    self,
-                    table_key,
-                    catalog,
-                    base_snapshot,
-                    source_snapshot,
-                    target_snapshot,
-                    &mut conflicts,
-                    &empty_external_preflight,
-                )
-                .await?
-                {
-                    candidates.insert(
-                        table_key.clone(),
-                        CandidateTableState::RewriteMerged(staged),
+                } else {
+                    // One TableWalk interval per scalar table: the three-way
+                    // ordered walk plus merged-row staging, ending before
+                    // validation and before the keyed publish loop
+                    // (KeyedStage/KeyedCommit stay disjoint).
+                    let table_walk_start = std::time::Instant::now();
+                    let staged = stage_streaming_table_merge(
+                        self,
+                        table_key,
+                        catalog,
+                        base_snapshot,
+                        source_snapshot,
+                        target_snapshot,
+                        &mut conflicts,
+                        &empty_external_preflight,
+                    )
+                    .await?;
+                    crate::instrumentation::record_merge_timing(
+                        crate::instrumentation::MergeTimingPhase::TableWalk,
+                        table_walk_start.elapsed(),
                     );
+                    if let Some(staged) = staged {
+                        candidates.insert(
+                            table_key.clone(),
+                            CandidateTableState::RewriteMerged(staged),
+                        );
+                    }
                 }
                 continue;
             }
@@ -3983,7 +3994,12 @@ impl Omnigraph {
                 continue;
             }
 
-            if let Some(staged) = stage_streaming_table_merge(
+            // One TableWalk interval per blob-bearing table (the scalar pass
+            // above records its own): the three-way ordered walk plus
+            // merged-row staging, ending before validation and before the
+            // keyed publish loop (KeyedStage/KeyedCommit stay disjoint).
+            let table_walk_start = std::time::Instant::now();
+            let staged = stage_streaming_table_merge(
                 self,
                 table_key,
                 catalog,
@@ -3993,8 +4009,12 @@ impl Omnigraph {
                 &mut conflicts,
                 &external_preflight,
             )
-            .await?
-            {
+            .await?;
+            crate::instrumentation::record_merge_timing(
+                crate::instrumentation::MergeTimingPhase::TableWalk,
+                table_walk_start.elapsed(),
+            );
+            if let Some(staged) = staged {
                 candidates.insert(
                     table_key.clone(),
                     CandidateTableState::RewriteMerged(staged),

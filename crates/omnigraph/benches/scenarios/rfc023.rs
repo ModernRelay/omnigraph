@@ -830,6 +830,8 @@ fn merge_phase_metrics(probes: &MergeWriteProbes) -> serde_json::Value {
         "outer_prepare": probes.outer_prepare_us(),
         "proven_insert_history": probes.proven_insert_history_us(),
         "proven_insert_plan_scan": probes.proven_insert_plan_scan_us(),
+        "table_walk_total": probes.table_walk_total_us(),
+        "table_walk_max": probes.table_walk_max_us(),
         "candidate_validation": probes.candidate_validation_us(),
         "final_revalidation": probes.final_revalidation_us(),
         "recovery_arm": probes.recovery_arm_us(),

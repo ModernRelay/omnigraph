@@ -1,0 +1,32 @@
+[package]
+name = "omnigraph-bench"
+version = "0.10.0"
+edition = "2024"
+description = "In-tree benchmark harness for Omnigraph (branch-control micro-benchmark, merge scenarios)."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+# Internal instrument, never published: keeps the release-coherence contract
+# (AGENTS.md maintenance rule 4) scoped to the shipped crates.
+publish = false
+
+[[bin]]
+name = "omnigraph-bench"
+path = "src/main.rs"
+
+[dependencies]
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph" }
+omnigraph-compiler = { path = "../omnigraph-compiler" }
+async-trait = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+lance = { workspace = true }
+object_store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+ulid = { workspace = true }
+
+[lints]
+workspace = true
