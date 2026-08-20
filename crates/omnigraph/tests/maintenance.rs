@@ -644,7 +644,7 @@ node Tag {\n    slug: String @key\n}\n";
 // Lance HEAD: reads stay pinned to the pre-compaction version (compaction is
 // invisible to them) and any subsequent schema apply / strict update/delete
 // fails its HEAD-vs-manifest precondition with
-// "stale view of '<table>': expected manifest table version X but current is Y".
+// "stale view of dataset for <type>: expected published dataset version X but current is Y".
 // This pins the fix — optimize publishes the compacted version, so manifest ==
 // HEAD and migrations after a compaction succeed.
 #[tokio::test]
@@ -1435,7 +1435,7 @@ async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
     let message = err.to_string();
     assert!(
         message.contains("could not classify live branch 'feature'")
-            && message.contains("node:Person"),
+            && message.contains("dataset for node type 'Person'"),
         "error must identify the unclassifiable live reference; got: {message}"
     );
     assert_eq!(
@@ -1476,7 +1476,7 @@ async fn cleanup_refuses_uncovered_main_head_drift_before_any_version_gc() {
     let message = err.to_string();
     assert!(
         message.contains("uncovered HEAD drift")
-            && message.contains("node:Person")
+            && message.contains("dataset for node type 'Person'")
             && message.contains("repair"),
         "drift refusal must be actionable; got: {message}"
     );
@@ -1695,7 +1695,7 @@ async fn index_build_tolerates_null_vector_rows() {
     assert_eq!(pending[0].column, "embedding");
     assert_eq!(
         pending[0].reason,
-        "column has no non-null vectors to train on yet"
+        "property has no non-null vectors to train on yet"
     );
 
     let after = snapshot_main(&db).await.unwrap();

@@ -10,12 +10,12 @@
 //! * `optimize_all_tables` — Lance `compact_files` on every table. Rewrites
 //!   small fragments into fewer large ones, then **publishes the compacted
 //!   versions together in one `__manifest` batch** so each `table_version`
-//!   tracks the compacted Lance HEAD (reads pin the manifest version, so without
+//!   tracks the compacted Lance HEAD (reads pin the published dataset version, so without
 //!   the publish compaction would be invisible to readers and would break the
 //!   HEAD-vs-manifest precondition of schema apply / strict writes). Compaction
 //!   is content-preserving (Lance `Operation::Rewrite` "reorganizes data
 //!   without semantic modification"), so old fragments remain reachable via
-//!   older manifest versions until `cleanup` runs.
+//!   older dataset versions until `cleanup` runs.
 //! * `cleanup_all_tables` — Lance `cleanup_old_versions` on every table.
 //!   Removes manifests (and their unique fragments) older than the configured
 //!   retention, capped at the oldest main-table version inherited by any live
@@ -38,6 +38,7 @@ use lance::index::DatasetIndexExt;
 use lance_index::optimize::OptimizeOptions;
 
 use super::*;
+use crate::error::missing_graph_type_at_snapshot;
 
 /// How many tables to optimize/cleanup concurrently. Each hits a separate
 /// Lance dataset so there is no shared state; the bound is there to avoid
@@ -58,13 +59,13 @@ fn maint_concurrency() -> usize {
 /// time cutoff AND the version cutoff are removed).
 #[derive(Debug, Clone, Default)]
 pub struct CleanupPolicyOptions {
-    /// Keep this many most-recent versions per table.
+    /// Keep this many most-recent versions per dataset.
     pub keep_versions: Option<u32>,
     /// Only remove versions older than this duration.
     pub older_than: Option<Duration>,
 }
 
-/// Why `optimize` did not compact a table. Typed so callers branch on the
+/// Why `optimize` did not compact a dataset. Typed so callers branch on the
 /// reason rather than sniffing a string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -72,7 +73,7 @@ pub enum SkipReason {
     /// The Lance dataset HEAD is ahead of the version recorded in
     /// `__manifest`, and no recovery sidecar covers that movement. `optimize`
     /// cannot infer whether the drift is benign maintenance or an external
-    /// semantic write, so it leaves the table untouched and points operators at
+    /// semantic write, so it leaves the dataset untouched and points operators at
     /// explicit `repair`.
     DriftNeedsRepair,
 }
@@ -91,37 +92,41 @@ impl std::fmt::Display for SkipReason {
     /// Human-readable reason for CLI and log output.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg = match self {
-            SkipReason::DriftNeedsRepair => "manifest/head drift — run omnigraph repair",
+            SkipReason::DriftNeedsRepair => {
+                "published dataset/Lance HEAD drift — run omnigraph repair"
+            }
         };
         f.write_str(msg)
     }
 }
 
-/// Per-table outcome of `optimize_all_tables`. This is a returned result type,
+/// Per-dataset outcome of `optimize_all_tables`. This is a returned result type,
 /// not built by callers, so it is `#[non_exhaustive]`: future fields stay
 /// non-breaking and downstream code reads fields rather than constructing it.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TableOptimizeStats {
+    /// Retained table-key compatibility identifier for the backing dataset.
     pub table_key: String,
     /// Number of source fragments that were rewritten by Lance.
     pub fragments_removed: usize,
     /// Number of new, larger fragments Lance produced.
     pub fragments_added: usize,
-    /// Did this table get a new manifest version from the compaction? True when
-    /// compaction ran and its compacted version was published to `__manifest`.
+    /// Whether this dataset advanced to a new Lance version that this run
+    /// published through the graph manifest. This may result from compaction,
+    /// index maintenance or materialization, or stale `auto_cleanup` removal.
     pub committed: bool,
-    /// `Some(reason)` if this table was deliberately not compacted. When set,
+    /// `Some(reason)` if this dataset was deliberately not compacted. When set,
     /// `fragments_removed == 0`, `fragments_added == 0`, and `!committed`.
     pub skipped: Option<SkipReason>,
-    /// Manifest table version observed by optimize for drift skips. `None` for
+    /// Published dataset version observed by optimize for drift skips. `None` for
     /// normal compaction/no-op outcomes.
     pub manifest_version: Option<u64>,
     /// Lance HEAD version observed by optimize for drift skips. `None` for
     /// normal compaction/no-op outcomes.
     pub lance_head_version: Option<u64>,
-    /// Declared `@index` columns on this table the reconciler could not build
-    /// this run, each with the `reason` (today: a vector column with no
+    /// Declared indexed properties on this type the reconciler could not build
+    /// this run, each with the `reason` (today: a vector property with no
     /// trainable vectors yet). Empty on the common path. Reported, not fatal — a
     /// later `optimize` retries; the `list_indices`/`indisvalid` analog so
     /// operators can see which index is pending and why.
@@ -162,11 +167,12 @@ impl TableOptimizeStats {
     }
 }
 
-/// Per-table outcome of `cleanup_all_tables`. `error` is `Some` when this
-/// table's version GC failed; cleanup is fault-isolated per table, so a single
-/// table's failure is recorded here rather than aborting the whole sweep.
+/// Per-dataset outcome of `cleanup_all_tables`. `error` is `Some` when this
+/// dataset's version GC failed; cleanup is fault-isolated per dataset, so a
+/// single dataset's failure is recorded here rather than aborting the whole sweep.
 #[derive(Debug, Clone)]
 pub struct TableCleanupStats {
+    /// Retained table-key compatibility identifier for the backing dataset.
     pub table_key: String,
     pub bytes_removed: u64,
     pub old_versions_removed: u64,
@@ -444,8 +450,10 @@ async fn prepare_optimize_table(
     let lance_head_version = snapshot.version();
     if lance_head_version < task.expected_version {
         return Err(OmniError::manifest_internal(format!(
-            "table '{}' Lance HEAD version {} is behind manifest version {}",
-            task.table_key, lance_head_version, task.expected_version
+            "{} is at Lance HEAD version {}, behind published dataset version {}",
+            dataset_subject(&task.table_key),
+            lance_head_version,
+            task.expected_version
         )));
     }
     if lance_head_version > task.expected_version {
@@ -534,13 +542,15 @@ async fn apply_optimize_table_effects(
             .await?
             .entry(&table_key)
             .map(|e| e.table_version)
-            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+            .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
 
         let lance_head_version = selected.version();
         if lance_head_version < expected_version {
             return Err(OmniError::manifest_internal(format!(
-                "table '{}' Lance HEAD version {} is behind manifest version {}",
-                table_key, lance_head_version, expected_version
+                "{} is at Lance HEAD version {}, behind published dataset version {}",
+                dataset_subject(&table_key),
+                lance_head_version,
+                expected_version
             )));
         }
         if !head_advanced && lance_head_version > expected_version {
@@ -550,9 +560,11 @@ async fn apply_optimize_table_effects(
             // that the publish below fast-forwards, NOT external drift, so this guard is
             // skipped on those retries.
             return Err(OmniError::manifest_conflict(format!(
-                "optimize table '{}' moved after the graph-wide recovery intent armed: \
-                 manifest version {}, Lance HEAD {}",
-                table_key, expected_version, lance_head_version
+                "optimize {} moved after the graph-wide recovery intent armed: \
+                 published dataset version {}, Lance HEAD version {}",
+                dataset_subject(&table_key),
+                expected_version,
+                lance_head_version
             )));
         }
 
@@ -1137,8 +1149,8 @@ pub async fn cleanup_all_tables(
             // of deleting unrelated history around an already-broken branch.
             entry.open(db.root_uri(), None).await.map_err(|err| {
                 OmniError::manifest_conflict(format!(
-                    "cleanup could not classify live branch '{branch_label}' table '{}' at main version {}; refusing version GC: {err}",
-                    entry.table_key, entry.table_version
+                    "cleanup could not classify live branch '{branch_label}' {} at published dataset version {}; refusing version GC: {err}",
+                    dataset_subject(&entry.table_key), entry.table_version
                 ))
             })?;
             let full_path = format!("{}/{}", db.root_uri, entry.table_path);
@@ -1146,9 +1158,9 @@ pub async fn cleanup_all_tables(
                 let head = db.storage().open_dataset_head(&full_path, None).await?;
                 if head.version() != entry.table_version {
                     return Err(OmniError::manifest_conflict(format!(
-                        "cleanup found uncovered HEAD drift for table '{}': manifest version {}, \
-                         Lance HEAD {}; run `omnigraph repair` before version GC",
-                        entry.table_key,
+                        "cleanup found uncovered HEAD drift for {}: published dataset version {}, \
+                         Lance HEAD version {}; run `omnigraph repair` before version GC",
+                        dataset_subject(&entry.table_key),
                         entry.table_version,
                         head.version()
                     )));
@@ -1209,7 +1221,8 @@ pub async fn cleanup_all_tables(
                     }
                     .ok_or_else(|| {
                         OmniError::manifest_internal(format!(
-                            "cleanup found no versions for open table '{table_key}'"
+                            "cleanup found no versions for open {}",
+                            dataset_subject(&table_key)
                         ))
                     })?;
                     Some(cutoff.version)
@@ -1246,7 +1259,7 @@ pub async fn cleanup_all_tables(
                         target: "omnigraph::cleanup",
                         table = %table_key,
                         error = %err,
-                        "version GC failed for table; other tables unaffected",
+                        "version GC failed for dataset; other datasets unaffected",
                     );
                     TableCleanupStats {
                         table_key,
@@ -1354,7 +1367,7 @@ async fn reconcile_orphaned_branches_with_catalog(
                     target: "omnigraph::cleanup",
                     table = %table_key,
                     error = %err,
-                    "listing branches failed during reconcile; skipping table",
+                    "listing branches failed during reconcile; skipping dataset",
                 );
                 stats.failures.push((table_key.clone(), err.to_string()));
                 continue;

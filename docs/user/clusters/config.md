@@ -120,7 +120,7 @@ bare names normalize to `provider.embedding.<name>`. Supported provider
 only when a `--cluster` server boots, so `cluster validate`, `plan`, and
 `apply` do not need deployment secrets. `mock` is deterministic and does not
 require `api_key`. Vector dimensions stay schema-driven by the target
-`Vector(N)` column, not the provider profile.
+`Vector(N)` property, not the provider profile.
 
 `graphs.<id>.external_blobs` is the graph-level resource boundary for new
 external Blob URI ingress. Missing `external_blobs`, or an empty `allow` list,
@@ -161,8 +161,8 @@ keep the 0.10 binary in place, remove each graph's `external_blobs` field, and
 run `omnigraph cluster apply --config <dir>` to convergence. While v0.10 is
 still running, that applies deny, removes `external_blob_policy` from the
 applied graph resource, and restores its historical digest; this is a
-control-state update and does not move the graph manifest or any data-table
-version. The purpose is only to restore a state shape that v0.9 can parse.
+control-state update and does not move the graph manifest or the version of any
+node or edge dataset. The purpose is only to restore a state shape that v0.9 can parse.
 v0.9 does not preserve the boundary: its writers admit arbitrary supported
 external URIs, including `file://`. Quiesce writers first, replace the complete
 server/control-plane fleet, and do not run mixed v0.9/v0.10 writers. If
@@ -382,7 +382,7 @@ A `schema.<id>` update (the declared schema differs from what state records)
 is executed by apply via the engine's schema-apply, after graph creates and
 before catalog writes — so a query change that depends on the new schema
 applies in the same run. Each schema apply is sidecar-fenced like a create:
-pre-operation manifest version recorded, post-operation version written back,
+pre-operation graph manifest version recorded, post-operation version written back,
 sidecar retired only after the state update lands; the recovery sweep
 classifies survivors by schema digest (consistent ledger → retired; completed
 on the graph → state rolled forward with an audit entry; anything else →
@@ -529,7 +529,7 @@ Both commands open declared graphs read-only at:
 <config-dir>/graphs/<graph-id>.omni
 ```
 
-They observe only branch `main`, recording graph existence, manifest version,
+They observe only branch `main`, recording graph existence, graph manifest version,
 live schema digest, desired schema digest, and schema-match status under
 `observations["graph.<id>"]`. Missing graph roots are recorded as drift and
 remove the graph/schema digests from state so a later `plan` proposes creates.

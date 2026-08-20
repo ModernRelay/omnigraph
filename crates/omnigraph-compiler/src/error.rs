@@ -107,7 +107,7 @@ pub enum CompilerError {
     Storage(String),
 
     #[error(
-        "@unique constraint violation on {type_name}.{property}: duplicate value '{value}' at rows {first_row} and {second_row}"
+        "@unique constraint violation on {type_name}.{property}: duplicate value '{value}' in input entities at positions {first_row} and {second_row}"
     )]
     UniqueConstraint {
         type_name: String,
@@ -174,6 +174,22 @@ mod tests {
     fn compiler_error_parse_display_is_stable() {
         let err = CompilerError::Parse("bad token".to_string());
         assert_eq!(err.to_string(), "parse error: bad token");
+    }
+
+    #[test]
+    fn unique_constraint_display_names_input_entities() {
+        let err = CompilerError::UniqueConstraint {
+            type_name: "Person".to_string(),
+            property: "email".to_string(),
+            value: "same@example.com".to_string(),
+            first_row: 3,
+            second_row: 7,
+        };
+        assert_eq!(
+            err.to_string(),
+            "@unique constraint violation on Person.email: duplicate value \
+             'same@example.com' in input entities at positions 3 and 7"
+        );
     }
 
     #[allow(deprecated)]

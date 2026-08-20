@@ -283,7 +283,7 @@ pub struct IngestOutput {
 /// One logical declaration touched by a graph-batch load.
 ///
 /// This deliberately carries the accepted-schema name, not the backing
-/// manifest table key, dataset path, or Lance identity.
+/// retained table-key compatibility selector, dataset path, or Lance identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct GraphBatchDeclarationOutput {
     pub name: String,
@@ -382,8 +382,8 @@ impl ChangeOpOutput {
 }
 
 /// Graph-scoped type identity. `id` is opaque: it survives a supported rename
-/// and changes after drop/re-add. It is never a table, dataset, or path
-/// identifier.
+/// and changes after drop/re-add. It is never a retained table-key
+/// compatibility selector, dataset, or path identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ChangeTypeOutput {
     pub id: String,
@@ -435,7 +435,7 @@ pub struct ChangeCauseOutput {
     pub authored_branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
-    /// Authorship time as Unix epoch microseconds — minted before table
+    /// Authorship time as Unix epoch microseconds — minted before dataset
     /// effects and stable across retries; deliberately not labeled a commit or
     /// publication time.
     #[schema(example = 1714000000000000i64)]
@@ -951,7 +951,7 @@ pub struct SchemaApplyRequest {
     )]
     pub schema_source: String,
     /// When true, promote every `DropMode::Soft` step in the plan to
-    /// `DropMode::Hard`, making the prior column data unreachable
+    /// `DropMode::Hard`, making the prior property data unreachable
     /// after the apply. Matches the CLI's `--allow-data-loss` flag.
     /// Defaults to `false` (drops remain reversible via time travel).
     #[serde(default)]
@@ -983,7 +983,7 @@ pub struct IngestRequest {
     /// creation is opt-in by presence of this field; omit it to require an
     /// existing branch.
     pub from: Option<String>,
-    /// How existing rows are handled. Defaults to `merge`.
+    /// How existing entities are handled. Defaults to `merge`.
     #[schema(value_type = Option<LoadModeSchema>)]
     pub mode: Option<LoadMode>,
     /// NDJSON payload: one record per line, each shaped
@@ -1001,7 +1001,7 @@ pub struct GraphBatchLoadQuery {
     pub branch: Option<String>,
     /// Parent branch used to create a missing target branch.
     pub from: Option<String>,
-    /// How existing rows are handled. Defaults to `merge`.
+    /// How existing entities are handled. Defaults to `merge`.
     #[param(value_type = Option<LoadModeSchema>)]
     pub mode: Option<LoadMode>,
 }
@@ -1013,7 +1013,8 @@ pub struct ExportRequest {
     /// Restrict the export to these node/edge type names. Empty exports all types.
     #[serde(default)]
     pub type_names: Vec<String>,
-    /// Restrict the export to these table keys. Empty exports all tables.
+    /// Restrict the export using retained table-key compatibility selectors.
+    /// Empty exports all node and edge types.
     #[serde(default)]
     pub table_keys: Vec<String>,
 }
@@ -1059,8 +1060,8 @@ pub enum ErrorCode {
 
 /// Structured details for a publisher-level OCC failure. Surfaces alongside
 /// HTTP 409 when a write was rejected because the caller's pre-write view of
-/// one table's manifest version was stale relative to the current head. The
-/// expected/actual fields tell the client which table to refresh.
+/// one backing dataset's published version was stale relative to the current
+/// head. The expected/actual fields tell the client which dataset to refresh.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ManifestConflictOutput {
     pub table_key: String,
@@ -1070,7 +1071,7 @@ pub struct ManifestConflictOutput {
 
 /// Structured authority mismatch for a prepared write. Values are
 /// strings because members include optional graph commit ids and future
-/// authority tokens, not only numeric table versions.
+/// authority tokens, not only numeric published dataset versions.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadSetConflictOutput {
     pub member: String,
@@ -1078,8 +1079,8 @@ pub struct ReadSetConflictOutput {
     pub actual: Option<String>,
 }
 
-/// A strict insert rejected because `key` already names a row in the keyed
-/// graph table.  The operation is effect-free when this output is returned;
+/// A strict insert rejected because `key` already names an entity in the
+/// selected node or edge type. The operation is effect-free when this output is returned;
 /// partial or ambiguous attempts surface `recovery_required` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KeyConflictOutput {
@@ -1180,8 +1181,8 @@ pub struct ErrorOutput {
     pub merge_conflicts: Vec<MergeConflictOutput>,
     /// Set when the conflict is a publisher CAS rejection
     /// (`ManifestConflictDetails::ExpectedVersionMismatch`). The caller's
-    /// pre-write view of `table_key` was at version `expected` but the
-    /// manifest is now at `actual`. Refresh and retry.
+    /// pre-write view of `table_key` was at published dataset version
+    /// `expected`, but the graph manifest now publishes `actual`. Refresh and retry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_conflict: Option<ManifestConflictOutput>,
     /// Set when a prepared write's logical authority changed before effects.
@@ -1193,7 +1194,7 @@ pub struct ErrorOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_conflict: Option<KeyConflictOutput>,
     /// Set when the request must be split into smaller graph commits. The
-    /// rejected attempt has no durable sidecar and no table effect.
+    /// rejected attempt has no durable sidecar and no dataset effect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limit: Option<ResourceLimitOutput>,
     /// Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.
@@ -1207,7 +1208,7 @@ pub struct ErrorOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_blob_source: Option<ExternalBlobSourceOutput>,
     /// Set when an overlapping durable recovery intent must be resolved before
-    /// retry. Its table effects may or may not have started.
+    /// retry. Its dataset effects may or may not have started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_required: Option<RecoveryRequiredOutput>,
     /// Set when a mutation's graph-commit precondition failed

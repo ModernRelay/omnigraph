@@ -23,7 +23,7 @@ exactly one logical node or edge envelope:
 ordinary ID rules: it must match a node's canonical `@key` ID when one exists;
 otherwise an omitted node or edge ID is generated. Duplicate members, unknown
 properties, reserved physical fields, and noncanonical supplied node IDs are
-rejected before effects. There is no table or dataset selector: one file may
+rejected before effects. There is no physical dataset selector: one file may
 touch several logical declarations and publishes as one atomic graph commit.
 Local and remote CLI loads use this same grammar; the remote client sends it as
 raw `application/x-ndjson` to `/graphs/{graph_id}/load/ndjson`.
@@ -64,7 +64,7 @@ file-based query — only the source loader changes.
 ## Reading Blob Cells
 
 `blob get` and `blob stat` address one logical node or edge property. They use
-graph vocabulary—not a physical table, dataset, row address, or per-table lane:
+graph vocabulary—not a physical dataset, row address, or per-dataset lane:
 
 ```bash
 # Stream the complete managed value to a file.
@@ -137,7 +137,7 @@ returns not found. The JSON shape is stable:
 ```
 
 `target.resolved_snapshot` is always present and should be treated as opaque.
-For a live branch it is a precise manifest witness, not necessarily a commit
+For a live branch it is a precise graph-manifest witness, not necessarily a commit
 ULID; a byte-for-byte graph copy can have a different ETag suffix because its
 control object lives in a different store. `target.branch` or `target.snapshot`
 appears only when that target was explicitly requested. In particular, an

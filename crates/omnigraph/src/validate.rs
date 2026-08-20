@@ -442,7 +442,7 @@ impl<'a> CommittedState<'a> {
                     .map(|name| {
                         batch.column_by_name(name).cloned().ok_or_else(|| {
                             OmniError::manifest(format!(
-                                "table {table_key} missing unique column '{name}'"
+                                "graph type {table_key} is missing unique property '{name}'"
                             ))
                         })
                     })
@@ -798,7 +798,9 @@ where
             .iter()
             .map(|name| {
                 batch.column_by_name(name).cloned().ok_or_else(|| {
-                    OmniError::manifest(format!("table {table_key} missing unique column '{name}'"))
+                    OmniError::manifest(format!(
+                        "graph type {table_key} is missing unique property '{name}'"
+                    ))
                 })
             })
             .collect::<Result<Vec<_>>>()?;

@@ -33,6 +33,76 @@ Code pull requests run a reporting-only
 `cargo check --workspace --locked` with default features; the heavy test graphs
 remain post-merge, tag-, or dispatch-time owners.
 
+The always-reporting `Graph Vocabulary Guard` is the CI owner for the reviewed
+four-surface vocabulary inventory, including on documentation-only pull
+requests. G1 scans route-reachable OpenAPI; G2 parses the closed set of
+user-visible Rust string sinks; G3 scans rendered Markdown events below
+`docs/user/`; G4 derives externally reachable signatures from the default and
+all-features rustdoc graphs for the seven public library crates. Its package
+tests own deterministic collection, reference cycles and compositions,
+Markdown container/event identity, Rust sink selection, public-signature
+normalization, inventory validation, and negative base/current comparison
+cases. The CI check compares every selected observation with
+`tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv` in the current
+and exact base trees. It fetches full history and fails if the base asset is
+absent or stale. It does not regenerate the specification or replace
+`crates/omnigraph-server/tests/openapi.rs`, which remains the byte-for-byte
+OpenAPI drift owner.
+
+`legacy_graph_misuse` is monotonic at a fingerprint-independent semantic
+boundary: editing the text cannot silently relabel a surviving misuse. The
+comparison first reserves every exact observation whose non-legacy
+classification is unchanged, so that row cannot be mistaken for a rewritten
+legacy neighbour that happens to share the coarse boundary. Every remaining
+observation is still an anti-laundering candidate: a text/fingerprint rewrite
+cannot escape review, and a marker placed on an exact unchanged non-legacy row
+cannot authorize another row's rewrite. When a reviewed presentation rewrite
+intentionally retains the noun only in a valid new role (for example, quoted
+compatibility prose), its non-legacy row uses the exact
+`compatibility_treatment` marker `reviewed_semantic_reclassification` and
+`rollout_phase=presentation`. The guard rejects a newly introduced, moved, or
+rewritten marker when no surviving base misuse needs it. An exact marker
+accepted in an earlier generation may persist (or be retired), so unrelated
+later pull requests do not inherit a cleanup obligation. This remains a visible
+migration exception rather than a general classification bypass.
+
+G4 pins `cargo-public-api` 0.52.0 and `nightly-2026-08-01`; the repository's
+stable toolchain remains the owner of the workspace build. CI caches the
+pinned extractor, nightly toolchain, and dedicated target. Its rows use the
+owning package manifest as the stable source and the complete normalized
+exported signature as the boundary because `cargo-public-api` does not expose
+one unambiguous declaration/re-export source span; the guard does not guess at
+aliases or macro-generated items. G4 always extracts
+the current and base trees. A path-only shortcut cannot prove that a change is
+irrelevant because Cargo `include!`, build scripts, generated sources, and
+configuration can make any tracked input affect rustdoc. An unreviewed
+workspace library is an error, so adding a crate requires an explicit
+public/internal reachability decision. G1–G3 also execute on every run.
+
+Run the focused evidence with a base that already contains the reviewed
+inventory:
+
+```bash
+cargo test -p omnigraph-vocabulary-guard --locked
+git fetch origin main
+BASE_SHA=$(git rev-parse origin/main)
+for surface in openapi rust-string user-docs; do
+  cargo run -p omnigraph-vocabulary-guard --locked -- \
+    check --surface "$surface" --base "$BASE_SHA" \
+    --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
+    --openapi openapi.json
+done
+
+rustup toolchain install nightly-2026-08-01 --profile minimal
+CARGO_INSTALL_ROOT="$PWD/target/vocabulary-public-api/tool" \
+  cargo install cargo-public-api --version 0.52.0 --locked
+cargo run -p omnigraph-vocabulary-guard --locked -- \
+  check --surface public-rust --base "$BASE_SHA" \
+  --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
+  --cargo-public-api target/vocabulary-public-api/tool/bin/cargo-public-api \
+  --public-api-target-dir target/vocabulary-public-api
+```
+
 When changing `.github/workflows/ci.yml`, validate its syntax and the remaining
 shell owners:
 

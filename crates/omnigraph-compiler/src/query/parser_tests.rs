@@ -1010,7 +1010,7 @@ return { $p.name
 
 #[test]
 fn test_parse_traversal_edge_binding() {
-    // `$p $w:knows $f` — the optional edge binding names the matched edge row
+    // `$p $w:knows $f` — the optional edge binding names the matched edge
     // so its properties become addressable (`$w.since`).
     let input = r#"
 query rated_friends($name: String) {

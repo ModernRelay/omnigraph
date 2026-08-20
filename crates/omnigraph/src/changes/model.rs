@@ -27,7 +27,7 @@ pub const COMMIT_CHANGES_MAX_ROWS: usize = 8_192;
 pub const COMMIT_CHANGES_DEFAULT_BYTES: u64 = 4 * 1024 * 1024;
 /// Public ceiling on the per-page byte packing target a caller may request.
 /// This bounds how much a caller may pack per page; it is NOT a ceiling on a
-/// single change's size — an `Update` serializes two row images and managed
+/// single change's size — an `Update` serializes two entity images and managed
 /// Blobs inline as base64 (~4/3), so one legal change can exceed this and is
 /// still delivered solo. (Historically this equalled the write-path keyed
 /// transaction budget, which wrongly implied a single change had to fit under it.)
@@ -102,7 +102,8 @@ impl ChangeOpKind {
 
 /// Opaque graph-scoped type identity plus the graph-schema name. The `id`
 /// survives a supported rename and changes after drop/re-add; it is never a
-/// table, dataset, path, or incarnation identifier.
+/// retained table-key compatibility selector, dataset, path, or incarnation
+/// identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GraphTypeRef {
     pub id: String,
@@ -120,7 +121,7 @@ pub struct EntityEndpoints {
 
 /// One exact logical entity image, decoded with the commit-era physical
 /// schema. `properties` carries user-schema keys verbatim; the logical `id`
-/// and edge endpoint columns are hoisted out of it.
+/// and edge endpoint fields are hoisted out of it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EntityImage {
     pub properties: serde_json::Map<String, serde_json::Value>,
@@ -158,7 +159,7 @@ pub struct ChangeCause {
     pub authored_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
-    /// Authorship time in Unix epoch microseconds. Minted before table
+    /// Authorship time in Unix epoch microseconds. Minted before dataset
     /// effects and stable across retries and recovery — deliberately not
     /// labeled a commit or publication time.
     pub authored_at: i64,

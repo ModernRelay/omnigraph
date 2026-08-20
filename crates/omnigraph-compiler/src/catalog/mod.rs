@@ -56,9 +56,9 @@ pub struct NodeType {
     /// project composite members in stable property-ID order so renames cannot
     /// change physical tuple identity.
     pub key: Option<Vec<String>>,
-    /// Uniqueness constraints (each entry is a list of column names)
+    /// Uniqueness constraints (each entry is a list of property names)
     pub unique_constraints: Vec<Vec<String>>,
-    /// Index declarations (each entry is a list of column names)
+    /// Index declarations (each entry is a list of property names)
     pub indices: Vec<Vec<String>>,
     /// Value range constraints
     pub range_constraints: Vec<RangeConstraint>,
@@ -106,7 +106,8 @@ pub struct EdgeType {
     pub to_type: String,
     pub cardinality: Cardinality,
     pub properties: HashMap<String, PropType>,
-    /// Uniqueness constraints on edge columns (e.g. `@unique(src, dst)`)
+    /// Uniqueness constraints on edge fields, including endpoint fields
+    /// (e.g. `@unique(src, dst)`).
     pub unique_constraints: Vec<Vec<String>>,
     /// Index declarations on edge properties
     pub indices: Vec<Vec<String>>,

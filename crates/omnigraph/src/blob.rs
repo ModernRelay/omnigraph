@@ -1005,8 +1005,9 @@ impl Omnigraph {
             || entry.identity.table_incarnation_id != resolved_cell.table_incarnation_id
         {
             return Err(OmniError::blob_integrity(format!(
-                "selected table '{}' has identity {}, expected {:016x}:{:016x}",
-                resolved_cell.table_key,
+                "selected dataset for {} type '{}' has identity {}, expected {:016x}:{:016x}",
+                entity_label(cell.entity),
+                cell.type_name,
                 entry.identity,
                 resolved_cell.stable_table_id,
                 resolved_cell.table_incarnation_id
@@ -1034,8 +1035,11 @@ impl Omnigraph {
         let actual_table_version = dataset.version().version;
         if actual_table_version != expected_table_version {
             return Err(OmniError::blob_integrity(format!(
-                "selected table '{}' opened at version {}, expected {}",
-                resolved_cell.table_key, actual_table_version, expected_table_version
+                "selected dataset for {} type '{}' opened at Lance version {}, expected published dataset version {}",
+                entity_label(cell.entity),
+                cell.type_name,
+                actual_table_version,
+                expected_table_version
             )));
         }
         if entry.table_branch.is_some() {
@@ -1055,8 +1059,9 @@ impl Omnigraph {
             // once materialized and inherited on a fresh fork.
             let live_branch = resolved_target.branch.as_deref().ok_or_else(|| {
                 OmniError::blob_integrity(format!(
-                    "selected named-branch table '{}' has no graph branch identity",
-                    resolved_cell.table_key
+                    "selected named-branch dataset for {} type '{}' has no graph branch identity",
+                    entity_label(cell.entity),
+                    cell.type_name
                 ))
             })?;
             let expected_graph_head = resolved_target.graph_commit_id.as_deref().ok_or_else(|| {
@@ -1079,8 +1084,10 @@ impl Omnigraph {
             && dataset.manifest_location().e_tag.as_deref() != Some(expected_e_tag)
         {
             return Err(OmniError::blob_integrity(format!(
-                "selected table '{}' opened a different manifest incarnation at version {}",
-                resolved_cell.table_key, expected_table_version
+                "selected dataset for {} type '{}' opened a different Lance manifest incarnation at published dataset version {}",
+                entity_label(cell.entity),
+                cell.type_name,
+                expected_table_version
             )));
         }
 
@@ -1201,8 +1208,10 @@ impl Omnigraph {
             for row in 0..batch.num_rows() {
                 if selected.is_some() {
                     return Err(OmniError::blob_integrity(format!(
-                        "logical id '{}' appears more than once in table '{}'",
-                        cell.id, resolved_cell.table_key
+                        "entity id '{}' appears more than once in {} type '{}'",
+                        cell.id,
+                        entity_label(cell.entity),
+                        cell.type_name
                     )));
                 }
                 if row_ids.is_null(row) {

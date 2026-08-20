@@ -512,7 +512,7 @@ async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
             "error should name the unavailable authority read, got: {message}"
         );
         assert!(
-            !message.contains("expected manifest table version"),
+            !message.contains("expected published dataset version"),
             "indeterminate authority must not be reported as a version mismatch: {message}"
         );
 
@@ -3577,7 +3577,8 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
 
         let err = delete.await.unwrap().unwrap_err();
         assert!(
-            err.to_string().contains("stale view of 'node:Person'")
+            err.to_string()
+                .contains("stale view of dataset for node type 'Person'")
                 || err.to_string().contains("ExpectedVersionMismatch")
                 || err.to_string().contains("expected version mismatch"),
             "unexpected error: {err}",

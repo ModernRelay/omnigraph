@@ -18,7 +18,7 @@
 pub enum Family {
     /// Destructive — data-loss class. Always requires explicit opt-in.
     DS,
-    /// Maybe-fail — data-dependent, may fail on existing rows.
+    /// Maybe-fail — data-dependent, may fail on existing entities.
     MF,
     /// Constraint deletion — invariant relaxation; consumer-warning.
     CD,
@@ -58,7 +58,7 @@ impl Family {
 /// Tier classification for a migration step. Determines apply-path
 /// behavior:
 /// - `Safe`: applies without scan or flag.
-/// - `Validated`: requires a single-pass scan of existing rows; fails on
+/// - `Validated`: requires a single-pass scan of existing entities; fails on
 ///   the first violation.
 /// - `Destructive`: requires explicit `--allow-data-loss` (or equivalent
 ///   opt-in) at apply time.

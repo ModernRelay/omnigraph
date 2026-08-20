@@ -1478,6 +1478,7 @@ return { $f.name }
     let msg = err.to_string();
     assert!(msg.contains("T23"), "dedicated code: {msg}");
     assert!(msg.contains("multi-hop"), "explains the restriction: {msg}");
+    assert!(msg.contains("not one edge"), "uses graph vocabulary: {msg}");
 }
 
 #[test]
@@ -1867,6 +1868,7 @@ return { $c.name }
     let msg = err.to_string();
     assert!(msg.contains("T23"), "{msg}");
     assert!(msg.contains("search"), "{msg}");
+    assert!(msg.contains("node properties"), "{msg}");
 }
 
 #[test]
@@ -1892,6 +1894,7 @@ limit 5
         msg.contains("T23"),
         "clear edge-binding error, not a confusing catalog miss: {msg}"
     );
+    assert!(msg.contains("node properties"), "{msg}");
 }
 
 #[test]

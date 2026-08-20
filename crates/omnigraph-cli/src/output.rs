@@ -3,6 +3,16 @@
 
 use super::*;
 
+pub(crate) fn graph_type_subject(table_key: &str) -> String {
+    if let Some(type_name) = table_key.strip_prefix("node:") {
+        format!("node type '{type_name}'")
+    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+        format!("edge type '{type_name}'")
+    } else {
+        format!("dataset '{table_key}'")
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct LoadOutput {
     pub(crate) uri: String,
@@ -77,7 +87,7 @@ pub(crate) fn print_schema_apply_human(output: &SchemaApplyOutput) {
     println!("schema apply for {}", output.uri);
     println!("supported: {}", if output.supported { "yes" } else { "no" });
     println!("applied: {}", if output.applied { "yes" } else { "no" });
-    println!("manifest_version: {}", output.manifest_version);
+    println!("graph_manifest_version: {}", output.manifest_version);
     if output.steps.is_empty() {
         println!("no schema changes");
         return;
@@ -495,7 +505,11 @@ pub(crate) fn print_ingest_human(output: &IngestOutput) {
         }
     );
     for table in &output.tables {
-        println!("{} rows_loaded={}", table.table_key, table.rows_loaded);
+        println!(
+            "{}: {} entities loaded",
+            graph_type_subject(&table.table_key),
+            table.rows_loaded
+        );
     }
     if let Some(actor_id) = &output.actor_id {
         println!("actor_id: {}", actor_id);
@@ -738,7 +752,7 @@ pub(crate) fn render_annotations(
 
 pub(crate) fn print_embed_human(output: &EmbedOutput) {
     println!(
-        "embedded {} rows (selected {}, cleaned {}) from {} -> {} [{} {}d]",
+        "embedded {} records (selected {}, cleaned {}) from {} -> {} [{} {}d]",
         output.embedded_rows,
         output.selected_rows,
         output.cleaned_rows,
@@ -755,13 +769,13 @@ pub(crate) fn print_snapshot_human(
     internal_schema_version: u32,
     entries: &[SnapshotTableOutput],
 ) {
-    println!("branch: {}", branch);
-    println!("manifest_version: {}", manifest_version);
+    println!("graph_branch: {}", branch);
+    println!("graph_manifest_version: {}", manifest_version);
     println!("internal_schema_version: {}", internal_schema_version);
     for entry in entries {
         println!(
-            "{} v{} branch={} rows={}",
-            entry.table_key,
+            "{} published_dataset_version={} native_dataset_branch={} entities={}",
+            graph_type_subject(&entry.table_key),
             entry.table_version,
             entry.table_branch.as_deref().unwrap_or("main"),
             entry.row_count
@@ -826,7 +840,7 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
     for commit in commits {
         let branch = commit.manifest_branch.as_deref().unwrap_or("main");
         println!(
-            "{} branch={} version={}{}",
+            "{} graph_branch={} graph_manifest_version={}{}",
             commit.graph_commit_id,
             branch,
             commit.manifest_version,
@@ -842,10 +856,10 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
 pub(crate) fn print_commit_human(commit: &CommitOutput) {
     println!("graph_commit_id: {}", commit.graph_commit_id);
     println!(
-        "manifest_branch: {}",
+        "graph_branch: {}",
         commit.manifest_branch.as_deref().unwrap_or("main")
     );
-    println!("manifest_version: {}", commit.manifest_version);
+    println!("graph_manifest_version: {}", commit.manifest_version);
     if let Some(parent_commit_id) = &commit.parent_commit_id {
         println!("parent_commit_id: {}", parent_commit_id);
     }
@@ -1504,7 +1518,16 @@ mod tests {
     use omnigraph_compiler::schema::parser::parse_schema;
     use std::collections::BTreeMap;
 
-    use super::{ChangeFeedJsonStream, CommitChangesJsonStream, render_annotations};
+    use super::{
+        ChangeFeedJsonStream, CommitChangesJsonStream, graph_type_subject, render_annotations,
+    };
+
+    #[test]
+    fn graph_type_subject_hides_internal_table_key_syntax() {
+        assert_eq!(graph_type_subject("node:Person"), "node type 'Person'");
+        assert_eq!(graph_type_subject("edge:Knows"), "edge type 'Knows'");
+        assert_eq!(graph_type_subject("__manifest"), "dataset '__manifest'");
+    }
 
     fn cause(commit: &str) -> omnigraph_api_types::ChangeCauseOutput {
         omnigraph_api_types::ChangeCauseOutput {

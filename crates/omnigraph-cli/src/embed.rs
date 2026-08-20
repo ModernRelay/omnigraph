@@ -26,13 +26,13 @@ pub(crate) struct EmbedArgs {
     /// Remove embedding fields instead of generating embeddings
     #[arg(long, conflicts_with = "reembed_all")]
     pub clean: bool,
-    /// Regenerate embeddings for all matching rows
+    /// Regenerate embeddings for all matching records
     #[arg(long, conflicts_with = "clean")]
     pub reembed_all: bool,
     /// Restrict processing to these type names
     #[arg(long = "type")]
     pub types: Vec<String>,
-    /// Reembed or clean matching rows only. Syntax: Type:field=value or field=value
+    /// Reembed or clean matching records only. Syntax: Type:field=value or field=value
     #[arg(long = "select")]
     pub selectors: Vec<String>,
     /// Print JSON summary
@@ -520,11 +520,11 @@ async fn embed_row(
 ) -> Result<()> {
     let type_name = row
         .type_name()
-        .ok_or_else(|| eyre!("cannot embed non-entity seed rows"))?
+        .ok_or_else(|| eyre!("cannot embed non-entity seed records"))?
         .to_string();
     let data = row
         .data_mut()
-        .ok_or_else(|| eyre!("cannot embed non-entity seed rows"))?;
+        .ok_or_else(|| eyre!("cannot embed non-entity seed records"))?;
     let text = build_embedding_text(&type_name, data, &spec.fields);
     if text.trim().is_empty() {
         return Ok(());

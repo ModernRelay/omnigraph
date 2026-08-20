@@ -52,8 +52,8 @@ pub struct ResolvedTraversal {
     pub direction: Direction,
     pub min_hops: u32,
     pub max_hops: Option<u32>,
-    /// Variable bound to the matched edge row (`$p $w:knows $f`), if any;
-    /// lowering uses it to carry edge property columns through the expand.
+    /// Variable bound to the matched edge (`$p $w:knows $f`), if any;
+    /// lowering uses it to carry edge properties through the expand.
     pub edge_binding: Option<String>,
 }
 
@@ -845,7 +845,7 @@ fn typecheck_traversal(
         && (traversal.min_hops != 1 || traversal.max_hops != Some(1))
     {
         return Err(CompilerError::Type(format!(
-            "T23: edge binding `${}` cannot be combined with traversal bounds; a multi-hop traversal matches a path of edges, not one edge row",
+            "T23: edge binding `${}` cannot be combined with traversal bounds; a multi-hop traversal matches a path of edges, not one edge",
             traversal.edge_binding.as_deref().unwrap_or("_")
         )));
     }
@@ -1086,7 +1086,7 @@ fn reject_edge_binding_search_field(ctx: &TypeContext, field: &Expr, func: &str)
             BoundVariable::Node { .. } => {}
             BoundVariable::Edge { .. } => {
                 return Err(CompilerError::Type(format!(
-                    "T23: {} cannot target edge property `${}.{}`; text/rank search runs on node columns — edge properties support comparison filters and projection",
+                    "T23: {} cannot target edge property `${}.{}`; text/rank search runs on node properties — edge properties support comparison filters and projection",
                     func, variable, property
                 )));
             }
@@ -1161,7 +1161,7 @@ fn resolve_expr_type(
                 Some(BoundVariable::Node { type_name }) => type_name,
                 Some(BoundVariable::Edge { .. }) => {
                     return Err(CompilerError::Type(format!(
-                        "T23: nearest cannot target edge binding `${}`; vector search runs on node columns",
+                        "T23: nearest cannot target edge binding `${}`; vector search runs on node properties",
                         variable
                     )));
                 }

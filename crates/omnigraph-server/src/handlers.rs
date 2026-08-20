@@ -441,7 +441,7 @@ pub(crate) fn authorize_request(
     operation_id = "getSnapshot",
     params(SnapshotQuery),
     responses(
-        (status = 200, description = "Database snapshot", body = api::SnapshotOutput),
+        (status = 200, description = "Graph snapshot", body = api::SnapshotOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
     ),
@@ -449,9 +449,9 @@ pub(crate) fn authorize_request(
 )]
 /// Read the current snapshot of a branch.
 ///
-/// Returns the manifest version plus per-table metadata (path, version, row
-/// count) for every table on the branch. Defaults to `main` when `branch` is
-/// omitted. Read-only.
+/// Returns the graph-manifest version plus per-dataset metadata (path,
+/// published dataset version, entity count) for every backing dataset on the
+/// branch. Defaults to `main` when `branch` is omitted. Read-only.
 pub(crate) async fn server_snapshot(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
@@ -826,9 +826,10 @@ fn redact_blob_api_error(mapped: ApiError) -> ApiError {
 /// Stream the contents of a branch as NDJSON.
 ///
 /// Emits one JSON object per line (`application/x-ndjson`). Filter with
-/// `type_names` (node/edge type names) and/or `table_keys`; both empty
-/// streams the entire branch. Suitable for large exports — the response is
-/// streamed, not buffered. Read-only.
+/// `type_names` (node/edge type names) and/or the retained table-key
+/// compatibility selectors in `table_keys`; both empty streams the entire
+/// branch. Suitable for large exports — the response is streamed, not
+/// buffered. Read-only.
 pub(crate) async fn server_export(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
@@ -1141,7 +1142,7 @@ pub(crate) async fn resolve_authorized_read_target(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
-        (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -1196,7 +1197,7 @@ pub(crate) async fn server_change(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
-        (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -1258,7 +1259,7 @@ pub(crate) async fn server_mutate(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
         (status = 412, description = "Graph-commit precondition failed; the write had no effect", body = ErrorOutput),
-        (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -1329,7 +1330,7 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
         (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
-        (status = 413, description = "Stored keyed mutation exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 413, description = "Stored keyed mutation exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
@@ -1378,7 +1379,7 @@ pub(crate) async fn server_invoke_query(
         (status = 404, description = "Unknown stored mutation, or `invoke_query` denied", body = ErrorOutput),
         (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
         (status = 412, description = "Stored mutation graph-commit precondition failed; the write had no effect", body = ErrorOutput),
-        (status = 413, description = "Stored keyed mutation exceeds the per-commit row or byte ceiling", body = ErrorOutput),
+        (status = 413, description = "Stored keyed mutation exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
@@ -1583,7 +1584,7 @@ pub(crate) async fn server_list_queries(
 /// Read the current schema source.
 ///
 /// Returns the project's schema as a single string in `.pg` source form.
-/// Useful for clients that want to introspect available types and tables
+/// Useful for clients that want to introspect available types and properties
 /// before constructing GQ queries. Read-only.
 pub(crate) async fn server_schema_get(
     Extension(handle): Extension<Arc<GraphHandle>>,
@@ -1627,7 +1628,7 @@ pub(crate) async fn server_schema_get(
 /// must apply schema changes through `omnigraph cluster apply` and restart.
 ///
 /// Diffs `schema_source` against the current schema and applies the resulting
-/// migration steps (add/drop type, add/drop column, etc.). **Destructive**:
+/// migration steps (add/drop type, add/drop property, etc.). **Destructive**:
 /// some steps drop data. Returns the list of steps applied; if `applied` is
 /// false the diff was unsupported and no changes were made.
 pub(crate) async fn server_schema_apply(
@@ -1800,7 +1801,7 @@ async fn run_ingest(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
-        (status = 413, description = "Load input or external Blob admission exceeds a bounded per-operation row or byte ceiling", body = ErrorOutput),
+        (status = 413, description = "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -1810,8 +1811,8 @@ async fn run_ingest(
 /// Compatibility-load NDJSON data through a JSON envelope.
 ///
 /// `data` is NDJSON with one record per line. `mode` controls behavior on
-/// existing rows: `merge` upserts by id (default), `append` strictly inserts
-/// absent ids, and `overwrite` replaces table contents. Branch creation is opt-in by
+/// existing entities: `merge` upserts by id (default), `append` strictly inserts
+/// absent ids, and `overwrite` replaces type data. Branch creation is opt-in by
 /// presence of `from`: with `from` set, a missing `branch` is created from
 /// it; without `from`, `branch` must already exist — a missing branch is a
 /// 404, never an implicit fork. **Destructive** when `mode` is `overwrite`
@@ -1976,7 +1977,7 @@ pub(crate) async fn server_load_ndjson(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
-        (status = 413, description = "Load input or external Blob admission exceeds a bounded per-operation row or byte ceiling", body = ErrorOutput),
+        (status = 413, description = "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -2066,7 +2067,7 @@ pub(crate) async fn server_branch_list(
 /// Create a new branch.
 ///
 /// Forks `name` off of `from` (defaults to `main`). The new branch shares
-/// table data with its parent until it is mutated. Returns 409 if `name`
+/// backing dataset data with its parent until it is mutated. Returns 409 if `name`
 /// already exists.
 pub(crate) async fn server_branch_create(
     State(state): State<AppState>,
@@ -2202,7 +2203,7 @@ pub(crate) async fn server_branch_delete(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Merge conflict", body = ErrorOutput),
-        (status = 413, description = "Merge row, byte, or recovery-chain ceiling exceeded before effects", body = ErrorOutput),
+        (status = 413, description = "Merge entity, byte, or recovery-chain ceiling exceeded before effects", body = ErrorOutput),
         (status = 424, description = "A merge could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -2330,7 +2331,7 @@ async fn delete_merged_source_branch(
 /// reachable from that branch's head (the main commits inherited up to the
 /// fork plus the branch-authored commits); omitting it returns `main`'s
 /// history. There is no cross-branch listing. Ordering is part of the
-/// contract — newest first by (manifest version, created-at, commit id) — and
+/// contract — newest first by (graph-manifest version, created-at, commit id) — and
 /// a future `cursor`/`limit` pagination will be keyset-based on that same
 /// order. Read-only.
 pub(crate) async fn server_commit_list(
@@ -2388,7 +2389,7 @@ pub(crate) struct CommitPath {
 
 /// Get a single commit.
 ///
-/// Returns the commit's manifest version, parent commit(s), and creation
+/// Returns the commit's graph-manifest version, parent commit(s), and creation
 /// metadata. Read-only.
 pub(crate) async fn server_commit_show(
     Extension(handle): Extension<Arc<GraphHandle>>,
@@ -2713,7 +2714,7 @@ pub(crate) fn parse_change_query(
         (status = 404, description = "Commit not found, or the actor cannot read the commit's branch", body = api::ChangeErrorOutput),
         (status = 409, description = "Commit cannot be entity-diffed (parentless commit or schema boundary); see change_diff_refusal", body = api::ChangeErrorOutput),
         (status = 410, description = "Required retained history is no longer readable; see change_feed_gap and capture a new baseline", body = api::ChangeErrorOutput),
-        (status = 413, description = "Requested limit exceeds the public row ceiling", body = api::ChangeErrorOutput),
+        (status = 413, description = "Requested limit exceeds the public change ceiling", body = api::ChangeErrorOutput),
         (status = 500, description = "Internal failure while reading changes", body = api::ChangeErrorOutput),
         (status = 503, description = "Recovery required before changes can be read", body = api::ChangeErrorOutput),
     ),
@@ -2923,7 +2924,7 @@ fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, 
         (status = 404, description = "Branch not found", body = api::ChangeErrorOutput),
         (status = 409, description = "The feed crossed an unprovable schema boundary; see change_diff_refusal", body = api::ChangeErrorOutput),
         (status = 410, description = "Feed gap: required history was reclaimed; reset via the baseline handshake", body = api::ChangeErrorOutput),
-        (status = 413, description = "Requested limit exceeds the public row ceiling", body = api::ChangeErrorOutput),
+        (status = 413, description = "Requested limit exceeds the public change ceiling", body = api::ChangeErrorOutput),
         (status = 500, description = "Internal failure while reading changes", body = api::ChangeErrorOutput),
         (status = 503, description = "Recovery required before changes can be read", body = api::ChangeErrorOutput),
     ),
@@ -2995,7 +2996,7 @@ pub(crate) async fn server_changes_feed(
     operation_id = "captureChangeBaseline",
     request_body = api::ChangeBaselineRequest,
     responses(
-        (status = 200, description = "NDJSON entity snapshot pinned at one captured commit. Every preceding record is one type-keyed entity row (the load/export NDJSON shape); the FINAL record is the ChangeBaselineRecord envelope — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.", body = api::ChangeBaselineRecord, content_type = "application/x-ndjson"),
+        (status = 200, description = "NDJSON entity snapshot pinned at one captured commit. Every preceding record is one type-keyed entity record (the load/export NDJSON shape); the FINAL record is the ChangeBaselineRecord envelope — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.", body = api::ChangeBaselineRecord, content_type = "application/x-ndjson"),
         (status = 400, description = "Invalid scope", body = api::ChangeErrorOutput),
         (status = 401, description = "Unauthorized", body = api::ChangeErrorOutput),
         (status = 403, description = "Forbidden", body = api::ChangeErrorOutput),

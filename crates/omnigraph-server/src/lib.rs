@@ -1143,10 +1143,7 @@ impl ApiError {
                     .collect(),
             ),
             OmniError::KeyConflict { table_key, key } => Self::key_conflict(
-                key.as_ref().map_or_else(
-                    || format!("key conflict in table '{table_key}'"),
-                    |key| format!("key conflict in table '{table_key}': id '{key}' already exists"),
-                ),
+                format_key_conflict(&table_key, key.as_deref()),
                 api::KeyConflictOutput { table_key, key },
             ),
             OmniError::ResourceLimitExceeded {
@@ -1164,9 +1161,9 @@ impl ApiError {
             // Change paths rewrite this into a typed feed gap before it can
             // escape; anywhere else a reclaimed pinned version is an internal
             // retention surprise, not a caller error.
-            OmniError::HistoricalVersionReclaimed { version } => {
-                Self::internal(format!("historical table version {version} was reclaimed"))
-            }
+            OmniError::HistoricalVersionReclaimed { version } => Self::internal(format!(
+                "historical published dataset version {version} was reclaimed"
+            )),
             // Caller-side continuation fault (decode, checksum, or scope). The
             // "change cursor rejected: " prefix is a stable contract so raw
             // HTTP clients can tell it from a genuine retention gap.
@@ -1272,14 +1269,15 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
     let preview: Vec<String> = conflicts
         .iter()
         .take(3)
-        .map(|conflict| match conflict.row_id.as_deref() {
-            Some(row_id) => format!(
-                "{}:{} ({})",
-                conflict.table_key,
-                row_id,
-                conflict.kind.as_str()
-            ),
-            None => format!("{} ({})", conflict.table_key, conflict.kind.as_str()),
+        .map(|conflict| {
+            let subject = graph_type_subject(&conflict.table_key);
+            match conflict.row_id.as_deref() {
+                Some(row_id) => format!(
+                    "{subject}, entity id '{row_id}' ({})",
+                    conflict.kind.as_str()
+                ),
+                None => format!("{subject} ({})", conflict.kind.as_str()),
+            }
         })
         .collect();
 
@@ -1290,6 +1288,24 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
     };
 
     format!("merge conflicts: {}{}", preview.join("; "), suffix)
+}
+
+fn graph_type_subject(table_key: &str) -> String {
+    if let Some(type_name) = table_key.strip_prefix("node:") {
+        format!("node type '{type_name}'")
+    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+        format!("edge type '{type_name}'")
+    } else {
+        format!("dataset '{table_key}'")
+    }
+}
+
+fn format_key_conflict(table_key: &str, key: Option<&str>) -> String {
+    let subject = graph_type_subject(table_key);
+    key.map_or_else(
+        || format!("{subject} already has this id"),
+        |key| format!("{subject} already has id '{key}'"),
+    )
 }
 
 /// Constant `Retry-After` value (seconds) emitted on 429 responses.
@@ -1330,6 +1346,21 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod api_error_tests {
     use super::*;
+
+    #[test]
+    fn merge_summary_uses_type_and_entity_vocabulary() {
+        let summary = summarize_merge_conflicts(&[api::MergeConflictOutput {
+            table_key: "node:Person".to_string(),
+            row_id: Some("p1".to_string()),
+            kind: api::MergeConflictKindOutput::DivergentUpdate,
+            message: "divergent update for id 'p1'".to_string(),
+        }]);
+        assert_eq!(
+            summary,
+            "merge conflicts: node type 'Person', entity id 'p1' (divergent_update)"
+        );
+        assert!(!summary.contains("node:Person"));
+    }
 
     #[tokio::test]
     async fn change_feed_gap_is_typed_410() {
@@ -1423,8 +1454,11 @@ mod api_error_tests {
     #[tokio::test]
     async fn key_conflict_is_409_with_structured_optional_key() {
         for (key, expected_message) in [
-            (Some("alice".to_string()), "id 'alice' already exists"),
-            (None, "key conflict in table 'node:Person'"),
+            (
+                Some("alice".to_string()),
+                "node type 'Person' already has id 'alice'",
+            ),
+            (None, "node type 'Person' already has this id"),
         ] {
             let response = ApiError::from_omni(OmniError::KeyConflict {
                 table_key: "node:Person".to_string(),

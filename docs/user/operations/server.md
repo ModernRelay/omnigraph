@@ -87,7 +87,7 @@ graph id from the cluster's applied revision:
 | POST | `/graphs/{id}/branches/merge` | bearer + `branch_merge` (+ `branch_delete` only when `delete_branch` is set) | merge `source → target`; `delete_branch: true` also deletes the source after the merge lands — a delete refusal is reported via `branch_deleted`/`branch_delete_error` on the 200 response, never as an error |
 | GET | `/graphs/{id}/commits?branch=` | bearer + `read` | list |
 | GET | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show |
-| GET | `/graphs/{id}/commits/{commit_id}/changes?page_token=&limit=&kind=&type=&op=` | bearer + `read` (against the commit's authored branch — the response carries row images) | exact entity changes of one commit vs its first parent; bounded pages via opaque `page_token`; unknown query parameters are 400s |
+| GET | `/graphs/{id}/commits/{commit_id}/changes?page_token=&limit=&kind=&type=&op=` | bearer + `read` (against the commit's authored branch — the response carries entity images) | exact entity changes of one commit vs its first parent; bounded pages via opaque `page_token`; unknown query parameters are 400s |
 | GET | `/graphs/{id}/changes?branch=&cursor=&start=&page_token=&limit=&kind=&type=&op=` | bearer + `read` | poll the change feed; `cursor` XOR `start` (`now` \| `beginning` \| `after:<commit_id>`) XOR `page_token`; the durable cursor appears only on terminal pages |
 | POST | `/graphs/{id}/changes/baseline` | bearer + `export` (a baseline is a full data export) | stream an entity snapshot pinned at one captured commit; the final NDJSON record is the `{"baseline": ...}` handshake |
 
@@ -158,7 +158,7 @@ request is rejected with HTTP 400 and an error pointing the caller at
 field names (`query`, `name`); the legacy field names `query_source` and
 `query_name` continue to deserialize as serde aliases so existing clients keep
 working without changes. Successful mutation and load responses carry the exact
-published `commit`; a mutation that changes no rows carries `commit: null`.
+published `commit`; a mutation that changes no entities carries `commit: null`.
 
 ## Deprecated names (`/read`, `/change`)
 
@@ -188,7 +188,7 @@ when swapping the URL path.
 `POST /graphs/{graph_id}/load/ndjson` accepts a raw
 `application/x-ndjson` body. Targeting stays at graph level: `branch`, optional
 `from`, and `mode=append|merge|overwrite` are query parameters; there is no
-table or dataset selector. One request may mix logical node and edge
+physical dataset selector. One request may mix logical node and edge
 declarations:
 
 ```http
@@ -205,8 +205,9 @@ the ordinary admission limits, strictly validates the complete batch, and calls
 the actor-aware graph-batch loader. All touched declarations publish through
 the existing multi-dataset transaction. A successful response is terminal: the
 single graph commit is already visible. Its `nodes` and `edges` arrays contain
-only logical accepted-schema names and row counts; physical table and Lance
-identities are not exposed.
+only logical accepted-schema names and entity counts; the compatibility counters
+remain `rows_loaded` and `total_rows`. Physical datasets and Lance identities are
+not exposed.
 
 `append` is strict insert, `merge` is upsert, and `overwrite` replaces each
 touched declaration's image. A malformed batch has no effect. Use multiple
@@ -229,8 +230,8 @@ validation all finish before the server sends `200`.
 The engine incrementally scans exact pinned Lance versions using an initial
 8,192-row estimate and Lance's approximate 32-MiB decoded-byte target; these
 are scheduling targets, not hard scanner-memory ceilings. Blob descriptors are
-explicitly sliced to one logical row before its complete Blob-property set is
-materialized. One row's Blob values and encoded JSON are indivisible scratch
+explicitly sliced to one logical entity before its complete Blob-property set is
+materialized. One entity's Blob values and encoded JSON are indivisible scratch
 outside the transport reservation. Encoded JSONL is split into independently
 owned chunks of at most 64 KiB.
 
@@ -252,7 +253,7 @@ fails.
 ## Blob delivery
 
 `GET /graphs/{graph_id}/blob` and its explicit `HEAD` twin select one logical
-node or edge property; they never expose a Lance dataset, table key, row
+node or edge property; they never expose a Lance dataset, compatibility `table_key`, row
 address, or physical Blob placement:
 
 ```http
@@ -312,13 +313,13 @@ with
 Merge conflicts attach structured
 `MergeConflictOutput { table_key, row_id?, kind, message }`.
 
-`manifest_conflict` is set on legacy per-table manifest-version rejections
+`manifest_conflict` is set on legacy per-dataset published-version rejections
 (HTTP 409). `ManifestConflictOutput { table_key, expected, actual }` tells the
-client which table was stale. Mutation and load use the unified coarse-OCC
+client which dataset was stale. Mutation and load use the unified coarse-OCC
 adapter described next; other writers retain this older conflict shape until
 they are enrolled.
 
-`read_set_conflict` is set when a prepared write is rejected before any table
+`read_set_conflict` is set when a prepared write is rejected before any dataset
 effect because its branch authority changed. The HTTP status is 409 and
 `ReadSetConflictOutput { member, expected, actual }` identifies the stale
 authority member. The engine already performs a bounded full-attempt retry for
@@ -342,7 +343,7 @@ half-open range and logical representation length without requiring clients to
 parse the human-readable error string.
 
 `recovery_required` is set when an overlapping durable recovery intent remains
-unresolved; its table effects may or may not have started. The HTTP status is 503 and
+unresolved; its dataset effects may or may not have started. The HTTP status is 503 and
 `RecoveryRequiredOutput { operation_id }` names the durable recovery intent.
 The optional `code` field is omitted for this response: adding a new value to
 the closed error-code enum would break older clients, while the optional
@@ -351,7 +352,7 @@ Do not blindly resubmit the write: let a read-write open or the recovery sweep
 resolve that operation first, then retry from a fresh snapshot.
 
 `change_feed_gap` is set when a commit diff or feed continuation can no longer
-be reconstructed because cleanup reclaimed one of its pinned table versions.
+be reconstructed because cleanup reclaimed one of its pinned dataset versions.
 The HTTP status is 410 and
 `ChangeFeedGapOutput { cursor, first_unreadable_commit_id }` identifies the
 failed continuation point. Retrying the same token cannot repair retention;
@@ -389,7 +390,7 @@ This 412 contract is enforced across concurrent requests within the supported
 single-writer-process topology. The gate is not a distributed lease. If an
 unsupported foreign writer advances the branch after local pre-effect
 arbitration, the exact publisher still prevents a silent lost update, but the
-losing request may already own durable table effects and therefore returns
+losing request may already own durable dataset effects and therefore returns
 `recovery_required` (503) for recovery instead of 412.
 
 HTTP status codes used include 200, 206, 302, 304, 400, 401, 403, 404, 405,
@@ -401,10 +402,10 @@ RFC-022-enrolled mutation/load preparation runs outside the effect gates, so
 parsing, validation, and reclaimable fragment staging can overlap across branches.
 Readers acquire none of these gates. Before the first durable effect, however, an
 attempt acquires the exclusive root schema gate, then its branch-effect gate and
-sorted table queues, and holds all of them through manifest publication. The root
+sorted dataset queues, and holds all of them through graph-manifest publication. The root
 schema gate means enrolled effect windows on one graph currently serialize
 in-process even across different branches; the branch gate preserves one atomic
-graph-head validation authority, while table queues protect each concrete Lance
+graph-head validation authority, while dataset queues protect each concrete Lance
 effect and legacy writer. These are process-local ordering gates, not a
 cross-process lock. To keep one heavy actor from exhausting shared capacity
 (Lance I/O, manifest churn, network), the server gates mutating handlers through

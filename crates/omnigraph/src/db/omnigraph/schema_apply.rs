@@ -599,7 +599,8 @@ where
     // this, an added type's dataset is created in Phase B but the
     // manifest never gains an entry for it after roll-forward — the
     // live `_schema.pg` declares a type the manifest doesn't know about
-    // and reads through the engine fail with "no manifest entry for X".
+    // and reads through the engine report that the logical type does not exist
+    // at that snapshot.
     let mut sidecar_registrations: Vec<crate::db::manifest::SidecarTableRegistration> = Vec::new();
     for table_key in &added_tables {
         let identity = table_identity_for_schema_key(&desired_ir, table_key)?;

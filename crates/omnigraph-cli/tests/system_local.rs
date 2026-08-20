@@ -371,9 +371,14 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
             .arg("--json"),
     );
     // The deprecation warning goes to stderr so --json stdout stays clean.
+    let ingest_stderr = String::from_utf8_lossy(&ingest_output.stderr);
     assert!(
-        String::from_utf8_lossy(&ingest_output.stderr).contains("deprecated"),
-        "ingest must warn about its deprecation on stderr"
+        ingest_stderr.contains("deprecated compatibility alias kept indefinitely"),
+        "ingest must describe its indefinite compatibility status on stderr: {ingest_stderr}"
+    );
+    assert!(
+        !ingest_stderr.contains("will be removed"),
+        "ingest must not promise removal: {ingest_stderr}"
     );
     let ingest_payload = parse_stdout_json(&ingest_output);
     assert_eq!(ingest_payload["branch"], "feature-ingest");
@@ -384,6 +389,20 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["mode"], "merge");
     assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
     assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
+
+    let human_ingest = output_success(
+        cli()
+            .arg("ingest")
+            .arg("--data")
+            .arg(&ingest_data)
+            .arg("--branch")
+            .arg("feature-ingest-human")
+            .arg(graph.path()),
+    );
+    let human_stdout = stdout_string(&human_ingest);
+    assert!(human_stdout.contains("node type 'Person': 2 entities loaded"));
+    assert!(!human_stdout.contains("node:Person"));
+    assert!(!human_stdout.contains("rows_loaded"));
 
     let feature_snapshot = parse_stdout_json(&output_success(
         cli()
