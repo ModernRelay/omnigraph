@@ -20,7 +20,7 @@ pub(super) fn branch_ref_error(error: lance::Error, branch: &str) -> OmniError {
         lance::Error::RefNotFound { .. } => OmniError::BranchNotFound {
             branch: branch.to_string(),
         },
-        other => OmniError::Lance(other.to_string()),
+        other => OmniError::storage(other),
     }
 }
 

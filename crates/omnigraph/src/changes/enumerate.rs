@@ -132,11 +132,11 @@ async fn emitted_image(
         let from = properties
             .remove("src")
             .and_then(|value| value.as_str().map(str::to_string))
-            .ok_or_else(|| OmniError::Lance("edge image is missing src".to_string()))?;
+            .ok_or_else(|| OmniError::manifest_internal("edge image is missing src"))?;
         let to = properties
             .remove("dst")
             .and_then(|value| value.as_str().map(str::to_string))
-            .ok_or_else(|| OmniError::Lance("edge image is missing dst".to_string()))?;
+            .ok_or_else(|| OmniError::manifest_internal("edge image is missing dst"))?;
         Some(EntityEndpoints { from, to })
     } else {
         None

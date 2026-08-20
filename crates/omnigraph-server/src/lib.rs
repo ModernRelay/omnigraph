@@ -1277,7 +1277,7 @@ impl ApiError {
                 Self::range_not_satisfiable(start, end, length)
             }
             err @ OmniError::BlobIntegrity { .. } => Self::internal(err.to_string()),
-            OmniError::Storage(failure) => Self::internal(failure.to_string()),
+            OmniError::Storage(failure) => Self::internal(failure.message),
             OmniError::RetryableCommitConflict(message) => {
                 Self::conflict(format!("retryable storage commit conflict: {message}"))
             }

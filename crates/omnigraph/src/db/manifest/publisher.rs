@@ -918,7 +918,7 @@ impl GraphNamespacePublisher {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], manifest_schema());
         let dataset = Arc::new(dataset);
         let mut merge_builder = MergeInsertBuilder::try_new(dataset, vec!["object_id".to_string()])
-            .map_err(OmniError::storage)?;
+            .map_err(OmniError::lance_internal)?;
         merge_builder.when_matched(WhenMatched::UpdateAll);
         merge_builder.when_not_matched(WhenNotMatched::InsertAll);
         // 0 here is intentional: Lance's built-in retry uses transparent rebase,
@@ -935,7 +935,7 @@ impl GraphNamespacePublisher {
         merge_builder.skip_auto_cleanup(true);
         let (new_dataset, _stats) = merge_builder
             .try_build()
-            .map_err(OmniError::storage)?
+            .map_err(OmniError::lance_internal)?
             .execute_reader(Box::new(reader))
             .await
             .map_err(map_lance_publish_error)?;

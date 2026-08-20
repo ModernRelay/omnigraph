@@ -376,10 +376,40 @@ impl OmniError {
         Self::manifest_internal(error.to_string())
     }
 
+    /// Lance also exposes fallible in-memory schema and builder APIs. Failures
+    /// from those engine-owned transformations are manifest machinery, not
+    /// evidence that the graph's storage substrate failed.
+    pub(crate) fn lance_internal(error: lance::Error) -> Self {
+        Self::manifest_internal(error.to_string())
+    }
+
+    /// Recover an engine-domain error carried through an engine-produced
+    /// DataFusion stream and Lance's `External` wrapper. Every other Lance
+    /// result keeps the ordinary storage classification.
+    pub(crate) fn lance_stream(error: lance::Error) -> Self {
+        match error.into_external() {
+            Ok(source) => match source.downcast::<Self>() {
+                Ok(error) => *error,
+                Err(source) => Self::storage(lance::Error::external(source)),
+            },
+            Err(error) => Self::storage(error),
+        }
+    }
+
+    /// Carry an engine-domain failure through a DataFusion stream without
+    /// flattening its variant, storage kind, or source into display text.
+    pub(crate) fn into_datafusion_external(self) -> datafusion::error::DataFusionError {
+        datafusion::error::DataFusionError::External(Box::new(self))
+    }
+
     /// Preserve typed storage evidence carried through DataFusion execution;
     /// otherwise retain the user query/execution category.
     pub fn datafusion(error: datafusion::error::DataFusionError) -> Self {
-        match find_storage_source_kind(&error, 0) {
+        let error = match recover_datafusion_engine_error(error) {
+            Ok(error) => return error,
+            Err(error) => error,
+        };
+        match find_storage_source_kind(&error) {
             Some(kind) => Self::classified_storage(kind, error),
             None => Self::DataFusion(error.to_string()),
         }
@@ -390,7 +420,11 @@ impl OmniError {
     /// failure remains an unknown storage failure because no user query owns
     /// these adapters.
     pub(crate) fn datafusion_internal(error: datafusion::error::DataFusionError) -> Self {
-        let kind = find_storage_source_kind(&error, 0).unwrap_or(StorageFailureKind::Unknown);
+        let error = match recover_datafusion_engine_error(error) {
+            Ok(error) => return error,
+            Err(error) => error,
+        };
+        let kind = find_storage_source_kind(&error).unwrap_or(StorageFailureKind::Unknown);
         Self::classified_storage(kind, error)
     }
 
@@ -557,8 +591,22 @@ impl OmniError {
         }
     }
 }
+fn recover_datafusion_engine_error(
+    error: datafusion::error::DataFusionError,
+) -> std::result::Result<OmniError, datafusion::error::DataFusionError> {
+    match error {
+        datafusion::error::DataFusionError::External(source) => {
+            match source.downcast::<OmniError>() {
+                Ok(error) => Ok(*error),
+                Err(source) => Err(datafusion::error::DataFusionError::External(source)),
+            }
+        }
+        error => Err(error),
+    }
+}
+
 fn classify_lance_error(error: &lance::Error) -> StorageFailureKind {
-    find_storage_source_kind(error, 0).unwrap_or(StorageFailureKind::Unknown)
+    find_storage_source_kind(error).unwrap_or(StorageFailureKind::Unknown)
 }
 
 fn classify_engine_storage_source<'a>(
@@ -618,9 +666,8 @@ fn classify_engine_storage_source<'a>(
 /// depth bound.
 fn find_storage_source_kind(
     source: &(dyn std::error::Error + 'static),
-    depth: usize,
 ) -> Option<StorageFailureKind> {
-    omnigraph_storage::find_storage_source_kind_with(source, depth, classify_engine_storage_source)
+    omnigraph_storage::find_storage_source_kind_with(source, classify_engine_storage_source)
 }
 
 fn classify_namespace_code(code: lance_namespace::ErrorCode) -> StorageFailureKind {
@@ -822,35 +869,71 @@ mod tests {
     fn all_lance_namespace_codes_have_the_rfc_mapping() {
         use lance_namespace::ErrorCode;
 
-        let expected = [
-            StorageFailureKind::Configuration,
-            StorageFailureKind::NotFound,
-            StorageFailureKind::Precondition,
-            StorageFailureKind::Precondition,
-            StorageFailureKind::NotFound,
-            StorageFailureKind::Precondition,
-            StorageFailureKind::NotFound,
-            StorageFailureKind::Precondition,
-            StorageFailureKind::NotFound,
-            StorageFailureKind::Precondition,
-            StorageFailureKind::NotFound,
-            StorageFailureKind::NotFound,
-            StorageFailureKind::NotFound,
-            StorageFailureKind::Configuration,
-            StorageFailureKind::Precondition,
-            StorageFailureKind::Configuration,
-            StorageFailureKind::Configuration,
-            StorageFailureKind::Transient,
-            StorageFailureKind::Permanent,
-            StorageFailureKind::Precondition,
-            StorageFailureKind::Configuration,
-            StorageFailureKind::Transient,
-            StorageFailureKind::NotFound,
-            StorageFailureKind::Precondition,
+        let cases = [
+            (ErrorCode::Unsupported, StorageFailureKind::Configuration),
+            (ErrorCode::NamespaceNotFound, StorageFailureKind::NotFound),
+            (
+                ErrorCode::NamespaceAlreadyExists,
+                StorageFailureKind::Precondition,
+            ),
+            (
+                ErrorCode::NamespaceNotEmpty,
+                StorageFailureKind::Precondition,
+            ),
+            (ErrorCode::TableNotFound, StorageFailureKind::NotFound),
+            (
+                ErrorCode::TableAlreadyExists,
+                StorageFailureKind::Precondition,
+            ),
+            (ErrorCode::TableIndexNotFound, StorageFailureKind::NotFound),
+            (
+                ErrorCode::TableIndexAlreadyExists,
+                StorageFailureKind::Precondition,
+            ),
+            (ErrorCode::TableTagNotFound, StorageFailureKind::NotFound),
+            (
+                ErrorCode::TableTagAlreadyExists,
+                StorageFailureKind::Precondition,
+            ),
+            (ErrorCode::TransactionNotFound, StorageFailureKind::NotFound),
+            (
+                ErrorCode::TableVersionNotFound,
+                StorageFailureKind::NotFound,
+            ),
+            (ErrorCode::TableColumnNotFound, StorageFailureKind::NotFound),
+            (ErrorCode::InvalidInput, StorageFailureKind::Configuration),
+            (
+                ErrorCode::ConcurrentModification,
+                StorageFailureKind::Precondition,
+            ),
+            (
+                ErrorCode::PermissionDenied,
+                StorageFailureKind::Configuration,
+            ),
+            (
+                ErrorCode::Unauthenticated,
+                StorageFailureKind::Configuration,
+            ),
+            (ErrorCode::ServiceUnavailable, StorageFailureKind::Transient),
+            (ErrorCode::Internal, StorageFailureKind::Permanent),
+            (
+                ErrorCode::InvalidTableState,
+                StorageFailureKind::Precondition,
+            ),
+            (
+                ErrorCode::TableSchemaValidationError,
+                StorageFailureKind::Configuration,
+            ),
+            (ErrorCode::Throttling, StorageFailureKind::Transient),
+            (ErrorCode::TableBranchNotFound, StorageFailureKind::NotFound),
+            (
+                ErrorCode::TableBranchAlreadyExists,
+                StorageFailureKind::Precondition,
+            ),
         ];
 
-        for (raw, expected) in (0_u32..=23).zip(expected) {
-            let code = ErrorCode::from_u32(raw).expect("all Lance 10 codes must exist");
+        for (raw, (code, expected)) in (0_u32..).zip(cases) {
+            assert_eq!(ErrorCode::from_u32(raw), Some(code));
             assert_eq!(classify_namespace_code(code), expected, "{code}");
             let namespace = lance_namespace::NamespaceError::from_code(raw, "typed namespace");
             let historical_message = format!("storage: {namespace}");
@@ -960,6 +1043,30 @@ mod tests {
             nested.storage_failure().map(|failure| failure.kind),
             Some(StorageFailureKind::Transient)
         );
+
+        let carried = OmniError::Storage(StorageFailure::new(
+            StorageFailureKind::NotFound,
+            "storage: exact carried failure",
+        ));
+        let carried = OmniError::datafusion_internal(carried.into_datafusion_external());
+        assert!(matches!(
+            carried,
+            OmniError::Storage(StorageFailure {
+                kind: StorageFailureKind::NotFound,
+                ref message,
+            }) if message == "storage: exact carried failure"
+        ));
+
+        let carried = OmniError::manifest_internal("carried engine invariant");
+        let carried = OmniError::datafusion(carried.into_datafusion_external());
+        assert!(matches!(
+            carried,
+            OmniError::Manifest(ManifestError {
+                kind: ManifestErrorKind::Internal,
+                ref message,
+                ..
+            }) if message == "carried engine invariant"
+        ));
     }
 
     #[test]
@@ -985,6 +1092,32 @@ mod tests {
                 kind: ManifestErrorKind::Internal,
                 ..
             })
+        ));
+
+        let lance_builder = OmniError::lance_internal(lance::Error::invalid_input(
+            "engine-owned builder invariant",
+        ));
+        assert!(matches!(
+            lance_builder,
+            OmniError::Manifest(ManifestError {
+                kind: ManifestErrorKind::Internal,
+                ..
+            })
+        ));
+
+        let carried = OmniError::ResourceLimitExceeded {
+            resource: "blob materialization bytes".to_string(),
+            limit: 10,
+            actual: 11,
+        };
+        let carried = OmniError::lance_stream(lance::Error::external(Box::new(carried)));
+        assert!(matches!(
+            carried,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 10,
+                actual: 11,
+            } if resource == "blob materialization bytes"
         ));
 
         let blob = OmniError::blob_integrity("persisted descriptor contradiction");

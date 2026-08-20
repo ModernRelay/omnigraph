@@ -27,7 +27,7 @@ pub enum StorageFailureKind {
     /// interruption.
     Transient,
     /// Authentication, permission, unsupported operation, malformed
-    /// input/location, or an exhausted configured disk cap.
+    /// input/location, or an operator-actionable capacity constraint.
     Configuration,
     /// The requested object, dataset, ref, version, index, or namespace entity
     /// is absent.
@@ -69,55 +69,10 @@ impl StorageFailure {
 
 /// Inspect at most eight source links. A typed cause beyond this bound, a
 /// cyclic chain, or a source-free opaque wrapper remains `Unknown`.
-pub const MAX_STORAGE_SOURCE_DEPTH: usize = 8;
+const MAX_STORAGE_SOURCE_DEPTH: usize = 8;
 
-/// Classify a storage-owned I/O error, recursively consulting a typed inner
-/// source only when the outer `ErrorKind` carries no decision.
-pub fn classify_io_error(error: &std::io::Error) -> StorageFailureKind {
-    classify_io_error_at_depth(error, 0)
-}
-
-#[doc(hidden)]
-pub fn classify_io_error_at_depth(error: &std::io::Error, depth: usize) -> StorageFailureKind {
-    find_storage_source_kind_with(error, depth, no_additional_storage_source)
-        .unwrap_or(StorageFailureKind::Unknown)
-}
-
-/// Classify an `object_store` 0.13 failure by its typed variant. Opaque
-/// `Generic` values are not assumed transient merely because the provider has
-/// already exhausted its own retries.
-pub fn classify_object_store_error(error: &object_store::Error) -> StorageFailureKind {
-    classify_object_store_error_at_depth(error, 0)
-}
-
-#[doc(hidden)]
-pub fn classify_object_store_error_at_depth(
-    error: &object_store::Error,
-    depth: usize,
-) -> StorageFailureKind {
-    find_storage_source_kind_with(error, depth, no_additional_storage_source)
-        .unwrap_or(StorageFailureKind::Unknown)
-}
-
-/// Recover typed object-store or I/O evidence from an opaque wrapper without
-/// inspecting display text.
-pub fn classify_storage_source(source: &(dyn std::error::Error + 'static)) -> StorageFailureKind {
-    classify_storage_source_at_depth(source, 0)
-}
-
-#[doc(hidden)]
-pub fn classify_storage_source_at_depth(
-    source: &(dyn std::error::Error + 'static),
-    depth: usize,
-) -> StorageFailureKind {
-    find_storage_source_kind_with(source, depth, no_additional_storage_source)
-        .unwrap_or(StorageFailureKind::Unknown)
-}
-
-/// Extension classifier used by the shared typed-source traversal.
-/// `Break(kind)` supplies typed engine-owned evidence,
-/// `Continue(Some(source))` supplies a recognized wrapper's typed source, and
-/// `Continue(None)` means the node is not owned by the extension.
+/// Callback used by an owning crate to add typed storage wrappers without
+/// duplicating the bounded source-chain traversal.
 #[doc(hidden)]
 pub type StorageSourceClassifier = for<'a> fn(
     &'a (dyn std::error::Error + 'static),
@@ -126,16 +81,33 @@ pub type StorageSourceClassifier = for<'a> fn(
     Option<&'a (dyn std::error::Error + 'static)>,
 >;
 
+/// Classify a storage-owned I/O error, recursively consulting a typed inner
+/// source only when the outer `ErrorKind` carries no decision.
+fn classify_io_error(error: &std::io::Error) -> StorageFailureKind {
+    find_storage_source_kind_with(error, no_additional_storage_source)
+        .unwrap_or(StorageFailureKind::Unknown)
+}
+
+/// Classify an `object_store` 0.13 failure by its typed variant. Opaque
+/// `Generic` values are not assumed transient merely because the provider has
+/// already exhausted its own retries.
+fn classify_object_store_error(error: &object_store::Error) -> StorageFailureKind {
+    find_storage_source_kind_with(error, no_additional_storage_source)
+        .unwrap_or(StorageFailureKind::Unknown)
+}
+
 /// The single bounded typed-source traversal shared by the storage adapter
 /// and engine-specific storage wrappers.
+/// `Break(kind)` supplies typed engine-owned evidence,
+/// `Continue(Some(source))` supplies a recognized wrapper's typed source, and
+/// `Continue(None)` means the node is not owned by the extension.
 #[doc(hidden)]
 pub fn find_storage_source_kind_with(
     source: &(dyn std::error::Error + 'static),
-    depth: usize,
     classify_additional: StorageSourceClassifier,
 ) -> Option<StorageFailureKind> {
     let mut current = source;
-    let mut current_depth = depth;
+    let mut current_depth = 0;
     let mut saw_storage_wrapper = false;
     loop {
         if current_depth >= MAX_STORAGE_SOURCE_DEPTH {
@@ -1591,19 +1563,21 @@ mod tests {
 
     #[test]
     fn typed_source_walk_accepts_depth_seven_and_bounds_depth_eight_and_cycles() {
+        let classify = |source: &(dyn std::error::Error + 'static)| {
+            find_storage_source_kind_with(source, no_additional_storage_source)
+                .unwrap_or(StorageFailureKind::Unknown)
+        };
         let depth_seven = source_chain(7, boxed_io(std::io::ErrorKind::TimedOut));
         assert_eq!(
-            classify_storage_source(depth_seven.as_ref()),
+            classify(depth_seven.as_ref()),
             StorageFailureKind::Transient
         );
 
         let depth_eight = source_chain(8, boxed_io(std::io::ErrorKind::TimedOut));
+        assert_eq!(classify(depth_eight.as_ref()), StorageFailureKind::Unknown);
+        assert_eq!(classify(&CyclicError), StorageFailureKind::Unknown);
         assert_eq!(
-            classify_storage_source(depth_eight.as_ref()),
-            StorageFailureKind::Unknown
-        );
-        assert_eq!(
-            classify_storage_source(&CyclicError),
+            classify_object_store_error(&generic(Box::new(CyclicError))),
             StorageFailureKind::Unknown
         );
     }

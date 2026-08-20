@@ -2020,13 +2020,13 @@ pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> 
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|e| OmniError::manifest(format!("invalid base64 blob data: {}", e)))?;
-        builder.push_bytes(bytes).map_err(OmniError::storage)
+        builder.push_bytes(bytes).map_err(OmniError::lance_internal)
     } else {
         // Treat as URI. Bound builder scratch before Lance copies the string;
         // policy/scheme/containment validation remains operation-wide after
         // last-write-wins folding.
         crate::blob::validate_external_blob_uri_builder_input(value)?;
-        builder.push_uri(value).map_err(OmniError::storage)
+        builder.push_uri(value).map_err(OmniError::lance_internal)
     }
 }
 
@@ -2039,7 +2039,7 @@ fn build_blob_column(name: &str, nullable: bool, rows: &[JsonValue]) -> Result<A
                 append_blob_value(&mut builder, s)?;
             }
             Some(JsonValue::Null) | None if nullable => {
-                builder.push_null().map_err(OmniError::storage)?;
+                builder.push_null().map_err(OmniError::lance_internal)?;
             }
             Some(JsonValue::Null) | None => {
                 return Err(OmniError::manifest(format!(
@@ -2055,7 +2055,7 @@ fn build_blob_column(name: &str, nullable: bool, rows: &[JsonValue]) -> Result<A
             }
         }
     }
-    builder.finish().map_err(OmniError::storage)
+    builder.finish().map_err(OmniError::lance_internal)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

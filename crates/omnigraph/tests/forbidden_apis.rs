@@ -2680,8 +2680,22 @@ fn lance_ordering_stays_behind_bounded_scan_executor() {
 }
 
 #[test]
-fn omni_error_has_no_global_upstream_error_conversions() {
+fn omni_error_has_only_reviewed_global_error_conversions() {
     use syn::{GenericArgument, PathArguments};
+
+    fn type_segments(error_type: &Type) -> Option<Vec<String>> {
+        let Type::Path(source) = error_type else {
+            return None;
+        };
+        Some(
+            source
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect(),
+        )
+    }
 
     let src = engine_src_root();
     let mut violations = Vec::new();
@@ -2692,6 +2706,33 @@ fn omni_error_has_no_global_upstream_error_conversions() {
         let relative = file.strip_prefix(&src).unwrap_or(&file);
         let ast = parse_rust_source(&contents, &relative.display().to_string());
         for item in ast.items {
+            if let Item::Enum(enumeration) = &item
+                && enumeration.ident == "OmniError"
+            {
+                for variant in &enumeration.variants {
+                    for field in &variant.fields {
+                        if !field
+                            .attrs
+                            .iter()
+                            .any(|attribute| attribute.path().is_ident("from"))
+                        {
+                            continue;
+                        }
+                        let segments = type_segments(&field.ty).unwrap_or_default();
+                        let reviewed = segments == ["omnigraph_compiler", "error", "CompilerError"]
+                            || segments == ["std", "io", "Error"];
+                        if !reviewed {
+                            violations.push(format!(
+                                "{}: OmniError::{} derives From<{}>",
+                                relative.display(),
+                                variant.ident,
+                                segments.join("::")
+                            ));
+                        }
+                    }
+                }
+            }
+
             let Item::Impl(implementation) = item else {
                 continue;
             };
@@ -2727,13 +2768,13 @@ fn omni_error_has_no_global_upstream_error_conversions() {
                 .iter()
                 .map(|segment| segment.ident.to_string())
                 .collect::<Vec<_>>();
-            let last = segments.last().map(String::as_str);
-            let forbidden = matches!(last, Some("ArrowError" | "DataFusionError" | "LanceError"))
-                || (last == Some("Error")
-                    && segments
-                        .iter()
-                        .any(|segment| segment == "lance" || segment == "lance_core"));
-            if forbidden {
+            // Keep every global conversion explicit. Requiring the exact
+            // reviewed spelling also catches an upstream `Error` imported
+            // under an alias, which type-name deny-lists miss.
+            let reviewed = segments == ["omnigraph_storage", "StorageError"]
+                || segments == ["ManifestInitError"]
+                || segments == ["SidecarSchemaError"];
+            if !reviewed {
                 violations.push(format!(
                     "{}: impl From<{}> for OmniError",
                     relative.display(),
@@ -2745,7 +2786,7 @@ fn omni_error_has_no_global_upstream_error_conversions() {
 
     assert!(
         violations.is_empty(),
-        "upstream errors require named, call-site-specific conversion helpers; global conversions found:\n  {}",
+        "new OmniError conversions require a deliberate source-guard review; unreviewed global conversions found:\n  {}",
         violations.join("\n  ")
     );
 }

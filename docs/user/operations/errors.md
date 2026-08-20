@@ -10,7 +10,7 @@
   - `Transient` — positive evidence of timeout, throttling, cancellation, or a
     transport interruption.
   - `Configuration` — authentication, permission, unsupported operation,
-    malformed input/location, or an exhausted configured disk cap.
+    malformed input/location, or an operator-actionable capacity constraint.
   - `NotFound` — a requested object, dataset, ref, version, index, or namespace
     entity is absent.
   - `Precondition` — state must be re-evaluated after an already-exists,

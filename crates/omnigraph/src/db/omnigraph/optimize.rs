@@ -1529,6 +1529,12 @@ mod tests {
         assert!(is_retryable_lance_conflict(
             &lance::Error::too_much_write_contention("contended")
         ));
+        assert!(is_retryable_lance_conflict(
+            &lance::Error::commit_conflict_source(
+                1,
+                Box::new(std::io::Error::other("overlapping rewrite")),
+            )
+        ));
         assert!(!is_retryable_lance_conflict(&lance::Error::invalid_input(
             "not a conflict"
         )));
