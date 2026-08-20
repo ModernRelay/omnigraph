@@ -857,7 +857,7 @@ async fn run_direction(
         Err(OmniError::MergeConflicts(conflicts)) => ActualOutcome::Conflicts(
             conflicts
                 .into_iter()
-                .map(|c| (c.table_key, c.kind, c.row_id))
+                .map(|c| (c.type_key, c.kind, c.entity_id))
                 .collect(),
         ),
         Err(other) => panic!("[{label}] unexpected merge error: {other:?}"),

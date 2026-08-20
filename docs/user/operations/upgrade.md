@@ -232,8 +232,9 @@ deliberately mints a new identity domain; identity continuity across
 export/import is not claimed.
 
 Tooling that reads `__manifest` directly must treat `stable_table_id` and
-`table_incarnation_id` as the dataset coordinate. `table_key` remains the current
-human-readable alias and can change during a type rename. A pure rename keeps
+`table_incarnation_id` as the dataset coordinate. Persisted `table_key` remains
+the current internal human-readable alias and can change during a type rename;
+public contracts use graph type names/keys. A pure rename keeps
 the same physical dataset path and Lance version.
 
 ## Migrating to internal schema v6

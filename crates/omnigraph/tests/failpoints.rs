@@ -1,4 +1,5 @@
 #![cfg(feature = "failpoints")]
+#![recursion_limit = "512"]
 
 mod helpers;
 
@@ -97,9 +98,9 @@ async fn node_table_uri(db: &Omnigraph, type_name: &str) -> String {
         .await
         .unwrap();
     let table_path = &snapshot
-        .entry(&table_key)
+        .dataset(&table_key)
         .unwrap_or_else(|| panic!("live manifest has no registration for {table_key}"))
-        .table_path;
+        .dataset_path;
     format!(
         "{}/{}",
         db.uri().trim_end_matches('/'),
@@ -1171,11 +1172,11 @@ async fn partial_first_touch_recovery_fails_closed_on_legacy_path_overlap() {
     let table_pins = ["node:Person", "edge:Knows"]
         .into_iter()
         .map(|table_key| {
-            let entry = main_snapshot.entry(table_key).unwrap();
+            let entry = main_snapshot.dataset(table_key).unwrap();
             (
                 table_key.to_string(),
-                format!("{uri}/{}", entry.table_path),
-                entry.table_version,
+                format!("{uri}/{}", entry.dataset_path),
+                entry.published_dataset_version,
             )
         })
         .collect::<Vec<_>>();
@@ -1984,9 +1985,9 @@ async fn rfc023_effect_free_conflict_is_typed_or_fully_reprepared() {
                 matches!(
                     err,
                     OmniError::KeyConflict {
-                        ref table_key,
-                        key: Some(ref key),
-                    } if table_key == "node:Person" && key == "racer"
+                        ref type_key,
+                        entity_id: Some(ref entity_id),
+                    } if type_key == "node:Person" && entity_id == "racer"
                 ),
                 "strict conflict must remain typed and report the freshly visible exact key: {err:?}"
             );
@@ -2159,7 +2160,7 @@ async fn rfc023_table_n_conflict_after_table_1_keeps_recovery_ownership() {
     let mut committed_by_a = Vec::new();
     let mut not_yet_committed = Vec::new();
     for fixture in &table_fixtures {
-        let expected = before.entry(fixture.0).unwrap().table_version;
+        let expected = before.dataset(fixture.0).unwrap().published_dataset_version;
         let head = Dataset::open(&fixture.3)
             .await
             .unwrap()
@@ -2212,9 +2213,9 @@ async fn rfc023_table_n_conflict_after_table_1_keeps_recovery_ownership() {
 
     let after = helpers::snapshot_main(&db).await.unwrap();
     for fixture in &table_fixtures {
-        let expected = before.entry(fixture.0).unwrap().table_version;
+        let expected = before.dataset(fixture.0).unwrap().published_dataset_version;
         assert_eq!(
-            after.entry(fixture.0).unwrap().table_version,
+            after.dataset(fixture.0).unwrap().published_dataset_version,
             expected,
             "the failed operation must publish neither table"
         );
@@ -2273,9 +2274,9 @@ async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
     let winner_manifest_pin = helpers::snapshot_main(&db)
         .await
         .unwrap()
-        .entry("node:User")
+        .dataset("node:User")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let user_uri = node_table_uri(&db, "User").await;
     let winner_lance_head = lance::Dataset::open(&user_uri)
         .await
@@ -2297,9 +2298,9 @@ async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
     let final_manifest_pin = helpers::snapshot_main(&db)
         .await
         .unwrap()
-        .entry("node:User")
+        .dataset("node:User")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let final_lance_head = lance::Dataset::open(&user_uri)
         .await
         .unwrap()
@@ -2355,9 +2356,9 @@ async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
     let winner_person_pin = helpers::snapshot_main(&db)
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let person_uri = node_table_uri(&db, "Person").await;
     let winner_person_head = lance::Dataset::open(&person_uri)
         .await
@@ -2385,9 +2386,9 @@ async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
     let final_person_pin = helpers::snapshot_main(&db)
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let final_person_head = lance::Dataset::open(&person_uri)
         .await
         .unwrap()
@@ -2451,9 +2452,9 @@ async fn conditional_update_and_delete_races_return_precondition_failed_before_e
         let winner_person_pin = helpers::snapshot_main(&db)
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version;
+            .published_dataset_version;
         let person_uri = node_table_uri(&db, "Person").await;
         let winner_person_head = lance::Dataset::open(&person_uri)
             .await
@@ -2485,9 +2486,9 @@ async fn conditional_update_and_delete_races_return_precondition_failed_before_e
         let final_person_pin = helpers::snapshot_main(&db)
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version;
+            .published_dataset_version;
         let final_person_head = lance::Dataset::open(&person_uri)
             .await
             .unwrap()
@@ -2675,9 +2676,9 @@ async fn append_load_revalidates_unique_after_pre_effect_authority_change() {
     let winner_manifest_pin = helpers::snapshot_main(&db)
         .await
         .unwrap()
-        .entry("node:User")
+        .dataset("node:User")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let user_uri = node_table_uri(&db, "User").await;
     let winner_lance_head = lance::Dataset::open(&user_uri)
         .await
@@ -2699,9 +2700,9 @@ async fn append_load_revalidates_unique_after_pre_effect_authority_change() {
     let final_manifest_pin = helpers::snapshot_main(&db)
         .await
         .unwrap()
-        .entry("node:User")
+        .dataset("node:User")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let final_lance_head = lance::Dataset::open(&user_uri)
         .await
         .unwrap()
@@ -2758,9 +2759,9 @@ async fn overwrite_load_rejects_disjoint_head_change_before_effects() {
     let winner_person_pin = helpers::snapshot_main(&db)
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let person_uri = node_table_uri(&db, "Person").await;
     let winner_person_head = lance::Dataset::open(&person_uri)
         .await
@@ -2788,9 +2789,9 @@ async fn overwrite_load_rejects_disjoint_head_change_before_effects() {
     let final_person_pin = helpers::snapshot_main(&db)
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let final_person_head = lance::Dataset::open(&person_uri)
         .await
         .unwrap()
@@ -2823,9 +2824,9 @@ async fn follower_after_initial_heal_reports_exact_pending_recovery_operation() 
     let initial_manifest_pin = helpers::snapshot_main(&db_a)
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
 
     // B passes its initial (empty) recovery heal, stages from the old pin, and
     // pauses before acquiring the effect gates.
@@ -2895,9 +2896,9 @@ async fn follower_after_initial_heal_reports_exact_pending_recovery_operation() 
             helpers::snapshot_main(&db_a)
                 .await
                 .unwrap()
-                .entry("node:Person")
+                .dataset("node:Person")
                 .unwrap()
-                .table_version,
+                .published_dataset_version,
             initial_manifest_pin,
             "A's failed publisher must leave the manifest pin unchanged"
         );
@@ -2932,9 +2933,9 @@ async fn follower_after_initial_heal_reports_exact_pending_recovery_operation() 
             helpers::snapshot_main(&db_b)
                 .await
                 .unwrap()
-                .entry("node:Person")
+                .dataset("node:Person")
                 .unwrap()
-                .table_version,
+                .published_dataset_version,
             initial_manifest_pin,
             "B must not publish around A's pending recovery"
         );
@@ -3244,7 +3245,7 @@ edge WorksAt: Person -> Company
         db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap()
-            .entry("node:Company")
+            .dataset("node:Company")
             .is_some()
     );
     let companies = stale_reader
@@ -3259,7 +3260,7 @@ edge WorksAt: Person -> Company
     assert_eq!(companies.num_rows(), 0);
     assert_eq!(
         stale_reader
-            .export_jsonl("main", &["Company".to_string()], &[])
+            .export_jsonl("main", &["Company".to_string()])
             .await
             .expect("export must use the same operation-local accepted catalog"),
         ""
@@ -3333,7 +3334,7 @@ async fn schema_apply_recovers_partial_rename() {
 /// After this test passes:
 /// - The originally-attempted insert ("Eve") is visible via a normal
 ///   query.
-/// - The next mutation succeeds without `ExpectedVersionMismatch`.
+/// - The next mutation succeeds without `PublishedDatasetVersionMismatch`.
 /// - `_graph_commit_recoveries.lance` carries an audit row with
 ///   `recovery_kind=RolledForward` and the original sidecar's
 ///   `actor_id` in `recovery_for_actor`.
@@ -3441,7 +3442,7 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
 /// parked sweep then loses its publish CAS at the now-stale `expected = v`.
 /// The manifest already reached the sidecar's goal, so this is convergence,
 /// not a logical conflict — the open must succeed, not panic with
-/// `ExpectedVersionMismatch`.
+/// `PublishedDatasetVersionMismatch`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn open_sweep_roll_forward_converges_when_manifest_advances_concurrently() {
@@ -3500,7 +3501,7 @@ async fn open_sweep_roll_forward_converges_when_manifest_advances_concurrently()
         .expect("the parked open task must not panic")
         .expect(
             "the open-time sweep must converge when the manifest already reached \
-             the sidecar's goal, not fail the open with ExpectedVersionMismatch",
+             the sidecar's goal, not fail the open with PublishedDatasetVersionMismatch",
         );
 
     // The sidecar is gone and the graph is readable and consistent.
@@ -3541,7 +3542,10 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
-    let pre_person_pin = pre_snapshot.entry("node:Person").unwrap().table_version;
+    let pre_person_pin = pre_snapshot
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
     let person_uri = node_table_uri(&db, "Person").await;
 
     {
@@ -3579,7 +3583,7 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
         assert!(
             err.to_string()
                 .contains("stale view of dataset for node type 'Person'")
-                || err.to_string().contains("ExpectedVersionMismatch")
+                || err.to_string().contains("PublishedDatasetVersionMismatch")
                 || err.to_string().contains("expected version mismatch"),
             "unexpected error: {err}",
         );
@@ -3634,9 +3638,9 @@ async fn recovery_rolls_forward_load_on_feature_branch() {
             .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .expect("main must have Person")
-            .table_version;
+            .published_dataset_version;
         feature_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
 
         let _failpoint =
@@ -3830,9 +3834,9 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .expect("main must have Person")
-        .table_version;
+        .published_dataset_version;
 
     // Make the feature branch's Person table genuinely need index work
     // while keeping the manifest internally consistent. The test-only
@@ -3855,9 +3859,9 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
         .unwrap();
     assert_eq!(
         feature_snapshot
-            .entry("node:Person")
+            .dataset("node:Person")
             .expect("feature must have Person")
-            .table_version,
+            .published_dataset_version,
         dropped_index_head,
         "test setup must publish the dropped-index table head before ensure_indices runs",
     );
@@ -4108,7 +4112,10 @@ async fn ensure_indices_entry_barrier_refuses_partial_armed_before_staging() {
     let snapshot = helpers::snapshot_main(&db).await.unwrap();
     let mut effected_tables = Vec::new();
     for (table_key, type_name) in [("node:Person", "Person"), ("node:Company", "Company")] {
-        let manifest_pin = snapshot.entry(table_key).unwrap().table_version;
+        let manifest_pin = snapshot
+            .dataset(table_key)
+            .unwrap()
+            .published_dataset_version;
         let table_uri = node_table_uri(&db, type_name).await;
         let lance_head = helpers::open_dataset_head(&table_uri, None)
             .await
@@ -4230,7 +4237,9 @@ async fn ensure_indices_post_effect_disjoint_winner_is_preserved() {
         .await
         .unwrap();
     assert_eq!(
-        main.entry("node:Company").unwrap().table_version,
+        main.dataset("node:Company")
+            .unwrap()
+            .published_dataset_version,
         winner_company_version,
         "index compensation must preserve the disjoint winner"
     );
@@ -4271,9 +4280,9 @@ async fn ensure_indices_post_effect_same_table_winner_fails_closed() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     rendezvous.release();
 
     let operation_id = match index_task.await.unwrap().unwrap_err() {
@@ -4302,9 +4311,9 @@ async fn ensure_indices_post_effect_same_table_winner_fails_closed() {
             .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
+            .published_dataset_version,
         winner_manifest_version
     );
     assert_eq!(
@@ -4403,9 +4412,9 @@ async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
         .unwrap();
     assert_eq!(
         inherited
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_branch
+            .native_dataset_branch
             .as_deref(),
         Some("feature")
     );
@@ -4416,7 +4425,11 @@ async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
         .await
         .unwrap();
     assert_eq!(
-        owned.entry("node:Person").unwrap().table_branch.as_deref(),
+        owned
+            .dataset("node:Person")
+            .unwrap()
+            .native_dataset_branch
+            .as_deref(),
         Some("experiment")
     );
 }
@@ -4505,7 +4518,7 @@ async fn ensure_indices_mixed_first_touch_rollback_does_not_delete_moved_ref() {
 /// sidecar persists. Without dropping the engine, call `db.refresh()`.
 /// The post-condition: sidecar gone; Eve visible; subsequent mutation
 /// on the same handle succeeds without restart and without
-/// ExpectedVersionMismatch.
+/// PublishedDatasetVersionMismatch.
 #[tokio::test]
 #[serial]
 async fn refresh_runs_roll_forward_recovery_in_process() {
@@ -4567,7 +4580,7 @@ async fn refresh_runs_roll_forward_recovery_in_process() {
         "Eve must be visible after refresh-time roll-forward"
     );
 
-    // A direct Person mutation also succeeds without ExpectedVersionMismatch.
+    // A direct Person mutation also succeeds without PublishedDatasetVersionMismatch.
     mutate_main(
         &mut db,
         MUTATION_QUERIES,
@@ -4792,9 +4805,9 @@ async fn sidecar_write_failure_aborts_load_with_no_head_advance() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     assert_eq!(manifest_pin, post_head, "no drift after a Phase A abort");
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 0);
 
@@ -5556,10 +5569,10 @@ async fn stage_a_barrier_reports_exact_operation_before_drift_guard() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
-    let entry = snapshot.entry("node:Person").unwrap();
-    let person_uri = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
+    let entry = snapshot.dataset("node:Person").unwrap();
+    let person_uri = format!("{}/{}", uri.trim_end_matches('/'), entry.dataset_path);
     let person_identity = node_table_identity_json(&db, "Person");
-    let manifest_pin = entry.table_version;
+    let manifest_pin = entry.published_dataset_version;
     let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
     helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after_drift = ds.version().version;
@@ -5929,10 +5942,10 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
-    let entry = snapshot.entry("node:Person").unwrap();
-    let person_uri = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
+    let entry = snapshot.dataset("node:Person").unwrap();
+    let person_uri = format!("{}/{}", uri.trim_end_matches('/'), entry.dataset_path);
     let person_identity = node_table_identity_json(&db, "Person");
-    let manifest_pin = entry.table_version;
+    let manifest_pin = entry.published_dataset_version;
 
     // Drift Person's Lance HEAD ahead of the manifest pin (without
     // touching the manifest) so the classifier can reach UnexpectedAtP1
@@ -6072,9 +6085,9 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     assert_eq!(
         entry_version, final_head,
         "full-sweep roll-back must publish so manifest pin ({entry_version}) == Lance HEAD ({final_head})",
@@ -6151,9 +6164,9 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     let person_pin_before = helpers::snapshot_main(&db)
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let person_head_before = lance::Dataset::open(&person_uri)
         .await
         .unwrap()
@@ -6198,9 +6211,9 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     let person_pin_after = helpers::snapshot_main(&db)
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let person_head_after = lance::Dataset::open(&person_uri)
         .await
         .unwrap()
@@ -6244,7 +6257,7 @@ fn schema_with_person_city() -> String {
 // active in the Phase B → Phase C window, drop the engine, reopen,
 // assert recovery rolled forward (manifest pin advanced, audit row
 // recorded, sidecar deleted) and a follow-up operation succeeds without
-// ExpectedVersionMismatch.
+// PublishedDatasetVersionMismatch.
 
 #[tokio::test]
 #[serial]
@@ -6640,7 +6653,7 @@ async fn schema_apply_recovery_reclaims_owned_add_type_target_and_retry_succeeds
             .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap()
-            .entry("node:Company")
+            .dataset("node:Company")
             .is_none(),
         "rollback must not register the orphan target"
     );
@@ -6751,7 +6764,7 @@ async fn schema_apply_first_touch_foreign_winner_is_preserved_not_adopted() {
             .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap()
-            .entry("node:Company")
+            .dataset("node:Company")
             .is_none(),
         "recovery must never adopt the foreign dataset into the graph manifest"
     );
@@ -7007,8 +7020,8 @@ edge WorksAt: Human -> Company
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
-    assert!(snapshot.entry("node:Person").is_some());
-    assert!(snapshot.entry("node:Human").is_none());
+    assert!(snapshot.dataset("node:Person").is_some());
+    assert!(snapshot.dataset("node:Human").is_none());
     assert_eq!(
         helpers::count_rows(&recovered, "node:Person").await,
         people_before
@@ -7165,7 +7178,9 @@ async fn schema_apply_post_effect_disjoint_winner_is_preserved() {
         .await
         .unwrap();
     assert_eq!(
-        main.entry("node:Company").unwrap().table_version,
+        main.dataset("node:Company")
+            .unwrap()
+            .published_dataset_version,
         winner_company_version,
         "compensation must preserve the disjoint winner's table pin"
     );
@@ -7211,9 +7226,9 @@ async fn schema_apply_post_effect_same_table_winner_fails_closed() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     rendezvous.release();
 
     let operation_id = match apply_task.await.unwrap().unwrap_err() {
@@ -7246,9 +7261,9 @@ async fn schema_apply_post_effect_same_table_winner_fails_closed() {
             .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
+            .published_dataset_version,
         winner_manifest_version,
         "failed recovery must not move the winning manifest pin"
     );
@@ -7488,7 +7503,7 @@ node Embedding {
     assert!(
         pending
             .iter()
-            .any(|index| { index.table_key == "node:Embedding" && index.column == "vector" }),
+            .any(|index| { index.type_key == "node:Embedding" && index.property == "vector" }),
         "fixture must leave the null vector index pending"
     );
     // Fixed productive tail on Work only; Embedding stays a one-fragment table
@@ -7526,14 +7541,14 @@ node Embedding {
     let stats = db.optimize().await.unwrap();
     let embedding = stats
         .iter()
-        .find(|stat| stat.table_key == "node:Embedding")
+        .find(|stat| stat.type_key == "node:Embedding")
         .expect("Embedding stat present");
     assert!(!embedding.committed, "pending-only table must stay a no-op");
     assert!(
         embedding
             .pending_indexes
             .iter()
-            .any(|index| index.column == "vector"),
+            .any(|index| index.property == "vector"),
         "pending-only vector status must remain visible"
     );
 }
@@ -7555,8 +7570,14 @@ async fn optimize_multi_table_partial_effect_rolls_back_under_one_v2_sidecar() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
-    let person_pin = snapshot_before.entry("node:Person").unwrap().table_version;
-    let company_pin = snapshot_before.entry("node:Company").unwrap().table_version;
+    let person_pin = snapshot_before
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
+    let company_pin = snapshot_before
+        .dataset("node:Company")
+        .unwrap()
+        .published_dataset_version;
     let commits_before = db.list_commits(Some("main")).await.unwrap().len();
     let person_rows = helpers::count_rows(&db, "node:Person").await;
     let company_rows = helpers::count_rows(&db, "node:Company").await;
@@ -7581,17 +7602,17 @@ async fn optimize_multi_table_partial_effect_rolls_back_under_one_v2_sidecar() {
         .unwrap();
     assert_eq!(
         snapshot_after_failure
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
+            .published_dataset_version,
         person_pin,
         "partial Optimize must not publish Person"
     );
     assert_eq!(
         snapshot_after_failure
-            .entry("node:Company")
+            .dataset("node:Company")
             .unwrap()
-            .table_version,
+            .published_dataset_version,
         company_pin,
         "partial Optimize must not publish Company"
     );
@@ -8222,7 +8243,7 @@ async fn optimize_retry_does_not_misclassify_own_head_drift() {
         .expect("optimize must converge, not misclassify its own HEAD drift");
     let person = stats
         .iter()
-        .find(|s| s.table_key == "node:Person")
+        .find(|s| s.type_key == "node:Person")
         .expect("node:Person stat present");
     assert!(
         person.skipped.is_none(),
@@ -8232,10 +8253,7 @@ async fn optimize_retry_does_not_misclassify_own_head_drift() {
 
     // No uncovered drift stranded: a follow-up optimize is clean and all rows read.
     let stats2 = db.optimize().await.unwrap();
-    let person2 = stats2
-        .iter()
-        .find(|s| s.table_key == "node:Person")
-        .unwrap();
+    let person2 = stats2.iter().find(|s| s.type_key == "node:Person").unwrap();
     assert!(
         person2.skipped.is_none(),
         "follow-up optimize must be clean (no stranded drift): {:?}",
@@ -9086,9 +9104,9 @@ async fn branch_merge_confirmation_rejects_foreign_append_after_data_effects() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("target"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let target_head_before_merge = branch_head_commit_id(dir.path(), "target").await.unwrap();
 
     let merge_db = std::sync::Arc::new(db);
@@ -9155,9 +9173,9 @@ async fn branch_merge_confirmation_rejects_foreign_append_after_data_effects() {
             .snapshot_of(omnigraph::db::ReadTarget::branch("target"))
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
+            .published_dataset_version,
         target_table_version_before_merge,
         "target manifest must remain at its pre-merge Person pin"
     );
@@ -9323,7 +9341,10 @@ async fn setup_branch_merge_multichunk_adopt(dir: &tempfile::TempDir) -> (String
     );
 
     let snapshot = helpers::snapshot_main(&db).await.unwrap();
-    let expected_version = snapshot.entry("node:Person").unwrap().table_version;
+    let expected_version = snapshot
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
     let person_uri = node_table_uri(&db, "Person").await;
     drop(db);
     (uri, person_uri, expected_version)
@@ -9380,9 +9401,9 @@ async fn branch_merge_multichunk_insert_armed_prefix_rolls_back() {
         helpers::snapshot_main(&db)
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
+            .published_dataset_version,
         expected_version
     );
     assert_eq!(count_rows(&db, "node:Person").await, 1);
@@ -9457,9 +9478,9 @@ async fn branch_merge_multichunk_effects_confirmed_rolls_forward() {
         helpers::snapshot_main(&db)
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
+            .published_dataset_version,
         expected_version,
         "confirmed table effects stay invisible until the manifest commit"
     );
@@ -9517,7 +9538,10 @@ query remove_scored() {
     );
 
     let snapshot = helpers::snapshot_main(&db).await.unwrap();
-    let expected_version = snapshot.entry("node:Person").unwrap().table_version;
+    let expected_version = snapshot
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
     let person_uri = node_table_uri(&db, "Person").await;
     drop(db);
     (uri, person_uri, expected_version)
@@ -9573,9 +9597,9 @@ async fn branch_merge_multichunk_delete_armed_prefix_rolls_back() {
         helpers::snapshot_main(&db)
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
+            .published_dataset_version,
         expected_version
     );
     assert_eq!(count_rows(&db, "node:Person").await, 8194);
@@ -9937,9 +9961,9 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
         db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .expect("main must have Person")
-            .table_version
+            .published_dataset_version
     };
     let target_parent_commit_id = branch_head_commit_id(dir.path(), "target_branch")
         .await
@@ -9997,13 +10021,13 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
 /// Contract: the BranchMerge sidecar's per-table `table_branch` MUST be
 /// the merge target branch (where commits land via
 /// `publish_rewritten_merge_table` → `open_for_mutation` → potentially
-/// `fork_dataset_from_entry_state`), NOT `entry.table_branch` (where
+/// `fork_dataset_from_entry_state`), NOT `entry.native_dataset_branch` (where
 /// the table currently lives in the target's manifest snapshot).
 ///
 /// `ensure_indices_for_branch` already has this invariant pinned by an
 /// explicit comment at `table_ops.rs:115-120`. Without the same fix in
 /// `merge.rs`, a future change to candidate selection or the publish
-/// path that produces a `RewriteMerged` whose entry.table_branch
+/// path that produces a `RewriteMerged` whose entry.native_dataset_branch
 /// diverges from active_branch would silently drift Lance HEAD on the
 /// target ref while recovery checks the wrong ref and no-ops the
 /// rollback.
@@ -10012,7 +10036,7 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
 /// `table_branch` equals the active (target) branch. Even when the
 /// values happen to coincide in practice (the strict candidate logic
 /// keeps RewriteMerged tables on active_branch), the contract assertion
-/// catches a regression that reverts to `entry.table_branch.clone()`.
+/// catches a regression that reverts to `entry.native_dataset_branch.clone()`.
 #[tokio::test]
 #[serial]
 #[serial(branch_merge_phase_b)]
@@ -10094,7 +10118,7 @@ async fn branch_merge_sidecar_pins_table_branch_to_active_branch() {
             table_branch, "target_branch",
             "sidecar pin must record `table_branch` as the merge target branch (where \
              commits actually land via publish_rewritten_merge_table → open_for_mutation), \
-             NOT entry.table_branch from the target snapshot. See merge.rs filter_map and \
+             NOT entry.native_dataset_branch from the target snapshot. See merge.rs filter_map and \
              the rationale comment at table_ops.rs:115-120. Got pin: {pin:?}"
         );
     }
@@ -10914,7 +10938,7 @@ node Document {
         .snapshot_of(ReadTarget::branch("feature"))
         .await
         .unwrap()
-        .entry("node:Document")
+        .dataset("node:Document")
         .unwrap()
         .clone();
     let rendezvous = helpers::failpoint::Rendezvous::park_first(names::BLOB_READ_POST_CAPTURE);
@@ -10946,11 +10970,14 @@ node Document {
     rendezvous.release();
 
     let new_snapshot = replacement.expect("delete/recreate replacement must complete");
-    let new_entry = new_snapshot.entry("node:Document").unwrap();
-    assert_eq!(new_entry.table_path, old_entry.table_path);
-    assert_eq!(new_entry.table_branch, old_entry.table_branch);
+    let new_entry = new_snapshot.dataset("node:Document").unwrap();
+    assert_eq!(new_entry.dataset_path, old_entry.dataset_path);
     assert_eq!(
-        new_entry.table_version, old_entry.table_version,
+        new_entry.native_dataset_branch,
+        old_entry.native_dataset_branch
+    );
+    assert_eq!(
+        new_entry.published_dataset_version, old_entry.published_dataset_version,
         "the regression must exercise same-path/same-version branch ABA"
     );
 
@@ -11021,7 +11048,7 @@ node Document {
         .snapshot_of(ReadTarget::branch("feature"))
         .await
         .unwrap()
-        .entry("node:Document")
+        .dataset("node:Document")
         .unwrap()
         .clone();
 
@@ -11056,9 +11083,9 @@ node Document {
     rendezvous.release();
 
     let new_snapshot = replacement.expect("delete/recreate replacement must complete");
-    let new_entry = new_snapshot.entry("node:Document").unwrap();
+    let new_entry = new_snapshot.dataset("node:Document").unwrap();
     assert_eq!(
-        new_entry.table_version, old_entry.table_version,
+        new_entry.published_dataset_version, old_entry.published_dataset_version,
         "the regression must exercise same-version branch ABA"
     );
 
@@ -11136,7 +11163,7 @@ node Document {
         .snapshot_of(ReadTarget::branch("feature"))
         .await
         .unwrap()
-        .entry("node:Document")
+        .dataset("node:Document")
         .unwrap()
         .clone();
 
@@ -11168,9 +11195,9 @@ node Document {
     rendezvous.release();
 
     let new_snapshot = replacement.expect("delete/recreate replacement must complete");
-    let new_entry = new_snapshot.entry("node:Document").unwrap();
+    let new_entry = new_snapshot.dataset("node:Document").unwrap();
     assert_eq!(
-        new_entry.table_version, old_entry.table_version,
+        new_entry.published_dataset_version, old_entry.published_dataset_version,
         "the regression must exercise same-version branch ABA"
     );
 
@@ -11589,9 +11616,9 @@ async fn branch_merge_rejects_late_uncovered_target_drift_before_sidecar() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let db = std::sync::Arc::new(db);
     let merge_rv =
         helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
@@ -11629,9 +11656,9 @@ async fn branch_merge_rejects_late_uncovered_target_drift_before_sidecar() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let head_after = lance::Dataset::open(&person_uri)
         .await
         .unwrap()
@@ -11821,7 +11848,7 @@ async fn branch_merge_pure_insert_rejects_source_table_ref_aba_before_arm() {
         Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
             ref member,
             ..
-        }) if member == "branch_merge_source_table_head:node:Person"
+        }) if member == "branch_merge_source_published_dataset_version:node:Person"
     ));
     assert_eq!(
         helpers::count_rows_branch(&merge_db, "main", "node:Person").await,
@@ -11881,14 +11908,14 @@ async fn branch_merge_pure_insert_rejects_target_table_ref_aba_before_arm() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("target"))
         .await
         .unwrap();
-    let target_entry = target_snapshot.entry("node:Person").unwrap();
+    let target_entry = target_snapshot.dataset("node:Person").unwrap();
     assert_eq!(
-        target_entry.table_branch.as_deref(),
+        target_entry.native_dataset_branch.as_deref(),
         Some("target"),
         "fixture requires an already-owned target table ref"
     );
-    assert_eq!(target_entry.row_count, main_rows as u64);
-    let expected_target_version = target_entry.table_version;
+    assert_eq!(target_entry.entity_count, main_rows as u64);
+    let expected_target_version = target_entry.published_dataset_version;
     let target_head_before = branch_head_commit_id(dir.path(), "target").await.unwrap();
     let source_head_before = branch_head_commit_id(dir.path(), "source").await.unwrap();
 
@@ -11987,7 +12014,7 @@ async fn branch_merge_pure_insert_rejects_target_table_ref_aba_before_arm() {
         Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
             ref member,
             ..
-        }) if member == "branch_merge_target_table_incarnation:node:Person"
+        }) if member == "branch_merge_target_dataset_incarnation:node:Person"
     ));
 
     assert_eq!(

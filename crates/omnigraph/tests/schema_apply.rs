@@ -14,7 +14,7 @@ use helpers::*;
 
 async fn assert_exact_id_primary_key(db: &Omnigraph, table_key: &str) {
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let dataset = snapshot.open(table_key).await.unwrap();
+    let dataset = snapshot.open_dataset(table_key).await.unwrap();
     let primary_key = dataset
         .schema()
         .unenforced_primary_key()
@@ -69,12 +69,12 @@ async fn apply_schema_interface_evolution_is_identity_only_and_durable() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entries()
+        .datasets()
         .map(|entry| {
             (
-                entry.table_key.clone(),
-                entry.table_path.clone(),
-                entry.table_version,
+                entry.type_key.clone(),
+                entry.dataset_path.clone(),
+                entry.published_dataset_version,
             )
         })
         .collect::<Vec<_>>();
@@ -117,12 +117,12 @@ async fn apply_schema_interface_evolution_is_identity_only_and_durable() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entries()
+        .datasets()
         .map(|entry| {
             (
-                entry.table_key.clone(),
-                entry.table_path.clone(),
-                entry.table_version,
+                entry.type_key.clone(),
+                entry.dataset_path.clone(),
+                entry.published_dataset_version,
             )
         })
         .collect::<Vec<_>>();
@@ -232,9 +232,9 @@ query insert_project($name: String) {
         .snapshot_of(ReadTarget::branch("source"))
         .await
         .unwrap()
-        .entry("node:Project")
+        .dataset("node:Project")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     stale_handle
         .ensure_indices_on("source")
         .await
@@ -243,9 +243,9 @@ query insert_project($name: String) {
         .snapshot_of(ReadTarget::branch("source"))
         .await
         .unwrap()
-        .entry("node:Project")
+        .dataset("node:Project")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     assert!(
         project_after_indices > project_before_indices,
         "the stale handle must discover and build Project's declared key index"
@@ -554,7 +554,7 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
 
     let desired = TEST_SCHEMA.replace("age: I32?", "age: I64?");
     let err = db.apply_schema(&desired).await.unwrap_err();
@@ -563,7 +563,7 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
         db.snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
-            .version(),
+            .graph_manifest_version(),
         before_version
     );
 }
@@ -659,7 +659,7 @@ node Document {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
 
     // Drop `note` from Document. v1 + chassis commit #3 emit
     // `DropProperty { Soft }`; the rewrite path projects to the
@@ -699,7 +699,7 @@ node Document {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
     assert!(
         after_version > before_version,
         "manifest version should advance after soft drop; before={before_version}, after={after_version}",
@@ -740,7 +740,10 @@ node Document {
 
     // (a) Current snapshot: `note` is gone from the dataset schema.
     let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let current_ds = current_snapshot.open("node:Document").await.unwrap();
+    let current_ds = current_snapshot
+        .open_dataset("node:Document")
+        .await
+        .unwrap();
     let current_fields = current_ds
         .schema()
         .fields
@@ -755,8 +758,14 @@ node Document {
     // (b) Time travel: at the pre-drop manifest version, the prior
     // Document dataset version still has `note`. Soft drop is reversible
     // via Lance's version graph until `omnigraph cleanup` runs.
-    let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
-    let pre_drop_ds = pre_drop_snapshot.open("node:Document").await.unwrap();
+    let pre_drop_snapshot = db
+        .snapshot_at_graph_manifest_version(before_version)
+        .await
+        .unwrap();
+    let pre_drop_ds = pre_drop_snapshot
+        .open_dataset("node:Document")
+        .await
+        .unwrap();
     let pre_drop_fields = pre_drop_ds
         .schema()
         .fields
@@ -778,7 +787,10 @@ node Document {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap();
-    let reopened_ds = reopened_snapshot.open("node:Document").await.unwrap();
+    let reopened_ds = reopened_snapshot
+        .open_dataset("node:Document")
+        .await
+        .unwrap();
     let reopened_fields = reopened_ds
         .schema()
         .fields
@@ -844,10 +856,10 @@ node Document {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Document")
+        .dataset("node:Document")
         .unwrap()
         .clone();
-    let table_uri = format!("{uri}/{}", entry.table_path);
+    let table_uri = format!("{uri}/{}", entry.dataset_path);
     let mut raw = lance::Dataset::open(&table_uri).await.unwrap();
     let logical_schema = arrow_schema::Schema::from(raw.schema());
     let mut descriptor_builder = BlobDescriptorArrayBuilder::new("content");
@@ -896,8 +908,11 @@ node Document {
         .unwrap();
 
     let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let manifest_before = before.version();
-    let table_before = before.entry("node:Document").unwrap().table_version;
+    let manifest_before = before.graph_manifest_version();
+    let table_before = before
+        .dataset("node:Document")
+        .unwrap()
+        .published_dataset_version;
     let physical_head_before = lance::Dataset::open(&table_uri)
         .await
         .unwrap()
@@ -914,9 +929,12 @@ node Document {
         "unexpected schema-apply refusal: {error}"
     );
     let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert_eq!(after.version(), manifest_before);
+    assert_eq!(after.graph_manifest_version(), manifest_before);
     assert_eq!(
-        after.entry("node:Document").unwrap().table_version,
+        after
+            .dataset("node:Document")
+            .unwrap()
+            .published_dataset_version,
         table_before
     );
     assert_eq!(
@@ -946,7 +964,7 @@ async fn apply_schema_drops_node_and_referencing_edge_softly() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
 
     // Drop the `Company` node type and the `WorksAt` edge that references it.
     // Per schema-lint v1 chassis commit #4 (MR-694), this emits two
@@ -998,7 +1016,7 @@ edge Knows: Person -> Person {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
     assert!(
         after_version > before_version,
         "manifest version should advance after soft type drop; before={before_version}, after={after_version}",
@@ -1007,29 +1025,32 @@ edge Knows: Person -> Person {
     // (a) Current snapshot: both manifest entries are gone.
     let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert!(
-        current_snapshot.entry("node:Company").is_none(),
+        current_snapshot.dataset("node:Company").is_none(),
         "current manifest must not list node:Company after soft drop",
     );
     assert!(
-        current_snapshot.entry("edge:WorksAt").is_none(),
+        current_snapshot.dataset("edge:WorksAt").is_none(),
         "current manifest must not list edge:WorksAt after soft drop",
     );
     // Person + Knows still present (Person wasn't dropped; Knows is in desired).
     assert!(
-        current_snapshot.entry("node:Person").is_some(),
+        current_snapshot.dataset("node:Person").is_some(),
         "node:Person must remain in the manifest",
     );
 
     // (b) Time travel: at the pre-drop manifest version, both dropped
     // tables are still listed. Soft drop is reversible via Lance's
     // version graph until `omnigraph cleanup` runs.
-    let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
+    let pre_drop_snapshot = db
+        .snapshot_at_graph_manifest_version(before_version)
+        .await
+        .unwrap();
     assert!(
-        pre_drop_snapshot.entry("node:Company").is_some(),
+        pre_drop_snapshot.dataset("node:Company").is_some(),
         "pre-drop manifest must still list node:Company (time-travel reversibility)",
     );
     assert!(
-        pre_drop_snapshot.entry("edge:WorksAt").is_some(),
+        pre_drop_snapshot.dataset("edge:WorksAt").is_some(),
         "pre-drop manifest must still list edge:WorksAt (time-travel reversibility)",
     );
 
@@ -1042,11 +1063,11 @@ edge Knows: Person -> Person {
         .await
         .unwrap();
     assert!(
-        reopened_snapshot.entry("node:Company").is_none(),
+        reopened_snapshot.dataset("node:Company").is_none(),
         "after reopen, node:Company must still be absent from the current manifest",
     );
     assert!(
-        reopened_snapshot.entry("edge:WorksAt").is_none(),
+        reopened_snapshot.dataset("edge:WorksAt").is_none(),
         "after reopen, edge:WorksAt must still be absent from the current manifest",
     );
 }
@@ -1060,7 +1081,7 @@ async fn apply_schema_drops_an_edge_type_softly() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
 
     // Drop only the `WorksAt` edge. Per chassis v1 commit #4, this
     // emits `DropType { Edge, WorksAt, Soft }`; apply tombstones the
@@ -1089,22 +1110,25 @@ async fn apply_schema_drops_an_edge_type_softly() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
     assert!(after_version > before_version);
 
     let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert!(
-        current_snapshot.entry("edge:WorksAt").is_none(),
+        current_snapshot.dataset("edge:WorksAt").is_none(),
         "current manifest must not list edge:WorksAt",
     );
     // Other tables untouched.
-    assert!(current_snapshot.entry("node:Person").is_some());
-    assert!(current_snapshot.entry("node:Company").is_some());
-    assert!(current_snapshot.entry("edge:Knows").is_some());
+    assert!(current_snapshot.dataset("node:Person").is_some());
+    assert!(current_snapshot.dataset("node:Company").is_some());
+    assert!(current_snapshot.dataset("edge:Knows").is_some());
 
-    let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
+    let pre_drop_snapshot = db
+        .snapshot_at_graph_manifest_version(before_version)
+        .await
+        .unwrap();
     assert!(
-        pre_drop_snapshot.entry("edge:WorksAt").is_some(),
+        pre_drop_snapshot.dataset("edge:WorksAt").is_some(),
         "pre-drop manifest must still list edge:WorksAt",
     );
 }
@@ -1118,7 +1142,7 @@ async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
 
     // Add `email: String` (required, non-nullable, no @rename_from). Existing
     // rows have no value to fill in, so this is unsupported in v1.
@@ -1133,7 +1157,7 @@ async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
         db.snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
-            .version(),
+            .graph_manifest_version(),
         before_version
     );
 }
@@ -1181,8 +1205,8 @@ async fn apply_schema_pure_type_rename_preserves_identity_path_and_version() {
     db.ensure_indices().await.unwrap();
     let before_snapshot_id = db.resolve_snapshot("main").await.unwrap();
     let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let before_version = before_snapshot.version();
-    let before = before_snapshot.entry("node:Person").unwrap().clone();
+    let before_version = before_snapshot.graph_manifest_version();
+    let before = before_snapshot.dataset("node:Person").unwrap().clone();
     let before_type_id = db.catalog().type_id("Person").unwrap();
     let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
     let before_name_property_id = db.catalog().property_id("Person", "name").unwrap();
@@ -1242,9 +1266,12 @@ edge WorksAt: Human -> Company
     );
 
     let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let after = after_snapshot.entry("node:Human").unwrap();
-    assert_eq!(after.table_path, before.table_path);
-    assert_eq!(after.table_version, before.table_version);
+    let after = after_snapshot.dataset("node:Human").unwrap();
+    assert_eq!(after.dataset_path, before.dataset_path);
+    assert_eq!(
+        after.published_dataset_version,
+        before.published_dataset_version
+    );
     assert_eq!(db.catalog().type_id("Human"), Some(before_type_id));
     assert_eq!(
         db.catalog().table_incarnation_id("Human"),
@@ -1255,7 +1282,7 @@ edge WorksAt: Human -> Company
         Some(before_name_property_id)
     );
     assert_eq!(count_rows(&db, "node:Human").await, people_before);
-    assert!(after_snapshot.entry("node:Person").is_none());
+    assert!(after_snapshot.dataset("node:Person").is_none());
 
     let current_avatar = read_managed_blob_bytes(
         &db,
@@ -1305,12 +1332,18 @@ edge WorksAt: Human -> Company
         OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::BadRequest
     ));
 
-    let historical_snapshot = db.snapshot_at_version(before_version).await.unwrap();
-    let historical = historical_snapshot.entry("node:Person").unwrap();
-    assert_eq!(historical.table_path, before.table_path);
-    assert_eq!(historical.table_path, after.table_path);
-    assert_eq!(historical.table_version, before.table_version);
-    assert!(historical_snapshot.entry("node:Human").is_none());
+    let historical_snapshot = db
+        .snapshot_at_graph_manifest_version(before_version)
+        .await
+        .unwrap();
+    let historical = historical_snapshot.dataset("node:Person").unwrap();
+    assert_eq!(historical.dataset_path, before.dataset_path);
+    assert_eq!(historical.dataset_path, after.dataset_path);
+    assert_eq!(
+        historical.published_dataset_version,
+        before.published_dataset_version
+    );
+    assert!(historical_snapshot.dataset("node:Human").is_none());
 }
 
 #[tokio::test]
@@ -1319,8 +1352,8 @@ async fn apply_schema_rename_and_hard_property_drop_cleans_source_incarnation() 
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let before_manifest_version = before_snapshot.version();
-    let before = before_snapshot.entry("node:Person").unwrap().clone();
+    let before_manifest_version = before_snapshot.graph_manifest_version();
+    let before = before_snapshot.dataset("node:Person").unwrap().clone();
 
     let desired = r#"
 node Human @rename_from("Person") {
@@ -1357,15 +1390,15 @@ edge WorksAt: Human -> Company
     )));
 
     let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let after = after_snapshot.entry("node:Human").unwrap();
-    assert_eq!(after.table_path, before.table_path);
-    assert!(after.table_version > before.table_version);
-    assert!(after_snapshot.entry("node:Person").is_none());
+    let after = after_snapshot.dataset("node:Human").unwrap();
+    assert_eq!(after.dataset_path, before.dataset_path);
+    assert!(after.published_dataset_version > before.published_dataset_version);
+    assert!(after_snapshot.dataset("node:Person").is_none());
     assert!(
-        db.snapshot_at_version(before_manifest_version)
+        db.snapshot_at_graph_manifest_version(before_manifest_version)
             .await
             .unwrap()
-            .open("node:Person")
+            .open_dataset("node:Person")
             .await
             .is_err(),
         "hard cleanup must reclaim the renamed source incarnation's prior version"
@@ -1394,7 +1427,7 @@ async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
         .clone();
     let before_type_id = db.catalog().type_id("Person").unwrap();
@@ -1462,10 +1495,10 @@ edge WorksAt: Human -> Company
     // Rows survive: table key now resolves under the new type name and the
     // old key is gone.
     let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let after = after_snapshot.entry("node:Human").unwrap();
-    assert_eq!(after.table_path, before.table_path);
+    let after = after_snapshot.dataset("node:Human").unwrap();
+    assert_eq!(after.dataset_path, before.dataset_path);
     assert!(
-        after.table_version > before.table_version,
+        after.published_dataset_version > before.published_dataset_version,
         "property rename must rewrite the same table rather than rematerialize it"
     );
     assert_eq!(db.catalog().type_id("Human"), Some(before_type_id));
@@ -1483,7 +1516,7 @@ edge WorksAt: Human -> Company
     );
     assert_eq!(count_rows(&db, "node:Human").await, people_before);
     assert!(
-        after_snapshot.entry("node:Person").is_none(),
+        after_snapshot.dataset("node:Person").is_none(),
         "old node:Person table key should be unmapped after rename"
     );
 
@@ -1621,7 +1654,7 @@ node Anchor { name: String @key }
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
         .clone();
     let before_type_id = db.catalog().type_id("Person").unwrap();
@@ -1634,7 +1667,7 @@ node Anchor { name: String @key }
         db.snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .is_none()
     );
 
@@ -1647,14 +1680,14 @@ node Anchor { name: String @key }
     .await
     .unwrap();
     let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let after = after_snapshot.entry("node:Person").unwrap();
+    let after = after_snapshot.dataset("node:Person").unwrap();
     assert_ne!(db.catalog().type_id("Person"), Some(before_type_id));
     assert_ne!(
         db.catalog().table_incarnation_id("Person"),
         Some(before_incarnation)
     );
-    assert_ne!(after.table_path, before.table_path);
-    assert_eq!(after.table_version, 1);
+    assert_ne!(after.dataset_path, before.dataset_path);
+    assert_eq!(after.published_dataset_version, 1);
 }
 
 // ─── Hard-mode drops (chassis v1 commit #5 — --allow-data-loss) ──────────────
@@ -1662,7 +1695,7 @@ node Anchor { name: String @key }
 // Hard mode promotes every `DropMode::Soft` step to `DropMode::Hard` and runs
 // `cleanup_old_versions` on affected datasets immediately after the manifest
 // publish. For DropProperty Hard, this removes the prior dataset version
-// (where the column lived), making `snapshot_at_version(pre_drop)` unable to
+// (where the column lived), making `snapshot_at_graph_manifest_version(pre_drop)` unable to
 // open the dataset at that version. For DropType Hard, the dataset is
 // untouched by the schema apply itself (no per-table write), so
 // cleanup_old_versions is currently a no-op for it — the dataset directory
@@ -1744,7 +1777,7 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
 
     // Hard drop the `age` column. Soft drop would leave the prior
     // dataset version intact; Hard drop runs cleanup_old_versions on
@@ -1763,7 +1796,7 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
 
     // Current snapshot: column gone from the dataset schema.
     let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let current_ds = current_snapshot.open("node:Person").await.unwrap();
+    let current_ds = current_snapshot.open_dataset("node:Person").await.unwrap();
     let current_fields = current_ds
         .schema()
         .fields
@@ -1780,11 +1813,14 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
     // the dataset at that snapshot should fail (Lance can't load the
     // dropped version). This is the Hard-mode contract — the prior
     // data is unreachable.
-    let pre_drop = db.snapshot_at_version(before_version).await.unwrap();
-    let open_result = pre_drop.open("node:Person").await;
+    let pre_drop = db
+        .snapshot_at_graph_manifest_version(before_version)
+        .await
+        .unwrap();
+    let open_result = pre_drop.open_dataset("node:Person").await;
     assert!(
         open_result.is_err(),
-        "after hard drop + cleanup, pre-drop snapshot.open() must fail (prior version was reclaimed); got {open_result:?}",
+        "after hard drop + cleanup, pre-drop snapshot.open_dataset() must fail (prior version was reclaimed); got {open_result:?}",
     );
 }
 
@@ -1797,7 +1833,7 @@ async fn apply_schema_hard_drops_node_and_edge_with_flag_succeeds() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
 
     let desired = r#"
 node Person {
@@ -1858,13 +1894,13 @@ edge Knows: Person -> Person {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .graph_manifest_version();
     assert!(after_version > before_version);
 
     // Current manifest: both dropped entries gone.
     let current = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert!(current.entry("node:Company").is_none());
-    assert!(current.entry("edge:WorksAt").is_none());
+    assert!(current.dataset("node:Company").is_none());
+    assert!(current.dataset("edge:WorksAt").is_none());
 
     // NOTE: DropType Hard's cleanup of the orphan dataset directory
     // is a known follow-up (the manifest entry is tombstoned and the
@@ -1950,9 +1986,9 @@ async fn index_only_constraint_apply_touches_no_table_data() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Doc")
+        .dataset("node:Doc")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let before_commits = db.list_commits(None).await.unwrap();
 
     // Add an @index on the existing `n` column.
@@ -1967,9 +2003,9 @@ async fn index_only_constraint_apply_touches_no_table_data() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Doc")
+        .dataset("node:Doc")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     assert_eq!(
         before, after,
         "adding an @index must not bump the table version (no inline index build)"
@@ -2005,9 +2041,9 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Ticket")
+        .dataset("node:Ticket")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     let before_commits = db.list_commits(None).await.unwrap();
 
     let v2 =
@@ -2020,9 +2056,9 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Ticket")
+        .dataset("node:Ticket")
         .unwrap()
-        .table_version;
+        .published_dataset_version;
     assert_eq!(
         before, after,
         "enum widening must not bump the table version (metadata-only)"

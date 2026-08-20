@@ -704,7 +704,7 @@ fn openapi_export_is_post() {
 fn export_documents_pre_header_failures() {
     let doc = openapi_json();
     let responses = &doc["paths"]["/graphs/{graph_id}/export"]["post"]["responses"];
-    for status in ["400", "401", "403", "404", "409", "413", "503"] {
+    for status in ["400", "401", "403", "404", "409", "413", "415", "503"] {
         assert!(
             responses[status].is_object(),
             "export must document {status}"
@@ -854,12 +854,20 @@ fn openapi_raw_graph_batch_has_ndjson_body_and_logical_result() {
     let props = doc["components"]["schemas"]["GraphBatchLoadOutput"]["properties"]
         .as_object()
         .unwrap();
-    for field in ["branch", "nodes", "edges", "total_rows"] {
+    for field in ["branch", "nodes", "edges", "total_entities"] {
         assert!(props.contains_key(field));
     }
     assert_optional_commit_field(&doc, "GraphBatchLoadOutput");
     assert!(!props.contains_key("tables"));
     assert!(!props.contains_key("table_key"));
+
+    let declaration_props =
+        doc["components"]["schemas"]["GraphBatchDeclarationOutput"]["properties"]
+            .as_object()
+            .unwrap();
+    assert_eq!(declaration_props.len(), 2);
+    assert!(declaration_props.contains_key("name"));
+    assert!(declaration_props.contains_key("entities_loaded"));
 }
 
 #[test]
@@ -924,8 +932,8 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "CommitOutput",
     "ErrorCode",
     "ErrorOutput",
+    "EntityKindOutput",
     "ChangeFeedGapOutput",
-    "ChangeEntityKind",
     "ChangeOpOutput",
     "ChangeTypeOutput",
     "ChangeEndpointsOutput",
@@ -944,9 +952,10 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ExternalBlobSourceOutput",
     "ExportRequest",
     "HealthOutput",
+    "GraphBatchDeclarationOutput",
+    "GraphBatchLoadOutput",
     "IngestOutput",
     "IngestRequest",
-    "IngestTableOutput",
     "KeyConflictOutput",
     "LoadMode",
     "MergeConflictKindOutput",
@@ -958,11 +967,11 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "PreconditionFailureOutput",
     "RecoveryRequiredOutput",
     "ResourceLimitOutput",
-    "ManifestConflictOutput",
+    "PublishedDatasetVersionConflictOutput",
     "SchemaApplyOutput",
     "SchemaApplyRequest",
+    "SnapshotDatasetOutput",
     "SnapshotOutput",
-    "SnapshotTableOutput",
 ];
 
 #[test]
@@ -977,6 +986,23 @@ fn openapi_contains_all_expected_schemas() {
         assert!(
             schema_keys.contains(expected),
             "missing schema: {expected}. Found: {schema_keys:?}"
+        );
+    }
+}
+
+#[test]
+fn openapi_omits_retired_vocabulary_components() {
+    let doc = openapi_json();
+    let schemas = doc["components"]["schemas"].as_object().unwrap();
+    for retired in [
+        "IngestTableOutput",
+        "ChangeEntityKind",
+        "ManifestConflictOutput",
+        "SnapshotTableOutput",
+    ] {
+        assert!(
+            !schemas.contains_key(retired),
+            "retired compatibility component must be absent: {retired}"
         );
     }
 }
@@ -1128,8 +1154,11 @@ fn ingest_output_schema_has_expected_fields() {
     assert!(props.contains_key("base_branch"));
     assert!(props.contains_key("branch_created"));
     assert!(props.contains_key("mode"));
-    assert!(props.contains_key("tables"));
+    assert!(props.contains_key("nodes"));
+    assert!(props.contains_key("edges"));
+    assert!(props.contains_key("total_entities"));
     assert_optional_commit_field(&doc, "IngestOutput");
+    assert!(!props.contains_key("tables"));
 }
 
 #[test]
@@ -1139,7 +1168,7 @@ fn export_request_schema_has_expected_fields() {
     let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("branch"));
     assert!(props.contains_key("type_names"));
-    assert!(props.contains_key("table_keys"));
+    assert!(!props.contains_key("table_keys"));
 }
 
 #[test]
@@ -1181,7 +1210,7 @@ fn error_output_schema_has_expected_fields() {
     assert!(props.contains_key("error"));
     assert!(props.contains_key("code"));
     assert!(props.contains_key("merge_conflicts"));
-    assert!(props.contains_key("manifest_conflict"));
+    assert!(props.contains_key("published_dataset_version_conflict"));
     assert!(props.contains_key("read_set_conflict"));
     assert!(props.contains_key("key_conflict"));
     assert!(props.contains_key("resource_limit"));
@@ -1217,13 +1246,28 @@ fn change_error_output_schema_matches_every_change_route_detail() {
 }
 
 #[test]
-fn manifest_conflict_output_schema_has_expected_fields() {
+fn published_dataset_version_conflict_output_schema_has_expected_fields() {
     let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["ManifestConflictOutput"];
+    let schema = &doc["components"]["schemas"]["PublishedDatasetVersionConflictOutput"];
     let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("table_key"));
-    assert!(props.contains_key("expected"));
-    assert!(props.contains_key("actual"));
+    assert_eq!(props.len(), 4);
+    assert!(props.contains_key("entity_kind"));
+    assert!(props.contains_key("type_name"));
+    assert!(props.contains_key("expected_published_dataset_version"));
+    assert!(props.contains_key("actual_published_dataset_version"));
+}
+
+#[test]
+fn merge_conflict_output_schema_has_expected_fields() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["MergeConflictOutput"];
+    let props = schema["properties"].as_object().unwrap();
+    assert_eq!(props.len(), 5);
+    assert!(props.contains_key("entity_kind"));
+    assert!(props.contains_key("type_name"));
+    assert!(props.contains_key("entity_id"));
+    assert!(props.contains_key("kind"));
+    assert!(props.contains_key("message"));
 }
 
 #[test]
@@ -1241,8 +1285,10 @@ fn key_conflict_output_schema_has_expected_fields() {
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["KeyConflictOutput"];
     let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("table_key"));
-    assert!(props.contains_key("key"));
+    assert_eq!(props.len(), 3);
+    assert!(props.contains_key("entity_kind"));
+    assert!(props.contains_key("type_name"));
+    assert!(props.contains_key("entity_id"));
 }
 
 #[test]
@@ -1269,10 +1315,20 @@ fn commit_output_schema_has_expected_fields() {
     let schema = &doc["components"]["schemas"]["CommitOutput"];
     let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("graph_commit_id"));
-    assert!(props.contains_key("manifest_version"));
+    assert!(props.contains_key("graph_branch"));
+    assert!(props.contains_key("graph_manifest_version"));
     assert!(props.contains_key("parent_commit_id"));
     assert!(props.contains_key("actor_id"));
     assert!(props.contains_key("created_at"));
+}
+
+#[test]
+fn schema_apply_output_uses_graph_manifest_version() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["SchemaApplyOutput"];
+    let props = schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("graph_manifest_version"));
+    assert!(!props.contains_key("manifest_version"));
 }
 
 #[test]
@@ -1280,21 +1336,37 @@ fn snapshot_output_schema_has_expected_fields() {
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["SnapshotOutput"];
     let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("branch"));
-    assert!(props.contains_key("manifest_version"));
+    assert!(props.contains_key("graph_branch"));
+    assert!(props.contains_key("graph_manifest_version"));
     assert!(props.contains_key("internal_schema_version"));
-    assert!(props.contains_key("tables"));
+    assert!(props.contains_key("datasets"));
 }
 
 #[test]
-fn snapshot_table_output_schema_has_expected_fields() {
+fn snapshot_dataset_output_schema_has_expected_fields() {
     let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["SnapshotTableOutput"];
+    let schema = &doc["components"]["schemas"]["SnapshotDatasetOutput"];
     let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("table_key"));
-    assert!(props.contains_key("table_path"));
-    assert!(props.contains_key("table_version"));
-    assert!(props.contains_key("row_count"));
+    assert_eq!(props.len(), 6);
+    assert!(props.contains_key("entity_kind"));
+    assert!(props.contains_key("type_name"));
+    assert!(props.contains_key("dataset_path"));
+    assert!(props.contains_key("published_dataset_version"));
+    assert!(props.contains_key("native_dataset_branch"));
+    assert!(props.contains_key("entity_count"));
+}
+
+#[test]
+fn entity_kind_output_schema_has_node_and_edge_variants() {
+    let doc = openapi_json();
+    let variants = doc["components"]["schemas"]["EntityKindOutput"]["enum"]
+        .as_array()
+        .unwrap();
+    let values = variants
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["node", "edge"]);
 }
 
 // ---------------------------------------------------------------------------

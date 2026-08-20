@@ -18,7 +18,7 @@ use super::layout::{
 use super::metadata::TableVersionMetadata;
 use super::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, current_stamp_entry, guard_stamp};
 use super::state::{
-    GraphLineageRow, ManifestState, SubTableEntry, entries_to_batch, graph_lineage_row_parts,
+    DatasetEntry, GraphLineageRow, ManifestState, entries_to_batch, graph_lineage_row_parts,
     manifest_schema, read_manifest_state, read_manifest_state_and_lineage,
 };
 use super::{TableIdentity, table_path_for_identity};
@@ -46,8 +46,8 @@ impl GenesisManifestAttempt {
         Ok(Self {
             lineage: GraphLineageRow {
                 graph_commit_id: ulid::Ulid::new().to_string(),
-                manifest_branch: None,
-                manifest_version: GENESIS_MANIFEST_VERSION,
+                graph_branch: None,
+                graph_manifest_version: GENESIS_MANIFEST_VERSION,
                 parent_commit_id: None,
                 merged_parent_commit_id: None,
                 actor_id: None,
@@ -303,7 +303,7 @@ async fn build_initial_entries(
     root_uri: &str,
     catalog: &Catalog,
     control_session: &Arc<lance::session::Session>,
-) -> Result<(Vec<SubTableEntry>, HashMap<TableIdentity, String>)> {
+) -> Result<(Vec<DatasetEntry>, HashMap<TableIdentity, String>)> {
     let mut entries = Vec::new();
     let mut version_metadata = HashMap::new();
     let accepted_ir = catalog.bound_schema_ir().ok_or_else(|| {
@@ -331,13 +331,13 @@ async fn build_initial_entries(
         let ds = create_empty_dataset(&full_path, &node_type.arrow_schema, control_session).await?;
         let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
 
-        entries.push(SubTableEntry {
+        entries.push(DatasetEntry {
             identity,
-            table_key: table_key.clone(),
-            table_path: table_path.clone(),
-            table_version: ds.version().version,
-            table_branch: None,
-            row_count: 0,
+            type_key: table_key.clone(),
+            dataset_path: table_path.clone(),
+            published_dataset_version: ds.version().version,
+            native_dataset_branch: None,
+            entity_count: 0,
             version_metadata: metadata.clone(),
         });
         version_metadata.insert(identity, metadata.to_json_string()?);
@@ -362,13 +362,13 @@ async fn build_initial_entries(
         let ds = create_empty_dataset(&full_path, &edge_type.arrow_schema, control_session).await?;
         let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
 
-        entries.push(SubTableEntry {
+        entries.push(DatasetEntry {
             identity,
-            table_key: table_key.clone(),
-            table_path: table_path.clone(),
-            table_version: ds.version().version,
-            table_branch: None,
-            row_count: 0,
+            type_key: table_key.clone(),
+            dataset_path: table_path.clone(),
+            published_dataset_version: ds.version().version,
+            native_dataset_branch: None,
+            entity_count: 0,
             version_metadata: metadata.clone(),
         });
         version_metadata.insert(identity, metadata.to_json_string()?);

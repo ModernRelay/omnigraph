@@ -138,7 +138,7 @@ pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
 /// Read all rows from a sub-table by table_key.
 pub async fn read_table(db: &Omnigraph, table_key: &str) -> Vec<RecordBatch> {
     let snap = snapshot_main(db).await.unwrap();
-    let ds = snap.open(table_key).await.unwrap();
+    let ds = snap.open_dataset(table_key).await.unwrap();
     ds.scan()
         .try_into_stream()
         .await
@@ -152,7 +152,7 @@ pub async fn read_table(db: &Omnigraph, table_key: &str) -> Vec<RecordBatch> {
 /// lifetime, while Lance plumbing fields do not impersonate graph identity.
 pub async fn assert_stable_property_markers(db: &Omnigraph, table_key: &str) {
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let dataset = snapshot.open(table_key).await.unwrap();
+    let dataset = snapshot.open_dataset(table_key).await.unwrap();
     let (entity_kind, type_name) = table_key.split_once(':').unwrap();
     for field in &dataset.schema().fields {
         let marker = field.metadata.get("omnigraph.stable_property_id");
@@ -189,7 +189,7 @@ pub async fn assert_stable_property_markers(db: &Omnigraph, table_key: &str) {
 /// Read all rows from a branch-local sub-table by table_key.
 pub async fn read_table_branch(db: &Omnigraph, branch: &str, table_key: &str) -> Vec<RecordBatch> {
     let snap = snapshot_branch(db, branch).await.unwrap();
-    let ds = snap.open(table_key).await.unwrap();
+    let ds = snap.open_dataset(table_key).await.unwrap();
     ds.scan()
         .try_into_stream()
         .await
@@ -202,14 +202,14 @@ pub async fn read_table_branch(db: &Omnigraph, branch: &str, table_key: &str) ->
 /// Count rows in a sub-table.
 pub async fn count_rows(db: &Omnigraph, table_key: &str) -> usize {
     let snap = snapshot_main(db).await.unwrap();
-    let ds = snap.open(table_key).await.unwrap();
+    let ds = snap.open_dataset(table_key).await.unwrap();
     ds.count_rows(None).await.unwrap()
 }
 
 /// Count rows in a branch-local sub-table.
 pub async fn count_rows_branch(db: &Omnigraph, branch: &str, table_key: &str) -> usize {
     let snap = snapshot_branch(db, branch).await.unwrap();
-    let ds = snap.open(table_key).await.unwrap();
+    let ds = snap.open_dataset(table_key).await.unwrap();
     ds.count_rows(None).await.unwrap()
 }
 
@@ -335,11 +335,13 @@ pub async fn snapshot_branch(db: &Omnigraph, branch: &str) -> Result<Snapshot> {
 }
 
 pub async fn version_main(db: &Omnigraph) -> Result<u64> {
-    db.version_of(ReadTarget::branch("main")).await
+    db.graph_manifest_version_of(ReadTarget::branch("main"))
+        .await
 }
 
 pub async fn version_branch(db: &Omnigraph, branch: &str) -> Result<u64> {
-    db.version_of(ReadTarget::branch(branch)).await
+    db.graph_manifest_version_of(ReadTarget::branch(branch))
+        .await
 }
 
 pub async fn sync_main(db: &mut Omnigraph) -> Result<()> {

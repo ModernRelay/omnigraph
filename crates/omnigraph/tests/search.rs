@@ -265,7 +265,7 @@ async fn doc_user_index_count(db: &Omnigraph) -> usize {
     let ds = snapshot_main(db)
         .await
         .unwrap()
-        .open("node:Doc")
+        .open_dataset("node:Doc")
         .await
         .unwrap();
     ds.load_indices()
@@ -1222,7 +1222,7 @@ node Doc {
     let ds = snapshot_main(&db)
         .await
         .unwrap()
-        .open("node:Doc")
+        .open_dataset("node:Doc")
         .await
         .unwrap();
     let indices = ds.load_indices().await.unwrap();
@@ -1243,7 +1243,7 @@ async fn load_commit_creates_inverted_indices_for_string_annotations() {
     let ds = snapshot_main(&db)
         .await
         .unwrap()
-        .open("node:Doc")
+        .open_dataset("node:Doc")
         .await
         .unwrap();
     let indices = ds.load_indices().await.unwrap();

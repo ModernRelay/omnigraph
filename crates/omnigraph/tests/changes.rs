@@ -24,7 +24,7 @@ fn change_tuples(change_set: &omnigraph::changes::ChangeSet) -> Vec<(String, Str
     let mut tuples: Vec<_> = change_set
         .changes
         .iter()
-        .map(|change| (change.table_key.clone(), change.id.clone(), change.op))
+        .map(|change| (change.type_key().clone(), change.id.clone(), change.op))
         .collect();
     tuples.sort_by(|a, b| {
         a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| {
@@ -65,7 +65,7 @@ async fn write_receipts_identify_exact_commits_and_mutation_noops() {
         .expect("a row-changing mutation publishes once");
     let stored = db.get_commit(&commit.graph_commit_id).await.unwrap();
     assert_eq!(stored.graph_commit_id, commit.graph_commit_id);
-    assert_eq!(stored.manifest_version, commit.manifest_version);
+    assert_eq!(stored.graph_manifest_version, commit.graph_manifest_version);
 
     let changes = db
         .diff_commits(
@@ -75,7 +75,10 @@ async fn write_receipts_identify_exact_commits_and_mutation_noops() {
         )
         .await
         .unwrap();
-    assert_eq!(changes.to_version, commit.manifest_version);
+    assert_eq!(
+        changes.to_graph_manifest_version,
+        commit.graph_manifest_version
+    );
     assert_eq!(
         change_tuples(&changes),
         vec![("node:Person".into(), "Eve".into(), ChangeOp::Insert)]
@@ -110,8 +113,8 @@ async fn write_receipts_identify_exact_commits_and_mutation_noops() {
         .unwrap();
     assert_eq!(stored.graph_commit_id, load_receipt.commit.graph_commit_id);
     assert_eq!(
-        stored.manifest_version,
-        load_receipt.commit.manifest_version
+        stored.graph_manifest_version,
+        load_receipt.commit.graph_manifest_version
     );
 
     // Empty Load has no table effect or recovery sidecar, but Load's public
@@ -234,7 +237,7 @@ node Anchor { name: String @key }
     let reincarnation_changes = reincarnation_diff
         .changes
         .iter()
-        .map(|change| (change.table_key.clone(), change.id.clone(), change.op))
+        .map(|change| (change.type_key().clone(), change.id.clone(), change.op))
         .collect::<Vec<_>>();
     assert_eq!(
         reincarnation_changes,
@@ -278,14 +281,14 @@ async fn diff_detects_node_insert() {
     let inserts: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Insert && c.table_key == "node:Person")
+        .filter(|c| c.op == ChangeOp::Insert && c.type_key() == "node:Person")
         .collect();
     assert!(
         !inserts.is_empty(),
         "Should detect the Person insert. Got changes: {:?}",
         cs.changes
             .iter()
-            .map(|c| (&c.table_key, &c.id, c.op))
+            .map(|c| (c.type_key(), c.id.clone(), c.op))
             .collect::<Vec<_>>()
     );
     assert!(
@@ -318,14 +321,14 @@ async fn diff_detects_node_update() {
     let updates: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Update && c.table_key == "node:Person")
+        .filter(|c| c.op == ChangeOp::Update && c.type_key() == "node:Person")
         .collect();
     assert!(
         !updates.is_empty(),
         "Should detect the Person update. Got changes: {:?}",
         cs.changes
             .iter()
-            .map(|c| (&c.table_key, &c.id, c.op))
+            .map(|c| (c.type_key(), c.id.clone(), c.op))
             .collect::<Vec<_>>()
     );
 }
@@ -351,7 +354,7 @@ async fn diff_detects_node_delete_with_cascade() {
     let table_keys = cs
         .changes
         .iter()
-        .map(|change| change.table_key.as_str())
+        .map(|change| change.type_key())
         .collect::<Vec<_>>();
     assert!(
         table_keys.windows(2).all(|pair| pair[0] <= pair[1]),
@@ -362,14 +365,14 @@ async fn diff_detects_node_delete_with_cascade() {
     let person_deletes: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Delete && c.table_key == "node:Person")
+        .filter(|c| c.op == ChangeOp::Delete && c.type_key() == "node:Person")
         .collect();
     assert!(
         !person_deletes.is_empty(),
         "Should detect Person delete. Changes: {:?}",
         cs.changes
             .iter()
-            .map(|c| (&c.table_key, &c.id, c.op))
+            .map(|c| (c.type_key(), c.id.clone(), c.op))
             .collect::<Vec<_>>()
     );
 
@@ -377,14 +380,14 @@ async fn diff_detects_node_delete_with_cascade() {
     let edge_deletes: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Delete && c.table_key == "edge:Knows")
+        .filter(|c| c.op == ChangeOp::Delete && c.type_key() == "edge:Knows")
         .collect();
     assert!(
         !edge_deletes.is_empty(),
         "Should detect cascaded Knows edge deletes. Changes: {:?}",
         cs.changes
             .iter()
-            .map(|c| (&c.table_key, &c.id, c.op))
+            .map(|c| (c.type_key(), c.id.clone(), c.op))
             .collect::<Vec<_>>()
     );
 
@@ -419,14 +422,14 @@ async fn diff_detects_edge_insert_with_endpoints() {
     let edge_inserts: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Insert && c.table_key == "edge:Knows")
+        .filter(|c| c.op == ChangeOp::Insert && c.type_key() == "edge:Knows")
         .collect();
     assert!(
         !edge_inserts.is_empty(),
         "Should detect Knows edge insert. Changes: {:?}",
         cs.changes
             .iter()
-            .map(|c| (&c.table_key, &c.id, c.op))
+            .map(|c| (c.type_key(), c.id.clone(), c.op))
             .collect::<Vec<_>>()
     );
 
@@ -471,7 +474,7 @@ async fn filter_by_type_name_skips_non_matching() {
         "Filter to Company should skip Person changes. Got: {:?}",
         cs.changes
             .iter()
-            .map(|c| (&c.table_key, &c.id, c.op))
+            .map(|c| (c.type_key(), c.id.clone(), c.op))
             .collect::<Vec<_>>()
     );
 }
@@ -517,7 +520,7 @@ async fn filter_by_op_skips_unwanted_operations() {
             ChangeOp::Insert,
             "Filter for Insert-only should not include {:?} for {} ({})",
             c.op,
-            c.table_key,
+            c.type_key(),
             c.id
         );
     }
@@ -572,7 +575,7 @@ async fn diff_after_merge_reports_actual_changes() {
     let person_changes: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.table_key == "node:Person")
+        .filter(|c| c.type_key() == "node:Person")
         .collect();
 
     let person_inserts: Vec<_> = person_changes
@@ -729,7 +732,7 @@ async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
 
     assert_eq!(change_tuples(&from_main), change_tuples(&from_feature));
     assert!(from_main.changes.iter().any(|change| {
-        change.table_key == "node:Person" && change.id == "Eve" && change.op == ChangeOp::Insert
+        change.type_key() == "node:Person" && change.id == "Eve" && change.op == ChangeOp::Insert
     }));
 }
 
@@ -804,7 +807,7 @@ async fn same_branch_diff_across_first_lazy_fork_detects_update() {
         .await
         .unwrap();
     assert!(change_set.changes.iter().any(|change| {
-        change.table_key == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Update
+        change.type_key() == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Update
     }));
 }
 
@@ -834,10 +837,10 @@ async fn diff_commits_cross_branch_reports_property_only_updates() {
         .unwrap();
 
     assert!(change_set.changes.iter().any(|change| {
-        change.table_key == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Update
+        change.type_key() == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Update
     }));
     assert!(!change_set.changes.iter().any(|change| {
-        change.table_key == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Insert
+        change.type_key() == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Insert
     }));
 }
 
@@ -929,7 +932,7 @@ query set_body($slug: String, $body: String) {
 
     assert!(
         change_set.changes.iter().any(|change| {
-            change.table_key == "node:Doc" && change.id == "x" && change.op == ChangeOp::Update
+            change.type_key() == "node:Doc" && change.id == "x" && change.op == ChangeOp::Update
         }),
         "null → empty-string must surface as an update, not be conflated: {:?}",
         change_set.changes
@@ -980,7 +983,7 @@ query set_notes($slug: String, $notes: String) {
 
     assert!(
         change_set.changes.iter().any(|change| {
-            change.table_key == "node:Doc" && change.id == "x" && change.op == ChangeOp::Update
+            change.type_key() == "node:Doc" && change.id == "x" && change.op == ChangeOp::Update
         }),
         "a change to a legal _row_-prefixed property must be detected: {:?}",
         change_set.changes
@@ -1164,7 +1167,7 @@ async fn cross_branch_diff_detects_same_length_blob_only_update() {
         .unwrap();
     assert!(
         change_set.changes.iter().any(|change| {
-            change.table_key == "node:Document"
+            change.type_key() == "node:Document"
                 && change.id == "doc"
                 && change.op == ChangeOp::Update
         }),
@@ -1226,7 +1229,7 @@ async fn cross_branch_diff_detects_same_length_blob_update_between_sibling_branc
         .unwrap();
     assert!(
         change_set.changes.iter().any(|change| {
-            change.table_key == "node:Document"
+            change.type_key() == "node:Document"
                 && change.id == "doc"
                 && change.op == ChangeOp::Update
         }),
@@ -1574,7 +1577,7 @@ async fn commit_changes_are_exact_ordered_and_bounded() {
 
     // Reclaiming a pinned participant turns the commit into a typed gap.
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let person_path = &snapshot.entry("node:Person").unwrap().table_path;
+    let person_path = &snapshot.dataset("node:Person").unwrap().dataset_path;
     let person_uri = format!(
         "{}/{}",
         db.uri().trim_end_matches('/'),
@@ -2064,7 +2067,7 @@ async fn commit_changes_page_token_rejections_are_typed() {
         .unwrap_err()
     {
         OmniError::ResourceLimitExceeded { resource, .. } => {
-            assert_eq!(resource, "commit_changes_page_rows")
+            assert_eq!(resource, "commit_changes_page_changes")
         }
         other => panic!("expected a typed resource limit, got: {other:?}"),
     }
@@ -2971,7 +2974,7 @@ async fn change_feed_gap_then_baseline_reset() {
     // Reclaim the Person history commit A pins: the feed cannot continue
     // contiguously and surfaces the typed gap with the caller's cursor.
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let person_path = &snapshot.entry("node:Person").unwrap().table_path;
+    let person_path = &snapshot.dataset("node:Person").unwrap().dataset_path;
     let person_uri = format!(
         "{}/{}",
         db.uri().trim_end_matches('/'),
@@ -3021,7 +3024,7 @@ async fn change_feed_gap_then_baseline_reset() {
     );
     let exported = String::from_utf8(snapshot_bytes).unwrap();
     assert!(exported.contains("gap-a") && exported.contains("gap-b"));
-    let direct = db.export_jsonl("main", &[], &[]).await.unwrap();
+    let direct = db.export_jsonl("main", &[]).await.unwrap();
     assert_eq!(exported, direct, "the baseline is the exact entity export");
 
     // A commit landing AFTER the handshake is outside the snapshot and is the

@@ -123,8 +123,8 @@ fn assert_write_parity(verb: &str, local: &std::process::Output, remote: &std::p
             "{verb}: {arm} receipt must carry graph_commit_id"
         );
         assert!(
-            commit["manifest_version"].as_u64().is_some(),
-            "{verb}: {arm} receipt must carry manifest_version"
+            commit["graph_manifest_version"].as_u64().is_some(),
+            "{verb}: {arm} receipt must carry graph_manifest_version"
         );
         for key in [
             "graph_commit_id",
@@ -625,7 +625,7 @@ fn parity_errors_share_exit_codes() {
 //
 // - `graphs list`: server-only today; becomes Both-capability when the
 //   embedded arm enumerates the cluster catalog (RFC-009 open Q3, answered).
-// - `ingest`: deprecated compatibility loader; its remote arm rides the
+// - `ingest`: deprecated permissive loader; its remote arm rides the
 //   deprecated JSON /ingest route. Canonical `load` is strict graph-batch on
 //   both arms; the remote arm sends raw NDJSON to `/load/ndjson`.
 // - `init`, `optimize`, `repair`, `cleanup`, `cluster *`: storage-plane by

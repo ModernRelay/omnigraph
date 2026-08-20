@@ -94,11 +94,11 @@ impl std::fmt::Display for RepairAction {
 /// Per-dataset repair outcome.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct TableRepairStats {
-    /// Retained table-key compatibility identifier for the backing dataset.
-    pub table_key: String,
+pub struct DatasetRepairStats {
+    /// Qualified graph type key, or `__manifest` for the system dataset.
+    pub type_key: String,
     /// Published dataset version before repair.
-    pub manifest_version: u64,
+    pub published_dataset_version: u64,
     pub lance_head_version: u64,
     pub classification: RepairClassification,
     pub action: RepairAction,
@@ -110,9 +110,9 @@ pub struct TableRepairStats {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RepairStats {
-    pub tables: Vec<TableRepairStats>,
+    pub datasets: Vec<DatasetRepairStats>,
     /// New graph-manifest version if repair published any dataset pins.
-    pub manifest_version: Option<u64>,
+    pub graph_manifest_version: Option<u64>,
 }
 
 struct ClassificationResult {
@@ -128,7 +128,7 @@ struct RepairTableTask {
     manifest_version: u64,
 }
 
-pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result<RepairStats> {
+pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Result<RepairStats> {
     if options.force && !options.confirm {
         return Err(OmniError::manifest("repair --force requires --confirm"));
     }
@@ -168,20 +168,20 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     let table_tasks = table_keys
         .into_iter()
         .filter_map(|table_key| {
-            let entry = snapshot.entry(&table_key)?;
+            let entry = snapshot.dataset(&table_key)?;
             Some(RepairTableTask {
                 identity: entry.identity,
                 table_key,
-                full_path: format!("{}/{}", db.root_uri, entry.table_path),
-                manifest_version: entry.table_version,
+                full_path: format!("{}/{}", db.root_uri, entry.dataset_path),
+                manifest_version: entry.published_dataset_version,
             })
         })
         .collect::<Vec<_>>();
 
     if table_tasks.is_empty() {
         return Ok(RepairStats {
-            tables: Vec::new(),
-            manifest_version: None,
+            datasets: Vec::new(),
+            graph_manifest_version: None,
         });
     }
 
@@ -215,9 +215,9 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
         }
 
         if lance_head_version == manifest_version {
-            tables.push(TableRepairStats {
-                table_key,
-                manifest_version,
+            tables.push(DatasetRepairStats {
+                type_key: table_key,
+                published_dataset_version: manifest_version,
                 lance_head_version,
                 classification: RepairClassification::NoDrift,
                 action: RepairAction::NoOp,
@@ -247,12 +247,12 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
 
         if matches!(action, RepairAction::Healed | RepairAction::Forced) {
             let state = db.storage().table_state(&full_path, &handle).await?;
-            updates.push(crate::db::SubTableUpdate {
+            updates.push(crate::db::DatasetUpdate {
                 identity,
-                table_key: table_key.clone(),
-                table_version: state.version,
-                table_branch: None,
-                row_count: state.row_count,
+                type_key: table_key.clone(),
+                published_dataset_version: state.version,
+                native_dataset_branch: None,
+                entity_count: state.row_count,
                 version_metadata: state.version_metadata,
             });
             expected.insert(
@@ -264,9 +264,9 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
             );
         }
 
-        tables.push(TableRepairStats {
-            table_key,
-            manifest_version,
+        tables.push(DatasetRepairStats {
+            type_key: table_key,
+            published_dataset_version: manifest_version,
             lance_head_version,
             classification: classification.classification,
             action,
@@ -284,7 +284,8 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
             Some("omnigraph:repair")
         };
         let PublishedSnapshot {
-            manifest_version, ..
+            graph_manifest_version: manifest_version,
+            ..
         } = db
             .coordinator
             .write()
@@ -294,7 +295,7 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
         db.runtime_cache.invalidate_all().await;
         if updates
             .iter()
-            .any(|update| update.table_key.starts_with("edge:"))
+            .any(|update| update.type_key.starts_with("edge:"))
         {
             db.invalidate_graph_index().await;
         }
@@ -302,8 +303,8 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     };
 
     Ok(RepairStats {
-        tables,
-        manifest_version,
+        datasets: tables,
+        graph_manifest_version: manifest_version,
     })
 }
 

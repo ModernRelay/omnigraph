@@ -512,7 +512,7 @@ impl ClusterStore {
         let state_cas = format!("sha256:{}", sha256_hex(text.as_bytes()));
         observations.state_cas = Some(state_cas.clone());
 
-        let state = serde_json::from_str::<ClusterState>(&text).map_err(|err| {
+        let mut state = serde_json::from_str::<ClusterState>(&text).map_err(|err| {
             Diagnostic::error(
                 "invalid_state_json",
                 CLUSTER_STATE_FILE,
@@ -530,6 +530,8 @@ impl ClusterStore {
                 ),
             ));
         }
+
+        canonicalize_observation_coordinates(&mut state)?;
 
         observations.applied_config_digest = state.applied_revision.config_digest.clone();
         observations.state_revision = state.state_revision;
@@ -745,6 +747,31 @@ impl ClusterStore {
             }
         }
     }
+}
+
+fn canonicalize_observation_coordinates(state: &mut ClusterState) -> Result<(), Diagnostic> {
+    for (resource, observation) in &mut state.observations {
+        let Some(object) = observation.as_object_mut() else {
+            continue;
+        };
+        let Some(legacy_version) = object.remove("manifest_version") else {
+            continue;
+        };
+        if let Some(graph_manifest_version) = object.get("graph_manifest_version") {
+            if graph_manifest_version != &legacy_version {
+                return Err(Diagnostic::error(
+                    "conflicting_graph_manifest_observation",
+                    format!("state.observations.{resource}"),
+                    format!(
+                        "cluster observation '{resource}' contains conflicting legacy and canonical graph-manifest versions"
+                    ),
+                ));
+            }
+        } else {
+            object.insert("graph_manifest_version".to_string(), legacy_version);
+        }
+    }
+    Ok(())
 }
 
 fn state_cas_mismatch() -> Diagnostic {

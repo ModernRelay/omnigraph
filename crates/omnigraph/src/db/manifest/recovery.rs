@@ -56,7 +56,7 @@ use super::publisher::{
     PublishPrecondition,
 };
 use super::{
-    ExpectedTableVersions, ManifestChange, ManifestCoordinator, SubTableUpdate, TableIdentity,
+    DatasetUpdate, ExpectedTableVersions, ManifestChange, ManifestCoordinator, TableIdentity,
     TableRegistration, TableRename, TableTombstone, TableVersionExpectation,
 };
 
@@ -388,7 +388,7 @@ pub(crate) enum SidecarKind {
     BranchMerge,
     /// `ensure_indices_for_branch` — index lifecycle commits.
     EnsureIndices,
-    /// `optimize_all_tables` — Lance `compact_files` (reserve-fragments +
+    /// `optimize_all_datasets` — Lance `compact_files` (reserve-fragments +
     /// rewrite commits) followed by a manifest publish of the compacted
     /// version. Loose-match like the other multi-commit writers; roll-forward
     /// is always safe because compaction is content-preserving (Lance
@@ -496,8 +496,8 @@ pub(crate) struct SidecarTablePin {
     /// sidecars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_version: Option<u64>,
-    /// Lance branch ref this table lives on (mirrors
-    /// `SubTableEntry::table_branch`). Required for the recovery sweep
+    /// Lance branch ref this dataset lives on (mirrors
+    /// `DatasetEntry::native_dataset_branch`). Required for the recovery sweep
     /// to open the dataset at the correct ref — `Dataset::open(path)`
     /// alone returns the default ref (typically main), which would
     /// classify a feature-branch sidecar against main's HEAD and silently
@@ -511,7 +511,7 @@ pub(crate) struct SidecarTablePin {
 /// can publish a `ManifestChange::RegisterTable` for tables that the
 /// writer was about to create. Without this, added tables exist as
 /// orphan datasets on disk after recovery while the live `_schema.pg`
-/// declares types the manifest doesn't know about — `snapshot.entry()`
+/// declares types the manifest doesn't know about — `snapshot.dataset()`
 /// returns None when the engine tries to read them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SidecarTableRegistration {
@@ -612,7 +612,7 @@ pub(crate) struct RecoveryTableEffect {
 }
 
 /// The confirmed value for one table-version output slot in the intended
-/// manifest delta. Metadata is copied from `SubTableUpdate` so recovery can
+/// manifest delta. Metadata is copied from `DatasetUpdate` so recovery can
 /// publish exactly what the original writer prepared rather than re-deriving a
 /// wider delta from an arbitrary live HEAD.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3396,8 +3396,8 @@ pub(crate) async fn recover_manifest_drift(
 fn snapshot_entry_by_identity(
     snapshot: &Snapshot,
     identity: TableIdentity,
-) -> Option<&super::SubTableEntry> {
-    snapshot.entries().find(|entry| entry.identity == identity)
+) -> Option<&super::DatasetEntry> {
+    snapshot.datasets().find(|entry| entry.identity == identity)
 }
 
 /// Resolve manifest authority by immutable identity. The alias is checked only
@@ -3406,20 +3406,20 @@ fn snapshot_entry_by_identity(
 fn snapshot_entry_for_pin<'a>(
     snapshot: &'a Snapshot,
     pin: &SidecarTablePin,
-) -> Result<Option<&'a super::SubTableEntry>> {
+) -> Result<Option<&'a super::DatasetEntry>> {
     if let Some(entry) = snapshot_entry_by_identity(snapshot, pin.identity) {
-        if entry.table_key != pin.table_key {
+        if entry.type_key != pin.table_key {
             return Err(OmniError::manifest_read_set_changed(
-                format!("table_binding:{}", pin.identity),
+                format!("dataset_binding:{}", pin.identity),
                 Some(pin.table_key.clone()),
-                Some(entry.table_key.clone()),
+                Some(entry.type_key.clone()),
             ));
         }
         return Ok(Some(entry));
     }
-    if let Some(entry) = snapshot.entry(&pin.table_key) {
+    if let Some(entry) = snapshot.dataset(&pin.table_key) {
         return Err(OmniError::manifest_read_set_changed(
-            format!("table_identity:{}", pin.table_key),
+            format!("dataset_identity:{}", pin.table_key),
             Some(pin.identity.to_string()),
             Some(entry.identity.to_string()),
         ));
@@ -3431,7 +3431,7 @@ fn snapshot_entry_for_schema_pin<'a>(
     snapshot: &'a Snapshot,
     pin: &SidecarTablePin,
     protocol: &RecoveryProtocolV7,
-) -> Result<Option<&'a super::SubTableEntry>> {
+) -> Result<Option<&'a super::DatasetEntry>> {
     let expected_alias = protocol
         .intended_delta
         .renames
@@ -3440,18 +3440,18 @@ fn snapshot_entry_for_schema_pin<'a>(
         .map(|rename| rename.expected_table_key.as_str())
         .unwrap_or(pin.table_key.as_str());
     if let Some(entry) = snapshot_entry_by_identity(snapshot, pin.identity) {
-        if entry.table_key != expected_alias {
+        if entry.type_key != expected_alias {
             return Err(OmniError::manifest_read_set_changed(
-                format!("table_binding:{}", pin.identity),
+                format!("dataset_binding:{}", pin.identity),
                 Some(expected_alias.to_string()),
-                Some(entry.table_key.clone()),
+                Some(entry.type_key.clone()),
             ));
         }
         return Ok(Some(entry));
     }
-    if let Some(entry) = snapshot.entry(expected_alias) {
+    if let Some(entry) = snapshot.dataset(expected_alias) {
         return Err(OmniError::manifest_read_set_changed(
-            format!("table_identity:{expected_alias}"),
+            format!("dataset_identity:{expected_alias}"),
             Some(pin.identity.to_string()),
             Some(entry.identity.to_string()),
         ));
@@ -3473,7 +3473,9 @@ async fn classify_sidecar_tables(
     let mut states = Vec::with_capacity(sidecar.tables.len());
     for pin in &sidecar.tables {
         let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
-        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
+        let manifest_pinned = manifest_entry
+            .map(|entry| entry.published_dataset_version)
+            .unwrap_or(0);
         // A first-touch named-branch mutation/load stages against the inherited
         // source snapshot, arms its v3 sidecar, and only then creates the Lance
         // target ref. Until Phase C publishes, the branch snapshot therefore
@@ -3489,7 +3491,7 @@ async fn classify_sidecar_tables(
                 .is_some_and(|branch| branch != "main")
             && sidecar.branch.as_deref() == pin.table_branch.as_deref()
             && manifest_entry
-                .map(|entry| entry.table_branch != pin.table_branch)
+                .map(|entry| entry.native_dataset_branch != pin.table_branch)
                 .unwrap_or(true);
         let allow_missing_target_ref = unpublished_fork
             && (matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
@@ -4469,11 +4471,13 @@ async fn process_ensure_indices_sidecar_v8(
             .find(|effect| effect.identity == pin.identity)
             .expect("validated schema-v8 key sets");
         let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
-        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
+        let manifest_pinned = manifest_entry
+            .map(|entry| entry.published_dataset_version)
+            .unwrap_or(0);
         let first_touch = effect.is_first_touch();
         let unpublished_fork = first_touch
             && manifest_entry
-                .map(|entry| entry.table_branch != pin.table_branch)
+                .map(|entry| entry.native_dataset_branch != pin.table_branch)
                 .unwrap_or(true);
         let target_ref = observe_branch_merge_target_ref(pin).await?;
         if first_touch {
@@ -4750,7 +4754,7 @@ async fn roll_back_ensure_indices_v8(
             continue;
         };
         if snapshot_entry_by_identity(snapshot, pin.identity)
-            .is_some_and(|entry| entry.table_branch == pin.table_branch)
+            .is_some_and(|entry| entry.native_dataset_branch == pin.table_branch)
         {
             return Err(OmniError::manifest_internal(format!(
                 "EnsureIndices sidecar '{}' cannot reclaim first-touch ref for '{}' because the manifest now owns it without the fixed original lineage",
@@ -4955,12 +4959,12 @@ async fn roll_forward_ensure_indices_v8(
                 table_version: slot.expected_version,
             },
         );
-        updates.push(ManifestChange::Update(SubTableUpdate {
+        updates.push(ManifestChange::Update(DatasetUpdate {
             identity: slot.identity,
-            table_key: slot.table_key.clone(),
-            table_version: confirmed.table_version,
-            table_branch: confirmed.table_branch.clone(),
-            row_count: confirmed.row_count,
+            type_key: slot.table_key.clone(),
+            published_dataset_version: confirmed.table_version,
+            native_dataset_branch: confirmed.table_branch.clone(),
+            entity_count: confirmed.row_count,
             version_metadata: confirmed.version_metadata.clone(),
         }));
         outcomes.push(TableOutcome {
@@ -5028,7 +5032,9 @@ async fn process_schema_apply_sidecar_v7(
             .find(|effect| effect.identity == pin.identity)
             .expect("validated schema-v7 key sets");
         let manifest_entry = snapshot_entry_for_schema_pin(snapshot, pin, protocol)?;
-        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
+        let manifest_pinned = manifest_entry
+            .map(|entry| entry.published_dataset_version)
+            .unwrap_or(0);
         let first_touch = effect.kind.is_first_touch();
         let observation = open_lance_head_if_present(
             &pin.table_path,
@@ -5298,12 +5304,12 @@ async fn publish_schema_apply_v7_forward(
                 table_key: slot.table_key.clone(),
                 table_version: slot.expected_version,
             });
-        changes.push(ManifestChange::Update(SubTableUpdate {
+        changes.push(ManifestChange::Update(DatasetUpdate {
             identity: slot.identity,
-            table_key: slot.table_key.clone(),
-            table_version: confirmed.table_version,
-            table_branch: confirmed.table_branch.clone(),
-            row_count: confirmed.row_count,
+            type_key: slot.table_key.clone(),
+            published_dataset_version: confirmed.table_version,
+            native_dataset_branch: confirmed.table_branch.clone(),
+            entity_count: confirmed.row_count,
             version_metadata: confirmed.version_metadata.clone(),
         }));
     }
@@ -5507,13 +5513,15 @@ async fn process_branch_merge_sidecar_v4(
             .find(|effect| effect.identity == pin.identity)
             .expect("v4 sidecar shape validates effect/pin key sets");
         let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
-        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
+        let manifest_pinned = manifest_entry
+            .map(|entry| entry.published_dataset_version)
+            .unwrap_or(0);
         let unpublished_fork = pin
             .table_branch
             .as_deref()
             .is_some_and(|branch| branch != "main")
             && manifest_entry
-                .map(|entry| entry.table_branch != pin.table_branch)
+                .map(|entry| entry.native_dataset_branch != pin.table_branch)
                 .unwrap_or(true);
         if manifest_pinned != pin.expected_version {
             unsafe_observation.get_or_insert_with(|| {
@@ -5772,12 +5780,12 @@ async fn roll_forward_branch_merge_v4(
                 table_version: slot.expected_version,
             },
         );
-        updates.push(ManifestChange::Update(SubTableUpdate {
+        updates.push(ManifestChange::Update(DatasetUpdate {
             identity: slot.identity,
-            table_key: slot.table_key.clone(),
-            table_version: confirmed.table_version,
-            table_branch: confirmed.table_branch.clone(),
-            row_count: confirmed.row_count,
+            type_key: slot.table_key.clone(),
+            published_dataset_version: confirmed.table_version,
+            native_dataset_branch: confirmed.table_branch.clone(),
+            entity_count: confirmed.row_count,
             version_metadata: confirmed.version_metadata.clone(),
         }));
         outcomes.push(TableOutcome {
@@ -5823,7 +5831,7 @@ async fn roll_forward_branch_merge_v4(
 }
 
 /// True if `err` is the publisher's per-table CAS precondition failure
-/// (`ExpectedVersionMismatch`) — the signal that a concurrent writer advanced
+/// (`PublishedDatasetVersionMismatch`) — the signal that a concurrent writer advanced
 /// the manifest past what this caller expected.
 fn is_expected_version_mismatch(err: &OmniError) -> bool {
     matches!(
@@ -5831,7 +5839,7 @@ fn is_expected_version_mismatch(err: &OmniError) -> bool {
         OmniError::Manifest(m)
             if matches!(
                 m.details,
-                Some(crate::error::ManifestConflictDetails::ExpectedVersionMismatch { .. })
+                Some(crate::error::ManifestConflictDetails::PublishedDatasetVersionMismatch { .. })
             )
     )
 }
@@ -5861,17 +5869,17 @@ fn sidecar_intent_satisfied(
         let Some(entry) = snapshot_entry_by_identity(snapshot, pin.identity) else {
             return false;
         };
-        if entry.table_key != pin.table_key {
+        if entry.type_key != pin.table_key {
             return false;
         }
-        let current = entry.table_version;
+        let current = entry.published_dataset_version;
         if current < state.lance_head {
             return false;
         }
     }
     for reg in &sidecar.additional_registrations {
         if snapshot_entry_by_identity(snapshot, reg.identity)
-            .is_none_or(|entry| entry.table_key != reg.table_key)
+            .is_none_or(|entry| entry.type_key != reg.table_key)
         {
             return false;
         }
@@ -5926,7 +5934,7 @@ async fn read_live_recovery_authority(
 }
 
 /// Convergence-idempotent handling of a roll-forward publish CAS that lost to a
-/// concurrent writer (`ExpectedVersionMismatch`). A roll-forward's postcondition
+/// concurrent writer (`PublishedDatasetVersionMismatch`). A roll-forward's postcondition
 /// is "the manifest reflects the sidecar's committed Lance state", not "this
 /// sweep won the CAS" (invariants 7 & 15). Re-read the live manifest:
 ///
@@ -5990,7 +5998,7 @@ async fn converge_or_defer_roll_forward(
             table_key: pin.table_key.clone(),
             from_version: pin.expected_version,
             to_version: snapshot_entry_by_identity(&fresh, pin.identity)
-                .map(|e| e.table_version)
+                .map(|e| e.published_dataset_version)
                 .unwrap_or(pin.post_commit_pin),
         })
         .collect();
@@ -6003,7 +6011,7 @@ async fn converge_or_defer_roll_forward(
             table_key: reg.table_key.clone(),
             from_version: 0,
             to_version: snapshot_entry_by_identity(&fresh, reg.identity)
-                .map(|e| e.table_version)
+                .map(|e| e.published_dataset_version)
                 .unwrap_or(0),
         });
     }
@@ -6621,7 +6629,7 @@ async fn record_audit_recovery_rollforward(
             table_key: registration.table_key.clone(),
             from_version: 0,
             to_version: snapshot_entry_by_identity(snapshot, registration.identity)
-                .map(|entry| entry.table_version)
+                .map(|entry| entry.published_dataset_version)
                 .unwrap_or(0),
         });
     }
@@ -6676,7 +6684,7 @@ async fn detect_visible_ensure_indices_rollback(
             sidecar.operation_id, sidecar.started_at, error,
         ))
     })?;
-    if commit.manifest_branch.as_deref() != expected_branch
+    if commit.graph_branch.as_deref() != expected_branch
         || commit.actor_id.as_deref() != Some(RECOVERY_ACTOR)
         || commit.merged_parent_commit_id.is_some()
         || commit.created_at != expected_created_at
@@ -6861,7 +6869,7 @@ async fn detect_visible_v7_outcome(
         .iter()
         .any(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
     let original_visible = if let Some(commit) = original_commit {
-        if commit.manifest_branch.is_some()
+        if commit.graph_branch.is_some()
             || protocol
                 .authority
                 .graph_head
@@ -6877,16 +6885,16 @@ async fn detect_visible_v7_outcome(
             )));
         }
         let committed_snapshot =
-            ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
+            ManifestCoordinator::snapshot_at(root_uri, None, commit.graph_manifest_version).await?;
         let updates_match = protocol.intended_delta.table_updates.iter().all(|slot| {
             let Some(confirmed) = slot.confirmed.as_ref() else {
                 return false;
             };
             snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
-                entry.table_key == slot.table_key
-                    && entry.table_version == confirmed.table_version
-                    && entry.table_branch == confirmed.table_branch
-                    && entry.row_count == confirmed.row_count
+                entry.type_key == slot.table_key
+                    && entry.published_dataset_version == confirmed.table_version
+                    && entry.native_dataset_branch == confirmed.table_branch
+                    && entry.entity_count == confirmed.row_count
                     && entry.version_metadata == confirmed.version_metadata
             })
         });
@@ -6898,14 +6906,14 @@ async fn detect_visible_v7_outcome(
                 .all(|registration| {
                     snapshot_entry_by_identity(&committed_snapshot, registration.identity)
                         .is_some_and(|entry| {
-                            entry.table_key == registration.table_key
-                                && entry.table_path == registration.table_path
-                                && entry.table_branch == registration.table_branch
+                            entry.type_key == registration.table_key
+                                && entry.dataset_path == registration.table_path
+                                && entry.native_dataset_branch == registration.table_branch
                         })
                 });
         let renames_match = protocol.intended_delta.renames.iter().all(|rename| {
             snapshot_entry_by_identity(&committed_snapshot, rename.identity).is_some_and(|entry| {
-                entry.table_key == rename.table_key && entry.table_path == rename.table_path
+                entry.type_key == rename.table_key && entry.dataset_path == rename.table_path
             })
         });
         let tombstones_match = protocol.intended_delta.tombstones.iter().all(|tombstone| {
@@ -7042,7 +7050,7 @@ async fn detect_visible_v8_outcome(
             .branch
             .as_deref()
             .filter(|branch| *branch != "main");
-        if commit.manifest_branch.as_deref() != expected_branch
+        if commit.graph_branch.as_deref() != expected_branch
             || protocol
                 .authority
                 .graph_head
@@ -7060,7 +7068,7 @@ async fn detect_visible_v8_outcome(
         let committed_snapshot = ManifestCoordinator::snapshot_at(
             root_uri,
             sidecar.branch.as_deref(),
-            commit.manifest_version,
+            commit.graph_manifest_version,
         )
         .await?;
         let delta_matches = protocol.intended_delta.table_updates.iter().all(|slot| {
@@ -7068,10 +7076,10 @@ async fn detect_visible_v8_outcome(
                 return false;
             };
             snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
-                entry.table_key == slot.table_key
-                    && entry.table_version == confirmed.table_version
-                    && entry.table_branch == confirmed.table_branch
-                    && entry.row_count == confirmed.row_count
+                entry.type_key == slot.table_key
+                    && entry.published_dataset_version == confirmed.table_version
+                    && entry.native_dataset_branch == confirmed.table_branch
+                    && entry.entity_count == confirmed.row_count
                     && entry.version_metadata == confirmed.version_metadata
             })
         });
@@ -7192,7 +7200,7 @@ async fn detect_visible_v3_outcome(
             .branch
             .as_deref()
             .filter(|branch| *branch != "main");
-        if commit.manifest_branch.as_deref() != expected_branch
+        if commit.graph_branch.as_deref() != expected_branch
             || protocol
                 .authority
                 .graph_head
@@ -7210,7 +7218,7 @@ async fn detect_visible_v3_outcome(
         let committed_snapshot = ManifestCoordinator::snapshot_at(
             root_uri,
             sidecar.branch.as_deref(),
-            commit.manifest_version,
+            commit.graph_manifest_version,
         )
         .await?;
         let delta_matches = protocol.intended_delta.table_updates.iter().all(|slot| {
@@ -7218,10 +7226,10 @@ async fn detect_visible_v3_outcome(
                 return false;
             };
             snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
-                entry.table_key == slot.table_key
-                    && entry.table_version == confirmed.table_version
-                    && entry.table_branch == confirmed.table_branch
-                    && entry.row_count == confirmed.row_count
+                entry.type_key == slot.table_key
+                    && entry.published_dataset_version == confirmed.table_version
+                    && entry.native_dataset_branch == confirmed.table_branch
+                    && entry.entity_count == confirmed.row_count
                     && entry.version_metadata == confirmed.version_metadata
             })
         });
@@ -7351,7 +7359,7 @@ async fn detect_visible_v4_outcome(
             .branch
             .as_deref()
             .filter(|branch| *branch != "main");
-        if commit.manifest_branch.as_deref() != expected_branch
+        if commit.graph_branch.as_deref() != expected_branch
             || protocol
                 .authority
                 .graph_head
@@ -7369,7 +7377,7 @@ async fn detect_visible_v4_outcome(
         let committed_snapshot = ManifestCoordinator::snapshot_at(
             root_uri,
             sidecar.branch.as_deref(),
-            commit.manifest_version,
+            commit.graph_manifest_version,
         )
         .await?;
         let delta_matches = protocol.intended_delta.table_updates.iter().all(|slot| {
@@ -7377,10 +7385,10 @@ async fn detect_visible_v4_outcome(
                 return false;
             };
             snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
-                entry.table_key == slot.table_key
-                    && entry.table_version == confirmed.table_version
-                    && entry.table_branch == confirmed.table_branch
-                    && entry.row_count == confirmed.row_count
+                entry.type_key == slot.table_key
+                    && entry.published_dataset_version == confirmed.table_version
+                    && entry.native_dataset_branch == confirmed.table_branch
+                    && entry.entity_count == confirmed.row_count
                     && entry.version_metadata == confirmed.version_metadata
             })
         });
@@ -7486,7 +7494,7 @@ async fn finalize_visible_v4_outcome(
 ///
 /// All-or-nothing at the substrate: the publish writes one `__manifest`
 /// row-level CAS that either advances every listed pin together or fails
-/// with `ExpectedVersionMismatch` (no partial publish). The publisher's
+/// with `PublishedDatasetVersionMismatch` (no partial publish). The publisher's
 /// internal `PUBLISHER_RETRY_BUDGET = 5` handles transient row-level CAS
 /// contention; persistent contention surfaces the typed conflict error to
 /// the recovery sweep, which leaves the sidecar in place for the next
@@ -7547,12 +7555,12 @@ async fn roll_forward_all(
                     table_version: slot.expected_version,
                 },
             );
-            updates.push(ManifestChange::Update(SubTableUpdate {
+            updates.push(ManifestChange::Update(DatasetUpdate {
                 identity: pin.identity,
-                table_key: pin.table_key.clone(),
-                table_version: confirmed.table_version,
-                table_branch: confirmed.table_branch.clone(),
-                row_count: confirmed.row_count,
+                type_key: pin.table_key.clone(),
+                published_dataset_version: confirmed.table_version,
+                native_dataset_branch: confirmed.table_branch.clone(),
+                entity_count: confirmed.row_count,
                 version_metadata: confirmed.version_metadata.clone(),
             }));
             published_versions.insert(pin.identity, confirmed.table_version);
@@ -7588,11 +7596,11 @@ async fn roll_forward_all(
     // Filtered against `snapshot`: when the manifest already has a live
     // entry for `reg.table_key`, a previous recovery (or the writer
     // itself, before crashing in Phase D) has already published the
-    // registration — skip it to avoid the publisher's ExpectedVersionMismatch
+    // registration — skip it to avoid the publisher's PublishedDatasetVersionMismatch
     // (expected=0, actual=current_version) on the redundant Register.
     for reg in &sidecar.additional_registrations {
         if snapshot
-            .entries()
+            .datasets()
             .find(|entry| entry.identity == reg.identity)
             .is_some()
         {
@@ -7600,17 +7608,17 @@ async fn roll_forward_all(
             // published_versions so the audit row's `to_version` reflects
             // reality, but emit no manifest change.
             if let Some(entry) = snapshot
-                .entries()
+                .datasets()
                 .find(|entry| entry.identity == reg.identity)
             {
-                if entry.table_key != reg.table_key {
+                if entry.type_key != reg.table_key {
                     return Err(OmniError::manifest_read_set_changed(
-                        format!("table_binding:{}", reg.identity),
+                        format!("dataset_binding:{}", reg.identity),
                         Some(reg.table_key.clone()),
-                        Some(entry.table_key.clone()),
+                        Some(entry.type_key.clone()),
                     ));
                 }
-                published_versions.insert(reg.identity, entry.table_version);
+                published_versions.insert(reg.identity, entry.published_dataset_version);
             }
             continue;
         }
@@ -7645,12 +7653,12 @@ async fn roll_forward_all(
             table_key: reg.table_key.clone(),
             table_path: reg.table_path.clone(),
         }));
-        updates.push(ManifestChange::Update(SubTableUpdate {
+        updates.push(ManifestChange::Update(DatasetUpdate {
             identity: reg.identity,
-            table_key: reg.table_key.clone(),
-            table_version: head_version,
-            table_branch: reg.table_branch.clone(),
-            row_count,
+            type_key: reg.table_key.clone(),
+            published_dataset_version: head_version,
+            native_dataset_branch: reg.table_branch.clone(),
+            entity_count: row_count,
             version_metadata,
         }));
         // No prior manifest entry expected for an added table.
@@ -7672,7 +7680,7 @@ async fn roll_forward_all(
     // publisher doesn't error on a redundant tombstone.
     for tomb in &sidecar.tombstones {
         if snapshot
-            .entries()
+            .datasets()
             .find(|entry| entry.identity == tomb.identity)
             .is_none()
         {
@@ -7767,12 +7775,12 @@ async fn push_table_update(
     let table_relative_path = super::table_path_for_identity(table_key, identity)?;
     let version_metadata =
         super::metadata::TableVersionMetadata::from_dataset(root_uri, &table_relative_path, &ds)?;
-    updates.push(ManifestChange::Update(SubTableUpdate {
+    updates.push(ManifestChange::Update(DatasetUpdate {
         identity,
-        table_key: table_key.to_string(),
-        table_version: published_version,
-        table_branch: branch.map(str::to_string),
-        row_count,
+        type_key: table_key.to_string(),
+        published_dataset_version: published_version,
+        native_dataset_branch: branch.map(str::to_string),
+        entity_count: row_count,
         version_metadata,
     }));
     expected.insert(
@@ -8155,7 +8163,7 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &mut RecoverySidecar,
-    updates: &[SubTableUpdate],
+    updates: &[DatasetUpdate],
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
     confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
 ) -> Result<()> {
@@ -8214,10 +8222,10 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
             .get(&effect.identity)
             .expect("confirmation key sets checked above");
         if pin.table_key != effect.table_key
-            || update.table_key != effect.table_key
+            || update.type_key != effect.table_key
             || committed != &effect.planned_transaction
-            || update.table_version != pin.post_commit_pin
-            || update.table_branch != pin.table_branch
+            || update.published_dataset_version != pin.post_commit_pin
+            || update.native_dataset_branch != pin.table_branch
         {
             return Err(OmniError::manifest_internal(format!(
                 "EnsureIndices sidecar '{}' table '{}' achieved transaction/version/branch outside its exact plan; leaving recovery Armed",
@@ -8230,7 +8238,7 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
                 sidecar.operation_id, effect.table_key
             ))
         })?;
-        if observed.version != update.table_version
+        if observed.version != update.published_dataset_version
             || !prove_ensure_indices_create_index_operation(
                 &observed.dataset,
                 &effect.planned_transaction,
@@ -8247,7 +8255,7 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
                 .get(&effect.identity)
                 .expect("first-touch key sets checked above");
             if observed.parent_version != Some(source_fork_version)
-                || observed.version != update.table_version
+                || observed.version != update.published_dataset_version
                 || &observed.branch_identifier != expected_identifier
             {
                 return Err(OmniError::manifest_internal(format!(
@@ -8279,9 +8287,9 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
             .find(|update| update.identity == slot.identity)
             .expect("confirmation key sets checked above");
         slot.confirmed = Some(RecoveryConfirmedTableUpdate {
-            table_version: update.table_version,
-            table_branch: update.table_branch.clone(),
-            row_count: update.row_count,
+            table_version: update.published_dataset_version,
+            table_branch: update.native_dataset_branch.clone(),
+            row_count: update.entity_count,
             version_metadata: update.version_metadata.clone(),
         });
     }
@@ -8290,7 +8298,7 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
             .iter()
             .find(|update| update.identity == pin.identity)
             .expect("confirmation key sets checked above");
-        pin.confirmed_version = Some(update.table_version);
+        pin.confirmed_version = Some(update.published_dataset_version);
     }
     confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
     validate_sidecar_shape(&uri, &confirmed)?;
@@ -8413,7 +8421,7 @@ pub(crate) async fn confirm_occ_sidecar_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &mut RecoverySidecar,
-    updates: &[SubTableUpdate],
+    updates: &[DatasetUpdate],
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
 ) -> Result<()> {
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
@@ -8472,17 +8480,17 @@ pub(crate) async fn confirm_occ_sidecar_v9(
             .find(|update| update.identity == effect.identity)
             .expect("confirmed key set checked above");
         if pin.table_key != effect.table_key
-            || update.table_key != effect.table_key
-            || update.table_version != pin.post_commit_pin
-            || update.table_branch != pin.table_branch
+            || update.type_key != effect.table_key
+            || update.published_dataset_version != pin.post_commit_pin
+            || update.native_dataset_branch != pin.table_branch
         {
             return Err(OmniError::manifest_internal(format!(
                 "OCC sidecar '{}' table '{}' achieved version/branch ({}, {:?}), \
                  planned ({}, {:?}); leaving recovery Armed",
                 sidecar.operation_id,
                 effect.table_key,
-                update.table_version,
-                update.table_branch,
+                update.published_dataset_version,
+                update.native_dataset_branch,
                 pin.post_commit_pin,
                 pin.table_branch
             )));
@@ -8508,9 +8516,9 @@ pub(crate) async fn confirm_occ_sidecar_v9(
             .find(|update| update.identity == slot.identity)
             .expect("confirmed key set checked above");
         slot.confirmed = Some(RecoveryConfirmedTableUpdate {
-            table_version: update.table_version,
-            table_branch: update.table_branch.clone(),
-            row_count: update.row_count,
+            table_version: update.published_dataset_version,
+            table_branch: update.native_dataset_branch.clone(),
+            row_count: update.entity_count,
             version_metadata: update.version_metadata.clone(),
         });
     }
@@ -8519,7 +8527,7 @@ pub(crate) async fn confirm_occ_sidecar_v9(
             .iter()
             .find(|update| update.identity == pin.identity)
             .expect("confirmed key set checked above");
-        pin.confirmed_version = Some(update.table_version);
+        pin.confirmed_version = Some(update.published_dataset_version);
     }
     confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
 
@@ -8593,7 +8601,7 @@ pub(crate) async fn confirm_schema_apply_sidecar_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &mut RecoverySidecar,
-    updates: &[SubTableUpdate],
+    updates: &[DatasetUpdate],
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
 ) -> Result<()> {
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
@@ -8641,10 +8649,10 @@ pub(crate) async fn confirm_schema_apply_sidecar_v9(
             .find(|update| update.identity == effect.identity)
             .expect("confirmed key set checked above");
         if pin.table_key != effect.table_key
-            || update.table_key != effect.table_key
+            || update.type_key != effect.table_key
             || committed != planned
-            || update.table_version != pin.post_commit_pin
-            || update.table_branch != pin.table_branch
+            || update.published_dataset_version != pin.post_commit_pin
+            || update.native_dataset_branch != pin.table_branch
         {
             return Err(OmniError::manifest_internal(format!(
                 "SchemaApply sidecar '{}' table '{}' achieved transaction/version/branch outside its exact plan; leaving recovery Armed",
@@ -8672,9 +8680,9 @@ pub(crate) async fn confirm_schema_apply_sidecar_v9(
             .find(|update| update.identity == slot.identity)
             .expect("confirmed key set checked above");
         slot.confirmed = Some(RecoveryConfirmedTableUpdate {
-            table_version: update.table_version,
-            table_branch: update.table_branch.clone(),
-            row_count: update.row_count,
+            table_version: update.published_dataset_version,
+            table_branch: update.native_dataset_branch.clone(),
+            row_count: update.entity_count,
             version_metadata: update.version_metadata.clone(),
         });
     }
@@ -8683,7 +8691,7 @@ pub(crate) async fn confirm_schema_apply_sidecar_v9(
             .iter()
             .find(|update| update.identity == pin.identity)
             .expect("confirmed key set checked above");
-        pin.confirmed_version = Some(update.table_version);
+        pin.confirmed_version = Some(update.published_dataset_version);
     }
     confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
 
@@ -8760,7 +8768,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &mut RecoverySidecar,
-    updates: &[SubTableUpdate],
+    updates: &[DatasetUpdate],
     confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
 ) -> Result<()> {
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
@@ -8811,10 +8819,13 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
             .iter()
             .find(|update| update.identity == slot.identity)
             .expect("update/delta key sets checked above");
-        if update.table_key != slot.table_key || update.table_branch != slot.table_branch {
+        if update.type_key != slot.table_key || update.native_dataset_branch != slot.table_branch {
             return Err(OmniError::manifest_internal(format!(
                 "BranchMerge sidecar '{}' table '{}' achieved output branch {:?}, planned {:?}",
-                sidecar.operation_id, slot.table_key, update.table_branch, slot.table_branch
+                sidecar.operation_id,
+                slot.table_key,
+                update.native_dataset_branch,
+                slot.table_branch
             )));
         }
     }
@@ -8828,7 +8839,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
             .iter()
             .find(|update| update.identity == effect.identity)
             .expect("physical effect is a delta-slot subset");
-        if pin.table_key != effect.table_key || update.table_key != effect.table_key {
+        if pin.table_key != effect.table_key || update.type_key != effect.table_key {
             return Err(OmniError::manifest_internal(format!(
                 "BranchMerge sidecar '{}' identity {} has inconsistent diagnostic aliases",
                 sidecar.operation_id, effect.identity
@@ -8840,10 +8851,13 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
                 sidecar.operation_id, effect.table_key
             ))
         })?;
-        if observed.version != update.table_version {
+        if observed.version != update.published_dataset_version {
             return Err(OmniError::manifest_internal(format!(
                 "BranchMerge sidecar '{}' table '{}' observed HEAD {}, achieved update says {}",
-                sidecar.operation_id, effect.table_key, observed.version, update.table_version
+                sidecar.operation_id,
+                effect.table_key,
+                observed.version,
+                update.published_dataset_version
             )));
         }
         if let Some(source_fork_version) = effect.kind.source_fork_version() {
@@ -8882,12 +8896,12 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
                             sidecar.operation_id, effect.table_key
                         ))
                     })?;
-                if update.table_version < planned_final_version {
+                if update.published_dataset_version < planned_final_version {
                     return Err(OmniError::manifest_internal(format!(
                         "BranchMerge sidecar '{}' multi-commit table '{}' stopped before its complete planned transaction chain ({} < {})",
                         sidecar.operation_id,
                         effect.table_key,
-                        update.table_version,
+                        update.published_dataset_version,
                         planned_final_version
                     )));
                 }
@@ -8914,12 +8928,12 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
                 }
             }
             RecoveryBranchMergeEffectKind::RefOnlyFork { source_version, .. } => {
-                if update.table_version != *source_version {
+                if update.published_dataset_version != *source_version {
                     return Err(OmniError::manifest_internal(format!(
                         "BranchMerge sidecar '{}' ref-only table '{}' achieved version {}, exact fork version {}",
                         sidecar.operation_id,
                         effect.table_key,
-                        update.table_version,
+                        update.published_dataset_version,
                         source_version
                     )));
                 }
@@ -8938,9 +8952,9 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
             .find(|update| update.identity == slot.identity)
             .expect("update/delta key sets checked above");
         slot.confirmed = Some(RecoveryConfirmedTableUpdate {
-            table_version: update.table_version,
-            table_branch: update.table_branch.clone(),
-            row_count: update.row_count,
+            table_version: update.published_dataset_version,
+            table_branch: update.native_dataset_branch.clone(),
+            row_count: update.entity_count,
             version_metadata: update.version_metadata.clone(),
         });
     }
@@ -8956,7 +8970,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
                 confirmed_branch_identifier,
                 ..
             } => {
-                *confirmed_version = Some(update.table_version);
+                *confirmed_version = Some(update.published_dataset_version);
                 *confirmed_branch_identifier = ref_identifier;
             }
             RecoveryBranchMergeEffectKind::RefOnlyFork {
@@ -8972,7 +8986,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
             .iter()
             .find(|update| update.identity == pin.identity)
             .expect("effect/pin keys are delta-slot subset");
-        pin.confirmed_version = Some(update.table_version);
+        pin.confirmed_version = Some(update.published_dataset_version);
     }
     confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
 
@@ -9778,12 +9792,12 @@ mod tests {
                 "naming_scheme": "V2"
             }))
             .unwrap();
-        let updates = vec![SubTableUpdate {
+        let updates = vec![DatasetUpdate {
             identity: test_identity("node:Person"),
-            table_key: "node:Person".to_string(),
-            table_version: 6,
-            table_branch: None,
-            row_count: 7,
+            type_key: "node:Person".to_string(),
+            published_dataset_version: 6,
+            native_dataset_branch: None,
+            entity_count: 7,
             version_metadata,
         }];
         let committed = HashMap::from([(
@@ -10484,9 +10498,9 @@ node Person {
 
         let txn = db.open_write_txn(None).await.unwrap();
         let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();
-        let entry = txn.base.entry("node:Person").unwrap().clone();
-        let table_uri = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
-        let stale_dataset = txn.base.open_dataset("node:Person").await.unwrap();
+        let entry = txn.base.dataset("node:Person").unwrap().clone();
+        let table_uri = format!("{}/{}", root.trim_end_matches('/'), entry.dataset_path);
+        let stale_dataset = txn.base.open_lance_dataset("node:Person").await.unwrap();
         let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
         let staged = store
             .stage_append(
@@ -10497,7 +10511,7 @@ node Person {
             .await
             .unwrap();
         let planned = staged.transaction_identity();
-        assert_eq!(planned.read_version, entry.table_version);
+        assert_eq!(planned.read_version, entry.published_dataset_version);
 
         db.load(
             "main",
@@ -10507,7 +10521,10 @@ node Person {
         .await
         .unwrap();
         let winner_snapshot = db.snapshot_of("main").await.unwrap();
-        let winner_version = winner_snapshot.entry("node:Person").unwrap().table_version;
+        let winner_version = winner_snapshot
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version;
         assert_eq!(winner_version, planned.read_version + 1);
 
         let authority = RecoveryAuthorityToken {
@@ -10535,7 +10552,7 @@ node Person {
                 expected_version: planned.read_version,
                 post_commit_pin: planned.read_version + 1,
                 confirmed_version: None,
-                table_branch: entry.table_branch,
+                table_branch: entry.native_dataset_branch,
             }],
             authority,
             recovery_lineage,
@@ -10585,7 +10602,7 @@ node Person {
 
         let recovered = crate::db::Omnigraph::open(root).await.unwrap();
         let snapshot = recovered.snapshot_of("main").await.unwrap();
-        let visible = snapshot.open("node:Person").await.unwrap();
+        let visible = snapshot.open_dataset("node:Person").await.unwrap();
         let batches: Vec<RecordBatch> =
             futures::TryStreamExt::try_collect(visible.scan().try_into_stream().await.unwrap())
                 .await
@@ -10610,10 +10627,10 @@ node Person {
             "recovery must preserve the published winner while removing only the stale effect"
         );
 
-        let recovered_entry = snapshot.entry("node:Person").unwrap();
+        let recovered_entry = snapshot.dataset("node:Person").unwrap();
         let lance_head = Dataset::open(&table_uri).await.unwrap().version().version;
         assert_eq!(
-            recovered_entry.table_version, lance_head,
+            recovered_entry.published_dataset_version, lance_head,
             "recovery must publish its compensation so manifest and Lance HEAD converge"
         );
         assert!(
@@ -10641,16 +10658,20 @@ node Company { age: I32? }
         let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();
         let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
 
-        let person_entry = txn.base.entry("node:Person").unwrap().clone();
-        let company_entry = txn.base.entry("node:Company").unwrap().clone();
-        let person_uri = format!("{}/{}", root.trim_end_matches('/'), person_entry.table_path);
+        let person_entry = txn.base.dataset("node:Person").unwrap().clone();
+        let company_entry = txn.base.dataset("node:Company").unwrap().clone();
+        let person_uri = format!(
+            "{}/{}",
+            root.trim_end_matches('/'),
+            person_entry.dataset_path
+        );
         let company_uri = format!(
             "{}/{}",
             root.trim_end_matches('/'),
-            company_entry.table_path
+            company_entry.dataset_path
         );
-        let person_ds = txn.base.open_dataset("node:Person").await.unwrap();
-        let company_ds = txn.base.open_dataset("node:Company").await.unwrap();
+        let person_ds = txn.base.open_lance_dataset("node:Person").await.unwrap();
+        let company_ds = txn.base.open_lance_dataset("node:Company").await.unwrap();
         let person_staged = store
             .stage_append(&person_ds, person_batch(&[("partial", Some(10))]), &[])
             .await
@@ -10685,19 +10706,19 @@ node Company { age: I32? }
                     identity: person_entry.identity,
                     table_key: "node:Person".to_string(),
                     table_path: person_uri,
-                    expected_version: person_entry.table_version,
-                    post_commit_pin: person_entry.table_version + 1,
+                    expected_version: person_entry.published_dataset_version,
+                    post_commit_pin: person_entry.published_dataset_version + 1,
                     confirmed_version: None,
-                    table_branch: person_entry.table_branch,
+                    table_branch: person_entry.native_dataset_branch,
                 },
                 SidecarTablePin {
                     identity: company_entry.identity,
                     table_key: "node:Company".to_string(),
                     table_path: company_uri,
-                    expected_version: company_entry.table_version,
-                    post_commit_pin: company_entry.table_version + 1,
+                    expected_version: company_entry.published_dataset_version,
+                    post_commit_pin: company_entry.published_dataset_version + 1,
                     confirmed_version: None,
-                    table_branch: company_entry.table_branch,
+                    table_branch: company_entry.native_dataset_branch,
                 },
             ],
             authority,
@@ -10719,7 +10740,10 @@ node Company { age: I32? }
             .unwrap();
         assert_eq!(observed, person_planned);
         let person_effect_version = person_committed.version().version;
-        assert_eq!(person_effect_version, person_entry.table_version + 1);
+        assert_eq!(
+            person_effect_version,
+            person_entry.published_dataset_version + 1
+        );
         drop(person_committed);
         drop(company_staged);
         drop(txn);
@@ -10756,7 +10780,7 @@ node Company { age: I32? }
             &[TableOutcome {
                 table_key: "node:Person".to_string(),
                 from_version: person_effect_version,
-                to_version: person_entry.table_version,
+                to_version: person_entry.published_dataset_version,
             }],
             "the untouched Company pin must not be fabricated into the audit plan"
         );
@@ -10775,7 +10799,7 @@ node Company { age: I32? }
                 .snapshot_of("main")
                 .await
                 .unwrap()
-                .open("node:Person")
+                .open_dataset("node:Person")
                 .await
                 .unwrap()
                 .count_rows(None)
@@ -10805,9 +10829,9 @@ node Person { age: I32? }
 
         let txn = db.open_write_txn(None).await.unwrap();
         let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();
-        let entry = txn.base.entry("node:Person").unwrap().clone();
-        let table_uri = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
-        let stale_dataset = txn.base.open_dataset("node:Person").await.unwrap();
+        let entry = txn.base.dataset("node:Person").unwrap().clone();
+        let table_uri = format!("{}/{}", root.trim_end_matches('/'), entry.dataset_path);
+        let stale_dataset = txn.base.open_lance_dataset("node:Person").await.unwrap();
         let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
         let staged = store
             .stage_append(
@@ -10830,9 +10854,9 @@ node Person { age: I32? }
             .snapshot_of("main")
             .await
             .unwrap()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version;
+            .published_dataset_version;
         assert_eq!(winner_version, planned.read_version + 1);
 
         let sidecar = new_occ_sidecar_v9(
@@ -10846,7 +10870,7 @@ node Person { age: I32? }
                 expected_version: planned.read_version,
                 post_commit_pin: planned.read_version + 1,
                 confirmed_version: None,
-                table_branch: entry.table_branch,
+                table_branch: entry.native_dataset_branch,
             }],
             RecoveryAuthorityToken {
                 branch_identifier: txn.authority.branch_identifier.clone(),
@@ -10919,7 +10943,7 @@ node Person { age: I32? }
 
         let recovered = crate::db::Omnigraph::open(root).await.unwrap();
         let snapshot = recovered.snapshot_of("main").await.unwrap();
-        let visible = snapshot.open("node:Person").await.unwrap();
+        let visible = snapshot.open_dataset("node:Person").await.unwrap();
         let batches: Vec<RecordBatch> = visible
             .scan()
             .try_into_stream()

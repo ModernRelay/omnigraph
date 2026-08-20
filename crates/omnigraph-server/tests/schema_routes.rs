@@ -330,8 +330,8 @@ async fn schema_apply_route_can_rename_type() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap();
-    assert!(snapshot.entry("node:Human").is_some());
-    assert!(snapshot.entry("node:Person").is_none());
+    assert!(snapshot.dataset("node:Human").is_some());
+    assert!(snapshot.dataset("node:Person").is_none());
 }
 
 #[tokio::test]
@@ -378,7 +378,7 @@ async fn schema_apply_route_can_add_index() {
     let before_index_count = {
         let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-        let dataset = snapshot.open("node:Person").await.unwrap();
+        let dataset = snapshot.open_dataset("node:Person").await.unwrap();
         dataset.load_indices().await.unwrap().len()
     };
 
@@ -426,7 +426,7 @@ async fn schema_apply_route_can_add_index() {
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap();
-    let dataset = snapshot.open("node:Person").await.unwrap();
+    let dataset = snapshot.open_dataset("node:Person").await.unwrap();
     let after_index_count = dataset.load_indices().await.unwrap().len();
     assert_eq!(
         after_index_count, before_index_count,
@@ -732,8 +732,11 @@ async fn schema_apply_route_soft_drops_property_via_http() {
     // Soft drop preserves the prior version — `age` is still readable
     // via time travel to the pre-drop manifest version. Mirrors the
     // SDK-side assertion in `apply_schema_drops_a_nullable_property_softly_preserves_prior_version`.
-    let pre_drop_snapshot = reopened.snapshot_at_version(pre_version).await.unwrap();
-    let pre_drop_ds = pre_drop_snapshot.open("node:Person").await.unwrap();
+    let pre_drop_snapshot = reopened
+        .snapshot_at_graph_manifest_version(pre_version)
+        .await
+        .unwrap();
+    let pre_drop_ds = pre_drop_snapshot.open_dataset("node:Person").await.unwrap();
     let pre_drop_fields = pre_drop_ds
         .schema()
         .fields
@@ -915,7 +918,7 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
             .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap();
-        snap.open("node:Person")
+        snap.open_dataset("node:Person")
             .await
             .expect("Person")
             .count_rows(None)
@@ -951,7 +954,7 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
         .await
         .unwrap();
     let post_count = snap
-        .open("node:Person")
+        .open_dataset("node:Person")
         .await
         .expect("Person")
         .count_rows(None)

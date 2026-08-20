@@ -30,13 +30,13 @@ use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent};
 use omnigraph_api_types::{
     BlobReadQuery, BlobStatOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
     BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeBaselineOutput,
-    ChangeBaselineRecord, ChangeBaselineRequest, ChangeEntityKind, ChangeFeedOutput,
-    ChangeOpOutput, ChangeOutput, ChangeRequest, CommitChangesOutput, CommitListOutput,
-    CommitOutput, ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse,
-    IngestOutput, IngestRequest, InvokeStoredQueryRequest, QueryRequest, ReadOutput,
-    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, change_baseline_output,
-    change_feed_output, change_scope, commit_changes_output, commit_output, ingest_receipt_output,
-    read_output, schema_apply_output, snapshot_payload,
+    ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOpOutput, ChangeOutput,
+    ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, EntityKindOutput,
+    ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse, IngestOutput,
+    IngestRequest, InvokeStoredQueryRequest, QueryRequest, ReadOutput, SchemaApplyOutput,
+    SchemaApplyRequest, SchemaOutput, SnapshotOutput, change_baseline_output, change_feed_output,
+    change_scope, commit_changes_output, commit_output, ingest_receipt_output, read_output,
+    schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::header::{CONTENT_RANGE, RANGE};
@@ -351,7 +351,8 @@ impl GraphClient {
                 let internal_schema_version = db
                     .internal_schema_version_of(ReadTarget::branch(branch))
                     .await?;
-                Ok(snapshot_payload(branch, &snapshot, internal_schema_version))
+                snapshot_payload(branch, &snapshot, internal_schema_version)
+                    .map_err(|error| eyre!(error))
             }
         }
     }
@@ -709,8 +710,8 @@ impl GraphClient {
     }
 
     /// `ingest` — the deprecated loader-compatible path. Unlike canonical
-    /// `load`, it retains the historical permissive parser and JSON `/ingest`
-    /// wire shape. The embedded arm echoes `actor_id: None` in the output
+    /// `load`, it retains the historical permissive parser and `/ingest`
+    /// endpoint. The embedded arm echoes `actor_id: None` in the output
     /// exactly as the legacy arm did (the actor is still attributed on the
     /// commit via `load_file_as_with_receipt`).
     pub(crate) async fn ingest(
@@ -1121,7 +1122,6 @@ impl GraphClient {
         &self,
         branch: &str,
         type_names: &[String],
-        table_keys: &[String],
         writer: &mut W,
     ) -> Result<()> {
         match self {
@@ -1137,7 +1137,6 @@ impl GraphClient {
                 .json(&ExportRequest {
                     branch: Some(branch.to_string()),
                     type_names: type_names.to_vec(),
-                    table_keys: table_keys.to_vec(),
                 });
                 let mut response = request.send().await?;
                 let status = response.status();
@@ -1156,7 +1155,7 @@ impl GraphClient {
             }
             GraphClient::Embedded { uri, .. } => {
                 let db = Omnigraph::open(uri).await?;
-                db.export_jsonl_to_writer(branch, type_names, table_keys, writer)
+                db.export_jsonl_to_writer(branch, type_names, writer)
                     .await?;
                 writer.flush()?;
                 Ok(())
@@ -1404,7 +1403,7 @@ fn validate_content_range(
 /// Shared spelling of the change-surface filters across the three verbs; one
 /// translation (`change_scope`) is used by the embedded arm and the server.
 pub(crate) struct ChangeFilterArgs<'a> {
-    pub kinds: &'a [ChangeEntityKind],
+    pub kinds: &'a [EntityKindOutput],
     pub types: &'a [String],
     pub ops: &'a [ChangeOpOutput],
 }

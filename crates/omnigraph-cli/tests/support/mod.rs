@@ -494,7 +494,7 @@ pub fn manifest_dataset_version(graph: &std::path::Path) -> u64 {
             .snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
-            .version()
+            .graph_manifest_version()
     })
 }
 
@@ -503,14 +503,14 @@ pub fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
         let uri = graph.to_string_lossy();
         let db = Omnigraph::open(uri.as_ref()).await.unwrap();
         let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-        let entry = snap.entry("node:Person").unwrap();
-        let full_path = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
+        let entry = snap.dataset("node:Person").unwrap();
+        let full_path = format!("{}/{}", uri.trim_end_matches('/'), entry.dataset_path);
         let mut ds = Dataset::open(&full_path).await.unwrap();
         let deleted = ds.delete("name = 'Alice'").await.unwrap();
         assert_eq!(deleted.num_deleted_rows, 1);
         let head = deleted.new_dataset.version().version;
-        assert!(head > entry.table_version);
-        (entry.table_version, head)
+        assert!(head > entry.published_dataset_version);
+        (entry.published_dataset_version, head)
     })
 }
 

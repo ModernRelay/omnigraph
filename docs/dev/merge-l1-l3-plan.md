@@ -480,7 +480,7 @@ fail if split).**
   `fast_forward_merge_defers_vector_index_to_reconciler`):
   `merged_outcome_defers_index_build_to_reconciler` — diverge both branches on
   one table to force `MergeOutcome::Merged`; assert via
-  `SnapshotTable::index_coverage` (the deterministic signal — BTREE/FTS
+  `SnapshotDataset::index_coverage` (the deterministic signal — BTREE/FTS
   coverage absent immediately post-merge, present after `ensure_indices`), and
   `with_merge_write_probes` `stage_vector_index_calls() == 0`. Do **not** rely
   on the vector probe alone: small fixtures leave Vector untrainable, so the

@@ -195,7 +195,7 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Indefinitely supported compatibility alias for load (defaults: --mode merge, --from main)
+    /// Deprecated permissive loader (defaults: --mode merge, --from main; canonical current output)
     #[command(hide = true)]
     Ingest {
         /// Graph URI
@@ -235,8 +235,6 @@ pub(crate) enum Command {
         jsonl: bool,
         #[arg(long = "type")]
         type_names: Vec<String>,
-        #[arg(long = "table")]
-        table_keys: Vec<String>,
     },
     /// Read one logical node or edge Blob cell.
     Blob {
@@ -652,7 +650,7 @@ pub(crate) enum SchemaCommand {
         ///
         /// Without this flag, drops are "soft": the property or type
         /// is removed from the current graph-manifest version but prior
-        /// versions are retained, so `snapshot_at_version(pre_drop)`
+        /// versions are retained, so `snapshot_at_graph_manifest_version(pre_drop)`
         /// can still read the dropped data until `omnigraph cleanup`
         /// runs. With this flag, drops are "hard": `cleanup_old_versions`
         /// runs on the affected datasets immediately after the apply,
@@ -724,7 +722,7 @@ pub(crate) enum ChangeKindArg {
     Edge,
 }
 
-impl From<ChangeKindArg> for omnigraph_api_types::ChangeEntityKind {
+impl From<ChangeKindArg> for omnigraph_api_types::EntityKindOutput {
     fn from(kind: ChangeKindArg) -> Self {
         match kind {
             ChangeKindArg::Node => Self::Node,

@@ -85,20 +85,20 @@ query add_friend($from: String, $to: String) {
     )
 }
 
-fn snapshot_table_row_count(graph: &SystemGraph, table_key: &str) -> u64 {
-    snapshot_table_row_count_at(graph.path(), table_key)
+fn snapshot_entity_count(graph: &SystemGraph, entity_kind: &str, type_name: &str) -> u64 {
+    snapshot_entity_count_at(graph.path(), entity_kind, type_name)
 }
 
-fn snapshot_table_row_count_at(graph: &std::path::Path, table_key: &str) -> u64 {
+fn snapshot_entity_count_at(graph: &std::path::Path, entity_kind: &str, type_name: &str) -> u64 {
     let payload = parse_stdout_json(&output_success(
         cli().arg("snapshot").arg(graph).arg("--json"),
     ));
-    payload["tables"]
+    payload["datasets"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|table| table["table_key"] == table_key)
-        .unwrap()["row_count"]
+        .find(|dataset| dataset["entity_kind"] == entity_kind && dataset["type_name"] == type_name)
+        .unwrap()["entity_count"]
         .as_u64()
         .unwrap()
 }
@@ -211,7 +211,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     assert_eq!(change_payload["branch"], "main");
     assert_eq!(change_payload["affected_nodes"], 1);
     assert!(change_payload["commit"]["graph_commit_id"].is_string());
-    assert!(change_payload["commit"]["manifest_version"].is_number());
+    assert!(change_payload["commit"]["graph_manifest_version"].is_number());
 
     let read_after = parse_stdout_json(&output_success(
         cli()
@@ -373,8 +373,8 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     // The deprecation warning goes to stderr so --json stdout stays clean.
     let ingest_stderr = String::from_utf8_lossy(&ingest_output.stderr);
     assert!(
-        ingest_stderr.contains("deprecated compatibility alias kept indefinitely"),
-        "ingest must describe its indefinite compatibility status on stderr: {ingest_stderr}"
+        ingest_stderr.contains("deprecated loader command"),
+        "ingest must describe its deprecated parser/default status on stderr: {ingest_stderr}"
     );
     assert!(
         !ingest_stderr.contains("will be removed"),
@@ -385,10 +385,12 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["base_branch"], "main");
     assert_eq!(ingest_payload["branch_created"], true);
     assert!(ingest_payload["commit"]["graph_commit_id"].is_string());
-    assert!(ingest_payload["commit"]["manifest_version"].is_number());
+    assert!(ingest_payload["commit"]["graph_manifest_version"].is_number());
     assert_eq!(ingest_payload["mode"], "merge");
-    assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
-    assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
+    assert_eq!(ingest_payload["nodes"][0]["name"], "Person");
+    assert_eq!(ingest_payload["nodes"][0]["entities_loaded"], 2);
+    assert_eq!(ingest_payload["total_entities"], 2);
+    assert!(ingest_payload.get("tables").is_none());
 
     let human_ingest = output_success(
         cli()
@@ -412,7 +414,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
             .arg("feature-ingest")
             .arg("--json"),
     ));
-    assert_eq!(feature_snapshot["branch"], "feature-ingest");
+    assert_eq!(feature_snapshot["graph_branch"], "feature-ingest");
 
     let zoe = parse_stdout_json(&output_success(
         cli()
@@ -495,9 +497,11 @@ fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
     assert_eq!(payload["base_branch"], "main");
     assert_eq!(payload["branch_created"], true);
     assert_eq!(payload["mode"], "merge");
-    assert_eq!(payload["nodes_loaded"], 1);
+    assert_eq!(payload["nodes"][0]["name"], "Person");
+    assert_eq!(payload["nodes"][0]["entities_loaded"], 1);
+    assert_eq!(payload["total_entities"], 1);
     assert!(payload["commit"]["graph_commit_id"].is_string());
-    assert!(payload["commit"]["manifest_version"].is_number());
+    assert!(payload["commit"]["graph_manifest_version"].is_number());
 
     let snapshot = parse_stdout_json(&output_success(
         cli()
@@ -507,7 +511,7 @@ fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
             .arg("feature-load")
             .arg("--json"),
     ));
-    assert_eq!(snapshot["branch"], "feature-load");
+    assert_eq!(snapshot["graph_branch"], "feature-load");
 }
 
 /// `--mode` is required: overwrite is destructive, so the unified `load`
@@ -594,19 +598,19 @@ fn local_cli_export_round_trips_full_branch_graph() {
     );
 
     assert_eq!(
-        snapshot_table_row_count_at(&imported_graph, "node:Person"),
+        snapshot_entity_count_at(&imported_graph, "node", "Person"),
         5
     );
     assert_eq!(
-        snapshot_table_row_count_at(&imported_graph, "node:Company"),
+        snapshot_entity_count_at(&imported_graph, "node", "Company"),
         2
     );
     assert_eq!(
-        snapshot_table_row_count_at(&imported_graph, "edge:Knows"),
+        snapshot_entity_count_at(&imported_graph, "edge", "Knows"),
         4
     );
     assert_eq!(
-        snapshot_table_row_count_at(&imported_graph, "edge:WorksAt"),
+        snapshot_entity_count_at(&imported_graph, "edge", "WorksAt"),
         2
     );
 
@@ -701,7 +705,7 @@ fn local_cli_s3_end_to_end_init_load_read_flow() {
             .arg(&graph_uri)
             .arg("--json"),
     ));
-    assert!(snapshot["tables"].is_array());
+    assert!(snapshot["datasets"].is_array());
 }
 
 #[test]
@@ -711,8 +715,8 @@ fn local_cli_failed_load_keeps_target_state_unchanged() {
         "system-bad-load.jsonl",
         r#"{"edge":"Knows","from":"Alice","to":"Missing"}"#,
     );
-    let person_rows_before = snapshot_table_row_count(&graph, "node:Person");
-    let knows_rows_before = snapshot_table_row_count(&graph, "edge:Knows");
+    let person_rows_before = snapshot_entity_count(&graph, "node", "Person");
+    let knows_rows_before = snapshot_entity_count(&graph, "edge", "Knows");
 
     let output = output_failure(
         cli()
@@ -727,11 +731,11 @@ fn local_cli_failed_load_keeps_target_state_unchanged() {
     assert!(stderr.contains("not found") || stderr.contains("Missing"));
 
     assert_eq!(
-        snapshot_table_row_count(&graph, "node:Person"),
+        snapshot_entity_count(&graph, "node", "Person"),
         person_rows_before
     );
     assert_eq!(
-        snapshot_table_row_count(&graph, "edge:Knows"),
+        snapshot_entity_count(&graph, "edge", "Knows"),
         knows_rows_before
     );
     // Failed loads leave no run record (the run lifecycle has been
@@ -1322,7 +1326,7 @@ fn local_cli_load_enforces_engine_layer_policy() {
     let data = temp.path().join("policy-load.jsonl");
     // The seeded graph (test.jsonl) has Knows/WorksAt edges over its Persons, so a
     // per-table overwrite must be self-consistent: replacing node:Person also
-    // replaces the edge tables that referenced the old Persons, or the retained
+    // replaces the edge datasets that referenced the old Persons, or the retained
     // edges would strand against the new node image (a loud OrphanEdge). The data
     // is incidental to this policy test; it just has to commit cleanly for the
     // allowed actor. WorksAt points at Acme, a Company the overwrite retains.
@@ -1376,7 +1380,7 @@ fn local_cli_load_enforces_engine_layer_policy() {
             .arg("--json"),
     ));
     assert_eq!(allowed["branch"], "main");
-    assert!(allowed["nodes_loaded"].as_u64().unwrap() >= 1);
+    assert!(allowed["total_entities"].as_u64().unwrap() >= 1);
 }
 
 #[test]

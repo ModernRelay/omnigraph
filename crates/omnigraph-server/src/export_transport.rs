@@ -256,10 +256,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let cut = db
-            .capture_served_export_cut("main", &[], &[])
-            .await
-            .unwrap();
+        let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
         let transport = ExportTransport::new(4, 4, Duration::from_millis(10));
         let lease = transport.reserve().await.unwrap();
         let producer_lease = Arc::clone(&lease);
@@ -285,7 +282,7 @@ mod tests {
         drop(sender);
         drop(producer_lease);
 
-        let error = match db.capture_served_export_cut("main", &[], &[]).await {
+        let error = match db.capture_served_export_cut("main", &[]).await {
             Ok(_) => panic!("queued terminal cut must keep the root slot"),
             Err(error) => error,
         };
@@ -299,10 +296,7 @@ mod tests {
         ));
 
         drop(body);
-        let retry = db
-            .capture_served_export_cut("main", &[], &[])
-            .await
-            .unwrap();
+        let retry = db.capture_served_export_cut("main", &[]).await.unwrap();
         drop(retry);
         assert_eq!(transport.available_bytes.available_permits(), 4);
     }

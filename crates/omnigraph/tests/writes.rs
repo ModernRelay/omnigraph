@@ -170,7 +170,7 @@ async fn multi_statement_mutation_is_atomic_with_read_your_writes() {
 /// accumulator and never reaches Lance — Lance HEAD on `node:Person`
 /// stays at the pre-mutation version. The publisher never publishes,
 /// the manifest never advances, and the next mutation against the same
-/// table proceeds normally (no `ExpectedVersionMismatch`).
+/// table proceeds normally (no `PublishedDatasetVersionMismatch`).
 ///
 /// Pins the staged-write contract:
 /// - Failed multi-statement mutation surfaces a clear error, no
@@ -569,13 +569,13 @@ async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_eff
         .await
         .unwrap();
     let before = snapshot_main(&over).await.unwrap();
-    let before_manifest = before.version();
-    let entry = before.entry("node:Thing").unwrap();
-    let before_table = entry.table_version;
+    let before_manifest = before.graph_manifest_version();
+    let entry = before.dataset("node:Thing").unwrap();
+    let before_table = entry.published_dataset_version;
     let table_uri = format!(
         "{}/{}",
         over.uri().trim_end_matches('/'),
-        entry.table_path.trim_start_matches('/')
+        entry.dataset_path.trim_start_matches('/')
     );
     let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
     let error = over
@@ -594,14 +594,17 @@ async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_eff
                 ref resource,
                 limit: 8192,
                 actual: 8193,
-            } if resource == "keyed rows for node:Thing"
+            } if resource == "keyed entities for node:Thing"
         ),
         "one-over mutation must return the typed keyed-row limit, got {error:?}"
     );
     let after = snapshot_main(&over).await.unwrap();
-    assert_eq!(after.version(), before_manifest);
+    assert_eq!(after.graph_manifest_version(), before_manifest);
     assert_eq!(
-        after.entry("node:Thing").unwrap().table_version,
+        after
+            .dataset("node:Thing")
+            .unwrap()
+            .published_dataset_version,
         before_table
     );
     assert_eq!(
@@ -653,13 +656,13 @@ query update_all() {
         .await
         .unwrap();
     let before = snapshot_main(&over).await.unwrap();
-    let before_manifest = before.version();
-    let entry = before.entry("node:Thing").unwrap();
-    let before_table = entry.table_version;
+    let before_manifest = before.graph_manifest_version();
+    let entry = before.dataset("node:Thing").unwrap();
+    let before_table = entry.published_dataset_version;
     let table_uri = format!(
         "{}/{}",
         over.uri().trim_end_matches('/'),
-        entry.table_path.trim_start_matches('/')
+        entry.dataset_path.trim_start_matches('/')
     );
     let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
 
@@ -674,14 +677,17 @@ query update_all() {
                 ref resource,
                 limit: 8192,
                 actual: 8193,
-            } if resource == "keyed rows for node:Thing"
+            } if resource == "keyed entities for node:Thing"
         ),
         "one-over update must return the typed keyed-row limit, got {error:?}"
     );
     let after = snapshot_main(&over).await.unwrap();
-    assert_eq!(after.version(), before_manifest);
+    assert_eq!(after.graph_manifest_version(), before_manifest);
     assert_eq!(
-        after.entry("node:Thing").unwrap().table_version,
+        after
+            .dataset("node:Thing")
+            .unwrap()
+            .published_dataset_version,
         before_table
     );
     assert_eq!(
@@ -748,13 +754,13 @@ query update_note($note: String) {
     .to_string();
     load_jsonl(&db, &row, LoadMode::Overwrite).await.unwrap();
     let before = snapshot_main(&db).await.unwrap();
-    let before_manifest = before.version();
-    let entry = before.entry("node:Document").unwrap();
-    let before_table = entry.table_version;
+    let before_manifest = before.graph_manifest_version();
+    let entry = before.dataset("node:Document").unwrap();
+    let before_table = entry.published_dataset_version;
     let table_uri = format!(
         "{}/{}",
         db.uri().trim_end_matches('/'),
-        entry.table_path.trim_start_matches('/')
+        entry.dataset_path.trim_start_matches('/')
     );
     let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
 
@@ -777,7 +783,7 @@ query update_note($note: String) {
                 ref resource,
                 limit: LIMIT,
                 actual,
-            } if resource == "keyed bytes for node:Document" && actual > LIMIT
+            } if resource == "keyed entity bytes for node:Document" && actual > LIMIT
         ),
         "oversized update blob must be rejected before payload read, got {error:?}"
     );
@@ -787,9 +793,12 @@ query update_note($note: String) {
         "BlobFile::size must reject the update before BlobFile::read"
     );
     let after = snapshot_main(&db).await.unwrap();
-    assert_eq!(after.version(), before_manifest);
+    assert_eq!(after.graph_manifest_version(), before_manifest);
     assert_eq!(
-        after.entry("node:Document").unwrap().table_version,
+        after
+            .dataset("node:Document")
+            .unwrap()
+            .published_dataset_version,
         before_table
     );
     assert_eq!(
@@ -1138,7 +1147,7 @@ async fn multi_statement_inserts_publish_exactly_once() {
 /// A load with a mid-input edge RI violation must leave Lance HEAD on
 /// the touched node tables untouched (staged loader never commits any
 /// fragment when the load fails). The next load on the same tables
-/// succeeds — no `ExpectedVersionMismatch` from drift.
+/// succeeds — no `PublishedDatasetVersionMismatch` from drift.
 #[tokio::test]
 async fn load_with_bad_edge_reference_unblocks_next_load() {
     let dir = tempfile::tempdir().unwrap();
@@ -1931,7 +1940,7 @@ async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
 
     // Forge the manifest-unreferenced fork directly at the Lance layer.
     let main = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let person_path = &main.entry("node:Person").unwrap().table_path;
+    let person_path = &main.dataset("node:Person").unwrap().dataset_path;
     let person_uri = format!(
         "{}/{}",
         db.uri().trim_end_matches('/'),
@@ -2112,7 +2121,7 @@ query chain($repo: String) {
 /// edges matched**, while the cascade recorded the new version in the manifest
 /// only `if deleted_rows > 0`. So deleting a node with no incident edges advanced
 /// `edge:Knows` Lance HEAD while the manifest stayed behind — a `HEAD > manifest`
-/// drift that then tripped the next strict write's `ExpectedVersionMismatch`, and
+/// drift that then tripped the next strict write's `PublishedDatasetVersionMismatch`, and
 /// `repair` refused (delete-class drift), wedging the graph.
 ///
 /// This pins the invariant directly: after any node delete, every edge table's
@@ -2148,17 +2157,17 @@ async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
     // The invariant: edge:Knows manifest version == its on-disk Lance HEAD.
     let snap = snapshot_main(&db).await.unwrap();
     let entry = snap
-        .entry("edge:Knows")
+        .dataset("edge:Knows")
         .expect("edge:Knows must be in the manifest");
-    let full = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
+    let full = format!("{}/{}", root.trim_end_matches('/'), entry.dataset_path);
     let head = Dataset::open(&full).await.unwrap().version().version;
     assert_eq!(
-        entry.table_version, head,
+        entry.published_dataset_version, head,
         "a node delete matching no edges advanced edge:Knows Lance HEAD to v{head} but the \
          manifest still records v{} — HEAD>manifest drift from a 0-row cascade delete. A staged \
          0-row delete must commit no Lance version at all (MR-A); this drift means that \
          regressed.",
-        entry.table_version,
+        entry.published_dataset_version,
     );
 }
 

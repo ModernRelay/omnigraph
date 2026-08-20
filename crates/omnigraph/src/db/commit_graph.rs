@@ -5,8 +5,8 @@ use crate::error::Result;
 #[derive(Debug, Clone)]
 pub struct GraphCommit {
     pub graph_commit_id: String,
-    pub manifest_branch: Option<String>,
-    pub manifest_version: u64,
+    pub graph_branch: Option<String>,
+    pub graph_manifest_version: u64,
     pub parent_commit_id: Option<String>,
     pub merged_parent_commit_id: Option<String>,
     pub actor_id: Option<String>,
@@ -19,7 +19,7 @@ impl GraphCommit {
     /// persisted first-parent links instead; this key never defines feed order.
     pub fn lineage_key(&self) -> (u64, i64, &str) {
         (
-            self.manifest_version,
+            self.graph_manifest_version,
             self.created_at,
             &self.graph_commit_id,
         )
@@ -102,7 +102,7 @@ impl CommitGraph {
     /// Head selection matches the manifest-sourced load (`should_replace_head`).
     pub fn insert_committed(&mut self, commit: GraphCommit) {
         debug_assert_eq!(
-            commit.manifest_branch.as_deref(),
+            commit.graph_branch.as_deref(),
             self.active_branch.as_deref(),
             "published lineage must target the commit graph's active branch"
         );
@@ -251,7 +251,7 @@ impl CommitGraph {
                         (
                             (
                                 *source_distance + *target_distance,
-                                u64::MAX - commit.manifest_version,
+                                u64::MAX - commit.graph_manifest_version,
                             ),
                             commit.clone(),
                         )
@@ -296,8 +296,8 @@ fn build_commit_cache(
     for row in rows {
         let commit = GraphCommit {
             graph_commit_id: row.graph_commit_id,
-            manifest_branch: row.manifest_branch,
-            manifest_version: row.manifest_version,
+            graph_branch: row.graph_branch,
+            graph_manifest_version: row.graph_manifest_version,
             parent_commit_id: row.parent_commit_id,
             merged_parent_commit_id: row.merged_parent_commit_id,
             actor_id: row.actor_id,

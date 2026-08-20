@@ -126,14 +126,20 @@ async fn historical_alias_binding_keeps_same_name_node_and_edge_identities_disti
         .await
         .unwrap()
         .snapshot();
-    let node_identity = snapshot.entry("node:Link").unwrap().identity;
-    let edge_identity = snapshot.entry("edge:Link").unwrap().identity;
+    let node_identity = snapshot.dataset("node:Link").unwrap().identity;
+    let edge_identity = snapshot.dataset("edge:Link").unwrap().identity;
     assert_ne!(node_identity, edge_identity);
 
     snapshot.bind_catalog_aliases(&catalog).unwrap();
 
-    assert_eq!(snapshot.entry("node:Link").unwrap().identity, node_identity);
-    assert_eq!(snapshot.entry("edge:Link").unwrap().identity, edge_identity);
+    assert_eq!(
+        snapshot.dataset("node:Link").unwrap().identity,
+        node_identity
+    );
+    assert_eq!(
+        snapshot.dataset("edge:Link").unwrap().identity,
+        edge_identity
+    );
 }
 
 #[tokio::test]
@@ -145,16 +151,16 @@ async fn test_init_creates_manifest_and_sub_tables() {
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
 
-    assert!(snap.entry("node:Person").is_some());
-    assert!(snap.entry("node:Company").is_some());
-    assert!(snap.entry("edge:Knows").is_some());
-    assert!(snap.entry("edge:WorksAt").is_some());
+    assert!(snap.dataset("node:Person").is_some());
+    assert!(snap.dataset("node:Company").is_some());
+    assert!(snap.dataset("edge:Knows").is_some());
+    assert!(snap.dataset("edge:WorksAt").is_some());
 
     for key in &["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
-        let entry = snap.entry(key).unwrap();
-        assert_eq!(entry.table_version, 1);
-        assert_eq!(entry.row_count, 0);
-        assert!(entry.table_branch.is_none());
+        let entry = snap.dataset(key).unwrap();
+        assert_eq!(entry.published_dataset_version, 1);
+        assert_eq!(entry.entity_count, 0);
+        assert!(entry.native_dataset_branch.is_none());
     }
 }
 
@@ -202,8 +208,8 @@ async fn test_open_reads_existing_manifest() {
 
     let mc = ManifestCoordinator::open(uri).await.unwrap();
     let snap = mc.snapshot();
-    assert!(snap.entry("node:Person").is_some());
-    assert!(snap.entry("edge:Knows").is_some());
+    assert!(snap.dataset("node:Person").is_some());
+    assert!(snap.dataset("edge:Knows").is_some());
 }
 
 #[tokio::test]
@@ -215,8 +221,8 @@ async fn test_commit_advances_version() {
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let v1 = mc.version();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap();
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let person_entry = snap.dataset("node:Person").unwrap();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
@@ -226,15 +232,15 @@ async fn test_commit_advances_version() {
     let person_version = person_ds.version().version;
 
     let new_version = mc
-        .commit(&[SubTableUpdate {
+        .commit(&[DatasetUpdate {
             identity: person_entry.identity,
-            table_key: "node:Person".to_string(),
-            table_version: person_version,
-            table_branch: None,
-            row_count: 1,
+            type_key: "node:Person".to_string(),
+            published_dataset_version: person_version,
+            native_dataset_branch: None,
+            entity_count: 1,
             version_metadata: table_version_metadata_for_state(
                 uri,
-                &person_entry.table_path,
+                &person_entry.dataset_path,
                 None,
                 person_version,
             )
@@ -247,13 +253,13 @@ async fn test_commit_advances_version() {
     assert!(new_version > v1);
 
     let snap = mc.snapshot();
-    let person = snap.entry("node:Person").unwrap();
-    assert_eq!(person.table_version, person_version);
-    assert_eq!(person.row_count, 1);
+    let person = snap.dataset("node:Person").unwrap();
+    assert_eq!(person.published_dataset_version, person_version);
+    assert_eq!(person.entity_count, 1);
 
-    let company = snap.entry("node:Company").unwrap();
-    assert_eq!(company.table_version, 1);
-    assert_eq!(company.row_count, 0);
+    let company = snap.dataset("node:Company").unwrap();
+    assert_eq!(company.published_dataset_version, 1);
+    assert_eq!(company.entity_count, 0);
 }
 
 #[tokio::test]
@@ -264,7 +270,7 @@ async fn test_drop_and_same_name_readd_uses_new_identity_and_path() {
 
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let before_version = mc.version();
-    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
+    let person_entry = mc.snapshot().dataset("node:Person").unwrap().clone();
 
     let table_key = "node:Person".to_string();
     let identity = TableIdentity::new(10_000, 1).unwrap();
@@ -290,36 +296,36 @@ async fn test_drop_and_same_name_readd_uses_new_identity_and_path() {
             table_key: table_key.clone(),
             table_path: table_path.clone(),
         }),
-        ManifestChange::Update(SubTableUpdate {
+        ManifestChange::Update(DatasetUpdate {
             identity,
-            table_key: table_key.clone(),
-            table_version: state.version,
-            table_branch: None,
-            row_count: state.row_count,
+            type_key: table_key.clone(),
+            published_dataset_version: state.version,
+            native_dataset_branch: None,
+            entity_count: state.row_count,
             version_metadata: state.version_metadata,
         }),
         ManifestChange::Tombstone(TableTombstone {
             identity: person_entry.identity,
             table_key: "node:Person".to_string(),
-            tombstone_version: person_entry.table_version + 1,
+            tombstone_version: person_entry.published_dataset_version + 1,
         }),
     ])
     .await
     .unwrap();
 
     let head = mc.snapshot();
-    let replacement = head.entry("node:Person").unwrap();
+    let replacement = head.dataset("node:Person").unwrap();
     assert_eq!(replacement.identity, identity);
     assert_ne!(replacement.identity, person_entry.identity);
-    assert_ne!(replacement.table_path, person_entry.table_path);
-    assert_eq!(replacement.table_version, 1);
+    assert_ne!(replacement.dataset_path, person_entry.dataset_path);
+    assert_eq!(replacement.published_dataset_version, 1);
 
     let historical = ManifestCoordinator::snapshot_at(uri, None, before_version)
         .await
         .unwrap();
-    let historical_person = historical.entry("node:Person").unwrap();
+    let historical_person = historical.dataset("node:Person").unwrap();
     assert_eq!(historical_person.identity, person_entry.identity);
-    assert_eq!(historical_person.table_path, person_entry.table_path);
+    assert_eq!(historical_person.dataset_path, person_entry.dataset_path);
 }
 
 #[tokio::test]
@@ -329,7 +335,7 @@ async fn metadata_only_rename_preserves_identity_path_and_table_version() {
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let before_manifest_version = mc.version();
-    let before = mc.snapshot().entry("node:Person").unwrap().clone();
+    let before = mc.snapshot().dataset("node:Person").unwrap().clone();
 
     // A rename into another live identity's alias is rejected before the
     // manifest advances.
@@ -338,7 +344,7 @@ async fn metadata_only_rename_preserves_identity_path_and_table_version() {
             identity: before.identity,
             expected_table_key: "node:Person".to_string(),
             table_key: "node:Company".to_string(),
-            table_path: before.table_path.clone(),
+            table_path: before.dataset_path.clone(),
         })])
         .await
         .expect_err("two live table identities cannot share an alias");
@@ -352,24 +358,27 @@ async fn metadata_only_rename_preserves_identity_path_and_table_version() {
         identity: before.identity,
         expected_table_key: "node:Person".to_string(),
         table_key: "node:Human".to_string(),
-        table_path: before.table_path.clone(),
+        table_path: before.dataset_path.clone(),
     })])
     .await
     .unwrap();
 
     let head = mc.snapshot();
-    assert!(head.entry("node:Person").is_none());
-    let renamed = head.entry("node:Human").unwrap();
+    assert!(head.dataset("node:Person").is_none());
+    let renamed = head.dataset("node:Human").unwrap();
     assert_eq!(renamed.identity, before.identity);
-    assert_eq!(renamed.table_path, before.table_path);
-    assert_eq!(renamed.table_version, before.table_version);
-    assert_eq!(renamed.row_count, before.row_count);
+    assert_eq!(renamed.dataset_path, before.dataset_path);
+    assert_eq!(
+        renamed.published_dataset_version,
+        before.published_dataset_version
+    );
+    assert_eq!(renamed.entity_count, before.entity_count);
 
     let stale_binding = HashMap::from([(
         before.identity,
         TableVersionExpectation {
             table_key: "node:Person".to_string(),
-            table_version: before.table_version,
+            table_version: before.published_dataset_version,
         },
     )]);
     let stale_error = mc
@@ -391,11 +400,14 @@ async fn metadata_only_rename_preserves_identity_path_and_table_version() {
     let historical = ManifestCoordinator::snapshot_at(uri, None, before_manifest_version)
         .await
         .unwrap();
-    assert!(historical.entry("node:Human").is_none());
-    let historical_person = historical.entry("node:Person").unwrap();
+    assert!(historical.dataset("node:Human").is_none());
+    let historical_person = historical.dataset("node:Person").unwrap();
     assert_eq!(historical_person.identity, before.identity);
-    assert_eq!(historical_person.table_path, before.table_path);
-    assert_eq!(historical_person.table_version, before.table_version);
+    assert_eq!(historical_person.dataset_path, before.dataset_path);
+    assert_eq!(
+        historical_person.published_dataset_version,
+        before.published_dataset_version
+    );
 }
 
 #[tokio::test]
@@ -406,7 +418,7 @@ async fn test_snapshot_open_sub_table() {
 
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_ds = snap.open("node:Person").await.unwrap();
+    let person_ds = snap.open_dataset("node:Person").await.unwrap();
 
     assert_eq!(person_ds.schema().fields.len(), 3);
     assert_eq!(person_ds.count_rows(None).await.unwrap(), 0);
@@ -430,7 +442,7 @@ async fn snapshot_scanner_strict_rows_survive_byte_target_override() {
     let dataset = Dataset::write(reader, dir.path().to_str().unwrap(), None)
         .await
         .unwrap();
-    let table = SnapshotTable::new(dataset);
+    let table = SnapshotDataset::new(dataset);
     let mut scanner = table.scan();
     scanner.batch_size(BATCH_ROWS);
     scanner.batch_size_bytes(32 * 1024 * 1024);
@@ -460,7 +472,7 @@ async fn test_version_is_manifest_version() {
 
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    assert_eq!(mc.version(), snap.version());
+    assert_eq!(mc.version(), snap.graph_manifest_version());
 }
 
 #[tokio::test]
@@ -488,8 +500,8 @@ async fn test_branch_namespace_lists_and_describes_versions() {
 
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
@@ -498,7 +510,7 @@ async fn test_branch_namespace_lists_and_describes_versions() {
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
     let version_metadata =
-        table_version_metadata_for_state(uri, &person_entry.table_path, None, person_version)
+        table_version_metadata_for_state(uri, &person_entry.dataset_path, None, person_version)
             .await
             .unwrap();
 
@@ -530,10 +542,16 @@ async fn test_branch_namespace_lists_and_describes_versions() {
         .unwrap();
     assert_eq!(described.version.version as u64, person_version);
     assert_eq!(
-        mc.snapshot().entry("node:Person").unwrap().table_version,
+        mc.snapshot()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
         person_version
     );
-    assert_eq!(mc.snapshot().entry("node:Person").unwrap().row_count, 1);
+    assert_eq!(
+        mc.snapshot().dataset("node:Person").unwrap().entity_count,
+        1
+    );
 }
 
 #[tokio::test]
@@ -544,8 +562,8 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
 
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
@@ -594,10 +612,16 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
     let _ = mc.refresh_for_live_read(|_| true).await.unwrap();
     assert_eq!(mc.version(), graph_manifest_version);
     assert_eq!(
-        mc.snapshot().entry("node:Person").unwrap().table_version,
-        person_entry.table_version
+        mc.snapshot()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        person_entry.published_dataset_version
     );
-    assert_eq!(mc.snapshot().entry("node:Person").unwrap().row_count, 0);
+    assert_eq!(
+        mc.snapshot().dataset("node:Person").unwrap().entity_count,
+        0
+    );
 }
 
 #[tokio::test]
@@ -611,12 +635,12 @@ async fn test_snapshot_at_reads_branch_pinned_historical_state() {
     mc.create_branch("feature").await.unwrap();
 
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     person_ds
-        .create_branch("feature", person_entry.table_version, None)
+        .create_branch("feature", person_entry.published_dataset_version, None)
         .await
         .unwrap();
     let mut feature_ds = person_ds.checkout_branch("feature").await.unwrap();
@@ -627,7 +651,7 @@ async fn test_snapshot_at_reads_branch_pinned_historical_state() {
     let feature_version = feature_ds.version().version;
     let feature_metadata = table_version_metadata_for_state(
         uri,
-        &person_entry.table_path,
+        &person_entry.dataset_path,
         Some("feature"),
         feature_version,
     )
@@ -650,12 +674,15 @@ async fn test_snapshot_at_reads_branch_pinned_historical_state() {
         ManifestCoordinator::snapshot_at(uri, Some("feature"), feature_mc.version())
             .await
             .unwrap();
-    let feature_entry = feature_snapshot.entry("node:Person").unwrap();
-    assert_eq!(feature_entry.table_version, feature_version);
-    assert_eq!(feature_entry.table_branch.as_deref(), Some("feature"));
+    let feature_entry = feature_snapshot.dataset("node:Person").unwrap();
+    assert_eq!(feature_entry.published_dataset_version, feature_version);
+    assert_eq!(
+        feature_entry.native_dataset_branch.as_deref(),
+        Some("feature")
+    );
     assert_eq!(
         feature_snapshot
-            .open("node:Person")
+            .open_dataset("node:Person")
             .await
             .unwrap()
             .count_rows(None)
@@ -667,12 +694,15 @@ async fn test_snapshot_at_reads_branch_pinned_historical_state() {
     let main_snapshot = ManifestCoordinator::snapshot_at(uri, None, main_manifest_version)
         .await
         .unwrap();
-    let main_entry = main_snapshot.entry("node:Person").unwrap();
-    assert_eq!(main_entry.table_version, person_entry.table_version);
-    assert_eq!(main_entry.table_branch, None);
+    let main_entry = main_snapshot.dataset("node:Person").unwrap();
+    assert_eq!(
+        main_entry.published_dataset_version,
+        person_entry.published_dataset_version
+    );
+    assert_eq!(main_entry.native_dataset_branch, None);
     assert_eq!(
         main_snapshot
-            .open("node:Person")
+            .open_dataset("node:Person")
             .await
             .unwrap()
             .count_rows(None)
@@ -692,14 +722,14 @@ async fn test_branch_manifest_namespace_uses_entry_owner_branch_for_latest_table
     mc.create_branch("feature").await.unwrap();
 
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let company_entry = snap.entry("node:Company").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let company_entry = snap.dataset("node:Company").unwrap().clone();
 
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     person_ds
-        .create_branch("feature", person_entry.table_version, None)
+        .create_branch("feature", person_entry.published_dataset_version, None)
         .await
         .unwrap();
     let mut feature_person_ds = person_ds.checkout_branch("feature").await.unwrap();
@@ -710,7 +740,7 @@ async fn test_branch_manifest_namespace_uses_entry_owner_branch_for_latest_table
     let feature_person_version = feature_person_ds.version().version;
     let feature_person_metadata = table_version_metadata_for_state(
         uri,
-        &person_entry.table_path,
+        &person_entry.dataset_path,
         Some("feature"),
         feature_person_version,
     )
@@ -804,7 +834,7 @@ async fn test_branch_manifest_namespace_uses_entry_owner_branch_for_latest_table
     .unwrap();
     assert_eq!(branch_owned_person_ds.count_rows(None).await.unwrap(), 1);
     assert_eq!(
-        company_entry.table_branch, None,
+        company_entry.native_dataset_branch, None,
         "sanity check: company table stays inherited on feature"
     );
 }
@@ -817,10 +847,10 @@ async fn test_refresh_observes_external_publish_without_mutating_existing_snapsh
 
     let mut reader = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let frozen_snapshot = reader.snapshot();
-    let person_entry = frozen_snapshot.entry("node:Person").unwrap().clone();
+    let person_entry = frozen_snapshot.dataset("node:Person").unwrap().clone();
     let manifest_version = reader.version();
 
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
@@ -829,7 +859,7 @@ async fn test_refresh_observes_external_publish_without_mutating_existing_snapsh
     person_ds.append(reader_batch, None).await.unwrap();
     let person_version = person_ds.version().version;
     let version_metadata =
-        table_version_metadata_for_state(uri, &person_entry.table_path, None, person_version)
+        table_version_metadata_for_state(uri, &person_entry.dataset_path, None, person_version)
             .await
             .unwrap();
 
@@ -845,12 +875,15 @@ async fn test_refresh_observes_external_publish_without_mutating_existing_snapsh
 
     assert_eq!(reader.version(), manifest_version);
     assert_eq!(
-        frozen_snapshot.entry("node:Person").unwrap().table_version,
-        person_entry.table_version
+        frozen_snapshot
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        person_entry.published_dataset_version
     );
     assert_eq!(
         frozen_snapshot
-            .open("node:Person")
+            .open_dataset("node:Person")
             .await
             .unwrap()
             .count_rows(None)
@@ -864,12 +897,19 @@ async fn test_refresh_observes_external_publish_without_mutating_existing_snapsh
     assert_eq!(
         reader
             .snapshot()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
+            .published_dataset_version,
         person_version
     );
-    assert_eq!(reader.snapshot().entry("node:Person").unwrap().row_count, 1);
+    assert_eq!(
+        reader
+            .snapshot()
+            .dataset("node:Person")
+            .unwrap()
+            .entity_count,
+        1
+    );
 }
 
 #[tokio::test]
@@ -881,10 +921,10 @@ async fn test_batch_create_table_versions_is_atomic_on_conflict() {
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let manifest_version = mc.version();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let company_entry = snap.entry("node:Company").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let company_entry = snap.dataset("node:Company").unwrap().clone();
 
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
@@ -894,14 +934,14 @@ async fn test_batch_create_table_versions_is_atomic_on_conflict() {
     let person_version = person_ds.version().version;
 
     let person_version_metadata =
-        table_version_metadata_for_state(uri, &person_entry.table_path, None, person_version)
+        table_version_metadata_for_state(uri, &person_entry.dataset_path, None, person_version)
             .await
             .unwrap();
     let company_version_metadata = table_version_metadata_for_state(
         uri,
-        &company_entry.table_path,
+        &company_entry.dataset_path,
         None,
-        company_entry.table_version,
+        company_entry.published_dataset_version,
     )
     .await
     .unwrap();
@@ -919,8 +959,8 @@ async fn test_batch_create_table_versions_is_atomic_on_conflict() {
     // `test_batch_create_table_versions_allows_identical_reregistration`.
     let conflicting_company_request = company_version_metadata.to_create_table_version_request(
         "node:Company",
-        company_entry.table_version,
-        company_entry.row_count + 1,
+        company_entry.published_dataset_version,
+        company_entry.entity_count + 1,
         None,
     );
 
@@ -938,13 +978,17 @@ async fn test_batch_create_table_versions_is_atomic_on_conflict() {
     assert_eq!(
         reopened
             .snapshot()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
-        person_entry.table_version
+            .published_dataset_version,
+        person_entry.published_dataset_version
     );
     assert_eq!(
-        reopened.snapshot().entry("node:Person").unwrap().row_count,
+        reopened
+            .snapshot()
+            .dataset("node:Person")
+            .unwrap()
+            .entity_count,
         0
     );
 }
@@ -958,9 +1002,9 @@ async fn test_batch_create_table_versions_rejects_duplicate_requests_without_adv
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let manifest_version = mc.version();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
 
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
@@ -969,7 +1013,7 @@ async fn test_batch_create_table_versions_rejects_duplicate_requests_without_adv
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
     let version_metadata =
-        table_version_metadata_for_state(uri, &person_entry.table_path, None, person_version)
+        table_version_metadata_for_state(uri, &person_entry.dataset_path, None, person_version)
             .await
             .unwrap();
     let request =
@@ -993,13 +1037,17 @@ async fn test_batch_create_table_versions_rejects_duplicate_requests_without_adv
     assert_eq!(
         reopened
             .snapshot()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
-        person_entry.table_version
+            .published_dataset_version,
+        person_entry.published_dataset_version
     );
     assert_eq!(
-        reopened.snapshot().entry("node:Person").unwrap().row_count,
+        reopened
+            .snapshot()
+            .dataset("node:Person")
+            .unwrap()
+            .entity_count,
         0
     );
 }
@@ -1019,20 +1067,20 @@ async fn test_batch_create_table_versions_allows_identical_reregistration() {
 
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
 
     let version_metadata = table_version_metadata_for_state(
         uri,
-        &person_entry.table_path,
+        &person_entry.dataset_path,
         None,
-        person_entry.table_version,
+        person_entry.published_dataset_version,
     )
     .await
     .unwrap();
     let request = version_metadata.to_create_table_version_request(
         "node:Person",
-        person_entry.table_version,
-        person_entry.row_count,
+        person_entry.published_dataset_version,
+        person_entry.entity_count,
         None,
     );
 
@@ -1042,10 +1090,16 @@ async fn test_batch_create_table_versions_allows_identical_reregistration() {
         .expect("re-registering the stored row must not be a conflict");
 
     let reopened = ManifestCoordinator::open(uri).await.unwrap();
-    let entry = reopened.snapshot().entry("node:Person").unwrap().clone();
-    assert_eq!(entry.table_version, person_entry.table_version);
-    assert_eq!(entry.table_branch, person_entry.table_branch);
-    assert_eq!(entry.row_count, person_entry.row_count);
+    let entry = reopened.snapshot().dataset("node:Person").unwrap().clone();
+    assert_eq!(
+        entry.published_dataset_version,
+        person_entry.published_dataset_version
+    );
+    assert_eq!(
+        entry.native_dataset_branch,
+        person_entry.native_dataset_branch
+    );
+    assert_eq!(entry.entity_count, person_entry.entity_count);
 }
 
 /// The widened exemption stays narrow: a row that DIFFERS at an occupied
@@ -1059,21 +1113,21 @@ async fn test_batch_create_table_versions_rejects_differing_row_at_same_version(
 
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
 
     let version_metadata = table_version_metadata_for_state(
         uri,
-        &person_entry.table_path,
+        &person_entry.dataset_path,
         None,
-        person_entry.table_version,
+        person_entry.published_dataset_version,
     )
     .await
     .unwrap();
     // Same identity, same version, same branch — but a different row count.
     let request = version_metadata.to_create_table_version_request(
         "node:Person",
-        person_entry.table_version,
-        person_entry.row_count + 1,
+        person_entry.published_dataset_version,
+        person_entry.entity_count + 1,
         None,
     );
 
@@ -1088,8 +1142,12 @@ async fn test_batch_create_table_versions_rejects_differing_row_at_same_version(
 
     let reopened = ManifestCoordinator::open(uri).await.unwrap();
     assert_eq!(
-        reopened.snapshot().entry("node:Person").unwrap().row_count,
-        person_entry.row_count,
+        reopened
+            .snapshot()
+            .dataset("node:Person")
+            .unwrap()
+            .entity_count,
+        person_entry.entity_count,
     );
 }
 
@@ -1103,12 +1161,12 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
     main_mc.create_branch("feature").await.unwrap();
 
     let snap = main_mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     person_ds
-        .create_branch("feature", person_entry.table_version, None)
+        .create_branch("feature", person_entry.published_dataset_version, None)
         .await
         .unwrap();
     let mut feature_ds = person_ds.checkout_branch("feature").await.unwrap();
@@ -1119,7 +1177,7 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
     let feature_version = feature_ds.version().version;
     let feature_metadata = table_version_metadata_for_state(
         uri,
-        &person_entry.table_path,
+        &person_entry.dataset_path,
         Some("feature"),
         feature_version,
     )
@@ -1146,7 +1204,7 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
         .unwrap();
     let experiment_metadata = table_version_metadata_for_state(
         uri,
-        &person_entry.table_path,
+        &person_entry.dataset_path,
         Some("experiment"),
         feature_version,
     )
@@ -1167,9 +1225,12 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
         .await
         .unwrap();
     let experiment_snapshot = experiment_mc.snapshot();
-    let experiment_entry = experiment_snapshot.entry("node:Person").unwrap();
-    assert_eq!(experiment_entry.table_version, feature_version);
-    assert_eq!(experiment_entry.table_branch.as_deref(), Some("experiment"));
+    let experiment_entry = experiment_snapshot.dataset("node:Person").unwrap();
+    assert_eq!(experiment_entry.published_dataset_version, feature_version);
+    assert_eq!(
+        experiment_entry.native_dataset_branch.as_deref(),
+        Some("experiment")
+    );
 }
 
 /// Regression (PR #307 review — Cursor Bugbot High + Codex P2): the post-publish
@@ -1195,12 +1256,12 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
 
     // Fork Person onto `feature` at version Vf (owner = feature).
     let snap = main_mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     person_ds
-        .create_branch("feature", person_entry.table_version, None)
+        .create_branch("feature", person_entry.published_dataset_version, None)
         .await
         .unwrap();
     let mut feature_ds = person_ds.checkout_branch("feature").await.unwrap();
@@ -1211,7 +1272,7 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
     let feature_version = feature_ds.version().version;
     let feature_metadata = table_version_metadata_for_state(
         uri,
-        &person_entry.table_path,
+        &person_entry.dataset_path,
         Some("feature"),
         feature_version,
     )
@@ -1238,7 +1299,7 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
         .unwrap();
     let experiment_metadata = table_version_metadata_for_state(
         uri,
-        &person_entry.table_path,
+        &person_entry.dataset_path,
         Some("experiment"),
         feature_version,
     )
@@ -1254,19 +1315,19 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
     assert_eq!(
         experiment_mc
             .snapshot()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_branch
+            .native_dataset_branch
             .as_deref(),
         Some("feature"),
     );
     experiment_mc
-        .commit(&[SubTableUpdate {
+        .commit(&[DatasetUpdate {
             identity: person_entry.identity,
-            table_key: "node:Person".to_string(),
-            table_version: feature_version,
-            table_branch: Some("experiment".to_string()),
-            row_count: 1,
+            type_key: "node:Person".to_string(),
+            published_dataset_version: feature_version,
+            native_dataset_branch: Some("experiment".to_string()),
+            entity_count: 1,
             version_metadata: experiment_metadata,
         }])
         .await
@@ -1275,9 +1336,9 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
     // Warm side: the folded known_state the commit adopted.
     let folded_branch = experiment_mc
         .snapshot()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_branch
+        .native_dataset_branch
         .clone();
     // Oracle: a fresh reopen rebuilds known_state via `read_manifest_state`.
     let reopened = ManifestCoordinator::open_at_branch(uri, "experiment")
@@ -1285,9 +1346,9 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
         .unwrap();
     let scanned_branch = reopened
         .snapshot()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
-        .table_branch
+        .native_dataset_branch
         .clone();
 
     assert_eq!(
@@ -1310,9 +1371,9 @@ async fn test_staged_namespace_lists_native_table_versions_before_publish() {
 
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
 
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
@@ -1321,7 +1382,7 @@ async fn test_staged_namespace_lists_native_table_versions_before_publish() {
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
 
-    let namespace = staged_table_namespace(uri, "node:Person", &person_entry.table_path, None);
+    let namespace = staged_table_namespace(uri, "node:Person", &person_entry.dataset_path, None);
     let listed = namespace
         .list_table_versions(ListTableVersionsRequest {
             id: Some(vec!["node:Person".to_string()]),
@@ -1417,8 +1478,8 @@ async fn test_commit_routes_through_injected_batch_publisher() {
 
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
@@ -1427,19 +1488,19 @@ async fn test_commit_routes_through_injected_batch_publisher() {
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
     let version_metadata =
-        table_version_metadata_for_state(uri, &person_entry.table_path, None, person_version)
+        table_version_metadata_for_state(uri, &person_entry.dataset_path, None, person_version)
             .await
             .unwrap();
 
     let recording = RecordingPublisher::new(uri, None);
     mc = mc.with_batch_publisher(Arc::new(recording.clone()));
 
-    mc.commit(&[SubTableUpdate {
+    mc.commit(&[DatasetUpdate {
         identity: person_entry.identity,
-        table_key: "node:Person".to_string(),
-        table_version: person_version,
-        table_branch: None,
-        row_count: 1,
+        type_key: "node:Person".to_string(),
+        published_dataset_version: person_version,
+        native_dataset_branch: None,
+        entity_count: 1,
         version_metadata: version_metadata.clone(),
     }])
     .await
@@ -1472,7 +1533,10 @@ async fn test_commit_routes_through_injected_batch_publisher() {
         Some("1")
     );
     assert_eq!(
-        mc.snapshot().entry("node:Person").unwrap().table_version,
+        mc.snapshot()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
         person_version
     );
 }
@@ -1486,8 +1550,8 @@ async fn test_commit_failure_from_injected_batch_publisher_preserves_visible_sta
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let manifest_version = mc.version();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
@@ -1496,18 +1560,18 @@ async fn test_commit_failure_from_injected_batch_publisher_preserves_visible_sta
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
     let version_metadata =
-        table_version_metadata_for_state(uri, &person_entry.table_path, None, person_version)
+        table_version_metadata_for_state(uri, &person_entry.dataset_path, None, person_version)
             .await
             .unwrap();
 
     mc = mc.with_batch_publisher(Arc::new(FailingPublisher));
     let err = mc
-        .commit(&[SubTableUpdate {
+        .commit(&[DatasetUpdate {
             identity: person_entry.identity,
-            table_key: "node:Person".to_string(),
-            table_version: person_version,
-            table_branch: None,
-            row_count: 1,
+            type_key: "node:Person".to_string(),
+            published_dataset_version: person_version,
+            native_dataset_branch: None,
+            entity_count: 1,
             version_metadata,
         }])
         .await
@@ -1515,31 +1579,37 @@ async fn test_commit_failure_from_injected_batch_publisher_preserves_visible_sta
     assert!(err.to_string().contains("injected batch publisher failure"));
     assert_eq!(mc.version(), manifest_version);
     assert_eq!(
-        mc.snapshot().entry("node:Person").unwrap().table_version,
-        person_entry.table_version
+        mc.snapshot()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        person_entry.published_dataset_version
     );
-    assert_eq!(mc.snapshot().entry("node:Person").unwrap().row_count, 0);
+    assert_eq!(
+        mc.snapshot().dataset("node:Person").unwrap().entity_count,
+        0
+    );
 
     let reopened = ManifestCoordinator::open(uri).await.unwrap();
     assert_eq!(reopened.version(), manifest_version);
     assert_eq!(
         reopened
             .snapshot()
-            .entry("node:Person")
+            .dataset("node:Person")
             .unwrap()
-            .table_version,
-        person_entry.table_version
+            .published_dataset_version,
+        person_entry.published_dataset_version
     );
 }
 
 /// Drive Person to a fresh on-disk dataset version `v` (returns the new
-/// version number) and produce a `SubTableUpdate` ready to publish.
+/// version number) and produce a `DatasetUpdate` ready to publish.
 async fn append_person_and_make_update(
     uri: &str,
-    person_entry: &SubTableEntry,
+    person_entry: &DatasetEntry,
     name: &str,
-) -> SubTableUpdate {
-    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+) -> DatasetUpdate {
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
@@ -1553,15 +1623,15 @@ async fn append_person_and_make_update(
     person_ds.append(reader, None).await.unwrap();
     let new_version = person_ds.version().version;
     let version_metadata =
-        table_version_metadata_for_state(uri, &person_entry.table_path, None, new_version)
+        table_version_metadata_for_state(uri, &person_entry.dataset_path, None, new_version)
             .await
             .unwrap();
-    SubTableUpdate {
+    DatasetUpdate {
         identity: person_entry.identity,
-        table_key: "node:Person".to_string(),
-        table_version: new_version,
-        table_branch: None,
-        row_count: 1,
+        type_key: "node:Person".to_string(),
+        published_dataset_version: new_version,
+        native_dataset_branch: None,
+        entity_count: 1,
         version_metadata,
     }
 }
@@ -1573,8 +1643,8 @@ async fn test_commit_with_expected_accepts_matching_versions() {
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let company_entry = snap.entry("node:Company").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let company_entry = snap.dataset("node:Company").unwrap().clone();
 
     let update = append_person_and_make_update(uri, &person_entry, "Alice").await;
     let mut expected = HashMap::new();
@@ -1600,8 +1670,11 @@ async fn test_commit_with_expected_accepts_matching_versions() {
 
     let after = mc.snapshot();
     assert_eq!(
-        after.entry("node:Person").unwrap().table_version,
-        update.table_version
+        after
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        update.published_dataset_version
     );
 }
 
@@ -1614,11 +1687,11 @@ async fn test_commit_with_expected_rejects_stale_with_typed_details() {
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
 
     // Writer A advances Person.
     let update_a = append_person_and_make_update(uri, &person_entry, "Alice").await;
-    let advanced_version = update_a.table_version;
+    let advanced_version = update_a.published_dataset_version;
     mc.commit(&[update_a]).await.unwrap();
 
     // Writer B then tries to commit, asserting Person is still at v=1.
@@ -1639,16 +1712,19 @@ async fn test_commit_with_expected_rejects_stale_with_typed_details() {
 
     match err {
         OmniError::Manifest(m) => match m.details {
-            Some(ManifestConflictDetails::ExpectedVersionMismatch {
-                table_key,
-                expected,
-                actual,
+            Some(ManifestConflictDetails::PublishedDatasetVersionMismatch {
+                type_key,
+                expected_published_dataset_version,
+                actual_published_dataset_version,
             }) => {
-                assert_eq!(table_key, "node:Person");
-                assert_eq!(expected, 1);
-                assert_eq!(actual, advanced_version);
+                assert_eq!(type_key, "node:Person");
+                assert_eq!(expected_published_dataset_version, 1);
+                assert_eq!(actual_published_dataset_version, advanced_version);
             }
-            other => panic!("expected ExpectedVersionMismatch details, got {:?}", other),
+            other => panic!(
+                "expected PublishedDatasetVersionMismatch details, got {:?}",
+                other
+            ),
         },
         other => panic!("expected OmniError::Manifest, got {:?}", other),
     }
@@ -1663,11 +1739,11 @@ async fn test_commit_with_expected_catches_drift_on_untouched_table() {
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let company_entry = snap.entry("node:Company").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let company_entry = snap.dataset("node:Company").unwrap().clone();
 
     // Writer A advances Company.
-    let mut company_ds = Dataset::open(&format!("{}/{}", uri, company_entry.table_path))
+    let mut company_ds = Dataset::open(&format!("{}/{}", uri, company_entry.dataset_path))
         .await
         .unwrap();
     let company_schema = Arc::new(company_ds.schema().into());
@@ -1676,15 +1752,15 @@ async fn test_commit_with_expected_catches_drift_on_untouched_table() {
     company_ds.append(reader, None).await.unwrap();
     let company_version = company_ds.version().version;
     let company_metadata =
-        table_version_metadata_for_state(uri, &company_entry.table_path, None, company_version)
+        table_version_metadata_for_state(uri, &company_entry.dataset_path, None, company_version)
             .await
             .unwrap();
-    mc.commit(&[SubTableUpdate {
+    mc.commit(&[DatasetUpdate {
         identity: company_entry.identity,
-        table_key: "node:Company".to_string(),
-        table_version: company_version,
-        table_branch: None,
-        row_count: 1,
+        type_key: "node:Company".to_string(),
+        published_dataset_version: company_version,
+        native_dataset_branch: None,
+        entity_count: 1,
         version_metadata: company_metadata,
     }])
     .await
@@ -1710,16 +1786,16 @@ async fn test_commit_with_expected_catches_drift_on_untouched_table() {
         panic!("expected OmniError::Manifest");
     };
     match m.details {
-        Some(ManifestConflictDetails::ExpectedVersionMismatch {
-            ref table_key,
-            expected,
-            actual,
+        Some(ManifestConflictDetails::PublishedDatasetVersionMismatch {
+            ref type_key,
+            expected_published_dataset_version,
+            actual_published_dataset_version,
         }) => {
-            assert_eq!(table_key, "node:Company");
-            assert_eq!(expected, 1);
-            assert_eq!(actual, company_version);
+            assert_eq!(type_key, "node:Company");
+            assert_eq!(expected_published_dataset_version, 1);
+            assert_eq!(actual_published_dataset_version, company_version);
         }
-        other => panic!("expected ExpectedVersionMismatch, got {:?}", other),
+        other => panic!("expected PublishedDatasetVersionMismatch, got {:?}", other),
     }
 }
 
@@ -1749,16 +1825,16 @@ async fn test_commit_with_expected_unknown_table_reports_actual_zero() {
         panic!("expected OmniError::Manifest");
     };
     match m.details {
-        Some(ManifestConflictDetails::ExpectedVersionMismatch {
-            table_key,
-            expected,
-            actual,
+        Some(ManifestConflictDetails::PublishedDatasetVersionMismatch {
+            type_key,
+            expected_published_dataset_version,
+            actual_published_dataset_version,
         }) => {
-            assert_eq!(table_key, "node:DoesNotExist");
-            assert_eq!(expected, 7);
-            assert_eq!(actual, 0);
+            assert_eq!(type_key, "node:DoesNotExist");
+            assert_eq!(expected_published_dataset_version, 7);
+            assert_eq!(actual_published_dataset_version, 0);
         }
-        other => panic!("expected ExpectedVersionMismatch, got {:?}", other),
+        other => panic!("expected PublishedDatasetVersionMismatch, got {:?}", other),
     }
 }
 
@@ -1770,7 +1846,7 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
+    let person_entry = mc.snapshot().dataset("node:Person").unwrap().clone();
 
     // Advance the Person dataset once so we have a real on-disk version 2 that
     // both publishers can target. Both attempt to land the *same*
@@ -1812,7 +1888,7 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
     let OmniError::Manifest(m) = err else {
         panic!("expected OmniError::Manifest, got {:?}", err);
     };
-    // The losing writer surfaces either ExpectedVersionMismatch (its retry's
+    // The losing writer surfaces either PublishedDatasetVersionMismatch (its retry's
     // pre-check observed the winner's advance) or a plain Conflict (Lance
     // row-level CAS rejected, retry exhausted before the pre-check fired).
     // Both are acceptable typed conflict signals; what matters is that the
@@ -1824,22 +1900,22 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
         m.kind,
         m.message,
     );
-    if let Some(ManifestConflictDetails::ExpectedVersionMismatch {
-        ref table_key,
-        expected,
+    if let Some(ManifestConflictDetails::PublishedDatasetVersionMismatch {
+        ref type_key,
+        expected_published_dataset_version,
         ..
     }) = m.details
     {
-        assert_eq!(table_key, "node:Person");
-        assert_eq!(expected, 1);
+        assert_eq!(type_key, "node:Person");
+        assert_eq!(expected_published_dataset_version, 1);
     }
 
     // Manifest must reflect exactly one new commit on Person at the requested
     // version (no duplicate version rows).
     let mc = ManifestCoordinator::open(uri).await.unwrap();
-    let entry = mc.snapshot().entry("node:Person").unwrap().clone();
+    let entry = mc.snapshot().dataset("node:Person").unwrap().clone();
     assert!(
-        entry.table_version > 1,
+        entry.published_dataset_version > 1,
         "Person should have advanced past v=1"
     );
 }
@@ -1981,7 +2057,7 @@ async fn test_publish_rejects_manifest_stamped_at_future_version() {
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
+    let person_entry = mc.snapshot().dataset("node:Person").unwrap().clone();
 
     // Stamp the manifest at a version higher than this binary knows about.
     let future = super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION + 99;
@@ -2145,7 +2221,7 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     load_jsonl(&db_old, seed, LoadMode::Overwrite)
         .await
         .unwrap();
-    let exported = db_old.export_jsonl("main", &[], &[]).await.unwrap();
+    let exported = db_old.export_jsonl("main", &[]).await.unwrap();
     assert!(
         exported.contains("alice") && exported.contains("bob"),
         "export must carry the loaded rows",
@@ -2183,7 +2259,7 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
         .unwrap();
 
     // The rebuilt graph preserves the data and is at CURRENT (opens without refusal).
-    let rebuilt = db_new.export_jsonl("main", &[], &[]).await.unwrap();
+    let rebuilt = db_new.export_jsonl("main", &[]).await.unwrap();
     assert!(
         rebuilt.contains("alice") && rebuilt.contains("bob"),
         "the rebuilt graph must preserve every node",
@@ -2392,17 +2468,17 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
 }
 
 /// Append one row to a two-column NODE table (`id`, `name`) and return the
-/// resulting `SubTableUpdate` at the new on-disk version. Generalizes
+/// resulting `DatasetUpdate` at the new on-disk version. Generalizes
 /// `append_person_and_make_update` to any node table whose schema is `(id:
 /// String, name: String[, ...])`; the extra `Person.age` column is filled null
 /// when present so the same helper drives both `node:Person` and `node:Company`.
 async fn append_node_row_and_make_update(
     uri: &str,
-    entry: &SubTableEntry,
+    entry: &DatasetEntry,
     id: &str,
     name: &str,
-) -> SubTableUpdate {
-    let mut ds = Dataset::open(&format!("{}/{}", uri, entry.table_path))
+) -> DatasetUpdate {
+    let mut ds = Dataset::open(&format!("{}/{}", uri, entry.dataset_path))
         .await
         .unwrap();
     let schema = Arc::new(ds.schema().into());
@@ -2423,15 +2499,15 @@ async fn append_node_row_and_make_update(
     ds.append(reader, None).await.unwrap();
     let new_version = ds.version().version;
     let version_metadata =
-        table_version_metadata_for_state(uri, &entry.table_path, None, new_version)
+        table_version_metadata_for_state(uri, &entry.dataset_path, None, new_version)
             .await
             .unwrap();
-    SubTableUpdate {
+    DatasetUpdate {
         identity: entry.identity,
-        table_key: entry.table_key.clone(),
-        table_version: new_version,
-        table_branch: None,
-        row_count: 1,
+        type_key: entry.type_key.clone(),
+        published_dataset_version: new_version,
+        native_dataset_branch: None,
+        entity_count: 1,
         version_metadata,
     }
 }
@@ -2520,8 +2596,8 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
     let catalog = build_test_catalog();
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let company_entry = snap.entry("node:Company").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let company_entry = snap.dataset("node:Company").unwrap().clone();
 
     // Two DISJOINT table-version rows (`node:Person@v=2`, `node:Company@v=2`):
     // distinct `object_id`s, so neither hits the table-version CAS. The ONLY
@@ -2582,8 +2658,20 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
     // Both committed table writes are visible (Person and Company advanced).
     let reopened = ManifestCoordinator::open(uri).await.unwrap();
     let after = reopened.snapshot();
-    assert_eq!(after.entry("node:Person").unwrap().table_version, 2);
-    assert_eq!(after.entry("node:Company").unwrap().table_version, 2);
+    assert_eq!(
+        after
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        2
+    );
+    assert_eq!(
+        after
+            .dataset("node:Company")
+            .unwrap()
+            .published_dataset_version,
+        2
+    );
 }
 
 /// Test C (S3 variant, bucket-gated): the same two-disjoint-writers +
@@ -2611,8 +2699,8 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
     let catalog = build_test_catalog();
     let mc = ManifestCoordinator::init(&uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let company_entry = snap.entry("node:Company").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let company_entry = snap.dataset("node:Company").unwrap().clone();
 
     let update_a = append_node_row_and_make_update(&uri, &person_entry, "p1", "Alice").await;
     let update_b = append_node_row_and_make_update(&uri, &company_entry, "c1", "Acme").await;
@@ -2677,15 +2765,15 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
     let catalog = build_test_catalog();
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
-    let person_entry = snap.entry("node:Person").unwrap().clone();
-    let company_entry = snap.entry("node:Company").unwrap().clone();
+    let person_entry = snap.dataset("node:Person").unwrap().clone();
+    let company_entry = snap.dataset("node:Company").unwrap().clone();
 
     // Synthesize N=8 DISJOINT table-version updates by sequentially advancing the
     // two node tables four versions each (Person@v2..v5, Company@v2..v5). Each
     // update is a distinct `object_id`, so the writers never collide on a
     // table-version row — only on the shared `graph_head:main`. Built serially
     // here (before the concurrent phase) so the on-disk versions exist.
-    let mut updates: Vec<SubTableUpdate> = Vec::with_capacity(N);
+    let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(N);
     for i in 0..(N / 2) {
         updates.push(
             append_node_row_and_make_update(uri, &person_entry, &format!("p{i}"), &format!("P{i}"))

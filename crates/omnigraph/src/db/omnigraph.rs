@@ -42,9 +42,9 @@ mod table_ops;
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub(crate) use export::{export_blob_values, logical_row_image};
-pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
+pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
 pub use repair::{
-    RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
+    DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
 pub use table_ops::PendingIndex;
@@ -77,7 +77,7 @@ pub enum MergeOutcome {
 pub struct SchemaApplyResult {
     pub supported: bool,
     pub applied: bool,
-    pub manifest_version: u64,
+    pub graph_manifest_version: u64,
     pub steps: Vec<SchemaMigrationStep>,
 }
 
@@ -1639,10 +1639,10 @@ impl Omnigraph {
             .map(|resolved| resolved.snapshot)
     }
 
-    pub async fn version_of(&self, target: impl Into<ReadTarget>) -> Result<u64> {
+    pub async fn graph_manifest_version_of(&self, target: impl Into<ReadTarget>) -> Result<u64> {
         self.snapshot_of(target)
             .await
-            .map(|snapshot| snapshot.version())
+            .map(|snapshot| snapshot.graph_manifest_version())
     }
 
     /// The on-disk internal-schema version of `target`'s branch (the storage-format
@@ -1842,16 +1842,24 @@ impl Omnigraph {
                     .any(|branch| branch.filter(|name| *name != "main") == intent.branch.as_deref())
         });
         if let Some(intent) = blocking {
-            let table_scope = if intent.table_keys.is_empty() {
-                "no table pins".to_string()
+            let dataset_scope = if intent.table_keys.is_empty() {
+                "no dataset pins".to_string()
             } else {
-                format!("tables {}", intent.table_keys.join(", "))
+                format!(
+                    "datasets {}",
+                    intent
+                        .table_keys
+                        .iter()
+                        .map(|type_key| crate::error::dataset_subject(type_key))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             };
             return Err(OmniError::recovery_required(
                 intent.operation_id.clone(),
                 format!(
                     "pending {:?} recovery operation on branch '{}' blocks the synchronous \
-                     write/control recovery barrier ({table_scope}); reopen the graph \
+                     write/control recovery barrier ({dataset_scope}); reopen the graph \
                      read-write before retrying",
                     intent.writer_kind,
                     intent.branch.as_deref().unwrap_or("main"),
@@ -2296,7 +2304,8 @@ impl Omnigraph {
         .await
     }
 
-    /// Diff two graph commits. Resolves each commit to `(manifest_branch, manifest_version)`
+    /// Diff two graph commits. Resolves each commit to
+    /// `(graph_branch, graph_manifest_version)`
     /// and creates branch-aware snapshots. Supports cross-branch comparison.
     pub async fn diff_commits(
         &self,
@@ -2354,7 +2363,7 @@ impl Omnigraph {
     ) -> Result<crate::changes::CommitChangesPage> {
         use crate::changes::token;
 
-        let max_changes = max_changes.unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_ROWS);
+        let max_changes = max_changes.unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_CHANGES);
         let max_bytes = max_bytes.unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_BYTES);
         crate::changes::enumerate::validate_change_page_limits(max_changes, max_bytes)?;
 
@@ -2560,51 +2569,47 @@ impl Omnigraph {
     pub async fn entity_at_target(
         &self,
         target: impl Into<ReadTarget>,
-        table_key: &str,
+        type_key: &str,
         id: &str,
     ) -> Result<Option<serde_json::Value>> {
-        export::entity_at_target(self, target, table_key, id).await
+        export::entity_at_target(self, target, type_key, id).await
     }
 
-    /// Read one entity at a specific graph-manifest version via time travel
-    /// (on-demand enrichment). `table_key` is the retained compatibility
-    /// selector for its node or edge type.
+    /// Read one entity of `type_key` at a specific graph-manifest version via
+    /// time travel (on-demand enrichment).
     pub async fn entity_at(
         &self,
-        table_key: &str,
+        type_key: &str,
         id: &str,
-        version: u64,
+        graph_manifest_version: u64,
     ) -> Result<Option<serde_json::Value>> {
-        export::entity_at(self, table_key, id, version).await
+        export::entity_at(self, type_key, id, graph_manifest_version).await
     }
 
     /// Create a Snapshot at any historical graph-manifest version.
-    pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
+    pub async fn snapshot_at_graph_manifest_version(
+        &self,
+        graph_manifest_version: u64,
+    ) -> Result<Snapshot> {
         self.ensure_schema_state_valid().await?;
         self.coordinator
             .read()
             .await
-            .snapshot_at_version(version)
+            .snapshot_at_graph_manifest_version(graph_manifest_version)
             .await
     }
 
-    pub async fn export_jsonl(
-        &self,
-        branch: &str,
-        type_names: &[String],
-        table_keys: &[String],
-    ) -> Result<String> {
-        export::export_jsonl(self, branch, type_names, table_keys).await
+    pub async fn export_jsonl(&self, branch: &str, type_names: &[String]) -> Result<String> {
+        export::export_jsonl(self, branch, type_names).await
     }
 
     pub async fn export_jsonl_to_writer<W: Write>(
         &self,
         branch: &str,
         type_names: &[String],
-        table_keys: &[String],
         writer: &mut W,
     ) -> Result<()> {
-        export::export_jsonl_to_writer(self, branch, type_names, table_keys, writer).await
+        export::export_jsonl_to_writer(self, branch, type_names, writer).await
     }
 
     /// The change-feed baseline handshake: stream one exact data-only entity
@@ -2668,13 +2673,13 @@ impl Omnigraph {
     pub async fn failpoint_publish_table_head_without_index_rebuild_for_test(
         &mut self,
         branch: &str,
-        table_key: &str,
+        type_key: &str,
         table_branch: Option<&str>,
     ) -> Result<u64> {
         table_ops::failpoint_publish_table_head_without_index_rebuild_for_test(
             self,
             branch,
-            table_key,
+            type_key,
             table_branch,
         )
         .await
@@ -2682,15 +2687,15 @@ impl Omnigraph {
 
     /// Compact small Lance fragments into fewer larger ones across every
     /// backing dataset for a node or edge type on `main`. See [`optimize`] for details.
-    pub async fn optimize(&self) -> Result<Vec<optimize::TableOptimizeStats>> {
-        optimize::optimize_all_tables(self).await
+    pub async fn optimize(&self) -> Result<Vec<optimize::DatasetOptimizeStats>> {
+        optimize::optimize_all_datasets(self).await
     }
 
     /// Classify and explicitly repair uncovered graph-manifest/Lance-HEAD drift. See
     /// [`repair`] for the distinction between safe maintenance drift and
     /// suspicious/unverifiable drift.
     pub async fn repair(&self, options: repair::RepairOptions) -> Result<repair::RepairStats> {
-        repair::repair_all_tables(self, options).await
+        repair::repair_all_datasets(self, options).await
     }
 
     /// Remove Lance manifests (and the fragments they uniquely own) per the
@@ -2699,8 +2704,8 @@ impl Omnigraph {
     pub async fn cleanup(
         &mut self,
         options: optimize::CleanupPolicyOptions,
-    ) -> Result<Vec<optimize::TableCleanupStats>> {
-        optimize::cleanup_all_tables(self, options).await
+    ) -> Result<Vec<optimize::DatasetCleanupStats>> {
+        optimize::cleanup_all_datasets(self, options).await
     }
 
     pub(crate) async fn active_branch(&self) -> Option<String> {
@@ -2723,7 +2728,7 @@ impl Omnigraph {
         Ok(
             coord.branch_identifier().await? == txn.authority.branch_identifier
                 && coord.exact_graph_head() == txn.authority.graph_head
-                && coord.version() == txn.base.version(),
+                && coord.version() == txn.base.graph_manifest_version(),
         )
     }
 
@@ -2733,7 +2738,7 @@ impl Omnigraph {
     /// but do not all acquire the coarse schema/branch gates yet. A native branch
     /// operation or version-GC barrier therefore takes every catalog table key on
     /// each graph branch it can affect before its final sidecar recheck. This is
-    /// intentionally broader than mutation/load's exact touched-table set.
+    /// intentionally broader than mutation/load's exact touched-dataset set.
     pub(crate) fn table_queue_keys_for_branches(
         &self,
         branches: &[Option<String>],
@@ -2891,9 +2896,9 @@ impl Omnigraph {
 
         let branch_snapshot = target.snapshot();
         let owned_tables = branch_snapshot
-            .entries()
-            .filter(|entry| entry.table_branch.as_deref() == Some(branch))
-            .map(|entry| (entry.table_key.clone(), entry.table_path.clone()))
+            .datasets()
+            .filter(|entry| entry.native_dataset_branch.as_deref() == Some(branch))
+            .map(|entry| (entry.type_key.clone(), entry.dataset_path.clone()))
             .collect::<Vec<_>>();
         let expected_identifier = target.branch_identifier().await?;
 
@@ -3313,7 +3318,7 @@ impl Omnigraph {
     #[cfg(test)]
     pub(crate) async fn commit_updates(
         &mut self,
-        updates: &[crate::db::SubTableUpdate],
+        updates: &[crate::db::DatasetUpdate],
     ) -> Result<u64> {
         table_ops::commit_updates(self, updates).await
     }
@@ -3321,7 +3326,7 @@ impl Omnigraph {
     pub(crate) async fn commit_updates_on_branch_with_expected(
         &self,
         branch: Option<&str>,
-        updates: &[crate::db::SubTableUpdate],
+        updates: &[crate::db::DatasetUpdate],
         expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
         actor_id: Option<&str>,
         txn: &crate::db::WriteTxn,
@@ -4641,7 +4646,7 @@ edge WorksAt: Person -> Company
     async fn seed_person_row(db: &mut Omnigraph, name: &str, age: Option<i32>) {
         // No-txn entry, so the handle is always `Some` (collapse #1's skip is
         // gated on `txn.is_some()`).
-        let identity = db.snapshot().await.entry("node:Person").unwrap().identity;
+        let identity = db.snapshot().await.dataset("node:Person").unwrap().identity;
         let (ds, full_path, table_branch) = db
             .open_for_mutation("node:Person", crate::db::MutationOpKind::Insert)
             .await
@@ -4666,12 +4671,12 @@ edge WorksAt: Person -> Company
             .table_state(&full_path, &committed)
             .await
             .unwrap();
-        db.commit_updates(&[crate::db::SubTableUpdate {
+        db.commit_updates(&[crate::db::DatasetUpdate {
             identity,
-            table_key: "node:Person".to_string(),
-            table_version: state.version,
-            table_branch,
-            row_count: state.row_count,
+            type_key: "node:Person".to_string(),
+            published_dataset_version: state.version,
+            native_dataset_branch: table_branch,
+            entity_count: state.row_count,
             version_metadata: state.version_metadata,
         }])
         .await
@@ -4732,7 +4737,7 @@ edge WorksAt: Person -> Company
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
         seed_person_row(&mut db, "Alice", Some(30)).await;
-        let before_version = db.snapshot().await.version();
+        let before_version = db.snapshot().await.graph_manifest_version();
 
         let desired = TEST_SCHEMA
             .replace("node Person {\n", "node Human @rename_from(\"Person\") {\n")
@@ -4744,13 +4749,13 @@ edge WorksAt: Person -> Company
         db.apply_schema(&desired).await.unwrap();
 
         let head = db.snapshot().await;
-        assert!(head.entry("node:Person").is_none());
-        assert!(head.entry("node:Human").is_some());
+        assert!(head.dataset("node:Person").is_none());
+        assert!(head.dataset("node:Human").is_some());
         let historical = ManifestCoordinator::snapshot_at(uri, None, before_version)
             .await
             .unwrap();
-        assert!(historical.entry("node:Person").is_some());
-        assert!(historical.entry("node:Human").is_none());
+        assert!(historical.dataset("node:Person").is_some());
+        assert!(historical.dataset("node:Human").is_none());
     }
 
     #[tokio::test]

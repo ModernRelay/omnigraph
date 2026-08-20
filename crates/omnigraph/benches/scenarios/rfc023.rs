@@ -31,7 +31,7 @@ use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, SnapshotTable};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, SnapshotDataset};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use sha2::{Digest as _, Sha256};
@@ -603,7 +603,7 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
         .await
         .expect("capture prepared main setup snapshot");
     let main_table = main_snapshot
-        .open("node:Chunk")
+        .open_dataset("node:Chunk")
         .await
         .expect("open prepared main setup table");
     let setup_main_rows = main_table
@@ -611,14 +611,14 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
         .await
         .expect("count prepared main setup rows");
     assert_eq!(setup_main_rows, args.rows, "prepared main row-count drift");
-    let setup_main_table_version = main_table.version();
+    let setup_main_dataset_version = main_table.published_dataset_version();
 
     let source_snapshot = db
         .snapshot_of(ReadTarget::branch("adopt-source"))
         .await
         .expect("capture prepared source setup snapshot");
     let source_table = source_snapshot
-        .open("node:Chunk")
+        .open_dataset("node:Chunk")
         .await
         .expect("open prepared source setup table");
     let setup_source_rows = source_table
@@ -630,7 +630,7 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
         args.rows * 2,
         "prepared source branch must contain inherited main plus the all-new delta"
     );
-    let setup_source_table_version = source_table.version();
+    let setup_source_dataset_version = source_table.published_dataset_version();
     let physical_main = DatasetBuilder::from_uri(&table_uri)
         .load()
         .await
@@ -660,9 +660,9 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
         args.rows,
         args.dims,
         args.seed,
-        setup_main_table_version,
+        setup_main_dataset_version,
         setup_main_rows,
-        setup_source_table_version,
+        setup_source_dataset_version,
         setup_source_rows,
     );
 
@@ -682,8 +682,8 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
         "setup_fingerprint": setup_fingerprint,
         "setup_main_rows": setup_main_rows,
         "setup_source_rows": setup_source_rows,
-        "setup_main_table_version": setup_main_table_version,
-        "setup_source_table_version": setup_source_table_version,
+        "setup_main_dataset_version": setup_main_dataset_version,
+        "setup_source_dataset_version": setup_source_dataset_version,
         "init_ms": init_ms,
         "target_load_ms": target_load_ms,
         "branch_create_ms": branch_create_ms,
@@ -1031,7 +1031,7 @@ fn verify_fixture_vector(
 /// contract without retaining payloads.
 enum VerificationTable<'a> {
     Physical(&'a Dataset),
-    Snapshot(&'a SnapshotTable),
+    Snapshot(&'a SnapshotDataset),
 }
 
 async fn verify_id_content(
@@ -1294,20 +1294,20 @@ pub(super) async fn fenced_adopt_verify(args: &Args) -> serde_json::Value {
         .await
         .expect("capture graph-visible main after measured operation");
     let manifest_main = main_snapshot
-        .open("node:Chunk")
+        .open_dataset("node:Chunk")
         .await
         .expect("open graph-visible main after measured operation");
-    let manifest_main_version = manifest_main.version();
+    let published_main_dataset_version = manifest_main.published_dataset_version();
 
     let source_snapshot = db
         .snapshot_of(ReadTarget::branch("adopt-source"))
         .await
         .expect("capture graph-visible source after measured operation");
     let manifest_source = source_snapshot
-        .open("node:Chunk")
+        .open_dataset("node:Chunk")
         .await
         .expect("open graph-visible source after measured operation");
-    let manifest_source_version = manifest_source.version();
+    let published_source_dataset_version = manifest_source.published_dataset_version();
 
     let physical_main = DatasetBuilder::from_uri(&table_uri)
         .load()
@@ -1405,8 +1405,8 @@ pub(super) async fn fenced_adopt_verify(args: &Args) -> serde_json::Value {
         "manifest_visible_final_rows": manifest_visible_final_rows,
         "manifest_source_final_rows": manifest_source_rows,
         "physical_source_final_rows": physical_source_rows,
-        "verify_main_table_version": manifest_main_version,
-        "verify_source_table_version": manifest_source_version,
+        "verify_main_dataset_version": published_main_dataset_version,
+        "verify_source_dataset_version": published_source_dataset_version,
         "physical_main_content": physical_main_content,
         "physical_source_content": physical_source_content,
         "manifest_main_content": manifest_main_content,
@@ -1577,7 +1577,7 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         .await
         .expect("capture prepared main snapshot");
     let main_table = main_snapshot
-        .open("node:Chunk")
+        .open_dataset("node:Chunk")
         .await
         .expect("open prepared main table");
     let setup_main_rows = main_table
@@ -1588,14 +1588,14 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         setup_main_rows, args.rows,
         "upsert-only divergence must not change the main row count"
     );
-    let setup_main_table_version = main_table.version();
+    let setup_main_dataset_version = main_table.published_dataset_version();
 
     let source_snapshot = db
         .snapshot_of(ReadTarget::branch(GENERAL_MERGE_SOURCE_BRANCH))
         .await
         .expect("capture prepared source snapshot");
     let source_table = source_snapshot
-        .open("node:Chunk")
+        .open_dataset("node:Chunk")
         .await
         .expect("open prepared source table");
     let setup_source_rows = source_table
@@ -1606,7 +1606,7 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         setup_source_rows, expected_source_rows,
         "prepared source branch row count drift"
     );
-    let setup_source_table_version = source_table.version();
+    let setup_source_dataset_version = source_table.published_dataset_version();
     let setup_verify_ms = verify_start.elapsed().as_millis() as u64;
 
     let setup_fingerprint = format!(
@@ -1618,9 +1618,9 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         GENERAL_MERGE_TARGET_DELTA_ROWS,
         args.dims,
         args.seed,
-        setup_main_table_version,
+        setup_main_dataset_version,
         setup_main_rows,
-        setup_source_table_version,
+        setup_source_dataset_version,
         setup_source_rows,
     );
 
@@ -1635,8 +1635,8 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         "setup_fingerprint": setup_fingerprint,
         "setup_main_rows": setup_main_rows,
         "setup_source_rows": setup_source_rows,
-        "setup_main_table_version": setup_main_table_version,
-        "setup_source_table_version": setup_source_table_version,
+        "setup_main_dataset_version": setup_main_dataset_version,
+        "setup_source_dataset_version": setup_source_dataset_version,
         "fixture_batch_rows": batch_rows,
         "max_target_json_chunk_bytes": max_target_json_chunk_bytes,
         "max_source_json_chunk_bytes": max_source_json_chunk_bytes,
@@ -1743,7 +1743,7 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
 /// scanner. The limit of two makes duplicate IDs fail visibly without an
 /// unbounded verification read.
 async fn verify_fixture_row(
-    table: &SnapshotTable,
+    table: &SnapshotDataset,
     prefix: &str,
     ordinal: usize,
     dims: usize,
@@ -1841,7 +1841,7 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
         .await
         .expect("capture merged main snapshot");
     let table = snapshot
-        .open("node:Chunk")
+        .open_dataset("node:Chunk")
         .await
         .expect("open merged main table");
     let final_rows = table
@@ -1877,7 +1877,7 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
     serde_json::json!({
         "verify_wall_ms": verify_wall_ms,
         "final_rows": final_rows,
-        "verify_main_table_version": table.version(),
+        "verify_main_dataset_version": table.published_dataset_version(),
         "source_delta_row": source_delta_row,
         "target_delta_row": target_delta_row,
     })

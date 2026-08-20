@@ -12,9 +12,9 @@ use crate::storage::{StorageAdapter, normalize_root_uri};
 use super::commit_graph::{CommitGraph, FirstParentEdge, GraphCommit};
 use super::is_internal_system_branch;
 use super::manifest::{
-    CapturedManifestProbe, ExpectedTableVersions, GenesisManifestAttempt, LineageIntent,
-    ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
-    PublishPrecondition, Snapshot, SubTableUpdate,
+    CapturedManifestProbe, DatasetUpdate, ExpectedTableVersions, GenesisManifestAttempt,
+    LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
+    PublishPrecondition, Snapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -111,7 +111,7 @@ fn classify_commit_range(from: GraphCommit, to: GraphCommit) -> ResolvedCommitRa
 
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedSnapshot {
-    pub manifest_version: u64,
+    pub graph_manifest_version: u64,
     pub _snapshot_id: SnapshotId,
     pub commit: GraphCommit,
 }
@@ -407,8 +407,16 @@ impl GraphCoordinator {
             .await
     }
 
-    pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
-        ManifestCoordinator::snapshot_at(self.root_uri(), self.current_branch(), version).await
+    pub async fn snapshot_at_graph_manifest_version(
+        &self,
+        graph_manifest_version: u64,
+    ) -> Result<Snapshot> {
+        ManifestCoordinator::snapshot_at(
+            self.root_uri(),
+            self.current_branch(),
+            graph_manifest_version,
+        )
+        .await
     }
 
     pub async fn resolve_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
@@ -488,8 +496,8 @@ impl GraphCoordinator {
                 let commit = self.resolve_commit(snapshot_id).await?;
                 let snapshot = ManifestCoordinator::snapshot_at(
                     self.root_uri(),
-                    commit.manifest_branch.as_deref(),
-                    commit.manifest_version,
+                    commit.graph_branch.as_deref(),
+                    commit.graph_manifest_version,
                 )
                 .await?;
                 // The reopen above is keyed only by (manifest branch, numeric
@@ -504,7 +512,7 @@ impl GraphCoordinator {
                 // commit_snapshot performs); fail closed otherwise. Main
                 // cannot undergo branch-name ABA, but the check is structural
                 // and harmless there.
-                if snapshot.graph_head(commit.manifest_branch.as_deref())
+                if snapshot.graph_head(commit.graph_branch.as_deref())
                     != Some(commit.graph_commit_id.as_str())
                 {
                     return Err(OmniError::manifest(format!(
@@ -516,7 +524,7 @@ impl GraphCoordinator {
                 }
                 Ok(ResolvedTarget {
                     requested: target.clone(),
-                    branch: commit.manifest_branch.clone(),
+                    branch: commit.graph_branch.clone(),
                     snapshot_id: snapshot_id.clone(),
                     graph_commit_id: Some(commit.graph_commit_id),
                     snapshot,
@@ -668,7 +676,7 @@ impl GraphCoordinator {
     #[cfg(test)]
     pub(crate) async fn commit_updates_with_actor(
         &mut self,
-        updates: &[SubTableUpdate],
+        updates: &[DatasetUpdate],
         actor_id: Option<&str>,
     ) -> Result<PublishedSnapshot> {
         self.commit_updates_with_actor_with_expected(
@@ -684,10 +692,10 @@ impl GraphCoordinator {
     /// each immutable table identity matches what the caller observed before
     /// writing; the diagnostic alias is checked as part of the expectation.
     /// Mismatches surface as `OmniError::Manifest` with
-    /// `ManifestConflictDetails::ExpectedVersionMismatch`.
+    /// `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
     pub(crate) async fn commit_updates_with_actor_with_expected(
         &mut self,
-        updates: &[SubTableUpdate],
+        updates: &[DatasetUpdate],
         expected_table_versions: &ExpectedTableVersions,
         actor_id: Option<&str>,
     ) -> Result<PublishedSnapshot> {
@@ -743,7 +751,7 @@ impl GraphCoordinator {
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         let commit = self.apply_lineage_to_cache(intent, &outcome);
         Ok(PublishedSnapshot {
-            manifest_version: outcome.version,
+            graph_manifest_version: outcome.version,
             _snapshot_id: SnapshotId::new(commit.graph_commit_id.clone()),
             commit,
         })
@@ -779,8 +787,8 @@ impl GraphCoordinator {
     ) -> GraphCommit {
         let commit = GraphCommit {
             graph_commit_id: intent.graph_commit_id.clone(),
-            manifest_branch: intent.branch,
-            manifest_version: outcome.version,
+            graph_branch: intent.branch,
+            graph_manifest_version: outcome.version,
             parent_commit_id: outcome.parent_commit_id.clone(),
             merged_parent_commit_id: intent.merged_parent_commit_id,
             actor_id: intent.actor_id,
@@ -802,8 +810,8 @@ impl GraphCoordinator {
     }
 }
 
-/// Wrap each `SubTableUpdate` as a `ManifestChange::Update` for the publisher.
-fn updates_to_changes(updates: &[SubTableUpdate]) -> Vec<ManifestChange> {
+/// Wrap each `DatasetUpdate` as a `ManifestChange::Update` for the publisher.
+fn updates_to_changes(updates: &[DatasetUpdate]) -> Vec<ManifestChange> {
     updates
         .iter()
         .cloned()
@@ -835,8 +843,8 @@ mod tests {
     ) -> GraphCommit {
         GraphCommit {
             graph_commit_id: id.to_string(),
-            manifest_branch: None,
-            manifest_version: 1,
+            graph_branch: None,
+            graph_manifest_version: 1,
             parent_commit_id: parent_commit_id.map(str::to_string),
             merged_parent_commit_id: merged_parent_commit_id.map(str::to_string),
             actor_id: None,

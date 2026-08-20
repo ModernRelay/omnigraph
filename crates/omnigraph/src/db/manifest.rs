@@ -67,7 +67,7 @@ pub(crate) use recovery::{
     new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_manifest_drift,
     schema_apply_serial_queue_key, write_sidecar,
 };
-pub use state::SubTableEntry;
+pub use state::DatasetEntry;
 #[cfg(test)]
 use state::string_column;
 pub(crate) use state::{GraphLineageRow, read_graph_lineage};
@@ -152,7 +152,7 @@ pub(crate) async fn refuse_if_internal_schema_unsupported(root_uri: &str) -> Res
 pub struct Snapshot {
     root_uri: String,
     version: u64,
-    entries: HashMap<String, SubTableEntry>,
+    entries: HashMap<String, DatasetEntry>,
     /// Exact materialized `graph_head:<branch>` commit ids from this SAME
     /// pinned manifest version (see `ManifestState::graph_heads`). Carried so
     /// a read can report the commit id of the world it was served from —
@@ -171,14 +171,14 @@ pub struct Snapshot {
 ///
 /// The underlying Lance [`Dataset`] is deliberately private: a snapshot dataset
 /// can scan rows and inspect read metadata, but it cannot reach Lance's
-/// mutating APIs or advance a table HEAD outside OmniGraph's coordinated write
+/// mutating APIs or advance a dataset HEAD outside OmniGraph's coordinated write
 /// path.
 #[derive(Debug, Clone)]
-pub struct SnapshotTable {
+pub struct SnapshotDataset {
     dataset: Dataset,
 }
 
-/// Read-only scan builder for a [`SnapshotTable`].
+/// Read-only scan builder for a [`SnapshotDataset`].
 ///
 /// This forwards scan configuration and execution, but not Lance's raw
 /// [`Scanner`] or physical-plan construction. A Lance physical scan plan
@@ -264,7 +264,7 @@ impl SnapshotScanner {
     }
 }
 
-impl SnapshotTable {
+impl SnapshotDataset {
     fn new(dataset: Dataset) -> Self {
         Self { dataset }
     }
@@ -290,7 +290,7 @@ impl SnapshotTable {
     }
 
     /// Lance version of this pinned dataset.
-    pub fn version(&self) -> u64 {
+    pub fn published_dataset_version(&self) -> u64 {
         self.dataset.version().version
     }
 
@@ -399,36 +399,37 @@ impl Snapshot {
         Ok(())
     }
 
-    /// Open a backing dataset at its pinned version using the retained
-    /// `table_key` compatibility selector. With read caches present
+    /// Open a backing dataset at its pinned version by qualified graph type key. With read caches present
     /// (live Branch reads), reuse a held handle through the cache (0 open IO on a
     /// warm repeat) and the shared `Session`; otherwise plain-open (Fix 2).
-    pub async fn open(&self, table_key: &str) -> Result<SnapshotTable> {
-        self.open_dataset(table_key).await.map(SnapshotTable::new)
+    pub async fn open_dataset(&self, type_key: &str) -> Result<SnapshotDataset> {
+        self.open_lance_dataset(type_key)
+            .await
+            .map(SnapshotDataset::new)
     }
 
     /// Open the raw Lance dataset for engine-internal read execution.
     ///
     /// This stays crate-private so downstream SDK callers cannot obtain a
     /// writable `Dataset` from a logical graph snapshot.
-    pub(crate) async fn open_dataset(&self, table_key: &str) -> Result<Dataset> {
+    pub(crate) async fn open_lance_dataset(&self, type_key: &str) -> Result<Dataset> {
         let entry = self
             .entries
-            .get(table_key)
-            .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(table_key)))?;
+            .get(type_key)
+            .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(type_key)))?;
         match &self.read_caches {
             Some(caches) => {
                 let location = table_uri_for_path(
                     &self.root_uri,
-                    &entry.table_path,
-                    entry.table_branch.as_deref(),
+                    &entry.dataset_path,
+                    entry.native_dataset_branch.as_deref(),
                 );
                 caches
                     .handles
                     .get_or_open(
-                        &entry.table_path,
-                        entry.table_branch.as_deref(),
-                        entry.table_version,
+                        &entry.dataset_path,
+                        entry.native_dataset_branch.as_deref(),
+                        entry.published_dataset_version,
                         entry.version_metadata.e_tag(),
                         &location,
                         Some(&caches.session),
@@ -447,16 +448,17 @@ impl Snapshot {
     }
 
     /// Graph-manifest version this snapshot was taken from.
-    pub fn version(&self) -> u64 {
+    pub fn graph_manifest_version(&self) -> u64 {
         self.version
     }
 
-    /// Look up backing-dataset metadata by the retained table-key selector.
-    pub fn entry(&self, table_key: &str) -> Option<&SubTableEntry> {
-        self.entries.get(table_key)
+    /// Look up backing-dataset metadata by qualified graph type key.
+    pub fn dataset(&self, type_key: &str) -> Option<&DatasetEntry> {
+        self.entries.get(type_key)
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = &SubTableEntry> {
+    /// Iterate over metadata for every backing dataset in this snapshot.
+    pub fn datasets(&self) -> impl Iterator<Item = &DatasetEntry> {
         self.entries.values()
     }
 }
@@ -553,13 +555,13 @@ async fn probe_dataset_latest_incarnation(
     })
 }
 
-impl SubTableUpdate {
+impl DatasetUpdate {
     pub(crate) fn to_create_table_version_request(&self) -> CreateTableVersionRequest {
         self.version_metadata.to_create_table_version_request(
-            &self.table_key,
-            self.table_version,
-            self.row_count,
-            self.table_branch.as_deref(),
+            &self.type_key,
+            self.published_dataset_version,
+            self.entity_count,
+            self.native_dataset_branch.as_deref(),
         )
     }
 }
@@ -640,7 +642,7 @@ pub(crate) struct TableRename {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ManifestChange {
-    Update(SubTableUpdate),
+    Update(DatasetUpdate),
     RegisterTable(TableRegistration),
     RenameTable(TableRename),
     Tombstone(TableTombstone),
@@ -659,8 +661,8 @@ pub(crate) struct TableVersionExpectation {
 
 pub(crate) type ExpectedTableVersions = HashMap<TableIdentity, TableVersionExpectation>;
 
-impl SubTableEntry {
-    /// Open this sub-table at its pinned version directly by location (Fix 2),
+impl DatasetEntry {
+    /// Open this dataset at its pinned version directly by location (Fix 2),
     /// without the Lance namespace — which would full-scan `__manifest` twice per
     /// open (`describe_table` + `describe_table_version`). The resolved Snapshot
     /// already holds the path, version, and branch. Branches are Lance native
@@ -678,16 +680,20 @@ impl SubTableEntry {
         // version lives under `tree/{branch}/_versions`, not the base. This
         // matches the physical layout the namespace path resolved, without the
         // per-open `__manifest` scan.
-        let location = table_uri_for_path(root_uri, &self.table_path, self.table_branch.as_deref());
+        let location = table_uri_for_path(
+            root_uri,
+            &self.dataset_path,
+            self.native_dataset_branch.as_deref(),
+        );
         // Route through the one opener (Fix 3). With no session this is exactly
         // the Fix-2 `from_uri(location).with_version`. This is the uncached
         // fallback (a snapshot detached from its graph's read caches); the
-        // cached path (`Snapshot::open` → handle cache) calls the same opener on
+        // cached path (`Snapshot::open_lance_dataset` → handle cache) calls the same opener on
         // a miss with the shared session, so both paths count on the per-query
         // `table_wrapper`.
         crate::instrumentation::open_dataset(
             &location,
-            crate::instrumentation::VersionResolution::At(self.table_version),
+            crate::instrumentation::VersionResolution::At(self.published_dataset_version),
             session,
             crate::instrumentation::table_wrapper(),
         )
@@ -716,12 +722,12 @@ pub(crate) fn table_path_for_identity(table_key: &str, identity: TableIdentity) 
 
 /// An update to apply to the manifest via `commit`.
 #[derive(Debug, Clone)]
-pub struct SubTableUpdate {
+pub struct DatasetUpdate {
     pub(crate) identity: TableIdentity,
-    pub table_key: String,
-    pub table_version: u64,
-    pub table_branch: Option<String>,
-    pub row_count: u64,
+    pub type_key: String,
+    pub published_dataset_version: u64,
+    pub native_dataset_branch: Option<String>,
+    pub entity_count: u64,
     pub(crate) version_metadata: TableVersionMetadata,
 }
 
@@ -800,7 +806,7 @@ impl ManifestCoordinator {
             entries: state
                 .entries
                 .into_iter()
-                .map(|entry| (entry.table_key.clone(), entry))
+                .map(|entry| (entry.type_key.clone(), entry))
                 .collect(),
             graph_heads: state.graph_heads,
             read_caches: None,
@@ -1008,8 +1014,8 @@ impl ManifestCoordinator {
             open_manifest_dataset_with_session(root, candidate_branch, control_session).await?;
         let snapshot = Self::snapshot_from_state(root, read_manifest_state(&dataset).await?);
         Ok(snapshot
-            .entries()
-            .any(|entry| entry.table_branch.as_deref() == Some(delete_target)))
+            .datasets()
+            .any(|entry| entry.native_dataset_branch.as_deref() == Some(delete_target)))
     }
 
     /// Return a Snapshot from the known manifest state. No storage I/O.
@@ -1097,7 +1103,7 @@ impl ManifestCoordinator {
     /// Atomically inserts one immutable `table_version` row per updated table.
     /// The merge-insert commit on `__manifest` is the graph-level publish point.
     #[cfg(test)]
-    pub(crate) async fn commit(&mut self, updates: &[SubTableUpdate]) -> Result<u64> {
+    pub(crate) async fn commit(&mut self, updates: &[DatasetUpdate]) -> Result<u64> {
         let changes = updates
             .iter()
             .cloned()
@@ -1110,11 +1116,11 @@ impl ManifestCoordinator {
     /// versions used for optimistic concurrency control. Each entry asserts
     /// the manifest's current latest non-tombstoned `table_version` for that
     /// table identity is exactly what the caller observed; mismatches surface
-    /// as `OmniError::Manifest` with `ManifestConflictDetails::ExpectedVersionMismatch`.
+    /// as `OmniError::Manifest` with `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
     #[cfg(test)]
     pub(crate) async fn commit_with_expected(
         &mut self,
-        updates: &[SubTableUpdate],
+        updates: &[DatasetUpdate],
         expected_table_versions: &ExpectedTableVersions,
     ) -> Result<u64> {
         let changes = updates

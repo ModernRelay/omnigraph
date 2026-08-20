@@ -168,8 +168,8 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
     assert!(setup.contains("setup_fingerprint"));
     assert!(setup.contains("setup_main_rows"));
     assert!(setup.contains("setup_source_rows"));
-    assert!(setup.contains("setup_main_table_version"));
-    assert!(setup.contains("setup_source_table_version"));
+    assert!(setup.contains("setup_main_dataset_version"));
+    assert!(setup.contains("setup_source_dataset_version"));
 
     let verify = source
         .split_once("pub(super) async fn fenced_adopt_verify")
@@ -193,7 +193,7 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
     assert!(verify.contains("VerificationTable::Snapshot(&manifest_source)"));
     assert!(
         !source.contains("open_graph_visible_dataset"),
-        "graph-visible verification must scan the pinned SnapshotTable directly"
+        "graph-visible verification must scan the pinned SnapshotDataset directly"
     );
     assert!(
         !verify.contains("with_branch(\"adopt-source\", Some("),

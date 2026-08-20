@@ -1740,13 +1740,13 @@ async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
     let db = init_and_load(&dir).await;
     let snapshot = snapshot_main(&db).await.unwrap();
     let entries = snapshot
-        .entries()
+        .datasets()
         .map(|entry| {
             (
-                entry.table_key.clone(),
-                entry.table_path.clone(),
-                entry.table_version,
-                entry.table_branch.clone(),
+                entry.type_key.clone(),
+                entry.dataset_path.clone(),
+                entry.published_dataset_version,
+                entry.native_dataset_branch.clone(),
             )
         })
         .collect::<Vec<_>>();

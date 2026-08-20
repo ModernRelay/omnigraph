@@ -124,7 +124,7 @@ async fn external_commit_observed_by_warm_reader() {
 // ── Finding A: drop the redundant per-query schema validation ─────────────────
 //
 // Every query runs `ensure_schema_state_valid`. It ran TWICE per query (once in
-// query()/run_query_at, once again in resolved_target/snapshot_at_version), each
+// query()/run_query_at, once again in resolved_target/snapshot_at_graph_manifest_version), each
 // reading 3 contract files + 2 existence probes (~10 storage ops). Finding A
 // removes the redundant caller, so validation runs once. (A cheaper source-only
 // probe was rejected: the codebase requires per-call detection of IR/state drift
@@ -400,7 +400,7 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
         "test setup: the old feature head must belong to the old branch lineage"
     );
     let old_version = reader
-        .version_of(ReadTarget::branch("feature"))
+        .graph_manifest_version_of(ReadTarget::branch("feature"))
         .await
         .unwrap();
 
@@ -416,7 +416,7 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     let replacement_inherited_head = writer.resolve_snapshot("main").await.unwrap();
     writer.branch_create("feature").await.unwrap();
     let new_version = writer
-        .version_of(ReadTarget::branch("feature"))
+        .graph_manifest_version_of(ReadTarget::branch("feature"))
         .await
         .unwrap();
     assert_eq!(
@@ -480,7 +480,7 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
         .find(|commit| commit.graph_commit_id == new_feature_head.as_str())
         .unwrap();
     assert_eq!(
-        new_feature_head_commit.manifest_version, new_version,
+        new_feature_head_commit.graph_manifest_version, new_version,
         "without intervening physical-only maintenance, the recreated branch snapshot and \
          lineage head must come from one manifest version"
     );
@@ -522,10 +522,10 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
         .snapshot_of(ReadTarget::branch("feature"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
         .clone();
-    assert_eq!(old_entry.table_branch.as_deref(), Some("feature"));
+    assert_eq!(old_entry.native_dataset_branch.as_deref(), Some("feature"));
 
     writer.branch_delete("feature").await.unwrap();
     writer.branch_create("feature").await.unwrap();
@@ -542,13 +542,16 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
         .snapshot_of(ReadTarget::branch("feature"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .unwrap()
         .clone();
-    assert_eq!(new_entry.table_path, old_entry.table_path);
-    assert_eq!(new_entry.table_branch, old_entry.table_branch);
+    assert_eq!(new_entry.dataset_path, old_entry.dataset_path);
     assert_eq!(
-        new_entry.table_version, old_entry.table_version,
+        new_entry.native_dataset_branch,
+        old_entry.native_dataset_branch
+    );
+    assert_eq!(
+        new_entry.published_dataset_version, old_entry.published_dataset_version,
         "test setup must force table handle identity to differ only by e_tag"
     );
 
@@ -640,10 +643,13 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
             .snapshot_of(ReadTarget::branch("feature"))
             .await
             .unwrap()
-            .entry("edge:Knows")
+            .dataset("edge:Knows")
             .unwrap()
             .clone();
-        assert_eq!(old_edge_entry.table_branch.as_deref(), Some("feature"));
+        assert_eq!(
+            old_edge_entry.native_dataset_branch.as_deref(),
+            Some("feature")
+        );
 
         writer.branch_delete("feature").await.unwrap();
         writer.branch_create("feature").await.unwrap();
@@ -663,13 +669,16 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
             .snapshot_of(ReadTarget::branch("feature"))
             .await
             .unwrap()
-            .entry("edge:Knows")
+            .dataset("edge:Knows")
             .unwrap()
             .clone();
-        assert_eq!(new_edge_entry.table_path, old_edge_entry.table_path);
-        assert_eq!(new_edge_entry.table_branch, old_edge_entry.table_branch);
+        assert_eq!(new_edge_entry.dataset_path, old_edge_entry.dataset_path);
         assert_eq!(
-            new_edge_entry.table_version, old_edge_entry.table_version,
+            new_edge_entry.native_dataset_branch,
+            old_edge_entry.native_dataset_branch
+        );
+        assert_eq!(
+            new_edge_entry.published_dataset_version, old_edge_entry.published_dataset_version,
             "test setup must force graph-index identity to differ only by snapshot incarnation"
         );
 

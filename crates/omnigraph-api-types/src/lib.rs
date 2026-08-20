@@ -35,23 +35,80 @@ enum LoadModeSchema {
     Merge,
 }
 
+/// Logical graph entity namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityKindOutput {
+    Node,
+    Edge,
+}
+
+impl EntityKindOutput {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Edge => "edge",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "node" => Some(Self::Node),
+            "edge" => Some(Self::Edge),
+            _ => None,
+        }
+    }
+}
+
+/// Error returned when an engine-internal selector cannot be projected into a
+/// logical node or edge type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityTypeMappingError;
+
+impl std::fmt::Display for EntityTypeMappingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("dataset metadata does not identify a node or edge type")
+    }
+}
+
+impl std::error::Error for EntityTypeMappingError {}
+
+/// Project an engine-internal type selector into its logical kind and accepted
+/// schema name. The internal spelling is deliberately not returned.
+pub fn entity_type_parts(
+    selector: &str,
+) -> Result<(EntityKindOutput, &str), EntityTypeMappingError> {
+    if let Some(type_name) = selector.strip_prefix("node:") {
+        (!type_name.is_empty())
+            .then_some((EntityKindOutput::Node, type_name))
+            .ok_or(EntityTypeMappingError)
+    } else if let Some(type_name) = selector.strip_prefix("edge:") {
+        (!type_name.is_empty())
+            .then_some((EntityKindOutput::Edge, type_name))
+            .ok_or(EntityTypeMappingError)
+    } else {
+        Err(EntityTypeMappingError)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SnapshotTableOutput {
-    pub table_key: String,
-    pub table_path: String,
-    pub table_version: u64,
-    pub table_branch: Option<String>,
-    pub row_count: u64,
+pub struct SnapshotDatasetOutput {
+    pub entity_kind: EntityKindOutput,
+    pub type_name: String,
+    pub dataset_path: String,
+    pub published_dataset_version: u64,
+    pub native_dataset_branch: Option<String>,
+    pub entity_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SnapshotOutput {
-    pub branch: String,
-    pub manifest_version: u64,
+    pub graph_branch: String,
+    pub graph_manifest_version: u64,
     /// The on-disk internal-schema (storage-format) version this graph's branch
     /// is stamped at.
     pub internal_schema_version: u32,
-    pub tables: Vec<SnapshotTableOutput>,
+    pub datasets: Vec<SnapshotDatasetOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -184,21 +241,24 @@ impl From<MergeConflictKind> for MergeConflictKindOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MergeConflictOutput {
-    pub table_key: String,
-    pub row_id: Option<String>,
+    pub entity_kind: EntityKindOutput,
+    pub type_name: String,
+    pub entity_id: Option<String>,
     pub kind: MergeConflictKindOutput,
     pub message: String,
 }
 
-impl From<&MergeConflict> for MergeConflictOutput {
-    fn from(value: &MergeConflict) -> Self {
-        Self {
-            table_key: value.table_key.clone(),
-            row_id: value.row_id.clone(),
-            kind: value.kind.into(),
-            message: value.message.clone(),
-        }
-    }
+pub fn merge_conflict_output(
+    value: &MergeConflict,
+) -> Result<MergeConflictOutput, EntityTypeMappingError> {
+    let (entity_kind, type_name) = entity_type_parts(&value.type_key)?;
+    Ok(MergeConflictOutput {
+        entity_kind,
+        type_name: type_name.to_string(),
+        entity_id: value.entity_id.clone(),
+        kind: value.kind.into(),
+        message: value.message.clone(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -260,12 +320,6 @@ pub struct ChangeOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct IngestTableOutput {
-    pub table_key: String,
-    pub rows_loaded: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IngestOutput {
     pub uri: String,
     pub branch: String,
@@ -275,19 +329,23 @@ pub struct IngestOutput {
     pub branch_created: bool,
     #[schema(value_type = LoadModeSchema)]
     pub mode: LoadMode,
-    pub tables: Vec<IngestTableOutput>,
+    /// Logical node declarations touched by this load, sorted by name.
+    pub nodes: Vec<GraphBatchDeclarationOutput>,
+    /// Logical edge declarations touched by this load, sorted by name.
+    pub edges: Vec<GraphBatchDeclarationOutput>,
+    pub total_entities: usize,
     pub actor_id: Option<String>,
     pub commit: Option<CommitOutput>,
 }
 
 /// One logical declaration touched by a graph-batch load.
 ///
-/// This deliberately carries the accepted-schema name, not the backing
-/// retained table-key compatibility selector, dataset path, or Lance identity.
+/// This deliberately carries the accepted-schema name, not a backing dataset
+/// selector, path, or Lance identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct GraphBatchDeclarationOutput {
     pub name: String,
-    pub rows_loaded: usize,
+    pub entities_loaded: usize,
 }
 
 /// Terminal result for the raw graph-level NDJSON load surface.
@@ -304,7 +362,7 @@ pub struct GraphBatchLoadOutput {
     pub nodes: Vec<GraphBatchDeclarationOutput>,
     /// Logical edge declarations touched by this batch, sorted by name.
     pub edges: Vec<GraphBatchDeclarationOutput>,
-    pub total_rows: usize,
+    pub total_entities: usize,
     pub actor_id: Option<String>,
     pub commit: Option<CommitOutput>,
 }
@@ -312,8 +370,8 @@ pub struct GraphBatchLoadOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitOutput {
     pub graph_commit_id: String,
-    pub manifest_branch: Option<String>,
-    pub manifest_version: u64,
+    pub graph_branch: Option<String>,
+    pub graph_manifest_version: u64,
     pub parent_commit_id: Option<String>,
     pub merged_parent_commit_id: Option<String>,
     pub actor_id: Option<String>,
@@ -325,31 +383,6 @@ pub struct CommitOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
-}
-
-/// Logical entity namespace of one change. Graph vocabulary only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeEntityKind {
-    Node,
-    Edge,
-}
-
-impl ChangeEntityKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Node => "node",
-            Self::Edge => "edge",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "node" => Some(Self::Node),
-            "edge" => Some(Self::Edge),
-            _ => None,
-        }
-    }
 }
 
 /// Logical operation of one change. Ordering rank is frozen:
@@ -382,8 +415,7 @@ impl ChangeOpOutput {
 }
 
 /// Graph-scoped type identity. `id` is opaque: it survives a supported rename
-/// and changes after drop/re-add. It is never a retained table-key
-/// compatibility selector, dataset, or path identifier.
+/// and changes after drop/re-add. It is not a type-name selector or path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ChangeTypeOutput {
     pub id: String,
@@ -413,7 +445,7 @@ pub struct ChangeImageOutput {
 /// delete only `before`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct EntityChangeOutput {
-    pub kind: ChangeEntityKind,
+    pub kind: EntityKindOutput,
     pub r#type: ChangeTypeOutput,
     pub id: String,
     pub op: ChangeOpOutput,
@@ -489,7 +521,7 @@ pub struct CommitChangesQuery {
     pub limit: Option<usize>,
     /// Repeatable filter: node | edge.
     #[serde(default)]
-    pub kind: Vec<ChangeEntityKind>,
+    pub kind: Vec<EntityKindOutput>,
     /// Repeatable filter: accepted-schema type name.
     #[serde(default)]
     pub r#type: Vec<String>,
@@ -515,7 +547,7 @@ pub struct ChangeFeedQuery {
     pub page_token: Option<String>,
     pub limit: Option<usize>,
     #[serde(default)]
-    pub kind: Vec<ChangeEntityKind>,
+    pub kind: Vec<EntityKindOutput>,
     #[serde(default)]
     pub r#type: Vec<String>,
     #[serde(default)]
@@ -531,7 +563,7 @@ pub struct ChangeBaselineRequest {
     /// Feed scope the resume cursor is bound to. The snapshot honors `kind`
     /// and `type`; `op` constrains only subsequent polls.
     #[serde(default)]
-    pub kind: Vec<ChangeEntityKind>,
+    pub kind: Vec<EntityKindOutput>,
     #[serde(default)]
     pub r#type: Vec<String>,
     #[serde(default)]
@@ -559,11 +591,10 @@ pub struct ChangeBaselineRecord {
 /// `…/changes/baseline`, `…/commits/{commit_id}/changes`): a wire-compatible
 /// projection of [`ErrorOutput`] restricted to the graph-vocabulary details
 /// those routes can produce after their error projection. The write-path
-/// conflict shapes (key / manifest / merge / read-set), which carry physical
-/// storage identifiers, are structurally absent, so storage vocabulary is
-/// unreachable from the change operations' schema graph. Servers serialize
-/// [`ErrorOutput`]; every field a change route can populate appears here with
-/// the same name and meaning, and absent optionals are wire-compatible.
+/// conflict shapes (key / published-dataset-version / merge / read-set) are
+/// structurally absent because change routes cannot produce them. Servers
+/// serialize [`ErrorOutput`]; every field a change route can populate appears
+/// here with the same name and meaning, and absent optionals are wire-compatible.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeErrorOutput {
     pub error: String,
@@ -636,8 +667,7 @@ pub struct QueryRequest {
 
 /// Logical graph entity selected by the Blob delivery surface.
 ///
-/// This is intentionally graph vocabulary. The wire contract never exposes a
-/// Lance dataset, table key, stable row id, or per-table lane.
+/// This is intentionally graph vocabulary: callers select a node or edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BlobEntityKind {
@@ -663,8 +693,7 @@ pub struct BlobReadQuery {
     pub snapshot: Option<String>,
 }
 
-/// One logical graph Blob cell, without exposing its backing Lance table or
-/// physical row identity.
+/// One logical graph Blob cell.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct BlobSelectorOutput {
     pub entity: BlobEntityKind,
@@ -964,7 +993,7 @@ pub struct SchemaApplyOutput {
     pub supported: bool,
     pub applied: bool,
     pub step_count: usize,
-    pub manifest_version: u64,
+    pub graph_manifest_version: u64,
     #[schema(value_type = Vec<Value>)]
     pub steps: Vec<SchemaMigrationStep>,
 }
@@ -1007,16 +1036,13 @@ pub struct GraphBatchLoadQuery {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExportRequest {
     /// Branch to export. Defaults to `main`.
     pub branch: Option<String>,
     /// Restrict the export to these node/edge type names. Empty exports all types.
     #[serde(default)]
     pub type_names: Vec<String>,
-    /// Restrict the export using retained table-key compatibility selectors.
-    /// Empty exports all node and edge types.
-    #[serde(default)]
-    pub table_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -1063,10 +1089,11 @@ pub enum ErrorCode {
 /// one backing dataset's published version was stale relative to the current
 /// head. The expected/actual fields tell the client which dataset to refresh.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ManifestConflictOutput {
-    pub table_key: String,
-    pub expected: u64,
-    pub actual: u64,
+pub struct PublishedDatasetVersionConflictOutput {
+    pub entity_kind: EntityKindOutput,
+    pub type_name: String,
+    pub expected_published_dataset_version: u64,
+    pub actual_published_dataset_version: u64,
 }
 
 /// Structured authority mismatch for a prepared write. Values are
@@ -1079,18 +1106,19 @@ pub struct ReadSetConflictOutput {
     pub actual: Option<String>,
 }
 
-/// A strict insert rejected because `key` already names an entity in the
+/// A strict insert rejected because `entity_id` already names an entity in the
 /// selected node or edge type. The operation is effect-free when this output is returned;
 /// partial or ambiguous attempts surface `recovery_required` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KeyConflictOutput {
-    pub table_key: String,
+    pub entity_kind: EntityKindOutput,
+    pub type_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
+    pub entity_id: Option<String>,
 }
 
 /// A write rejected before durable recovery ownership because its bounded
-/// physical plan exceeded an explicit row, byte, or transaction-chain ceiling.
+/// physical plan exceeded an explicit entity, byte, or transaction-chain ceiling.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResourceLimitOutput {
     pub resource: String,
@@ -1179,12 +1207,11 @@ pub struct ErrorOutput {
     pub code: Option<ErrorCode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_conflicts: Vec<MergeConflictOutput>,
-    /// Set when the conflict is a publisher CAS rejection
-    /// (`ManifestConflictDetails::ExpectedVersionMismatch`). The caller's
-    /// pre-write view of `table_key` was at published dataset version
-    /// `expected`, but the graph manifest now publishes `actual`. Refresh and retry.
+    /// Set when the conflict is a publisher CAS rejection. The caller's
+    /// pre-write view named the expected published dataset version, but the
+    /// graph manifest now publishes the actual version. Refresh and retry.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub manifest_conflict: Option<ManifestConflictOutput>,
+    pub published_dataset_version_conflict: Option<PublishedDatasetVersionConflictOutput>,
     /// Set when a prepared write's logical authority changed before effects.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_set_conflict: Option<ReadSetConflictOutput>,
@@ -1230,25 +1257,29 @@ pub fn snapshot_payload(
     branch: &str,
     snapshot: &Snapshot,
     internal_schema_version: u32,
-) -> SnapshotOutput {
-    let mut entries: Vec<_> = snapshot.entries().cloned().collect();
-    entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
-    let tables = entries
+) -> Result<SnapshotOutput, EntityTypeMappingError> {
+    let mut entries: Vec<_> = snapshot.datasets().cloned().collect();
+    entries.sort_by(|a, b| a.type_key.cmp(&b.type_key));
+    let datasets = entries
         .iter()
-        .map(|entry| SnapshotTableOutput {
-            table_key: entry.table_key.clone(),
-            table_path: entry.table_path.clone(),
-            table_version: entry.table_version,
-            table_branch: entry.table_branch.clone(),
-            row_count: entry.row_count,
+        .map(|entry| {
+            let (entity_kind, type_name) = entity_type_parts(&entry.type_key)?;
+            Ok(SnapshotDatasetOutput {
+                entity_kind,
+                type_name: type_name.to_string(),
+                dataset_path: entry.dataset_path.clone(),
+                published_dataset_version: entry.published_dataset_version,
+                native_dataset_branch: entry.native_dataset_branch.clone(),
+                entity_count: entry.entity_count,
+            })
         })
-        .collect::<Vec<_>>();
-    SnapshotOutput {
-        branch: branch.to_string(),
-        manifest_version: snapshot.version(),
+        .collect::<Result<Vec<_>, EntityTypeMappingError>>()?;
+    Ok(SnapshotOutput {
+        graph_branch: branch.to_string(),
+        graph_manifest_version: snapshot.graph_manifest_version(),
         internal_schema_version,
-        tables,
-    }
+        datasets,
+    })
 }
 
 pub fn schema_apply_output(uri: &str, result: SchemaApplyResult) -> SchemaApplyOutput {
@@ -1257,7 +1288,7 @@ pub fn schema_apply_output(uri: &str, result: SchemaApplyResult) -> SchemaApplyO
         supported: result.supported,
         applied: result.applied,
         step_count: result.steps.len(),
-        manifest_version: result.manifest_version,
+        graph_manifest_version: result.graph_manifest_version,
         steps: result.steps,
     }
 }
@@ -1265,8 +1296,8 @@ pub fn schema_apply_output(uri: &str, result: SchemaApplyResult) -> SchemaApplyO
 pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
     CommitOutput {
         graph_commit_id: commit.graph_commit_id.clone(),
-        manifest_branch: commit.manifest_branch.clone(),
-        manifest_version: commit.manifest_version,
+        graph_branch: commit.graph_branch.clone(),
+        graph_manifest_version: commit.graph_manifest_version,
         parent_commit_id: commit.parent_commit_id.clone(),
         merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
         actor_id: commit.actor_id.clone(),
@@ -1274,7 +1305,7 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
     }
 }
 
-impl From<omnigraph::changes::ChangeEntityKind> for ChangeEntityKind {
+impl From<omnigraph::changes::ChangeEntityKind> for EntityKindOutput {
     fn from(kind: omnigraph::changes::ChangeEntityKind) -> Self {
         match kind {
             omnigraph::changes::ChangeEntityKind::Node => Self::Node,
@@ -1283,11 +1314,11 @@ impl From<omnigraph::changes::ChangeEntityKind> for ChangeEntityKind {
     }
 }
 
-impl From<ChangeEntityKind> for omnigraph::changes::ChangeEntityKind {
-    fn from(kind: ChangeEntityKind) -> Self {
+impl From<EntityKindOutput> for omnigraph::changes::ChangeEntityKind {
+    fn from(kind: EntityKindOutput) -> Self {
         match kind {
-            ChangeEntityKind::Node => Self::Node,
-            ChangeEntityKind::Edge => Self::Edge,
+            EntityKindOutput::Node => Self::Node,
+            EntityKindOutput::Edge => Self::Edge,
         }
     }
 }
@@ -1315,7 +1346,7 @@ impl From<ChangeOpOutput> for omnigraph::changes::ChangeOpKind {
 /// Wire filter vocabulary → the engine's feed scope. Shared by the server
 /// handlers and the CLI's embedded arm so both translate identically.
 pub fn change_scope(
-    kinds: &[ChangeEntityKind],
+    kinds: &[EntityKindOutput],
     type_names: &[String],
     ops: &[ChangeOpOutput],
 ) -> omnigraph::changes::ChangeFeedScope {
@@ -1441,20 +1472,16 @@ pub fn ingest_output(
     mode: LoadMode,
     actor_id: Option<String>,
 ) -> IngestOutput {
+    let (nodes, edges, total_entities) = load_declaration_outputs(result);
     IngestOutput {
         uri: uri.to_string(),
         branch: result.branch.clone(),
         base_branch: result.base_branch.clone(),
         branch_created: result.branch_created,
         mode,
-        tables: result
-            .to_ingest_tables()
-            .into_iter()
-            .map(|table| IngestTableOutput {
-                table_key: table.table_key,
-                rows_loaded: table.rows_loaded,
-            })
-            .collect(),
+        nodes,
+        edges,
+        total_entities,
         actor_id,
         commit: None,
     }
@@ -1476,31 +1503,7 @@ pub fn graph_batch_load_output(
     mode: LoadMode,
     actor_id: Option<String>,
 ) -> GraphBatchLoadOutput {
-    let mut nodes = result
-        .nodes_loaded
-        .iter()
-        .map(|(name, rows_loaded)| GraphBatchDeclarationOutput {
-            name: name.clone(),
-            rows_loaded: *rows_loaded,
-        })
-        .collect::<Vec<_>>();
-    nodes.sort_by(|left, right| left.name.cmp(&right.name));
-
-    let mut edges = result
-        .edges_loaded
-        .iter()
-        .map(|(name, rows_loaded)| GraphBatchDeclarationOutput {
-            name: name.clone(),
-            rows_loaded: *rows_loaded,
-        })
-        .collect::<Vec<_>>();
-    edges.sort_by(|left, right| left.name.cmp(&right.name));
-
-    let total_rows = nodes
-        .iter()
-        .chain(&edges)
-        .map(|declaration| declaration.rows_loaded)
-        .sum();
+    let (nodes, edges, total_entities) = load_declaration_outputs(result);
     GraphBatchLoadOutput {
         branch: result.branch.clone(),
         base_branch: result.base_branch.clone(),
@@ -1508,10 +1511,45 @@ pub fn graph_batch_load_output(
         mode,
         nodes,
         edges,
-        total_rows,
+        total_entities,
         actor_id,
         commit: None,
     }
+}
+
+fn load_declaration_outputs(
+    result: &LoadResult,
+) -> (
+    Vec<GraphBatchDeclarationOutput>,
+    Vec<GraphBatchDeclarationOutput>,
+    usize,
+) {
+    let mut nodes = result
+        .nodes_loaded
+        .iter()
+        .map(|(name, entities_loaded)| GraphBatchDeclarationOutput {
+            name: name.clone(),
+            entities_loaded: *entities_loaded,
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut edges = result
+        .edges_loaded
+        .iter()
+        .map(|(name, entities_loaded)| GraphBatchDeclarationOutput {
+            name: name.clone(),
+            entities_loaded: *entities_loaded,
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let total_entities = nodes
+        .iter()
+        .chain(&edges)
+        .map(|declaration| declaration.entities_loaded)
+        .sum();
+    (nodes, edges, total_entities)
 }
 
 pub fn graph_batch_load_receipt_output(
@@ -1561,6 +1599,41 @@ pub struct GraphListResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn entity_type_parts_projects_only_logical_node_and_edge_selectors() {
+        assert_eq!(
+            EntityKindOutput::parse("node"),
+            Some(EntityKindOutput::Node)
+        );
+        assert_eq!(
+            EntityKindOutput::parse("edge"),
+            Some(EntityKindOutput::Edge)
+        );
+        assert_eq!(EntityKindOutput::parse("table"), None);
+        assert_eq!(
+            entity_type_parts("node:Person"),
+            Ok((EntityKindOutput::Node, "Person"))
+        );
+        assert_eq!(
+            entity_type_parts("edge:Knows"),
+            Ok((EntityKindOutput::Edge, "Knows"))
+        );
+        for invalid in ["Person", "node:", "edge:", "table:Person"] {
+            assert_eq!(entity_type_parts(invalid), Err(EntityTypeMappingError));
+        }
+    }
+
+    #[test]
+    fn export_request_rejects_removed_table_key_selector() {
+        let error = serde_json::from_value::<ExportRequest>(json!({
+            "branch": "main",
+            "type_names": [],
+            "table_keys": ["node:Person"]
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `table_keys`"));
+    }
 
     #[test]
     fn blob_stat_output_has_one_shared_shape_and_omits_inapplicable_fields() {

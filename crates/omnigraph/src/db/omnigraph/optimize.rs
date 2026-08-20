@@ -1,24 +1,24 @@
 //! Lance compaction + version cleanup exposed at the graph level.
 //!
-//! Lance accumulates many small `.lance` fragment files per table over the
+//! Lance accumulates many small `.lance` fragment files per backing dataset over the
 //! life of a graph: each `write`, `load`, and `change` op appends one or more
 //! fragments and a new manifest. Over long timescales this hurts open times
 //! and S3 object counts without improving anything.
 //!
 //! Two dials:
 //!
-//! * `optimize_all_tables` — Lance `compact_files` on every table. Rewrites
+//! * `optimize_all_datasets` — Lance `compact_files` on every dataset. Rewrites
 //!   small fragments into fewer large ones, then **publishes the compacted
-//!   versions together in one `__manifest` batch** so each `table_version`
-//!   tracks the compacted Lance HEAD (reads pin the published dataset version, so without
-//!   the publish compaction would be invisible to readers and would break the
+//!   versions together in one `__manifest` batch** so each persisted
+//!   `table_version` column tracks the compacted Lance HEAD (reads pin the
+//!   published dataset version, so without the publish compaction would be invisible to readers and would break the
 //!   HEAD-vs-manifest precondition of schema apply / strict writes). Compaction
 //!   is content-preserving (Lance `Operation::Rewrite` "reorganizes data
 //!   without semantic modification"), so old fragments remain reachable via
 //!   older dataset versions until `cleanup` runs.
-//! * `cleanup_all_tables` — Lance `cleanup_old_versions` on every table.
+//! * `cleanup_all_datasets` — Lance `cleanup_old_versions` on every dataset.
 //!   Removes manifests (and their unique fragments) older than the configured
-//!   retention, capped at the oldest main-table version inherited by any live
+//!   retention, capped at the oldest main-dataset version inherited by any live
 //!   lazy graph branch. Destructive to unreferenced version history — callers
 //!   should gate this behind an explicit confirm flag at the CLI layer.
 //!
@@ -40,7 +40,7 @@ use lance_index::optimize::OptimizeOptions;
 use super::*;
 use crate::error::missing_graph_type_at_snapshot;
 
-/// How many tables to optimize/cleanup concurrently. Each hits a separate
+/// How many datasets to optimize/cleanup concurrently. Each has separate
 /// Lance dataset so there is no shared state; the bound is there to avoid
 /// flooding the runtime and the S3 connection pool.
 const DEFAULT_MAINT_CONCURRENCY: usize = 8;
@@ -53,7 +53,7 @@ fn maint_concurrency() -> usize {
         .unwrap_or(DEFAULT_MAINT_CONCURRENCY)
 }
 
-/// Retention knobs for [`cleanup_all_tables`]. At least one must be set or
+/// Retention knobs for [`cleanup_all_datasets`]. At least one must be set or
 /// nothing is cleaned. If both are set, Lance applies them as AND (a manifest
 /// is kept if it satisfies either — i.e. only manifests older than BOTH the
 /// time cutoff AND the version cutoff are removed).
@@ -100,14 +100,14 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
-/// Per-dataset outcome of `optimize_all_tables`. This is a returned result type,
+/// Per-dataset outcome of `optimize_all_datasets`. This is a returned result type,
 /// not built by callers, so it is `#[non_exhaustive]`: future fields stay
 /// non-breaking and downstream code reads fields rather than constructing it.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct TableOptimizeStats {
-    /// Retained table-key compatibility identifier for the backing dataset.
-    pub table_key: String,
+pub struct DatasetOptimizeStats {
+    /// Qualified graph type key, or `__manifest` for the system dataset.
+    pub type_key: String,
     /// Number of source fragments that were rewritten by Lance.
     pub fragments_removed: usize,
     /// Number of new, larger fragments Lance produced.
@@ -121,7 +121,7 @@ pub struct TableOptimizeStats {
     pub skipped: Option<SkipReason>,
     /// Published dataset version observed by optimize for drift skips. `None` for
     /// normal compaction/no-op outcomes.
-    pub manifest_version: Option<u64>,
+    pub published_dataset_version: Option<u64>,
     /// Lance HEAD version observed by optimize for drift skips. `None` for
     /// normal compaction/no-op outcomes.
     pub lance_head_version: Option<u64>,
@@ -133,47 +133,47 @@ pub struct TableOptimizeStats {
     pub pending_indexes: Vec<super::PendingIndex>,
 }
 
-impl TableOptimizeStats {
-    /// Stat for a table that Lance actually compacted.
-    fn compacted(table_key: String, metrics: &CompactionMetrics, committed: bool) -> Self {
+impl DatasetOptimizeStats {
+    /// Stat for a dataset that Lance actually compacted.
+    fn compacted(type_key: String, metrics: &CompactionMetrics, committed: bool) -> Self {
         Self {
-            table_key,
+            type_key,
             fragments_removed: metrics.fragments_removed,
             fragments_added: metrics.fragments_added,
             committed,
             skipped: None,
-            manifest_version: None,
+            published_dataset_version: None,
             lance_head_version: None,
             pending_indexes: Vec::new(),
         }
     }
 
-    /// Stat for a table skipped because the manifest and Lance HEAD disagree.
+    /// Stat for a dataset skipped because the graph manifest and Lance HEAD disagree.
     fn skipped_for_drift(
-        table_key: String,
-        manifest_version: u64,
+        type_key: String,
+        published_dataset_version: u64,
         lance_head_version: u64,
     ) -> Self {
         Self {
-            table_key,
+            type_key,
             fragments_removed: 0,
             fragments_added: 0,
             committed: false,
             skipped: Some(SkipReason::DriftNeedsRepair),
-            manifest_version: Some(manifest_version),
+            published_dataset_version: Some(published_dataset_version),
             lance_head_version: Some(lance_head_version),
             pending_indexes: Vec::new(),
         }
     }
 }
 
-/// Per-dataset outcome of `cleanup_all_tables`. `error` is `Some` when this
+/// Per-dataset outcome of `cleanup_all_datasets`. `error` is `Some` when this
 /// dataset's version GC failed; cleanup is fault-isolated per dataset, so a
 /// single dataset's failure is recorded here rather than aborting the whole sweep.
 #[derive(Debug, Clone)]
-pub struct TableCleanupStats {
-    /// Retained table-key compatibility identifier for the backing dataset.
-    pub table_key: String,
+pub struct DatasetCleanupStats {
+    /// Qualified graph type key, or `__manifest` for the system dataset.
+    pub type_key: String,
     pub bytes_removed: u64,
     pub old_versions_removed: u64,
     pub error: Option<String>,
@@ -196,21 +196,21 @@ struct PreparedOptimizeTable {
 
 enum OptimizePreparation {
     Work(PreparedOptimizeTable),
-    Stat(TableOptimizeStats),
+    Stat(DatasetOptimizeStats),
 }
 
 struct OptimizeEffectOutcome {
-    stat: TableOptimizeStats,
-    update: Option<crate::db::SubTableUpdate>,
+    stat: DatasetOptimizeStats,
+    update: Option<crate::db::DatasetUpdate>,
 }
 
-/// Run Lance maintenance across every node + edge table on `main` under one
-/// graph visibility envelope. Physical table work remains bounded-parallel,
-/// but every productive table shares one recovery sidecar and one monotonic
+/// Run Lance maintenance across every node + edge dataset on `main` under one
+/// graph visibility envelope. Physical dataset work remains bounded-parallel,
+/// but every productive dataset shares one recovery sidecar and one monotonic
 /// manifest batch publish, so one public Optimize produces at most one graph
 /// commit. The final physical `__manifest` compaction remains outside that
-/// graph-visible envelope because the internal table is read directly at HEAD.
-pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStats>> {
+/// graph-visible envelope because the system dataset is read directly at HEAD.
+pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimizeStats>> {
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("optimize").await?;
@@ -277,12 +277,12 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     let table_tasks = table_keys
         .into_iter()
         .filter_map(|table_key| {
-            let entry = snapshot.entry(&table_key)?;
+            let entry = snapshot.dataset(&table_key)?;
             Some(OptimizeTableTask {
                 identity: entry.identity,
                 table_key,
-                full_path: format!("{}/{}", db.root_uri, entry.table_path),
-                expected_version: entry.table_version,
+                full_path: format!("{}/{}", db.root_uri, entry.dataset_path),
+                expected_version: entry.published_dataset_version,
             })
         })
         .collect::<Vec<_>>();
@@ -378,7 +378,7 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         let any_committed = outcomes.iter().any(|outcome| outcome.stat.committed);
         let edge_committed = outcomes
             .iter()
-            .any(|outcome| outcome.stat.committed && outcome.stat.table_key.starts_with("edge:"));
+            .any(|outcome| outcome.stat.committed && outcome.stat.type_key.starts_with("edge:"));
         stats.extend(outcomes.into_iter().map(|outcome| outcome.stat));
 
         // Phase D: the graph-visible postcondition is durable. A failed delete
@@ -404,7 +404,7 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         }
     }
 
-    stats.sort_by(|left, right| left.table_key.cmp(&right.table_key));
+    stats.sort_by(|left, right| left.type_key.cmp(&right.type_key));
 
     // Data-table recovery/publish is finished. Release the sorted table and
     // schema gates before physical internal maintenance; retain main's branch
@@ -466,7 +466,7 @@ async fn prepare_optimize_table(
              to classify and publish covered maintenance drift explicitly",
         );
         return Ok(OptimizePreparation::Stat(
-            TableOptimizeStats::skipped_for_drift(
+            DatasetOptimizeStats::skipped_for_drift(
                 task.table_key,
                 task.expected_version,
                 lance_head_version,
@@ -490,7 +490,7 @@ async fn prepare_optimize_table(
     .await?;
     if !will_compact && !needs_reindex && !index_work.needs_commit {
         let mut stat =
-            TableOptimizeStats::compacted(task.table_key, &CompactionMetrics::default(), false);
+            DatasetOptimizeStats::compacted(task.table_key, &CompactionMetrics::default(), false);
         stat.pending_indexes = index_work.pending;
         return Ok(OptimizePreparation::Stat(stat));
     }
@@ -504,9 +504,9 @@ async fn prepare_optimize_table(
     }))
 }
 
-/// Apply one productive table's physical maintenance work. This helper owns no
+/// Apply one productive dataset's physical maintenance work. This helper owns no
 /// locks, sidecar, or graph publish; those are graph-wide responsibilities of
-/// `optimize_all_tables`.
+/// `optimize_all_datasets`.
 async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
@@ -540,8 +540,8 @@ async fn apply_optimize_table_effects(
         let expected_version = db
             .fresh_snapshot_for_branch(None)
             .await?
-            .entry(&table_key)
-            .map(|e| e.table_version)
+            .dataset(&table_key)
+            .map(|e| e.published_dataset_version)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
 
         let lance_head_version = selected.version();
@@ -600,7 +600,7 @@ async fn apply_optimize_table_effects(
                     true,
                 );
             }
-            let mut stat = TableOptimizeStats::compacted(
+            let mut stat = DatasetOptimizeStats::compacted(
                 table_key.clone(),
                 &CompactionMetrics::default(),
                 false,
@@ -687,16 +687,16 @@ async fn apply_optimize_table_effects(
         break (snapshot, metrics, pending_indexes, head_advanced);
     };
 
-    let mut stat = TableOptimizeStats::compacted(table_key, &metrics, committed);
+    let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, committed);
     stat.pending_indexes = pending_indexes;
     let update = if committed {
         let state = db.storage().table_state(&full_path, &snapshot).await?;
-        Some(crate::db::SubTableUpdate {
+        Some(crate::db::DatasetUpdate {
             identity,
-            table_key: stat.table_key.clone(),
-            table_version: state.version,
-            table_branch: None,
-            row_count: state.row_count,
+            type_key: stat.type_key.clone(),
+            published_dataset_version: state.version,
+            native_dataset_branch: None,
+            entity_count: state.row_count,
             version_metadata: state.version_metadata,
         })
     } else {
@@ -711,7 +711,7 @@ async fn apply_optimize_table_effects(
 /// pointers use their freshly observed versions as row-level expectations.
 async fn publish_optimize_batch_monotonic(
     db: &Omnigraph,
-    targets: &[crate::db::SubTableUpdate],
+    targets: &[crate::db::DatasetUpdate],
 ) -> Result<()> {
     if targets.is_empty() {
         return Ok(());
@@ -723,25 +723,25 @@ async fn publish_optimize_batch_monotonic(
         let mut updates = Vec::with_capacity(targets.len());
         let mut expected = std::collections::HashMap::with_capacity(targets.len());
         for target in targets {
-            let entry = current.entry(&target.table_key).ok_or_else(|| {
+            let entry = current.dataset(&target.type_key).ok_or_else(|| {
                 OmniError::manifest_conflict(format!(
                     "optimize target '{}' disappeared before graph-wide publish",
-                    target.table_key
+                    target.type_key
                 ))
             })?;
             if entry.identity != target.identity {
                 return Err(OmniError::manifest_read_set_changed(
-                    format!("table_identity:{}", target.table_key),
+                    format!("dataset_identity:{}", target.type_key),
                     Some(target.identity.to_string()),
                     Some(entry.identity.to_string()),
                 ));
             }
-            if entry.table_version < target.table_version {
+            if entry.published_dataset_version < target.published_dataset_version {
                 expected.insert(
                     entry.identity,
                     crate::db::manifest::TableVersionExpectation {
-                        table_key: target.table_key.clone(),
-                        table_version: entry.table_version,
+                        table_key: target.type_key.clone(),
+                        table_version: entry.published_dataset_version,
                     },
                 );
                 updates.push(target.clone());
@@ -766,8 +766,9 @@ async fn publish_optimize_batch_monotonic(
 
     let current = db.fresh_snapshot_for_branch(None).await?;
     if targets.iter().all(|target| {
-        current.entry(&target.table_key).is_some_and(|entry| {
-            entry.identity == target.identity && entry.table_version >= target.table_version
+        current.dataset(&target.type_key).is_some_and(|entry| {
+            entry.identity == target.identity
+                && entry.published_dataset_version >= target.published_dataset_version
         })
     }) {
         return Ok(());
@@ -852,7 +853,7 @@ fn is_retryable_lance_conflict(err: &lance::Error) -> bool {
 /// A manifest publish conflict that optimize's monotonic Phase-C loop re-evaluates
 /// (re-read the current version, then no-op or fast-forward). Both shapes that reach
 /// here are `Conflict`-kind and mean "the manifest moved under us; reconsider," never
-/// a lost update: the typed `ExpectedVersionMismatch` (a concurrent writer advanced
+/// a lost update: the typed `PublishedDatasetVersionMismatch` (a concurrent writer advanced
 /// the table) and the publisher's exhausted row-level CAS (`manifest_conflict`).
 fn is_retryable_manifest_conflict(err: &OmniError) -> bool {
     matches!(
@@ -932,7 +933,7 @@ async fn compact_internal_table(
     db: &Omnigraph,
     table_key: &str,
     uri: String,
-) -> Result<TableOptimizeStats> {
+) -> Result<DatasetOptimizeStats> {
     // App-level retry against concurrent live writers. compact_files does NOT
     // auto-retry a Rewrite-vs-live-write conflict (see is_retryable_lance_conflict),
     // so optimize would otherwise fail spuriously on a live graph. On a retryable
@@ -966,7 +967,7 @@ async fn compact_internal_table(
             if cleared_config {
                 db.coordinator.write().await.refresh().await?;
             }
-            return Ok(TableOptimizeStats::compacted(
+            return Ok(DatasetOptimizeStats::compacted(
                 table_key.to_string(),
                 &CompactionMetrics::default(),
                 false,
@@ -979,7 +980,7 @@ async fn compact_internal_table(
                 // handles at the compacted HEAD (they live in `db.coordinator`, not
                 // the data-table `runtime_cache`).
                 db.coordinator.write().await.refresh().await?;
-                return Ok(TableOptimizeStats::compacted(
+                return Ok(DatasetOptimizeStats::compacted(
                     table_key.to_string(),
                     &metrics,
                     true,
@@ -997,14 +998,14 @@ async fn compact_internal_table(
     )))
 }
 
-/// Run Lance `cleanup_old_versions` on every node + edge table on `main`,
+/// Run Lance `cleanup_old_versions` on every node + edge dataset on `main`,
 /// using [`CleanupPolicyOptions`]. The latest manifest is always preserved
 /// regardless (Lance invariant), and the requested cutoff is capped at the
-/// oldest main-table version inherited by a live lazy graph branch.
-pub async fn cleanup_all_tables(
+/// oldest main-dataset version inherited by a live lazy graph branch.
+pub async fn cleanup_all_datasets(
     db: &mut Omnigraph,
     options: CleanupPolicyOptions,
-) -> Result<Vec<TableCleanupStats>> {
+) -> Result<Vec<DatasetCleanupStats>> {
     if options.keep_versions.is_none() && options.older_than.is_none() {
         return Err(OmniError::manifest(
             "cleanup requires at least one of keep_versions or older_than",
@@ -1075,8 +1076,8 @@ pub async fn cleanup_all_tables(
     let table_tasks: Vec<_> = all_table_keys(&cleanup_catalog)
         .into_iter()
         .filter_map(|table_key| {
-            let entry = snapshot.entry(&table_key)?;
-            let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+            let entry = snapshot.dataset(&table_key)?;
+            let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
             Some((table_key, full_path))
         })
         .collect();
@@ -1140,8 +1141,8 @@ pub async fn cleanup_all_tables(
                 ))
             })?;
         for entry in branch_snapshot
-            .entries()
-            .filter(|entry| entry.table_branch.is_none())
+            .datasets()
+            .filter(|entry| entry.native_dataset_branch.is_none())
         {
             // Validate that the exact protected version is still openable
             // before GC starts. This catches pre-existing damage from an older
@@ -1150,26 +1151,26 @@ pub async fn cleanup_all_tables(
             entry.open(db.root_uri(), None).await.map_err(|err| {
                 OmniError::manifest_conflict(format!(
                     "cleanup could not classify live branch '{branch_label}' {} at published dataset version {}; refusing version GC: {err}",
-                    dataset_subject(&entry.table_key), entry.table_version
+                    dataset_subject(&entry.type_key), entry.published_dataset_version
                 ))
             })?;
-            let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+            let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
             if branch_target.is_none() {
                 let head = db.storage().open_dataset_head(&full_path, None).await?;
-                if head.version() != entry.table_version {
+                if head.version() != entry.published_dataset_version {
                     return Err(OmniError::manifest_conflict(format!(
                         "cleanup found uncovered HEAD drift for {}: published dataset version {}, \
                          Lance HEAD version {}; run `omnigraph repair` before version GC",
-                        dataset_subject(&entry.table_key),
-                        entry.table_version,
+                        dataset_subject(&entry.type_key),
+                        entry.published_dataset_version,
                         head.version()
                     )));
                 }
             }
             oldest_live_main_version_by_path
                 .entry(full_path)
-                .and_modify(|oldest| *oldest = (*oldest).min(entry.table_version))
-                .or_insert(entry.table_version);
+                .and_modify(|oldest| *oldest = (*oldest).min(entry.published_dataset_version))
+                .or_insert(entry.published_dataset_version);
         }
     }
 
@@ -1194,7 +1195,7 @@ pub async fn cleanup_all_tables(
     // stats row (`error: Some`) and logged, never aborting the healthy tables.
     // cleanup is the convergence backstop, so it must do as much as it can and
     // converge on re-run rather than fail wholesale (invariant 13).
-    let results: Vec<TableCleanupStats> = futures::stream::iter(table_tasks)
+    let results: Vec<DatasetCleanupStats> = futures::stream::iter(table_tasks)
         .map(|(table_key, full_path, live_main_floor)| async move {
             let outcome: Result<RemovalStats> = async {
                 crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_TABLE_GC)?;
@@ -1248,8 +1249,8 @@ pub async fn cleanup_all_tables(
             }
             .await;
             match outcome {
-                Ok(removed) => TableCleanupStats {
-                    table_key,
+                Ok(removed) => DatasetCleanupStats {
+                    type_key: table_key,
                     bytes_removed: removed.bytes_removed,
                     old_versions_removed: removed.old_versions,
                     error: None,
@@ -1261,8 +1262,8 @@ pub async fn cleanup_all_tables(
                         error = %err,
                         "version GC failed for dataset; other datasets unaffected",
                     );
-                    TableCleanupStats {
-                        table_key,
+                    DatasetCleanupStats {
+                        type_key: table_key,
                         bytes_removed: 0,
                         old_versions_removed: 0,
                         error: Some(err.to_string()),
@@ -1342,8 +1343,8 @@ async fn reconcile_orphaned_branches_with_catalog(
         all_table_keys(catalog)
             .into_iter()
             .filter_map(|table_key| {
-                let entry = snapshot.entry(&table_key)?;
-                let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+                let entry = snapshot.dataset(&table_key)?;
+                let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
                 Some((entry.identity, table_key, full_path))
             })
             .collect();
@@ -1416,9 +1417,9 @@ async fn reconcile_orphaned_branches_with_catalog(
                     }
                 }
                 branch_snapshots[&branch]
-                    .entries()
+                    .datasets()
                     .find(|entry| entry.identity == identity)
-                    .map(|e| e.table_branch.as_deref() != Some(branch.as_str()))
+                    .map(|e| e.native_dataset_branch.as_deref() != Some(branch.as_str()))
                     .unwrap_or(true)
             };
             if is_orphan {
@@ -1543,9 +1544,9 @@ mod tests {
             .await
             .unwrap();
         let table_path = &snapshot
-            .entry(&table_key)
+            .dataset(&table_key)
             .unwrap_or_else(|| panic!("live manifest has no registration for {table_key}"))
-            .table_path;
+            .dataset_path;
         format!(
             "{}/{}",
             db.uri().trim_end_matches('/'),

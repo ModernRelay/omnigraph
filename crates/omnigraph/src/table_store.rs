@@ -61,7 +61,7 @@ use crate::blob::{
     BlobDescriptor, BlobDescriptorDecoder, ExternalBlobPolicy, NormalizedExternalBlobUri,
 };
 use crate::db::manifest::TableVersionMetadata;
-use crate::db::{Snapshot, SubTableEntry};
+use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::storage_layer::{
     ForkOutcome, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
@@ -931,8 +931,8 @@ impl TableStore {
         &self.root_uri
     }
 
-    pub fn dataset_uri(&self, table_path: &str) -> String {
-        format!("{}/{}", self.root_uri, table_path)
+    pub fn dataset_uri(&self, dataset_path: &str) -> String {
+        format!("{}/{}", self.root_uri, dataset_path)
     }
 
     fn table_path_from_dataset_uri(&self, dataset_uri: &str) -> Result<String> {
@@ -964,12 +964,12 @@ impl TableStore {
     pub async fn open_snapshot_table(
         &self,
         snapshot: &Snapshot,
-        table_key: &str,
+        type_key: &str,
     ) -> Result<Dataset> {
-        snapshot.open_dataset(table_key).await
+        snapshot.open_lance_dataset(type_key).await
     }
 
-    pub async fn open_at_entry(&self, entry: &SubTableEntry) -> Result<Dataset> {
+    pub async fn open_at_entry(&self, entry: &DatasetEntry) -> Result<Dataset> {
         entry.open(&self.root_uri, Some(&self.session)).await
     }
 
@@ -983,8 +983,8 @@ impl TableStore {
     /// dataset's manifest e_tag to match the entry's recorded incarnation; a
     /// mismatch fails closed. Main entries cannot undergo branch-name ABA and
     /// use the warm path unchanged.
-    pub async fn open_at_entry_verified(&self, entry: &SubTableEntry) -> Result<Dataset> {
-        if entry.table_branch.is_none() {
+    pub async fn open_at_entry_verified(&self, entry: &DatasetEntry) -> Result<Dataset> {
+        if entry.native_dataset_branch.is_none() {
             return self.open_at_entry(entry).await;
         }
         let dataset = entry.open(&self.root_uri, None).await?;
@@ -1005,7 +1005,7 @@ impl TableStore {
                 "change feed table '{}' has no persisted native-branch incarnation \
                  witness at the reopened dataset; the branch was deleted and \
                  recreated during the poll",
-                entry.table_key,
+                entry.type_key,
             )));
         }
         Ok(dataset)
@@ -1080,18 +1080,18 @@ impl TableStore {
     pub fn ensure_expected_version(
         &self,
         ds: &Dataset,
-        table_key: &str,
+        type_key: &str,
         expected_version: u64,
     ) -> Result<()> {
         let actual = ds.version().version;
         if actual != expected_version {
-            // Use the structured ExpectedVersionMismatch variant so callers
+            // Use the structured PublishedDatasetVersionMismatch variant so callers
             // (and the HTTP server) can match on details rather than parsing
             // the message. This drift is a publisher-style OCC failure: the
             // caller's pre-write view of the table version is stale relative
             // to the on-disk Lance head.
-            return Err(OmniError::manifest_expected_version_mismatch(
-                table_key,
+            return Err(OmniError::published_dataset_version_mismatch(
+                type_key,
                 expected_version,
                 actual,
             ));
@@ -1103,11 +1103,11 @@ impl TableStore {
         &self,
         dataset_uri: &str,
         branch: Option<&str>,
-        table_key: &str,
+        type_key: &str,
         expected_version: u64,
     ) -> Result<Dataset> {
         let ds = self.open_dataset_head(dataset_uri, branch).await?;
-        self.ensure_expected_version(&ds, table_key, expected_version)?;
+        self.ensure_expected_version(&ds, type_key, expected_version)?;
         Ok(ds)
     }
 
@@ -1115,7 +1115,7 @@ impl TableStore {
         &self,
         dataset_uri: &str,
         source_branch: Option<&str>,
-        table_key: &str,
+        type_key: &str,
         source_version: u64,
         target_branch: &str,
     ) -> Result<ForkOutcome<Dataset>> {
@@ -1125,7 +1125,7 @@ impl TableStore {
             .checkout_version(source_version)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.ensure_expected_version(&source_ds, table_key, source_version)?;
+        self.ensure_expected_version(&source_ds, type_key, source_version)?;
 
         let created = match crate::branch_control::create_branch_recoverably(
             &mut source_ds,
@@ -1152,7 +1152,7 @@ impl TableStore {
         let ds = self
             .open_dataset_head(dataset_uri, Some(target_branch))
             .await?;
-        self.ensure_expected_version(&ds, table_key, source_version)?;
+        self.ensure_expected_version(&ds, type_key, source_version)?;
         Ok(ForkOutcome::Created(ds))
     }
 
@@ -2461,7 +2461,7 @@ impl TableStore {
     pub async fn stage_keyed_write(
         &self,
         ds: Dataset,
-        table_key: &str,
+        type_key: &str,
         batch: RecordBatch,
         semantics: KeyedWriteSemantics,
     ) -> Result<StagedWrite> {
@@ -2474,14 +2474,14 @@ impl TableStore {
             .map_err(|_| OmniError::manifest_internal("keyed write batch bytes exceed u64"))?;
         if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::resource_limit(
-                format!("keyed write rows for {table_key}"),
+                format!("keyed write entities for {type_key}"),
                 KEYED_WRITE_MAX_ROWS as u64,
                 batch.num_rows() as u64,
             ));
         }
         if batch_bytes > KEYED_WRITE_MAX_BYTES {
             return Err(OmniError::resource_limit(
-                format!("keyed write bytes for {table_key}"),
+                format!("keyed write bytes for {type_key}"),
                 KEYED_WRITE_MAX_BYTES,
                 batch_bytes,
             ));
@@ -2489,13 +2489,13 @@ impl TableStore {
         let id_field_id = exact_id_primary_key_field_id(&ds, "stage_keyed_write")?;
         let expected_read_version = ds.version().version;
         let expected_schema_preorder_ids = schema_preorder_field_ids(&ds, "stage_keyed_write")?;
-        let source_ids = validate_keyed_write_batch_ids(&batch, table_key, "stage_keyed_write")?;
+        let source_ids = validate_keyed_write_batch_ids(&batch, type_key, "stage_keyed_write")?;
         if semantics == KeyedWriteSemantics::StrictInsert {
-            Self::preflight_strict_insert_ids(&ds, table_key, &source_ids).await?;
+            Self::preflight_strict_insert_ids(&ds, type_key, &source_ids).await?;
             return self
                 .stage_absence_proven_strict_insert(
                     ds,
-                    table_key,
+                    type_key,
                     batch,
                     source_ids,
                     id_field_id,
@@ -2511,7 +2511,7 @@ impl TableStore {
         // ceiling before handing the still-logical blob array to Lance. This
         // retains keyed fencing without an Append side door; Overwrite keeps
         // Lance's external-reference behavior because it accepts WriteParams.
-        let batch = self.prepare_keyed_write_batch(table_key, batch).await?;
+        let batch = self.prepare_keyed_write_batch(type_key, batch).await?;
 
         let merged_rows = batch.num_rows() as u64;
         let schema = batch.schema();
@@ -2544,7 +2544,7 @@ impl TableStore {
             // write. StrictInsert keeps the same check mandatory because its
             // exact filter is part of the requested conflict semantics.
             tracing::debug!(
-                table_key,
+                type_key,
                 error = %error,
                 "all-new upsert is not eligible for the insertion-absence certificate"
             );
@@ -2632,7 +2632,7 @@ impl TableStore {
         })?;
         if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::resource_limit(
-                format!("keyed write rows for {table_key}"),
+                format!("keyed write entities for {table_key}"),
                 KEYED_WRITE_MAX_ROWS as u64,
                 batch.num_rows() as u64,
             ));
@@ -2755,12 +2755,12 @@ impl TableStore {
     /// [`Self::stage_keyed_write`].
     pub async fn prepare_keyed_write_batch(
         &self,
-        table_key: &str,
+        type_key: &str,
         batch: RecordBatch,
     ) -> Result<RecordBatch> {
         let external_uris = collect_external_blob_uris(&batch)?;
         let preflight = self.preflight_external_blob_uris(&external_uris).await?;
-        self.prepare_keyed_write_batch_with_preflight(table_key, batch, &preflight)
+        self.prepare_keyed_write_batch_with_preflight(type_key, batch, &preflight)
             .await
     }
 
@@ -2833,8 +2833,8 @@ impl TableStore {
     /// touching any Lance/manifest authority. This is deliberately separate
     /// from [`Self::stage_keyed_write`]: Overwrite and deferred first-touch
     /// plans must fail before recovery arm / native-ref creation too.
-    pub fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()> {
-        validate_keyed_write_batch_ids(batch, table_key, "prepare keyed write batch")?;
+    pub fn validate_keyed_write_batch(&self, type_key: &str, batch: &RecordBatch) -> Result<()> {
+        validate_keyed_write_batch_ids(batch, type_key, "prepare keyed write batch")?;
         Ok(())
     }
 
@@ -2854,7 +2854,7 @@ impl TableStore {
     pub async fn stage_keyed_write_stream(
         &self,
         ds: Dataset,
-        table_key: &str,
+        type_key: &str,
         source: &Dataset,
         semantics: KeyedWriteSemantics,
     ) -> Result<StagedWrite> {
@@ -2875,9 +2875,9 @@ impl TableStore {
                     )
                 })?;
             let source_ids =
-                validate_keyed_write_batch_ids(&batch, table_key, "stage_keyed_write_stream")?;
+                validate_keyed_write_batch_ids(&batch, type_key, "stage_keyed_write_stream")?;
             if semantics == KeyedWriteSemantics::StrictInsert {
-                Self::preflight_strict_insert_ids(&ds, table_key, &source_ids).await?;
+                Self::preflight_strict_insert_ids(&ds, type_key, &source_ids).await?;
             }
         }
         if merged_rows == 0 {
@@ -3027,7 +3027,7 @@ impl TableStore {
     pub async fn scan_proven_insert_delta_bounded(
         &self,
         source: &Dataset,
-        table_key: &str,
+        type_key: &str,
         begin_version: u64,
         end_version: u64,
         external_preflight: &ExternalBlobPreflight,
@@ -3036,12 +3036,12 @@ impl TableStore {
 
         if begin_version >= end_version {
             return Err(OmniError::manifest_internal(format!(
-                "scan_proven_insert_delta_bounded for {table_key} requires begin_version < end_version, got {begin_version}..={end_version}"
+                "scan_proven_insert_delta_bounded for {type_key} requires begin_version < end_version, got {begin_version}..={end_version}"
             )));
         }
         if source.version().version != end_version {
             return Err(OmniError::manifest_internal(format!(
-                "scan_proven_insert_delta_bounded for {table_key} received source version {}, expected pinned end version {end_version}",
+                "scan_proven_insert_delta_bounded for {type_key} received source version {}, expected pinned end version {end_version}",
                 source.version().version
             )));
         }
@@ -3070,7 +3070,7 @@ impl TableStore {
             return Ok(bounded_proven_insert_stream(
                 output_schema,
                 raw,
-                table_key.to_string(),
+                type_key.to_string(),
             ));
         }
 
@@ -3152,7 +3152,7 @@ impl TableStore {
         Ok(bounded_proven_insert_stream(
             output_schema,
             materialized,
-            table_key.to_string(),
+            type_key.to_string(),
         ))
     }
 
@@ -3477,7 +3477,7 @@ impl TableStore {
         max_retries: Option<u32>,
     ) -> Result<(Dataset, Option<StagedTransactionIdentity>)> {
         // Skip Lance's auto-cleanup hook on every commit. OmniGraph owns version
-        // GC explicitly (optimize.rs::cleanup_all_tables); Lance's hook fires off
+        // GC explicitly (optimize.rs::cleanup_all_datasets); Lance's hook fires off
         // the *dataset's stored* `lance.auto_cleanup.*` config, which graphs
         // created before the v7 bump (6.0.1 defaulted auto_cleanup ON) still
         // carry — so `WriteParams::auto_cleanup = None` alone does NOT stop it on
@@ -4105,7 +4105,7 @@ impl TableStore {
                             OmniError::manifest_internal("pending scan byte count overflow")
                         })?;
                     return Err(OmniError::resource_limit(
-                        format!("keyed bytes for {}", account.table_key()),
+                        format!("keyed entity bytes for {}", account.table_key()),
                         KEYED_WRITE_MAX_BYTES,
                         actual,
                     ));
@@ -4420,7 +4420,7 @@ impl PendingScanAccount {
             .ok_or_else(|| OmniError::manifest_internal("pending scan row count overflow"))?;
         if next_rows > KEYED_WRITE_MAX_ROWS as u64 {
             return Err(OmniError::resource_limit(
-                format!("keyed rows for {}", self.table_key),
+                format!("keyed entities for {}", self.table_key),
                 KEYED_WRITE_MAX_ROWS as u64,
                 next_rows,
             ));
@@ -4431,7 +4431,7 @@ impl PendingScanAccount {
             .ok_or_else(|| OmniError::manifest_internal("pending scan byte count overflow"))?;
         if next_bytes > KEYED_WRITE_MAX_BYTES {
             return Err(OmniError::resource_limit(
-                format!("keyed bytes for {}", self.table_key),
+                format!("keyed entity bytes for {}", self.table_key),
                 KEYED_WRITE_MAX_BYTES,
                 next_bytes,
             ));
@@ -4450,7 +4450,7 @@ impl PendingScanAccount {
             .ok_or_else(|| OmniError::manifest_internal("pending scan row count overflow"))?;
         if actual > KEYED_WRITE_MAX_ROWS as u64 {
             return Err(OmniError::resource_limit(
-                format!("keyed rows for {}", self.table_key),
+                format!("keyed entities for {}", self.table_key),
                 KEYED_WRITE_MAX_ROWS as u64,
                 actual,
             ));
@@ -4468,7 +4468,7 @@ impl PendingScanAccount {
         let actual = self.bytes_with(bytes)?;
         if actual > KEYED_WRITE_MAX_BYTES {
             return Err(OmniError::resource_limit(
-                format!("keyed bytes for {}", self.table_key),
+                format!("keyed entity bytes for {}", self.table_key),
                 KEYED_WRITE_MAX_BYTES,
                 actual,
             ));
@@ -5663,7 +5663,7 @@ fn copy_proven_insert_batch_range(
 fn validate_proven_insert_source_batch(batch: &RecordBatch, table_key: &str) -> Result<()> {
     if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
         return Err(OmniError::resource_limit(
-            format!("proven insert delta rows for {table_key}"),
+            format!("proven insert delta entities for {table_key}"),
             KEYED_WRITE_MAX_ROWS as u64,
             batch.num_rows() as u64,
         ));

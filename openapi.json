@@ -1079,7 +1079,7 @@
           "mutations"
         ],
         "summary": "**Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.",
-        "description": "Apply a GQ mutation to a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /mutate`, which has identical semantics and a name that pairs\ncleanly with `POST /query`. Responses from this route include\n`Deprecation: true` and `Link: <mutate>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
+        "description": "Apply a GQ mutation to a branch. The deprecated route retains its request\nand execution semantics, while its response uses the current canonical\nvocabulary. New integrations should target `POST /mutate`. Responses include\n`Deprecation: true` and `Link: <mutate>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
         "operationId": "cluster_change",
         "parameters": [
           {
@@ -1272,7 +1272,7 @@
             "schema": {
               "type": "array",
               "items": {
-                "$ref": "#/components/schemas/ChangeEntityKind"
+                "$ref": "#/components/schemas/EntityKindOutput"
               }
             }
           },
@@ -1726,7 +1726,7 @@
             "schema": {
               "type": "array",
               "items": {
-                "$ref": "#/components/schemas/ChangeEntityKind"
+                "$ref": "#/components/schemas/EntityKindOutput"
               }
             }
           },
@@ -1860,7 +1860,7 @@
           "queries"
         ],
         "summary": "Stream the contents of a branch as NDJSON.",
-        "description": "Emits one JSON object per line (`application/x-ndjson`). Filter with\n`type_names` (node/edge type names) and/or the retained table-key\ncompatibility selectors in `table_keys`; both empty streams the entire\nbranch. Suitable for large exports — the response is streamed, not\nbuffered. Read-only.",
+        "description": "Emits one JSON object per line (`application/x-ndjson`). Filter with\n`type_names` (node/edge type names); an empty list streams the entire branch.\nSuitable for large exports — the response is streamed, not buffered.\nRead-only.",
         "operationId": "cluster_export",
         "parameters": [
           {
@@ -1950,6 +1950,16 @@
               }
             }
           },
+          "415": {
+            "description": "Request body must use application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Recovery required",
             "content": {
@@ -1974,7 +1984,7 @@
           "mutations"
         ],
         "summary": "**Deprecated** — use [`POST /load`](#tag/mutations/operation/load) instead.",
-        "description": "Bulk-load NDJSON data into a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /load`, which has identical semantics. Responses from this route\ninclude `Deprecation: true` and `Link: <load>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.",
+        "description": "Bulk-load NDJSON data into a branch. The deprecated route retains its\nparser and branch defaults, but its response uses the current canonical\nvocabulary. New integrations should target `POST /load`. Responses\ninclude `Deprecation: true` and `Link: <load>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.",
         "operationId": "cluster_ingest",
         "parameters": [
           {
@@ -3501,7 +3511,7 @@
     "schemas": {
       "BlobEntityKind": {
         "type": "string",
-        "description": "Logical graph entity selected by the Blob delivery surface.\n\nThis is intentionally graph vocabulary. The wire contract never exposes a\nLance dataset, table key, stable row id, or per-table lane.",
+        "description": "Logical graph entity selected by the Blob delivery surface.\n\nThis is intentionally graph vocabulary: callers select a node or edge.",
         "enum": [
           "node",
           "edge"
@@ -3724,7 +3734,7 @@
           "kind": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/ChangeEntityKind"
+              "$ref": "#/components/schemas/EntityKindOutput"
             },
             "description": "Feed scope the resume cursor is bound to. The snapshot honors `kind`\nand `type`; `op` constrains only subsequent polls."
           },
@@ -3851,17 +3861,9 @@
           }
         }
       },
-      "ChangeEntityKind": {
-        "type": "string",
-        "description": "Logical entity namespace of one change. Graph vocabulary only.",
-        "enum": [
-          "node",
-          "edge"
-        ]
-      },
       "ChangeErrorOutput": {
         "type": "object",
-        "description": "Error envelope for the read-only change surfaces (`…/changes`,\n`…/changes/baseline`, `…/commits/{commit_id}/changes`): a wire-compatible\nprojection of [`ErrorOutput`] restricted to the graph-vocabulary details\nthose routes can produce after their error projection. The write-path\nconflict shapes (key / manifest / merge / read-set), which carry physical\nstorage identifiers, are structurally absent, so storage vocabulary is\nunreachable from the change operations' schema graph. Servers serialize\n[`ErrorOutput`]; every field a change route can populate appears here with\nthe same name and meaning, and absent optionals are wire-compatible.",
+        "description": "Error envelope for the read-only change surfaces (`…/changes`,\n`…/changes/baseline`, `…/commits/{commit_id}/changes`): a wire-compatible\nprojection of [`ErrorOutput`] restricted to the graph-vocabulary details\nthose routes can produce after their error projection. The write-path\nconflict shapes (key / published-dataset-version / merge / read-set) are\nstructurally absent because change routes cannot produce them. Servers\nserialize [`ErrorOutput`]; every field a change route can populate appears\nhere with the same name and meaning, and absent optionals are wire-compatible.",
         "required": [
           "error"
         ],
@@ -4084,7 +4086,7 @@
       },
       "ChangeTypeOutput": {
         "type": "object",
-        "description": "Graph-scoped type identity. `id` is opaque: it survives a supported rename\nand changes after drop/re-add. It is never a retained table-key\ncompatibility selector, dataset, or path identifier.",
+        "description": "Graph-scoped type identity. `id` is opaque: it survives a supported rename\nand changes after drop/re-add. It is not a type-name selector or path.",
         "required": [
           "id",
           "name"
@@ -4142,7 +4144,7 @@
         "type": "object",
         "required": [
           "graph_commit_id",
-          "manifest_version",
+          "graph_manifest_version",
           "created_at"
         ],
         "properties": {
@@ -4158,16 +4160,16 @@
             "description": "Commit creation time as Unix epoch microseconds.",
             "example": 1714000000000000
           },
-          "graph_commit_id": {
-            "type": "string"
-          },
-          "manifest_branch": {
+          "graph_branch": {
             "type": [
               "string",
               "null"
             ]
           },
-          "manifest_version": {
+          "graph_commit_id": {
+            "type": "string"
+          },
+          "graph_manifest_version": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -4220,7 +4222,7 @@
             "type": "string"
           },
           "kind": {
-            "$ref": "#/components/schemas/ChangeEntityKind"
+            "$ref": "#/components/schemas/EntityKindOutput"
           },
           "op": {
             "$ref": "#/components/schemas/ChangeOpOutput"
@@ -4229,6 +4231,14 @@
             "$ref": "#/components/schemas/ChangeTypeOutput"
           }
         }
+      },
+      "EntityKindOutput": {
+        "type": "string",
+        "description": "Logical graph entity namespace.",
+        "enum": [
+          "node",
+          "edge"
+        ]
       },
       "ErrorCode": {
         "type": "string",
@@ -4317,17 +4327,6 @@
               }
             ]
           },
-          "manifest_conflict": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ManifestConflictOutput",
-                "description": "Set when the conflict is a publisher CAS rejection\n(`ManifestConflictDetails::ExpectedVersionMismatch`). The caller's\npre-write view of `table_key` was at published dataset version\n`expected`, but the graph manifest now publishes `actual`. Refresh and retry."
-              }
-            ]
-          },
           "merge_conflicts": {
             "type": "array",
             "items": {
@@ -4342,6 +4341,17 @@
               {
                 "$ref": "#/components/schemas/PreconditionFailureOutput",
                 "description": "Set when a mutation's graph-commit precondition failed\n(HTTP 412). Like `recovery_required`, the meaning rides this additive\nfield — `ErrorCode` is a closed rolling wire contract."
+              }
+            ]
+          },
+          "published_dataset_version_conflict": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedDatasetVersionConflictOutput",
+                "description": "Set when the conflict is a publisher CAS rejection. The caller's\npre-write view named the expected published dataset version, but the\ngraph manifest now publishes the actual version. Refresh and retry."
               }
             ]
           },
@@ -4390,13 +4400,6 @@
             ],
             "description": "Branch to export. Defaults to `main`."
           },
-          "table_keys": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Restrict the export using retained table-key compatibility selectors.\nEmpty exports all node and edge types."
-          },
           "type_names": {
             "type": "array",
             "items": {
@@ -4404,7 +4407,8 @@
             },
             "description": "Restrict the export to these node/edge type names. Empty exports all types."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ExternalBlobSourceOutput": {
         "type": "object",
@@ -4426,18 +4430,18 @@
       },
       "GraphBatchDeclarationOutput": {
         "type": "object",
-        "description": "One logical declaration touched by a graph-batch load.\n\nThis deliberately carries the accepted-schema name, not the backing\nretained table-key compatibility selector, dataset path, or Lance identity.",
+        "description": "One logical declaration touched by a graph-batch load.\n\nThis deliberately carries the accepted-schema name, not a backing dataset\nselector, path, or Lance identity.",
         "required": [
           "name",
-          "rows_loaded"
+          "entities_loaded"
         ],
         "properties": {
-          "name": {
-            "type": "string"
-          },
-          "rows_loaded": {
+          "entities_loaded": {
             "type": "integer",
             "minimum": 0
+          },
+          "name": {
+            "type": "string"
           }
         }
       },
@@ -4450,7 +4454,7 @@
           "mode",
           "nodes",
           "edges",
-          "total_rows"
+          "total_entities"
         ],
         "properties": {
           "actor_id": {
@@ -4499,7 +4503,7 @@
             },
             "description": "Logical node declarations touched by this batch, sorted by name."
           },
-          "total_rows": {
+          "total_entities": {
             "type": "integer",
             "minimum": 0
           }
@@ -4571,7 +4575,9 @@
           "branch",
           "branch_created",
           "mode",
-          "tables"
+          "nodes",
+          "edges",
+          "total_entities"
         ],
         "properties": {
           "actor_id": {
@@ -4603,14 +4609,26 @@
               }
             ]
           },
+          "edges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
+            },
+            "description": "Logical edge declarations touched by this load, sorted by name."
+          },
           "mode": {
             "$ref": "#/components/schemas/LoadMode"
           },
-          "tables": {
+          "nodes": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/IngestTableOutput"
-            }
+              "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
+            },
+            "description": "Logical node declarations touched by this load, sorted by name."
+          },
+          "total_entities": {
+            "type": "integer",
+            "minimum": 0
           },
           "uri": {
             "type": "string"
@@ -4652,22 +4670,6 @@
                 "description": "How existing entities are handled. Defaults to `merge`."
               }
             ]
-          }
-        }
-      },
-      "IngestTableOutput": {
-        "type": "object",
-        "required": [
-          "table_key",
-          "rows_loaded"
-        ],
-        "properties": {
-          "rows_loaded": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "table_key": {
-            "type": "string"
           }
         }
       },
@@ -4714,18 +4716,22 @@
       },
       "KeyConflictOutput": {
         "type": "object",
-        "description": "A strict insert rejected because `key` already names an entity in the\nselected node or edge type. The operation is effect-free when this output is returned;\npartial or ambiguous attempts surface `recovery_required` instead.",
+        "description": "A strict insert rejected because `entity_id` already names an entity in the\nselected node or edge type. The operation is effect-free when this output is returned;\npartial or ambiguous attempts surface `recovery_required` instead.",
         "required": [
-          "table_key"
+          "entity_kind",
+          "type_name"
         ],
         "properties": {
-          "key": {
+          "entity_id": {
             "type": [
               "string",
               "null"
             ]
           },
-          "table_key": {
+          "entity_kind": {
+            "$ref": "#/components/schemas/EntityKindOutput"
+          },
+          "type_name": {
             "type": "string"
           }
         }
@@ -4768,30 +4774,6 @@
           "merge"
         ]
       },
-      "ManifestConflictOutput": {
-        "type": "object",
-        "description": "Structured details for a publisher-level OCC failure. Surfaces alongside\nHTTP 409 when a write was rejected because the caller's pre-write view of\none backing dataset's published version was stale relative to the current\nhead. The expected/actual fields tell the client which dataset to refresh.",
-        "required": [
-          "table_key",
-          "expected",
-          "actual"
-        ],
-        "properties": {
-          "actual": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "expected": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "table_key": {
-            "type": "string"
-          }
-        }
-      },
       "MergeConflictKindOutput": {
         "type": "string",
         "enum": [
@@ -4807,24 +4789,28 @@
       "MergeConflictOutput": {
         "type": "object",
         "required": [
-          "table_key",
+          "entity_kind",
+          "type_name",
           "kind",
           "message"
         ],
         "properties": {
+          "entity_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entity_kind": {
+            "$ref": "#/components/schemas/EntityKindOutput"
+          },
           "kind": {
             "$ref": "#/components/schemas/MergeConflictKindOutput"
           },
           "message": {
             "type": "string"
           },
-          "row_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "table_key": {
+          "type_name": {
             "type": "string"
           }
         }
@@ -4900,6 +4886,34 @@
             ]
           },
           "expected": {
+            "type": "string"
+          }
+        }
+      },
+      "PublishedDatasetVersionConflictOutput": {
+        "type": "object",
+        "description": "Structured details for a publisher-level OCC failure. Surfaces alongside\nHTTP 409 when a write was rejected because the caller's pre-write view of\none backing dataset's published version was stale relative to the current\nhead. The expected/actual fields tell the client which dataset to refresh.",
+        "required": [
+          "entity_kind",
+          "type_name",
+          "expected_published_dataset_version",
+          "actual_published_dataset_version"
+        ],
+        "properties": {
+          "actual_published_dataset_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "entity_kind": {
+            "$ref": "#/components/schemas/EntityKindOutput"
+          },
+          "expected_published_dataset_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "type_name": {
             "type": "string"
           }
         }
@@ -5125,7 +5139,7 @@
       },
       "ResourceLimitOutput": {
         "type": "object",
-        "description": "A write rejected before durable recovery ownership because its bounded\nphysical plan exceeded an explicit row, byte, or transaction-chain ceiling.",
+        "description": "A write rejected before durable recovery ownership because its bounded\nphysical plan exceeded an explicit entity, byte, or transaction-chain ceiling.",
         "required": [
           "resource",
           "limit",
@@ -5154,14 +5168,14 @@
           "supported",
           "applied",
           "step_count",
-          "manifest_version",
+          "graph_manifest_version",
           "steps"
         ],
         "properties": {
           "applied": {
             "type": "boolean"
           },
-          "manifest_version": {
+          "graph_manifest_version": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -5210,66 +5224,70 @@
           }
         }
       },
-      "SnapshotOutput": {
+      "SnapshotDatasetOutput": {
         "type": "object",
         "required": [
-          "branch",
-          "manifest_version",
-          "internal_schema_version",
-          "tables"
+          "entity_kind",
+          "type_name",
+          "dataset_path",
+          "published_dataset_version",
+          "entity_count"
         ],
         "properties": {
-          "branch": {
+          "dataset_path": {
             "type": "string"
           },
-          "internal_schema_version": {
-            "type": "integer",
-            "format": "int32",
-            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at.",
-            "minimum": 0
-          },
-          "manifest_version": {
+          "entity_count": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
           },
-          "tables": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SnapshotTableOutput"
-            }
-          }
-        }
-      },
-      "SnapshotTableOutput": {
-        "type": "object",
-        "required": [
-          "table_key",
-          "table_path",
-          "table_version",
-          "row_count"
-        ],
-        "properties": {
-          "row_count": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
+          "entity_kind": {
+            "$ref": "#/components/schemas/EntityKindOutput"
           },
-          "table_branch": {
+          "native_dataset_branch": {
             "type": [
               "string",
               "null"
             ]
           },
-          "table_key": {
-            "type": "string"
-          },
-          "table_path": {
-            "type": "string"
-          },
-          "table_version": {
+          "published_dataset_version": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          },
+          "type_name": {
+            "type": "string"
+          }
+        }
+      },
+      "SnapshotOutput": {
+        "type": "object",
+        "required": [
+          "graph_branch",
+          "graph_manifest_version",
+          "internal_schema_version",
+          "datasets"
+        ],
+        "properties": {
+          "datasets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SnapshotDatasetOutput"
+            }
+          },
+          "graph_branch": {
+            "type": "string"
+          },
+          "graph_manifest_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "internal_schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at.",
             "minimum": 0
           }
         }

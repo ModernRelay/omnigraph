@@ -249,7 +249,7 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
             ref resource,
             limit: 8192,
             actual: 8193,
-        } if resource == "keyed rows for test:people"
+        } if resource == "keyed entities for test:people"
     ));
 
     let byte_error = PendingScanAccount::new(PendingScanBudget::new(
@@ -265,7 +265,7 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
             ref resource,
             limit: KEYED_WRITE_MAX_BYTES,
             actual,
-        } if resource == "keyed bytes for test:people"
+        } if resource == "keyed entity bytes for test:people"
             && actual == KEYED_WRITE_MAX_BYTES + 1
     ));
 }
@@ -631,8 +631,11 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
         .unwrap_err();
     assert!(matches!(
         error,
-        OmniError::KeyConflict { table_key, key }
-            if table_key == "Person" && key.as_deref() == Some("alice")
+        OmniError::KeyConflict {
+            type_key,
+            entity_id
+        }
+            if type_key == "Person" && entity_id.as_deref() == Some("alice")
     ));
     assert_eq!(
         Dataset::open(&uri).await.unwrap().version().version,
@@ -1062,8 +1065,11 @@ fn keyed_batch_validation_requires_non_null_utf8_unique_physical_ids() {
         .unwrap_err();
     assert!(matches!(
         duplicate_error,
-        OmniError::KeyConflict { table_key, key }
-            if table_key == "node:Person" && key.as_deref() == Some("alice")
+        OmniError::KeyConflict {
+            type_key,
+            entity_id
+        }
+            if type_key == "node:Person" && entity_id.as_deref() == Some("alice")
     ));
 
     let nullable_schema = Arc::new(Schema::new(vec![
@@ -1544,7 +1550,7 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             ref resource,
             limit: 8192,
             actual: 8193,
-        } if resource == "keyed rows for test:people"
+        } if resource == "keyed entities for test:people"
     ));
 }
 

@@ -28,10 +28,10 @@ The sealed general keyed adapter can mint that certificate in two cases:
 BranchMerge admits the no-target-preflight route only when the **complete**
 retained `(base_version, source_version]` chain verifies:
 
-- base and source name the same stable table identity/path, use stable row IDs,
+- base and source name the same stable dataset identity/path, use stable row IDs,
   and have an exact non-null UTF-8 `id` PK. Lance
   `BranchIdentifier::find_referenced_version` must place the base at the exact
-  graph merge-base version (same-ref equality is required when both snapshots
+  graph merge-base's published dataset version (same-ref equality is required when both snapshots
   name one ref);
 - the transaction count equals the numeric version interval, and every link
   has a UUID, reads exactly the previous version, and carries the exact v1
@@ -44,7 +44,7 @@ retained `(base_version, source_version]` chain verifies:
   preorder** of field IDs. This prevents existing indexes on top-level or
   nested fields from falsely claiming coverage of the new fragments;
 - every new fragment reports `physical_rows`, and the total across the chain
-  equals the manifest row-count delta.
+  equals the graph-manifest entity-count delta.
 
 The pinned source is then read by `_row_created_at_version` directly. A
 read-only normalizer lazily compacts one retained-parent Arrow slice at a time
@@ -64,8 +64,9 @@ prove and replay it again rather than falling back merely because this route
 created the source rows.
 
 The exact source and target native `BranchIdentifier`s are rechecked under the
-final schema → branch → table gates, together with source manifest/HEAD
-agreement and the existing target's ordinary manifest/HEAD baseline. Numeric
+final schema → branch → dataset gates, together with agreement between each
+source graph-manifest-published dataset version and dataset HEAD, plus the
+existing target's corresponding published-version/HEAD baseline. Numeric
 path/version equality cannot substitute for either incarnation because a ref
 can be deleted and recreated at the same version. A post-proof ABA is typed
 `ReadSetChanged` before the sidecar. The proven data-replay route is
@@ -77,7 +78,7 @@ unfamiliar operation, incomplete schema preorder, row-total mismatch, or a
 non-descendant ref is an optimization miss and falls back to the general
 ordered diff and ordinary fenced writes. The v1 property is not a signature or
 a trust mechanism for arbitrary Lance writers: raw direct-Lance mutation of a
-graph table is unsupported, and the marker is accepted only together with the
+graph dataset is unsupported, and the marker is accepted only together with the
 complete structural, ancestry, row-count, schema, and authority proof above.
 
 This shortcut removes the base scan, row signatures, target merge join, and
@@ -99,7 +100,7 @@ exact-content verification, and setup/operation/verification phase passed.
 
 The general route remains an ordered, row-by-row cursor merge:
 
-- `OrderedTableCursor` scans each table sorted by `id` and supports peek/pop
+- `OrderedTableCursor` scans each dataset sorted by `id` and supports peek/pop
   matching. Every production cursor explicitly sets both Lance scanner limits:
   **8,192 rows and 32 MiB decoded bytes per batch**; it never inherits the
   process/environment default for this retained transform.
@@ -118,27 +119,27 @@ The general route remains an ordered, row-by-row cursor merge:
   closed unless every classified id updates; true three-way rewrites still use
   exact-`id` Upsert pending L2b. The complete ordered chain is pre-minted under
   one `protocol_v4`
-  recovery sidecar, with at most **1,024 logical data transactions per table**.
+  recovery sidecar, with at most **1,024 logical data transactions per dataset**.
   A larger row or plan returns typed `ResourceLimitExceeded` before sidecar arm.
 - Exact recovery scans at most **1,026 versions**: the 1,024 logical data
   transactions plus backward-compatible headroom for one legacy
   `CreateIndex` tail and one compensating `Restore`. Current branch-merge
   writers build no indexes inline; the legacy allowance keeps v9 sidecars from
   older binaries recoverable. Restore headroom remains required because
-  recovery can crash after restoring the table but before publishing the
-  manifest outcome.
-- The merge runs per sub-table, but all chunks become graph-visible through one
-  atomic manifest update. Once the sidecar is armed, any chunk conflict retains
+  recovery can crash after restoring the dataset but before publishing the
+  graph-manifest outcome.
+- The merge runs per dataset, but all chunks become graph-visible through one
+  atomic graph-manifest update. Once the sidecar is armed, any chunk conflict retains
   recovery ownership and returns `RecoveryRequired`; the merge never retries
   semantically around a committed prefix.
 - Integrity validation projects staged deltas to `id`/`src`/`dst` plus scalar
   properties and streams those batches under the same row/byte scanner limits.
-  Because the unified evaluator currently needs one cross-table `ChangeSet`,
+  Because the unified evaluator currently needs one cross-dataset `ChangeSet`,
   exact projected Arrow bytes are charged before each batch is retained against
   one deterministic, operation-wide **32 MiB** budget (deleted-ID clones are
   charged conservatively too). Crossing it returns typed
-  `ResourceLimitExceeded` before a recovery sidecar or table effect; this keeps
-  many individually valid chunks/tables from reassembling into an unbounded
+  `ResourceLimitExceeded` before a recovery sidecar or dataset effect; this keeps
+  many individually valid chunks/datasets from reassembling into an unbounded
   scalar delta.
 
 ## Outcome enum
@@ -158,4 +159,7 @@ MergeConflictKind:
   ValueConstraintViolation
 ```
 
-Returned as `OmniError::MergeConflicts(Vec<MergeConflict { table_key, row_id?, kind, message }>)`. The HTTP server surfaces this as a 409 with structured `merge_conflicts[]` (top 3 + "+N more").
+Returned as `OmniError::MergeConflicts(Vec<MergeConflict { type_key,
+entity_id?, kind, message }>)`. The HTTP server projects `type_key` into
+`entity_kind` plus `type_name` and surfaces a 409 with structured
+`merge_conflicts[]` (top 3 + "+N more").

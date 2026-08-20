@@ -38,7 +38,7 @@ use api::{
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::http::{HeaderMap, StatusCode};
@@ -301,7 +301,7 @@ pub struct ApiError {
     code: Option<ErrorCode>,
     message: Box<str>,
     merge_conflicts: Box<[api::MergeConflictOutput]>,
-    manifest_conflict: Option<Box<api::ManifestConflictOutput>>,
+    published_dataset_version_conflict: Option<Box<api::PublishedDatasetVersionConflictOutput>>,
     read_set_conflict: Option<Box<api::ReadSetConflictOutput>>,
     key_conflict: Option<Box<api::KeyConflictOutput>>,
     resource_limit: Option<Box<api::ResourceLimitOutput>>,
@@ -643,7 +643,7 @@ impl ApiError {
             code: Some(ErrorCode::Unauthorized),
             message: message.into().into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -662,7 +662,7 @@ impl ApiError {
             code: Some(ErrorCode::Forbidden),
             message: message.into().into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -681,7 +681,7 @@ impl ApiError {
             code: Some(ErrorCode::BadRequest),
             message: message.into().into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -694,13 +694,28 @@ impl ApiError {
         }
     }
 
+    fn json_rejection(context: &str, rejection: JsonRejection) -> Self {
+        let status = match rejection.status() {
+            // Axum classifies serde data-shape failures as 422. OmniGraph's
+            // documented request-contract refusal is the typed 400 lane.
+            StatusCode::UNPROCESSABLE_ENTITY => StatusCode::BAD_REQUEST,
+            status => status,
+        };
+        let mut error = Self::bad_request(format!("{context}: {}", rejection.body_text()));
+        // Axum uses JsonRejection for data/syntax failures (400), a body-limit
+        // failure (413), and a missing/wrong JSON Content-Type (415). Keep the
+        // transport status while projecting every case into ErrorOutput.
+        error.status = status;
+        error
+    }
+
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             code: Some(ErrorCode::NotFound),
             message: message.into().into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -723,7 +738,7 @@ impl ApiError {
             code: Some(ErrorCode::MethodNotAllowed),
             message: message.into().into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -742,7 +757,7 @@ impl ApiError {
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -761,7 +776,7 @@ impl ApiError {
             code: Some(ErrorCode::BadRequest),
             message: message.into().into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -785,7 +800,7 @@ impl ApiError {
             )
             .into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -808,7 +823,7 @@ impl ApiError {
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -827,7 +842,7 @@ impl ApiError {
             code: Some(ErrorCode::Internal),
             message: message.into().into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -865,7 +880,7 @@ impl ApiError {
             code: None,
             message: message.into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -888,7 +903,7 @@ impl ApiError {
             code: Some(ErrorCode::TooManyRequests),
             message: message.into().into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -918,7 +933,7 @@ impl ApiError {
             code: Some(ErrorCode::Conflict),
             message: summarize_merge_conflicts(&conflicts).into_boxed_str(),
             merge_conflicts: conflicts.into_boxed_slice(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -931,13 +946,16 @@ impl ApiError {
         }
     }
 
-    fn manifest_version_conflict(message: String, details: api::ManifestConflictOutput) -> Self {
+    fn published_dataset_version_conflict(
+        message: String,
+        details: api::PublishedDatasetVersionConflictOutput,
+    ) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: Some(Box::new(details)),
+            published_dataset_version_conflict: Some(Box::new(details)),
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -956,7 +974,7 @@ impl ApiError {
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: Some(Box::new(details)),
             key_conflict: None,
             resource_limit: None,
@@ -975,7 +993,7 @@ impl ApiError {
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: Some(Box::new(details)),
             resource_limit: None,
@@ -994,7 +1012,7 @@ impl ApiError {
             code: Some(ErrorCode::BadRequest),
             message: message.into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: Some(Box::new(details)),
@@ -1016,7 +1034,7 @@ impl ApiError {
             code: None,
             message: message.into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -1039,7 +1057,7 @@ impl ApiError {
             code: None,
             message: message.into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -1063,7 +1081,7 @@ impl ApiError {
             message: format!("change feed gap at commit '{first_unreadable_commit_id}'")
                 .into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -1087,7 +1105,7 @@ impl ApiError {
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
             merge_conflicts: Box::default(),
-            manifest_conflict: None,
+            published_dataset_version_conflict: None,
             read_set_conflict: None,
             key_conflict: None,
             resource_limit: None,
@@ -1108,18 +1126,26 @@ impl ApiError {
                 ManifestErrorKind::BadRequest => Self::bad_request(err.message),
                 ManifestErrorKind::NotFound => Self::not_found(err.message),
                 ManifestErrorKind::Conflict => match err.details {
-                    Some(ManifestConflictDetails::ExpectedVersionMismatch {
-                        table_key,
-                        expected,
-                        actual,
-                    }) => Self::manifest_version_conflict(
-                        err.message,
-                        api::ManifestConflictOutput {
-                            table_key,
-                            expected,
-                            actual,
-                        },
-                    ),
+                    Some(ManifestConflictDetails::PublishedDatasetVersionMismatch {
+                        type_key,
+                        expected_published_dataset_version,
+                        actual_published_dataset_version,
+                    }) => {
+                        let Ok((entity_kind, type_name)) = api::entity_type_parts(&type_key) else {
+                            return Self::internal(
+                                "published dataset conflict named invalid graph type metadata",
+                            );
+                        };
+                        Self::published_dataset_version_conflict(
+                            err.message,
+                            api::PublishedDatasetVersionConflictOutput {
+                                entity_kind,
+                                type_name: type_name.to_string(),
+                                expected_published_dataset_version,
+                                actual_published_dataset_version,
+                            },
+                        )
+                    }
                     Some(ManifestConflictDetails::ReadSetChanged {
                         member,
                         expected,
@@ -1136,16 +1162,32 @@ impl ApiError {
                 },
                 ManifestErrorKind::Internal => Self::internal(err.message),
             },
-            OmniError::MergeConflicts(conflicts) => Self::merge_conflict(
-                conflicts
+            OmniError::MergeConflicts(conflicts) => {
+                let Ok(outputs) = conflicts
                     .iter()
-                    .map(api::MergeConflictOutput::from)
-                    .collect(),
-            ),
-            OmniError::KeyConflict { table_key, key } => Self::key_conflict(
-                format_key_conflict(&table_key, key.as_deref()),
-                api::KeyConflictOutput { table_key, key },
-            ),
+                    .map(api::merge_conflict_output)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                else {
+                    return Self::internal("merge conflict named invalid graph type metadata");
+                };
+                Self::merge_conflict(outputs)
+            }
+            OmniError::KeyConflict {
+                type_key,
+                entity_id,
+            } => {
+                let Ok((entity_kind, type_name)) = api::entity_type_parts(&type_key) else {
+                    return Self::internal("key conflict named invalid graph type metadata");
+                };
+                Self::key_conflict(
+                    format_key_conflict(entity_kind, type_name, entity_id.as_deref()),
+                    api::KeyConflictOutput {
+                        entity_kind,
+                        type_name: type_name.to_string(),
+                        entity_id,
+                    },
+                )
+            }
             OmniError::ResourceLimitExceeded {
                 resource,
                 limit,
@@ -1161,8 +1203,10 @@ impl ApiError {
             // Change paths rewrite this into a typed feed gap before it can
             // escape; anywhere else a reclaimed pinned version is an internal
             // retention surprise, not a caller error.
-            OmniError::HistoricalVersionReclaimed { version } => Self::internal(format!(
-                "historical published dataset version {version} was reclaimed"
+            OmniError::HistoricalVersionReclaimed {
+                published_dataset_version,
+            } => Self::internal(format!(
+                "historical published dataset version {published_dataset_version} was reclaimed"
             )),
             // Caller-side continuation fault (decode, checksum, or scope). The
             // "change cursor rejected: " prefix is a stable contract so raw
@@ -1270,10 +1314,10 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
         .iter()
         .take(3)
         .map(|conflict| {
-            let subject = graph_type_subject(&conflict.table_key);
-            match conflict.row_id.as_deref() {
-                Some(row_id) => format!(
-                    "{subject}, entity id '{row_id}' ({})",
+            let subject = graph_type_subject(conflict.entity_kind, &conflict.type_name);
+            match conflict.entity_id.as_deref() {
+                Some(entity_id) => format!(
+                    "{subject}, entity id '{entity_id}' ({})",
                     conflict.kind.as_str()
                 ),
                 None => format!("{subject} ({})", conflict.kind.as_str()),
@@ -1290,21 +1334,22 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
     format!("merge conflicts: {}{}", preview.join("; "), suffix)
 }
 
-fn graph_type_subject(table_key: &str) -> String {
-    if let Some(type_name) = table_key.strip_prefix("node:") {
-        format!("node type '{type_name}'")
-    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
-        format!("edge type '{type_name}'")
-    } else {
-        format!("dataset '{table_key}'")
+fn graph_type_subject(entity_kind: api::EntityKindOutput, type_name: &str) -> String {
+    match entity_kind {
+        api::EntityKindOutput::Node => format!("node type '{type_name}'"),
+        api::EntityKindOutput::Edge => format!("edge type '{type_name}'"),
     }
 }
 
-fn format_key_conflict(table_key: &str, key: Option<&str>) -> String {
-    let subject = graph_type_subject(table_key);
-    key.map_or_else(
+fn format_key_conflict(
+    entity_kind: api::EntityKindOutput,
+    type_name: &str,
+    entity_id: Option<&str>,
+) -> String {
+    let subject = graph_type_subject(entity_kind, type_name);
+    entity_id.map_or_else(
         || format!("{subject} already has this id"),
-        |key| format!("{subject} already has id '{key}'"),
+        |entity_id| format!("{subject} already has id '{entity_id}'"),
     )
 }
 
@@ -1327,7 +1372,9 @@ impl IntoResponse for ApiError {
                 error: self.message.into(),
                 code: self.code,
                 merge_conflicts: self.merge_conflicts.into_vec(),
-                manifest_conflict: self.manifest_conflict.map(|d| *d),
+                published_dataset_version_conflict: self
+                    .published_dataset_version_conflict
+                    .map(|d| *d),
                 read_set_conflict: self.read_set_conflict.map(|d| *d),
                 key_conflict: self.key_conflict.map(|d| *d),
                 resource_limit: self.resource_limit.map(|d| *d),
@@ -1350,8 +1397,9 @@ mod api_error_tests {
     #[test]
     fn merge_summary_uses_type_and_entity_vocabulary() {
         let summary = summarize_merge_conflicts(&[api::MergeConflictOutput {
-            table_key: "node:Person".to_string(),
-            row_id: Some("p1".to_string()),
+            entity_kind: api::EntityKindOutput::Node,
+            type_name: "Person".to_string(),
+            entity_id: Some("p1".to_string()),
             kind: api::MergeConflictKindOutput::DivergentUpdate,
             message: "divergent update for id 'p1'".to_string(),
         }]);
@@ -1360,6 +1408,30 @@ mod api_error_tests {
             "merge conflicts: node type 'Person', entity id 'p1' (divergent_update)"
         );
         assert!(!summary.contains("node:Person"));
+    }
+
+    #[tokio::test]
+    async fn published_dataset_version_conflict_is_409_with_graph_vocabulary() {
+        let response = ApiError::from_omni(OmniError::published_dataset_version_mismatch(
+            "edge:Knows",
+            7,
+            9,
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        let details = error
+            .published_dataset_version_conflict
+            .expect("structured published dataset version conflict");
+        assert_eq!(details.entity_kind, api::EntityKindOutput::Edge);
+        assert_eq!(details.type_name, "Knows");
+        assert_eq!(details.expected_published_dataset_version, 7);
+        assert_eq!(details.actual_published_dataset_version, 9);
+        assert!(!error.error.contains("edge:Knows"));
     }
 
     #[tokio::test]
@@ -1452,8 +1524,8 @@ mod api_error_tests {
     }
 
     #[tokio::test]
-    async fn key_conflict_is_409_with_structured_optional_key() {
-        for (key, expected_message) in [
+    async fn key_conflict_is_409_with_structured_optional_entity_id() {
+        for (entity_id, expected_message) in [
             (
                 Some("alice".to_string()),
                 "node type 'Person' already has id 'alice'",
@@ -1461,8 +1533,8 @@ mod api_error_tests {
             (None, "node type 'Person' already has this id"),
         ] {
             let response = ApiError::from_omni(OmniError::KeyConflict {
-                table_key: "node:Person".to_string(),
-                key: key.clone(),
+                type_key: "node:Person".to_string(),
+                entity_id: entity_id.clone(),
             })
             .into_response();
 
@@ -1473,8 +1545,9 @@ mod api_error_tests {
             let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
             assert!(error.error.contains(expected_message));
             let details = error.key_conflict.expect("structured key conflict");
-            assert_eq!(details.table_key, "node:Person");
-            assert_eq!(details.key, key);
+            assert_eq!(details.entity_kind, api::EntityKindOutput::Node);
+            assert_eq!(details.type_name, "Person");
+            assert_eq!(details.entity_id, entity_id);
             assert!(error.recovery_required.is_none());
         }
     }
@@ -1482,7 +1555,7 @@ mod api_error_tests {
     #[tokio::test]
     async fn resource_limit_is_413_with_structured_ceiling() {
         let response = ApiError::from_omni(OmniError::ResourceLimitExceeded {
-            resource: "keyed write rows for node:Person".to_string(),
+            resource: "keyed write entities for node:Person".to_string(),
             limit: 8192,
             actual: 8193,
         })
@@ -1495,7 +1568,7 @@ mod api_error_tests {
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, Some(ErrorCode::BadRequest));
         let details = error.resource_limit.expect("structured resource limit");
-        assert_eq!(details.resource, "keyed write rows for node:Person");
+        assert_eq!(details.resource, "keyed write entities for node:Person");
         assert_eq!(details.limit, 8192);
         assert_eq!(details.actual, 8193);
         assert!(error.recovery_required.is_none());
@@ -1735,7 +1808,7 @@ pub fn build_app(state: AppState) -> Router {
         // dedicated handler makes the zero-payload-read contract structural.
         .route("/blob", get(server_blob_get).head(server_blob_head))
         .route("/export", post(server_export))
-        // /read and /change are kept indefinitely for back-compat;
+        // /read and /change retain their deprecated route/request semantics;
         // their handlers carry #[deprecated] so the OpenAPI operation is
         // flagged and their responses include RFC 9745 Deprecation +
         // RFC 8288 Link headers. Suppress the call-site warning for the

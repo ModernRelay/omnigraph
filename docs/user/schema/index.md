@@ -177,9 +177,9 @@ spelling did not cross a drop/re-add lifetime. This refusal applies even when no
 rename occurred. This is additive field metadata, not a manifest-format bump.
 
 Named-branch reads have a separate incarnation fence. An explicit snapshot's
-reopened manifest must still carry the resolved graph commit, so deleting and
+reopened graph manifest must still carry the resolved graph commit, so deleting and
 recreating a named graph ref cannot retarget even an inherited-main dataset. V6
-entries do not persist Lance's native `BranchIdentifier`, and a manifest e-tag
+entries do not persist Lance's native `BranchIdentifier`, and a Lance dataset-manifest e-tag
 is not a sufficient substitute. After opening a dataset stored on a named native
 branch, OmniGraph cold-rechecks that the selected graph ref still has the
 captured effective head. A raced live read and an older branch-owned snapshot
@@ -228,7 +228,7 @@ Applying a plan reports whether it was supported, the steps applied, and the res
 
 ## Destructive drops — `--allow-data-loss`
 
-`DropProperty` and `DropType` steps default to `Soft` mode: the catalog tombstones the entry but the prior physical property field or dataset remains time-travel-reachable via `snapshot_at_version(prev)` until `omnigraph cleanup` runs. Soft drops are reversible.
+`DropProperty` and `DropType` steps default to `Soft` mode: the catalog tombstones the entry but the prior physical property field or dataset remains time-travel-reachable via `snapshot_at_graph_manifest_version(prev)` until `omnigraph cleanup` runs. Soft drops are reversible.
 
 Pass `--allow-data-loss` (CLI `schema apply`) or `allow_data_loss: true` (SDK `SchemaApplyOptions`) to promote every drop in the plan to `Hard` mode. Hard drops run `cleanup_old_versions` on the affected dataset immediately after the graph-manifest publish, making the prior physical property field or dataset unreachable. **Irreversible.**
 

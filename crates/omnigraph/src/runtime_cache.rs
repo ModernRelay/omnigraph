@@ -184,12 +184,12 @@ fn graph_index_cache_key(
             let table_key = format!("edge:{}", edge_name);
             resolved
                 .snapshot
-                .entry(&table_key)
+                .dataset(&table_key)
                 .map(|entry| GraphIndexTableState {
                     identity: entry.identity,
                     table_key,
-                    table_version: entry.table_version,
-                    table_branch: entry.table_branch.clone(),
+                    table_version: entry.published_dataset_version,
+                    table_branch: entry.native_dataset_branch.clone(),
                     e_tag: entry.version_metadata.e_tag().map(str::to_string),
                     endpoints: endpoints.clone(),
                 })
@@ -242,12 +242,12 @@ impl TableHandleCache {
         inner.entries.invalidate_all();
     }
 
-    /// Return the dataset for `(table_path, branch, version, e_tag)`, reusing a
+    /// Return the dataset for `(dataset_path, branch, version, e_tag)`, reusing a
     /// held handle (0 open IO) or opening it once at `location` with the shared
     /// `session` on a miss.
     pub async fn get_or_open(
         &self,
-        table_path: &str,
+        dataset_path: &str,
         table_branch: Option<&str>,
         version: u64,
         e_tag: Option<&str>,
@@ -255,7 +255,7 @@ impl TableHandleCache {
         session: Option<&Arc<Session>>,
     ) -> Result<Dataset> {
         let key = TableHandleKey {
-            table_path: table_path.to_string(),
+            table_path: dataset_path.to_string(),
             table_branch: table_branch.map(str::to_string),
             version,
             e_tag: e_tag.map(str::to_string),

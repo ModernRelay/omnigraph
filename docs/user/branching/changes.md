@@ -18,18 +18,18 @@ Diffing two read targets uses a three-level algorithm:
 ```
 ChangeOp: Insert | Update | Delete
 EntityKind: Node | Edge
-EntityChange { table_key, kind, type_name, id, op, manifest_version, endpoints?: {src, dst} }
+EntityChange { kind, type_name, id, op, published_dataset_version, endpoints?: {src, dst} }
 ChangeFilter { kinds?, type_names?, ops? }
-ChangeSet { from_version, to_version, branch?, changes[], stats }
+ChangeSet { from_graph_manifest_version, to_graph_manifest_version, graph_branch?, changes[], stats }
 ```
 
 ## Ordering
 
-Changed dataset lifetimes are grouped in ascending graph-visible `table_key`
-order, with immutable dataset identity as the hidden tie-breaker when one alias
-names multiple lifetimes across the compared snapshots. Entity order within one
-dataset is not a public guarantee; callers that need their own total order must
-sort the returned changes explicitly.
+Changed dataset lifetimes are grouped by entity kind and type name (edges before
+nodes), with immutable dataset identity as the hidden tie-breaker when one type
+name identifies multiple lifetimes across the compared snapshots. Entity order
+within one dataset is not a public guarantee; callers that need their own total
+order must sort the returned changes explicitly.
 
 ## Commit changes: exact per-commit entity diffs
 
@@ -66,7 +66,7 @@ feed cursor — and binds the exact commit and filter scope. Filters
 query parameters are rejected with 400.
 
 The CLI auto-consumes those pages without rebuilding one in-memory result:
-JSON keeps one output array open and human output prints each row before the
+JSON keeps one output array open and human output prints each change before the
 next page is fetched. `--page-token` instead fetches and prints exactly one raw
 page. If a later auto-pagination request fails, the command exits nonzero and
 stdout may contain the already-emitted prefix; redirect through a temporary

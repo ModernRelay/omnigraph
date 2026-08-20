@@ -52,9 +52,9 @@ async fn node_table_fixture(db: &Omnigraph, type_name: &str) -> (String, serde_j
         .await
         .unwrap();
     let table_path = &snapshot
-        .entry(&table_key)
+        .dataset(&table_key)
         .unwrap_or_else(|| panic!("live manifest has no registration for {table_key}"))
-        .table_path;
+        .dataset_path;
     let catalog = db.catalog();
     let stable_table_id = catalog
         .type_id(type_name)
@@ -633,12 +633,12 @@ async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
     // Convergence: manifest pin == Lance HEAD. Fails before the fix — the
     // manifest stays at manifest_pin while HEAD advanced past it.
     let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let entry = snap.entry("node:Person").unwrap();
+    let entry = snap.dataset("node:Person").unwrap();
     let lance_head = Dataset::open(&person_uri).await.unwrap().version().version;
     assert_eq!(
-        entry.table_version, lance_head,
+        entry.published_dataset_version, lance_head,
         "roll-back must publish so manifest pin ({}) == Lance HEAD ({})",
-        entry.table_version, lance_head,
+        entry.published_dataset_version, lance_head,
     );
 
     // The +1-loop victim: an additive schema apply must now succeed (its
@@ -889,10 +889,10 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .expect("Person entry exists post-load")
         .clone();
-    let manifest_pin = person_entry.table_version;
+    let manifest_pin = person_entry.published_dataset_version;
     let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
@@ -1224,11 +1224,14 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
     let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
     let after = snapshot_main(&db).await.unwrap();
-    assert_eq!(after.version(), before.version());
+    assert_eq!(
+        after.graph_manifest_version(),
+        before.graph_manifest_version()
+    );
     for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
         assert_eq!(
-            after.entry(key).unwrap().table_version,
-            before.entry(key).unwrap().table_version
+            after.dataset(key).unwrap().published_dataset_version,
+            before.dataset(key).unwrap().published_dataset_version
         );
     }
     assert!(
@@ -1264,11 +1267,14 @@ async fn recovery_ensure_indices_handles_empty_tables() {
     let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
     let after = snapshot_main(&db).await.unwrap();
-    assert_eq!(after.version(), before.version());
+    assert_eq!(
+        after.graph_manifest_version(),
+        before.graph_manifest_version()
+    );
     for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
         assert_eq!(
-            after.entry(key).unwrap().table_version,
-            before.entry(key).unwrap().table_version
+            after.dataset(key).unwrap().published_dataset_version,
+            before.dataset(key).unwrap().published_dataset_version
         );
     }
     assert!(
@@ -1281,11 +1287,14 @@ async fn recovery_ensure_indices_handles_empty_tables() {
     let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
     let after = snapshot_main(&db).await.unwrap();
-    assert_eq!(after.version(), before.version());
+    assert_eq!(
+        after.graph_manifest_version(),
+        before.graph_manifest_version()
+    );
     for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
         assert_eq!(
-            after.entry(key).unwrap().table_version,
-            before.entry(key).unwrap().table_version
+            after.dataset(key).unwrap().published_dataset_version,
+            before.dataset(key).unwrap().published_dataset_version
         );
     }
     assert!(
@@ -1463,13 +1472,13 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
 /// A sidecar from a feature-branch writer must be classified against
 /// THAT FEATURE BRANCH's manifest pin and Lance HEAD — not main's.
 /// Otherwise:
-///   - `snapshot.entry(table_key)` returns main's entry (or None) and
+///   - `snapshot.dataset(table_key)` returns main's entry (or None) and
 ///     `manifest_pinned` is wrong.
 ///   - `Dataset::open(path)` returns the default ref's HEAD (main),
 ///     missing the feature branch's actual drift.
 /// Either way, the classifier sees NoMovement → RollBack as no-op →
 /// sidecar deleted while feature's drift remains. Subsequent feature
-/// writers surface ExpectedVersionMismatch.
+/// writers surface PublishedDatasetVersionMismatch.
 ///
 /// Setup:
 /// - Load alice on main.
@@ -1519,17 +1528,17 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
         .await
         .unwrap();
     let feature_entry = feature_snapshot
-        .entry("node:Person")
+        .dataset("node:Person")
         .expect("feature snapshot must have Person entry");
-    let v_pin = feature_entry.table_version;
-    let feature_branch_name = feature_entry.table_branch.clone();
+    let v_pin = feature_entry.published_dataset_version;
+    let feature_branch_name = feature_entry.native_dataset_branch.clone();
     let main_pin = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .expect("main snapshot must have Person entry")
-        .table_version;
+        .published_dataset_version;
     let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
@@ -1629,17 +1638,17 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
         .await
         .unwrap();
     let feature_entry = feature_snapshot
-        .entry("node:Person")
+        .dataset("node:Person")
         .expect("feature snapshot must have Person entry");
-    let v_pin = feature_entry.table_version;
-    let feature_branch_name = feature_entry.table_branch.clone();
+    let v_pin = feature_entry.published_dataset_version;
+    let feature_branch_name = feature_entry.native_dataset_branch.clone();
     let main_pin = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
-        .entry("node:Person")
+        .dataset("node:Person")
         .expect("main snapshot must have Person entry")
-        .table_version;
+        .published_dataset_version;
     let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 

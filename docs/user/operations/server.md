@@ -80,7 +80,7 @@ graph id from the cluster's applied revision:
 | POST | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | disabled for cluster-backed serving; returns 409 and points operators at `omnigraph cluster apply` + restart |
 | POST | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | JSON-envelope load (`data` contains NDJSON), retained for compatibility (32 MB body limit) |
 | POST | `/graphs/{id}/load/ndjson?branch=&from=&mode=` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | strict raw `application/x-ndjson` graph batch; one request publishes one graph commit before success (32 MB body limit) |
-| POST | `/graphs/{id}/ingest` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | **deprecated** alias of `/load` (carries `Deprecation: true` + `Link: <load>; rel="successor-version"`) (32 MB body limit) |
+| POST | `/graphs/{id}/ingest` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | **deprecated** permissive-loader route with historical branch defaults and canonical current output (carries `Deprecation: true` + `Link: <load>; rel="successor-version"`) (32 MB body limit) |
 | GET | `/graphs/{id}/branches` | bearer + `read` | list branches |
 | POST | `/graphs/{id}/branches` | bearer + `branch_create` | create |
 | DELETE | `/graphs/{id}/branches/{branch}` | bearer + `branch_delete` | delete |
@@ -162,10 +162,10 @@ published `commit`; a mutation that changes no entities carries `commit: null`.
 
 ## Deprecated names (`/read`, `/change`)
 
-`POST /read` and `POST /change` are kept for back-compat indefinitely. They
-retain their legacy request shapes and otherwise share `/query` / `/mutate`
-execution semantics. `/read` also retains its legacy token-free response body;
-only `/query` exposes `graph_commit_id`. They are flagged as deprecated through
+`POST /read` and `POST /change` retain their deprecated route and request
+semantics. `/read` also retains its legacy token-free response body; `/change`
+uses the current canonical mutation response vocabulary. Only `/query` exposes
+`graph_commit_id`. They are flagged as deprecated through
 three independent channels:
 
 - **OpenAPI**: the operations carry `deprecated: true` in `openapi.json`, so
@@ -205,9 +205,8 @@ the ordinary admission limits, strictly validates the complete batch, and calls
 the actor-aware graph-batch loader. All touched declarations publish through
 the existing multi-dataset transaction. A successful response is terminal: the
 single graph commit is already visible. Its `nodes` and `edges` arrays contain
-only logical accepted-schema names and entity counts; the compatibility counters
-remain `rows_loaded` and `total_rows`. Physical datasets and Lance identities are
-not exposed.
+only logical accepted-schema names and `entities_loaded` counts; the aggregate
+is `total_entities`. Physical datasets and Lance identities are not exposed.
 
 `append` is strict insert, `merge` is upsert, and `overwrite` replaces each
 touched declaration's image. A malformed batch has no effect. Use multiple
@@ -253,8 +252,8 @@ fails.
 ## Blob delivery
 
 `GET /graphs/{graph_id}/blob` and its explicit `HEAD` twin select one logical
-node or edge property; they never expose a Lance dataset, compatibility `table_key`, row
-address, or physical Blob placement:
+node or edge property; they never expose a Lance dataset, type key, row address,
+or physical Blob placement:
 
 ```http
 GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
@@ -307,17 +306,18 @@ rather than widening that value to the whole target object.
 ## Error model
 
 Uniform
-`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, key_conflict?, read_set_conflict?, resource_limit?, external_blob_source?, blob_range?, recovery_required?, precondition_failure?, change_feed_gap?, change_diff_refusal? }`
+`ErrorOutput { error, code?, merge_conflicts[], published_dataset_version_conflict?, key_conflict?, read_set_conflict?, resource_limit?, external_blob_source?, blob_range?, recovery_required?, precondition_failure?, change_feed_gap?, change_diff_refusal? }`
 with
 `code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
 Merge conflicts attach structured
-`MergeConflictOutput { table_key, row_id?, kind, message }`.
+`MergeConflictOutput { entity_kind, type_name, entity_id?, kind, message }`.
 
-`manifest_conflict` is set on legacy per-dataset published-version rejections
-(HTTP 409). `ManifestConflictOutput { table_key, expected, actual }` tells the
-client which dataset was stale. Mutation and load use the unified coarse-OCC
-adapter described next; other writers retain this older conflict shape until
-they are enrolled.
+`published_dataset_version_conflict` is set on per-dataset published-version rejections
+(HTTP 409). `PublishedDatasetVersionConflictOutput { entity_kind, type_name,
+expected_published_dataset_version, actual_published_dataset_version }` tells
+the client which dataset was stale. Mutation and load use the unified
+coarse-OCC adapter described next; other writers retain this conflict shape
+until they are enrolled.
 
 `read_set_conflict` is set when a prepared write is rejected before any dataset
 effect because its branch authority changed. The HTTP status is 409 and

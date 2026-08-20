@@ -107,14 +107,14 @@ pub enum CompilerError {
     Storage(String),
 
     #[error(
-        "@unique constraint violation on {type_name}.{property}: duplicate value '{value}' in input entities at positions {first_row} and {second_row}"
+        "@unique constraint violation on {type_name}.{property}: duplicate value '{value}' in input entities at positions {first_input_position} and {second_input_position}"
     )]
     UniqueConstraint {
         type_name: String,
         property: String,
         value: String,
-        first_row: usize,
-        second_row: usize,
+        first_input_position: usize,
+        second_input_position: usize,
     },
 
     #[error("plan error: {0}")]
@@ -182,8 +182,8 @@ mod tests {
             type_name: "Person".to_string(),
             property: "email".to_string(),
             value: "same@example.com".to_string(),
-            first_row: 3,
-            second_row: 7,
+            first_input_position: 3,
+            second_input_position: 7,
         };
         assert_eq!(
             err.to_string(),

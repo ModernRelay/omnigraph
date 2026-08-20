@@ -86,7 +86,7 @@ query all_replacement_persons() {
 //   Tabular  × Insert  × Main  (returns_historical_data)
 //   Traversal × Insert × Main  (traversal_uses_historical_graph_index)
 //   Tabular  × Update  × Main  (multiple_versions_sees_correct_state)
-//   Error case                  (snapshot_at_version_fails_for_nonexistent_version)
+//   Error case                  (snapshot_at_graph_manifest_version_fails_for_nonexistent_version)
 //
 // New coverage (9 tests below):
 //   Tabular    × Delete node  × Main   → non-empty becomes smaller
@@ -263,11 +263,11 @@ async fn run_query_at_traversal_uses_historical_graph_index() {
 }
 
 #[tokio::test]
-async fn snapshot_at_version_fails_for_nonexistent_version() {
+async fn snapshot_at_graph_manifest_version_fails_for_nonexistent_version() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
 
-    let result = db.snapshot_at_version(99999).await;
+    let result = db.snapshot_at_graph_manifest_version(99999).await;
     assert!(result.is_err(), "non-existent version should return error");
 }
 
@@ -860,7 +860,7 @@ async fn historical_read_of_reclaimed_version_is_typed() {
 
     // …then reclaim every pre-current Person version directly.
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let person_path = &snapshot.entry("node:Person").unwrap().table_path;
+    let person_path = &snapshot.dataset("node:Person").unwrap().dataset_path;
     let person_uri = format!(
         "{}/{}",
         db.uri().trim_end_matches('/'),

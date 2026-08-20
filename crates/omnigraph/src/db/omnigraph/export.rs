@@ -93,7 +93,6 @@ impl Omnigraph {
         self: &Arc<Self>,
         branch: &str,
         type_names: &[String],
-        table_keys: &[String],
     ) -> Result<ExportCut> {
         let slot = self.write_queue().try_acquire_export_cut().ok_or_else(|| {
             OmniError::ResourceLimitExceeded {
@@ -106,7 +105,7 @@ impl Omnigraph {
         self.heal_pending_recovery_sidecars_outcome().await?;
         let (resolved, catalog) = self.capture_read_view(ReadTarget::branch(branch)).await?;
         let snapshot = resolved.snapshot;
-        let selected_tables = export_table_keys(&snapshot, type_names, table_keys)?;
+        let selected_tables = export_type_keys(&snapshot, type_names)?;
 
         Ok(ExportCut {
             db: Arc::clone(self),
@@ -144,36 +143,35 @@ impl Omnigraph {
 pub(super) async fn entity_at_target(
     db: &Omnigraph,
     target: impl Into<ReadTarget>,
-    table_key: &str,
+    type_key: &str,
     id: &str,
 ) -> Result<Option<serde_json::Value>> {
     let resolved = db.resolved_target(target).await?;
-    entity_from_snapshot(db, &resolved.snapshot, table_key, id).await
+    entity_from_snapshot(db, &resolved.snapshot, type_key, id).await
 }
 
 pub(super) async fn entity_at(
     db: &Omnigraph,
-    table_key: &str,
+    type_key: &str,
     id: &str,
-    version: u64,
+    graph_manifest_version: u64,
 ) -> Result<Option<serde_json::Value>> {
     let snap = db
         .coordinator
         .read()
         .await
-        .snapshot_at_version(version)
+        .snapshot_at_graph_manifest_version(graph_manifest_version)
         .await?;
-    entity_from_snapshot(db, &snap, table_key, id).await
+    entity_from_snapshot(db, &snap, type_key, id).await
 }
 
 pub(super) async fn export_jsonl(
     db: &Omnigraph,
     branch: &str,
     type_names: &[String],
-    table_keys: &[String],
 ) -> Result<String> {
     let mut out = Vec::new();
-    export_jsonl_to_writer(db, branch, type_names, table_keys, &mut out).await?;
+    export_jsonl_to_writer(db, branch, type_names, &mut out).await?;
     String::from_utf8(out)
         .map_err(|err| OmniError::manifest(format!("export produced invalid UTF-8: {}", err)))
 }
@@ -182,7 +180,6 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
     db: &Omnigraph,
     branch: &str,
     type_names: &[String],
-    table_keys: &[String],
     writer: &mut W,
 ) -> Result<()> {
     // Reserve before the first manifest read. Cleanup, schema apply, branch
@@ -196,7 +193,7 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
         }
     })?;
     let (resolved, catalog) = db.capture_read_view(ReadTarget::branch(branch)).await?;
-    let selected_tables = export_table_keys(&resolved.snapshot, type_names, table_keys)?;
+    let selected_tables = export_type_keys(&resolved.snapshot, type_names)?;
     let mut emit =
         |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));
     export_selected_tables(
@@ -262,7 +259,7 @@ async fn capture_baseline_parts(
         )))
         .await?;
     let type_names = scope.type_names.clone().unwrap_or_default();
-    let selected_tables: Vec<String> = export_table_keys(&resolved.snapshot, &type_names, &[])?
+    let selected_tables: Vec<String> = export_type_keys(&resolved.snapshot, &type_names)?
         .into_iter()
         .filter(|table_key| {
             let kind = if table_key.starts_with("edge:") {
@@ -325,16 +322,16 @@ pub(super) async fn capture_change_baseline<W: Write>(
 async fn entity_from_snapshot(
     db: &Omnigraph,
     snapshot: &Snapshot,
-    table_key: &str,
+    type_key: &str,
     id: &str,
 ) -> Result<Option<serde_json::Value>> {
-    if snapshot.entry(table_key).is_none() {
+    if snapshot.dataset(type_key).is_none() {
         return Ok(None);
     }
 
     let ds = db
         .storage()
-        .open_snapshot_at_table(snapshot, table_key)
+        .open_snapshot_at_table(snapshot, type_key)
         .await?;
     let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
     let batches = db
@@ -364,26 +361,12 @@ where
     Ok(())
 }
 
-fn export_table_keys(
-    snapshot: &Snapshot,
-    type_names: &[String],
-    table_keys: &[String],
-) -> Result<Vec<String>> {
+fn export_type_keys(snapshot: &Snapshot, type_names: &[String]) -> Result<Vec<String>> {
     let available = snapshot
-        .entries()
-        .map(|entry| entry.table_key.clone())
+        .datasets()
+        .map(|entry| entry.type_key.clone())
         .collect::<BTreeSet<_>>();
     let mut selected = BTreeSet::new();
-
-    for table_key in table_keys {
-        if !available.contains(table_key) {
-            return Err(OmniError::manifest(format!(
-                "unknown export table '{}'",
-                table_key
-            )));
-        }
-        selected.insert(table_key.clone());
-    }
 
     for type_name in type_names {
         let mut matched = false;

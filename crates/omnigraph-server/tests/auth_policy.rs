@@ -344,12 +344,11 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
     )
     .await;
     assert_eq!(snapshot_status, StatusCode::OK);
-    assert_eq!(snapshot_body["branch"], "main");
+    assert_eq!(snapshot_body["graph_branch"], "main");
 
     let export_request = ExportRequest {
         branch: Some("main".to_string()),
         type_names: Vec::new(),
-        table_keys: Vec::new(),
     };
     let (forbidden_status, forbidden_body) = json_response(
         &app,

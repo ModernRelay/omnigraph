@@ -70,12 +70,12 @@ async fn key_column_index_coverage_detects_btree_presence() {
 
     // The shared fixture explicitly reconciles indexes after loading, so the
     // edge `src` BTREE is present and fully covered here.
-    let edge_ds = snap.open("edge:Knows").await.unwrap();
+    let edge_ds = snap.open_dataset("edge:Knows").await.unwrap();
     let src_cov = edge_ds.index_coverage("src").await.unwrap();
     assert_eq!(src_cov, IndexCoverage::Indexed, "edge src is BTREE-indexed");
 
     // A node property column with no scalar index → Degraded (the warn path).
-    let node_ds = snap.open("node:Person").await.unwrap();
+    let node_ds = snap.open_dataset("node:Person").await.unwrap();
     let age_cov = node_ds.index_coverage("age").await.unwrap();
     assert!(
         matches!(age_cov, IndexCoverage::Degraded { .. }),
@@ -96,7 +96,7 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
     // The fixture's explicit post-load `ensure_indices` covers every current
     // Knows fragment → Indexed.
     let snap = snapshot_main(&db).await.unwrap();
-    let edge_ds = snap.open("edge:Knows").await.unwrap();
+    let edge_ds = snap.open_dataset("edge:Knows").await.unwrap();
     assert_eq!(
         edge_ds.index_coverage("src").await.unwrap(),
         IndexCoverage::Indexed,
@@ -114,7 +114,7 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
     .unwrap();
 
     let snap2 = snapshot_main(&db).await.unwrap();
-    let edge_ds2 = snap2.open("edge:Knows").await.unwrap();
+    let edge_ds2 = snap2.open_dataset("edge:Knows").await.unwrap();
     let cov = edge_ds2.index_coverage("src").await.unwrap();
     assert!(
         matches!(cov, IndexCoverage::Degraded { .. }),

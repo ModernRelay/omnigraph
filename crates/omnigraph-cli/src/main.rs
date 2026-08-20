@@ -6,7 +6,8 @@ use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, ChangeOutput, CommitOutput, ErrorOutput,
-    GraphBatchLoadOutput, IngestOutput, ReadOutput, SchemaApplyOutput, SnapshotTableOutput,
+    GraphBatchDeclarationOutput, GraphBatchLoadOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
+    SnapshotDatasetOutput,
 };
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
@@ -371,9 +372,9 @@ async fn main() -> Result<()> {
         } => {
             // stderr so `--json` consumers reading stdout are unaffected.
             eprintln!(
-                "warning: `omnigraph ingest` is a deprecated compatibility alias kept indefinitely; \
+                "warning: `omnigraph ingest` is a deprecated loader command; \
                  use strict graph-batch `omnigraph load --from <base> --mode <mode>` for new integrations \
-                 (ingest defaults: --from main --mode merge)"
+                 (ingest retains its permissive parser and defaults: --from main --mode merge; output uses current canonical vocabulary)"
             );
             let client = client::GraphClient::resolve_with_policy(
                 capability,
@@ -577,7 +578,7 @@ async fn main() -> Result<()> {
                     cli.store.as_deref(),
                 )
                 .await?;
-                let kinds: Vec<omnigraph_api_types::ChangeEntityKind> =
+                let kinds: Vec<omnigraph_api_types::EntityKindOutput> =
                     kinds.into_iter().map(Into::into).collect();
                 let ops: Vec<omnigraph_api_types::ChangeOpOutput> =
                     ops.into_iter().map(Into::into).collect();
@@ -657,7 +658,7 @@ async fn main() -> Result<()> {
                     cli.store.as_deref(),
                 )
                 .await?;
-                let kinds: Vec<omnigraph_api_types::ChangeEntityKind> =
+                let kinds: Vec<omnigraph_api_types::EntityKindOutput> =
                     kinds.into_iter().map(Into::into).collect();
                 let ops: Vec<omnigraph_api_types::ChangeOpOutput> =
                     ops.into_iter().map(Into::into).collect();
@@ -728,7 +729,7 @@ async fn main() -> Result<()> {
                     cli.store.as_deref(),
                 )
                 .await?;
-                let kinds: Vec<omnigraph_api_types::ChangeEntityKind> =
+                let kinds: Vec<omnigraph_api_types::EntityKindOutput> =
                     kinds.into_iter().map(Into::into).collect();
                 let ops: Vec<omnigraph_api_types::ChangeOpOutput> =
                     ops.into_iter().map(Into::into).collect();
@@ -979,10 +980,10 @@ async fn main() -> Result<()> {
                 print_json(&payload)?;
             } else {
                 print_snapshot_human(
-                    &payload.branch,
-                    payload.manifest_version,
+                    &payload.graph_branch,
+                    payload.graph_manifest_version,
                     payload.internal_schema_version,
-                    &payload.tables,
+                    &payload.datasets,
                 );
             }
         }
@@ -991,7 +992,6 @@ async fn main() -> Result<()> {
             branch,
             jsonl,
             type_names,
-            table_keys,
         } => {
             let client = client::GraphClient::resolve(
                 capability,
@@ -1009,9 +1009,7 @@ async fn main() -> Result<()> {
 
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-            client
-                .export(&branch, &type_names, &table_keys, &mut stdout)
-                .await?;
+            client.export(&branch, &type_names, &mut stdout).await?;
         }
         Command::Blob { command } => match command {
             BlobCommand::Get {
@@ -1295,16 +1293,16 @@ async fn main() -> Result<()> {
             if json {
                 let value = serde_json::json!({
                     "uri": uri,
-                    "tables": stats.iter().map(|s| serde_json::json!({
-                        "table_key": s.table_key,
+                    "datasets": stats.iter().map(|s| serde_json::json!({
+                        "type_key": s.type_key,
                         "fragments_removed": s.fragments_removed,
                         "fragments_added": s.fragments_added,
                         "committed": s.committed,
                         "skipped": s.skipped.map(|r| r.as_str()),
-                        "manifest_version": s.manifest_version,
+                        "published_dataset_version": s.published_dataset_version,
                         "lance_head_version": s.lance_head_version,
                         "pending_indexes": s.pending_indexes.iter().map(|p| serde_json::json!({
-                            "column": p.column,
+                            "property": p.property,
                             "reason": p.reason,
                         })).collect::<Vec<_>>(),
                     })).collect::<Vec<_>>(),
@@ -1313,7 +1311,7 @@ async fn main() -> Result<()> {
             } else {
                 println!("optimize {} — {} datasets", uri, stats.len());
                 for s in &stats {
-                    let subject = graph_type_subject(&s.table_key);
+                    let subject = graph_type_subject(&s.type_key);
                     if let Some(reason) = s.skipped {
                         println!("  {subject:<40} skipped ({reason})");
                     } else if s.committed {
@@ -1327,7 +1325,7 @@ async fn main() -> Result<()> {
                     for p in &s.pending_indexes {
                         println!(
                             "    ↳ index pending on property '{}': {}",
-                            p.column, p.reason
+                            p.property, p.reason
                         );
                     }
                 }
@@ -1354,7 +1352,7 @@ async fn main() -> Result<()> {
                 .repair(omnigraph::db::RepairOptions { confirm, force })
                 .await?;
             let refused_count = stats
-                .tables
+                .datasets
                 .iter()
                 .filter(|s| matches!(s.action, omnigraph::db::RepairAction::Refused))
                 .count();
@@ -1363,10 +1361,10 @@ async fn main() -> Result<()> {
                     "uri": uri,
                     "confirm": confirm,
                     "force": force,
-                    "manifest_version": stats.manifest_version,
-                    "tables": stats.tables.iter().map(|s| serde_json::json!({
-                        "table_key": s.table_key,
-                        "manifest_version": s.manifest_version,
+                    "graph_manifest_version": stats.graph_manifest_version,
+                    "datasets": stats.datasets.iter().map(|s| serde_json::json!({
+                        "type_key": s.type_key,
+                        "published_dataset_version": s.published_dataset_version,
                         "lance_head_version": s.lance_head_version,
                         "classification": s.classification.as_str(),
                         "action": s.action.as_str(),
@@ -1381,13 +1379,13 @@ async fn main() -> Result<()> {
                     "repair {} — {} mode, {} datasets",
                     uri,
                     mode,
-                    stats.tables.len()
+                    stats.datasets.len()
                 );
-                for s in &stats.tables {
-                    let drift = if s.manifest_version == s.lance_head_version {
-                        format!("{}", s.manifest_version)
+                for s in &stats.datasets {
+                    let drift = if s.published_dataset_version == s.lance_head_version {
+                        format!("{}", s.published_dataset_version)
                     } else {
-                        format!("{} → {}", s.manifest_version, s.lance_head_version)
+                        format!("{} → {}", s.published_dataset_version, s.lance_head_version)
                     };
                     let ops = if s.operations.is_empty() {
                         String::new()
@@ -1401,7 +1399,7 @@ async fn main() -> Result<()> {
                         .unwrap_or_default();
                     println!(
                         "  {:<40} {:<12} {:<22} {}{}{}",
-                        graph_type_subject(&s.table_key),
+                        graph_type_subject(&s.type_key),
                         s.action.as_str(),
                         s.classification.as_str(),
                         drift,
@@ -1479,8 +1477,8 @@ async fn main() -> Result<()> {
                     "uri": uri,
                     "keep_versions": keep,
                     "older_than_secs": older_than_dur.map(|d| d.as_secs()),
-                    "tables": stats.iter().map(|s| serde_json::json!({
-                        "table_key": s.table_key,
+                    "datasets": stats.iter().map(|s| serde_json::json!({
+                        "type_key": s.type_key,
                         "bytes_removed": s.bytes_removed,
                         "old_versions_removed": s.old_versions_removed,
                         "error": s.error,
@@ -1493,7 +1491,7 @@ async fn main() -> Result<()> {
                 let failed: Vec<String> = stats
                     .iter()
                     .filter(|s| s.error.is_some())
-                    .map(|s| graph_type_subject(&s.table_key))
+                    .map(|s| graph_type_subject(&s.type_key))
                     .collect();
                 println!(
                     "cleanup {} ({}) — removed {} versions ({} bytes) across {} datasets",

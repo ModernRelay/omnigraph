@@ -168,7 +168,7 @@ omnigraph cluster refresh --config company-brain          # re-observe live grap
 ```
 
 `status` never touches the graphs; `refresh` opens them read-only and
-records what it finds — manifest versions, live schema digests, catalog blob
+records what it finds — graph-manifest versions, live schema digests, catalog blob
 integrity. If someone changed a graph behind the control plane's back (a
 direct `omnigraph schema apply`, a tampered catalog file), refresh marks the
 resource **`drifted`**.

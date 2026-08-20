@@ -48,9 +48,9 @@ pub struct LoadReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IngestTableResult {
-    pub table_key: String,
-    pub rows_loaded: usize,
+pub struct IngestDeclarationResult {
+    pub type_key: String,
+    pub entities_loaded: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +59,7 @@ pub struct IngestResult {
     pub base_branch: String,
     pub branch_created: bool,
     pub mode: LoadMode,
-    pub tables: Vec<IngestTableResult>,
+    pub declarations: Vec<IngestDeclarationResult>,
 }
 
 /// Load mode for data ingestion.
@@ -116,7 +116,7 @@ impl Omnigraph {
     }
 
     #[deprecated(
-        note = "use `load_as` with an explicit `base` for new integrations; the ingest family is kept indefinitely for compatibility"
+        note = "use `load_as` with an explicit `base` for new integrations; ingest retains its parser and branch defaults, but its result follows the current canonical vocabulary"
     )]
     pub async fn ingest(
         &self,
@@ -129,13 +129,12 @@ impl Omnigraph {
         self.ingest_as(branch, from, data, mode, None).await
     }
 
-    /// Indefinitely supported compatibility shim over the unified `load_as`.
-    /// Preserves the historical
-    /// ingest contract exactly: `from: None` means fork from `main`, and the
-    /// base branch is recorded in the result even when the target branch
-    /// already existed (no fork happened).
+    /// Deprecated parser/default shim over the unified `load_as`.
+    /// Preserves the ingest branch semantics: `from: None` means fork from
+    /// `main`, and the base graph branch is recorded even when the target
+    /// already existed. Its result uses the current canonical vocabulary.
     #[deprecated(
-        note = "use `load_as` with an explicit `base` for new integrations; the ingest family is kept indefinitely for compatibility"
+        note = "use `load_as` with an explicit `base` for new integrations; ingest retains its parser and branch defaults, but its result follows the current canonical vocabulary"
     )]
     pub async fn ingest_as(
         &self,
@@ -152,7 +151,7 @@ impl Omnigraph {
     }
 
     #[deprecated(
-        note = "use `load_file_as` with an explicit `base` for new integrations; the ingest family is kept indefinitely for compatibility"
+        note = "use `load_file_as` with an explicit `base` for new integrations; ingest retains its parser and branch defaults, but its result follows the current canonical vocabulary"
     )]
     pub async fn ingest_file(
         &self,
@@ -166,7 +165,7 @@ impl Omnigraph {
     }
 
     #[deprecated(
-        note = "use `load_file_as` with an explicit `base` for new integrations; the ingest family is kept indefinitely for compatibility"
+        note = "use `load_file_as` with an explicit `base` for new integrations; ingest retains its parser and branch defaults, but its result follows the current canonical vocabulary"
     )]
     pub async fn ingest_file_as(
         &self,
@@ -428,35 +427,35 @@ impl LoadMode {
 
 impl LoadResult {
     fn into_ingest_result(self, mode: LoadMode) -> IngestResult {
-        let tables = self.to_ingest_tables();
+        let declarations = self.to_ingest_declarations();
         IngestResult {
             branch: self.branch,
             base_branch: self.base_branch.unwrap_or_else(|| "main".to_string()),
             branch_created: self.branch_created,
             mode,
-            tables,
+            declarations,
         }
     }
 
-    pub fn to_ingest_tables(&self) -> Vec<IngestTableResult> {
-        let mut tables = self
+    pub fn to_ingest_declarations(&self) -> Vec<IngestDeclarationResult> {
+        let mut declarations = self
             .nodes_loaded
             .iter()
-            .map(|(type_name, rows_loaded)| IngestTableResult {
-                table_key: format!("node:{type_name}"),
-                rows_loaded: *rows_loaded,
+            .map(|(type_name, entities_loaded)| IngestDeclarationResult {
+                type_key: format!("node:{type_name}"),
+                entities_loaded: *entities_loaded,
             })
             .chain(
                 self.edges_loaded
                     .iter()
-                    .map(|(edge_name, rows_loaded)| IngestTableResult {
-                        table_key: format!("edge:{edge_name}"),
-                        rows_loaded: *rows_loaded,
+                    .map(|(edge_name, entities_loaded)| IngestDeclarationResult {
+                        type_key: format!("edge:{edge_name}"),
+                        entities_loaded: *entities_loaded,
                     }),
             )
             .collect::<Vec<_>>();
-        tables.sort_by(|a, b| a.table_key.cmp(&b.table_key));
-        tables
+        declarations.sort_by(|a, b| a.type_key.cmp(&b.type_key));
+        declarations
     }
 }
 
@@ -673,14 +672,14 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
         let _entry = snapshot
-            .entry(&table_key)
+            .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         prepared_nodes.push((type_name.clone(), table_key, vec![batch], loaded_count));
     }
     for (type_name, rows) in strict_nodes {
         let table_key = format!("node:{type_name}");
         let _entry = snapshot
-            .entry(&table_key)
+            .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
         let loaded_count = batch.num_rows();
@@ -724,14 +723,14 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
         let _entry = snapshot
-            .entry(&table_key)
+            .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         prepared_edges.push((edge_name.clone(), table_key, vec![batch], loaded_count));
     }
     for (edge_name, rows) in strict_edges {
         let table_key = format!("edge:{edge_name}");
         let _entry = snapshot
-            .entry(&table_key)
+            .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
         let loaded_count = batch.num_rows();
@@ -1259,7 +1258,7 @@ fn account_keyed_json_row(
         .ok_or_else(|| OmniError::manifest_internal("keyed input entity count overflow"))?;
     if entry.0 > crate::storage_layer::KEYED_WRITE_MAX_ROWS {
         return Err(OmniError::resource_limit(
-            format!("keyed rows for {table_key}"),
+            format!("keyed entities for {table_key}"),
             crate::storage_layer::KEYED_WRITE_MAX_ROWS as u64,
             entry.0 as u64,
         ));
@@ -1276,7 +1275,7 @@ fn account_keyed_json_row(
         .ok_or_else(|| OmniError::manifest_internal("keyed parsed byte count overflow"))?;
     if entry.1 > KEYED_WRITE_MAX_BYTES {
         return Err(OmniError::resource_limit(
-            format!("keyed parsed value bytes for {table_key}"),
+            format!("keyed parsed entity bytes for {table_key}"),
             KEYED_WRITE_MAX_BYTES,
             entry.1,
         ));
@@ -3315,7 +3314,7 @@ edge WorksAt: Person -> Company
         let snapshot = db.snapshot().await;
         assert_eq!(
             snapshot
-                .open("node:Person")
+                .open_dataset("node:Person")
                 .await
                 .unwrap()
                 .count_rows(None)
@@ -3325,7 +3324,7 @@ edge WorksAt: Person -> Company
         );
         assert_eq!(
             snapshot
-                .open("edge:Knows")
+                .open_dataset("edge:Knows")
                 .await
                 .unwrap()
                 .count_rows(None)
@@ -3356,7 +3355,7 @@ node Doc {
             .expect("a nullable @embed target may remain null");
         let nullable_snapshot = nullable_db.snapshot().await;
         let nullable_rows = nullable_snapshot
-            .open("node:Doc")
+            .open_dataset("node:Doc")
             .await
             .unwrap()
             .scan()
@@ -3447,10 +3446,14 @@ node Doc {
                 .expect_err(case);
             assert!(error.to_string().contains(expected), "{case}: {error}");
             let after = db.snapshot().await;
-            assert_eq!(after.version(), before.version(), "{case} changed manifest");
+            assert_eq!(
+                after.graph_manifest_version(),
+                before.graph_manifest_version(),
+                "{case} changed manifest"
+            );
             assert_eq!(
                 after
-                    .open("node:Person")
+                    .open_dataset("node:Person")
                     .await
                     .unwrap()
                     .count_rows(None)
@@ -3489,7 +3492,7 @@ node Doc {
 
         // Read back via snapshot
         let snap = db.snapshot().await;
-        let person_ds = snap.open("node:Person").await.unwrap();
+        let person_ds = snap.open_dataset("node:Person").await.unwrap();
 
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 2);
 
@@ -3526,7 +3529,7 @@ node Doc {
             .unwrap();
 
         let snap = db.snapshot().await;
-        let knows_ds = snap.open("edge:Knows").await.unwrap();
+        let knows_ds = snap.open_dataset("edge:Knows").await.unwrap();
 
         let batches: Vec<RecordBatch> = knows_ds
             .scan()
@@ -3582,7 +3585,7 @@ node Doc {
         load_jsonl(&db, batch2, LoadMode::Append).await.unwrap();
 
         let snap = db.snapshot().await;
-        let person_ds = snap.open("node:Person").await.unwrap();
+        let person_ds = snap.open_dataset("node:Person").await.unwrap();
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 2);
     }
 
@@ -3614,23 +3617,23 @@ node Doc {
         assert!(result.branch_created);
         assert_eq!(result.mode, LoadMode::Overwrite);
         assert_eq!(
-            result.tables,
+            result.declarations,
             vec![
-                IngestTableResult {
-                    table_key: "edge:Knows".to_string(),
-                    rows_loaded: 1
+                IngestDeclarationResult {
+                    type_key: "edge:Knows".to_string(),
+                    entities_loaded: 1
                 },
-                IngestTableResult {
-                    table_key: "edge:WorksAt".to_string(),
-                    rows_loaded: 1
+                IngestDeclarationResult {
+                    type_key: "edge:WorksAt".to_string(),
+                    entities_loaded: 1
                 },
-                IngestTableResult {
-                    table_key: "node:Company".to_string(),
-                    rows_loaded: 1
+                IngestDeclarationResult {
+                    type_key: "node:Company".to_string(),
+                    entities_loaded: 1
                 },
-                IngestTableResult {
-                    table_key: "node:Person".to_string(),
-                    rows_loaded: 2
+                IngestDeclarationResult {
+                    type_key: "node:Person".to_string(),
+                    entities_loaded: 2
                 },
             ]
         );
@@ -3671,10 +3674,10 @@ node Doc {
         assert!(!result.branch_created);
         assert_eq!(result.mode, LoadMode::Merge);
         assert_eq!(
-            result.tables,
-            vec![IngestTableResult {
-                table_key: "node:Person".to_string(),
-                rows_loaded: 2
+            result.declarations,
+            vec![IngestDeclarationResult {
+                type_key: "node:Person".to_string(),
+                entities_loaded: 2
             }]
         );
 
@@ -3682,7 +3685,7 @@ node Doc {
             .snapshot_of(crate::db::ReadTarget::branch("feature"))
             .await
             .unwrap();
-        let person_ds = snap.open("node:Person").await.unwrap();
+        let person_ds = snap.open_dataset("node:Person").await.unwrap();
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 3);
 
         let batches: Vec<RecordBatch> = person_ds

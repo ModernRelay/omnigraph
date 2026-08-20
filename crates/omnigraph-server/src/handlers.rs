@@ -479,11 +479,9 @@ pub(crate) async fn server_snapshot(
             .map_err(ApiError::from_omni)?;
         (snapshot, internal_schema_version)
     };
-    Ok(Json(snapshot_payload(
-        &branch,
-        &snapshot,
-        internal_schema_version,
-    )))
+    let output = snapshot_payload(&branch, &snapshot, internal_schema_version)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(Json(output))
 }
 
 /// Header values that flag a response as coming from a deprecated route
@@ -818,6 +816,7 @@ fn redact_blob_api_error(mapped: ApiError) -> ApiError {
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Export authority conflict", body = ErrorOutput),
         (status = 413, description = "Export cut or transport capacity exhausted", body = ErrorOutput),
+        (status = 415, description = "Request body must use application/json", body = ErrorOutput),
         (status = 404, description = "Branch not found", body = ErrorOutput),
         (status = 503, description = "Recovery required", body = ErrorOutput),
     ),
@@ -826,16 +825,17 @@ fn redact_blob_api_error(mapped: ApiError) -> ApiError {
 /// Stream the contents of a branch as NDJSON.
 ///
 /// Emits one JSON object per line (`application/x-ndjson`). Filter with
-/// `type_names` (node/edge type names) and/or the retained table-key
-/// compatibility selectors in `table_keys`; both empty streams the entire
-/// branch. Suitable for large exports — the response is streamed, not
-/// buffered. Read-only.
+/// `type_names` (node/edge type names); an empty list streams the entire branch.
+/// Suitable for large exports — the response is streamed, not buffered.
+/// Read-only.
 pub(crate) async fn server_export(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
-    Json(request): Json<ExportRequest>,
+    request: std::result::Result<Json<ExportRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
+    let Json(request) = request
+        .map_err(|rejection| ApiError::json_rejection("invalid export request", rejection))?;
     let branch = normalize_change_branch(request.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
@@ -856,7 +856,7 @@ pub(crate) async fn server_export(
         .map_err(ApiError::from_omni)?;
     let cut = handle
         .engine
-        .capture_served_export_cut(&branch, &request.type_names, &request.table_keys)
+        .capture_served_export_cut(&branch, &request.type_names)
         .await
         .map_err(ApiError::from_omni)?;
     let producer_queue_lease = Arc::clone(&queue_lease);
@@ -1149,13 +1149,14 @@ pub(crate) async fn resolve_authorized_read_target(
     ),
     security(("bearer_token" = [])),
 )]
-#[deprecated(note = "use POST /mutate instead; /change is kept indefinitely for back-compat")]
+#[deprecated(
+    note = "use POST /mutate instead; /change retains its request and execution semantics"
+)]
 /// **Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.
 ///
-/// Apply a GQ mutation to a branch. Behavior is unchanged; the route is
-/// kept indefinitely for back-compat. New integrations should target
-/// `POST /mutate`, which has identical semantics and a name that pairs
-/// cleanly with `POST /query`. Responses from this route include
+/// Apply a GQ mutation to a branch. The deprecated route retains its request
+/// and execution semantics, while its response uses the current canonical
+/// vocabulary. New integrations should target `POST /mutate`. Responses include
 /// `Deprecation: true` and `Link: <mutate>; rel="successor-version"`
 /// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
 /// signal.
@@ -1984,12 +1985,12 @@ pub(crate) async fn server_load_ndjson(
     ),
     security(("bearer_token" = [])),
 )]
-#[deprecated(note = "use POST /load instead; /ingest is kept indefinitely for back-compat")]
+#[deprecated(note = "use POST /load instead; /ingest retains its parser and branch defaults")]
 /// **Deprecated** — use [`POST /load`](#tag/mutations/operation/load) instead.
 ///
-/// Bulk-load NDJSON data into a branch. Behavior is unchanged; the route is
-/// kept indefinitely for back-compat. New integrations should target
-/// `POST /load`, which has identical semantics. Responses from this route
+/// Bulk-load NDJSON data into a branch. The deprecated route retains its
+/// parser and branch defaults, but its response uses the current canonical
+/// vocabulary. New integrations should target `POST /load`. Responses
 /// include `Deprecation: true` and `Link: <load>; rel="successor-version"`
 /// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.
 pub(crate) async fn server_ingest(
@@ -2624,7 +2625,7 @@ pub(crate) struct ParsedChangeParams {
     pub start: Option<String>,
     pub page_token: Option<String>,
     pub limit: Option<usize>,
-    pub kinds: Vec<api::ChangeEntityKind>,
+    pub kinds: Vec<api::EntityKindOutput>,
     pub types: Vec<String>,
     pub ops: Vec<api::ChangeOpOutput>,
 }
@@ -2679,7 +2680,7 @@ pub(crate) fn parse_change_query(
             }
             "kind" => params
                 .kinds
-                .push(api::ChangeEntityKind::parse(&value).ok_or_else(|| {
+                .push(api::EntityKindOutput::parse(&value).ok_or_else(|| {
                     ApiError::bad_request(format!("unknown kind '{value}' (expected node | edge)"))
                 })?),
             "type" => params.types.push(value),
@@ -2733,7 +2734,7 @@ pub(crate) async fn server_commit_changes(
 ) -> std::result::Result<Json<api::CommitChangesOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), COMMIT_CHANGES_PARAMS)?;
     validate_change_http_limit(params.limit)?;
-    // Resolve the commit first: unlike commit-show, this response carries row
+    // Resolve the commit first: unlike commit-show, this response carries entity
     // images, so read authorization binds to the branch the commit landed on.
     let db = &handle.engine;
     let commit = db
@@ -2741,7 +2742,7 @@ pub(crate) async fn server_commit_changes(
         .await
         .map_err(|error| change_route_commit_lookup_error(error, &commit_id))?;
     let branch = commit
-        .manifest_branch
+        .graph_branch
         .clone()
         .unwrap_or_else(|| "main".to_string());
     match authorize(
@@ -2823,7 +2824,7 @@ fn change_route_commit_lookup_error(error: OmniError, commit_id: &str) -> ApiErr
 /// graph-vocabulary fields cross the wire. Everything else — including broad
 /// `Manifest::BadRequest` / conflict categories and any future `OmniError`
 /// variant — is logged and collapsed to a fixed 500 so adding an engine error
-/// can never accidentally expose a path, dataset, table key, or sidecar.
+/// can never accidentally expose an internal storage identifier or sidecar.
 fn change_route_error(error: OmniError) -> ApiError {
     match error {
         OmniError::ResourceLimitExceeded {
@@ -2832,7 +2833,7 @@ fn change_route_error(error: OmniError) -> ApiError {
             actual,
         } if matches!(
             resource.as_str(),
-            "commit_changes_page_rows"
+            "commit_changes_page_changes"
                 | "commit_changes_page_bytes"
                 | "change_feed_commits_per_poll"
                 | "change_continuation_token_encoded_bytes"

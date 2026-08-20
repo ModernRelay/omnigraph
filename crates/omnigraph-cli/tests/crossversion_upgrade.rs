@@ -142,9 +142,9 @@ fn assert_exported_blob_fidelity(label: &str, original: &[u8], rebuilt: &[u8]) {
 }
 
 /// Format v6 activates RFC-023 by installing exactly `id` as the unenforced
-/// Lance primary key on every graph table. Assert the rebuilt image crossed
+/// Lance primary key on every graph dataset. Assert the rebuilt image crossed
 /// that physical boundary, not only that its stamp changed.
-fn assert_v6_graph_tables_use_exact_id_pk(graph: &Path) {
+fn assert_v6_graph_datasets_use_exact_id_pk(graph: &Path) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
@@ -153,20 +153,20 @@ fn assert_v6_graph_tables_use_exact_id_pk(graph: &Path) {
             .snapshot_of(ReadTarget::branch("main"))
             .await
             .expect("open rebuilt v6 main snapshot");
-        let table_keys = snapshot
-            .entries()
+        let type_keys = snapshot
+            .datasets()
             .filter(|entry| {
-                entry.table_key.starts_with("node:") || entry.table_key.starts_with("edge:")
+                entry.type_key.starts_with("node:") || entry.type_key.starts_with("edge:")
             })
-            .map(|entry| entry.table_key.clone())
+            .map(|entry| entry.type_key.clone())
             .collect::<Vec<_>>();
-        assert!(!table_keys.is_empty(), "rebuilt v6 graph has no graph tables");
-        for table_key in table_keys {
-            let table = snapshot
-                .open(&table_key)
+        assert!(!type_keys.is_empty(), "rebuilt v6 graph has no graph datasets");
+        for type_key in type_keys {
+            let dataset = snapshot
+                .open_dataset(&type_key)
                 .await
-                .unwrap_or_else(|error| panic!("open rebuilt v6 table {table_key}: {error}"));
-            let primary_key = table
+                .unwrap_or_else(|error| panic!("open rebuilt v6 dataset {type_key}: {error}"));
+            let primary_key = dataset
                 .schema()
                 .unenforced_primary_key()
                 .iter()
@@ -175,13 +175,13 @@ fn assert_v6_graph_tables_use_exact_id_pk(graph: &Path) {
             assert_eq!(
                 primary_key,
                 ["id"],
-                "rebuilt v6 table {table_key} must declare exactly `id` as its Lance unenforced primary key",
+                "rebuilt v6 dataset {type_key} must declare exactly `id` as its Lance unenforced primary key",
             );
         }
     });
 }
 
-fn assert_v6_graph_tables_empty(graph: &Path) {
+fn assert_v6_graph_datasets_empty(graph: &Path) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
@@ -190,20 +190,20 @@ fn assert_v6_graph_tables_empty(graph: &Path) {
             .snapshot_of(ReadTarget::branch("main"))
             .await
             .expect("open rejected-import v6 main snapshot");
-        for entry in snapshot.entries().filter(|entry| {
-            entry.table_key.starts_with("node:") || entry.table_key.starts_with("edge:")
+        for entry in snapshot.datasets().filter(|entry| {
+            entry.type_key.starts_with("node:") || entry.type_key.starts_with("edge:")
         }) {
-            let table = snapshot
-                .open(&entry.table_key)
+            let dataset = snapshot
+                .open_dataset(&entry.type_key)
                 .await
                 .unwrap_or_else(|error| {
-                    panic!("open rejected-import table {}: {error}", entry.table_key)
+                    panic!("open rejected-import dataset {}: {error}", entry.type_key)
                 });
             assert_eq!(
-                table.count_rows(None).await.unwrap(),
+                dataset.count_rows(None).await.unwrap(),
                 0,
-                "duplicate-id import must publish no rows to {}",
-                entry.table_key,
+                "duplicate-id import must publish no entities to {}",
+                entry.type_key,
             );
         }
     });
@@ -328,7 +328,7 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
     // 5. Round-trip fidelity: re-export with the current binary and compare.
     let reexport = output_success(cli().arg("export").arg(&new_graph));
     assert_export_fidelity("v3 → v6", &export.stdout, &reexport.stdout);
-    assert_v6_graph_tables_use_exact_id_pk(&new_graph);
+    assert_v6_graph_datasets_use_exact_id_pk(&new_graph);
 }
 
 #[test]
@@ -401,7 +401,7 @@ fn current_v6_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v6() {
     );
     let reexport = output_success(cli().arg("export").arg(&new_graph));
     assert_export_fidelity("v4 → v6", &export.stdout, &reexport.stdout);
-    assert_v6_graph_tables_use_exact_id_pk(&new_graph);
+    assert_v6_graph_datasets_use_exact_id_pk(&new_graph);
 
     let reverse = run_old(&previous, &["snapshot", new_graph.to_str().unwrap()]);
     assert!(
@@ -539,7 +539,7 @@ fn current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6() {
         rejected_stderr.contains("@unique violation") && rejected_stderr.contains("ml-intro"),
         "duplicate-id rebuild import must fail loudly with the duplicate key, got: {rejected_stderr}",
     );
-    assert_v6_graph_tables_empty(&rejected_graph);
+    assert_v6_graph_datasets_empty(&rejected_graph);
     let source_after_rejection = run_old(&v5, &["export", v5_uri]);
     assert_ok(
         "v5 export after rejected target import",
@@ -571,7 +571,7 @@ fn current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6() {
     let reexport = output_success(cli().arg("export").arg(&v6_graph));
     assert_export_fidelity("v5 → v6", &export.stdout, &reexport.stdout);
     assert_exported_blob_fidelity("v5 → v6", &export.stdout, &reexport.stdout);
-    assert_v6_graph_tables_use_exact_id_pk(&v6_graph);
+    assert_v6_graph_datasets_use_exact_id_pk(&v6_graph);
     assert_v6_blob_bytes(&v6_graph, &[0, 1, 2, 3, 255]);
 
     // The fence is bidirectional: a predecessor writer cannot accidentally

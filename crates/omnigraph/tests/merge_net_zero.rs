@@ -132,7 +132,7 @@ async fn assert_adopted_string_change(
     );
 
     let snapshot = snapshot_main(&main).await.unwrap();
-    let dataset = snapshot.open("node:Document").await.unwrap();
+    let dataset = snapshot.open_dataset("node:Document").await.unwrap();
     let batches = dataset
         .scan()
         .try_into_stream()
@@ -257,10 +257,10 @@ query set_note($title: String, $note: String) {
     .await
     .unwrap();
     let base = snapshot_main(&main).await.unwrap();
-    let base_entry = base.entry("node:Document").expect("base Document entry");
+    let base_entry = base.dataset("node:Document").expect("base Document entry");
     let base_table_uri = dir
         .path()
-        .join(&base_entry.table_path)
+        .join(&base_entry.dataset_path)
         .to_string_lossy()
         .into_owned();
     let base_dataset = Dataset::open(&base_table_uri).await.unwrap();
@@ -290,10 +290,13 @@ query set_note($title: String, $note: String) {
         .await
         .unwrap();
     let source_entry = source
-        .entry("node:Document")
+        .dataset("node:Document")
         .expect("feature Document entry");
-    assert_eq!(source_entry.table_path, base_entry.table_path);
-    assert_eq!(source_entry.table_branch.as_deref(), Some("feature"));
+    assert_eq!(source_entry.dataset_path, base_entry.dataset_path);
+    assert_eq!(
+        source_entry.native_dataset_branch.as_deref(),
+        Some("feature")
+    );
     let source_table_uri = format!("{base_table_uri}/tree/feature");
     let source_dataset = Dataset::open(&source_table_uri).await.unwrap();
     assert_ne!(source_dataset.uri(), base_dataset.uri());
@@ -396,7 +399,7 @@ query set_note($title: String, $note: String) {
 
     let merged = snapshot_main(&main).await.unwrap();
     let merged_batches = merged
-        .open("node:Document")
+        .open_dataset("node:Document")
         .await
         .unwrap()
         .scan()
@@ -468,7 +471,7 @@ query replace_content($title: String, $content: Blob) {
         .await
         .unwrap();
     let base_batch = base
-        .open("node:Document")
+        .open_dataset("node:Document")
         .await
         .unwrap()
         .scan()
@@ -480,7 +483,7 @@ query replace_content($title: String, $content: Blob) {
         .unwrap()
         .remove(0);
     let source_batch = source
-        .open("node:Document")
+        .open_dataset("node:Document")
         .await
         .unwrap()
         .scan()
@@ -569,14 +572,14 @@ async fn net_zero_merge_advances_the_manifest_once_and_moves_no_table() {
     apply_net_zero_edge_cycle(&mut feature, "feature").await;
 
     let before = snapshot_main(&main).await.unwrap();
-    let before_version = before.version();
+    let before_version = before.graph_manifest_version();
     let before_tables: Vec<(String, u64, u64)> = before
-        .entries()
+        .datasets()
         .map(|entry| {
             (
-                entry.table_key.clone(),
-                entry.table_version,
-                entry.row_count,
+                entry.type_key.clone(),
+                entry.published_dataset_version,
+                entry.entity_count,
             )
         })
         .collect();
@@ -585,16 +588,16 @@ async fn net_zero_merge_advances_the_manifest_once_and_moves_no_table() {
 
     let after = snapshot_main(&main).await.unwrap();
     assert_eq!(
-        after.version(),
+        after.graph_manifest_version(),
         before_version + 1,
         "a no-op merge publishes its lineage commit and nothing else",
     );
     for (table_key, table_version, row_count) in before_tables {
         let entry = after
-            .entry(&table_key)
+            .dataset(&table_key)
             .unwrap_or_else(|| panic!("table '{table_key}' must survive the merge"));
         assert_eq!(
-            (entry.table_version, entry.row_count),
+            (entry.published_dataset_version, entry.entity_count),
             (table_version, row_count),
             "table '{table_key}' must not move across a merge that changes nothing",
         );
@@ -685,9 +688,9 @@ async fn merge_publishes_a_real_delta_alongside_a_net_zero_table() {
     let knows_version_before = snapshot_main(&main)
         .await
         .unwrap()
-        .entry("edge:Knows")
+        .dataset("edge:Knows")
         .expect("fixture registers edge:Knows")
-        .table_version;
+        .published_dataset_version;
 
     main.branch_merge("feature", "main").await.unwrap();
 
@@ -709,9 +712,9 @@ async fn merge_publishes_a_real_delta_alongside_a_net_zero_table() {
         snapshot_main(&main)
             .await
             .unwrap()
-            .entry("edge:Knows")
+            .dataset("edge:Knows")
             .expect("edge:Knows must survive the merge")
-            .table_version,
+            .published_dataset_version,
         knows_version_before,
         "the net-zero table must not be re-registered at a new version",
     );

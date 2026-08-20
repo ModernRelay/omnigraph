@@ -4,13 +4,17 @@
 
 - `Compiler(...)` — schema/query parse/typecheck errors
 - `Lance(String)` — storage layer
-- `HistoricalVersionReclaimed { version }` — an exact graph-manifest-pinned Lance
+- `HistoricalVersionReclaimed { published_dataset_version }` — an exact graph-manifest-pinned Lance
   version was reclaimed. Historical callers keep this distinct from ordinary
   absence; change routes project it to the typed 410 baseline-reset contract.
 - `DataFusion(String)` — execution layer
 - `Io(io::Error)`
 - `Manifest(ManifestError { kind: BadRequest|NotFound|Conflict|Internal, details: Option<ManifestConflictDetails>, … })`
-  - `ManifestConflictDetails::ExpectedVersionMismatch { table_key, expected, actual }` — caller's `expected_table_versions` did not match the graph manifest's current latest non-tombstoned dataset version (set by `OmniError::manifest_expected_version_mismatch`).
+  - `ManifestConflictDetails::PublishedDatasetVersionMismatch { type_key,
+    expected_published_dataset_version, actual_published_dataset_version }` —
+    the caller's expected dataset version did not match the graph manifest's
+    current latest non-tombstoned published version (set by
+    `OmniError::published_dataset_version_mismatch`).
   - `ManifestConflictDetails::ReadSetChanged { member, expected, actual }` — an RFC-022 prepared write's branch/head/dataset authority changed before physical effects. HTTP returns **409** with `read_set_conflict`. A retry must start from preparation; strict writes leave that choice to the caller.
   - `ManifestConflictDetails::RowLevelCasContention` — Lance row-level CAS rejected the publish because a concurrent writer landed the same `object_id`. Retried internally by the publisher; only surfaces if the retry budget exhausts.
   - **Missing schema files on open**: after opening a readable `__manifest`,
@@ -44,11 +48,13 @@
     snapshot authenticates; independent property/schema checks may still refuse
     the read.
 - `MergeConflicts(Vec<MergeConflict>)`
-- `KeyConflict { table_key, key }` — a strict insert found an existing `id` in
+- `KeyConflict { type_key, entity_id }` — a strict insert found an existing `id` in
   its pinned dataset image or lost an effect-free concurrent same-key race. HTTP
-  returns **409** with `key_conflict.table_key`. V6 emits
-  `key_conflict.key` only after an observed preflight or fresh exact-ID probe;
-  the field stays optional in the additive wire schema. Retrying the same
+  returns **409** with `key_conflict.entity_kind` and
+  `key_conflict.type_name`. V6 emits
+  `key_conflict.entity_id` only after an observed preflight or fresh exact-ID
+  probe; the field is optional because some conflict paths cannot prove the
+  exact entity. Retrying the same
   strict operation does not turn it into an upsert.
 - `ChangeCursorRejected { reason }` — an opaque change page token or feed
   cursor is malformed, non-canonical, the wrong token kind, or bound to another
@@ -109,23 +115,23 @@
   `stream_export_transport_bytes`, `Blob read range bytes`, `external Blob URI
   bytes`, `external Blob reference cells`, `external Blob URI metadata bytes`,
   `external Blob object bytes`, `decoded blob input bytes`, `materialized blob
-  payload bytes`, `commit_changes_page_rows`, `commit_changes_page_bytes`,
+  payload bytes`, `commit_changes_page_changes`, `commit_changes_page_bytes`,
   `change_feed_commits_per_poll`, `change_continuation_token_encoded_bytes`,
   `ordered_scan_memory_bytes`, `ordered_scan_scratch_bytes`,
   `ordered_scan_input_batch_bytes`, `ordered_scan_spilling_disabled`,
   `materialized external blob payload bytes`, `branch-merge delete filter
-  bytes`, `branch-merge retained delete plan bytes`, `branch-merge fenced row
+  bytes`, `branch-merge retained delete plan bytes`, `branch-merge fenced entity
   bytes`, `branch-merge recovery transaction chain`, and `branch-merge retained
-  validation delta bytes`. Dataset-scoped compatibility strings use these enumerable
-  patterns: `keyed rows for {table_key}`, `keyed parsed value bytes for
-  {table_key}`, `decoded blob input bytes for {table_key}`, `keyed write rows
-  for {table_key}`, `keyed write bytes for {table_key}`, `keyed bytes for
-  {table_key}`, `branch-merge pure-insert validation batch rows for
-  {table_key}`, `branch-merge pure-insert validation batch bytes for
-  {table_key}`, `branch-merge recovery transactions for {table_key}`, `proven
-  insert delta rows for {table_key}`, and `proven insert delta bytes for
-  {table_key}`. Treat `resource` as a typed discriminator, including its
-  documented table-key suffix; do not infer one ceiling from another.
+  validation delta bytes`. Dataset-scoped strings use these enumerable
+  patterns: `keyed entities for {type_key}`, `keyed parsed entity bytes for
+  {type_key}`, `decoded blob input bytes for {type_key}`, `keyed write entities
+  for {type_key}`, `keyed write bytes for {type_key}`, `keyed entity bytes for
+  {type_key}`, `branch-merge pure-insert validation batch entities for
+  {type_key}`, `branch-merge pure-insert validation batch bytes for
+  {type_key}`, `branch-merge recovery transactions for {type_key}`, `proven
+  insert delta entities for {type_key}`, and `proven insert delta bytes for
+  {type_key}`. Treat `resource` as a typed discriminator, including its
+  documented type-key suffix; do not infer one ceiling from another.
 - `ExternalBlobPolicy { uri, reason }` — new external-URI ingress is malformed,
   uses a disallowed execution scope, or falls outside the graph's normalized
   allow bases. The URI field is normalized and credential-free (or redacted);

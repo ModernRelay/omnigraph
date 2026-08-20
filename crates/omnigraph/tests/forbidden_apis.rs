@@ -93,8 +93,9 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
     "Dataset::drop_columns",
     "Dataset::truncate_table",
     "Dataset::restore",
-    // Raw dataset OPENS — all reads must route through `Snapshot::open` (the
-    // held-handle cache + shared Session, Fix 3). Only the instrumented opener
+    // Raw dataset OPENS — all reads must route through
+    // `Snapshot::open_lance_dataset` (the held-handle cache + shared Session,
+    // Fix 3). Only the instrumented opener
     // (`instrumentation.rs`) and the storage/manifest layers (allow-listed below)
     // open datasets directly; forbidding these in the read/exec layer keeps a
     // future read from silently bypassing the cache.
@@ -251,7 +252,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "plan_schema_with_options"),
     ("db/omnigraph.rs", "preview_schema_apply_with_options"),
     ("db/omnigraph.rs", "snapshot_of"),
-    ("db/omnigraph.rs", "version_of"),
+    ("db/omnigraph.rs", "graph_manifest_version_of"),
     ("db/omnigraph.rs", "internal_schema_version_of"),
     ("db/omnigraph.rs", "resolved_branch_of"),
     ("db/omnigraph.rs", "sync_branch"),
@@ -263,7 +264,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "capture_change_baseline"),
     ("db/omnigraph.rs", "entity_at_target"),
     ("db/omnigraph.rs", "entity_at"),
-    ("db/omnigraph.rs", "snapshot_at_version"),
+    ("db/omnigraph.rs", "snapshot_at_graph_manifest_version"),
     ("db/omnigraph.rs", "export_jsonl"),
     ("db/omnigraph.rs", "export_jsonl_to_writer"),
     ("db/omnigraph.rs", "graph_index"),
@@ -343,7 +344,7 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "snapshot_at_version",
+        "snapshot_at_graph_manifest_version",
     ),
     (
         "db/graph_coordinator.rs",
@@ -1240,7 +1241,13 @@ impl<'ast> Visit<'ast> for CallInventory {
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         let method = node.method.to_string();
-        self.record(method.clone());
+        // The durable primitive is the zero-argument raw-handle accessor
+        // `.dataset()`. `Snapshot::dataset(type_key)` is a logical metadata
+        // lookup introduced by the graph-vocabulary API and cannot expose a
+        // Lance handle. Keep the write guard exact by distinguishing arity.
+        if method != "dataset" || node.args.is_empty() {
+            self.record(method.clone());
+        }
         if method == "append" && node.args.len() == 2 {
             self.record(".raw_dataset_append(");
         }
@@ -1257,7 +1264,12 @@ impl<'ast> Visit<'ast> for CallInventory {
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let Some(identifier) = final_path_ident(&node.func) {
-            self.record(identifier.clone());
+            // UFCS adds the receiver as the first argument, so
+            // `Owner::dataset(owner)` is the zero-argument method form while
+            // `Snapshot::dataset(snapshot, type_key)` is the logical lookup.
+            if identifier != "dataset" || node.args.len() <= 1 {
+                self.record(identifier.clone());
+            }
             if identifier == "append" && node.args.len() == 3 {
                 self.record(".raw_dataset_append(");
             }
@@ -1986,6 +1998,23 @@ fn structural_call_scanner_counts_method_and_ufcs_not_text() {
 }
 
 #[test]
+fn structural_call_scanner_distinguishes_raw_dataset_accessor_from_logical_lookup() {
+    let ast = parse_rust_source(
+        r#"
+        fn exercise(raw: &RawOwner, snapshot: &Snapshot) {
+            raw.dataset();
+            RawOwner::dataset(raw);
+            snapshot.dataset("node:Person");
+            Snapshot::dataset(snapshot, "node:Person");
+        }
+        "#,
+        "scanner dataset arity self-test",
+    );
+    let inventory = call_inventory(&ast);
+    assert_eq!(inventory.counts.get("dataset"), Some(&2));
+}
+
+#[test]
 fn structural_call_scanner_skips_test_module_but_keeps_later_production() {
     let ast = parse_rust_source(
         r#"
@@ -2220,7 +2249,7 @@ fn public_snapshot_and_storage_boundaries_do_not_leak_writable_datasets() {
 
     let manifest_contents = std::fs::read_to_string(src.join("db/manifest.rs")).unwrap();
     let manifest = parse_rust_source(&manifest_contents, "db/manifest.rs");
-    for owner in ["SnapshotTable", "SnapshotScanner"] {
+    for owner in ["SnapshotDataset", "SnapshotScanner"] {
         let structure = manifest.items.iter().find_map(|item| match item {
             Item::Struct(structure) if structure.ident == owner => Some(structure),
             _ => None,
@@ -2242,7 +2271,7 @@ fn public_snapshot_and_storage_boundaries_do_not_leak_writable_datasets() {
         };
         if implementation.trait_.is_some()
             || !(is_named_type(&implementation.self_ty, "Snapshot")
-                || is_named_type(&implementation.self_ty, "SnapshotTable")
+                || is_named_type(&implementation.self_ty, "SnapshotDataset")
                 || is_named_type(&implementation.self_ty, "SnapshotScanner"))
         {
             continue;

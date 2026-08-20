@@ -37,7 +37,7 @@ use crate::db::manifest::{
     RecoveryAuthorityToken, RecoveryLineageIntent, RecoverySidecarHandle, SidecarKind,
     SidecarTablePin, confirm_occ_sidecar_v9, new_occ_sidecar_v9, write_sidecar,
 };
-use crate::db::{MutationOpKind, SubTableUpdate};
+use crate::db::{DatasetUpdate, MutationOpKind};
 use crate::error::{OmniError, Result};
 use crate::table_store::ExternalBlobUriCollector;
 
@@ -176,7 +176,7 @@ impl MutationStaging {
         if let Some(existing) = self.paths.get(table_key) {
             if existing.identity != identity {
                 return Err(OmniError::manifest_read_set_changed(
-                    format!("table_identity:{table_key}"),
+                    format!("dataset_identity:{table_key}"),
                     Some(existing.identity.to_string()),
                     Some(identity.to_string()),
                 ));
@@ -274,7 +274,7 @@ impl MutationStaging {
                 .ok_or_else(|| OmniError::manifest_internal("pending keyed row count overflow"))?;
             if rows > KEYED_WRITE_MAX_ROWS {
                 return Err(OmniError::resource_limit(
-                    format!("keyed rows for {table_key}"),
+                    format!("keyed entities for {table_key}"),
                     KEYED_WRITE_MAX_ROWS as u64,
                     rows as u64,
                 ));
@@ -291,7 +291,7 @@ impl MutationStaging {
                 .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?;
             if bytes > KEYED_WRITE_MAX_BYTES {
                 return Err(OmniError::resource_limit(
-                    format!("keyed bytes for {table_key}"),
+                    format!("keyed entity bytes for {table_key}"),
                     KEYED_WRITE_MAX_BYTES,
                     bytes,
                 ));
@@ -646,14 +646,14 @@ fn prepare_pending_table(table_key: &str, table: PendingTable) -> Result<Prepare
                 })?;
         if rows > KEYED_WRITE_MAX_ROWS as u64 {
             return Err(OmniError::resource_limit(
-                format!("keyed rows for {table_key}"),
+                format!("keyed entities for {table_key}"),
                 KEYED_WRITE_MAX_ROWS as u64,
                 rows,
             ));
         }
         if bytes > KEYED_WRITE_MAX_BYTES {
             return Err(OmniError::resource_limit(
-                format!("keyed bytes for {table_key}"),
+                format!("keyed entity bytes for {table_key}"),
                 KEYED_WRITE_MAX_BYTES,
                 bytes,
             ));
@@ -951,7 +951,7 @@ async fn fresh_conflicting_strict_id(
 ) -> Result<Option<String>> {
     let branch = branch.filter(|name| *name != "main");
     let snapshot = db.fresh_snapshot_for_branch(branch).await?;
-    let Some(entry) = snapshot.entry(table_key) else {
+    let Some(entry) = snapshot.dataset(table_key) else {
         return Ok(None);
     };
     if entry.identity != identity {
@@ -965,7 +965,7 @@ async fn fresh_conflicting_strict_id(
 /// plus the queue guards the caller must hold through Stage G manifest publish.
 pub(crate) struct CommittedMutation {
     /// Per-table updates to publish to the manifest.
-    pub(crate) updates: Vec<SubTableUpdate>,
+    pub(crate) updates: Vec<DatasetUpdate>,
     /// Per-table physical pins captured in the immutable `WriteTxn`; the
     /// publisher checks them together with native branch identity, exact graph
     /// head, and schema identity as one authority precondition.
@@ -1109,8 +1109,8 @@ impl StagedMutation {
         let snapshot = db.revalidate_write_txn(txn).await?;
         for entry in &staged {
             let current = snapshot
-                .entry(&entry.table_key)
-                .map(|e| e.table_version)
+                .dataset(&entry.table_key)
+                .map(|e| e.published_dataset_version)
                 .ok_or_else(|| {
                     OmniError::manifest_conflict(format!(
                         "table '{}' missing from manifest at commit time",
@@ -1125,7 +1125,7 @@ impl StagedMutation {
             // whole validation attempt before effects.
             if entry.expected_version != current {
                 return Err(OmniError::manifest_read_set_changed(
-                    format!("table_head:{}", entry.table_key),
+                    format!("published_dataset_version:{}", entry.table_key),
                     Some(entry.expected_version.to_string()),
                     Some(current.to_string()),
                 ));
@@ -1139,7 +1139,7 @@ impl StagedMutation {
             if entry.path.deferred_fork.is_some() {
                 if entry.dataset.version() != current {
                     return Err(OmniError::manifest_read_set_changed(
-                        format!("table_head:{}", entry.table_key),
+                        format!("published_dataset_version:{}", entry.table_key),
                         Some(current.to_string()),
                         Some(entry.dataset.version().to_string()),
                     ));
@@ -1251,8 +1251,8 @@ impl StagedMutation {
                     &entry.table_key,
                     fork.source_entry.identity,
                     &entry.path.full_path,
-                    fork.source_entry.table_branch.as_deref(),
-                    fork.source_entry.table_version,
+                    fork.source_entry.native_dataset_branch.as_deref(),
+                    fork.source_entry.published_dataset_version,
                     &fork.target_branch,
                     Some(&operation_id),
                 )
@@ -1344,7 +1344,7 @@ impl StagedMutation {
                 })?;
         }
 
-        let mut updates: Vec<SubTableUpdate> = Vec::with_capacity(staged.len());
+        let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
         let mut committed_transactions = HashMap::with_capacity(staged.len());
 
         for entry in staged {
@@ -1468,12 +1468,12 @@ impl StagedMutation {
                 .map_err(|error| {
                     OmniError::recovery_required(operation_id.clone(), error.to_string())
                 })?;
-            updates.push(SubTableUpdate {
+            updates.push(DatasetUpdate {
                 identity: path.identity,
-                table_key: table_key.clone(),
-                table_version: state.version,
-                table_branch: path.table_branch.clone(),
-                row_count: state.row_count,
+                type_key: table_key.clone(),
+                published_dataset_version: state.version,
+                native_dataset_branch: path.table_branch.clone(),
+                entity_count: state.row_count,
                 version_metadata: state.version_metadata,
             });
             crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_TABLE_COMMIT)

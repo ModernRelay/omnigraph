@@ -421,8 +421,8 @@ impl OrderedTableCursor {
     }
 
     async fn open(snapshot: &Snapshot, table_key: &str, eager_signatures: bool) -> Result<Self> {
-        let dataset = match snapshot.entry(table_key) {
-            Some(_) => Some(snapshot.open_dataset(table_key).await?),
+        let dataset = match snapshot.dataset(table_key) {
+            Some(_) => Some(snapshot.open_lance_dataset(table_key).await?),
             None => None,
         };
         Self::from_dataset(dataset, eager_signatures).await
@@ -587,7 +587,7 @@ impl StagedTableWriter {
         };
         if predicted_row_bytes > KEYED_WRITE_MAX_BYTES {
             return Err(OmniError::resource_limit(
-                "branch-merge fenced row bytes",
+                "branch-merge fenced entity bytes",
                 KEYED_WRITE_MAX_BYTES,
                 predicted_row_bytes,
             ));
@@ -611,7 +611,7 @@ impl StagedTableWriter {
         })?;
         if row_bytes > KEYED_WRITE_MAX_BYTES {
             return Err(OmniError::resource_limit(
-                "branch-merge fenced row bytes",
+                "branch-merge fenced entity bytes",
                 KEYED_WRITE_MAX_BYTES,
                 row_bytes,
             ));
@@ -774,27 +774,27 @@ async fn try_proven_pure_insert_history(
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
 ) -> Result<Option<ProvenPureInsertAdopt>> {
-    let Some(base_entry) = base_snapshot.entry(table_key) else {
+    let Some(base_entry) = base_snapshot.dataset(table_key) else {
         return Ok(None);
     };
-    let Some(source_entry) = source_snapshot.entry(table_key) else {
+    let Some(source_entry) = source_snapshot.dataset(table_key) else {
         return Ok(None);
     };
     if source_entry.identity != base_entry.identity
-        || source_entry.table_path != base_entry.table_path
+        || source_entry.dataset_path != base_entry.dataset_path
     {
         return Ok(None);
     }
     let Some(version_count) = source_entry
-        .table_version
-        .checked_sub(base_entry.table_version)
+        .published_dataset_version
+        .checked_sub(base_entry.published_dataset_version)
         .filter(|count| *count > 0)
     else {
         return Ok(None);
     };
     let Some(inserted_rows) = source_entry
-        .row_count
-        .checked_sub(base_entry.row_count)
+        .entity_count
+        .checked_sub(base_entry.entity_count)
         .filter(|rows| *rows > 0)
     else {
         return Ok(None);
@@ -804,10 +804,10 @@ async fn try_proven_pure_insert_history(
     }
 
     let history_start = std::time::Instant::now();
-    let base = base_snapshot.open_dataset(table_key).await?;
-    let source = source_snapshot.open_dataset(table_key).await?;
-    if source.version().version != source_entry.table_version
-        || base.version().version != base_entry.table_version
+    let base = base_snapshot.open_lance_dataset(table_key).await?;
+    let source = source_snapshot.open_lance_dataset(table_key).await?;
+    if source.version().version != source_entry.published_dataset_version
+        || base.version().version != base_entry.published_dataset_version
         || !source.manifest.uses_stable_row_ids()
         || !base.manifest.uses_stable_row_ids()
     {
@@ -821,17 +821,18 @@ async fn try_proven_pure_insert_history(
         .branch_identifier()
         .await
         .map_err(|error| OmniError::Lance(error.to_string()))?;
-    if base_entry.table_branch == source_entry.table_branch && source_identifier != base_identifier
+    if base_entry.native_dataset_branch == source_entry.native_dataset_branch
+        && source_identifier != base_identifier
     {
         return Err(OmniError::manifest_read_set_changed(
-            format!("branch_merge_source_table_incarnation:{table_key}"),
+            format!("branch_merge_source_dataset_incarnation:{table_key}"),
             Some(format!("{base_identifier:?}")),
             Some(format!("{source_identifier:?}")),
         ));
     }
-    if base_entry.table_branch != source_entry.table_branch
+    if base_entry.native_dataset_branch != source_entry.native_dataset_branch
         && source_identifier.find_referenced_version(&base_identifier)
-            != Some(base_entry.table_version)
+            != Some(base_entry.published_dataset_version)
     {
         tracing::debug!(
             table_key,
@@ -860,8 +861,8 @@ async fn try_proven_pure_insert_history(
     };
     let delta = match source
         .delta()
-        .with_begin_version(base_entry.table_version)
-        .with_end_version(source_entry.table_version)
+        .with_begin_version(base_entry.published_dataset_version)
+        .with_end_version(source_entry.published_dataset_version)
         .build()
     {
         Ok(delta) => delta,
@@ -894,7 +895,7 @@ async fn try_proven_pure_insert_history(
     let mut proven_inserted_rows = 0_u64;
     for (offset, transaction) in transactions.iter().enumerate() {
         let expected_read_version = base_entry
-            .table_version
+            .published_dataset_version
             .checked_add(u64::try_from(offset).map_err(|_| {
                 OmniError::manifest_internal(
                     "branch merge pure-insert transaction offset exceeds u64",
@@ -930,12 +931,12 @@ async fn try_proven_pure_insert_history(
     Ok(Some(ProvenPureInsertAdopt {
         source,
         source_identity: source_entry.identity,
-        source_table_path: source_entry.table_path.clone(),
-        source_table_branch: source_entry.table_branch.clone(),
+        source_table_path: source_entry.dataset_path.clone(),
+        source_table_branch: source_entry.native_dataset_branch.clone(),
         source_branch_identifier: source_identifier,
         target_base_branch_identifier: base_identifier,
-        base_version: base_entry.table_version,
-        source_version: source_entry.table_version,
+        base_version: base_entry.published_dataset_version,
+        source_version: source_entry.published_dataset_version,
         inserted_rows,
         chunk_rows: Vec::new(),
     }))
@@ -1185,9 +1186,9 @@ async fn revalidate_proven_pure_insert_source(
     proven: &ProvenPureInsertAdopt,
     live_source: &Snapshot,
 ) -> Result<()> {
-    let Some(live_entry) = live_source.entry(table_key) else {
+    let Some(live_entry) = live_source.dataset(table_key) else {
         return Err(OmniError::manifest_read_set_changed(
-            format!("branch_merge_source_table:{table_key}"),
+            format!("branch_merge_source_dataset:{table_key}"),
             Some(format!(
                 "{}@{}",
                 proven.source_table_path, proven.source_version
@@ -1196,12 +1197,12 @@ async fn revalidate_proven_pure_insert_source(
         ));
     };
     if live_entry.identity != proven.source_identity
-        || live_entry.table_path != proven.source_table_path
-        || live_entry.table_branch != proven.source_table_branch
-        || live_entry.table_version < proven.source_version
+        || live_entry.dataset_path != proven.source_table_path
+        || live_entry.native_dataset_branch != proven.source_table_branch
+        || live_entry.published_dataset_version < proven.source_version
     {
         return Err(OmniError::manifest_read_set_changed(
-            format!("branch_merge_source_table:{table_key}"),
+            format!("branch_merge_source_dataset:{table_key}"),
             Some(format!(
                 "{:?}:{}:{:?}@{}",
                 proven.source_identity,
@@ -1212,27 +1213,27 @@ async fn revalidate_proven_pure_insert_source(
             Some(format!(
                 "{:?}:{}:{:?}@{}",
                 live_entry.identity,
-                live_entry.table_path,
-                live_entry.table_branch,
-                live_entry.table_version
+                live_entry.dataset_path,
+                live_entry.native_dataset_branch,
+                live_entry.published_dataset_version
             )),
         ));
     }
 
-    let full_path = db.storage().dataset_uri(&live_entry.table_path);
+    let full_path = db.storage().dataset_uri(&live_entry.dataset_path);
     let head = db
         .storage()
-        .open_dataset_head(&full_path, live_entry.table_branch.as_deref())
+        .open_dataset_head(&full_path, live_entry.native_dataset_branch.as_deref())
         .await?;
     let live_identifier = db.storage().branch_identifier(&head).await?;
     if live_identifier != proven.source_branch_identifier
-        || head.version() != live_entry.table_version
+        || head.version() != live_entry.published_dataset_version
     {
         return Err(OmniError::manifest_read_set_changed(
-            format!("branch_merge_source_table_head:{table_key}"),
+            format!("branch_merge_source_published_dataset_version:{table_key}"),
             Some(format!(
                 "{:?}@{}",
-                proven.source_branch_identifier, live_entry.table_version
+                proven.source_branch_identifier, live_entry.published_dataset_version
             )),
             Some(format!("{live_identifier:?}@{}", head.version())),
         ));
@@ -1257,7 +1258,7 @@ async fn revalidate_proven_pure_insert_target_incarnation(
     let live_identifier = db.storage().branch_identifier(current).await?;
     if live_identifier != proven.target_base_branch_identifier {
         return Err(OmniError::manifest_read_set_changed(
-            format!("branch_merge_target_table_incarnation:{table_key}"),
+            format!("branch_merge_target_dataset_incarnation:{table_key}"),
             Some(format!("{:?}", proven.target_base_branch_identifier)),
             Some(format!("{live_identifier:?}")),
         ));
@@ -1682,16 +1683,16 @@ fn validation_schema(
 }
 
 fn same_manifest_state(
-    left: Option<&crate::db::SubTableEntry>,
-    right: Option<&crate::db::SubTableEntry>,
+    left: Option<&crate::db::DatasetEntry>,
+    right: Option<&crate::db::DatasetEntry>,
 ) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => {
             left.identity == right.identity
-                && left.table_path == right.table_path
-                && left.table_version == right.table_version
-                && left.table_branch == right.table_branch
-                && left.row_count == right.row_count
+                && left.dataset_path == right.dataset_path
+                && left.published_dataset_version == right.published_dataset_version
+                && left.native_dataset_branch == right.native_dataset_branch
+                && left.entity_count == right.entity_count
                 && left.version_metadata == right.version_metadata
         }
         (None, None) => true,
@@ -1710,7 +1711,7 @@ fn ensure_merge_identity_compatible(
         if let Some(observed_identity) = observed {
             if candidate_identity != observed_identity {
                 return Err(OmniError::manifest_read_set_changed(
-                    format!("branch_merge_table_identity:{table_key}"),
+                    format!("branch_merge_dataset_identity:{table_key}"),
                     Some(observed_identity.to_string()),
                     Some(candidate_identity.to_string()),
                 ));
@@ -1779,8 +1780,8 @@ fn classify_merge_conflict(
         ),
     };
     MergeConflict {
-        table_key: table_key.to_string(),
-        row_id: Some(row_id.to_string()),
+        type_key: table_key.to_string(),
+        entity_id: Some(row_id.to_string()),
         kind,
         message,
     }
@@ -2082,7 +2083,7 @@ async fn scan_proven_pure_inserts_for_validation(
         })?;
         if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::resource_limit(
-                format!("branch-merge pure-insert validation batch rows for {table_key}"),
+                format!("branch-merge pure-insert validation batch entities for {table_key}"),
                 KEYED_WRITE_MAX_ROWS as u64,
                 batch.num_rows() as u64,
             ));
@@ -2186,15 +2187,16 @@ fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
 
 fn adopt_advances_head(
     target_active: Option<&str>,
-    source_entry: &crate::db::SubTableEntry,
-    target_entry: Option<&crate::db::SubTableEntry>,
+    source_entry: &crate::db::DatasetEntry,
+    target_entry: Option<&crate::db::DatasetEntry>,
 ) -> bool {
-    match (target_active, source_entry.table_branch.as_deref()) {
+    match (target_active, source_entry.native_dataset_branch.as_deref()) {
         // Source on a branch, target on main — delta applied onto main's lineage.
         (None, Some(_)) => true,
         // Both on branches, target owns this table — delta applied onto it.
         (Some(target_branch), Some(_)) => {
-            target_entry.and_then(|entry| entry.table_branch.as_deref()) == Some(target_branch)
+            target_entry.and_then(|entry| entry.native_dataset_branch.as_deref())
+                == Some(target_branch)
         }
         // Source on main (pointer switch) or target doesn't own (fork): no advance.
         _ => false,
@@ -2223,16 +2225,16 @@ async fn classify_adopt(
     target_active: Option<&str>,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
 ) -> Result<Option<CandidateTableState>> {
-    let Some(source_entry) = source_snapshot.entry(table_key) else {
+    let Some(source_entry) = source_snapshot.dataset(table_key) else {
         // Source has no such table — nothing to adopt or validate.
         return Ok(Some(CandidateTableState::AdoptSourceState {
             validation_delta: None,
         }));
     };
-    let target_entry = target_snapshot.entry(table_key);
+    let target_entry = target_snapshot.dataset(table_key);
     ensure_merge_identity_compatible(
         table_key,
-        base_snapshot.entry(table_key).map(|entry| entry.identity),
+        base_snapshot.dataset(table_key).map(|entry| entry.identity),
         Some(source_entry.identity),
         target_entry.map(|entry| entry.identity),
     )?;
@@ -2317,7 +2319,7 @@ enum AdoptPublish {
     /// The planned registration is field-for-field the stored entry.
     Nothing,
     /// A pointer switch onto a lineage the target can already read.
-    Pointer(crate::db::SubTableUpdate),
+    Pointer(crate::db::DatasetUpdate),
     /// The target holds no ref for this table yet; publication forks one. The
     /// only arm that touches storage.
     Fork {
@@ -2333,39 +2335,39 @@ enum AdoptPublish {
 /// [`publish_adopted_delta`].
 fn plan_adopted_source_state(
     target_active: Option<&str>,
-    source_entry: &crate::db::SubTableEntry,
-    target_entry: Option<&crate::db::SubTableEntry>,
+    source_entry: &crate::db::DatasetEntry,
+    target_entry: Option<&crate::db::DatasetEntry>,
     table_key: &str,
 ) -> AdoptPublish {
     let identity = source_entry.identity;
-    let planned = match (target_active, source_entry.table_branch.as_deref()) {
+    let planned = match (target_active, source_entry.native_dataset_branch.as_deref()) {
         // Source on main — pointer switch to its version. The target reads the
         // same lineage whether it sits on main or on a branch.
-        (None, None) | (Some(_), None) => crate::db::SubTableUpdate {
+        (None, None) | (Some(_), None) => crate::db::DatasetUpdate {
             identity,
-            table_key: table_key.to_string(),
-            table_version: source_entry.table_version,
-            table_branch: None,
-            row_count: source_entry.row_count,
+            type_key: table_key.to_string(),
+            published_dataset_version: source_entry.published_dataset_version,
+            native_dataset_branch: None,
+            entity_count: source_entry.entity_count,
             version_metadata: source_entry.version_metadata.clone(),
         },
         // Source on a branch, target on main — the target keeps its own
         // version and metadata; only the row count comes from the source.
-        (None, Some(_)) => crate::db::SubTableUpdate {
+        (None, Some(_)) => crate::db::DatasetUpdate {
             identity,
-            table_key: table_key.to_string(),
-            table_version: target_entry
-                .map(|entry| entry.table_version)
-                .unwrap_or(source_entry.table_version),
-            table_branch: None,
-            row_count: source_entry.row_count,
+            type_key: table_key.to_string(),
+            published_dataset_version: target_entry
+                .map(|entry| entry.published_dataset_version)
+                .unwrap_or(source_entry.published_dataset_version),
+            native_dataset_branch: None,
+            entity_count: source_entry.entity_count,
             version_metadata: target_entry
                 .map(|entry| entry.version_metadata.clone())
                 .unwrap_or_else(|| source_entry.version_metadata.clone()),
         },
         (Some(target_branch), Some(source_branch)) => {
-            let Some(owned) =
-                target_entry.filter(|entry| entry.table_branch.as_deref() == Some(target_branch))
+            let Some(owned) = target_entry
+                .filter(|entry| entry.native_dataset_branch.as_deref() == Some(target_branch))
             else {
                 // A fork registers a ref the target lacks, so it is never a
                 // no-op.
@@ -2374,12 +2376,12 @@ fn plan_adopted_source_state(
                     target_branch: target_branch.to_string(),
                 };
             };
-            crate::db::SubTableUpdate {
+            crate::db::DatasetUpdate {
                 identity,
-                table_key: table_key.to_string(),
-                table_version: owned.table_version,
-                table_branch: Some(target_branch.to_string()),
-                row_count: source_entry.row_count,
+                type_key: table_key.to_string(),
+                published_dataset_version: owned.published_dataset_version,
+                native_dataset_branch: Some(target_branch.to_string()),
+                entity_count: source_entry.entity_count,
                 version_metadata: owned.version_metadata.clone(),
             }
         }
@@ -2393,16 +2395,16 @@ fn plan_adopted_source_state(
 
 /// Whether a planned registration is field-for-field the stored entry.
 ///
-/// `table_path` is absent from [`crate::db::SubTableUpdate`] by design: a
+/// `table_path` is absent from [`crate::db::DatasetUpdate`] by design: a
 /// pointer switch never moves a table, so the path cannot differ.
 fn reregisters_current_entry(
-    planned: &crate::db::SubTableUpdate,
-    current: &crate::db::SubTableEntry,
+    planned: &crate::db::DatasetUpdate,
+    current: &crate::db::DatasetEntry,
 ) -> bool {
     planned.identity == current.identity
-        && planned.table_version == current.table_version
-        && planned.table_branch == current.table_branch
-        && planned.row_count == current.row_count
+        && planned.published_dataset_version == current.published_dataset_version
+        && planned.native_dataset_branch == current.native_dataset_branch
+        && planned.entity_count == current.entity_count
         && planned.version_metadata == current.version_metadata
 }
 
@@ -2415,8 +2417,8 @@ fn reregisters_current_entry(
 fn keep_publishing_candidate(
     candidate: CandidateTableState,
     target_active: Option<&str>,
-    source_entry: &crate::db::SubTableEntry,
-    target_entry: Option<&crate::db::SubTableEntry>,
+    source_entry: &crate::db::DatasetEntry,
+    target_entry: Option<&crate::db::DatasetEntry>,
     table_key: &str,
 ) -> Option<CandidateTableState> {
     let publishes_nothing = matches!(
@@ -2456,14 +2458,14 @@ mod adopt_plan_tests {
         branch: Option<&str>,
         row_count: u64,
         manifest_path: &str,
-    ) -> crate::db::SubTableEntry {
-        crate::db::SubTableEntry {
+    ) -> crate::db::DatasetEntry {
+        crate::db::DatasetEntry {
             identity: crate::db::manifest::TableIdentity::new(3, 12).unwrap(),
-            table_key: "edge:Knows".to_string(),
-            table_path: "edges/0000000000000003-000000000000000c".to_string(),
-            table_version: version,
-            table_branch: branch.map(ToOwned::to_owned),
-            row_count,
+            type_key: "edge:Knows".to_string(),
+            dataset_path: "edges/0000000000000003-000000000000000c".to_string(),
+            published_dataset_version: version,
+            native_dataset_branch: branch.map(ToOwned::to_owned),
+            entity_count: row_count,
             version_metadata: metadata(manifest_path),
         }
     }
@@ -2585,11 +2587,11 @@ async fn publish_adopted_source_state(
     target_snapshot: &Snapshot,
     table_key: &str,
     target_active: Option<&str>,
-) -> Result<crate::db::SubTableUpdate> {
+) -> Result<crate::db::DatasetUpdate> {
     let source_entry = source_snapshot
-        .entry(table_key)
+        .dataset(table_key)
         .ok_or_else(|| OmniError::manifest(format!("missing source entry for {}", table_key)))?;
-    let target_entry = target_snapshot.entry(table_key);
+    let target_entry = target_snapshot.dataset(table_key);
     ensure_merge_identity_compatible(
         table_key,
         None,
@@ -2603,24 +2605,24 @@ async fn publish_adopted_source_state(
             source_branch,
             target_branch,
         } => {
-            let full_path = format!("{}/{}", target_db.uri(), source_entry.table_path);
+            let full_path = format!("{}/{}", target_db.uri(), source_entry.dataset_path);
             let ds = target_db
                 .fork_dataset_from_entry_state(
                     table_key,
                     source_entry.identity,
                     &full_path,
                     Some(&source_branch),
-                    source_entry.table_version,
+                    source_entry.published_dataset_version,
                     &target_branch,
                 )
                 .await?;
             let state = target_db.storage().table_state(&full_path, &ds).await?;
-            Ok(crate::db::SubTableUpdate {
+            Ok(crate::db::DatasetUpdate {
                 identity: source_entry.identity,
-                table_key: table_key.to_string(),
-                table_version: state.version,
-                table_branch: Some(target_branch),
-                row_count: state.row_count,
+                type_key: table_key.to_string(),
+                published_dataset_version: state.version,
+                native_dataset_branch: Some(target_branch),
+                entity_count: state.row_count,
                 version_metadata: state.version_metadata,
             })
         }
@@ -2958,7 +2960,7 @@ async fn publish_rewritten_merge_table(
     staged: &StagedMergeResult,
     prepared_target: Option<PreparedExistingMergeTarget>,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
-) -> Result<crate::db::SubTableUpdate> {
+) -> Result<crate::db::DatasetUpdate> {
     // Branch merge's source-rewrite path is Merge-shaped (upsert from
     // source onto target). The staged delete later in this function
     // (`stage_delete` + an exact commit) operates on rows the rewrite chose
@@ -3045,12 +3047,12 @@ async fn publish_rewritten_merge_table(
         .table_state(&full_path, &current_ds)
         .await?;
 
-    Ok(crate::db::SubTableUpdate {
+    Ok(crate::db::DatasetUpdate {
         identity,
-        table_key: table_key.to_string(),
-        table_version: final_state.version,
-        table_branch,
-        row_count: final_state.row_count,
+        type_key: table_key.to_string(),
+        published_dataset_version: final_state.version,
+        native_dataset_branch: table_branch,
+        entity_count: final_state.row_count,
         version_metadata: final_state.version_metadata,
     })
 }
@@ -3236,7 +3238,7 @@ async fn commit_keyed_stream_chunks(
     }
     if has_extra_rows || observed_rows != expected_row_count {
         return Err(OmniError::manifest_internal(format!(
-            "branch merge table '{table_key}' streamed {observed_rows} keyed rows against an armed plan for {}",
+            "branch merge table '{table_key}' streamed {observed_rows} keyed entities against an armed plan for {}",
             expected_row_count
         )));
     }
@@ -3260,7 +3262,7 @@ async fn publish_proven_pure_insert_adopt(
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     prepared_target: PreparedExistingMergeTarget,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
-) -> Result<crate::db::SubTableUpdate> {
+) -> Result<crate::db::DatasetUpdate> {
     let publish_start = std::time::Instant::now();
     let (current, full_path, table_branch) = prepared_target.into_parts();
     let source = SnapshotHandle::new(proven.source.clone());
@@ -3304,12 +3306,12 @@ async fn publish_proven_pure_insert_adopt(
         publish_start.elapsed(),
     );
 
-    Ok(crate::db::SubTableUpdate {
+    Ok(crate::db::DatasetUpdate {
         identity,
-        table_key: table_key.to_string(),
-        table_version: final_state.version,
-        table_branch,
-        row_count: final_state.row_count,
+        type_key: table_key.to_string(),
+        published_dataset_version: final_state.version,
+        native_dataset_branch: table_branch,
+        entity_count: final_state.row_count,
         version_metadata: final_state.version_metadata,
     })
 }
@@ -3335,7 +3337,7 @@ async fn publish_adopted_delta(
     delta: &AdoptDelta,
     prepared_target: Option<PreparedExistingMergeTarget>,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
-) -> Result<crate::db::SubTableUpdate> {
+) -> Result<crate::db::DatasetUpdate> {
     // Existing refs consume the same handle verified before Phase A. Only a
     // first-touch target reaches `open_for_mutation` here, after recovery owns
     // the ref creation; its no-txn path always returns a handle.
@@ -3438,12 +3440,12 @@ async fn publish_adopted_delta(
         .table_state(&full_path, &current_ds)
         .await?;
 
-    Ok(crate::db::SubTableUpdate {
+    Ok(crate::db::DatasetUpdate {
         identity,
-        table_key: table_key.to_string(),
-        table_version: final_state.version,
-        table_branch,
-        row_count: final_state.row_count,
+        type_key: table_key.to_string(),
+        published_dataset_version: final_state.version,
+        native_dataset_branch: table_branch,
+        entity_count: final_state.row_count,
         version_metadata: final_state.version_metadata,
     })
 }
@@ -3623,8 +3625,8 @@ impl Omnigraph {
         } else {
             ManifestCoordinator::snapshot_at(
                 self.uri(),
-                base_commit.manifest_branch.as_deref(),
-                base_commit.manifest_version,
+                base_commit.graph_branch.as_deref(),
+                base_commit.graph_manifest_version,
             )
             .await?
         };
@@ -3724,14 +3726,14 @@ impl Omnigraph {
         let target_snapshot = &target_txn.base;
         let catalog = target_txn.catalog.as_ref();
         let mut table_keys = HashSet::new();
-        for entry in base_snapshot.entries() {
-            table_keys.insert(entry.table_key.clone());
+        for entry in base_snapshot.datasets() {
+            table_keys.insert(entry.type_key.clone());
         }
-        for entry in source_snapshot.entries() {
-            table_keys.insert(entry.table_key.clone());
+        for entry in source_snapshot.datasets() {
+            table_keys.insert(entry.type_key.clone());
         }
-        for entry in target_snapshot.entries() {
-            table_keys.insert(entry.table_key.clone());
+        for entry in target_snapshot.datasets() {
+            table_keys.insert(entry.type_key.clone());
         }
 
         let mut ordered_table_keys: Vec<String> = table_keys.into_iter().collect();
@@ -3753,9 +3755,9 @@ impl Omnigraph {
         // and fork adoption write no row, so their descriptors require neither
         // policy approval nor source I/O.
         for table_key in &ordered_table_keys {
-            let base_entry = base_snapshot.entry(table_key);
-            let source_entry = source_snapshot.entry(table_key);
-            let target_entry = target_snapshot.entry(table_key);
+            let base_entry = base_snapshot.dataset(table_key);
+            let source_entry = source_snapshot.dataset(table_key);
+            let target_entry = target_snapshot.dataset(table_key);
             if same_manifest_state(source_entry, target_entry)
                 || same_manifest_state(base_entry, source_entry)
             {
@@ -3883,9 +3885,9 @@ impl Omnigraph {
             if !blob_table_keys.contains(table_key) {
                 continue;
             }
-            let base_entry = base_snapshot.entry(table_key);
-            let source_entry = source_snapshot.entry(table_key);
-            let target_entry = target_snapshot.entry(table_key);
+            let base_entry = base_snapshot.dataset(table_key);
+            let source_entry = source_snapshot.dataset(table_key);
+            let target_entry = target_snapshot.dataset(table_key);
             if same_manifest_state(source_entry, target_entry) {
                 continue;
             }
@@ -4064,11 +4066,13 @@ impl Omnigraph {
             fresh_target_snapshot,
         ) = self.revalidate_merge_inputs(source_txn, target_txn).await?;
         ensure_merge_target_authority_unchanged(target_txn, &live_target_authority)?;
-        if target_snapshot.version() != fresh_target_snapshot.version() {
+        if target_snapshot.graph_manifest_version()
+            != fresh_target_snapshot.graph_manifest_version()
+        {
             return Err(OmniError::manifest_read_set_changed(
                 format!("branch_merge_target:{}", target_branch.unwrap_or("main")),
-                Some(target_snapshot.version().to_string()),
-                Some(fresh_target_snapshot.version().to_string()),
+                Some(target_snapshot.graph_manifest_version().to_string()),
+                Some(fresh_target_snapshot.graph_manifest_version().to_string()),
             ));
         }
         // The comparison above checked the complete target authority
@@ -4144,17 +4148,17 @@ impl Omnigraph {
             .keys()
             .filter_map(|table_key| {
                 let identity = target_snapshot
-                    .entry(table_key)
-                    .or_else(|| source_snapshot.entry(table_key))
-                    .or_else(|| base_snapshot.entry(table_key))?
+                    .dataset(table_key)
+                    .or_else(|| source_snapshot.dataset(table_key))
+                    .or_else(|| base_snapshot.dataset(table_key))?
                     .identity;
                 Some((
                     identity,
                     crate::db::manifest::TableVersionExpectation {
                         table_key: table_key.clone(),
                         table_version: target_snapshot
-                            .entry(table_key)
-                            .map(|entry| entry.table_version)
+                            .dataset(table_key)
+                            .map(|entry| entry.published_dataset_version)
                             .unwrap_or(0),
                     },
                 ))
@@ -4179,27 +4183,29 @@ impl Omnigraph {
             let Some(candidate) = candidates.get(table_key) else {
                 continue;
             };
-            let source_entry = source_snapshot.entry(table_key).ok_or_else(|| {
+            let source_entry = source_snapshot.dataset(table_key).ok_or_else(|| {
                 OmniError::manifest(format!(
                     "branch merge candidate '{}' has no captured source entry",
                     table_key
                 ))
             })?;
-            let target_entry = target_snapshot.entry(table_key);
+            let target_entry = target_snapshot.dataset(table_key);
             ensure_merge_identity_compatible(
                 table_key,
-                base_snapshot.entry(table_key).map(|entry| entry.identity),
+                base_snapshot.dataset(table_key).map(|entry| entry.identity),
                 Some(source_entry.identity),
                 target_entry.map(|entry| entry.identity),
             )?;
             let identity = source_entry.identity;
-            let expected_version = target_entry.map(|entry| entry.table_version).unwrap_or(0);
+            let expected_version = target_entry
+                .map(|entry| entry.published_dataset_version)
+                .unwrap_or(0);
             let planned_output_branch = match candidate {
                 CandidateTableState::RewriteMerged(_)
                 | CandidateTableState::AdoptWithDelta(_)
                 | CandidateTableState::AdoptPureInserts(_) => active_branch_for_keys.clone(),
                 CandidateTableState::AdoptSourceState { .. } => {
-                    match (target_branch, source_entry.table_branch.as_deref()) {
+                    match (target_branch, source_entry.native_dataset_branch.as_deref()) {
                         (Some(target), Some(_)) => Some(target.to_string()),
                         _ => None,
                     }
@@ -4224,8 +4230,8 @@ impl Omnigraph {
                         ))
                     })?;
                     let source_fork_version = target_branch
-                        .filter(|target| entry.table_branch.as_deref() != Some(*target))
-                        .map(|_| entry.table_version);
+                        .filter(|target| entry.native_dataset_branch.as_deref() != Some(*target))
+                        .map(|_| entry.published_dataset_version);
                     if source_fork_version.is_some()
                         && matches!(candidate, CandidateTableState::AdoptPureInserts(_))
                     {
@@ -4261,7 +4267,7 @@ impl Omnigraph {
                     recovery_pins.push(crate::db::manifest::SidecarTablePin {
                         identity,
                         table_key: table_key.clone(),
-                        table_path: self.storage().dataset_uri(&entry.table_path),
+                        table_path: self.storage().dataset_uri(&entry.dataset_path),
                         expected_version,
                         post_commit_pin: expected_version + 1,
                         confirmed_version: None,
@@ -4282,8 +4288,8 @@ impl Omnigraph {
                     let Some(target) = target_branch else {
                         continue;
                     };
-                    let creates_target_ref = source_entry.table_branch.is_some()
-                        && target_entry.and_then(|entry| entry.table_branch.as_deref())
+                    let creates_target_ref = source_entry.native_dataset_branch.is_some()
+                        && target_entry.and_then(|entry| entry.native_dataset_branch.as_deref())
                             != Some(target);
                     if !creates_target_ref {
                         continue;
@@ -4292,9 +4298,9 @@ impl Omnigraph {
                     recovery_pins.push(crate::db::manifest::SidecarTablePin {
                         identity,
                         table_key: table_key.clone(),
-                        table_path: self.storage().dataset_uri(&source_entry.table_path),
+                        table_path: self.storage().dataset_uri(&source_entry.dataset_path),
                         expected_version,
-                        post_commit_pin: source_entry.table_version,
+                        post_commit_pin: source_entry.published_dataset_version,
                         confirmed_version: None,
                         table_branch: Some(target.to_string()),
                     });
@@ -4302,7 +4308,7 @@ impl Omnigraph {
                         identity,
                         table_key: table_key.clone(),
                         kind: crate::db::manifest::RecoveryBranchMergeEffectKind::RefOnlyFork {
-                            source_version: source_entry.table_version,
+                            source_version: source_entry.published_dataset_version,
                             confirmed_branch_identifier: None,
                         },
                     });
@@ -4327,13 +4333,13 @@ impl Omnigraph {
                     .await?;
                 }
                 let expected_version = target_snapshot
-                    .entry(table_key)
+                    .dataset(table_key)
                     .ok_or_else(|| {
                         OmniError::manifest_internal(format!(
                             "prepared branch merge target '{table_key}' has no manifest entry"
                         ))
                     })?
-                    .table_version;
+                    .published_dataset_version;
                 self.ensure_existing_effect_baseline(
                     table_key,
                     prepared.table_branch.as_deref(),
@@ -4423,7 +4429,7 @@ impl Omnigraph {
                     continue;
                 };
                 let identity = source_snapshot
-                    .entry(table_key)
+                    .dataset(table_key)
                     .ok_or_else(|| {
                         OmniError::manifest_internal(format!(
                             "branch merge candidate '{table_key}' lost its source identity"
@@ -4520,15 +4526,15 @@ impl Omnigraph {
                         ))
                     })?;
                     let entry = target_snapshot
-                        .entry(table_key)
-                        .or_else(|| source_snapshot.entry(table_key))
+                        .dataset(table_key)
+                        .or_else(|| source_snapshot.dataset(table_key))
                         .ok_or_else(|| {
                             OmniError::manifest_internal(format!(
                                 "first-touch merge effect '{}' has no table path",
                                 table_key
                             ))
                         })?;
-                    let full_path = self.storage().dataset_uri(&entry.table_path);
+                    let full_path = self.storage().dataset_uri(&entry.dataset_path);
                     let target_head = self
                         .storage()
                         .open_dataset_head(&full_path, Some(target))

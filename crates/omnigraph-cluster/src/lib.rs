@@ -625,7 +625,7 @@ pub async fn apply_config_dir_with_options(
         // here leaves expected = null and the sweep classifies by digest).
         if let Ok(db) = Omnigraph::open_read_only(&graph_uri).await {
             if let Ok(snapshot) = db.snapshot_of(ReadTarget::branch("main")).await {
-                sidecar.expected_manifest_version = Some(snapshot.version());
+                sidecar.expected_manifest_version = Some(snapshot.graph_manifest_version());
                 if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar).await {
                     diagnostics.push(diagnostic);
                 }
@@ -745,7 +745,7 @@ pub async fn apply_config_dir_with_options(
             continue;
         }
         let observed_manifest_version = match db.snapshot_of(ReadTarget::branch("main")).await {
-            Ok(snapshot) => Some(snapshot.version()),
+            Ok(snapshot) => Some(snapshot.graph_manifest_version()),
             Err(_) => None,
         };
         let recorded_schema_digest = state
@@ -797,7 +797,7 @@ pub async fn apply_config_dir_with_options(
             .await
         {
             Ok(result) => {
-                sidecar.expected_manifest_version = Some(result.manifest_version);
+                sidecar.expected_manifest_version = Some(result.graph_manifest_version);
                 if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar).await {
                     diagnostics.push(diagnostic);
                 }
@@ -991,7 +991,7 @@ pub async fn apply_config_dir_with_options(
         };
         let observed_manifest_version = match Omnigraph::open_read_only(&graph_uri).await {
             Ok(db) => match db.snapshot_of(ReadTarget::branch("main")).await {
-                Ok(snapshot) => Some(snapshot.version()),
+                Ok(snapshot) => Some(snapshot.graph_manifest_version()),
                 Err(_) => None,
             },
             Err(_) => None, // partial/unopenable roots still get deleted
@@ -2235,7 +2235,7 @@ async fn live_schema_matches_recorded_digest(
     let Ok(snapshot) = db.snapshot_of(ReadTarget::branch("main")).await else {
         return false;
     };
-    if snapshot.version() != observed_manifest_version {
+    if snapshot.graph_manifest_version() != observed_manifest_version {
         return false;
     }
     sha256_hex(db.schema_source().as_bytes()) == recorded_schema_digest

@@ -1,7 +1,7 @@
 //! Coverage for `build_indices_on_dataset_for_catalog`'s per-property index
 //! dispatch: which scalar/vector index each `@index`/`@key` column gets.
 //!
-//! The observable signal is `SnapshotTable::index_coverage`, which
+//! The observable signal is `SnapshotDataset::index_coverage`, which
 //! reports `Indexed` only when a BTREE covers the column (the same helper the
 //! traversal chooser uses). Enums and orderable scalars must get a BTREE so
 //! `=`/range/IN/IS NULL are index-accelerated; free-text Strings keep FTS
@@ -47,7 +47,7 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
     db.ensure_indices().await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Item").await.unwrap();
+    let ds = snap.open_dataset("node:Item").await.unwrap();
 
     for col in ["status", "published", "rank"] {
         let cov = ds.index_coverage(col).await.unwrap();
@@ -75,13 +75,13 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
 
     // Idempotence: a second run finds every declared index present and
     // publishes nothing (dual indexes must not re-plan as missing forever).
-    let version_before = ds.version();
+    let version_before = ds.published_dataset_version();
     db.ensure_indices().await.unwrap();
     let snap2 = snapshot_main(&db).await.unwrap();
-    let ds2 = snap2.open("node:Item").await.unwrap();
+    let ds2 = snap2.open_dataset("node:Item").await.unwrap();
     assert_eq!(
         version_before,
-        ds2.version(),
+        ds2.published_dataset_version(),
         "second ensure_indices must be a no-op on a fully-indexed graph"
     );
 }

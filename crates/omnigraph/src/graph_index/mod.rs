@@ -131,11 +131,11 @@ impl GraphIndex {
 
         for (edge_name, (from_type, to_type)) in edge_types {
             let table_key = format!("edge:{}", edge_name);
-            if snapshot.entry(&table_key).is_none() {
+            if snapshot.dataset(&table_key).is_none() {
                 continue;
             }
 
-            let ds = snapshot.open_dataset(&table_key).await?;
+            let ds = snapshot.open_lance_dataset(&table_key).await?;
 
             let batches: Vec<arrow_array::RecordBatch> = ds
                 .scan()

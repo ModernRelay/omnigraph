@@ -180,15 +180,15 @@ diverged fragments, not the whole table.
 
 In `exec/merge.rs`, the `AdoptWithDelta` classification and its
 `compute_adopt_delta` row walk + `publish_adopted_delta` copy are replaced: when
-`target == base`, classify the table as **adopt-by-reference** and publish via
+`target == base`, classify the dataset as **adopt-by-reference** and publish via
 `stage_adopt_fragments(target, source_branch_uri, source_version_fragments)`.
-The merge already holds everything required — `source_entry.table_branch`,
-`table_version`, and `table_path` (`SubTableEntry`) — to locate the source's
+The merge already holds everything required — `source_entry.native_dataset_branch`,
+`published_dataset_version`, and `dataset_path` (`DatasetEntry`) — to locate the source's
 fragments. `AdoptSourceState` is untouched (already optimal). `RewriteMerged`
 stays on the existing row path until Phase 2.
 
-The per-table adopt commit still publishes through the unified merge manifest CAS
-(one `graph_commit`), so cross-table atomic visibility (Invariant 2) is
+The per-dataset adopt commit still publishes through the unified merge graph-manifest CAS
+(one `graph_commit`), so cross-dataset atomic visibility (Invariant 2) is
 unchanged.
 
 ### Component 3 — recovery coverage
@@ -240,7 +240,7 @@ the existing `SidecarKind::Optimize` pin when it runs in the same pass (a distin
 compaction — decide by whether the two can be separated). It inherits
 `optimize`'s bounded `maint_concurrency()` budget and its refuse-on-unrecovered /
 skip-uncovered-drift guards. Progress is reported by extending the returned,
-`#[non_exhaustive]` `TableOptimizeStats` with `bytes_rehomed` / `files_rehomed` /
+`#[non_exhaustive]` `DatasetOptimizeStats` with `bytes_rehomed` / `files_rehomed` /
 `files_still_referenced` (the last modeled on the existing `pending_indexes`
 "work this pass could not finish, reported not fatal" field) — additive, no
 breakage.
@@ -274,9 +274,9 @@ site*, so deferring the sweep buys little and leaves a real cliff: the per-merge
 guard protects only the *reclaim* path, not `cleanup_old_versions` itself, which
 on an unrelated run would still GC a base-referenced file in a source tree (the
 Delta "VACUUM-on-source" hazard the RFC cites). The integration point already
-exists: `reconcile_orphaned_branches` (`optimize.rs`) — which `cleanup_all_tables`
+exists: `reconcile_orphaned_branches` (`optimize.rs`) — which `cleanup_all_datasets`
 already calls first — already enumerates all branches and caches each branch's
-snapshot. Extend it to open each `(branch, table)` dataset at its pinned version,
+snapshot. Extend it to open each `(branch, dataset)` at its pinned version,
 union its manifest `base_paths` into a live set, then (a) thread that set into the
 per-table `cleanup_old_versions` closure as a "refuse to delete in-set files"
 filter and (b) into the reclaim decision so a tree with inbound references is

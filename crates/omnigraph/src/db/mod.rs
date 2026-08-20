@@ -8,13 +8,13 @@ pub(crate) mod write_queue;
 
 pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
-pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubTableUpdate};
+pub use manifest::{DatasetEntry, DatasetUpdate, Snapshot, SnapshotDataset, SnapshotScanner};
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
-    CleanupPolicyOptions, EXPORT_CHUNK_MAX_BYTES, ExportCut, InitOptions, MergeOutcome, Omnigraph,
-    OpenMode, PendingIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
-    SchemaApplyOptions, SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats,
-    TableRepairStats,
+    CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
+    EXPORT_CHUNK_MAX_BYTES, ExportCut, InitOptions, MergeOutcome, Omnigraph, OpenMode,
+    PendingIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
+    SchemaApplyOptions, SchemaApplyResult, SkipReason,
 };
 pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};
