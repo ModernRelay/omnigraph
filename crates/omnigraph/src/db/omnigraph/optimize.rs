@@ -126,6 +126,11 @@ pub struct TableOptimizeStats {
     /// later `optimize` retries; the `list_indices`/`indisvalid` analog so
     /// operators can see which index is pending and why.
     pub pending_indexes: Vec<super::PendingIndex>,
+    /// Physical layout of each built vector index on this table (#486):
+    /// partition count, indexed rows, and a degenerate flag for layouts that
+    /// cannot prune. Coverage that omits this reports a mono-partition index
+    /// as healthy while every query flat-scans the index payload.
+    pub vector_index_layouts: Vec<super::VectorIndexLayout>,
 }
 
 impl TableOptimizeStats {
@@ -140,6 +145,7 @@ impl TableOptimizeStats {
             manifest_version: None,
             lance_head_version: None,
             pending_indexes: Vec::new(),
+            vector_index_layouts: Vec::new(),
         }
     }
 
@@ -158,6 +164,7 @@ impl TableOptimizeStats {
             manifest_version: Some(manifest_version),
             lance_head_version: Some(lance_head_version),
             pending_indexes: Vec::new(),
+            vector_index_layouts: Vec::new(),
         }
     }
 }
@@ -484,6 +491,7 @@ async fn prepare_optimize_table(
         let mut stat =
             TableOptimizeStats::compacted(task.table_key, &CompactionMetrics::default(), false);
         stat.pending_indexes = index_work.pending;
+        stat.vector_index_layouts = index_work.vector_layouts;
         return Ok(OptimizePreparation::Stat(stat));
     }
 
@@ -594,6 +602,7 @@ async fn apply_optimize_table_effects(
                 false,
             );
             stat.pending_indexes = index_work.pending;
+            stat.vector_index_layouts = index_work.vector_layouts;
             return Ok(OptimizeEffectOutcome { stat, update: None });
         }
 
@@ -675,8 +684,12 @@ async fn apply_optimize_table_effects(
         break (snapshot, metrics, pending_indexes, head_advanced);
     };
 
-    let mut stat = TableOptimizeStats::compacted(table_key, &metrics, committed);
+    let mut stat = TableOptimizeStats::compacted(table_key.clone(), &metrics, committed);
     stat.pending_indexes = pending_indexes;
+    stat.vector_index_layouts = super::table_ops::vector_index_layouts_on_dataset(
+        db, catalog, &table_key, &snapshot,
+    )
+    .await?;
     let update = if committed {
         let state = db.storage().table_state(&full_path, &snapshot).await?;
         Some(crate::db::SubTableUpdate {

@@ -1822,3 +1822,46 @@ async fn optimize_materializes_index_after_type_rename() {
         "optimize must build the renamed table's deferred rank index"
     );
 }
+
+// #486: coverage must answer "can this index prune", not just "does an index
+// exist over these rows". A mono-partition IVF index over a large table
+// reports complete coverage while every nearest() reads the full index
+// payload; optimize's stats now carry each vector index's physical layout so
+// that state is visible to whoever watches coverage.
+#[tokio::test]
+async fn optimize_stats_surface_vector_index_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = "node Doc {\n    \
+        slug: String @key\n    \
+        embedding: Vector(4)? @index\n\
+        }\n";
+    let db = Omnigraph::init(uri, schema).await.unwrap();
+    let rows: String = (0..8)
+        .map(|i| {
+            format!(
+                "{{\"type\":\"Doc\",\"data\":{{\"slug\":\"d{i}\",\"embedding\":[{i}.0,1.0,0.0,0.0]}}}}\n"
+            )
+        })
+        .collect();
+    load_jsonl(&db, &rows, LoadMode::Merge).await.unwrap();
+    db.ensure_indices().await.unwrap();
+
+    let stats = db.optimize().await.unwrap();
+    let doc = stats
+        .iter()
+        .find(|s| s.table_key == "node:Doc")
+        .expect("optimize must report node:Doc");
+    let layout = doc
+        .vector_index_layouts
+        .iter()
+        .find(|l| l.column == "embedding")
+        .expect("optimize stats must surface the vector index layout (#486)");
+    assert!(layout.partitions >= 1, "a built IVF index has partitions");
+    assert_eq!(layout.indexed_rows, 8, "all rows are covered");
+    assert!(
+        !layout.degenerate,
+        "one partition over 8 rows prunes nothing but also costs nothing; \
+         the degenerate flag is reserved for layouts where the flat read hurts"
+    );
+}

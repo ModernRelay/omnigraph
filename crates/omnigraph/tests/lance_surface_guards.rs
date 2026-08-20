@@ -2165,6 +2165,21 @@ async fn vector_optimize_after_delete_keeps_stable_ids_and_addresses_aligned() {
     let partition_count = stats["indices"][0]["num_partitions"]
         .as_u64()
         .expect("IVF statistics must expose num_partitions") as usize;
+    // Pinned because `TableStore::vector_index_layout_on` parses both fields
+    // for #486 coverage reporting: total rows plus per-delta rows aligned with
+    // `indices[]`. An upgrade that drops or renames either must fail here,
+    // not silently degrade optimize's layout stats.
+    stats["num_indexed_rows"]
+        .as_u64()
+        .expect("index statistics must expose top-level num_indexed_rows");
+    let per_delta = stats["num_indexed_rows_per_delta"]
+        .as_array()
+        .expect("index statistics must expose num_indexed_rows_per_delta");
+    assert_eq!(
+        per_delta.len(),
+        stats["indices"].as_array().unwrap().len(),
+        "num_indexed_rows_per_delta must align one-to-one with indices[]"
+    );
     assert!(
         partition_count > 1,
         "the guard must exercise the split/reshuffle path fixed by lance#7704; stats: {stats}"

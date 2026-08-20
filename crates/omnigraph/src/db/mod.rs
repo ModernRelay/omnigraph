@@ -12,7 +12,7 @@ pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubT
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
     CleanupPolicyOptions, EXPORT_CHUNK_MAX_BYTES, ExportCut, InitOptions, MergeOutcome, Omnigraph,
-    OpenMode, PendingIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
+    OpenMode, PendingIndex, VectorIndexLayout, RepairAction, RepairClassification, RepairOptions, RepairStats,
     SchemaApplyOptions, SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats,
     TableRepairStats,
 };

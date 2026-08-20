@@ -759,6 +759,13 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn has_btree_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     async fn has_vector_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
+    /// Physical layout of the column's vector index, if one exists:
+    /// `(index_name, total_indexed_rows, per_segment (partitions, rows))`.
+    async fn vector_index_layout(
+        &self,
+        snapshot: &SnapshotHandle,
+        column: &str,
+    ) -> Result<Option<(String, u64, Vec<(u64, u64)>)>>;
 
     // ── URI helpers ────────────────────────────────────────────────────
     //
@@ -1263,6 +1270,14 @@ impl TableStorage for TableStore {
 
     async fn has_vector_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {
         TableStore::has_vector_index(self, snapshot.dataset(), column).await
+    }
+
+    async fn vector_index_layout(
+        &self,
+        snapshot: &SnapshotHandle,
+        column: &str,
+    ) -> Result<Option<(String, u64, Vec<(u64, u64)>)>> {
+        TableStore::vector_index_layout_on(snapshot.dataset(), column).await
     }
 
     fn root_uri(&self) -> &str {
