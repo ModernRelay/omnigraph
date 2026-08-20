@@ -194,6 +194,38 @@ pub(crate) fn traversal_mode_override() -> Option<&'static str> {
     TRAVERSAL_MODE_OVERRIDE.try_with(|m| *m).ok().flatten()
 }
 
+tokio::task_local! {
+    static STAGE_WRITE_CONCURRENCY_OVERRIDE: Option<usize>;
+}
+
+/// Force the fragment-writing stage width for the scope of `fut` WITHOUT
+/// mutating the process-global `OMNIGRAPH_LOAD_CONCURRENCY` env var. Same seam
+/// as [`with_traversal_mode`], for the same reason: a width-forcing test stays
+/// scope-bound and process-safe, so it never perturbs a concurrent test in the
+/// same binary and needs no `#[serial]`. The env var stays the production/ops
+/// escape hatch; this scoped override takes precedence over it
+/// (`exec::staging::stage_write_concurrency`).
+///
+/// `0` is not a concurrency: it is ignored in favour of the default, matching
+/// the env parse rules.
+pub async fn with_stage_write_concurrency<F>(concurrency: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    STAGE_WRITE_CONCURRENCY_OVERRIDE
+        .scope(Some(concurrency), fut)
+        .await
+}
+
+/// The scoped staging-width override active for this task, if any. `None` in
+/// production (no scope installed), so the env var is consulted instead.
+pub(crate) fn stage_write_concurrency_override() -> Option<usize> {
+    STAGE_WRITE_CONCURRENCY_OVERRIDE
+        .try_with(|c| *c)
+        .ok()
+        .flatten()
+}
+
 pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.manifest_wrapper.clone()).flatten()
 }

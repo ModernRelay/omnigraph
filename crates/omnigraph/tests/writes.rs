@@ -19,11 +19,11 @@
 mod helpers;
 
 use arrow_array::Array;
-use serial_test::serial;
 use lance::Dataset;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
+use omnigraph::instrumentation::with_stage_write_concurrency;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
@@ -2612,14 +2612,39 @@ async fn insert_only_mutation_stale_expected_head_is_terminal_issue_365() {
 /// (issue #504). The risk a reviewer cares about is not speed but sameness:
 /// a multi-table mutation staged concurrently must land the same observable
 /// effects as the serial staging it replaces. Same query, two fresh stores,
-/// concurrency forced to 1 and then 4 via the env knob; affected counts,
-/// per-table row counts, the inserted person's row values, and the exact
-/// edge endpoint pairs must all agree.
+/// concurrency forced to 1 and then 4 through the scoped
+/// `with_stage_write_concurrency` seam; affected counts, per-table row counts,
+/// the inserted person's row values, and the exact edge endpoint pairs must all
+/// agree.
+///
+/// The width is forced through the task-local seam rather than the env var on
+/// purpose: `#[serial]` only excludes other `#[serial]` tests, so an env-mutating
+/// test still races every unannotated test in this binary — and `set_var` under a
+/// live multi-thread runtime violates `setenv`'s thread-safety precondition. The
+/// scoped override is process-safe and cannot leak past the future.
 #[tokio::test]
-#[serial]
 async fn multi_table_staging_matches_serial_staging() {
-    async fn run_at(concurrency: &str) -> (usize, usize, usize, usize, Option<i32>, Vec<(String, String)>) {
-        let _env = EnvGuard::set(&[("OMNIGRAPH_LOAD_CONCURRENCY", Some(concurrency))]);
+    async fn run_at(
+        concurrency: usize,
+    ) -> (
+        usize,
+        usize,
+        usize,
+        usize,
+        Option<i32>,
+        Vec<(String, String)>,
+    ) {
+        with_stage_write_concurrency(concurrency, run_once()).await
+    }
+
+    async fn run_once() -> (
+        usize,
+        usize,
+        usize,
+        usize,
+        Option<i32>,
+        Vec<(String, String)>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db = init_and_load(&dir).await;
         let result = db
@@ -2639,11 +2664,17 @@ async fn multi_table_staging_matches_serial_staging() {
         let mut nadia_age: Option<i32> = None;
         for batch in &read_table(&db, "node:Person").await {
             let names = batch
-                .column_by_name("name").unwrap()
-                .as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
             let ages = batch
-                .column_by_name("age").unwrap()
-                .as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+                .column_by_name("age")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap();
             for i in 0..batch.num_rows() {
                 if names.value(i) == "Nadia" {
                     nadia_age = Some(ages.value(i));
@@ -2654,11 +2685,17 @@ async fn multi_table_staging_matches_serial_staging() {
         let mut edges: Vec<(String, String)> = Vec::new();
         for batch in &read_table(&db, "edge:Knows").await {
             let from = batch
-                .column_by_name("src").unwrap()
-                .as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+                .column_by_name("src")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
             let to = batch
-                .column_by_name("dst").unwrap()
-                .as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+                .column_by_name("dst")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
             for i in 0..batch.num_rows() {
                 edges.push((from.value(i).to_string(), to.value(i).to_string()));
             }
@@ -2674,45 +2711,10 @@ async fn multi_table_staging_matches_serial_staging() {
         )
     }
 
-    let serial = run_at("1").await;
-    let concurrent = run_at("4").await;
+    let serial = run_at(1).await;
+    let concurrent = run_at(4).await;
     assert_eq!(
         serial, concurrent,
         "staging concurrency must not change any observable effect"
     );
-}
-
-struct EnvGuard {
-    saved: Vec<(&'static str, Option<String>)>,
-}
-
-impl EnvGuard {
-    fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
-        let saved = vars
-            .iter()
-            .map(|(name, _)| (*name, std::env::var(name).ok()))
-            .collect::<Vec<_>>();
-        for (name, value) in vars {
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-        Self { saved }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in self.saved.drain(..) {
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
 }
