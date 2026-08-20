@@ -7,7 +7,7 @@ result as
 **one atomic commit** across the whole graph.
 
 ```bash
-omnigraph branch merge review/2026-04-25 --into main s3://bucket/graph.omni
+omnigraph branch merge review/2026-04-25 --into main --store s3://bucket/graph.omni
 ```
 
 `branch merge <source> [--into <target>]` merges `<source>` into `<target>`
@@ -25,7 +25,7 @@ storage, the recommended lifecycle is to delete the source right after merging.
 on `POST /branches/merge`):
 
 ```bash
-omnigraph branch merge review/2026-04-25 --into main --delete-branch s3://bucket/graph.omni
+omnigraph branch merge review/2026-04-25 --into main --delete-branch --store s3://bucket/graph.omni
 ```
 
 The deletion runs after the merge has landed, under its **own** `branch_delete`

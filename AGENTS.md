@@ -241,8 +241,8 @@ omnigraph query --query ./queries.gq find_similar \
 omnigraph schema plan  --schema ./next.pg s3://my-bucket/graph.omni
 omnigraph schema apply --schema ./next.pg s3://my-bucket/graph.omni --json
 
-# Merge review branch back
-omnigraph branch merge review/2026-04-25 --into main s3://my-bucket/graph.omni
+# Merge review branch back (branch commands take the graph via --store, not positionally)
+omnigraph branch merge review/2026-04-25 --into main --store s3://my-bucket/graph.omni
 
 # Compact, preview any uncovered drift, then repair/GC after review
 omnigraph optimize s3://my-bucket/graph.omni
