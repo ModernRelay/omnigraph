@@ -58,6 +58,14 @@ that closes the specific hole above. A shared historical
 service or database is deliberately deferred until local records plus release
 artifacts prove insufficient (§4.4).
 
+**Amendment note (2026-08-16).** §11 records what has been built against this
+RFC since it was drafted: two concurrent implementations of its counting idea
+(PR #503 on real backends, and a counting pass hosted on the deterministic
+simulation harness recorded in [RFC-0037](0037-deterministic-simulation-harness.md)),
+the first measurement placing both on one ruler, and the division of roles
+that follows. Nothing in §§1-10 is
+retracted; §11 narrows where the counting side goes next.
+
 ## 1. Why the existing instruments do not cover this
 
 | Instrument | Measures | Cannot |
@@ -592,3 +600,139 @@ The harness must prove itself before its numbers are trusted:
 1. **Shared history trigger** — local JSONL plus checksummed release assets are
    the accepted V1. Define the concrete query/retention need that justifies a
    shared prefix or derived SQLite index before adding either.
+
+## 11. Amendment (2026-08-16): the counting side as built
+
+Added after the original draft. Records results from DST v1, the first
+iteration of the project's deterministic simulation testing (bench runs 001
+and 002), and from PR #503. Design authority for the hosting harness is the
+merged [RFC-0037](0037-deterministic-simulation-harness.md) design record
+(PR #507); like this amendment, it documents machinery already built and
+measured.
+
+### 11.1 Two implementations of the counting idea
+
+Since this RFC was drafted, its storage-action counting idea has been
+implemented twice, independently and concurrently:
+
+- **PR #503** (aaltshuler): a real-backend comparator. One node insert and one
+  edge insert on a fresh indexed fixture, counted through the Lance data-table
+  and `__manifest` object-store wrappers, on local FS and on RustFS
+  1.0.0-beta.12 pinned by image digest, gated by hand-calibrated per-field
+  ceilings, with the CI gate wired through declarative in-repo branch
+  protection. Its calibration: node insert 14 ops (12 reads, 2 writes) and
+  edge insert 34 ops (32 reads, 2 writes) on local FS; node insert 37 ops
+  (30 reads, 7 writes) and edge insert 57 ops (50 reads, 7 writes) on RustFS.
+- **The DST counting pass** (DST v1): this RFC's counting family hosted on the
+  deterministic simulation harness. A slot-armed cost ledger, inserted only
+  when a universe arms it (a universe is one sampled operation stream run in
+  the simulated world), counts every storage call in two realms, where a realm
+  is one of the two counting boundaries: the engine's own control I/O through
+  its storage adapter (`a.*` rows: schema artifacts, recovery sidecars,
+  conditional writes, existence and listing checks) and Lance's dataset I/O
+  (`l.*` rows). Both counters sit at the innermost layer, on the adapter
+  itself and on the store handle Lance uses, which is what backs "every": the
+  calls are counted where they actually flow, below any dispatch above. Every
+  call carries the operation kind that issued it, and harness phases
+  (`_setup`, `_verify`, `_history`, `_close`, `_audit`) are separated from
+  operation rows, so a row is the operation's own cost, not its
+  neighborhood's. The output is a per-(operation kind, realm-verb) call table
+  for a standard universe, checked in as a golden (an exact expected table the
+  suite diffs against): the test `dst_bench_cost_count_golden`.
+
+The pass is built and measured (bench run-001, 2026-08-14). It lands upstream
+with the harness code, and it builds on the shared cost counters PR #503
+extended rather than adding a parallel counter surface.
+
+### 11.2 What the first profile showed (bench run-001)
+
+One 30-operation universe (seed 7) on the in-memory object-store backend, the
+S3-semantics stand-in the simulation runs against; whole-universe sums per
+operation kind:
+
+- Optimize, the maintenance operation that compacts the store without
+  changing logical state, dominates: 979 `l.get` plus 85 `l.put`.
+- Edge insert (AddFriend) issues 377 `l.get` against person update (UpdateV)
+  at 4, roughly a 90x gap worth engine attention.
+- The correctness checks' own traffic is large and cleanly excluded: the
+  `_verify` phase alone reads 2,365 `l.get`, none of it on operation rows.
+
+One measured decision is recorded as part of the design: **the golden compares
+call counts only.** Byte totals wobble run to run because Lance varint-encodes
+wall-clock timestamps into file bytes, so equal logical work can yield unequal
+byte totals. The §2 bytes family therefore stays informational in this
+instrument until upstream Lance puts time behind an injection seam, a point
+where a test can substitute a controlled clock. That substitution is a
+standing upstream request (the mock-time ask), and this wobble is fresh
+evidence for it.
+
+### 11.3 One ruler for both instruments (bench run-002)
+
+The two implementations report very different raw numbers, and the difference
+decomposes across four axes: denominator (one marginal insert versus sums over
+a whole universe), counting boundary (Lance-only versus both realms and all
+verbs), store state (a fresh indexed fixture versus operations mid-life in an
+accumulating store), and backend (local FS and RustFS versus the in-memory
+object-store backend).
+To compare them at all, run-002 replicated #503's shape inside the simulation:
+a fresh store, exactly one sampled operation, counted on the Lance realm only,
+which is where the two rulers overlap. That cell is an operation's floor, its
+cost on a store with no history. On that shared ruler:
+
+- Write counts match #503's RustFS column exactly: 7 puts on both insert
+  kinds.
+- Edge-insert reads land within three calls, 53 versus 50, if #503's "reads"
+  exclude listing calls (an open boundary question).
+- Node-insert reads are the one open residual, 47 versus 30 reads; the prime
+  suspect is store state again (#503 measures on an indexed fixture, the
+  floor scenario runs unindexed).
+- #503's local-FS column (2 writes) matches neither our cells nor its own
+  RustFS column. That mismatch is the backend axis measured from both sides:
+  the in-memory object-store backend behaves like a real object store, while
+  a filesystem's atomic rename elides staged writes an object store must
+  make. Request-shape conclusions from local FS remain provisional, exactly
+  as §3 already required.
+
+Two side results from the same run: the two node-insert kinds (InsertV,
+which writes a versioned person row, and InsertLegacy, which writes the
+plain form) have identical floor cells, call for call (47 get, 14 list,
+7 put), so the fresh-store insert path does not distinguish them; and
+edge-insert reads roughly double as the store ages (floor 53 `l.get`, an
+average near 100 across the same kind's later instances in the 30-operation
+universe): the accumulation half of the store-state axis, measured directly.
+
+#503 also contributes evidence this RFC could not generate for itself: its
+order-swapped measurements reproduced identical logical counts on both real
+backends, evidence that exact call-count repetition is a property of the
+code path rather than an artifact of the simulation.
+
+### 11.4 Division of roles
+
+For the logical-comparator job (count an operation's logical storage calls and
+gate CI on them), the DST counting pass is the broader instrument: every
+operation kind the harness samples (11 today), with a new kind joining the
+table automatically once sampled; both realms, with existence and listing
+checks counted as first-class verbs; per-kind attribution with harness traffic
+excluded; and determinism by construction (the hosting harness's contract,
+argued in the deterministic simulation RFC), so a regression is named per
+(operation kind, verb) rather than caught by a ceiling. #503's machinery owns
+what the simulation deliberately does not claim: truth on real backends. The
+intended end state is one counting instrument, stated element by element in
+the deterministic simulation RFC's #503 table (for each #503 technique, where
+it lands) and gated on completing the reconciliation above: the counting
+golden also runs against real backends after merge, one column per supported
+provider, absorbing #503's prefix leak check (no keys left under the test
+prefix after a run), digest-pinned backend identity, order-swap control, and
+ceilings-as-budgets, each credited to #503.
+
+### 11.5 CI posture
+
+Nothing in §6 changes. The counting golden is per-PR-viable precisely because
+it is a structural gate, not a performance gate, the same altitude as §6.3's
+structural request-count invariants: exact call counts, no timing statistics,
+no tolerance bands, at ordinary workspace-test cost. Wall clock
+stays where §4.2 put it, in direct release-profile runs, and the two kinds of
+number never compare. The roadmap beyond the golden is a per-PR cost report
+plus a direction-aware ratchet (a regression fails the gate; an accepted
+improvement re-baselines the table), which grows toward #503's budget form as
+its ceilings and the golden's exactness merge into one gate.
