@@ -2045,13 +2045,13 @@ async fn plan_lineage_merge(
         tracing::debug!(table_key, "lineage merge gate: blob schema; using the walk");
         return Ok(None);
     }
-    let base_entry = base_snapshot.entry(table_key);
-    let source_entry = source_snapshot.entry(table_key);
-    let target_entry = target_snapshot.entry(table_key);
+    let base_entry = base_snapshot.dataset(table_key);
+    let source_entry = source_snapshot.dataset(table_key);
+    let target_entry = target_snapshot.dataset(table_key);
     let mut table_paths = [base_entry, source_entry, target_entry]
         .into_iter()
         .flatten()
-        .map(|entry| entry.table_path.as_str());
+        .map(|entry| entry.dataset_path.as_str());
     if let Some(first_path) = table_paths.next() {
         if table_paths.any(|path| path != first_path) {
             tracing::debug!(
@@ -2063,15 +2063,15 @@ async fn plan_lineage_merge(
     }
 
     let base = match base_entry {
-        Some(_) => Some(base_snapshot.open_dataset(table_key).await?),
+        Some(_) => Some(base_snapshot.open_lance_dataset(table_key).await?),
         None => None,
     };
     let source = match source_entry {
-        Some(_) => Some(source_snapshot.open_dataset(table_key).await?),
+        Some(_) => Some(source_snapshot.open_lance_dataset(table_key).await?),
         None => None,
     };
     let target = match target_entry {
-        Some(_) => Some(target_snapshot.open_dataset(table_key).await?),
+        Some(_) => Some(target_snapshot.open_lance_dataset(table_key).await?),
         None => None,
     };
 
@@ -2083,7 +2083,7 @@ async fn plan_lineage_merge(
         let (Some(dataset), Some(entry)) = (dataset, entry) else {
             continue;
         };
-        if dataset.version().version != entry.table_version
+        if dataset.version().version != entry.published_dataset_version
             || !dataset.manifest.uses_stable_row_ids()
         {
             tracing::debug!(
@@ -2139,8 +2139,8 @@ async fn plan_lineage_merge(
                 .branch_identifier()
                 .await
                 .map_err(|error| OmniError::Lance(error.to_string()))?;
-            if side_entry.table_branch == base_entry.table_branch {
-                if side_entry.table_version < base_entry.table_version
+            if side_entry.native_dataset_branch == base_entry.native_dataset_branch {
+                if side_entry.published_dataset_version < base_entry.published_dataset_version
                     || side_identifier != base_identifier
                 {
                     tracing::debug!(
@@ -2150,7 +2150,7 @@ async fn plan_lineage_merge(
                     return Ok(None);
                 }
             } else if side_identifier.find_referenced_version(&base_identifier)
-                != Some(base_entry.table_version)
+                != Some(base_entry.published_dataset_version)
             {
                 tracing::debug!(
                     table_key,
