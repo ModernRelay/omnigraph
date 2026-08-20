@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
+| **Status** | Accepted |
 | **Date** | 2026-08-19 |
 | **Author track** | Public contribution |
 | **Author(s)** | Azim Afroozeh ([@azimafroozeh](https://github.com/azimafroozeh)) |
