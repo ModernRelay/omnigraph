@@ -60,17 +60,17 @@ priced toward CSR rather than capped mid-traversal. The override flag forces a p
 only the path differs).
 
 **Branch-merge classification mode.** `OMNIGRAPH_MERGE_LINEAGE` selects how a
-branch merge finds the rows to classify. `on` (the release default) discovers
-candidate rows from Lance version metadata — fragment lists and deletion files
-— and reads only those rows, so merge cost tracks the delta size instead of the
-table size; a fail-closed precondition gate falls back to the full three-way
-scan whenever any assumption cannot be proven (Blob-bearing schema, differing
-schemas or table paths across the pins, version pins not matching the manifest
-entries, missing stable row ids or the exact-id primary-key contract,
-non-linear history, or a candidate set past its byte budget). `off` forces the
-full three-way scan for every table — the operational fallback if merge results
-are ever in question. `verify` runs both, compares their row classifications,
-publishes the scan's result, and fails the merge loudly on any divergence (the
-debug-build default, used for validation; it costs both paths). A merge that
-succeeds produces the same result in every mode; only cost differs. An
-unrecognized value logs a warning and behaves as `off`.
+branch merge finds what changed. `on` (the release default) discovers
+candidates from Lance version metadata — fragment lists and deletion files —
+and reads only the changed data, so merge cost tracks the delta size instead
+of the dataset size; a fail-closed precondition gate falls back to the full
+three-way scan whenever any assumption cannot be proven (Blob-bearing schema,
+differing schemas or storage paths across the pins, version pins not matching
+the manifest entries, missing stable identifiers or the exact-id primary-key
+contract, non-linear history, or a candidate set past its byte budget). `off`
+forces the full three-way scan everywhere — the operational fallback if merge
+results are ever in question. `verify` runs both, compares their decisions
+entity by entity, publishes the scan's result, and fails the merge loudly on
+any divergence (the debug-build default, used for validation; it costs both
+paths). A merge that succeeds produces the same result in every mode; only
+cost differs. An unrecognized value logs a warning and behaves as `off`.
