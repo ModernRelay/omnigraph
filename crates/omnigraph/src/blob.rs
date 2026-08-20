@@ -179,9 +179,7 @@ pub(crate) fn validate_external_blob_uri_raw_limit(raw: &str) -> Result<()> {
 pub(crate) fn validate_external_blob_uri_builder_input(raw: &str) -> Result<()> {
     validate_external_blob_uri_raw_limit(raw)?;
     if raw.is_empty() {
-        return Err(policy_error(
-            "external Blob URI must be non-empty and contain no surrounding whitespace",
-        ));
+        return Err(policy_error("external Blob URI must be non-empty"));
     }
     Ok(())
 }
@@ -1571,6 +1569,9 @@ mod tests {
     #[test]
     fn external_blob_policy_rejects_credentials_ambiguity_and_overlapping_bases() {
         for uri in [
+            " ",
+            " s3://bucket/base",
+            "s3://bucket/base ",
             "s3://user@bucket/base",
             "s3://bucket/base?token=secret",
             "s3://bucket/base#fragment",

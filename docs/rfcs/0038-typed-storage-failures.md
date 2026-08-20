@@ -18,8 +18,10 @@ turning that classification into a generic retry decision. `OmniError::Lance`
 becomes `OmniError::Storage(StorageFailure)`, and `StorageFailureKind`
 distinguishes positive evidence of transient, configuration, absence,
 precondition, and permanent conditions from `Unknown`. Storage diagnostics keep
-their historical operator-facing text. HTTP, OpenAPI, and persisted graph data
-do not change.
+their historical operator-facing text. HTTP and OpenAPI schemas and persisted
+graph data do not change; generic storage failures remain HTTP 500, while a
+corrected operation-specific category may intentionally restore that
+category's existing status.
 
 ## Motivation
 
@@ -95,6 +97,9 @@ idempotency API. A caller may use the classification as one input to an
 operation-local policy, but it must separately prove the operation's effect and
 replay boundary.
 
+`Unknown` is not a weaker form of `Transient`: it never authorizes replay.
+Replay still requires a separate operation-local effect and idempotency proof.
+
 `StorageFailure.message` is the complete operator-facing diagnostic, and
 `OmniError::Storage` displays it unchanged. Existing genuine storage messages
 therefore remain exact:
@@ -162,8 +167,23 @@ The adapter maps `object_store` 0.13.2 as follows:
 | `InvalidPath`, `NotSupported`, `NotImplemented`, `PermissionDenied`, `Unauthenticated`, `UnknownConfigurationKey` | `Configuration` |
 | `JoinError` cancelled | `Transient` |
 | `JoinError` panic | `Permanent` |
-| `Generic` | recursively classify its typed source; otherwise `Unknown` |
+| `Generic` carrying public `HttpErrorKind::Connect`, `Timeout`, or `Interrupted` | `Transient` |
+| `Generic` carrying public `HttpErrorKind::Request`, `Decode`, or `Unknown` | `Unknown` |
+| other `Generic` | recursively classify its typed source; otherwise `Unknown` |
 | future non-exhaustive variant | `Unknown` |
+
+The public `HttpErrorKind` cases describe broad client failure stages, not HTTP
+response statuses. `Request` is ambiguous because `object_store` also uses it
+for request-construction and serialization failures; `Decode` does not prove
+whether a malformed response is stable. Neither is positive transient or
+permanent evidence, so both remain `Unknown`. In `object_store` 0.13.2, a real
+S3-compatible 408, 429, or 5xx
+response whose provider retries are exhausted is carried by an internal status
+wrapper that OmniGraph cannot name or downcast through the public API. OmniGraph
+does not parse its display text, so that case remains `Unknown` pending upstream
+support; see [`object_store` issue #737](https://github.com/apache/arrow-rs-object-store/issues/737).
+This RFC does not claim that those real status responses become `Transient`,
+and their `Unknown` result never authorizes replay.
 
 Storage-owned `std::io::ErrorKind` values map as follows:
 
@@ -199,6 +219,17 @@ Every current `lance::Error` variant is mapped explicitly:
 otherwise become `Unknown`. `Namespace` downcasts its source to
 `lance_namespace::NamespaceError`; a failed downcast uses the same bounded
 typed-source rule and otherwise becomes `Unknown`.
+
+That preservation applies only while the upstream error still carries a typed
+source. Lance 10 converts a top-level `DataFusionError::Shared` by attempting to
+unwrap its `Arc`; if the error is multiply owned, Lance falls back to a
+display-only `lance::Error::Execution`. Lance's `ReplayExec` can likewise turn
+an upstream typed failure into a display-only external error.
+By either boundary, the concrete type has already been erased before OmniGraph
+receives it. OmniGraph refuses to reconstruct semantics from text and reports
+`Storage(Unknown)` pending [Lance issue #8676](https://github.com/lance-format/lance/issues/8676).
+This RFC therefore does not promise type preservation through every
+DataFusion/Lance execution wrapper, and the fallback never authorizes replay.
 
 The apparently counterintuitive corrections are deliberate. A Lance
 `Execution` string is not automatically a DataFusion user error, and a
@@ -250,7 +281,14 @@ This is an intentional pre-1.0 Rust API break:
 
 - `OmniError::Lance(String)` is removed;
 - exhaustive consumers must handle `OmniError::Storage(StorageFailure)`; and
-- callers may inspect `StorageFailureKind` instead of parsing text.
+- callers may inspect `StorageFailureKind` instead of parsing text;
+- direct `omnigraph-storage` consumers must handle the new
+  `Backend(StorageFailure)` variant, and replace tuple `Io(std::io::Error)`
+  matches with `Io { failure, source }`;
+- `StorageError::CreateIfAbsentUnsupported` is replaced by a
+  `Configuration`-kind `Io`; and
+- `From<std::io::Error>` remains available, but now produces the structured
+  `Io { failure, source }` variant.
 
 Exact operator text is preserved for genuine adapter and Lance storage
 failures. Some errors intentionally change category: manifest-owned Arrow
@@ -267,14 +305,20 @@ HTTP-schema, or OpenAPI migration. No persisted data changes.
 
 Tests extend the existing in-source owners and staged table-store suite:
 
-- every object-store variant, recognized and opaque `Generic` sources, nested
-  depth seven/eight, a cyclic source, and future/depth fallback;
+- every public object-store variant, all public `HttpErrorKind` values,
+  recognized and opaque `Generic` sources, nested depth seven/eight, a cyclic
+  source, and future/depth fallback;
+- a local S3-compatible responder that exhausts retries for 408, 429, 500, 502,
+  503, and 504 and proves the internal status wrapper remains `Unknown` without
+  display-text parsing;
 - local I/O cases for all six categories plus cancelled/panicked join tasks;
 - all 24 Lance Namespace codes and every Lance family, including recursive
-  `IO`, `Wrapped`, and `External` sources;
+  `IO`, `Wrapped`, and `External` sources whose concrete type survives upstream;
 - exact direct-adapter, direct-Lance, and contextual-Lance display strings;
-- DataFusion user errors, nested typed substrate errors, Arrow/internal
-  failures, and Blob-integrity contradictions at their owning boundaries;
+- DataFusion user errors; supported engine carriers through `Context`,
+  `Diagnostic`, and `Shared`; nested typed substrate errors; the top-level
+  multiply-owned Lance `Shared` fallback to `Storage(Unknown)`; Arrow/internal
+  failures; and Blob-integrity contradictions at their owning boundaries;
 - the table-store proof that only the effect-free adapter emits
   `RetryableCommitConflict`, while the generic classifier reports the same
   Lance variants as `Precondition`;
@@ -297,8 +341,9 @@ the adapter, substrate, conflict, and transport boundaries separately. It does
 not change graph publication, recovery, schema identity, or source-of-truth
 rules.
 
-It also closes two deny-list risks. No caller needs to parse string-flattened
-errors for semantics, and exact observable error text is treated as a contract.
+It also closes two deny-list risks. Callers receive an explicit `Unknown`
+fallback instead of parsing string-flattened errors for semantics, and exact
+observable error text is treated as a contract.
 The change does not add a transaction manager, retry queue, alternate write
 path, or side channel for replay semantics.
 
@@ -335,5 +380,6 @@ available as historical context but is not merged or rebased.
 
 ## Unresolved questions
 
-None. New typed substrate evidence may justify finer classification in a later
-RFC, but provider message parsing is not an acceptable substitute.
+No unresolved OmniGraph design questions. New public upstream evidence may
+justify finer classification in a later RFC, but provider message parsing is
+not an acceptable substitute.

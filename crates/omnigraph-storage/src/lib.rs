@@ -147,6 +147,20 @@ fn classify_builtin_storage_source<'a>(
     use std::io::ErrorKind;
     use std::ops::ControlFlow::{Break, Continue};
 
+    if let Some(error) = source.downcast_ref::<object_store::client::HttpError>() {
+        return Break(match error.kind() {
+            object_store::client::HttpErrorKind::Connect
+            | object_store::client::HttpErrorKind::Timeout
+            | object_store::client::HttpErrorKind::Interrupted => StorageFailureKind::Transient,
+            // `Request` also wraps request-construction/serialization failures,
+            // and `Decode` does not prove whether the bad response is stable.
+            // Neither public kind is positive retry or permanence evidence.
+            object_store::client::HttpErrorKind::Request
+            | object_store::client::HttpErrorKind::Decode
+            | object_store::client::HttpErrorKind::Unknown => StorageFailureKind::Unknown,
+            _ => StorageFailureKind::Unknown,
+        });
+    }
     if let Some(error) = source.downcast_ref::<object_store::Error>() {
         return match error {
             object_store::Error::NotFound { .. } => Break(StorageFailureKind::NotFound),
@@ -276,6 +290,14 @@ impl StorageError {
             failure: StorageFailure::new(kind, message),
             source: error,
         }
+    }
+}
+
+/// Preserve the pre-v0.10 `?` conversion while enriching the resulting I/O
+/// variant with typed storage evidence.
+impl From<std::io::Error> for StorageError {
+    fn from(error: std::io::Error) -> Self {
+        Self::io(error)
     }
 }
 
@@ -1348,6 +1370,117 @@ mod tests {
         }
     }
 
+    fn spawn_status_server(
+        status: u16,
+        response_count: usize,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local status server");
+        listener
+            .set_nonblocking(true)
+            .expect("configure local status server");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("local server address")
+        );
+        let server = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut served = 0;
+            while served < response_count {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "status server accept timed out");
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("status server accept failed: {error}"),
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("configure blocking status connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("configure status server read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("configure status server write timeout");
+
+                let mut request = [0_u8; 16 * 1024];
+                let mut request_len = 0;
+                loop {
+                    assert!(
+                        request_len < request.len(),
+                        "status server request headers exceeded test bound"
+                    );
+                    let read = stream
+                        .read(&mut request[request_len..])
+                        .expect("read local status request");
+                    assert!(read != 0, "status request ended before its headers");
+                    request_len += read;
+                    if request[..request_len]
+                        .windows(4)
+                        .any(|window| window == b"\r\n\r\n")
+                    {
+                        break;
+                    }
+                }
+                assert!(
+                    request[..request_len].starts_with(b"GET "),
+                    "status evidence must come from a real object-store GET"
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write local status response");
+                stream.flush().expect("flush local status response");
+                served += 1;
+            }
+            served
+        });
+        (endpoint, server)
+    }
+
+    async fn exhausted_s3_status_error(status: u16) -> object_store::Error {
+        use std::time::Duration;
+
+        const EXPECTED_REQUESTS: usize = 2;
+        let (endpoint, server) = spawn_status_server(status, EXPECTED_REQUESTS);
+        let store = AmazonS3Builder::new()
+            .with_bucket_name("test-bucket")
+            .with_region("us-east-1")
+            .with_access_key_id("test-access-key")
+            .with_secret_access_key("test-secret-key")
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_virtual_hosted_style_request(false)
+            .with_retry(object_store::RetryConfig {
+                backoff: object_store::BackoffConfig {
+                    init_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(1),
+                    base: 2.0,
+                },
+                max_retries: 1,
+                retry_timeout: Duration::from_secs(2),
+            })
+            .build()
+            .expect("build local S3 status client");
+        let error = store
+            .get(&ObjectPath::from("key"))
+            .await
+            .expect_err("status response must fail the object-store GET");
+        assert_eq!(
+            server.await.expect("join local status server"),
+            EXPECTED_REQUESTS,
+            "object_store must exhaust its configured retry before surfacing status {status}"
+        );
+        error
+    }
+
     #[test]
     fn storage_failure_is_transient_only_for_transient_kind() {
         for kind in [
@@ -1432,7 +1565,7 @@ mod tests {
             (ErrorKind::InvalidData, StorageFailureKind::Permanent),
             (ErrorKind::Other, StorageFailureKind::Unknown),
         ] {
-            let error = StorageError::io(std::io::Error::new(error_kind, "local failure"));
+            let error = StorageError::from(std::io::Error::new(error_kind, "local failure"));
             let StorageError::Io { failure, source } = error else {
                 panic!("local storage I/O must retain its structured source")
             };
@@ -1531,6 +1664,48 @@ mod tests {
                 generic(boxed_io(std::io::ErrorKind::TimedOut)),
                 StorageFailureKind::Transient,
             ),
+            (
+                generic(Box::new(object_store::client::HttpError::new(
+                    object_store::client::HttpErrorKind::Connect,
+                    OpaqueError,
+                ))),
+                StorageFailureKind::Transient,
+            ),
+            (
+                generic(Box::new(object_store::client::HttpError::new(
+                    object_store::client::HttpErrorKind::Request,
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "inner timeout"),
+                ))),
+                StorageFailureKind::Unknown,
+            ),
+            (
+                generic(Box::new(object_store::client::HttpError::new(
+                    object_store::client::HttpErrorKind::Timeout,
+                    OpaqueError,
+                ))),
+                StorageFailureKind::Transient,
+            ),
+            (
+                generic(Box::new(object_store::client::HttpError::new(
+                    object_store::client::HttpErrorKind::Interrupted,
+                    OpaqueError,
+                ))),
+                StorageFailureKind::Transient,
+            ),
+            (
+                generic(Box::new(object_store::client::HttpError::new(
+                    object_store::client::HttpErrorKind::Decode,
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "inner timeout"),
+                ))),
+                StorageFailureKind::Unknown,
+            ),
+            (
+                generic(Box::new(object_store::client::HttpError::new(
+                    object_store::client::HttpErrorKind::Unknown,
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "inner timeout"),
+                ))),
+                StorageFailureKind::Unknown,
+            ),
             (generic(Box::new(OpaqueError)), StorageFailureKind::Unknown),
         ];
 
@@ -1561,6 +1736,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn exhausted_http_status_wrappers_remain_unknown_without_public_typed_evidence() {
+        // object_store 0.13.2 retains these status codes in a private retry
+        // wrapper. The controlled server proves the status supplied to the
+        // public client; classification must not recover it from display text.
+        for status in [408, 429, 500, 502, 503, 504] {
+            let error = exhausted_s3_status_error(status).await;
+            assert!(
+                matches!(&error, object_store::Error::Generic { .. }),
+                "status {status} must exercise object_store's opaque exhausted-retry wrapper"
+            );
+            assert_eq!(
+                classify_object_store_error(&error),
+                StorageFailureKind::Unknown,
+                "private status evidence must remain unknown for {status}"
+            );
+        }
+    }
+
     #[test]
     fn typed_source_walk_accepts_depth_seven_and_bounds_depth_eight_and_cycles() {
         let classify = |source: &(dyn std::error::Error + 'static)| {
@@ -1575,6 +1769,28 @@ mod tests {
 
         let depth_eight = source_chain(8, boxed_io(std::io::ErrorKind::TimedOut));
         assert_eq!(classify(depth_eight.as_ref()), StorageFailureKind::Unknown);
+        let http_depth_seven = source_chain(
+            7,
+            Box::new(object_store::client::HttpError::new(
+                object_store::client::HttpErrorKind::Timeout,
+                OpaqueError,
+            )),
+        );
+        assert_eq!(
+            classify(http_depth_seven.as_ref()),
+            StorageFailureKind::Transient
+        );
+        let http_depth_eight = source_chain(
+            8,
+            Box::new(object_store::client::HttpError::new(
+                object_store::client::HttpErrorKind::Timeout,
+                OpaqueError,
+            )),
+        );
+        assert_eq!(
+            classify(http_depth_eight.as_ref()),
+            StorageFailureKind::Unknown
+        );
         assert_eq!(classify(&CyclicError), StorageFailureKind::Unknown);
         assert_eq!(
             classify_object_store_error(&generic(Box::new(CyclicError))),

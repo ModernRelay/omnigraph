@@ -27,6 +27,23 @@
   `Precondition` means re-evaluate state, not “retry this operation.” The HTTP
   API does not expose this Rust classification: generic storage failures remain
   **500**, and the OpenAPI schema is unchanged.
+
+  Public `object_store::client::HttpErrorKind` conditions are typed:
+  `Connect`, `Timeout`, and `Interrupted` are `Transient`; ambiguous `Request`,
+  `Decode`, and `Unknown` remain `Unknown`. These are broad client stages, not
+  HTTP response statuses: `Request` can be a request-construction failure, and
+  `Decode` does not prove whether a malformed response is stable. In
+  `object_store` 0.13.2, real S3-compatible 408,
+  429, and 5xx responses whose retries are exhausted retain their status only
+  behind an internal wrapper, so OmniGraph reports `Unknown` pending upstream
+  support rather than parsing display text.
+
+  Lance 10 can similarly erase a top-level multiply-owned
+  `DataFusionError::Shared` or an error crossing `ReplayExec` into a
+  display-only error before OmniGraph receives it. Those cases also become
+  `Storage(Unknown)` pending [Lance #8676](https://github.com/lance-format/lance/issues/8676).
+  `Unknown` never authorizes replay; an operation still needs its own effect
+  and idempotency proof.
 - `HistoricalVersionReclaimed { published_dataset_version }` — an exact graph-manifest-pinned Lance
   version was reclaimed. Historical callers keep this distinct from ordinary
   absence; change routes project it to the typed 410 baseline-reset contract.

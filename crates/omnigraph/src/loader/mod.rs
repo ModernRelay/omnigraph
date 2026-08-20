@@ -4049,8 +4049,7 @@ node Doc {
             append_blob_value(&mut builder, ""),
             Err(OmniError::ExternalBlobPolicy { uri, reason })
                 if uri == "<redacted>"
-                    && reason
-                        == "external Blob URI must be non-empty and contain no surrounding whitespace"
+                    && reason == "external Blob URI must be non-empty"
         ));
     }
 
