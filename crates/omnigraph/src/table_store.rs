@@ -172,6 +172,12 @@ impl ScanTuning<'_> {
         self.scanner.with_row_address();
         self
     }
+
+    /// Restrict the scan to the given fragments.
+    pub(crate) fn with_fragments(&mut self, fragments: Vec<Fragment>) -> &mut Self {
+        self.scanner.with_fragments(fragments);
+        self
+    }
 }
 
 fn mark_ordered_scan_resource_error(
@@ -4971,7 +4977,7 @@ fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &
     Ok(())
 }
 
-fn exact_id_primary_key_field_id(ds: &Dataset, context: &'static str) -> Result<i32> {
+pub(crate) fn exact_id_primary_key_field_id(ds: &Dataset, context: &'static str) -> Result<i32> {
     let primary_key = ds.schema().unenforced_primary_key();
     if primary_key.len() == 1
         && primary_key[0].name == "id"
