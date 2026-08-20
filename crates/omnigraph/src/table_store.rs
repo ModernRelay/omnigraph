@@ -166,13 +166,6 @@ impl ScanTuning<'_> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("ordered scan exhausted {resource} (limit {limit} bytes)")]
-struct OrderedScanResourceExhausted {
-    resource: &'static str,
-    limit: u64,
-}
-
 fn mark_ordered_scan_resource_error(
     error: DataFusionError,
     memory_limit: u64,
@@ -187,16 +180,16 @@ fn mark_ordered_scan_resource_error(
             } else {
                 ("ordered_scan_memory_bytes", memory_limit)
             };
-        return DataFusionError::External(Box::new(OrderedScanResourceExhausted {
-            resource,
-            limit,
-        }));
+        return OmniError::resource_limit(resource, limit, limit.saturating_add(1))
+            .into_datafusion_external();
     }
     if message.contains("single row is") && message.contains("maximum allowed batch size") {
-        return DataFusionError::External(Box::new(OrderedScanResourceExhausted {
-            resource: "ordered_scan_input_batch_bytes",
-            limit: input_batch_limit,
-        }));
+        return OmniError::resource_limit(
+            "ordered_scan_input_batch_bytes",
+            input_batch_limit,
+            input_batch_limit.saturating_add(1),
+        )
+        .into_datafusion_external();
     }
     error
 }
@@ -1277,9 +1270,7 @@ impl TableStore {
                             let materialized = store
                                 .materialize_blob_batch_with_limit(&ds, row, Some(limit))
                                 .await
-                                .map_err(|error| {
-                                    datafusion::error::DataFusionError::Execution(error.to_string())
-                                })?;
+                                .map_err(OmniError::into_datafusion_external)?;
                             return Ok(Some((materialized, (raw, current, offset, ds, store))));
                         }
 
@@ -1304,9 +1295,7 @@ impl TableStore {
                 store
                     .materialize_blob_batch_with_limit(&ds, batch, None)
                     .await
-                    .map_err(|error| {
-                        datafusion::error::DataFusionError::Execution(error.to_string())
-                    })
+                    .map_err(OmniError::into_datafusion_external)
             }
         });
         Box::pin(RecordBatchStreamAdapter::new(schema, materialized))
@@ -1338,9 +1327,7 @@ impl TableStore {
             .column_by_name("_rowid")
             .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                OmniError::manifest_internal(
-                    "expected _rowid column when materializing Blobs".to_string(),
-                )
+                OmniError::manifest_internal("expected _rowid column when materializing Blobs")
             })?
             .values()
             .to_vec();
@@ -1370,9 +1357,7 @@ impl TableStore {
             .column_by_name("_rowid")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                OmniError::manifest_internal(
-                    "expected _rowid column when materializing blobs".to_string(),
-                )
+                OmniError::manifest_internal("expected _rowid column when materializing blobs")
             })?
             .values()
             .iter()
@@ -1435,8 +1420,8 @@ impl TableStore {
         let external_payloads = supplied_external_payloads.unwrap_or(&mut owned_external_payloads);
         let mut columns = Vec::with_capacity(schema.fields().len());
         for field in schema.fields() {
-            let lance_field =
-                lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
+            let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+                .map_err(OmniError::lance_internal)?;
             let column = batch.column_by_name(field.name()).ok_or_else(|| {
                 OmniError::manifest_internal(format!("batch missing column '{}'", field.name()))
             })?;
@@ -1603,7 +1588,7 @@ impl TableStore {
         let mut managed_files = blob_files.into_iter();
         for descriptor in descriptors {
             match descriptor {
-                BlobDescriptor::Null => builder.push_null().map_err(OmniError::storage)?,
+                BlobDescriptor::Null => builder.push_null().map_err(OmniError::lance_internal)?,
                 BlobDescriptor::Managed { length } => {
                     let blob = managed_files
                         .next()
@@ -1626,7 +1611,7 @@ impl TableStore {
                     crate::instrumentation::record_blob_payload_read();
                     builder
                         .push_bytes(blob.read().await.map_err(OmniError::storage)?)
-                        .map_err(OmniError::storage)?;
+                        .map_err(OmniError::lance_internal)?;
                 }
                 BlobDescriptor::External {
                     uri,
@@ -1645,7 +1630,7 @@ impl TableStore {
                     };
                     builder
                         .push_bytes(bytes.as_ref())
-                        .map_err(OmniError::storage)?;
+                        .map_err(OmniError::lance_internal)?;
                 }
             }
         }
@@ -1657,7 +1642,7 @@ impl TableStore {
             )));
         }
 
-        builder.finish().map_err(OmniError::storage)
+        builder.finish().map_err(OmniError::lance_internal)
     }
 
     pub async fn scan_stream(
@@ -1897,30 +1882,7 @@ impl TableStore {
     /// Preserve a typed resource failure after Lance converts the DataFusion
     /// stream error at the public Dataset boundary.
     pub(crate) fn ordered_scan_error(error: lance::Error) -> OmniError {
-        if let Some(resource) = error
-            .external_source()
-            .and_then(|source| source.downcast_ref::<OrderedScanResourceExhausted>())
-        {
-            return OmniError::ResourceLimitExceeded {
-                resource: resource.resource.to_string(),
-                limit: resource.limit,
-                actual: resource.limit.saturating_add(1),
-            };
-        }
-        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
-        while let Some(candidate) = current {
-            if let Some(resource) = candidate.downcast_ref::<OrderedScanResourceExhausted>() {
-                return OmniError::ResourceLimitExceeded {
-                    resource: resource.resource.to_string(),
-                    limit: resource.limit,
-                    // DataFusion reports only that the bound was crossed. The
-                    // smallest truthful lower bound is one byte over it.
-                    actual: resource.limit.saturating_add(1),
-                };
-            }
-            current = candidate.source();
-        }
-        OmniError::storage(error)
+        OmniError::lance_stream(error)
     }
 
     pub async fn scan(
@@ -2406,7 +2368,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted_stream(stream)
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(OmniError::lance_stream)?;
         let mut new_fragments = match &transaction.operation {
             Operation::Append { fragments } => fragments.clone(),
             Operation::Overwrite { fragments, .. } => fragments.clone(),
@@ -2638,7 +2600,7 @@ impl TableStore {
         for id in &source_ids {
             filter_builder
                 .insert(KeyValue::String(id.clone()))
-                .map_err(OmniError::storage)?;
+                .map_err(OmniError::lance_internal)?;
         }
         if filter_builder.len() != batch.num_rows()
             || source_ids
@@ -2938,7 +2900,7 @@ impl TableStore {
         context: &'static str,
     ) -> Result<(StagedWrite, MergeStats)> {
         let mut builder = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
-            .map_err(OmniError::storage)?;
+            .map_err(OmniError::lance_internal)?;
         builder.when_matched(match semantics {
             KeyedWriteSemantics::StrictInsert => WhenMatched::Fail,
             KeyedWriteSemantics::Upsert | KeyedWriteSemantics::KnownPresentUpdate => {
@@ -2966,10 +2928,10 @@ impl TableStore {
         builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
         let uncommitted = builder
             .try_build()
-            .map_err(OmniError::storage)?
+            .map_err(OmniError::lance_internal)?
             .execute_uncommitted(stream)
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(OmniError::lance_stream)?;
 
         match semantics {
             KeyedWriteSemantics::StrictInsert => {
@@ -3082,17 +3044,18 @@ impl TableStore {
                                     column.as_any().downcast_ref::<UInt64Array>()
                                 })
                                 .ok_or_else(|| {
-                                    datafusion::error::DataFusionError::Execution(
+                                    OmniError::manifest_internal(
                                         "scan_proven_insert_delta_bounded expected stable _rowid in blob source scan"
                                             .to_string(),
                                     )
+                                    .into_datafusion_external()
                                 })?
                                 .value(0);
                         let descriptors = source
                             .take_rows(&[row_id], source.schema().clone())
                             .await
                             .map_err(|error| {
-                                datafusion::error::DataFusionError::Execution(error.to_string())
+                                OmniError::storage(error).into_datafusion_external()
                             })?;
                         let materialized = store
                             .materialize_blob_batch_with_row_ids(
@@ -3104,9 +3067,7 @@ impl TableStore {
                                 None,
                             )
                             .await
-                            .map_err(|error| {
-                                datafusion::error::DataFusionError::Execution(error.to_string())
-                            })?;
+                            .map_err(OmniError::into_datafusion_external)?;
                         return Ok(Some((
                             materialized,
                             (raw, current, offset, source, store, external_preflight),
@@ -3291,7 +3252,7 @@ impl TableStore {
 
         let ds = Arc::new(ds);
         let mut builder =
-            MergeInsertBuilder::try_new(ds, key_columns).map_err(OmniError::storage)?;
+            MergeInsertBuilder::try_new(ds, key_columns).map_err(OmniError::lance_internal)?;
         builder.when_matched(when_matched);
         builder.when_not_matched(when_not_matched);
         // Workaround for a Lance bug class where sequential merge_insert calls
@@ -3310,14 +3271,14 @@ impl TableStore {
         // walk in `exec/merge.rs`). Retire when upstream Lance fixes the bug
         // class. Tracked at MR-957; upstream: lance-format/lance#6877.
         builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
-        let job = builder.try_build().map_err(OmniError::storage)?;
+        let job = builder.try_build().map_err(OmniError::lance_internal)?;
         let schema = batch.schema();
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
         let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
         let uncommitted = job
             .execute_uncommitted(stream)
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(OmniError::lance_stream)?;
         // Record only after the staging write succeeds, so a failed write does
         // not inflate the probe (matches `stage_append`/`stage_append_stream`).
         crate::instrumentation::record_stage_merge_insert(merged_rows);
@@ -3552,8 +3513,8 @@ impl TableStore {
         // Lance's row-id-lineage spec, so this stays correct for legacy
         // datasets.
         let (transaction, mut new_fragments) = if batch.num_rows() == 0 {
-            let schema =
-                LanceSchema::try_from(batch.schema().as_ref()).map_err(OmniError::storage)?;
+            let schema = LanceSchema::try_from(batch.schema().as_ref())
+                .map_err(OmniError::lance_internal)?;
             let transaction = TransactionBuilder::new(
                 ds.manifest.version,
                 Operation::Overwrite {
@@ -4042,9 +4003,7 @@ impl TableStore {
                 .column_by_name("_rowid")
                 .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
                 .ok_or_else(|| {
-                    OmniError::manifest_internal(
-                        "expected _rowid in predicate-matched blob scan".to_string(),
-                    )
+                    OmniError::manifest_internal("expected _rowid in predicate-matched blob scan")
                 })?
                 .values()
                 .to_vec();
@@ -4681,7 +4640,7 @@ fn append_persisted_blob_selection(
 ) -> Result<()> {
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
         let lance_field =
-            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::lance_internal)?;
         if !lance_field.is_blob() {
             continue;
         }
@@ -4723,7 +4682,7 @@ fn visit_external_blob_uris<'a>(
 ) -> Result<()> {
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
         let lance_field =
-            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::lance_internal)?;
         if !lance_field.is_blob() {
             continue;
         }
@@ -4793,7 +4752,7 @@ fn canonicalize_external_blob_inputs(
     let mut columns = Vec::with_capacity(batch.num_columns());
     for (field, column) in schema.fields().iter().zip(batch.columns()) {
         let lance_field =
-            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::lance_internal)?;
         if !lance_field.is_blob() {
             columns.push(column.clone());
             continue;
@@ -4852,7 +4811,7 @@ async fn materialize_external_blob_inputs(
     let mut external_payloads: HashMap<String, Arc<[u8]>> = HashMap::new();
     for (field, column) in schema.fields().iter().zip(batch.columns()) {
         let lance_field =
-            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::lance_internal)?;
         if !lance_field.is_blob() {
             columns.push(column.clone());
             continue;
@@ -4865,11 +4824,11 @@ async fn materialize_external_blob_inputs(
         let mut builder = BlobArrayBuilder::new(descriptions.len());
         for row in 0..descriptions.len() {
             if descriptions.is_null(row) {
-                builder.push_null().map_err(OmniError::storage)?;
+                builder.push_null().map_err(OmniError::lance_internal)?;
             } else if input.data.is_valid(row) {
                 builder
                     .push_bytes(input.data.value(row))
-                    .map_err(OmniError::storage)?;
+                    .map_err(OmniError::lance_internal)?;
             } else {
                 let uri = input.uris.value(row);
                 let entry = preflight.entry(uri)?;
@@ -4884,10 +4843,10 @@ async fn materialize_external_blob_inputs(
                 };
                 builder
                     .push_bytes(bytes.as_ref())
-                    .map_err(OmniError::storage)?;
+                    .map_err(OmniError::lance_internal)?;
             }
         }
-        columns.push(builder.finish().map_err(OmniError::storage)?);
+        columns.push(builder.finish().map_err(OmniError::lance_internal)?);
     }
     RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }
@@ -4901,7 +4860,7 @@ async fn materialize_external_blob_inputs(
 fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &str) -> Result<()> {
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
         let lance_field =
-            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::lance_internal)?;
         if !lance_field.is_blob() {
             continue;
         }
@@ -5209,7 +5168,7 @@ fn certify_insert_absence(
     for id in source_ids {
         expected_filter
             .insert(KeyValue::String(id.clone()))
-            .map_err(OmniError::storage)?;
+            .map_err(OmniError::lance_internal)?;
     }
     if expected_filter.len() != source_ids.len()
         || source_ids
@@ -5332,9 +5291,10 @@ fn bounded_proven_insert_stream(
                     let batch_rows = batch.num_rows();
                     let batch_bytes =
                         u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-                            datafusion::error::DataFusionError::Execution(
-                                "proven insert delta batch bytes exceed u64".to_string(),
+                            OmniError::manifest_internal(
+                                "proven insert delta batch bytes exceed u64",
                             )
+                            .into_datafusion_external()
                         })?;
                     let fits = accumulated_rows
                         .checked_add(batch_rows)
@@ -5362,9 +5322,7 @@ fn bounded_proven_insert_stream(
                                 std::mem::take(&mut accumulated),
                                 &table_key,
                             )
-                            .map_err(|error| {
-                                datafusion::error::DataFusionError::Execution(error.to_string())
-                            })?;
+                            .map_err(OmniError::into_datafusion_external)?;
                             return Ok(Some((
                                 output,
                                 (
@@ -5389,9 +5347,7 @@ fn bounded_proven_insert_stream(
                         std::mem::take(&mut accumulated),
                         &table_key,
                     )
-                    .map_err(|error| {
-                        datafusion::error::DataFusionError::Execution(error.to_string())
-                    })?;
+                    .map_err(OmniError::into_datafusion_external)?;
                     return Ok(Some((
                         output,
                         (
@@ -5411,11 +5367,8 @@ fn bounded_proven_insert_stream(
                 if let Some(batch) = current.as_ref() {
                     if current_offset < batch.num_rows() {
                         pending = Some(
-                            next_proven_insert_batch(batch, current_offset, &table_key).map_err(
-                                |error| {
-                                    datafusion::error::DataFusionError::Execution(error.to_string())
-                                },
-                            )?,
+                            next_proven_insert_batch(batch, current_offset, &table_key)
+                                .map_err(OmniError::into_datafusion_external)?,
                         );
                         continue;
                     }
@@ -5437,9 +5390,7 @@ fn bounded_proven_insert_stream(
                             std::mem::take(&mut accumulated),
                             &table_key,
                         )
-                        .map_err(|error| {
-                            datafusion::error::DataFusionError::Execution(error.to_string())
-                        })?;
+                        .map_err(OmniError::into_datafusion_external)?;
                         return Ok(Some((
                             output,
                             (

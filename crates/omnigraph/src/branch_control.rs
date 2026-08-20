@@ -27,10 +27,6 @@ pub(crate) enum BranchCreateOutcome {
     RefAlreadyExists,
 }
 
-fn lance_error(error: lance::Error) -> OmniError {
-    OmniError::storage(error)
-}
-
 const BRANCH_ENUMERATION_MAX_ATTEMPTS: usize = 3;
 
 /// List Lance's authoritative named-branch refs through one bounded
@@ -51,7 +47,7 @@ pub(crate) async fn list_branch_contents(
             Err(lance::Error::NotFound { .. }) if attempt < BRANCH_ENUMERATION_MAX_ATTEMPTS => {
                 tokio::task::yield_now().await;
             }
-            Err(error) => return Err(lance_error(error)),
+            Err(error) => return Err(OmniError::storage(error)),
         }
     }
     unreachable!("the bounded branch-enumeration loop always returns")
@@ -82,7 +78,7 @@ async fn force_delete_branch_tree_unchecked(dataset: &mut Dataset, branch: &str)
         Ok(()) | Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => {
             Ok(())
         }
-        Err(error) => Err(lance_error(error)),
+        Err(error) => Err(OmniError::storage(error)),
     }
 }
 
@@ -200,7 +196,7 @@ pub(crate) async fn create_branch_recoverably(
 ) -> Result<BranchCreateOutcome> {
     // Lance validates inside phase 2 today. Validate before phase 1 so an
     // invalid name cannot leave a clone-only zombie.
-    check_valid_branch(branch).map_err(lance_error)?;
+    check_valid_branch(branch).map_err(OmniError::storage)?;
     if source.version().version != source_version {
         return Err(OmniError::manifest_conflict(format!(
             "branch source moved before native create: expected version {}, current {}",
@@ -210,7 +206,10 @@ pub(crate) async fn create_branch_recoverably(
     }
 
     let parent_branch = source.manifest().branch.clone();
-    let parent_identifier = source.branch_identifier().await.map_err(lance_error)?;
+    let parent_identifier = source
+        .branch_identifier()
+        .await
+        .map_err(OmniError::storage)?;
 
     let initial_branches = list_branch_contents(source).await?;
     if initial_branches.contains_key(branch) {
@@ -230,7 +229,7 @@ pub(crate) async fn create_branch_recoverably(
         let native_error = match source
             .create_branch(branch, source_version, None)
             .await
-            .map_err(lance_error)
+            .map_err(OmniError::storage)
         {
             Ok(created) => match crate::failpoints::maybe_fail(
                 crate::failpoints::names::BRANCH_CREATE_POST_NATIVE,
@@ -332,7 +331,11 @@ pub(crate) async fn delete_branch_recoverably(
         )));
     }
 
-    let native_result = match dataset.delete_branch(branch).await.map_err(lance_error) {
+    let native_result = match dataset
+        .delete_branch(branch)
+        .await
+        .map_err(OmniError::storage)
+    {
         Ok(()) => {
             crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_POST_NATIVE)
         }
@@ -635,7 +638,11 @@ mod tests {
         let error = list_branch_contents(&wrapped)
             .await
             .expect_err("persistent branch churn must escape after the fixed bound");
-        assert!(matches!(error, OmniError::Lance(_)));
+        assert!(matches!(
+            error,
+            OmniError::Storage(ref failure)
+                if failure.kind == crate::error::StorageFailureKind::NotFound
+        ));
         assert_eq!(fault.branch_lists(), BRANCH_ENUMERATION_MAX_ATTEMPTS);
         assert!(
             fault.injected_failures() >= BRANCH_ENUMERATION_MAX_ATTEMPTS,

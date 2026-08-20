@@ -530,7 +530,7 @@ pub(crate) async fn logical_row_image(
         .iter()
         .filter_map(|field| {
             let lance_field = lance::datatypes::Field::try_from(field.as_ref())
-                .map_err(|error| OmniError::Lance(error.to_string()));
+                .map_err(OmniError::lance_internal);
             match lance_field {
                 Ok(field) if field.is_blob() => Some(Ok(field.name.clone())),
                 Ok(_) => None,
@@ -544,7 +544,7 @@ pub(crate) async fn logical_row_image(
         let row_id = row_batch
             .column_by_name("_rowid")
             .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| OmniError::Lance("change row is missing _rowid".to_string()))?
+            .ok_or_else(|| OmniError::manifest_internal("change row is missing _rowid"))?
             .value(0);
         Some(export_blob_values(source_ds, &row_batch, &[row_id], &blob_properties).await?)
     };

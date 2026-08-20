@@ -1510,14 +1510,16 @@ async fn rebuild_blob_column(
     let mut files = blob_files.into_iter();
     for descriptor in row_descriptors {
         match descriptor {
-            crate::blob::BlobDescriptor::Null => builder.push_null().map_err(OmniError::storage)?,
+            crate::blob::BlobDescriptor::Null => {
+                builder.push_null().map_err(OmniError::lance_internal)?
+            }
             crate::blob::BlobDescriptor::External {
                 uri,
                 offset,
                 length,
             } => {
                 let uri = whole_external_uri_for_schema_rewrite(uri, offset, length)?;
-                builder.push_uri(uri).map_err(OmniError::storage)?;
+                builder.push_uri(uri).map_err(OmniError::lance_internal)?;
             }
             crate::blob::BlobDescriptor::Managed { .. } => {
                 let blob = files
@@ -1542,7 +1544,7 @@ async fn rebuild_blob_column(
                 }
                 builder
                     .push_bytes(blob.read().await.map_err(OmniError::storage)?)
-                    .map_err(OmniError::storage)?;
+                    .map_err(OmniError::lance_internal)?;
             }
         }
     }
@@ -1554,7 +1556,7 @@ async fn rebuild_blob_column(
         )));
     }
 
-    builder.finish().map_err(OmniError::storage)
+    builder.finish().map_err(OmniError::lance_internal)
 }
 
 /// Lance's logical Blob input can retain a whole-object URI but cannot encode

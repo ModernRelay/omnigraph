@@ -2469,7 +2469,12 @@ mod change_route_error_tests {
     fn change_route_error_hides_substrate_paths() {
         let leaky =
             "/srv/data/graph/nodes/0000000a-0000000b.lance: No such file or directory".to_string();
-        let mapped = change_route_error(OmniError::Lance(leaky));
+        let mapped = change_route_error(OmniError::Storage(
+            omnigraph::error::StorageFailure::new(
+                omnigraph::error::StorageFailureKind::Unknown,
+                format!("storage: {leaky}"),
+            ),
+        ));
         assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(
             !mapped.message().contains(".lance") && !mapped.message().contains("/srv/data"),

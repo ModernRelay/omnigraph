@@ -1649,7 +1649,7 @@ fn schema_has_blob(schema: &SchemaRef) -> Result<bool> {
             return Ok(true);
         }
         let lance_field =
-            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::lance_internal)?;
         if lance_field.is_blob() {
             return Ok(true);
         }

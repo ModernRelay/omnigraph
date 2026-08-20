@@ -82,7 +82,7 @@ pub enum OmniError {
 | Kind | Evidence carried |
 |---|---|
 | `Transient` | A timeout, throttling response, cancellation, or recognized transport interruption occurred. |
-| `Configuration` | Authentication, permission, unsupported operation, malformed input/location, or an exhausted configured disk cap prevents the request as configured. |
+| `Configuration` | Authentication, permission, unsupported operation, malformed input/location, or an operator-actionable capacity constraint prevents the request as configured. |
 | `NotFound` | The requested object, dataset, ref, version, index, or namespace entity is absent. |
 | `Precondition` | Already-exists, not-modified, CAS/concurrency conflict, stale transaction/ref, or fenced authority requires state to be re-evaluated. |
 | `Permanent` | Typed evidence reports corruption, a schema/storage invariant failure, panic, or substrate-internal failure. |
@@ -171,7 +171,7 @@ Storage-owned `std::io::ErrorKind` values map as follows:
 |---|---|
 | `NotFound` | `NotFound` |
 | `AlreadyExists` | `Precondition` |
-| `PermissionDenied`, `InvalidInput`, `Unsupported` | `Configuration` |
+| `PermissionDenied`, `InvalidInput`, `Unsupported`, `StorageFull`, `QuotaExceeded`, `ReadOnlyFilesystem`, `FileTooLarge` | `Configuration` |
 | `TimedOut`, `Interrupted`, `ConnectionAborted`, `ConnectionRefused`, `ConnectionReset`, `BrokenPipe`, `NotConnected`, `HostUnreachable`, `NetworkUnreachable`, `WouldBlock` | `Transient` |
 | `InvalidData` | `Permanent` |
 | every other kind without stronger typed evidence | `Unknown` |

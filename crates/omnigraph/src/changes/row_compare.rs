@@ -202,21 +202,21 @@ fn prepare_batch(dataset: &Dataset, batch: &RecordBatch) -> Result<VecDeque<RawR
     let ids = batch
         .column_by_name("id")
         .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| OmniError::Lance("change row is missing string id".to_string()))?;
+        .ok_or_else(|| OmniError::manifest_internal("change row is missing string id"))?;
 
     let mut blob_columns = Vec::new();
     for (field, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
         if is_reserved_storage_system_column(field.name()) {
             continue;
         }
-        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let lance_field =
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::lance_internal)?;
         if lance_field.is_blob() {
             let descriptions = column
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| {
-                    OmniError::Lance(format!(
+                    OmniError::blob_integrity(format!(
                         "expected blob descriptions for change column '{}'",
                         field.name()
                     ))
@@ -224,7 +224,7 @@ fn prepare_batch(dataset: &Dataset, batch: &RecordBatch) -> Result<VecDeque<RawR
             // The Lance field id keys the row's owning data file (a Blob column
             // has one field id spanning several physical columns).
             let field_id = dataset.schema().field_id(field.name()).map_err(|error| {
-                OmniError::Lance(format!(
+                OmniError::blob_integrity(format!(
                     "blob column '{}' has no field id: {error}",
                     field.name()
                 ))
@@ -263,9 +263,8 @@ fn prepare_batch(dataset: &Dataset, batch: &RecordBatch) -> Result<VecDeque<RawR
                 .column_by_name("_rowaddr")
                 .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
                 .ok_or_else(|| {
-                    OmniError::Lance(
+                    OmniError::manifest_internal(
                         "change scan is missing _rowaddr; managed Blob comparison needs the owning data file"
-                            .to_string(),
                     )
                 })?,
         )
@@ -304,7 +303,7 @@ fn data_file_path_for_field<'a>(
     field_id: i32,
 ) -> Result<&'a str> {
     let fragment = fragments_by_id.get(&fragment_id).ok_or_else(|| {
-        OmniError::Lance(format!(
+        OmniError::blob_integrity(format!(
             "change scan referenced fragment {fragment_id} absent from the manifest"
         ))
     })?;
@@ -314,7 +313,7 @@ fn data_file_path_for_field<'a>(
         .find(|file| file.fields.contains(&field_id))
         .map(|file| file.path.as_str())
         .ok_or_else(|| {
-            OmniError::Lance(format!(
+            OmniError::blob_integrity(format!(
                 "fragment {fragment_id} has no data file for blob field {field_id}"
             ))
         })
@@ -420,7 +419,7 @@ async fn blob_values_for(
     let row_id = slice
         .column_by_name("_rowid")
         .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-        .ok_or_else(|| OmniError::Lance("change row is missing _rowid".to_string()))?
+        .ok_or_else(|| OmniError::manifest_internal("change row is missing _rowid"))?
         .value(0);
     export_blob_values(dataset, slice, &[row_id], columns).await
 }

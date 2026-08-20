@@ -325,14 +325,14 @@ fn typed_list_literal_to_array(
 fn build_blob_array_from_value(value: &str) -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(1);
     crate::loader::append_blob_value(&mut builder, value)?;
-    builder.finish().map_err(OmniError::storage)
+    builder.finish().map_err(OmniError::lance_internal)
 }
 
 /// Build a null blob array with one element.
 fn build_null_blob_array() -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(1);
-    builder.push_null().map_err(OmniError::storage)?;
-    builder.finish().map_err(OmniError::storage)
+    builder.push_null().map_err(OmniError::lance_internal)?;
+    builder.finish().map_err(OmniError::lance_internal)
 }
 
 /// Build a single-row RecordBatch from resolved assignments.
@@ -456,7 +456,7 @@ fn apply_assignments(
                 for _ in 0..batch.num_rows() {
                     crate::loader::append_blob_value(&mut builder, uri)?;
                 }
-                columns.push(builder.finish().map_err(OmniError::storage)?);
+                columns.push(builder.finish().map_err(OmniError::lance_internal)?);
             } else {
                 // Unassigned: the materializing scan must have normalized the
                 // committed value (or pending value) to the logical blob
