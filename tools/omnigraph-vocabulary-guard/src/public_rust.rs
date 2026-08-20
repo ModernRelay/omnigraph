@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -35,6 +36,7 @@ pub(crate) struct ToolConfig {
 struct Package {
     name: String,
     manifest_path: PathBuf,
+    has_non_default_features: bool,
 }
 
 pub(crate) fn scan_worktree(
@@ -52,7 +54,13 @@ pub(crate) fn scan_worktree(
     let mut rows: BTreeMap<String, InventoryRow> = BTreeMap::new();
     for package in packages {
         let manifest_path = workspace_relative_manifest_path(&root, &package.manifest_path)?;
-        for feature_mode in [FeatureMode::Default, FeatureMode::All] {
+        for &feature_mode in feature_modes(&package) {
+            let started = Instant::now();
+            eprintln!(
+                "Graph vocabulary guard: scanning public Rust package {} ({})",
+                package.name,
+                feature_mode.label()
+            );
             let mut command = Command::new(&config.executable);
             command
                 .current_dir(&root)
@@ -98,6 +106,12 @@ pub(crate) fn scan_worktree(
                 &mut rows,
                 scan_output(&stdout, &package.name, &manifest_path),
             )?;
+            eprintln!(
+                "Graph vocabulary guard: scanned public Rust package {} ({}) in {:.1}s",
+                package.name,
+                feature_mode.label(),
+                started.elapsed().as_secs_f64()
+            );
         }
     }
     let rows: Vec<_> = rows.into_values().collect();
@@ -152,6 +166,20 @@ fn merge_feature_rows(
 enum FeatureMode {
     Default,
     All,
+}
+
+fn feature_modes(package: &Package) -> &'static [FeatureMode] {
+    const DEFAULT_ONLY: &[FeatureMode] = &[FeatureMode::Default];
+    const DEFAULT_AND_ALL: &[FeatureMode] = &[FeatureMode::Default, FeatureMode::All];
+
+    if package.has_non_default_features {
+        DEFAULT_AND_ALL
+    } else {
+        // `--all-features` is byte-for-byte the default feature set when a
+        // package declares no non-default features. Running it again produces
+        // no additional public surface and needlessly repeats rustdoc work.
+        DEFAULT_ONLY
+    }
 }
 
 impl FeatureMode {
@@ -332,11 +360,16 @@ fn workspace_library_packages(root: &Path) -> Result<Vec<Package>, GuardError> {
             .get("manifest_path")
             .and_then(Value::as_str)
             .ok_or_else(|| GuardError::PublicRust(format!("package {name} lacks manifest_path")))?;
+        let features = package
+            .get("features")
+            .and_then(Value::as_object)
+            .ok_or_else(|| GuardError::PublicRust(format!("package {name} lacks features")))?;
         by_name.insert(
             name.to_owned(),
             Package {
                 name: name.to_owned(),
                 manifest_path: PathBuf::from(manifest_path),
+                has_non_default_features: features.keys().any(|feature| feature != "default"),
             },
         );
     }
@@ -461,6 +494,24 @@ pub fn omnigraph::ordinary(value: usize)
         merge_feature_rows(&mut union, all_features).unwrap();
         assert_eq!(union.len(), default.len() + 1);
         assert!(union.values().any(|row| row.current_term == "column"));
+    }
+
+    #[test]
+    fn feature_modes_skip_only_a_provably_identical_all_features_pass() {
+        let package = |has_non_default_features| Package {
+            name: "example".to_owned(),
+            manifest_path: PathBuf::from("crates/example/Cargo.toml"),
+            has_non_default_features,
+        };
+
+        assert!(matches!(
+            feature_modes(&package(false)),
+            [FeatureMode::Default]
+        ));
+        assert!(matches!(
+            feature_modes(&package(true)),
+            [FeatureMode::Default, FeatureMode::All]
+        ));
     }
 
     #[cfg(unix)]

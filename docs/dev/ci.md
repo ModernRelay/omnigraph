@@ -20,8 +20,11 @@
     inventory lives at
     `tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv`. G4 is
     derived with exactly `cargo-public-api` 0.52.0 on
-    `nightly-2026-08-01`, for the default/all-features union of the seven public
-    library crates; workspace checks remain on the repository's stable pin.
+    `nightly-2026-08-01`. Every one of the seven public library crates is
+    scanned with default features; crates that declare any non-default feature
+    are additionally scanned with all features and the two surfaces are
+    unioned. A crate with no non-default feature skips that provably identical
+    second pass. Workspace checks remain on the repository's stable pin.
     `cargo-public-api` does not emit a unique declaration/re-export source span,
     so each G4 row uses the owning package manifest as its stable source and the
     complete normalized exported signature as its review boundary. The guard
@@ -29,8 +32,10 @@
     macro-generated items.
     G4 always extracts both trees: Cargo `include!`, build scripts, generated
     sources, configuration, and other transitive inputs make a path-based skip
-    predicate unsound. The job's pinned-tool and build-target caches bound the
-    cold cost, and its 45-minute timeout fails visibly instead of silently
+    predicate unsound. Current and base keep isolated build targets; the job's
+    pinned-tool and build-target caches reduce warm cost without allowing one
+    tree's path-crate artifacts to satisfy the other. Its 75-minute timeout
+    keeps a genuinely cold run finite and fails visibly instead of silently
     accepting a stale public surface.
     The guard rejects an unreviewed workspace library crate rather than
     silently omitting it. It never regenerates OpenAPI; the server's existing

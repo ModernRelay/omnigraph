@@ -103,11 +103,13 @@ jobs:
     # classifier so it always reports. The review-owned inventory protects the
     # OpenAPI, Rust presentation-string, user-doc, and public-Rust surfaces.
     runs-on: ubuntu-latest
-    # A cold default + all-features rustdoc pass over all seven public library
-    # crates is substrate-sized. Keep it bounded without pretending it is a
-    # ten-minute check; the pinned-tool and build-target caches make warm runs
-    # substantially cheaper.
-    timeout-minutes: 45
+    # A cold default + relevant all-features rustdoc pass over all seven public
+    # library crates is substrate-sized. The first hosted run completed the
+    # public-Rust step in 39 minutes, while the larger breaking-contract tree
+    # was still compiling when a 45-minute whole-job bound cancelled it. Keep
+    # current/base targets isolated for correctness and retain a finite cold-run
+    # ceiling; the pinned-tool and build-target caches make warm runs cheaper.
+    timeout-minutes: 75
     permissions:
       contents: read
     steps:
