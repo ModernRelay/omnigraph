@@ -2,13 +2,12 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Proposed |
 | **Date** | 2026-08-19 |
 | **Author track** | Public contribution |
-| **Author(s)** | Azim Afroozeh |
-| **Number** | 0039 (next free: `docs/rfcs/` runs through 0038 at PR time; the number is reserved by the merge, re-check for in-flight collisions before opening the PR) |
-| **Discussion** | <link when opened> |
-| **Implementation** | harness prototype in progress; arrives as separate PRs once this specification settles |
+| **Author(s)** | Azim Afroozeh ([@azimafroozeh](https://github.com/azimafroozeh)) |
+| **Discussion** | [Issue #539](https://github.com/ModernRelay/omnigraph/issues/539) |
+| **Implementation** | [PR #537](https://github.com/ModernRelay/omnigraph/pull/537) (proposed; must follow RFC acceptance) |
 
 ## Evidence status of this document
 
