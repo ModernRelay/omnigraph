@@ -384,6 +384,15 @@ shared by both `mutate_as` and the bulk loader:
   after sidecar + fork under the gates so its uncommitted files live in the
   correct Lance branch tree. Cross-table conflicts surface as typed read-set or
   manifest conflicts.
+- **Staging width is shared with the loader.** Independent tables stage
+  concurrently at `OMNIGRAPH_LOAD_CONCURRENCY` (default 8) — the knob is not
+  load-only despite its name; it governs the fragment-writing stage of *any*
+  multi-table write, mutations included. Ops within one table stay serial under
+  Lance's manifest OCC, so cross-table staging has no shared state to race, and
+  publication is unaffected: everything after staging still funnels through the
+  single manifest CAS. Tests force a width through the scoped
+  `instrumentation::with_stage_write_concurrency` seam rather than mutating the
+  env var.
 - **Deletes stage too (MR-A).** Lance 7.0's
   `DeleteBuilder::execute_uncommitted` (#6658) makes delete a two-phase op,
   so deletes no longer inline-commit. Each delete records a predicate in
@@ -558,7 +567,10 @@ each touched table with Lance `Operation::Overwrite`, then runs
 `commit_staged` under the normal `SidecarKind::Load` recovery sidecar
 before publishing `__manifest`. `OMNIGRAPH_LOAD_CONCURRENCY` applies to the
 fragment-writing stage only; the commit and manifest publish run while holding
-the root-shared schema → branch → sorted-table gates. Empty-table overwrite is
+the root-shared schema → branch → sorted-table gates. The same knob sets the
+staging width for end-of-query mutation staging (see
+`MutationStaging::stage_all` above), so tuning it for bulk loads also tunes
+ordinary multi-table mutations. Empty-table overwrite is
 represented as a valid zero-fragment Lance `Overwrite` transaction, not as
 truncate-then-append.
 

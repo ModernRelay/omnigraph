@@ -168,7 +168,16 @@ pub(crate) struct MutationStaging {
 /// Override via `OMNIGRAPH_LOAD_CONCURRENCY`.
 pub(crate) const DEFAULT_STAGE_WRITE_CONCURRENCY: usize = 8;
 
+/// Resolution order: the scoped test override
+/// ([`crate::instrumentation::with_stage_write_concurrency`]), then
+/// `OMNIGRAPH_LOAD_CONCURRENCY`, then the default. Tests force a width through
+/// the scoped seam so they never mutate process-global environment.
 pub(crate) fn stage_write_concurrency() -> usize {
+    if let Some(scoped) = crate::instrumentation::stage_write_concurrency_override()
+        && scoped > 0
+    {
+        return scoped;
+    }
     parse_stage_write_concurrency(std::env::var("OMNIGRAPH_LOAD_CONCURRENCY").ok().as_deref())
 }
 
@@ -1652,14 +1661,51 @@ fn dedupe_merge_batches_by_id(
 
 #[cfg(test)]
 mod stage_write_concurrency_tests {
-    use super::parse_stage_write_concurrency;
+    use super::{parse_stage_write_concurrency, stage_write_concurrency};
+    use crate::instrumentation::with_stage_write_concurrency;
 
     // Pure parser, no process-global environment touched.
     #[test]
     fn resolves_default_override_and_junk() {
-        assert_eq!(parse_stage_write_concurrency(None), 8, "default without the env var");
+        assert_eq!(
+            parse_stage_write_concurrency(None),
+            8,
+            "default without the env var"
+        );
         assert_eq!(parse_stage_write_concurrency(Some("3")), 3, "override wins");
-        assert_eq!(parse_stage_write_concurrency(Some("0")), 8, "zero is not a concurrency");
-        assert_eq!(parse_stage_write_concurrency(Some("banana")), 8, "junk falls back to default");
+        assert_eq!(
+            parse_stage_write_concurrency(Some("0")),
+            8,
+            "zero is not a concurrency"
+        );
+        assert_eq!(
+            parse_stage_write_concurrency(Some("banana")),
+            8,
+            "junk falls back to default"
+        );
+    }
+
+    /// The scoped seam must actually reach the resolver, and must not outlive its
+    /// future. Without this, a width-forcing test would silently run at the default
+    /// width on both sides of an equivalence comparison and prove nothing.
+    #[tokio::test]
+    async fn scoped_override_wins_and_does_not_leak() {
+        let outside_before = stage_write_concurrency();
+        assert_eq!(
+            with_stage_write_concurrency(3, async { stage_write_concurrency() }).await,
+            3,
+            "the scoped override must reach the resolver"
+        );
+        // 0 is not a concurrency: the scope is ignored, not obeyed.
+        assert_ne!(
+            with_stage_write_concurrency(0, async { stage_write_concurrency() }).await,
+            0,
+            "a zero override must fall back, never pin the width to zero"
+        );
+        assert_eq!(
+            stage_write_concurrency(),
+            outside_before,
+            "the override must be gone once its future resolves"
+        );
     }
 }
