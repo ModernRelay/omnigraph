@@ -3832,7 +3832,7 @@ impl TableStore {
             .map(|rows| rows.iter().filter_map(|r| r.as_u64()).collect())
             .unwrap_or_default();
         if segment_partitions.is_empty()
-            || segment_partitions.iter().any(|p| *p == 0)
+            || segment_partitions.contains(&0)
             || segment_rows.len() != segment_partitions.len()
         {
             return Err(OmniError::Lance(format!(

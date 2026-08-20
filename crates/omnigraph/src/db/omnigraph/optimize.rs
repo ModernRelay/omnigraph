@@ -686,10 +686,9 @@ async fn apply_optimize_table_effects(
 
     let mut stat = TableOptimizeStats::compacted(table_key.clone(), &metrics, committed);
     stat.pending_indexes = pending_indexes;
-    stat.vector_index_layouts = super::table_ops::vector_index_layouts_on_dataset(
-        db, catalog, &table_key, &snapshot,
-    )
-    .await?;
+    stat.vector_index_layouts =
+        super::table_ops::vector_index_layouts_on_dataset(db, catalog, &table_key, &snapshot)
+            .await?;
     let update = if committed {
         let state = db.storage().table_state(&full_path, &snapshot).await?;
         Some(crate::db::SubTableUpdate {

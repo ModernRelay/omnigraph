@@ -46,8 +46,8 @@ pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
-pub use table_ops::{PendingIndex, VectorIndexLayout};
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
+pub use table_ops::{PendingIndex, VectorIndexLayout};
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
