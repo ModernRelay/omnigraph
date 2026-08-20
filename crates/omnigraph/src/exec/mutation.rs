@@ -1204,7 +1204,7 @@ impl Omnigraph {
                     OmniError::manifest(format!("insert {key_description} cannot contain null"))
                 })?
             } else {
-                ulid::Ulid::new().to_string()
+                crate::dst_ids::new_ulid().to_string()
             };
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
@@ -1242,7 +1242,7 @@ impl Omnigraph {
             let edge_type = &catalog.edge_types[type_name];
             let schema = edge_type.arrow_schema.clone();
             let blob_props = edge_type.blob_properties.clone();
-            let id = ulid::Ulid::new().to_string();
+            let id = crate::dst_ids::new_ulid().to_string();
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             // Validation (edge-RI, enum, unique, @card against the live

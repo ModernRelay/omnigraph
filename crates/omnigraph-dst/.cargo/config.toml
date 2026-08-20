@@ -1,0 +1,13 @@
+# Crate-local cargo config: running cargo FROM THIS DIRECTORY builds with
+# the `tokio_unstable` cfg the DST suite needs (tokio's seeded scheduler,
+# `Builder::rng_seed`, sits behind it).
+#
+#   cd crates/omnigraph-dst && cargo test
+#
+# Scope: cargo discovers config by walking up from the invocation
+# directory, so this applies only when invoked from inside this crate —
+# workspace-root builds and the default CI jobs stay flag-free (the crate
+# compiles empty there by design). The DST CI workflows set RUSTFLAGS
+# themselves.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

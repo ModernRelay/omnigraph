@@ -45,7 +45,7 @@ impl GenesisManifestAttempt {
     pub(crate) fn mint() -> Result<Self> {
         Ok(Self {
             lineage: GraphLineageRow {
-                graph_commit_id: ulid::Ulid::new().to_string(),
+                graph_commit_id: crate::dst_ids::new_ulid().to_string(),
                 manifest_branch: None,
                 manifest_version: GENESIS_MANIFEST_VERSION,
                 parent_commit_id: None,
@@ -312,7 +312,9 @@ async fn build_initial_entries(
         )
     })?;
 
-    for (name, node_type) in &catalog.node_types {
+    let mut __dst_nt: Vec<_> = catalog.node_types.iter().collect();
+    __dst_nt.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, node_type) in __dst_nt {
         let node_ir = accepted_ir
             .nodes
             .iter()
@@ -343,7 +345,9 @@ async fn build_initial_entries(
         version_metadata.insert(identity, metadata.to_json_string()?);
     }
 
-    for (name, edge_type) in &catalog.edge_types {
+    let mut __dst_et: Vec<_> = catalog.edge_types.iter().collect();
+    __dst_et.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, edge_type) in __dst_et {
         let edge_ir = accepted_ir
             .edges
             .iter()

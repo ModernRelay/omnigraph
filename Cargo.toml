@@ -9,6 +9,7 @@ members = [
     "crates/omnigraph-cluster",
     "crates/omnigraph-policy",
     "crates/omnigraph-server",
+    "crates/omnigraph-dst",
 ]
 default-members = [
     "crates/omnigraph",
@@ -39,6 +40,10 @@ datafusion-functions-aggregate = "54"
 # hydration; see docs/dev/lance.md.
 lance = { version = "10.0.0", default-features = false, features = ["aws"] }
 lance-core = "10.0.0"
+# lance-io + rand: consumed only by omnigraph-dst (fault injection at the
+# Lance IO seam; the harness PRNG seeds).
+lance-io = { version = "10.0.0", default-features = false }
+rand = "0.9"
 # RowAddrTreeMap moved from lance-core::utils::mask to the new lance-select crate in 9.x.
 lance-select = "10.0.0"
 lance-datafusion = "10.0.0"
@@ -56,7 +61,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 pest = "2"
 pest_derive = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
+# DST: test-util for Builder::start_paused (virtual clock in simulations).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync", "test-util"] }
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -75,7 +81,10 @@ ariadne = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 object_store = { version = "0.13.2", default-features = false, features = ["aws", "fs"] }
-fail = "0.5"
+# fail-parallel instead of fail: the failpoint registry becomes a value
+# (SlateDB precedent) instead of a process-global, so a test harness can
+# own faults per-universe.
+fail-parallel = "0.6"
 time = { version = "0.3", features = ["formatting"] }
 axum = { version = "0.8", features = ["json", "macros"] }
 utoipa = { version = "5", features = ["axum_extras"] }
@@ -90,6 +99,14 @@ collapsible_if = "allow"
 # Streaming/recovery internals thread identity + authority + payload explicitly;
 # a params-struct refactor is not earned yet.
 too_many_arguments = "allow"
+
+# DST: fast simulations that KEEP assertions — the slatedb pattern.
+# Use: cargo test -p omnigraph-dst --profile dst
+[profile.dst]
+inherits = "test"
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
 
 [profile.dev]
 debug = 0

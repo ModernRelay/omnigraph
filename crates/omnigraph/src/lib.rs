@@ -11,6 +11,9 @@ pub(crate) mod blob;
 mod branch_control;
 pub mod changes;
 pub mod db;
+pub mod dst_clock;
+pub mod dst_gate;
+pub mod dst_ids;
 pub mod embedding;
 pub mod error;
 mod exec;
@@ -40,3 +43,8 @@ pub struct MutationReceipt {
     pub result: omnigraph_compiler::result::MutationResult,
     pub commit: Option<db::GraphCommit>,
 }
+
+// DST seam: registry access for the harness's Lance-realm fault injector.
+// Hidden like the dst_ids/dst_clock seams.
+#[doc(hidden)]
+pub use lance_access::store_registry as dst_lance_store_registry;

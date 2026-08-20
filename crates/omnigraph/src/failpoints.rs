@@ -1,10 +1,77 @@
 use crate::error::Result;
 
+// The failpoint registry is a VALUE (`fail-parallel`) held behind one
+// swappable crate-global handle: `registry()` exposes it, `set_registry()`
+// swaps it. Reifying the registry is what lets a test harness own its
+// faults per-universe; until callers thread a registry of their own,
+// everything shares this default and scenario-holding tests serialize on
+// `SCENARIO_GATE` below.
+#[cfg(feature = "failpoints")]
+mod fp_registry {
+    use std::sync::{Arc, LazyLock, RwLock};
+
+    use fail_parallel::FailPointRegistry;
+
+    static CURRENT: LazyLock<RwLock<Arc<FailPointRegistry>>> =
+        LazyLock::new(|| RwLock::new(Arc::new(FailPointRegistry::new())));
+
+    /// The registry consulted by every failpoint crossing.
+    pub fn registry() -> Arc<FailPointRegistry> {
+        CURRENT.read().unwrap().clone()
+    }
+
+    /// Swap in a caller-owned registry; returns the previous one.
+    pub fn set_registry(next: Arc<FailPointRegistry>) -> Arc<FailPointRegistry> {
+        std::mem::replace(&mut *CURRENT.write().unwrap(), next)
+    }
+}
+#[cfg(feature = "failpoints")]
+pub use fp_registry::{registry, set_registry};
+
+/// Serializes scenario-holding tests: everything shares the one default
+/// registry, so concurrent scenarios would clear and fire each other's
+/// points. Kept call-shape-compatible with the `fail` crate this
+/// replaced, whose global scenario mutex provided the same serialization.
+#[cfg(feature = "failpoints")]
+static SCENARIO_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII failpoint scenario over the crate registry. Holds
+/// [`SCENARIO_GATE`] for its lifetime so scenario-holding tests
+/// serialize; a poisoned gate is recovered, so one panicking test cannot
+/// wedge the rest of the suite.
+#[cfg(feature = "failpoints")]
+pub struct FailScenario {
+    // Field order: `_inner` must drop first (clearing the registry while
+    // the gate is still held), then `_gate` releases.
+    _inner: fail_parallel::FailScenario,
+    _gate: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(feature = "failpoints")]
+impl FailScenario {
+    /// Acquires the scenario gate — blocks until no other scenario is
+    /// live — then opens a fresh scenario on the registry.
+    pub fn setup() -> Self {
+        let gate = SCENARIO_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self {
+            _inner: fail_parallel::FailScenario::setup(registry()),
+            _gate: gate,
+        }
+    }
+
+    /// Clears the registry and releases the gate.
+    pub fn teardown(self) {
+        self._inner.teardown();
+    }
+}
+
 pub(crate) fn maybe_fail(_name: &str) -> Result<()> {
     #[cfg(feature = "failpoints")]
     {
         let name = _name;
-        fail::fail_point!(name, |_| {
+        fail_parallel::fail_point!(registry(), name, |_| {
             Err(crate::error::OmniError::manifest(format!(
                 "injected failpoint triggered: {}",
                 name
@@ -35,7 +102,7 @@ pub(crate) fn is_enabled(_name: &str) -> bool {
 pub(crate) fn maybe_fail_retryable_contention(name: &str) -> Result<()> {
     #[cfg(feature = "failpoints")]
     {
-        fail::fail_point!(name, |_| {
+        fail_parallel::fail_point!(registry(), name, |_| {
             Err(crate::error::OmniError::manifest_row_level_cas_contention(
                 format!("injected retryable contention failpoint: {name}"),
             ))
@@ -179,6 +246,17 @@ pub mod names {
     /// without hard-link support (issue #453) for both `init` and
     /// read-write `open`.
     pub const LOCAL_CREATE_IF_ABSENT_PROBE: &str = "storage.local_create_if_absent_probe";
+    /// The implicit fork-if-missing branch
+    /// create completed durably, before any load staging byte is written.
+    /// The load "never happened" yet its target branch exists — a failed
+    /// load's surviving empty branch.
+    pub const LOAD_POST_BRANCH_CREATE_PRE_STAGE: &str = "load.post_branch_create_pre_stage";
+    /// Between per-table fragment uploads
+    /// inside `stage_all_with_concurrency`. A crash here
+    /// leaves a PARTIAL set of staged files across tables with no breadcrumb
+    /// — benign by construction (unreferenced, reclaimable by cleanup), which
+    /// is exactly what the window lets a universe prove.
+    pub const LOAD_BETWEEN_TABLE_STAGES: &str = "load.between_table_stages";
     pub const MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE: &str =
         "mutation.delete_node_pre_primary_delete";
     /// After every deferred first-touch table ref is created under a durable
@@ -275,7 +353,7 @@ pub struct ScopedFailPoint {
 #[cfg(feature = "failpoints")]
 impl ScopedFailPoint {
     pub fn new(name: &str, action: &str) -> Self {
-        fail::cfg(name, action).expect("configure failpoint");
+        fail_parallel::cfg(registry(), name, action).expect("configure failpoint");
         Self {
             name: name.to_string(),
         }
@@ -289,7 +367,8 @@ impl ScopedFailPoint {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        fail::cfg_callback(name, callback).expect("configure callback failpoint");
+        fail_parallel::cfg_callback(registry(), name, callback)
+            .expect("configure callback failpoint");
         Self {
             name: name.to_string(),
         }
@@ -299,6 +378,6 @@ impl ScopedFailPoint {
 #[cfg(feature = "failpoints")]
 impl Drop for ScopedFailPoint {
     fn drop(&mut self) {
-        fail::remove(&self.name);
+        fail_parallel::remove(registry(), &self.name);
     }
 }

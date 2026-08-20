@@ -640,7 +640,9 @@ impl GraphNamespacePublisher {
         existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
     ) -> HashMap<TableIdentity, u64> {
         let mut max_tombstones = HashMap::<TableIdentity, u64>::new();
-        for (identity, version) in existing_tombstones.keys() {
+        let mut __dst_tk: Vec<_> = existing_tombstones.keys().collect();
+        __dst_tk.sort();
+        for (identity, version) in __dst_tk {
             max_tombstones
                 .entry(*identity)
                 .and_modify(|v| {
@@ -652,7 +654,9 @@ impl GraphNamespacePublisher {
         }
 
         let mut latest = HashMap::<TableIdentity, u64>::new();
-        for (identity, version) in existing_versions.keys() {
+        let mut __dst_vk: Vec<_> = existing_versions.keys().collect();
+        __dst_vk.sort();
+        for (identity, version) in __dst_vk {
             let tombstoned = max_tombstones
                 .get(identity)
                 .map(|t| *t >= *version)
@@ -672,7 +676,9 @@ impl GraphNamespacePublisher {
 
         // For tables that have only tombstones (no visible entry), surface the
         // tombstone version so callers see a non-zero `actual`.
-        for (identity, tombstone) in &max_tombstones {
+        let mut __dst_mt: Vec<_> = max_tombstones.iter().collect();
+        __dst_mt.sort_by(|a, b| a.0.cmp(b.0));
+        for (identity, tombstone) in __dst_mt {
             latest.entry(*identity).or_insert(*tombstone);
         }
 
@@ -813,9 +819,15 @@ impl GraphNamespacePublisher {
             }
         }
 
+        // dst: canonically-ordered hash-walk — the post-publish fold's output
+        // order must not depend on HashMap iteration order (this was the one
+        // unsorted walk left in the engine; error- and output-order-sensitive,
+        // the named suspect for concurrent-mode replay flips).
+        let mut ordered_versions: Vec<_> = version_map.into_iter().collect();
+        ordered_versions.sort_by_key(|(key, _)| *key);
         Ok((
             registrations,
-            version_map.into_values().collect(),
+            ordered_versions.into_iter().map(|(_, e)| e).collect(),
             tombstones,
         ))
     }
@@ -829,7 +841,9 @@ impl GraphNamespacePublisher {
         registrations: &HashMap<TableIdentity, TableRegistration>,
         expected: &ExpectedTableVersions,
     ) -> Result<()> {
-        for (identity, expectation) in expected {
+        let mut __dst_ex: Vec<_> = expected.iter().collect();
+        __dst_ex.sort_by(|a, b| a.0.cmp(b.0));
+        for (identity, expectation) in __dst_ex {
             identity.validate()?;
             if let Some(registration) = registrations.get(identity) {
                 if registration.table_key != expectation.table_key {

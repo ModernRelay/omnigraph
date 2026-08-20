@@ -171,7 +171,7 @@ async fn publish_recovery_commit(
                 _ => None,
             };
             LineageIntent {
-                graph_commit_id: ulid::Ulid::new().to_string(),
+                graph_commit_id: crate::dst_ids::new_ulid().to_string(),
                 branch: sidecar.branch.clone(),
                 actor_id: Some(RECOVERY_ACTOR.to_string()),
                 merged_parent_commit_id,
@@ -3230,7 +3230,7 @@ async fn discard_orphaned_branch_sidecar(
         // Phase 7) — no `_graph_commits.lance` row. The publisher stamps the
         // commit at the version it produces.
         let intent = LineageIntent {
-            graph_commit_id: ulid::Ulid::new().to_string(),
+            graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             branch: None,
             actor_id: Some(RECOVERY_ACTOR.to_string()),
             merged_parent_commit_id: None,
@@ -8005,9 +8005,9 @@ fn new_unvalidated_sidecar(
     actor_id: Option<String>,
     tables: Vec<SidecarTablePin>,
 ) -> RecoverySidecar {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
+    use std::time::UNIX_EPOCH;
+    let operation_id = crate::dst_ids::new_ulid().to_string();
+    let started_at = match crate::dst_clock::system_time_now().duration_since(UNIX_EPOCH) {
         Ok(d) => format!("{}", d.as_micros()),
         Err(_) => "0".to_string(),
     };
@@ -8048,7 +8048,7 @@ pub(crate) fn new_ensure_indices_sidecar_v6(
         tables,
     );
     sidecar.ensure_indices_rollback_v6 = Some(RecoveryEnsureIndicesRollbackV6 {
-        rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+        rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
         rollback_audit_outcomes: None,
     });
     validate_sidecar_shape("<new-ensure-indices-sidecar>", &sidecar)?;
@@ -8083,8 +8083,9 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
         ));
     }
 
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+    let operation_id = crate::dst_ids::new_ulid().to_string();
+    let started_at = match crate::dst_clock::system_time_now().duration_since(std::time::UNIX_EPOCH)
+    {
         Ok(duration) => duration.as_micros().to_string(),
         Err(_) => "0".to_string(),
     };
@@ -8136,7 +8137,7 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
         protocol_v8: Some(RecoveryProtocolV8 {
             authority,
             lineage,
-            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             rollback_audit_outcomes: None,
             effect_phase: RecoveryEffectPhase::Armed,
             effects,
@@ -8339,8 +8340,9 @@ pub(crate) fn new_occ_sidecar_v9(
         ));
     }
 
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+    let operation_id = crate::dst_ids::new_ulid().to_string();
+    let started_at = match crate::dst_clock::system_time_now().duration_since(std::time::UNIX_EPOCH)
+    {
         Ok(duration) => duration.as_micros().to_string(),
         Err(_) => "0".to_string(),
     };
@@ -8382,7 +8384,7 @@ pub(crate) fn new_occ_sidecar_v9(
         protocol_v3: Some(RecoveryProtocolV3 {
             authority,
             lineage,
-            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             rollback_audit_outcomes: None,
             effect_phase: RecoveryEffectPhase::Armed,
             effects,
@@ -8549,8 +8551,9 @@ pub(crate) fn new_schema_apply_sidecar_v9(
     intended_delta: RecoveryManifestDelta,
     target_schema_ir_hash: String,
 ) -> Result<RecoverySidecar> {
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+    let operation_id = crate::dst_ids::new_ulid().to_string();
+    let started_at = match crate::dst_clock::system_time_now().duration_since(std::time::UNIX_EPOCH)
+    {
         Ok(duration) => duration.as_micros().to_string(),
         Err(_) => "0".to_string(),
     };
@@ -8572,7 +8575,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
         protocol_v7: Some(RecoveryProtocolV7 {
             authority,
             lineage,
-            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             rollback_audit_outcomes: None,
             target_schema_ir_hash,
             effect_phase: RecoveryEffectPhase::Armed,
@@ -8715,8 +8718,9 @@ pub(crate) fn new_branch_merge_sidecar_v9(
     effects: Vec<RecoveryBranchMergeEffect>,
     intended_delta: RecoveryManifestDelta,
 ) -> Result<RecoverySidecar> {
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+    let operation_id = crate::dst_ids::new_ulid().to_string();
+    let started_at = match crate::dst_clock::system_time_now().duration_since(std::time::UNIX_EPOCH)
+    {
         Ok(duration) => duration.as_micros().to_string(),
         Err(_) => "0".to_string(),
     };
@@ -8737,7 +8741,7 @@ pub(crate) fn new_branch_merge_sidecar_v9(
         protocol_v4: Some(RecoveryProtocolV4 {
             authority,
             lineage,
-            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             rollback_audit_outcomes: None,
             effect_phase: RecoveryEffectPhase::Armed,
             effects,
@@ -10633,7 +10637,7 @@ node Person {
 node Person { age: I32? }
 node Company { age: I32? }
 "#;
-        let _scenario = fail::FailScenario::setup();
+        let _scenario = crate::failpoints::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
@@ -10798,7 +10802,7 @@ node Company { age: I32? }
         const SCHEMA: &str = r#"
 node Person { age: I32? }
 "#;
-        let _scenario = fail::FailScenario::setup();
+        let _scenario = crate::failpoints::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();

@@ -117,7 +117,9 @@ pub(super) async fn ensure_indices_for_branch(
     // BTREE/FTS/vector batch can be staged here and abandoned safely if final
     // authority revalidation loses. A first-touch named ref does not have that
     // root yet; its artifacts must be staged after sidecar -> ref creation.
-    for type_name in catalog.node_types.keys() {
+    let mut __dst_nk1: Vec<_> = catalog.node_types.keys().collect();
+    __dst_nk1.sort();
+    for type_name in __dst_nk1 {
         let table_key = format!("node:{}", type_name);
         let Some(entry) = snapshot.entry(&table_key) else {
             continue;
@@ -186,7 +188,9 @@ pub(super) async fn ensure_indices_for_branch(
             work_by_table.insert(table_key, work);
         }
     }
-    for edge_name in catalog.edge_types.keys() {
+    let mut __dst_ek1: Vec<_> = catalog.edge_types.keys().collect();
+    __dst_ek1.sort();
+    for edge_name in __dst_ek1 {
         let table_key = format!("edge:{}", edge_name);
         let Some(entry) = snapshot.entry(&table_key) else {
             continue;
@@ -541,7 +545,9 @@ pub(super) async fn ensure_indices_for_branch(
     // Preserve the historical, observable catalog order even though planning
     // and physical effects now happen in separate phases.
     let mut pending = Vec::new();
-    for type_name in catalog.node_types.keys() {
+    let mut __dst_nk2: Vec<_> = catalog.node_types.keys().collect();
+    __dst_nk2.sort();
+    for type_name in __dst_nk2 {
         if let Some(mut table_pending) = pending_by_table.remove(&format!("node:{type_name}")) {
             pending.append(&mut table_pending);
         }
@@ -554,7 +560,7 @@ fn pre_minted_index_transaction(
 ) -> crate::table_store::StagedTransactionIdentity {
     crate::table_store::StagedTransactionIdentity {
         read_version,
-        uuid: format!("omnigraph-index-{}", ulid::Ulid::new()),
+        uuid: format!("omnigraph-index-{}", crate::dst_ids::new_ulid()),
     }
 }
 

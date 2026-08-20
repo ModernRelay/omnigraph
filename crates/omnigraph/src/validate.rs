@@ -105,7 +105,9 @@ fn evaluate_value_constraints_with_sink<F>(
 where
     F: FnMut(Violation) -> Result<()>,
 {
-    for (table_key, change) in changeset {
+    let mut __dst_cs: Vec<_> = changeset.iter().collect();
+    __dst_cs.sort_by(|a, b| a.0.cmp(b.0));
+    for (table_key, change) in __dst_cs {
         if let Some(type_name) = table_key.strip_prefix("node:") {
             let Some(node_type) = catalog.node_types.get(type_name) else {
                 continue;
@@ -187,7 +189,9 @@ pub(crate) enum Constraint {
 /// `@card` edge.
 pub(crate) fn constraints_for(catalog: &Catalog) -> Vec<Constraint> {
     let mut out = vec![Constraint::Value];
-    for (name, node_type) in &catalog.node_types {
+    let mut __dst_vn: Vec<_> = catalog.node_types.iter().collect();
+    __dst_vn.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, node_type) in __dst_vn {
         let table_key = format!("node:{name}");
         // `@key` is id-backed: cross-version duplication is impossible (the key
         // IS the identity), so it needs only intra-delta dedup — `is_key: true`
@@ -211,7 +215,9 @@ pub(crate) fn constraints_for(catalog: &Catalog) -> Vec<Constraint> {
             });
         }
     }
-    for (name, edge_type) in &catalog.edge_types {
+    let mut __dst_ve: Vec<_> = catalog.edge_types.iter().collect();
+    __dst_ve.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, edge_type) in __dst_ve {
         let table_key = format!("edge:{name}");
         // Edges have no `@key`; every `@unique` group needs the committed lookup.
         for columns in &edge_type.unique_constraints {
@@ -1084,7 +1090,9 @@ where
         per_src.entry(src.clone()).or_default().insert(id.clone());
     }
 
-    for src in &affected {
+    let mut __dst_af: Vec<_> = affected.iter().collect();
+    __dst_af.sort();
+    for src in __dst_af {
         let count = per_src.get(src).map(|ids| ids.len() as u32).unwrap_or(0);
         if let Some(max) = card.max {
             if count > max {
