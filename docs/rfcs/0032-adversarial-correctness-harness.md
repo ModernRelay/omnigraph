@@ -61,11 +61,12 @@ do not claim that two agreeing implementations must be correct, that a replay
 proves semantics, or that bounded crash/schedule search proves the absence of
 bugs (§6 records why a second full graph implementation is rejected).
 
-**Amendment note (2026-08-17).** §13 records the deterministic simulation
-harness (PR #507, in review) as an execution layer this RFC's instruments can
-also run on, notes the stronger determinism contract now available beside
-§3.3, and corrects two §6 entries against measured evidence. Nothing in
-§§1-12 is restructured; each affected section is engaged in place.
+**Amendment note (2026-08-17).** §13 records
+[RFC-037's deterministic simulation harness](0037-deterministic-simulation-harness.md)
+as an execution layer this RFC's instruments can also run on, notes the
+stronger determinism contract now available beside §3.3, and corrects two §6
+entries against measured evidence. Nothing in §§1-12 is restructured; each
+affected section is engaged in place.
 
 ## 1. Why the existing instruments do not cover this
 
@@ -600,11 +601,11 @@ Each phase lands with its §9 gate. No phase blocks RFC-031's implementation.
 Added after the original draft. Since this RFC merged, DST v1 (the first
 iteration of the project's deterministic simulation testing) built and
 measured a harness that runs engine operations in a fully seeded simulated
-world; its design document is the deterministic simulation RFC (PR #507, in
-review). That RFC's unresolved question 1 asked whether it should amend this
-RFC in place or stand beside it; this amendment is the in-place half of the
-answer. Details live in the simulation RFC; this amendment cites, it does
-not restate.
+world; its design authority is
+[RFC-037](0037-deterministic-simulation-harness.md). RFC-037 stands beside this
+RFC as the simulation architecture; this amendment records only how RFC-032's
+instruments compose with that execution layer. Details live in RFC-037; this
+amendment cites, it does not restate.
 
 ### 13.1 §3.3: two determinism contracts, each with its domain
 
@@ -652,9 +653,10 @@ Two of §4's instruments now have working twins in the simulated world:
   seams upstream to Lance instead of forking it or buying around it. That
   lane is now open and cheap to name: the first ask is an injectable clock
   (the mock-time ask, evidenced by the counting golden's byte wobble
-  recorded in RFC-031 §11), with entropy and scheduling seams as
-  candidates behind it. Each accepted upstream seam shrinks §2's
-  cannot-virtualize list by one.
+  recorded in
+  [RFC-031 §11](0031-comparative-cost-harness.md#11-amendment-2026-08-16-the-counting-side-as-built)),
+  with entropy and scheduling seams as candidates behind it. Each accepted
+  upstream seam shrinks §2's cannot-virtualize list by one.
 
 ### 13.4 §4.1 replay hygiene: the checked upgrade path
 
