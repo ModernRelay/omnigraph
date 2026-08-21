@@ -365,6 +365,12 @@ async fn plan_intervals(
     // cannot undergo branch-name ABA and pays no extra manifest resolution.
     reprove_named_branch_heads(store, parent, &parent_branches).await?;
     reprove_named_branch_heads(store, child, &child_branches).await?;
+    // Nothing after this witness may read the branch's numeric-path history
+    // live: version manifests sit at replaceable numeric paths (unlike
+    // UUID-named data and transaction files), so a later live read would see a
+    // recreated branch's history under this commit's label. Tests park here
+    // and recreate the branch to pin that contract.
+    crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_POST_HEAD_WITNESS)?;
     // The opaque ids are domain-scoped SHA-256 projections of distinct
     // immutable identities, so this order is total and deterministic.
     plans.sort_by(|left, right| {
