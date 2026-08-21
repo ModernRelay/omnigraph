@@ -121,6 +121,14 @@ pub mod names {
     /// the LOGICAL post-open head re-prove still refuses the replacement —
     /// the e_tag is defense-in-depth, not the load-bearing witness.
     pub const CHANGE_FEED_SKIP_ETAG_WITNESS: &str = "change_feed.skip_etag_witness";
+    /// A change-feed poll has passed the final post-open logical head witness
+    /// for one commit, and is about to plan each interval's emitter. Tests
+    /// delete and recreate a named branch here: any live read of the branch's
+    /// numeric-path history after this point (the replaceable read — version
+    /// manifests sit at numeric paths, unlike UUID-named data and transaction
+    /// files) would classify the interval from the REPLACEMENT branch's
+    /// transactions and can silently omit the original commit's deletes.
+    pub const CHANGE_FEED_POST_HEAD_WITNESS: &str = "change_feed.post_head_witness";
     pub const CLEANUP_RECONCILE_FORK: &str = "cleanup.reconcile_fork";
     /// After cleanup's fast empty-sidecar probe, before it acquires the closed
     /// schema/branch/table GC gate set and performs the authoritative recheck.
