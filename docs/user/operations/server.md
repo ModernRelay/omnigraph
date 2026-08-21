@@ -458,7 +458,7 @@ See [deployment.md](../deployment.md) for token-source operational details.
 - `tower_http::TraceLayer::new_for_http()`
 - Policy decisions logged at INFO level with actor, action, branch, decision, matched rule
 - Startup logs: token source name, graph URI, bind address
-- Graceful SIGINT shutdown
+- Graceful SIGINT shutdown; after the drain the server joins any in-flight branch-delete fork reclaims, bounded by the 600 s reclaim watchdog
 
 ## Not implemented (by design or "TBD")
 
