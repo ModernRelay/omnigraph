@@ -1341,6 +1341,68 @@ async fn change_feed_detects_same_length_blob_update_after_overwrite() {
     );
 }
 
+/// RFC-030 §4.2/§9 L0: candidate pruning must NOT be applied to an operation
+/// that can remove or reuse a logical id. An overwrite that drops one id and
+/// changes another is `Operation::Overwrite`, which the classifier rejects, so
+/// the enumerator falls back to the exact ordered merge and reports BOTH the
+/// delete and the update. A candidate scan of the child's new fragments alone
+/// would never see the dropped id, silently losing the delete.
+#[tokio::test]
+async fn commit_changes_falls_back_for_overwrite_that_removes_an_id() {
+    use omnigraph::changes::{ChangeFeedScope, ChangeOpKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        "node Doc {\n    slug: String @key\n    body: String?\n}",
+    )
+    .await
+    .unwrap();
+    db.load_with_receipt(
+        "main",
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"x\",\"body\":\"a\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"y\",\"body\":\"b\"}}",
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    // Overwrite the whole table: y is dropped and x is changed.
+    let overwritten = db
+        .load_with_receipt(
+            "main",
+            "{\"type\":\"Doc\",\"data\":{\"slug\":\"x\",\"body\":\"c\"}}",
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+    let page = db
+        .commit_changes_page(
+            &overwritten.commit.graph_commit_id,
+            &ChangeFeedScope::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut ops: Vec<(String, ChangeOpKind)> = page
+        .block
+        .changes
+        .iter()
+        .map(|change| (change.id.clone(), change.op))
+        .collect();
+    ops.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        ops,
+        vec![
+            ("x".to_string(), ChangeOpKind::Update),
+            ("y".to_string(), ChangeOpKind::Delete),
+        ],
+        "overwrite must fall back to the exact merge and report the dropped id as a delete"
+    );
+}
+
 #[tokio::test]
 async fn commit_changes_are_exact_ordered_and_bounded() {
     use omnigraph::changes::{ChangeEntityKind, ChangeFeedScope, ChangeOpKind};

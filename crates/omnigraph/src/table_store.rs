@@ -117,6 +117,14 @@ impl ScanTuning<'_> {
         self
     }
 
+    /// Scope the scan to exactly these physical fragments — a scan-input
+    /// selection like `filter_expr`, not an ordering decision, so the bounded
+    /// executor routing chosen by `scan_stream_with` is unaffected.
+    pub(crate) fn with_fragments(&mut self, fragments: Vec<Fragment>) -> &mut Self {
+        self.scanner.with_fragments(fragments);
+        self
+    }
+
     pub(crate) fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.scanner.batch_size(batch_size);
         self
@@ -243,6 +251,46 @@ pub(crate) fn has_insert_absence_certificate(transaction: &Transaction) -> bool 
         .as_ref()
         .and_then(|properties| properties.get(INSERT_ABSENCE_PROPERTY))
         .is_some_and(|value| value == INSERT_ABSENCE_V1)
+}
+
+/// Durable provenance marker asserting that a keyed-write `Operation::Update`
+/// was produced by an OmniGraph keyed writer, whose `merge_insert` never uses a
+/// delete-capable by-source arm (Lance defaults the unmatched-by-source arm to
+/// Keep, and the `no_delete_capable_merge_arm_in_engine_source` guard forbids
+/// such an arm in engine source). It therefore removed no unmatched-by-source
+/// row, so a
+/// consumer may treat the interval as row-set-preserving. Unlike
+/// `insert_absence`, it is stamped on every **general keyed MergeInsert
+/// update** — real upserts, known-present updates, and stream strict inserts —
+/// not only pure inserts; batch/proven strict inserts carry `insert_absence`
+/// instead, which consumers accept as the same no-delete proof. It is
+/// read-advisory: a missing marker only forces a fall-back, never a
+/// correctness change. A persisted `Update` from an external Lance merge
+/// (e.g. adopted via `repair --force`) carries no marker and cannot be pruned.
+pub(crate) const NO_BY_SOURCE_DELETE_PROPERTY: &str = "omnigraph.no_by_source_delete";
+pub(crate) const NO_BY_SOURCE_DELETE_V1: &str = "v1";
+
+pub(crate) fn has_no_by_source_delete_marker(transaction: &Transaction) -> bool {
+    transaction
+        .transaction_properties
+        .as_ref()
+        .and_then(|properties| properties.get(NO_BY_SOURCE_DELETE_PROPERTY))
+        .is_some_and(|value| value == NO_BY_SOURCE_DELETE_V1)
+}
+
+/// Stamp [`NO_BY_SOURCE_DELETE_PROPERTY`] on a keyed-write transaction before it
+/// is committed. Unconditional: every OmniGraph keyed `merge_insert` is
+/// no-by-source-delete by construction. Mirrors `certify_insert_absence`'s
+/// property write; the two keys are distinct, so a pure-insert upsert that also
+/// earns `insert_absence` carries both.
+fn stamp_no_by_source_delete(transaction: &mut Transaction) {
+    let properties = transaction
+        .transaction_properties
+        .get_or_insert_with(|| Arc::new(HashMap::new()));
+    Arc::make_mut(properties).insert(
+        NO_BY_SOURCE_DELETE_PROPERTY.to_string(),
+        NO_BY_SOURCE_DELETE_V1.to_string(),
+    );
 }
 
 /// Verify one persisted link of the insertion-absence proof chain and return
@@ -5683,7 +5731,7 @@ fn validate_proven_insert_source_batch(batch: &RecordBatch, table_key: &str) -> 
 /// Preserve all conflict metadata Lance returned while exposing the physical
 /// fragment delta needed by read-your-writes scans.
 fn staged_keyed_merge_result(
-    uncommitted: UncommittedMergeInsert,
+    mut uncommitted: UncommittedMergeInsert,
     context: &'static str,
 ) -> Result<StagedWrite> {
     let (new_fragments, removed_fragment_ids) = match &uncommitted.transaction.operation {
@@ -5704,6 +5752,13 @@ fn staged_keyed_merge_result(
             )));
         }
     };
+    // This is the single chokepoint for every general OmniGraph keyed
+    // `merge_insert` Update (upsert, known-present update, stream strict
+    // insert), none of which use a by-source-delete arm. Stamp the durable
+    // no-by-source-delete marker before the transaction is committed, so the CDC
+    // candidate-pruning classifier can trust this persisted `Update` removed no
+    // rows (an external merge adopted via `repair --force` carries no marker).
+    stamp_no_by_source_delete(&mut uncommitted.transaction);
     Ok(StagedWrite::with_commit_metadata(
         uncommitted.transaction,
         StagedCommitMetadata::affected_rows(uncommitted.affected_rows),

@@ -367,10 +367,15 @@ snapshot.
 
 An optimization may skip this comparison only after inspecting every exact
 table transaction in the interval and proving that every operation is a mature,
-row-set-preserving shape used by OmniGraph. Missing transaction files, cleaned
-version holes, `Overwrite`, `Restore`, delete-capable `Update`, unknown/new
-operation variants, and experimental Lance operations all mean **unknown** and
-fall back to the exact ID comparison. The optimization is never authority.
+row-set-preserving shape used by OmniGraph. A `RewriteRows` `Update` proves this
+only by carrying a durable OmniGraph provenance marker (`omnigraph.no_by_source_delete`,
+stamped on every keyed write, or the `insert_absence` certificate) — the op
+shape alone is insufficient because `repair --force` can adopt an external Lance
+merge that persists a delete-capable `Update{RewriteRows}`. Missing transaction
+files, cleaned version holes, `Overwrite`, `Restore`, an unmarked or
+delete-capable `Update`, unknown/new operation variants, and experimental Lance
+operations all mean **unknown** and fall back to the exact ID comparison. The
+optimization is never authority.
 
 Forbidden delete shortcuts:
 
@@ -657,6 +662,11 @@ Extend existing owners before adding a new test silo: `changes.rs`,
   merge-delete, compaction, and missing transaction files.
 - A source-walk or exhaustive match makes new Lance `Operation` variants fall
   back to exact ID comparison until reviewed.
+- A `RewriteRows` `Update` prunes only with a durable OmniGraph provenance proof
+  (`omnigraph.no_by_source_delete` marker or `insert_absence`); a marker-less
+  `Update` (an external delete-capable merge adopted via `repair --force`) falls
+  back. The write path stamps the marker at the one keyed merge chokepoint and it
+  survives commit → `list_transactions`.
 
 ### G0 — graph semantics
 
@@ -782,8 +792,8 @@ compatible graph schema established out of band.
 
 ## 11. Format and compatibility audit
 
-The C0–C4 core below persists nothing and therefore requires no internal-schema
-or recovery-schema bump:
+The C0–C4 read surfaces below persist nothing and therefore require no
+internal-schema or recovery-schema bump:
 
 - lineage and table pins already exist;
 - graph type identity already exists in accepted SchemaIR and is projected
@@ -792,12 +802,26 @@ or recovery-schema bump:
 - page tokens and cursors are caller-owned wire values;
 - typed errors and new read APIs are additive.
 
+One write-path addition accompanies the candidate-pruning optimization and is
+audited here as §11 requires for any persisted operation summary: every
+**general keyed MergeInsert update** stamps the advisory
+`omnigraph.no_by_source_delete=v1` Lance transaction property (proven strict
+inserts carry the `insert_absence` certificate instead — a separate,
+pre-existing property). The conclusion stands — **no format bump** — because
+the marker is read-advisory in every direction: a missing marker only forces
+the exact-merge fallback, never a correctness change, so pre-marker history and
+foreign transactions degrade to the authority path; older binaries ignore
+unknown transaction properties; and neither recovery nor publication consults
+it. It is an optimization-eligibility proof carried inside Lance's existing
+transaction-property surface, not a stored watermark, feed offset, or
+tombstone.
+
 Opaque page tokens and cursors have separate wire versions and decoders. An
 unsupported version or cross-use is a typed error, not best-effort decoding.
 
-Any implementation that proposes a stored watermark, feed offset, operation
-summary, delete tombstone, or historical SchemaIR changes this conclusion and
-must return to this RFC's format audit before landing.
+Any implementation that proposes a stored watermark, feed offset, a NON-advisory
+operation summary, delete tombstone, or historical SchemaIR changes this
+conclusion and must return to this RFC's format audit before landing.
 
 ## 12. Phasing
 
@@ -846,13 +870,48 @@ whose cost is justified by C1.
 C0 through C3 shipped on the surveyed contract. Details frozen by the
 implementation, recorded here so later phases inherit them:
 
-- **v1 derivation is the exact ordered-merge authority path only.** No
-  row-version candidate pruning and no transaction-interval no-delete proof
-  shipped; both remain the sanctioned optimizations of §4.2/§4.3. The cost
-  instrument (`changes_cost.rs`) pins the O(table-extent) scan term as a
-  growing tripwire that the pruning slice must flip to a flat assertion, and
-  pins bounded per-page opens, Blob-lazy payload work, data-flat caught-up
-  polls, and the one-manifest-snapshot-per-commit backlog term.
+- **Candidate pruning shipped (§4.2/§4.3).** The exact ordered merge remains the
+  authority path, but a proven row-set-preserving interval is now derived in
+  O(delta) (`changes::candidate_scan`). Per changed interval the classifier reads
+  the interval's Lance transactions and requires every op to be `Append` or a
+  `RewriteRows` merge `Update` (an exhaustive, wildcard-free `Operation` match, so
+  a new Lance variant compile-errors into review). When proven, the child scan is
+  scoped by `Scanner::with_fragments` to exactly the fragments the parent lacks
+  (the manifest diff — no data reads to compute) with the
+  `_row_last_updated_at_version ∈ (begin, end]` window dropping carried-over rows,
+  and each candidate is classified against a batched `id IN (chunk)` BTREE probe
+  of the parent using the same typed `rows_equal`/`emitted_image`. A `RewriteRows`
+  `Update` is trusted as delete-free only with a **durable per-transaction
+  provenance proof** — the `omnigraph.no_by_source_delete` marker every
+  **general keyed MergeInsert update** stamps
+  (`table_store::stamp_no_by_source_delete` at the one keyed merge chokepoint;
+  proven strict inserts carry the RFC-023 `insert_absence` certificate instead),
+  or that `insert_absence` certificate itself. The op shape
+  plus the D2 rule and the retained `forbidden_apis.rs` source guard
+  (`no_delete_capable_merge_arm_in_engine_source`, now defense-in-depth) prove
+  only that *current engine code* builds no by-source-delete arm; they cannot
+  authenticate a *persisted* `Update` that `repair --force --confirm` may adopt
+  from an external Lance merge, whose child-only candidate scan would silently
+  drop the removed rows. So an `Update` carrying neither proof falls back to the
+  exact merge, as does any unproven op (delete, overwrite, restore, compaction, a
+  branch/lineage change, a non-advancing or oversized interval, a missing/cleaned
+  transaction). The `changes_cost.rs` tripwire is now `assert_flat` on the pruned
+  path (data reads do not grow with table extent at fixed Δ, with a reconciled
+  `id` BTREE — the production steady state) with a companion growing tripwire for
+  the fallback; bounded per-page opens, Blob-lazy payload work, data-flat
+  caught-up polls, and the one-manifest-snapshot-per-commit backlog term are
+  still pinned. Shipped: the inductive per-write row-set-preserving proof is the
+  read-advisory `no_by_source_delete` marker (stamped unconditionally on every
+  general keyed MergeInsert update; a missing marker only forces the
+  exact-merge fallback, never a correctness change — see the §11 audit note).
+  It is required independently of whether a delete-capable arm ever exists in
+  engine, because the exposure is external *persisted* history adopted by
+  `repair --force`, not engine code. Pruning additionally requires every
+  changed fragment's `_row_last_updated_at_version` sequence to be present and
+  decodable: pinned Lance 10 silently fills the column with 1 when a sequence
+  is missing or fails to load, which would empty the candidate window for
+  `begin > 1`; a fragment failing that loadability gate falls the interval
+  back to the exact merge.
 - **Typed structural equality** uses Arrow logical equality on one-row
   slices for non-Blob user columns and physical descriptor identity with an
   exact payload tie-break for Blob columns. Float comparison is bitwise.
