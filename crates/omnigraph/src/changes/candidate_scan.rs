@@ -555,4 +555,54 @@ mod tests {
         // tests staying flat/green (they would fall back and fail otherwise).
         assert!(!fragment_version_metadata_is_loadable(&Fragment::new(7)));
     }
+
+    #[test]
+    fn external_row_version_metadata_is_not_loadable() {
+        // Pinned Lance 10's `RowDatasetVersionMeta::External` arm of
+        // `load_sequence()` is `todo!()` — it panics rather than returning
+        // `Err`. The gate must classify the variant structurally instead of
+        // probing it, so an externally-stored sequence routes the interval to
+        // the exact ordered merge instead of aborting the poll.
+        let mut fragment = Fragment::new(7);
+        fragment.last_updated_at_version_meta = Some(
+            lance_table::rowids::version::RowDatasetVersionMeta::External(
+                lance_table::format::ExternalFile {
+                    path: "external.versions".to_string(),
+                    offset: 0,
+                    size: 64,
+                },
+            ),
+        );
+        assert!(!fragment_version_metadata_is_loadable(&fragment));
+    }
+
+    #[test]
+    fn short_row_version_sequence_is_not_loadable() {
+        // A sequence can decode cleanly yet cover fewer rows than the fragment
+        // holds; pinned Lance 10's single-run fast path then stamps that run's
+        // version across every requested row without consulting the encoded
+        // length. Loadable therefore means decodable AND exactly
+        // `physical_rows` long — anything shorter (or a fragment that does not
+        // even record its physical row count) falls back to the exact merge.
+        use lance_table::rowids::version::{
+            RowDatasetVersionMeta, RowDatasetVersionSequence, write_dataset_versions,
+        };
+
+        let mut fragment = Fragment::new(7);
+        fragment.physical_rows = Some(5);
+        let short = RowDatasetVersionSequence::from_uniform_row_count(3, 42);
+        fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Inline(
+            write_dataset_versions(&short).into(),
+        ));
+        assert!(!fragment_version_metadata_is_loadable(&fragment));
+
+        let exact = RowDatasetVersionSequence::from_uniform_row_count(5, 42);
+        fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Inline(
+            write_dataset_versions(&exact).into(),
+        ));
+        assert!(fragment_version_metadata_is_loadable(&fragment));
+
+        fragment.physical_rows = None;
+        assert!(!fragment_version_metadata_is_loadable(&fragment));
+    }
 }
