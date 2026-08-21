@@ -139,6 +139,13 @@ pub(crate) fn transaction_is_row_set_preserving(transaction: &Transaction) -> bo
 /// an inactive row-version column, a missing/cleaned transaction, or an unproven
 /// operation — returns `Ok(None)` so the caller uses the exact merge. It never
 /// returns `Err` for a normal miss (e.g. cleaned history).
+///
+/// The `(begin, end]` transaction walk is a LIVE read of numeric-path version
+/// manifests — the one replaceable read on the pruned path (data and
+/// transaction files are UUID-named). The sole caller is `plan_intervals`,
+/// which runs it BEFORE the final `reprove_named_branch_heads` witness so a
+/// branch delete/recreate cannot swap the classified history; the
+/// `CHANGE_FEED_POST_HEAD_WITNESS` failpoint cell pins that ordering.
 pub(crate) async fn interval_changed_fragments(
     from_entry: &SubTableEntry,
     to_entry: &SubTableEntry,
@@ -371,17 +378,21 @@ pub(crate) enum EmitSource {
 }
 
 impl EmitSource {
+    /// Open the emitter for one interval. `changed_fragments` is the pruning
+    /// decision [`interval_changed_fragments`] computed in `plan_intervals`
+    /// UNDER the final head witness — this constructor performs no live
+    /// history read, so a branch delete/recreate after the witness cannot
+    /// reroute the interval.
     pub(crate) async fn plan(
         from_entry: &SubTableEntry,
         to_entry: &SubTableEntry,
         from_dataset: Dataset,
         to_dataset: Dataset,
+        changed_fragments: Option<Vec<Fragment>>,
         after_id: Option<&str>,
         scope: &ChangeFeedScope,
     ) -> Result<Self> {
-        if let Some(changed_fragments) =
-            interval_changed_fragments(from_entry, to_entry, &from_dataset, &to_dataset).await?
-        {
+        if let Some(changed_fragments) = changed_fragments {
             Ok(Self::Pruned(
                 CandidateUpserts::open(
                     from_entry,

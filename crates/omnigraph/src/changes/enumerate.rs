@@ -214,13 +214,17 @@ pub(crate) struct IntervalPlan {
     opaque_id: String,
     kind: ChangeEntityKind,
     type_name: String,
-    /// The paired manifest entries (begin/end version, branch, identity). Used
-    /// by the candidate-pruning classifier to decide whether the interval can
-    /// be derived in O(delta).
+    /// The paired manifest entries (begin/end version, branch, identity).
     pub(crate) from_entry: SubTableEntry,
     pub(crate) to_entry: SubTableEntry,
     pub(crate) from_dataset: Dataset,
     pub(crate) to_dataset: Dataset,
+    /// The candidate-pruning decision, computed by `plan_intervals` BEFORE the
+    /// final post-open head witness so its `(begin, end]` transaction walk — a
+    /// live read of replaceable numeric-path version manifests — is covered by
+    /// `reprove_named_branch_heads`. `Some` carries the changed child
+    /// fragments for the O(delta) path; `None` means the exact ordered merge.
+    pub(crate) changed_fragments: Option<Vec<lance_table::format::Fragment>>,
 }
 
 /// Resolve the exceptional bounded digest position to its exact logical ID.
@@ -295,6 +299,7 @@ async fn plan_intervals(
     child: &Snapshot,
     schema_identity_domain: &str,
     graph_commit_id: &str,
+    scope: &ChangeFeedScope,
 ) -> Result<Vec<IntervalPlan>> {
     let intervals = changed_table_intervals(parent, child);
 
@@ -336,14 +341,33 @@ async fn plan_intervals(
                     return Err(schema_boundary(graph_commit_id, table_key));
                 }
                 let (kind, type_name) = parse_table_key(table_key);
+                let kind: ChangeEntityKind = kind.into();
+                // Classify the interval HERE — before the head witness below —
+                // because the classifier's `(begin, end]` transaction walk is a
+                // live read of replaceable numeric-path version manifests.
+                // Scope-filtered intervals are never emitted, so they skip the
+                // walk; their stored decision is irrelevant.
+                let changed_fragments =
+                    if scope.wants_kind(kind) && scope.wants_type_name(type_name) {
+                        super::candidate_scan::interval_changed_fragments(
+                            &from,
+                            &to,
+                            &from_dataset,
+                            &to_dataset,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
                 plans.push(IntervalPlan {
                     opaque_id: opaque_type_id(schema_identity_domain, interval.identity),
-                    kind: kind.into(),
+                    kind,
                     type_name: type_name.to_string(),
                     from_entry: from.clone(),
                     to_entry: to.clone(),
                     from_dataset,
                     to_dataset,
+                    changed_fragments,
                 });
             }
             (None, None) => unreachable!("changed intervals have at least one endpoint"),
@@ -431,6 +455,7 @@ pub(crate) async fn enumerate_commit_changes(
         child,
         schema_identity_domain,
         graph_commit_id,
+        scope,
     )
     .await?;
 
@@ -477,12 +502,15 @@ pub(crate) async fn enumerate_commit_changes(
         // effect is a proven row-set-preserving shape, else the exact full
         // ordered merge. Both yield the same id-ordered `Emit` stream, so the
         // budgeting/continuation loop below is identical. Before-images come
-        // from the parent handle, after-images from the child handle.
+        // from the parent handle, after-images from the child handle. The
+        // pruning decision itself was made by `plan_intervals` under the head
+        // witness — no live history read happens here.
         let mut source = EmitSource::plan(
             &plan.from_entry,
             &plan.to_entry,
             plan.from_dataset,
             plan.to_dataset,
+            plan.changed_fragments,
             after_id.as_deref(),
             scope,
         )
