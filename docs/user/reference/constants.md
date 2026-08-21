@@ -31,6 +31,7 @@
 | Expand indexed-path hop ceiling | `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS=6` | traversal |
 | Expand CSR-build cost factor | `CSR_BUILD_FACTOR = 1.5` | traversal |
 | Expand mode override | `OMNIGRAPH_TRAVERSAL_MODE` (`indexed`\|`csr`; unset = cost-based auto) | traversal |
+| Branch-merge classification mode | `OMNIGRAPH_MERGE_LINEAGE` (`off`\|`on`\|`verify`; unset = `on` in release builds, `verify` in debug builds) | branch merge |
 | Default body limit | `1 MB` | HTTP server |
 | Load (bulk-write) body limit | `32 MiB` | HTTP server (`/load`, `/load/ndjson`, and the deprecated `/ingest` alias) |
 | Strict-input Arrow preflight | `strict_input_arrow_bytes` ceiling = `KEYED_WRITE_MAX_BYTES` (32 MiB) | a strict load's projected Arrow allocation per declaration group, charged before materialization. Applies to **every** load mode — Overwrite escapes the keyed entity/byte ceilings above but not this preflight; a larger bulk replacement is one overwrite chunk followed by merge chunks |
@@ -57,3 +58,19 @@ them CSR is always used); they are not a hard per-hop bound — the cost model
 *estimates* total indexed work as ~`hops × frontier × fanout`, so dense fan-out is
 priced toward CSR rather than capped mid-traversal. The override flag forces a path (the `auto` result is identical either way;
 only the path differs).
+
+**Branch-merge classification mode.** `OMNIGRAPH_MERGE_LINEAGE` selects how a
+branch merge finds what changed. `on` (the release default) discovers
+candidates from Lance version metadata — fragment lists and deletion files —
+and reads only the changed data, so merge cost tracks the delta size instead
+of the dataset size; a fail-closed precondition gate falls back to the full
+three-way scan whenever any assumption cannot be proven (Blob-bearing schema,
+differing schemas or storage paths across the pins, version pins not matching
+the manifest entries, missing stable identifiers or the exact-id primary-key
+contract, non-linear history, or a candidate set past its byte budget). `off`
+forces the full three-way scan everywhere — the operational fallback if merge
+results are ever in question. `verify` runs both, compares their decisions
+entity by entity, publishes the scan's result, and fails the merge loudly on
+any divergence (the debug-build default, used for validation; it costs both
+paths). A merge that succeeds produces the same result in every mode; only
+cost differs. An unrecognized value logs a warning and behaves as `off`.
