@@ -3035,6 +3035,10 @@ async fn branch_delete_removes_owned_table_branches_and_allows_recreate() {
 
     main.branch_delete("feature").await.unwrap();
     assert_eq!(main.branch_list().await.unwrap(), vec!["main"]);
+    // Join the background fork reclaim so the recreate below starts from a
+    // physically clean namespace (it would otherwise serialize behind the
+    // reclaim's gates and self-heal any leftover orphan).
+    main.wait_for_fork_reclaims().await;
 
     main.branch_create("feature").await.unwrap();
     mutate_branch(
