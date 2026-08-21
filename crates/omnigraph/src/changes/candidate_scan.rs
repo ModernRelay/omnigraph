@@ -219,14 +219,31 @@ pub(crate) async fn interval_changed_fragments(
 }
 
 /// Whether one changed fragment's `_row_last_updated_at_version` sequence is
-/// present and decodable — the §4.2 "genuinely active" requirement at the
-/// fragment level. `uses_stable_row_ids()` alone is a dataset-level flag and
-/// cannot prove a specific fragment's sequence survives loading.
+/// present, decodable, and complete — the §4.2 "genuinely active" requirement
+/// at the fragment level. `uses_stable_row_ids()` alone is a dataset-level
+/// flag and cannot prove a specific fragment's sequence survives loading.
+///
+/// The Inline bytes are decoded directly rather than through
+/// `load_sequence()`: pinned Lance 10's External arm of that method is
+/// `todo!()` (it panics, it does not `Err`), so the variant must be
+/// structurally unreachable here. And a clean decode alone does not prove the
+/// sequence covers the fragment — Lance's single-run fast path stamps its one
+/// version across every requested row without consulting the encoded length —
+/// so the sequence must be exactly `physical_rows` long. Absent, external,
+/// undecodable, short, or unmeasurable all mean "not provably complete" and
+/// route the interval to the exact ordered merge.
 fn fragment_version_metadata_is_loadable(fragment: &Fragment) -> bool {
+    let Some(lance_table::rowids::version::RowDatasetVersionMeta::Inline(data)) =
+        fragment.last_updated_at_version_meta.as_ref()
+    else {
+        return false;
+    };
+    let Ok(sequence) = lance_table::rowids::version::read_dataset_versions(data) else {
+        return false;
+    };
     fragment
-        .last_updated_at_version_meta
-        .as_ref()
-        .is_some_and(|meta| meta.load_sequence().is_ok())
+        .physical_rows
+        .is_some_and(|rows| sequence.len() == rows as u64)
 }
 
 /// Fetch full before-image rows for `ids` from the parent handle in one
