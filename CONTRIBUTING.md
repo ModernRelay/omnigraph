@@ -35,9 +35,23 @@ brew install protobuf                                  # macOS
 sudo apt-get install -y protobuf-compiler libprotobuf-dev   # Debian/Ubuntu
 ```
 
+The first clean build compiles the Arrow/Lance storage stack and can take many
+minutes depending on hardware and network cache state. For the shortest edit
+loop, check or test only the package you changed before running the workspace
+gate:
+
 ```bash
-cargo build --workspace
-cargo test --workspace
+cargo check -p omnigraph-engine --locked
+cargo test -p omnigraph-engine --test traversal
+```
+
+Substitute the owning package and existing test target; the coverage map in
+[`docs/dev/testing.md`](docs/dev/testing.md) identifies them. Before merging a
+non-trivial change, run the canonical feature-superset gate:
+
+```bash
+cargo test --workspace --locked \
+  --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
 If you touch S3-backed flows, the CI model uses a local RustFS instance for

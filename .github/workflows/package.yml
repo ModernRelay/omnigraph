@@ -28,7 +28,7 @@ on:
 jobs:
   package_default:
     name: Package default build
-    uses: ModernRelay/.github/.github/workflows/omnigraph-package.yml@main
+    uses: ModernRelay/.github/.github/workflows/omnigraph-package.yml@fa42b9641a86884b3752a8659ff6daed79b6e777 # main
     permissions:
       id-token: write
       contents: read
@@ -40,7 +40,7 @@ jobs:
 
   package_aws:
     name: Package aws-feature build
-    uses: ModernRelay/.github/.github/workflows/omnigraph-package.yml@main
+    uses: ModernRelay/.github/.github/workflows/omnigraph-package.yml@fa42b9641a86884b3752a8659ff6daed79b6e777 # main
     permissions:
       id-token: write
       contents: read

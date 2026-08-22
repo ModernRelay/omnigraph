@@ -65,6 +65,8 @@ build_from_source() {
   fi
 
   need_cmd cargo
+  command -v protoc >/dev/null 2>&1 \
+    || die "missing required command: protoc — install the Protocol Buffers compiler first (brew install protobuf / apt-get install -y protobuf-compiler libprotobuf-dev)"
   log "Building omnigraph binaries from source"
   (
     cd "$repo_root"

@@ -55,7 +55,7 @@ jobs:
 
       - name: Checkout source at tag
         if: env.CARGO_PUBLISH_SKIP != '1'
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ steps.ref.outputs.ref }}
 
@@ -77,13 +77,13 @@ jobs:
 
       - name: Install Rust stable
         if: env.CARGO_PUBLISH_SKIP != '1'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
 
       - name: Cache Rust build data
         if: env.CARGO_PUBLISH_SKIP != '1'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
             . -> target
