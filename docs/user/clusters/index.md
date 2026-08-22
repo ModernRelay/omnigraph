@@ -144,7 +144,7 @@ curl -H 'authorization: Bearer s3cret' \
   -H 'content-type: application/json' -d '{"params":{"name":"Ada"}}'
 ```
 
-That request returns `200` with Ada's row. A caller without `invoke_query`
+That request returns `200` with Ada in the result. A caller without `invoke_query`
 receives the same `404` as an unknown query name, intentionally preventing
 catalog probing. If this example returns `404`, confirm that the query was
 applied with `GET /graphs/knowledge/queries` and that the actor appears in the
