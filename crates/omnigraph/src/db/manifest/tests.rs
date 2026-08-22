@@ -141,6 +141,29 @@ fn table_identity_rejects_zero_and_drives_paths_and_object_ids() {
     );
 }
 
+#[test]
+fn azure_table_locations_and_manifest_paths_use_remote_object_layout() {
+    let root = "az://omnigraph/clusters/company%20brain";
+    let table_path = "nodes/000000000000002a-0000000000000007";
+
+    assert_eq!(
+        table_uri_for_path(root, table_path, None).unwrap(),
+        format!("{root}/{table_path}")
+    );
+    assert_eq!(
+        table_uri_for_path(root, table_path, Some("review/one")).unwrap(),
+        format!("{root}/{table_path}/tree/review/one")
+    );
+    assert_eq!(
+        object_store_path_from_uri(&format!(
+            "{root}/{table_path}/_versions/00000000000000000001.manifest"
+        ))
+        .unwrap(),
+        format!("clusters/company brain/{table_path}/_versions/00000000000000000001.manifest")
+    );
+    assert!(table_uri_for_path("https://example.test/graph", table_path, None).is_err());
+}
+
 #[tokio::test]
 async fn historical_alias_binding_keeps_same_name_node_and_edge_identities_distinct() {
     let dir = tempfile::tempdir().unwrap();

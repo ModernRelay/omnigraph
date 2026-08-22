@@ -1,5 +1,13 @@
 # Operating an OmniGraph Cluster
 
+Clusters may use a local root, `s3://`, or an Azure Blob
+`az://<container>/<prefix>` root. Azure is a qualification preview, not a
+production-supported deployment: the safe live managed-identity smoke test has
+passed, while adversarial lease, concurrency, and termination qualification is
+still pending. The Azure reference deployment and its required single-process
+lease admission are documented in
+[Deployment](../deployment.md#azure-container-apps).
+
 This is the operator's guide to the cluster control plane: how to go from an
 empty directory to a served deployment, and how to run it day to day —
 evolving schemas, rotating queries and policies, healing drift, approving
@@ -130,9 +138,12 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-reader":"s3cret"}' \
 
 `--cluster` accepts either a **config directory** (the storage root resolves
 through `cluster.yaml`'s `storage:` key) or a **storage-root URI directly**
-(`--cluster s3://bucket/prefix`) — config-free serving: a serving box needs
+(`--cluster s3://bucket/prefix` or `--cluster az://container/prefix`) —
+config-free serving: a serving box needs
 only the URI and credentials, no checkout of the config repo. The ledger and
-catalog on the bucket are the deployment artifact.
+catalog in object storage are the deployment artifact. An Azure-rooted,
+mutation-capable server must still enter through the admission wrapper; the URI
+alone is not writer authority.
 
 `--cluster` is an **exclusive boot source**: it cannot be combined with a
 graph URI or `--config`, and `omnigraph.yaml` is never read in
@@ -185,6 +196,11 @@ the config files, outside the running system (the reasoning is
 [cluster-axioms.md](../../dev/cluster-axioms.md) §3 and §4). The server only ever
 *reads* the converged ledger, which is why a held apply lock never blocks
 serving (see §5 below, in this guide).
+
+For an `az://` cluster, the same out-of-band operation uses the documented
+Azure account and managed-identity environment. In the reference preview
+topology, it must run through the same admission wrapper as the server; the
+cluster state lock is not a graph-writer fence.
 
 What each change kind does:
 
@@ -307,11 +323,13 @@ and `/graphs` lists only the ready graphs. Pass
 
 ## 6. Deployment patterns
 
-- **Replicas**: any number of `--cluster` servers can serve the same config
-  directory; boot is read-only. Roll out a change by `apply` once, then
-  restarting replicas (serving is static per process — there is no hot
-  reload yet). Container/cloud recipes (AWS ECS+EFS, Railway volumes):
-  [deployment.md](../deployment.md#cluster-mode-in-containers-aws-railway).
+- **Replicas**: do not infer safe multi-replica mutation serving from the
+  read-only boot sequence. Once started, a normal server can accept graph
+  writes, and current recovery ownership is not a distributed writer fence.
+  Keep one externally admitted writer process; a structurally read-only server
+  role and read-replica topology require separate design and evidence. The
+  Azure preview enforces the stronger rule of one lease-admitted writer for the
+  whole cluster.
 - **The directory is the deployable unit**: config, catalog, ledger,
   approvals, and graph data all live under it. Back it up as a whole;
   version the *config files* (not `__cluster/` or `graphs/`) in git.
@@ -349,11 +367,13 @@ If the cluster has exactly **one** applied graph you can omit `--graph` — it i
 used automatically. With **several**, omitting `--graph` errors and lists the
 candidates; it never picks one for you.
 
-Against an **`s3://`-backed cluster** the resolved graph storage is non-local, so a
-destructive `cleanup` additionally requires **`--yes`** (an interactive prompt
-otherwise, refusal without a TTY) on top of `--confirm` — see [cli-reference.md](../cli/reference.md)'s
-*Write diagnostics & destructive confirmation*. Every maintenance run also echoes
-its resolved target to stderr (suppress with `--quiet`).
+Against an **`s3://`- or `az://`-backed cluster** the resolved graph storage is
+non-local, so a destructive `cleanup` additionally requires **`--yes`** (an
+interactive prompt otherwise, refusal without a TTY) on top of `--confirm` —
+see [cli-reference.md](../cli/reference.md)'s *Write diagnostics & destructive
+confirmation*. Every maintenance run also echoes its resolved target to stderr
+(suppress with `--quiet`). Azure maintenance must also run under the cluster's
+admission wrapper, never concurrently with the mutation-capable server.
 
 ## What the control plane does not do (yet)
 

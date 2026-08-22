@@ -185,6 +185,14 @@ the ledger CAS uses conditional writes (verified against AWS S3 semantics and
 RustFS), the lock becomes genuinely cross-machine, and graph roots are
 engine-native S3 URIs. Credentials are **never** in `cluster.yaml` — the
 standard `AWS_*` environment contract applies, identical to graph storage.
+`az://container/prefix` is the corresponding native Azure Blob qualification
+preview, not a production-supported deployment. It uses the Azure environment
+contract, real Blob ETag CAS, and the same derived graph-root layout; code,
+Azurite validation, and the safe live managed-identity smoke test are complete,
+while adversarial qualification remains pending. The cluster state lock
+serializes apply but is not a graph-writer fence, so every Azure apply,
+mutation-capable server, direct data writer, and maintenance process must enter
+through the same cluster-wide admission wrapper.
 Declared configuration (`cluster.yaml` and the schema/query/policy sources it
 references) always stays in the working tree: config is versioned in git,
 state lives in the store — the Terraform split.

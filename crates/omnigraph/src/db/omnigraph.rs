@@ -3716,7 +3716,7 @@ const CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS: usize = 4;
 /// write, and it is a property of the mount behind the root (a store can be
 /// copied), so probe per root, per bind.
 async fn verify_local_create_if_absent(root: &str, storage: &dyn StorageAdapter) -> Result<()> {
-    if storage_kind_for_uri(root) != StorageKind::Local {
+    if storage_kind_for_uri(root)? != StorageKind::Local {
         return Ok(());
     }
     crate::failpoints::maybe_fail(crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE)?;

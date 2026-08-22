@@ -47,7 +47,9 @@ use layout::{
 };
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
-use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
+use metadata::{
+    OMNIGRAPH_ROW_COUNT_KEY, object_store_path_from_uri, table_version_metadata_for_state,
+};
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
@@ -419,7 +421,7 @@ impl Snapshot {
                     &self.root_uri,
                     &entry.dataset_path,
                     entry.native_dataset_branch.as_deref(),
-                );
+                )?;
                 caches
                     .handles
                     .get_or_open(
@@ -680,7 +682,7 @@ impl DatasetEntry {
             root_uri,
             &self.dataset_path,
             self.native_dataset_branch.as_deref(),
-        );
+        )?;
         // Route through the one opener (Fix 3). With no session this is exactly
         // the Fix-2 `from_uri(location).with_version`. This is the uncached
         // fallback (a snapshot detached from its graph's read caches); the

@@ -696,9 +696,13 @@ durable_calls! {
     ("storage.rs", ".rename_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".delete(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".delete_prefix(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
-    ("omnigraph-storage/lib.rs", ".delete(", 2, WriteProtocol::Composed("storage adapter primitive")),
-    ("omnigraph-storage/lib.rs", ".put(", 2, WriteProtocol::Composed("object storage put primitive")),
+    ("omnigraph-storage/lib.rs", ".delete(", 3, WriteProtocol::Composed("storage adapter primitive, including Azure rename source retirement")),
+    ("omnigraph-storage/lib.rs", ".put(", 4, WriteProtocol::Composed("object storage put primitive, including Azure rename destination publication")),
     ("omnigraph-storage/lib.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
+    ("omnigraph-storage/lib.rs", ".put_multipart(", 1, WriteProtocol::Composed("Azure multipart rename staging")),
+    ("omnigraph-storage/lib.rs", ".put_part(", 1, WriteProtocol::Composed("Azure multipart rename staging")),
+    ("omnigraph-storage/lib.rs", ".complete(", 1, WriteProtocol::Composed("Azure multipart rename destination publication")),
+    ("omnigraph-storage/lib.rs", ".abort(", 1, WriteProtocol::Composed("Azure multipart rename failure cleanup")),
     ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
@@ -850,6 +854,10 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".delete_prefix(",
     ".put(",
     ".put_opts(",
+    ".put_multipart(",
+    ".put_part(",
+    ".complete(",
+    ".abort(",
     ".rename(",
     ".rename_text(",
     "GraphCoordinator::init_commit_with_session(",
@@ -2055,19 +2063,35 @@ fn structural_call_scanner_skips_test_module_but_keeps_later_production() {
         r#"
         #[cfg(test)]
         mod tests {
-            fn helper(storage: &Storage) {
+            fn helper(storage: &Storage, object_store: &ObjectStore, upload: &mut Upload) {
                 storage.commit_staged_exact();
+                object_store.put_multipart(location);
+                upload.put_part(payload);
+                upload.complete();
+                upload.abort();
             }
         }
 
-        fn production_after_tests(storage: &Storage) {
+        fn production_after_tests(
+            storage: &Storage,
+            object_store: &ObjectStore,
+            upload: &mut Upload,
+        ) {
             storage.commit_staged_exact();
+            object_store.put_multipart(location);
+            upload.put_part(payload);
+            upload.complete();
+            upload.abort();
         }
         "#,
         "scanner cfg(test) self-test",
     );
     let inventory = call_inventory(&ast);
     assert_eq!(inventory.counts.get("commit_staged_exact"), Some(&1));
+    assert_eq!(inventory.counts.get("put_multipart"), Some(&1));
+    assert_eq!(inventory.counts.get("put_part"), Some(&1));
+    assert_eq!(inventory.counts.get("complete"), Some(&1));
+    assert_eq!(inventory.counts.get("abort"), Some(&1));
 }
 
 #[test]
@@ -2079,6 +2103,8 @@ fn structural_call_scanner_closes_raw_dataset_and_ufcs_routes() {
             scanner: &mut Scanner,
             storage: &Storage,
             audit: &mut RecoveryAudit,
+            object_store: &ObjectStore,
+            upload: &mut Upload,
         ) {
             ds.append(reader, params);
             ds.list_branches();
@@ -2094,8 +2120,14 @@ fn structural_call_scanner_closes_raw_dataset_and_ufcs_routes() {
             StorageAdapter::write_text(storage, uri, contents);
             object_store.put(location, payload);
             object_store.put_opts(location, payload, options);
+            object_store.put_multipart(location);
+            upload.put_part(payload);
+            upload.complete();
+            upload.abort();
             object_store.rename(from, to);
             audit.append(RecoveryAuditRecord {});
+            let _ = "put_multipart() put_part() complete() abort()";
+            // upload.complete();
         }
         "#,
         "scanner raw Dataset/UFCS self-test",
@@ -2117,6 +2149,10 @@ fn structural_call_scanner_closes_raw_dataset_and_ufcs_routes() {
     assert_eq!(inventory.counts.get("write_text"), Some(&1));
     assert_eq!(inventory.counts.get("put"), Some(&1));
     assert_eq!(inventory.counts.get("put_opts"), Some(&1));
+    assert_eq!(inventory.counts.get("put_multipart"), Some(&1));
+    assert_eq!(inventory.counts.get("put_part"), Some(&1));
+    assert_eq!(inventory.counts.get("complete"), Some(&1));
+    assert_eq!(inventory.counts.get("abort"), Some(&1));
     assert_eq!(inventory.counts.get("rename"), Some(&1));
     assert_eq!(
         inventory.counts.get(".append(RecoveryAuditRecord"),

@@ -11,7 +11,12 @@ Every node type and every edge type is its own Lance dataset:
 - **Stable row IDs**: stable row IDs are enabled on every Lance dataset OmniGraph creates — node and edge datasets, `__manifest`, `_graph_commit_recoveries.lance`, and any future system datasets. This is an architectural invariant: the flag is one-way at dataset create, so a future change that introduces a Lance dataset must preserve it. Consequences: `_row_created_at_version` and `_row_last_updated_at_version` are available on every dataset (load-bearing for change-feed validators); indices survive `omnigraph optimize`. Pre-0.4.x graphs created before this code path settled may have datasets without the flag and cannot be retrofitted in place — the supported path is dump-and-reload. The rewrite path used by `schema_apply` preserves the flag.
 - **Append / delete / `merge_insert`**: native Lance write modes.
 - **Per-dataset branches** (Lance native): copy-on-write at the dataset level.
-- **Object-store agnostic**: file://, s3://, gs://, az://, http (read-only via Lance) — OmniGraph wires file:// and s3://.
+- **Object-store agnostic**: OmniGraph natively wires local/`file://` and `s3://`
+  roots through Lance and the shared control-object adapter. Azure `az://` roots
+  are implemented as a qualification preview, not a production-supported
+  deployment: code, Azurite validation, and the safe live managed-identity
+  smoke test are complete, while adversarial qualification remains pending.
+  Other schemes are rejected rather than silently treated as local paths.
 
 ## L2 — Multi-dataset coordination via `__manifest`
 
@@ -67,7 +72,7 @@ flowchart TB
     classDef l1 fill:#fef3e8,stroke:#c46900,color:#000
     classDef l2 fill:#e8f4fd,stroke:#1e6aa8,color:#000
 
-    graph["graph URI<br/>file:// or s3://bucket/prefix"]:::l2
+    graph["graph URI<br/>file://, s3://bucket/prefix, or az://container/prefix"]:::l2
 
     manifest["__manifest/<br/>L2 catalog of datasets"]:::l2
     nodes["nodes/{stable-id}-{incarnation}/<br/>one dataset per node-type incarnation"]:::l2
@@ -100,7 +105,7 @@ flowchart TB
 
 **What's where:**
 
-- **Graph root** is one directory (or S3 prefix). Everything below is part of one OmniGraph graph.
+- **Graph root** is one directory, S3 prefix, or Azure container prefix. Everything below is part of one OmniGraph graph.
 - **`__manifest/`** is a Lance dataset whose rows describe which dataset version is published on which graph branch. Reading a snapshot starts here.
 - **`nodes/`** and **`edges/`** are sibling directories holding one Lance dataset per live node/edge type incarnation. Names encode the stable table ID and incarnation, so a public type rename keeps its path while a drop/re-add receives a fresh one.
 - The graph commit DAG lives in **`__manifest`** as `graph_commit` / `graph_head` rows written in the publish CAS (RFC-013 Phase 7). The former `_graph_commits.lance` / `_graph_commit_actors.lance` lineage datasets are retired — a graph this binary creates has neither.
@@ -118,6 +123,7 @@ The split — L2 owns the cross-dataset catalog; L1 owns the per-dataset interna
 |---|---|---|
 | local path / `file://` | local filesystem | Normalized to absolute paths; relative and dot-segment paths are lexically absolutized. Requires hard-link support (below) |
 | `s3://bucket/prefix` | S3 object store | Honors `AWS_ENDPOINT_URL_S3`, `AWS_ALLOW_HTTP`, `AWS_S3_FORCE_PATH_STYLE` |
+| `az://container/prefix` | Azure Blob service (qualification preview) | Account and credentials come from the Azure environment contract below. The public URI carries the container and prefix, never credentials. Code, Azurite validation, and the safe live managed-identity smoke test are complete; adversarial qualification remains pending, so this is not production-supported. |
 | `http(s)://host:port` | HTTP client to `omnigraph-server` | Used by CLI as a target, not a storage backend |
 
 ### Local filesystem requirement: hard links
@@ -134,7 +140,7 @@ reserved for OmniGraph internals, e.g. `__create_if_absent_probe_<unique-id>`).
 Each bind removes only the probe object it successfully created; a colliding
 foreign or crash-residue name is left untouched and retried with a fresh name.
 Read-only opens (export, `commit list`) perform no writes and work on such
-filesystems. S3-compatible backends are unaffected — the store implements
+filesystems. S3-compatible and Azure backends are unaffected — the store implements
 the conditional put server-side. The limitation comes from the upstream
 local object-store implementation, which performs conditional put via
 `hard_link(2)`; [apache/arrow-rs-object-store#826](https://github.com/apache/arrow-rs-object-store/pull/826)
@@ -146,3 +152,32 @@ tracks a `renameat2(RENAME_NOREPLACE)` fallback.
 - `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3` — for MinIO / RustFS / GCS-via-XML
 - `AWS_S3_FORCE_PATH_STYLE=true` — path-style URLs
 - `AWS_ALLOW_HTTP=true` — allow plain HTTP (local dev)
+
+## Object-store env vars (Azure)
+
+An Azure root has the strict form `az://<container>/<prefix>`. OmniGraph rejects
+userinfo, ports, query strings, fragments, path aliases, and alternate Azure
+schemes so the engine, control-object adapter, and process-admission wrapper
+cannot interpret the same root differently.
+
+- `AZURE_STORAGE_ACCOUNT_NAME` — required account selected for every `az://` URI
+- `AZURE_STORAGE_CLIENT_ID` — optional user-assigned managed-identity client ID
+  (`AZURE_CLIENT_ID` is the upstream alias)
+- `IDENTITY_ENDPOINT` and `IDENTITY_HEADER` — injected by Azure Container Apps;
+  a deprecated `MSI_ENDPOINT` duplicate is accepted only when it matches the
+  present `IDENTITY_ENDPOINT`
+- `AZURE_STORAGE_ENDPOINT` — optional custom Blob service endpoint
+- `AZURE_STORAGE_USE_EMULATOR=true` and optional
+  `AZURITE_BLOB_STORAGE_URL` — local Azurite integration
+
+The first Azure open captures all recognized selection options for the process;
+changing them requires a restart. The control-object adapter and Lance both
+receive that immutable snapshot. For Azurite, OmniGraph expands the emulator
+selection into an ordinary explicit HTTP endpoint containing the account path
+and prevents either builder from rereading live environment. Dataset and
+control-object credentials remain owned by the upstream Azure credential
+providers; the narrow admission wrapper obtains a fresh managed-identity token
+for each Blob request and never persists it. See
+[Azure deployment](../deployment.md#azure-container-apps) for the required
+single-writer admission boundary. The safe live managed-identity smoke test is
+complete; adversarial live-Azure qualification remains pending.

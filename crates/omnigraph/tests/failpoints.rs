@@ -3312,6 +3312,57 @@ async fn schema_apply_recovers_partial_rename() {
     assert_no_staging_files(dir.path());
 }
 
+/// Azure implements schema-contract promotion as GET -> completed PUT ->
+/// DELETE. Model a crash after the destination PUT by leaving the identical
+/// live and staging objects together, then prove the ordinary open-time
+/// recovery completes the remaining source deletions.
+#[tokio::test]
+#[serial]
+async fn azure_schema_apply_recovers_source_and_destination_after_partial_rename() {
+    let Ok(container) = std::env::var("OMNIGRAPH_AZURE_TEST_CONTAINER") else {
+        eprintln!(
+            "skipping Azure schema rename recovery: OMNIGRAPH_AZURE_TEST_CONTAINER is not set"
+        );
+        return;
+    };
+    let _scenario = FailScenario::setup();
+    let uri = format!(
+        "az://{container}/engine-failpoints/schema-rename-{}",
+        ulid::Ulid::new()
+    );
+    let storage = omnigraph_storage::storage_for_uri(&uri).unwrap();
+
+    {
+        let db = Omnigraph::init(&uri, SCHEMA_V1).await.unwrap();
+        db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap();
+    }
+
+    for name in ["_schema.ir.json", "__schema_state.json"] {
+        let live = format!("{uri}/{name}");
+        let staging = format!("{live}.staging");
+        let body = storage.read_text(&live).await.unwrap();
+        storage.write_text(&staging, &body).await.unwrap();
+        assert!(storage.exists(&live).await.unwrap());
+        assert!(storage.exists(&staging).await.unwrap());
+    }
+
+    let reopened = Omnigraph::open(&uri)
+        .await
+        .expect("Azure open must complete the interrupted schema-contract rename");
+    assert_eq!(reopened.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
+    for name in ["_schema.ir.json", "__schema_state.json"] {
+        assert!(storage.exists(&format!("{uri}/{name}")).await.unwrap());
+        assert!(
+            !storage
+                .exists(&format!("{uri}/{name}.staging"))
+                .await
+                .unwrap()
+        );
+    }
+    drop(reopened);
+    storage.delete_prefix(&uri).await.unwrap();
+}
+
 /// Prove the recovery sweep closes the "finalize → publisher residual"
 /// across one open cycle.
 ///
@@ -3428,6 +3479,107 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
         person_count, 2,
         "Frank's insert must land normally after recovery"
     );
+}
+
+/// The same confirmed-effect recovery boundary must hold when both the Lance
+/// dataset and OmniGraph's recovery/control objects live in Azure Blob Storage.
+/// This extends the provider-neutral owner above instead of creating a second
+/// recovery suite; it runs only in the configured Azurite CI job.
+#[tokio::test]
+#[serial]
+async fn azure_recovery_rolls_forward_after_finalize_publisher_failure() {
+    let Ok(container) = std::env::var("OMNIGRAPH_AZURE_TEST_CONTAINER") else {
+        eprintln!("skipping Azure mutation recovery: OMNIGRAPH_AZURE_TEST_CONTAINER is not set");
+        return;
+    };
+    let _scenario = FailScenario::setup();
+    let uri = format!(
+        "az://{container}/engine-failpoints/finalize-publisher-{}",
+        ulid::Ulid::new()
+    );
+    let adapter = omnigraph_storage::storage_for_uri(&uri).unwrap();
+
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        let person_uri = node_table_uri(&db, "Person").await;
+        let manifest_pin = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version;
+
+        {
+            let _failpoint =
+                ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+            let err = mutate_main(
+                &mut db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+            )
+            .await
+            .expect_err("the Azure mutation must stop after its durable dataset effect");
+            assert!(
+                err.to_string()
+                    .contains("mutation.post_finalize_pre_publisher"),
+                "unexpected error: {err}"
+            );
+        }
+
+        let dataset_head = Dataset::open(&person_uri).await.unwrap().version().version;
+        assert_eq!(
+            dataset_head,
+            manifest_pin + 1,
+            "the Azure dataset effect must be durable while the manifest remains pinned"
+        );
+        let sidecars = adapter
+            .list_dir(&format!("{uri}/__recovery"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sidecars
+                .iter()
+                .filter(|path| path.ends_with(".json"))
+                .count(),
+            1,
+            "the confirmed Azure effect must retain one recovery sidecar: {sidecars:?}"
+        );
+    }
+
+    let mut recovered = Omnigraph::open(&uri)
+        .await
+        .expect("a fresh Azure open must roll the confirmed effect forward");
+    let people = helpers::read_table(&recovered, "node:Person").await;
+    assert_eq!(
+        collect_column_strings(&people, "name"),
+        vec!["Eve"],
+        "recovery must preserve the interrupted row exactly once"
+    );
+    let remaining_sidecars = adapter
+        .list_dir(&format!("{uri}/__recovery"))
+        .await
+        .unwrap();
+    assert!(
+        remaining_sidecars
+            .iter()
+            .all(|path| !path.ends_with(".json")),
+        "successful recovery must retire the Azure sidecar: {remaining_sidecars:?}"
+    );
+
+    mutate_main(
+        &mut recovered,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
+    )
+    .await
+    .expect("the recovered Azure graph must accept the next mutation");
+    assert_eq!(helpers::count_rows(&recovered, "node:Person").await, 2);
+    drop(recovered);
+
+    adapter.delete_prefix(&uri).await.unwrap();
 }
 
 /// Regression for iss-schema-apply-reopen-recovery-race: the open-time

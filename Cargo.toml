@@ -7,6 +7,7 @@ members = [
     "crates/omnigraph-cli",
     "crates/omnigraph-api-types",
     "crates/omnigraph-cluster",
+    "crates/omnigraph-azure-admission",
     "crates/omnigraph-policy",
     "crates/omnigraph-server",
     "tools/omnigraph-vocabulary-guard",
@@ -38,7 +39,7 @@ datafusion-functions-aggregate = "54"
 # stale-index-coverage, and Blob null/empty correctness gaps carried by the
 # 9.0.0 pin. Its ordered-coalesce fix remains locally fenced for late payload
 # hydration; see docs/dev/lance.md.
-lance = { version = "10.0.0", default-features = false, features = ["aws"] }
+lance = { version = "10.0.0", default-features = false, features = ["aws", "azure"] }
 lance-core = "10.0.0"
 # RowAddrTreeMap moved from lance-core::utils::mask to the new lance-select crate in 9.x.
 lance-select = "10.0.0"
@@ -75,7 +76,7 @@ bytes = "1"
 ariadne = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-object_store = { version = "0.13.2", default-features = false, features = ["aws", "fs"] }
+object_store = { version = "0.13.2", default-features = false, features = ["aws", "azure", "fs"] }
 fail = "0.5"
 time = { version = "0.3", features = ["formatting"] }
 axum = { version = "0.8", features = ["json", "macros"] }
@@ -88,6 +89,9 @@ proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "visit"] }
 walkdir = "2"
+uuid = { version = "1", features = ["v4"] }
+hmac = "0.12"
+httpdate = "1"
 
 [workspace.lints.clippy]
 # Nested guards often read clearer than one merged condition (Polars allows this too).

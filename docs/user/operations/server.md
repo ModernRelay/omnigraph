@@ -1,14 +1,28 @@
 # HTTP Server (`omnigraph-server`)
 
-Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot**: the server always boots from a cluster (`--cluster <dir | s3://…>`) and serves N graphs (N ≥ 1) under cluster routes. There is no longer a single-graph flat-route mode, no positional `<URI>` boot, no `--target`, and no `omnigraph.yaml`-`graphs:`-map boot. All HTTP is nested under `/graphs/{graph_id}/...`; `/healthz` and the management `/graphs` enumeration stay flat.
+Cluster storage may be local, `s3://`, or Azure Blob
+`az://<container>/<prefix>`. Azure is a qualification preview, not a
+production-supported deployment: the safe live managed-identity smoke test has
+passed, while adversarial lease, concurrency, and termination qualification is
+still pending. Every mutation-capable Azure server must use the checked-in
+admission wrapper described in [Deployment](../deployment.md#azure-container-apps).
+
+Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot**: the server always boots from a cluster (`--cluster <dir | s3://… | az://…>`) and serves N graphs (N ≥ 1) under cluster routes. There is no longer a single-graph flat-route mode, no positional `<URI>` boot, no `--target`, and no `omnigraph.yaml`-`graphs:`-map boot. All HTTP is nested under `/graphs/{graph_id}/...`; `/healthz` and the management `/graphs` enumeration stay flat.
 
 ## Boot
 
 ### Cluster boot (the only boot)
 
 ```bash
-omnigraph-server --cluster <dir | s3://…> --bind 0.0.0.0:8080
+omnigraph-server --cluster <dir | s3://… | az://…> --bind 0.0.0.0:8080
 ```
+
+For an Azure root, that server command is the supervised child, not the outer
+entrypoint. Run it through `omnigraph-azure-admission run --mode server`. The
+checked-in container entrypoint adds that wrapper automatically when its
+`--cluster` argument (or `OMNIGRAPH_CLUSTER`) is itself an `az://` root; a local
+config directory whose `storage:` resolves to Azure still needs an explicit
+outer wrapper.
 
 Passing port `0` lets the operating system select an available port. After the
 listener binds, the server writes the actual address to stdout as one
@@ -48,8 +62,8 @@ Operators who want the original all-or-nothing boot contract can pass
 any graph quarantine, graph-open failure, stored-query startup failure, or
 embedding-provider resolution failure aborts startup.
 
-A scheme-qualified argument (`s3://…`) reads the ledger straight from the
-storage root, with no local config directory. `--bind`,
+A scheme-qualified argument (`s3://…` or `az://…`) reads the ledger straight
+from the storage root, with no local config directory. `--bind`,
 `--unauthenticated`, and the bearer-token env vars all apply.
 
 ### Stored-query validation at startup

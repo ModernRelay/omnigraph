@@ -17,7 +17,7 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
 **Version surveyed:** 0.10.0
-**Workspace crates:** `omnigraph-compiler`, `omnigraph-storage` (shared control-object storage), `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`
+**Workspace crates:** `omnigraph-compiler`, `omnigraph-storage` (shared control-object storage), `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`, `omnigraph-azure-admission` (Azure single-writer deployment wrapper)
 **Storage substrate:** Lance 10.0.0 (columnar, versioned, branchable; crates.io release)
 **License:** MIT
 **Toolchain:** Rust stable, edition 2024
@@ -48,7 +48,7 @@ OmniGraph is a typed property-graph engine built as a coordination layer over ma
   physical datasets or per-dataset lanes. OmniGraph owns no MemWAL firehose,
   token ledger, stream lifecycle, or durable-but-not-visible acknowledgement.
   See [Streaming ingestion after RFC-026](docs/dev/wal-removal.md).
-- **HTTP server**: Axum + utoipa OpenAPI, bearer auth (SHA-256 hashed, optional AWS Secrets Manager). Cedar policy enforcement is engine-wide — every `_as` writer calls `Omnigraph::enforce(action, scope, actor)`, so HTTP, CLI, and embedded SDK consumers all hit the same gate. **Cluster-only boot** (RFC-011): the server always boots from a cluster directory (`--cluster <dir | s3://…>`, RFC-005) and serves N graphs (N ≥ 1) under multi-graph routes (`/graphs/{graph_id}/...` + read-only `GET /graphs` enumeration); there are no single-graph flat routes and no positional-URI boot. Per-graph + server-level Cedar policies. Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not exposed — operators run `cluster apply` and restart.
+- **HTTP server**: Axum + utoipa OpenAPI, bearer auth (SHA-256 hashed, optional AWS Secrets Manager). Cedar policy enforcement is engine-wide — every `_as` writer calls `Omnigraph::enforce(action, scope, actor)`, so HTTP, CLI, and embedded SDK consumers all hit the same gate. **Cluster-only boot** (RFC-011): the server always boots from a cluster directory (`--cluster <dir | s3://… | az://…>`, RFC-005/029) and serves N graphs (N ≥ 1) under multi-graph routes (`/graphs/{graph_id}/...` + read-only `GET /graphs` enumeration); there are no single-graph flat routes and no positional-URI boot. Azure is a qualification preview and every mutation-capable Azure server must run through `omnigraph-azure-admission`. Per-graph + server-level Cedar policies. Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not exposed — operators run `cluster apply` and restart.
 - **CLI** with two-surface config (RFC-007/008): the team-owned cluster directory (`cluster.yaml`) plus the per-operator `~/.omnigraph/config.yaml` (servers, clusters, credentials, actor, profiles, aliases, defaults). Graphs are addressed via `--store`/`--server`/`--cluster`/`--profile`/operator defaults (RFC-011). Multi-format output (json/jsonl/csv/kv/table).
 
 Throughout the docs, capabilities are split into **L1 — Inherited from Lance** vs **L2 — Added by OmniGraph**.
@@ -71,7 +71,7 @@ CLI (omnigraph)        HTTP Server (omnigraph-server, Axum)
               Lance 10.x        ── columnar Arrow, fragments, per-dataset versions/branches, indexes
                       │
                       ▼
-        Object store (file / s3 / RustFS / MinIO / S3-compat)
+        Object store (file / S3-compatible / Azure Blob)
 ```
 
 Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architecture.md).
@@ -89,7 +89,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | **Test coverage map — what's covered, what helpers to reuse, before-every-task checklist** | **[docs/dev/testing.md](docs/dev/testing.md)** |
 | The canon — linear internal narrative of the whole system (philosophy, read/write/crash walkthroughs, exclusions, risk register, roadmap) | [docs/dev/canon.md](docs/dev/canon.md) |
 | Architecture, L1/L2 framing, concurrency model | [docs/dev/architecture.md](docs/dev/architecture.md) |
-| Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/user/concepts/storage.md](docs/user/concepts/storage.md) |
+| Storage layout, `__manifest` schema, URI schemes, S3/Azure env vars | [docs/user/concepts/storage.md](docs/user/concepts/storage.md) |
 | `.pg` schema language, types, constraints, annotations, migration planning | [docs/user/schema/index.md](docs/user/schema/index.md) |
 | Schema-lint codes (`OG-XXX-NNN`), families, severity, suppression | [docs/user/schema/lint.md](docs/user/schema/lint.md) |
 | `.gq` query language, MATCH/RETURN/ORDER, IR ops, lint codes | [docs/user/queries/index.md](docs/user/queries/index.md) |
@@ -205,7 +205,9 @@ cargo build --workspace --locked              # build everything
 cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
                                                 # canonical CI test graph (one feature-superset build)
 cargo run -p omnigraph-cli -- <args>          # run the `omnigraph` CLI from source
-cargo run -p omnigraph-server -- --cluster <dir|s3://...> --bind 0.0.0.0:8080   # run the server from source
+cargo run -p omnigraph-server -- --cluster <dir|s3://...> --bind 0.0.0.0:8080   # run a local/S3 server from source
+# Azure is a qualification preview; run its mutation-capable server through
+# omnigraph-azure-admission as documented in docs/user/deployment.md.
 
 # Run one crate / one test file / one test fn
 cargo test -p omnigraph-engine --test traversal           # one integration-test file (see docs/dev/testing.md)
@@ -217,9 +219,9 @@ cargo test -p omnigraph-engine --features failpoints --test failpoints   # fault
 cargo test -p omnigraph-server --features aws    # AWS Secrets Manager bearer-token source (CI runs this suite too)
 ```
 
-S3-backed tests (`s3_storage`, and the S3 paths in server/CLI system tests) **skip** unless `OMNIGRAPH_S3_TEST_BUCKET` + `AWS_*` (incl. `AWS_ENDPOINT_URL_S3` for non-AWS) are set; CI runs them against containerized RustFS. To run RustFS/MinIO yourself, see [docs/user/deployment.md](docs/user/deployment.md) → *Testing against S3 locally*.
+S3-backed tests (`s3_storage`, and the S3 paths in server/CLI system tests) **skip** unless `OMNIGRAPH_S3_TEST_BUCKET` + `AWS_*` (incl. `AWS_ENDPOINT_URL_S3` for non-AWS) are set; CI runs them against containerized RustFS. Azure tests similarly require `OMNIGRAPH_AZURE_TEST_CONTAINER` plus the documented `AZURE_*`/Azurite environment and run in the dedicated Azurite CI job. See [docs/user/deployment.md](docs/user/deployment.md).
 
-CI runs `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_macro` (default features, then the failpoints superset) as PR-time gates (`Format (rustfmt)` and `Lint (clippy)`); run both before pushing. Lint levels stay `warn` in the workspace table and only CI denies; toolchain-pin and cache mechanics are commented in `.github/workflows/ci.yml`. The workspace allows `collapsible_if` and `too_many_arguments` (root `Cargo.toml`). CI's canonical test graph is `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints`, which compiles the current tree once with failpoint hooks present but inert unless a test configures one; run it before pushing. The immediate-predecessor storage-format fence and the default/failpoint configured-RustFS graphs are separate parallel jobs. Three non-test CI checks are `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs), `scripts/check-workflow-action-pins.py` (every external Action and reusable workflow must use a full commit SHA), and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
+CI runs `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_macro` (default features, then the failpoints superset) as PR-time gates (`Format (rustfmt)` and `Lint (clippy)`); run both before pushing. Lint levels stay `warn` in the workspace table and only CI denies; toolchain-pin and cache mechanics are commented in `.github/workflows/ci.yml`. The workspace allows `collapsible_if` and `too_many_arguments` (root `Cargo.toml`). CI's canonical test graph is `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints`, which compiles the current tree once with failpoint hooks present but inert unless a test configures one; run it before pushing. The immediate-predecessor storage-format fence and the default/failpoint configured-RustFS graphs are separate parallel jobs. Additional non-test checks include `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs), `scripts/check-workflow-action-pins.py` (every external Action and reusable workflow must use a full commit SHA), container/package binary parity, the Azure admission dependency boundary, and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
 
 ## Quick-reference flows
 
@@ -267,7 +269,7 @@ omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act
 
 | Capability | L1 (Lance default) | L2 (OmniGraph adds) |
 |---|---|---|
-| Columnar storage on object store | ✅ Arrow/Lance | URI normalization, S3 env-var plumbing |
+| Columnar storage on object store | ✅ Arrow/Lance | Strict URI normalization and aligned S3/Azure environment plumbing. Azure is a qualification preview and requires the admission wrapper for writers. |
 | Per-dataset versioning + time travel | ✅ | `snapshot_at_graph_manifest_version`, `entity_at`, snapshot-pinned reads across many datasets |
 | Blob-v2 cell access | ✅ Blob-v2 descriptors and range readers | `read_blob_at` selects one logical node/edge Blob cell at an exact branch or snapshot without exposing Lance placement. Managed readers are bounded and snapshot-pinned; HTTP GET/explicit HEAD adds ranges, conditionals, and a two-chunk backpressure envelope. CLI `blob get/stat` adds raw managed bytes and descriptor metadata: whole-object external stat is zero-I/O, GET never follows the reference, and ranged external delivery fails closed. Identity ambiguity and malformed state fail closed. See [RFC-033](docs/rfcs/0033-blob-management.md), [execution internals](docs/dev/execution.md), and the [CLI guide](docs/user/cli/index.md#reading-blob-cells). |
 | Stable schema + dataset identity | — | Persisted accepted SchemaIR v2 owns one graph identity domain and a shared monotonic no-reuse allocator for nonzero type, property, and dataset-incarnation IDs. Internal graph-manifest schema v5 introduced identity-keyed registration, version, tombstone, OCC, recovery ownership, and identity-derived node/edge paths; v6 preserves that contract and adds exact non-null `id` fencing. The persisted `table_key` column is a mutable internal alias: rename preserves identity/path/history, while drop/re-add mints a new lifetime. Public contracts expose graph type names/keys and explicit dataset coordinates. This binary serves exactly v6; released v4 graphs rebuild by export/init/load, and abandoned unreleased v7-v19 roots are refused as future formats. |
@@ -291,10 +293,10 @@ omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act
 | Three-way entity-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` net diff, plus the graph change surfaces: exact per-commit entity diffs vs the first parent (before/after images, opaque rename-stable type identity, commit-era schema decoding, typed schema-boundary/genesis refusals), a durable first-parent change feed with caller-owned cursors that advance only over complete commits, and the snapshot+cursor baseline handshake as the sole reset after a typed retention gap. HTTP (`/commits/{id}/changes`, `/changes`, `/changes/baseline`), CLI (`commit changes`, `changes poll\|baseline`), and SDK share one enumerator |
 | Cedar policy | — | Per-graph actions plus server-scoped actions (see [docs/user/operations/policy.md](docs/user/operations/policy.md) for the current list), branch / target_branch / protected scopes, validate/test/explain CLI. **Engine-wide enforcement** (MR-722): every `_as` writer (`apply_schema_as`, `mutate_as`, `load_as` — the deprecated `ingest_as` shims route through it — `branch_create_as` / `branch_create_from_as`, `branch_delete_as`, `branch_merge_as`) calls `Omnigraph::enforce(action, scope, actor)` — HTTP, CLI, embedded SDK all hit the same gate. |
-| HTTP server | — | Axum, OpenAPI via utoipa, bearer auth (SHA-256, AWS Secrets Manager option), `authorize_request` at the HTTP boundary (resolves bearer→actor, applies admission control), NDJSON streaming export, **cluster-only boot (RFC-011): always `--cluster <dir | s3://…>`, serving N graphs (N ≥ 1) under multi-graph routes + read-only `GET /graphs` enumeration + per-graph + server-level Cedar policies. Add/remove graphs via `cluster apply` and restart.** |
+| HTTP server | — | Axum, OpenAPI via utoipa, bearer auth (SHA-256, AWS Secrets Manager option), `authorize_request` at the HTTP boundary (resolves bearer→actor, applies admission control), NDJSON streaming export, **cluster-only boot (RFC-011): always `--cluster <dir | s3://… | az://…>`, serving N graphs (N ≥ 1) under multi-graph routes + read-only `GET /graphs` enumeration + per-graph + server-level Cedar policies. Azure remains a qualification preview; mutation-capable Azure servers require `omnigraph-azure-admission`. Add/remove graphs via `cluster apply` and restart.** |
 | CLI with config | — | two-surface config (team `cluster.yaml` dir + per-operator `~/.omnigraph/config.yaml`), scope addressing (`--store`/`--server`/`--cluster`/`--profile`/defaults, RFC-011), aliases, multi-format output (json/jsonl/csv/kv/table) |
 | Audit / actor tracking | — | `_as` write APIs + actor map in commit graph |
-| Local S3 testing | — | run RustFS/MinIO + the `AWS_*` env; see [docs/user/deployment.md](docs/user/deployment.md) → *Testing against S3 locally* |
+| Local object-store testing | — | run RustFS/MinIO with `AWS_*`, or Azurite with the Azure emulator env; see [docs/user/deployment.md](docs/user/deployment.md) |
 | Agent skill | — | `skills/omnigraph` — operational playbook for driving Omnigraph; install with `npx skills add ModernRelay/omnigraph@omnigraph` |
 
 The supported SDK graph-write set is closed primarily by Rust visibility: the

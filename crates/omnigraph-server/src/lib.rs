@@ -171,7 +171,7 @@ const SERVER_INTERNAL_SCHEMA_VERSION: u32 =
 pub struct ServerConfig {
     /// Server topology + the graphs to open at startup. RFC-011
     /// cluster-only: the server always boots from a cluster
-    /// (`--cluster <dir | s3://…>`) and serves N graphs under cluster
+    /// (`--cluster <dir | s3://… | az://…>`) and serves N graphs under cluster
     /// routes.
     pub mode: ServerConfigMode,
     pub bind: String,
@@ -195,7 +195,7 @@ pub struct ServerConfig {
 /// multi-graph deployment (N ≥ 1 graphs).
 #[derive(Debug, Clone)]
 pub enum ServerConfigMode {
-    /// Cluster boot — `--cluster <dir | s3://…>` resolves the applied
+    /// Cluster boot — `--cluster <dir | s3://… | az://…>` resolves the applied
     /// revision into per-graph startup configs plus an optional
     /// server-level policy.
     Multi {
@@ -566,7 +566,7 @@ impl AppState {
     }
 
     /// Multi-mode constructor — used by the startup loop. Operators
-    /// reach this by invoking `omnigraph-server --cluster <dir|s3://...>`.
+    /// reach this by invoking `omnigraph-server --cluster <dir|s3://...|az://...>`.
     ///
     /// Caller supplies the already-opened `GraphHandle`s and (optionally)
     /// the path to the source cluster. `server_policy` is loaded from the

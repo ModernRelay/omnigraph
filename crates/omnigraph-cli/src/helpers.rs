@@ -133,7 +133,7 @@ pub(crate) struct ResolvedCliGraph {
 
 /// Resolve the cluster for a control-plane tooling command (`policy`,
 /// `queries`) from `--cluster`. A configured name (`clusters:` in operator
-/// config) is rewritten to its root; a literal dir / `s3://`/`file://` root is
+/// config) is rewritten to its root; a literal dir / `s3://`/`az://`/`file://` root is
 /// passed through. A `--profile`/`OMNIGRAPH_PROFILE` cluster binding also
 /// resolves here when `--cluster` is absent. No omnigraph.yaml.
 pub(crate) fn require_cluster_scope(
@@ -177,18 +177,22 @@ pub(crate) fn require_cluster_scope(
 async fn read_serving_snapshot_or_report(
     cluster: &str,
 ) -> Result<omnigraph_cluster::ServingSnapshot> {
-    omnigraph_cluster::read_serving_snapshot(cluster)
-        .await
-        .map_err(|diagnostics| {
-            color_eyre::eyre::eyre!(
-                "cluster `{cluster}` is not servable:\n  {}",
-                diagnostics
-                    .iter()
-                    .map(|d| d.message.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n  ")
-            )
-        })
+    let diagnostic_cluster = omnigraph::storage::redacted_storage_uri(cluster);
+    let snapshot = if cluster.contains("://") {
+        omnigraph_cluster::read_serving_snapshot_from_storage(cluster).await
+    } else {
+        omnigraph_cluster::read_serving_snapshot(cluster).await
+    };
+    snapshot.map_err(|diagnostics| {
+        color_eyre::eyre::eyre!(
+            "cluster `{diagnostic_cluster}` is not servable:\n  {}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        )
+    })
 }
 
 /// Resolve the Cedar policy bundle(s) for a `--cluster` policy-tooling command
@@ -556,7 +560,7 @@ pub(crate) fn resolve_local_graph(
         bail!(
             "`{}` is a direct (storage-native) command and needs direct storage \
              access; the resolved target is a remote server ({}). Pass the \
-             graph's file:// or s3:// URI.",
+             graph's file://, s3://, or az:// URI.",
             operation,
             graph.uri
         );
@@ -1144,6 +1148,19 @@ mod tests {
         assert!(!uri_is_local("https://host/graphs/g"));
         assert!(!uri_is_local("s3://bucket/graph.omni"));
         assert!(!uri_is_local("gs://bucket/graph.omni"));
+    }
+
+    #[tokio::test]
+    async fn cluster_storage_errors_redact_uri_credentials() {
+        let secret = "TOPSECRET-CLI-SAS";
+        let cluster = format!("az://omnigraph/clusters/company-brain?sv=2026-01-01&sig={secret}");
+        let error = read_serving_snapshot_or_report(&cluster)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(secret));
+        assert!(error.contains("az://omnigraph/clusters/company-brain"));
+        assert!(error.contains("query redacted"));
     }
 
     // RFC-011 Decision 9: a non-local destructive write with `--json` (the CI

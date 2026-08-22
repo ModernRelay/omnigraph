@@ -1,6 +1,15 @@
 # Maintenance: Optimize, Repair & Cleanup
 
-**Addressing.** `optimize`, `repair`, and `cleanup` are **direct** (storage-native) CLI commands: they run with direct storage access against a positional `file://`/`s3://` URI or **`--cluster <dir|s3://…> --graph <id>`** (which resolves the graph's storage URI from the served cluster state, so you needn't know the `<storage>/graphs/<id>.omni` layout). They never run through a server, and reject `--server` or a remote (`http(s)://`) URI with a declared error. There are no server routes for them by design — to maintain a server-backed graph, run them out-of-band against the graph's storage URI. See the *Command capabilities* section of [cli-reference.md](../cli/reference.md).
+Native Azure roots (`az://<container>/<prefix>`) are implemented as direct
+storage targets in the same places this guide names `s3://`; they are non-local
+and therefore use the same explicit destructive-confirmation gates. Azure is a
+qualification preview, not a production-supported deployment: the safe live
+managed-identity smoke test is complete, while adversarial qualification
+remains pending. Every Azure maintenance writer must run under root-scoped
+admission. Use the canonical cluster root for a cluster-managed graph, or the
+standalone graph root otherwise.
+
+**Addressing.** `optimize`, `repair`, and `cleanup` are **direct** (storage-native) CLI commands: they run with direct storage access against a positional `file://`/`s3://`/`az://` URI or **`--cluster <dir|s3://…|az://…> --graph <id>`** (which resolves the graph's storage URI from the served cluster state, so you needn't know the `<storage>/graphs/<id>.omni` layout). They never run through a server, and reject `--server` or a remote (`http(s)://`) URI with a declared error. There are no server routes for them by design — to maintain a server-backed graph, run them out-of-band against the graph's storage URI. See the *Command capabilities* section of [cli-reference.md](../cli/reference.md).
 
 ## `optimize` — non-destructive
 
@@ -58,7 +67,7 @@
   preflight invariants instead: either must succeed before any version GC runs.
   Rerun `cleanup` to converge either kind of per-dataset failure.
 - CLI guards with `--confirm`; without it, prints a preview line.
-- **Non-local consent.** Against a non-local target (an `s3://` store/cluster), `cleanup` additionally requires `--yes` on top of `--confirm`: a TTY is prompted, and a non-interactive run (no TTY, or `--json`) refuses rather than destroying. A local (`file://`) target needs only `--confirm`. The same `--yes` gate applies to overwrite `load` and `branch delete`; every maintenance run echoes its resolved target to stderr (suppress with `--quiet`).
+- **Non-local consent.** Against a non-local target (an `s3://` or `az://` store/cluster), `cleanup` additionally requires `--yes` on top of `--confirm`: a TTY is prompted, and a non-interactive run (no TTY, or `--json`) refuses rather than destroying. A local (`file://`) target needs only `--confirm`. The same `--yes` gate applies to overwrite `load` and `branch delete`; every maintenance run echoes its resolved target to stderr (suppress with `--quiet`).
 - **Recovery floor:** `--keep < 3` may garbage-collect versions that a later
   rollback would otherwise use. `--keep 10` is the recommended conservative
   count; there is no implicit default, so pass a policy explicitly.

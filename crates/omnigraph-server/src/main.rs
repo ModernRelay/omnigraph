@@ -10,7 +10,12 @@ use omnigraph_server::{ServerConfig, init_tracing, load_server_settings, serve};
 struct Cli {
     /// Boot from a cluster: either a config directory (storage resolved
     /// through cluster.yaml) or a storage-root URI directly
-    /// (s3://bucket/prefix — config-free serving from the bucket).
+    /// (s3://bucket/prefix or az://container/prefix — config-free serving).
+    /// Azure is a qualification preview: code, Azurite, and a safe live
+    /// managed-identity smoke are complete, while adversarial qualification
+    /// remains pending. A mutation-capable Azure server must be launched through
+    /// omnigraph-azure-admission. The checked-in container entrypoint does so
+    /// when this argument is itself an az:// root.
     /// The server's only boot source (RFC-011 cluster-only).
     #[arg(long)]
     cluster: Option<PathBuf>,

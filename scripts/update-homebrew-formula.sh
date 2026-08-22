@@ -95,12 +95,13 @@ class Omnigraph < Formula
   end
 
   def install
-    bin.install "omnigraph", "omnigraph-server"
+    bin.install "omnigraph", "omnigraph-server", "omnigraph-azure-admission"
   end
 
   test do
     assert_match "omnigraph ", shell_output("#{bin}/omnigraph version")
     assert_match "HTTP server for the Omnigraph graph database", shell_output("#{bin}/omnigraph-server --help")
+    assert_match "Azure Blob lease admission", shell_output("#{bin}/omnigraph-azure-admission --help")
   end
 end
 EOF

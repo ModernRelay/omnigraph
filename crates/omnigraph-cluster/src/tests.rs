@@ -1468,6 +1468,57 @@ async fn import_graph_open_error_does_not_create_state() {
     assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
 }
 
+#[tokio::test]
+async fn graph_existence_probe_error_preserves_prior_state_and_observation() {
+    let dir = fixture();
+    let desired = load_desired(dir.path()).desired.unwrap();
+    let mut state: ClusterState = serde_json::from_value(json!({
+        "version": 1,
+        "state_revision": 7,
+        "applied_revision": {
+            "resources": {
+                "graph.knowledge": { "digest": "prior-graph" },
+                "schema.knowledge": { "digest": "prior-schema" }
+            }
+        },
+        "observations": {
+            "graph.knowledge": { "kind": "prior-observation", "sentinel": true }
+        }
+    }))
+    .unwrap();
+
+    // A regular file in place of the graph directory makes the child probe
+    // return ENOTDIR. That is unknown storage state, not authoritative
+    // absence.
+    fs::write(dir.path().join(CLUSTER_GRAPHS_DIR), "not a directory").unwrap();
+    let backend = ClusterStore::for_config_dir(dir.path());
+    let errors = observe_declared_graphs(&desired, &backend, &mut state).await;
+
+    assert_eq!(errors, 1);
+    assert_eq!(
+        state.applied_revision.resources["graph.knowledge"].digest,
+        "prior-graph"
+    );
+    assert_eq!(
+        state.applied_revision.resources["schema.knowledge"].digest,
+        "prior-schema"
+    );
+    assert_eq!(
+        state.observations["graph.knowledge"],
+        json!({ "kind": "prior-observation", "sentinel": true })
+    );
+    for address in ["graph.knowledge", "schema.knowledge"] {
+        let status = &state.resource_statuses[address];
+        assert_eq!(status.status, ResourceLifecycleStatus::Error);
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition == "graph_observation_error")
+        );
+    }
+}
+
 // ---- config-only apply (Stage 3A) ----
 
 /// Seed a state.json that simulates "graph exists with the desired schema,
@@ -2987,6 +3038,29 @@ async fn sweep_removes_sidecar_when_root_absent() {
 }
 
 #[tokio::test]
+async fn sweep_probe_errors_preserve_create_and_delete_intent() {
+    let dir = fixture();
+    write_applyable_state(dir.path());
+    let create = write_create_sidecar(dir.path(), "knowledge", "irrelevant", "01PROBEC");
+    let delete = write_delete_sidecar(dir.path(), "old", None, "01PROBED");
+    fs::write(dir.path().join(CLUSTER_GRAPHS_DIR), "not a directory").unwrap();
+
+    let out = apply_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "cluster_recovery_storage_error")
+            .count()
+            >= 2,
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(create.exists(), "create recovery intent must remain");
+    assert!(delete.exists(), "delete recovery intent must remain");
+}
+
+#[tokio::test]
 async fn sweep_rolls_forward_completed_create() {
     let dir = fixture();
     init_derived_graph(dir.path()).await;
@@ -3916,20 +3990,105 @@ async fn storage_root_file_uri_relocates_the_cluster() {
 }
 
 #[test]
-fn storage_root_invalid_uri_fails_validation() {
+fn storage_root_azure_uri_is_accepted_and_canonicalized() {
     let dir = fixture();
     let mut config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap();
-    config = config.replace("version: 1\n", "version: 1\nstorage: \"s3://\"\n");
+    config = config.replace(
+        "version: 1\n",
+        "version: 1\nstorage: \"az://omnigraph/clusters/company-brain/\"\n",
+    );
     fs::write(dir.path().join("cluster.yaml"), config).unwrap();
+
+    let out = load_desired(dir.path());
+    assert!(!has_errors(&out.diagnostics), "{:?}", out.diagnostics);
+    assert_eq!(
+        out.desired.unwrap().storage_root.as_deref(),
+        Some("az://omnigraph/clusters/company-brain")
+    );
+}
+
+#[test]
+fn storage_root_invalid_or_unknown_uri_fails_validation() {
+    for invalid in [
+        "s3://",
+        "az://",
+        "az://omnigraph/clusters//company-brain",
+        "https://account.blob.core.windows.net/container",
+    ] {
+        let dir = fixture();
+        let mut config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap();
+        config = config.replace(
+            "version: 1\n",
+            &format!("version: 1\nstorage: \"{invalid}\"\n"),
+        );
+        fs::write(dir.path().join("cluster.yaml"), config).unwrap();
+        let out = validate_config_dir(dir.path());
+        assert!(!out.ok, "{invalid} unexpectedly validated");
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "invalid_storage_root"),
+            "{invalid}: {:?}",
+            out.diagnostics
+        );
+    }
+}
+
+#[test]
+fn storage_root_credentials_are_redacted_from_validation_errors() {
+    let dir = fixture();
+    let secret = "TOPSECRET-VALIDATION-SAS";
+    let mut config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap();
+    config = config.replace(
+        "version: 1\n",
+        &format!(
+            "version: 1\nstorage: \"az://omnigraph/clusters/company-brain?sv=2026-01-01&sig={secret}\"\n"
+        ),
+    );
+    fs::write(dir.path().join("cluster.yaml"), config).unwrap();
+
     let out = validate_config_dir(dir.path());
     assert!(!out.ok);
-    assert!(
-        out.diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "invalid_storage_root"),
-        "{:?}",
-        out.diagnostics
+    let rendered = serde_json::to_string(&out.diagnostics).unwrap();
+    assert!(!rendered.contains(secret));
+    assert!(rendered.contains("az://omnigraph/clusters/company-brain"));
+    assert!(rendered.contains("query redacted"));
+
+    let malformed_dir = fixture();
+    let malformed_secret = "TOPSECRET-MALFORMED-VALIDATION-SAS";
+    let mut malformed_config =
+        fs::read_to_string(malformed_dir.path().join("cluster.yaml")).unwrap();
+    malformed_config = malformed_config.replace(
+        "version: 1\n",
+        &format!("version: 1\nstorage: \"az://[invalid?sig={malformed_secret}\"\n"),
     );
+    fs::write(malformed_dir.path().join("cluster.yaml"), malformed_config).unwrap();
+    let malformed = validate_config_dir(malformed_dir.path());
+    let rendered = serde_json::to_string(&malformed.diagnostics).unwrap();
+    assert!(!rendered.contains(malformed_secret));
+    assert!(rendered.contains("az://<invalid or redacted>"));
+}
+
+#[tokio::test]
+async fn storage_root_credentials_are_redacted_from_open_errors() {
+    let secret = "TOPSECRET-OPEN-SAS";
+    let root = format!("az://omnigraph/clusters/company-brain?sv=2026-01-01&sig={secret}");
+    let diagnostics = read_serving_snapshot_from_storage(&root)
+        .await
+        .expect_err("query-bearing Azure root must fail before storage access");
+    let rendered = serde_json::to_string(&diagnostics).unwrap();
+    assert!(!rendered.contains(secret));
+    assert!(rendered.contains("az://omnigraph/clusters/company-brain"));
+    assert!(rendered.contains("query redacted"));
+
+    let malformed_secret = "TOPSECRET-MALFORMED-OPEN-SAS";
+    let malformed_root = format!("az://[invalid?sig={malformed_secret}");
+    let diagnostics = read_serving_snapshot_from_storage(&malformed_root)
+        .await
+        .expect_err("malformed Azure root must fail before storage access");
+    let rendered = serde_json::to_string(&diagnostics).unwrap();
+    assert!(!rendered.contains(malformed_secret));
+    assert!(rendered.contains("az://<invalid or redacted>"));
 }
 
 #[tokio::test]

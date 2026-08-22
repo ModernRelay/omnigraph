@@ -313,7 +313,16 @@ async fn main() -> Result<()> {
             // RFC-010 Slice 3: graphs inside an established cluster are created
             // by `cluster apply` (which records ledger/recovery/approvals), not
             // by hand-running `init` into the cluster's storage layout.
-            if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri).await {
+            if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri)
+                .await
+                .map_err(|diagnostic| {
+                    color_eyre::eyre::eyre!(
+                        "could not check cluster ownership for `{}`: {}",
+                        diagnostic.path,
+                        diagnostic.message
+                    )
+                })?
+            {
                 bail!(
                     "`{uri}` is inside cluster `{root}`. Graphs in a cluster are created by \
                      `cluster apply` (which records ledger, recovery, and approvals), not `init`. \
@@ -879,8 +888,15 @@ async fn main() -> Result<()> {
                 // address a storage root; a served apply (`--server`) is the
                 // server's concern.
                 if !client.is_remote() {
-                    if let Some(root) =
-                        omnigraph_cluster::cluster_root_for_graph_uri(client.uri()).await
+                    if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(client.uri())
+                        .await
+                        .map_err(|diagnostic| {
+                            color_eyre::eyre::eyre!(
+                                "could not check cluster ownership for `{}`: {}",
+                                diagnostic.path,
+                                diagnostic.message
+                            )
+                        })?
                     {
                         bail!(
                             "`{}` is inside cluster `{root}`. A graph in a cluster evolves via \

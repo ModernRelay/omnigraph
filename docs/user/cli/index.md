@@ -235,8 +235,10 @@ omnigraph commit show --uri graph.omni <commit-id> --json
 (Mutations and loads publish atomically; the commit graph (`omnigraph commit list`) is the audit surface.)
 
 `query lint` and `query check` are the same command surface. In v1, graph-backed
-lint uses local or `s3://` graph URIs; HTTP targets are only supported when you
-also pass `--schema`.
+lint uses local, `s3://`, or `az://` graph URIs; HTTP targets are only supported
+when you also pass `--schema`. Azure remains a qualification preview, not a
+production-supported deployment: the safe live managed-identity smoke test has
+passed, while adversarial qualification remains pending.
 
 ## Config
 

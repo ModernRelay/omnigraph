@@ -83,7 +83,7 @@ jobs:
             . -> target
 
       - name: Build release binaries
-        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server
+        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission
 
       - name: Package Unix release archive
         if: runner.os != 'Windows'
@@ -91,7 +91,8 @@ jobs:
           mkdir -p release
           install -m 0755 target/release/omnigraph release/omnigraph
           install -m 0755 target/release/omnigraph-server release/omnigraph-server
-          tar -C release -czf "${{ matrix.asset_name }}.tar.gz" omnigraph omnigraph-server
+          install -m 0755 target/release/omnigraph-azure-admission release/omnigraph-azure-admission
+          tar -C release -czf "${{ matrix.asset_name }}.tar.gz" omnigraph omnigraph-server omnigraph-azure-admission
           shasum -a 256 "${{ matrix.asset_name }}.tar.gz" > "${{ matrix.asset_name }}.sha256"
 
       - name: Package Windows release archive
@@ -101,13 +102,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item target/release/omnigraph.exe release/omnigraph.exe
           Copy-Item target/release/omnigraph-server.exe release/omnigraph-server.exe
-          Compress-Archive -Path release/omnigraph.exe, release/omnigraph-server.exe -DestinationPath "${{ matrix.asset_name }}.zip" -Force
+          Copy-Item target/release/omnigraph-azure-admission.exe release/omnigraph-azure-admission.exe
+          Compress-Archive -Path release/omnigraph.exe, release/omnigraph-server.exe, release/omnigraph-azure-admission.exe -DestinationPath "${{ matrix.asset_name }}.zip" -Force
           $hash = (Get-FileHash "${{ matrix.asset_name }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  ${{ matrix.asset_name }}.zip" | Out-File -FilePath "${{ matrix.asset_name }}.sha256" -Encoding ascii
           New-Item -ItemType Directory -Force -Path verify | Out-Null
           Expand-Archive -Path "${{ matrix.asset_name }}.zip" -DestinationPath verify -Force
           $items = Get-ChildItem -Path verify -File
-          if ($items.Count -ne 2 -or !(Test-Path verify/omnigraph.exe) -or !(Test-Path verify/omnigraph-server.exe)) {
+          if ($items.Count -ne 3 -or !(Test-Path verify/omnigraph.exe) -or !(Test-Path verify/omnigraph-server.exe) -or !(Test-Path verify/omnigraph-azure-admission.exe)) {
             throw "Windows release archive is missing expected binaries"
           }
 
@@ -140,3 +142,4 @@ jobs:
         run: |
           & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph.exe" version
           & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph-server.exe" --help
+          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph-azure-admission.exe" --help

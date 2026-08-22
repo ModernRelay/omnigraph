@@ -315,6 +315,17 @@ pub fn s3_test_graph_uri(suite: &str) -> Option<String> {
     Some(format!("s3://{}/{}/{}/{}", bucket, prefix, suite, unique))
 }
 
+pub fn azure_test_graph_uri(suite: &str) -> Option<String> {
+    let container = env::var("OMNIGRAPH_AZURE_TEST_CONTAINER").ok()?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!(
+        "az://{container}/omnigraph-itests/{suite}/{unique}"
+    ))
+}
+
 pub async fn app_for_loaded_graph() -> (tempfile::TempDir, Router) {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());

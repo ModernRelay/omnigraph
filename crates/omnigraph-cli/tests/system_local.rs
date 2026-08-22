@@ -167,6 +167,17 @@ fn s3_test_graph_uri(suite: &str) -> Option<String> {
     Some(format!("s3://{}/{}/{}/{}", bucket, prefix, suite, unique))
 }
 
+fn azure_test_graph_uri(suite: &str) -> Option<String> {
+    let container = env::var("OMNIGRAPH_AZURE_TEST_CONTAINER").ok()?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!(
+        "az://{container}/omnigraph-itests/{suite}/{unique}"
+    ))
+}
+
 #[test]
 fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let graph = SystemGraph::initialized();
@@ -651,6 +662,19 @@ fn local_cli_s3_end_to_end_init_load_read_flow() {
         return;
     };
 
+    cli_object_store_end_to_end_init_load_read_flow(&graph_uri);
+}
+
+#[test]
+fn local_cli_azure_end_to_end_init_load_read_flow() {
+    let Some(graph_uri) = azure_test_graph_uri("cli-local") else {
+        eprintln!("skipping azure cli test: OMNIGRAPH_AZURE_TEST_CONTAINER is not set");
+        return;
+    };
+    cli_object_store_end_to_end_init_load_read_flow(&graph_uri);
+}
+
+fn cli_object_store_end_to_end_init_load_read_flow(graph_uri: &str) {
     let temp = tempfile::tempdir().unwrap();
     let query_root = temp.path();
     let query = query_root.join("test.gq");
@@ -662,7 +686,7 @@ fn local_cli_s3_end_to_end_init_load_read_flow() {
             .arg("init")
             .arg("--schema")
             .arg(fixture("test.pg"))
-            .arg(&graph_uri),
+            .arg(graph_uri),
     );
     output_success(
         cli()
@@ -671,12 +695,12 @@ fn local_cli_s3_end_to_end_init_load_read_flow() {
             .arg("--mode")
             .arg("overwrite")
             // `--yes` clears the RFC-011 Decision 9 destructive-write
-            // confirmation: `--mode overwrite` against a non-local (s3://)
+            // confirmation: `--mode overwrite` against a non-local object store
             // target is refused without it.
             .arg("--yes")
             .arg("--data")
             .arg(fixture("test.jsonl"))
-            .arg(&graph_uri),
+            .arg(graph_uri),
     );
 
     // RFC-011: the graph is addressed by `--store <uri>`; the `.gq` path is
@@ -686,7 +710,7 @@ fn local_cli_s3_end_to_end_init_load_read_flow() {
             .current_dir(query_root)
             .arg("read")
             .arg("--store")
-            .arg(&graph_uri)
+            .arg(graph_uri)
             .arg("--query")
             .arg("test.gq")
             .arg("get_person")
@@ -702,7 +726,7 @@ fn local_cli_s3_end_to_end_init_load_read_flow() {
             .current_dir(query_root)
             .arg("snapshot")
             .arg("--store")
-            .arg(&graph_uri)
+            .arg(graph_uri)
             .arg("--json"),
     ));
     assert!(snapshot["datasets"].is_array());
