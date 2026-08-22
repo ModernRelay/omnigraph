@@ -455,6 +455,25 @@ pub async fn execute_query(
         return execute_rrf_query(ir, params, snapshot, graph_index, catalog, rrf).await;
     }
 
+    let has_aggregates = ir
+        .return_exprs
+        .iter()
+        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
+
+    // Limit pushdown into a final Expand (query-level half of the legality
+    // check; the op-level half lives in `execute_pipeline`). An unordered
+    // `limit` demands ANY n valid rows, so a traversal may stop once n pairs
+    // are emitted. Ordering (explicit or search-imposed) needs the full row
+    // set to rank, and an aggregate consumes every row — both disqualify.
+    let final_expand_cap = match ir.limit {
+        Some(limit)
+            if ir.order_by.is_empty() && !has_aggregates && !is_search_ordered(&search_mode) =>
+        {
+            usize::try_from(limit).ok()
+        }
+        _ => None,
+    };
+
     let mut wide: Option<RecordBatch> = None;
     execute_pipeline(
         &ir.pipeline,
@@ -464,15 +483,10 @@ pub async fn execute_query(
         catalog,
         &mut wide,
         &search_mode,
+        final_expand_cap,
     )
     .await?;
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
-
-    // Project return expressions
-    let has_aggregates = ir
-        .return_exprs
-        .iter()
-        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
     let mut result_batch = project_return(&wide_batch, &ir.return_exprs, params)?;
 
     // Apply ordering (skip if search mode already ordered the results)
@@ -517,6 +531,7 @@ async fn execute_rrf_query(
         catalog,
         &mut primary_wide,
         &rrf.primary,
+        None,
     )
     .await?;
 
@@ -530,6 +545,7 @@ async fn execute_rrf_query(
         catalog,
         &mut secondary_wide,
         &rrf.secondary,
+        None,
     )
     .await?;
 
@@ -779,6 +795,13 @@ fn execute_pipeline<'a>(
     catalog: &'a Catalog,
     wide: &'a mut Option<RecordBatch>,
     search_mode: &'a SearchMode,
+    // The query's `limit`, pushable into a final Expand as an emission bound.
+    // `Some` only from `execute_query` when the query-level conditions hold
+    // (unordered, aggregate-free, plain search mode); the op-level conditions
+    // (effectively-last Expand, no destination filters, no edge binding) are
+    // checked at the op site below. Anti-join inner pipelines and RRF arms
+    // always pass `None`.
+    final_expand_cap: Option<usize>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         // Pre-pass: hoist filters onto the op that introduces their binding.
@@ -847,6 +870,14 @@ fn execute_pipeline<'a>(
             hoisted_indices.insert(i);
         }
 
+        // The last op that will actually execute (hoisted filters are skipped
+        // in place). Only an Expand in this position may take the emission
+        // cap: any later executing op could drop or multiply rows, making
+        // emitted pairs and result rows diverge.
+        let last_effective_idx = (0..pipeline.len())
+            .rev()
+            .find(|i| !hoisted_indices.contains(i));
+
         for (i, op) in pipeline.iter().enumerate() {
             // Skip hoisted search filters
             if hoisted_indices.contains(&i) {
@@ -903,6 +934,21 @@ fn execute_pipeline<'a>(
                     if let Some(extra) = hoisted_dst_filters.get(dst_var) {
                         all_dst_filters.extend(extra.iter().cloned());
                     }
+                    // Emission cap (limit pushdown): only for the effectively
+                    // last op, and only when nothing can drop emitted pairs
+                    // after the traversal — destination filters (lowered OR
+                    // hoisted) drop rows at hydration, and a bound edge emits
+                    // one row per edge ROW rather than per pair.
+                    let emit_cap = match final_expand_cap {
+                        Some(cap)
+                            if Some(i) == last_effective_idx
+                                && all_dst_filters.is_empty()
+                                && edge_binding.is_none() =>
+                        {
+                            Some(cap)
+                        }
+                        _ => None,
+                    };
                     if let Some(batch) = wide.as_mut() {
                         execute_expand(
                             batch,
@@ -919,6 +965,7 @@ fn execute_pipeline<'a>(
                             &all_dst_filters,
                             edge_binding.as_deref(),
                             params,
+                            emit_cap,
                         )
                         .await?;
                     }
@@ -1038,7 +1085,7 @@ impl<'a> GraphIndexHandle<'a> {
                         db.graph_index_for_resolved(resolved, edge_types).await?,
                     )),
                     GraphIndexBuilder::Direct(snapshot, edge_types) => Ok(Some(Arc::new(
-                        GraphIndex::build(snapshot, edge_types).await?,
+                        GraphIndex::load_or_build(snapshot, edge_types, None).await?,
                     ))),
                 }
             })
@@ -1139,6 +1186,12 @@ struct ExpandCostInputs {
     /// built (making the CSR path ≈ free). Conservatively `false` until the
     /// cache-peek is wired (the plan's optional refinement).
     csr_cached: bool,
+    /// Endpoint probes the indexed path issues per hop: 1 for a directed
+    /// traversal, 2 for undirected (`Direction::Both` scans BOTH the src-keyed
+    /// and dst-keyed orientations — see `endpoint_probes`). Without this the
+    /// cost model priced an undirected traversal at half its probe count and
+    /// half its effective degree.
+    probe_factor: f64,
 }
 
 /// Pure cost-based traversal-mode chooser. Compares an estimate of the indexed
@@ -1167,9 +1220,10 @@ fn choose_expand_mode(i: &ExpandCostInputs) -> ExpandMode {
 
     // Indexed work scales with the frontier when the BTREE serves the IN-list;
     // a degraded scan is a full edge scan per hop instead (the C6 perf cliff).
+    // Either way an undirected traversal pays every hop twice (both probes).
     let indexed_cost = match i.coverage {
-        crate::table_store::IndexCoverage::Indexed => hops * frontier * fanout,
-        crate::table_store::IndexCoverage::Degraded { .. } => hops * edges,
+        crate::table_store::IndexCoverage::Indexed => hops * frontier * fanout * i.probe_factor,
+        crate::table_store::IndexCoverage::Degraded { .. } => hops * edges * i.probe_factor,
     };
     // A warm CSR is ~free to reuse; a cold one costs a build over all edges.
     let csr_cost = if i.csr_cached {
@@ -1183,6 +1237,58 @@ fn choose_expand_mode(i: &ExpandCostInputs) -> ExpandMode {
     } else {
         ExpandMode::Csr
     }
+}
+
+/// Mid-traversal re-decision (issue #533): asked at the top of every indexed
+/// hop after the first with the OBSERVED union frontier, where the dispatch
+/// decision only ever saw the initial one. Pure so the crossover is
+/// unit-tested like `choose_expand_mode`.
+///
+/// Two triggers, either sufficient:
+///
+/// 1. **The hard frontier ceiling.** Dispatch enforces it only against the
+///    initial frontier; here it becomes an execution bound.
+/// 2. **Remaining-work estimate.** Projects the frontier forward over the
+///    remaining hops using the OBSERVED per-hop growth ratio when it exceeds
+///    the manifest's average fanout — heavy-tailed graphs (the #533 shape)
+///    blow through the average, and the observed ratio is the only estimator
+///    that sees hubs. Each projected frontier saturates at |V_src| (BFS
+///    `visited` pruning caps reach). Switch when that estimate exceeds what
+///    the CSR path still costs (a build when cold, ~nothing when warm) —
+///    correct precisely because the switch CONTINUES from carried state, so
+///    switching pays `csr_cost` once while staying pays the whole estimate.
+fn should_switch_to_csr(
+    observed_frontier: usize,
+    prev_frontier: usize,
+    remaining_hops: u32,
+    csr_ready: bool,
+    i: &ExpandCostInputs,
+) -> bool {
+    if observed_frontier > i.max_frontier_cap {
+        return true;
+    }
+    let edges = i.edge_count as f64;
+    let src = i.src_node_count.max(1) as f64;
+    let fanout = edges / src;
+    let observed_growth = if prev_frontier > 0 {
+        observed_frontier as f64 / prev_frontier as f64
+    } else {
+        fanout
+    };
+    let growth = observed_growth.max(fanout).max(1.0);
+
+    let mut remaining_cost = 0.0;
+    let mut frontier = observed_frontier as f64;
+    for _ in 0..remaining_hops {
+        remaining_cost += frontier * fanout * i.probe_factor;
+        frontier = (frontier * growth).min(src);
+    }
+    let csr_cost = if csr_ready {
+        0.0
+    } else {
+        CSR_BUILD_FACTOR * edges
+    };
+    remaining_cost > csr_cost
 }
 
 /// Hops the indexed path will actually run, for cost-model purposes. A cross-type
@@ -1235,7 +1341,17 @@ fn gather_cost_inputs(
         max_frontier_cap: expand_indexed_max_frontier(),
         coverage,
         csr_cached,
+        probe_factor: direction_probe_factor(direction),
     })
+}
+
+/// Per-hop probe multiplier for the indexed path: `endpoint_probes` issues one
+/// scan for a directed traversal and two for an undirected one.
+fn direction_probe_factor(direction: Direction) -> f64 {
+    match direction {
+        Direction::Out | Direction::In => 1.0,
+        Direction::Both => 2.0,
+    }
 }
 
 /// Coverage value to feed the cost decision. A failed coverage probe is treated
@@ -1315,10 +1431,20 @@ fn endpoint_probes(direction: Direction) -> &'static [(&'static str, &'static st
     }
 }
 
-/// Execute a graph traversal (Expand). Dispatches to the BTREE-indexed path
-/// (selective traversals — neighbor lookups via the persisted src/dst index) or
-/// the in-memory CSR path (dense / whole-graph traversals). The CSR index is
-/// built lazily and only the CSR path requests it.
+/// Execute a graph traversal (Expand). Dispatches to the BTREE-indexed
+/// strategy (selective traversals — neighbor lookups via the persisted
+/// src/dst index) or the in-memory CSR strategy (dense / whole-graph
+/// traversals); both run in the shared `execute_expand_bfs` core, which can
+/// also swap indexed → CSR mid-traversal when the frontier outgrows the
+/// dispatch decision (issue #533). The CSR index is built lazily and only
+/// requested when a CSR start or a mid-traversal switch needs it.
+///
+/// `emit_cap`, when set by the pipeline (an unordered trailing `limit` on a
+/// final filterless Expand), bounds the traversal's emitted pairs. Hydration
+/// can drop an emitted id that no longer resolves (a dangling edge), which
+/// would under-fill a capped result; the guard re-runs uncapped in that rare
+/// case, so the cap is a pure optimization, never a correctness change.
+#[allow(clippy::too_many_arguments)]
 async fn execute_expand(
     wide: &mut RecordBatch,
     graph_index: &GraphIndexHandle<'_>,
@@ -1334,7 +1460,102 @@ async fn execute_expand(
     dst_filters: &[IRFilter],
     edge_binding: Option<&str>,
     params: &ParamMap,
+    emit_cap: Option<usize>,
 ) -> Result<()> {
+    if let Some(cap) = emit_cap {
+        // RecordBatch clones are Arc'd column handles — cheap insurance for
+        // the rerun path.
+        let original = wide.clone();
+        let stopped_early = execute_expand_dispatch(
+            wide,
+            graph_index,
+            snapshot,
+            catalog,
+            src_var,
+            dst_var,
+            edge_type,
+            direction,
+            dst_type,
+            min_hops,
+            max_hops,
+            dst_filters,
+            edge_binding,
+            params,
+            Some(cap),
+        )
+        .await?;
+        if stopped_early && wide.num_rows() < cap {
+            tracing::debug!(
+                target: "omnigraph::traverse",
+                edge = %edge_type,
+                rows = wide.num_rows(),
+                cap,
+                "capped expand under-filled after hydration; re-running uncapped",
+            );
+            *wide = original;
+            execute_expand_dispatch(
+                wide,
+                graph_index,
+                snapshot,
+                catalog,
+                src_var,
+                dst_var,
+                edge_type,
+                direction,
+                dst_type,
+                min_hops,
+                max_hops,
+                dst_filters,
+                edge_binding,
+                params,
+                None,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    execute_expand_dispatch(
+        wide,
+        graph_index,
+        snapshot,
+        catalog,
+        src_var,
+        dst_var,
+        edge_type,
+        direction,
+        dst_type,
+        min_hops,
+        max_hops,
+        dst_filters,
+        edge_binding,
+        params,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The mode-dispatch half of Expand execution: pick the starting strategy,
+/// then hand off to the shared BFS core. Returns whether the core stopped
+/// early on `emit_cap`.
+#[allow(clippy::too_many_arguments)]
+async fn execute_expand_dispatch(
+    wide: &mut RecordBatch,
+    graph_index: &GraphIndexHandle<'_>,
+    snapshot: &Snapshot,
+    catalog: &Catalog,
+    src_var: &str,
+    dst_var: &str,
+    edge_type: &str,
+    direction: Direction,
+    dst_type: &str,
+    min_hops: u32,
+    max_hops: Option<u32>,
+    dst_filters: &[IRFilter],
+    edge_binding: Option<&str>,
+    params: &ParamMap,
+    emit_cap: Option<usize>,
+) -> Result<bool> {
     let frontier_rows = wide.num_rows();
     let effective_max_hops = max_hops.unwrap_or(min_hops.max(1));
     let (key_col, _) = endpoint_columns(direction);
@@ -1346,7 +1567,7 @@ async fn execute_expand(
     // does not apply.
     if let Some(binding) = edge_binding {
         let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
-        return execute_expand_bound(
+        execute_expand_bound(
             wide,
             snapshot,
             catalog,
@@ -1360,7 +1581,8 @@ async fn execute_expand(
             params,
             edge_ds,
         )
-        .await;
+        .await?;
+        return Ok(false);
     }
 
     // Cardinality-first preliminary decision (no IO). The override wins; else the
@@ -1400,12 +1622,9 @@ async fn execute_expand(
             mode = "csr",
             "expand mode chosen",
         );
-        let gi = graph_index.get().await?.ok_or_else(|| {
-            OmniError::manifest("graph index required for CSR traversal".to_string())
-        })?;
-        return execute_expand_csr(
+        return execute_expand_bfs(
             wide,
-            gi,
+            graph_index,
             snapshot,
             catalog,
             src_var,
@@ -1417,6 +1636,9 @@ async fn execute_expand(
             max_hops,
             dst_filters,
             params,
+            None,
+            HopPolicy::Off,
+            emit_cap,
         )
         .await;
     }
@@ -1460,12 +1682,9 @@ async fn execute_expand(
                     reason = "index coverage degraded",
                     "expand mode chosen",
                 );
-                let gi = graph_index.get().await?.ok_or_else(|| {
-                    OmniError::manifest("graph index required for CSR traversal".to_string())
-                })?;
-                return execute_expand_csr(
+                return execute_expand_bfs(
                     wide,
-                    gi,
+                    graph_index,
                     snapshot,
                     catalog,
                     src_var,
@@ -1477,6 +1696,9 @@ async fn execute_expand(
                     max_hops,
                     dst_filters,
                     params,
+                    None,
+                    HopPolicy::Off,
+                    emit_cap,
                 )
                 .await;
             }
@@ -1493,8 +1715,30 @@ async fn execute_expand(
     );
     // Surface the C6 silent scalar-index fallback once, now that coverage is known.
     warn_on_degraded_coverage(&coverage, key_col, edge_type);
-    execute_expand_indexed(
+    // Per-hop re-decision policy (issue #533): a forced mode is a contract and
+    // never switches; the cost model re-decides per hop with observed frontier
+    // cardinality; absent manifest counts, the hard frontier ceiling still
+    // becomes an execution bound instead of a dispatch-only gate.
+    let hop_policy = if forced.is_some() {
+        HopPolicy::Off
+    } else {
+        match gather_cost_inputs(
+            snapshot,
+            catalog,
+            edge_type,
+            direction,
+            frontier_rows,
+            effective_max_hops,
+            coverage_for_decision(&coverage),
+            graph_index.is_built(),
+        ) {
+            Some(inputs) => HopPolicy::Full(inputs),
+            None => HopPolicy::CapOnly,
+        }
+    };
+    execute_expand_bfs(
         wide,
+        graph_index,
         snapshot,
         catalog,
         src_var,
@@ -1506,7 +1750,9 @@ async fn execute_expand(
         max_hops,
         dst_filters,
         params,
-        edge_ds,
+        Some(edge_ds),
+        hop_policy,
+        emit_cap,
     )
     .await
 }
@@ -1715,14 +1961,118 @@ async fn execute_expand_bound(
     .await
 }
 
-/// BTREE-indexed graph traversal: per hop, batch the current frontier into one
-/// `scan_edges_by_endpoint` call against the persisted src/dst index, then fan
-/// out per source row. Cost scales with the frontier, not |E|. Produces the
-/// same `(src_row, dst_id)` pairs as the CSR path and shares its hydrate+align
-/// tail. Multi-hop only advances for same-type edges; cross-type frontiers go
-/// empty after one hop (no edges key off the destination type), matching CSR.
-async fn execute_expand_indexed(
+/// Where the shared BFS core reads each hop's neighbors from. The two sources
+/// are the same two execution strategies the dispatcher chooses between; the
+/// core can swap Indexed → Csr BETWEEN hops (issue #533), carrying its BFS
+/// state across the swap instead of restarting.
+///
+/// Id spaces differ per source: Indexed owns a per-traversal interner (both
+/// endpoint types in ONE dense space — see the cross-type single-hop guard in
+/// `execute_expand_bfs`), Csr borrows the graph index's per-type dictionaries.
+/// A swap therefore translates all live state through the id strings once.
+enum ActiveExpandSource<'g> {
+    // Boxed: the indexed state (dataset handle + interner + per-hop map) is
+    // hundreds of bytes against Csr's four refs, and exactly one instance
+    // lives per expand.
+    Indexed(Box<IndexedExpandSource>),
+    Csr {
+        adj: &'g crate::graph_index::CsrIndex,
+        adj_rev: Option<&'g crate::graph_index::CsrIndex>,
+        src_idx: &'g crate::graph_index::TypeIndex,
+        dst_idx: &'g crate::graph_index::TypeIndex,
+    },
+}
+
+struct IndexedExpandSource {
+    edge_ds: Dataset,
+    interner: crate::graph_index::TypeIndex,
+    /// This hop's dense key -> dense neighbors (scan order; duplicates
+    /// preserved, like CSR multi-edges). Rebuilt per hop.
+    neighbor_map: HashMap<u32, Vec<u32>>,
+}
+
+/// Per-hop re-decision policy for a traversal that started on the indexed
+/// path. `Off` for forced modes and CSR starts; `CapOnly` when manifest counts
+/// were unavailable at dispatch (the legacy-ceiling fallback still deserves an
+/// execution bound); `Full` re-runs the cost comparison with observed growth.
+enum HopPolicy {
+    Off,
+    CapOnly,
+    Full(ExpandCostInputs),
+}
+
+/// Resolve the CSR-side borrows for one edge type + direction from a built
+/// graph index (shared by the CSR start and the mid-traversal switch).
+fn resolve_csr_source<'g>(
+    gi: &'g GraphIndex,
+    edge_def: &omnigraph_compiler::catalog::EdgeType,
+    edge_type: &str,
+    direction: Direction,
+) -> Result<ActiveExpandSource<'g>> {
+    let (src_type_name, dst_type_name) = match direction {
+        Direction::Out => (&edge_def.from_type, &edge_def.to_type),
+        Direction::In => (&edge_def.to_type, &edge_def.from_type),
+        // Both requires from_type == to_type (typecheck T22).
+        Direction::Both => (&edge_def.from_type, &edge_def.from_type),
+    };
+    let src_idx = gi
+        .type_index(src_type_name)
+        .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", src_type_name)))?;
+    let dst_idx = gi
+        .type_index(dst_type_name)
+        .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", dst_type_name)))?;
+    let adj = match direction {
+        Direction::Out | Direction::Both => gi.csr(edge_type),
+        Direction::In => gi.csc(edge_type),
+    }
+    .ok_or_else(|| OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type)))?;
+    // Undirected: additionally walk incoming edges (CSC); the BFS gates below
+    // dedup pairs that exist in both directions and self-loops.
+    let adj_rev = match direction {
+        Direction::Both => Some(gi.csc(edge_type).ok_or_else(|| {
+            OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type))
+        })?),
+        _ => None,
+    };
+    Ok(ActiveExpandSource::Csr {
+        adj,
+        adj_rev,
+        src_idx,
+        dst_idx,
+    })
+}
+
+/// The one Expand BFS, shared by both execution strategies. Per hop it asks
+/// the active source for neighbors — a batched `scan_edges_by_endpoint` per
+/// orientation against the persisted src/dst BTREE (Indexed: cost scales with
+/// the frontier, not |E|), or in-memory adjacency slices (Csr). Emission,
+/// dedup, hop gating, and the hydrate+align tail are identical either way, so
+/// both strategies produce the same `(src_row, dst_id)` pairs by construction.
+///
+/// Multi-hop only advances for same-type edges; a cross-type traversal is
+/// structurally single-hop. The Indexed source enforces that BEFORE scanning:
+/// it interns every endpoint string into ONE dense id space, so a cross-type
+/// id-string collision (a Person and a Company sharing an id) would otherwise
+/// let hop 2 de-intern a destination id back to the colliding source-type id
+/// and match its edges, emitting rows the CSR source never produces.
+///
+/// Issue #533 lives here: `hop_policy` is consulted at the top of every
+/// indexed hop after the first with the OBSERVED union frontier, and a
+/// traversal that has outgrown the indexed path swaps to CSR mid-flight,
+/// translating frontier/visited/seen state through the id strings once. Every
+/// emitted destination so far is an edge endpoint, so it exists in the CSR
+/// dictionaries — nothing is lost in translation; a frontier or visited entry
+/// absent from the CSR dictionary has no edges at all and is dropped as
+/// unreachable.
+///
+/// `emit_cap` bounds the number of emitted `(src_row, dst)` pairs; the loop
+/// stops as soon as the cap is reached (limit pushdown — the caller only
+/// engages it when result rows and emitted pairs are 1:1). Returns whether
+/// the traversal stopped early on that cap.
+#[allow(clippy::too_many_arguments)]
+async fn execute_expand_bfs(
     wide: &mut RecordBatch,
+    graph_index: &GraphIndexHandle<'_>,
     snapshot: &Snapshot,
     catalog: &Catalog,
     src_var: &str,
@@ -1734,8 +2084,10 @@ async fn execute_expand_indexed(
     max_hops: Option<u32>,
     dst_filters: &[IRFilter],
     params: &ParamMap,
-    edge_ds: Dataset,
-) -> Result<()> {
+    start_indexed: Option<Dataset>,
+    hop_policy: HopPolicy,
+    emit_cap: Option<usize>,
+) -> Result<bool> {
     let src_id_col_name = format!("{}.id", src_var);
     let src_ids = wide
         .column_by_name(&src_id_col_name)
@@ -1752,48 +2104,71 @@ async fn execute_expand_indexed(
         .get(edge_type)
         .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_type)))?;
     let same_type = edge_def.from_type == edge_def.to_type;
-    // The keyed/opposite endpoint columns for this direction. The edge dataset
-    // and the C6 coverage warn are owned by the caller (`execute_expand`), which
-    // opens the dataset once and threads it in.
     let probes = endpoint_probes(direction);
 
     let max = max_hops.unwrap_or(min_hops.max(1));
-    // Cross-type edges cannot chain (a Company is not a `WorksAt` source), so a
-    // variable-length traversal over one is structurally single-hop. Enforce it
-    // here instead of relying on the hop-2 scan returning empty: this BFS interns
-    // every endpoint string into ONE dense id space, so a cross-type id-string
-    // collision (a Person and a Company sharing an id) would otherwise let hop 2
-    // de-intern a destination id back to the colliding source-type id and match
-    // its edges, emitting rows the CSR path never produces.
+    // Cross-type edges cannot chain (a Company is not a `WorksAt` source): see
+    // the doc comment for why the Indexed source must enforce this before the
+    // hop-2 scan rather than relying on it returning empty.
     let max = if same_type { max } else { max.min(1) };
 
-    // Per-source BFS state in DENSE id space: intern node ids to u32 once via a
-    // per-traversal interner so visited/seen/frontier/neighbor-map avoid string
-    // hashing + cloning in the hot loop (mirrors the CSR path's TypeIndex). The
-    // GraphIndex/CSR is NOT built — only a local id↔u32 dictionary. Strings
-    // survive at the substrate edges only: the per-hop IN-list to Lance, and the
-    // emitted dst ids handed to the string-keyed hydrate+align tail.
-    let mut interner = crate::graph_index::TypeIndex::new();
+    // The active neighbor source. Indexed starts own a per-traversal interner
+    // (local id ↔ u32 dictionary — the GraphIndex/CSR is NOT built); CSR
+    // starts borrow the built graph index's dictionaries.
+    let mut active = match start_indexed {
+        Some(edge_ds) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
+            edge_ds,
+            interner: crate::graph_index::TypeIndex::new(),
+            neighbor_map: HashMap::new(),
+        })),
+        None => {
+            let gi = graph_index.get().await?.ok_or_else(|| {
+                OmniError::manifest("graph index required for CSR traversal".to_string())
+            })?;
+            resolve_csr_source(gi, edge_def, edge_type, direction)?
+        }
+    };
+
+    // Per-source BFS state, dense in the ACTIVE source's id space so both
+    // pure paths run exactly as they did before unification; only a
+    // mid-traversal swap pays a one-time translation.
     let n = src_ids.len();
     let mut frontiers: Vec<Vec<u32>> = Vec::with_capacity(n);
     let mut visited: Vec<HashSet<u32>> = Vec::with_capacity(n);
     let mut seen_dst: Vec<HashSet<u32>> = Vec::with_capacity(n);
     for i in 0..n {
-        let sid = interner.get_or_insert(src_ids.value(i));
+        let seed = match &mut active {
+            ActiveExpandSource::Indexed(src) => Some(src.interner.get_or_insert(src_ids.value(i))),
+            // A seed the CSR dictionary has never seen touches no edge; its
+            // BFS is empty (mirrors the old CSR path's `continue`).
+            ActiveExpandSource::Csr { src_idx, .. } => src_idx.to_dense(src_ids.value(i)),
+        };
         let mut v = HashSet::new();
+        // Only track visited in the destination namespace for same-type edges
+        // (to avoid revisiting the source). For cross-type edges, dense indices
+        // are in different namespaces so collision is impossible.
         if same_type {
-            v.insert(sid);
+            if let Some(s) = seed {
+                v.insert(s);
+            }
         }
-        frontiers.push(vec![sid]);
+        frontiers.push(seed.map(|s| vec![s]).unwrap_or_default());
         visited.push(v);
         seen_dst.push(HashSet::new());
     }
 
-    let mut src_indices: Vec<u32> = Vec::new();
-    let mut dst_dense: Vec<u32> = Vec::new();
+    // Emissions carry the destination as a STRING so they survive an id-space
+    // swap unchanged. Allocation-neutral: both old paths stringified every
+    // emitted pair for the hydrate tail anyway, just later.
+    let mut emitted_src: Vec<u32> = Vec::new();
+    let mut emitted_dst: Vec<String> = Vec::new();
+    let cap = emit_cap.unwrap_or(usize::MAX);
+    let mut stopped_early = false;
+    let mut prev_union_len: usize = 0;
 
-    for hop in 1..=max {
-        // Union of all live frontiers (dense), de-interned once for the IN-list.
+    'hops: for hop in 1..=max {
+        // Union of all live frontiers (dense). Needed for the Indexed scan's
+        // IN-list; also the observed cardinality the hop policy re-decides on.
         let mut union_dense: Vec<u32> = Vec::new();
         {
             let mut seen: HashSet<u32> = HashSet::new();
@@ -1808,85 +2183,176 @@ async fn execute_expand_indexed(
         if union_dense.is_empty() {
             break;
         }
-        let union_keys: Vec<String> = union_dense
-            .iter()
-            .map(|&u| {
-                interner
-                    .to_id(u)
-                    .expect("interned frontier id must resolve")
-                    .to_string()
-            })
-            .collect();
 
-        // dense key -> dense neighbors (scan order; duplicates preserved, like
-        // CSR multi-edges). One probe per orientation: Out/In do one pass;
-        // Both merges the src-keyed and dst-keyed scans into one map (the
-        // per-source `seen_dst` gate below dedups pairs present both ways).
-        let mut neighbor_map: HashMap<u32, Vec<u32>> = HashMap::new();
-        for &(key_col, opp_col) in probes {
-            let batches = crate::table_store::TableStore::scan_edges_by_endpoint(
-                &edge_ds,
-                key_col,
-                opp_col,
-                &union_keys,
-            )
-            .await?;
-            for batch in &batches {
-                let keys = batch
-                    .column_by_name(key_col)
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("edge batch missing '{}'", key_col))
-                    })?
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("edge '{}' is not Utf8", key_col))
-                    })?;
-                let opps = batch
-                    .column_by_name(opp_col)
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("edge batch missing '{}'", opp_col))
-                    })?
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("edge '{}' is not Utf8", opp_col))
-                    })?;
-                for r in 0..batch.num_rows() {
-                    let k = interner.get_or_insert(keys.value(r));
-                    let o = interner.get_or_insert(opps.value(r));
-                    neighbor_map.entry(k).or_default().push(o);
+        // Issue #533: re-decide the mode with the OBSERVED frontier before
+        // paying this hop's indexed scan. Hop 1's frontier is what dispatch
+        // already decided on; later hops are what dispatch could never see.
+        if hop > 1 && matches!(active, ActiveExpandSource::Indexed(_)) {
+            let switch = match &hop_policy {
+                HopPolicy::Off => false,
+                HopPolicy::CapOnly => union_dense.len() > expand_indexed_max_frontier(),
+                HopPolicy::Full(inputs) => should_switch_to_csr(
+                    union_dense.len(),
+                    prev_union_len,
+                    max - hop + 1,
+                    graph_index.is_built(),
+                    inputs,
+                ),
+            };
+            if switch {
+                let gi = graph_index.get().await?.ok_or_else(|| {
+                    OmniError::manifest("graph index required for CSR traversal".to_string())
+                })?;
+                let csr_source = resolve_csr_source(gi, edge_def, edge_type, direction)?;
+                let old = std::mem::replace(&mut active, csr_source);
+                let ActiveExpandSource::Indexed(old_src) = old else {
+                    unreachable!("switch only fires while the Indexed source is active");
+                };
+                let interner = old_src.interner;
+                let ActiveExpandSource::Csr {
+                    src_idx, dst_idx, ..
+                } = &active
+                else {
+                    unreachable!("active source was just replaced with Csr");
+                };
+                // Translate all live state through the id strings once. An
+                // entry the CSR dictionary lacks has no edges: droppable from
+                // a frontier (expands to nothing) and from visited/seen (it
+                // cannot be reached again through adjacency).
+                let translate_set =
+                    |set: &HashSet<u32>, idx: &crate::graph_index::TypeIndex| -> HashSet<u32> {
+                        set.iter()
+                            .filter_map(|&d| interner.to_id(d).and_then(|id| idx.to_dense(id)))
+                            .collect()
+                    };
+                for i in 0..n {
+                    frontiers[i] = frontiers[i]
+                        .iter()
+                        .filter_map(|&d| interner.to_id(d).and_then(|id| src_idx.to_dense(id)))
+                        .collect();
+                    visited[i] = translate_set(&visited[i], src_idx);
+                    seen_dst[i] = translate_set(&seen_dst[i], dst_idx);
+                }
+                tracing::debug!(
+                    target: "omnigraph::traverse",
+                    edge = %edge_type,
+                    hop,
+                    frontier = union_dense.len(),
+                    mode = "csr",
+                    reason = "frontier outgrew the indexed path",
+                    "expand mode switched mid-traversal",
+                );
+            }
+        }
+        prev_union_len = union_dense.len();
+
+        // Indexed source: one batched BTREE scan per orientation for this
+        // hop's union frontier (Both merges both orientations into one map;
+        // the per-source `seen_dst` gate dedups pairs present both ways).
+        if let ActiveExpandSource::Indexed(src) = &mut active {
+            src.neighbor_map.clear();
+            let union_keys: Vec<String> = union_dense
+                .iter()
+                .map(|&u| {
+                    src.interner
+                        .to_id(u)
+                        .expect("interned frontier id must resolve")
+                        .to_string()
+                })
+                .collect();
+            for &(key_col, opp_col) in probes {
+                let batches = crate::table_store::TableStore::scan_edges_by_endpoint(
+                    &src.edge_ds,
+                    key_col,
+                    opp_col,
+                    &union_keys,
+                )
+                .await?;
+                for batch in &batches {
+                    let keys = batch
+                        .column_by_name(key_col)
+                        .ok_or_else(|| {
+                            OmniError::manifest(format!("edge batch missing '{}'", key_col))
+                        })?
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            OmniError::manifest(format!("edge '{}' is not Utf8", key_col))
+                        })?;
+                    let opps = batch
+                        .column_by_name(opp_col)
+                        .ok_or_else(|| {
+                            OmniError::manifest(format!("edge batch missing '{}'", opp_col))
+                        })?
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            OmniError::manifest(format!("edge '{}' is not Utf8", opp_col))
+                        })?;
+                    for r in 0..batch.num_rows() {
+                        let k = src.interner.get_or_insert(keys.value(r));
+                        let o = src.interner.get_or_insert(opps.value(r));
+                        src.neighbor_map.entry(k).or_default().push(o);
+                    }
                 }
             }
         }
 
-        // Advance each source row's frontier independently (dense ids).
+        // Advance each source row's frontier independently (dense ids). The
+        // emission contract is identical across sources: a self-edge is a
+        // valid destination that reaches nothing new — emit it without
+        // entering the frontier, so the seeded-source `visited` pre-mark
+        // prunes only multi-hop cycle returns (same-type only: cross-type
+        // dense ids live in different namespaces, where node == neighbor is
+        // meaningless for Csr and collision-prone for Indexed).
         for i in 0..n {
             let cur = std::mem::take(&mut frontiers[i]);
             let mut next: Vec<u32> = Vec::new();
             for &node in &cur {
-                let Some(neighbors) = neighbor_map.get(&node) else {
-                    continue;
+                let (fwd, rev): (&[u32], &[u32]) = match &active {
+                    ActiveExpandSource::Indexed(src) => (
+                        src.neighbor_map
+                            .get(&node)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                        &[],
+                    ),
+                    ActiveExpandSource::Csr { adj, adj_rev, .. } => (
+                        adj.neighbors(node),
+                        adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]),
+                    ),
                 };
-                for &neighbor in neighbors {
-                    // A self-edge is a valid destination that reaches nothing
-                    // new: emit it without entering the frontier, so the
-                    // seeded-source `visited` pre-mark prunes only multi-hop
-                    // cycle returns. Same-type only: this path interns both
-                    // endpoint types into one dense space, so a cross-type id
-                    // collision could alias node == neighbor.
-                    if same_type && neighbor == node {
-                        if hop >= min_hops && seen_dst[i].insert(neighbor) {
-                            src_indices.push(i as u32);
-                            dst_dense.push(neighbor);
-                        }
+                for &neighbor in fwd.iter().chain(rev) {
+                    let is_self = same_type && neighbor == node;
+                    if !is_self && same_type && !visited[i].insert(neighbor) {
                         continue;
                     }
-                    if !same_type || visited[i].insert(neighbor) {
+                    if !is_self {
                         next.push(neighbor);
-                        if hop >= min_hops && seen_dst[i].insert(neighbor) {
-                            src_indices.push(i as u32);
-                            dst_dense.push(neighbor);
+                    }
+                    if hop >= min_hops && seen_dst[i].insert(neighbor) {
+                        let dst_id = match &active {
+                            ActiveExpandSource::Indexed(src) => Some(
+                                src.interner
+                                    .to_id(neighbor)
+                                    .expect("interned dst id must resolve")
+                                    .to_string(),
+                            ),
+                            // Dense ids from adjacency always resolve; drop
+                            // defensively rather than panic (mirrors the old
+                            // CSR tail).
+                            ActiveExpandSource::Csr { dst_idx, .. } => {
+                                dst_idx.to_id(neighbor).map(str::to_string)
+                            }
+                        };
+                        if let Some(dst_id) = dst_id {
+                            emitted_src.push(i as u32);
+                            emitted_dst.push(dst_id);
+                            if emitted_src.len() >= cap {
+                                stopped_early = true;
+                                frontiers[i] = next;
+                                break 'hops;
+                            }
                         }
                     }
                 }
@@ -1895,22 +2361,10 @@ async fn execute_expand_indexed(
         }
     }
 
-    // De-intern emitted destination ids (parallel to src_indices) for the
-    // string-keyed hydrate+align tail, exactly as the CSR path does.
-    let dst_ids: Vec<String> = dst_dense
-        .iter()
-        .map(|&d| {
-            interner
-                .to_id(d)
-                .expect("interned dst id must resolve")
-                .to_string()
-        })
-        .collect();
-
     expand_hydrate_and_align(
         wide,
-        src_indices,
-        dst_ids,
+        emitted_src,
+        emitted_dst,
         snapshot,
         catalog,
         dst_type,
@@ -1919,7 +2373,8 @@ async fn execute_expand_indexed(
         params,
         None,
     )
-    .await
+    .await?;
+    Ok(stopped_early)
 }
 
 /// Shared tail for all Expand modes: hydrate the unique destination ids, align
@@ -2010,157 +2465,6 @@ async fn expand_hydrate_and_align(
         apply_filter(wide, f, params)?;
     }
     Ok(())
-}
-
-/// CSR-backed graph traversal: BFS over the in-memory adjacency index. Used for
-/// dense / whole-graph traversals; selective traversals use
-/// `execute_expand_indexed`. Both share `expand_hydrate_and_align`.
-async fn execute_expand_csr(
-    wide: &mut RecordBatch,
-    graph_index: &GraphIndex,
-    snapshot: &Snapshot,
-    catalog: &Catalog,
-    src_var: &str,
-    dst_var: &str,
-    edge_type: &str,
-    direction: Direction,
-    dst_type: &str,
-    min_hops: u32,
-    max_hops: Option<u32>,
-    dst_filters: &[IRFilter],
-    params: &ParamMap,
-) -> Result<()> {
-    let src_id_col_name = format!("{}.id", src_var);
-    let src_ids = wide
-        .column_by_name(&src_id_col_name)
-        .ok_or_else(|| {
-            OmniError::manifest(format!("wide batch missing '{}' column", src_id_col_name))
-        })?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest(format!("'{}' column is not Utf8", src_id_col_name)))?
-        .clone();
-
-    // Determine which type index to use for source and destination
-    let edge_def = catalog
-        .edge_types
-        .get(edge_type)
-        .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_type)))?;
-
-    let (src_type_name, dst_type_name) = match direction {
-        Direction::Out => (&edge_def.from_type, &edge_def.to_type),
-        Direction::In => (&edge_def.to_type, &edge_def.from_type),
-        // Both requires from_type == to_type (typecheck T22).
-        Direction::Both => (&edge_def.from_type, &edge_def.from_type),
-    };
-
-    let src_type_idx = graph_index
-        .type_index(src_type_name)
-        .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", src_type_name)))?;
-    let dst_type_idx = graph_index
-        .type_index(dst_type_name)
-        .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", dst_type_name)))?;
-
-    let adj = match direction {
-        Direction::Out | Direction::Both => graph_index.csr(edge_type),
-        Direction::In => graph_index.csc(edge_type),
-    }
-    .ok_or_else(|| OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type)))?;
-    // Undirected: additionally walk incoming edges (CSC); the BFS gates below
-    // dedup pairs that exist in both directions and self-loops.
-    let adj_rev = match direction {
-        Direction::Both => Some(graph_index.csc(edge_type).ok_or_else(|| {
-            OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type))
-        })?),
-        _ => None,
-    };
-
-    let max = max_hops.unwrap_or(min_hops.max(1));
-
-    let same_type = src_type_name == dst_type_name;
-    // Cross-type edges cannot chain; a variable-length traversal over one is
-    // structurally single-hop (mirrors the indexed path's guarantee).
-    let max = if same_type { max } else { max.min(1) };
-
-    // BFS to collect (src_row_idx, dst_dense) pairs with per-source dedup.
-    // Dense u32 ids stay in hand through BFS, dedup, and align — we only
-    // stringify the unique set for Lance's SQL IN-list.
-    let mut src_indices: Vec<u32> = Vec::new();
-    let mut dst_dense_list: Vec<u32> = Vec::new();
-    for i in 0..src_ids.len() {
-        let src_id = src_ids.value(i);
-        let Some(src_dense) = src_type_idx.to_dense(src_id) else {
-            continue;
-        };
-
-        // BFS with hop tracking
-        let mut frontier: Vec<u32> = vec![src_dense];
-        let mut visited: HashSet<u32> = HashSet::new();
-        let mut seen_dst_dense: HashSet<u32> = HashSet::new();
-        // Only track visited in the destination namespace for same-type edges
-        // (to avoid revisiting the source). For cross-type edges, dense indices
-        // are in different namespaces so collision is impossible.
-        if same_type {
-            visited.insert(src_dense);
-        }
-
-        for hop in 1..=max {
-            let mut next_frontier = Vec::new();
-            for &node in &frontier {
-                let rev: &[u32] = adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]);
-                for &neighbor in adj.neighbors(node).iter().chain(rev) {
-                    // Self-edge: emit without entering the frontier — same
-                    // contract as execute_expand_indexed. Same-type only:
-                    // cross-type dense ids live in different TypeIndex
-                    // namespaces, where node == neighbor is meaningless.
-                    if same_type && neighbor == node {
-                        if hop >= min_hops && seen_dst_dense.insert(neighbor) {
-                            src_indices.push(i as u32);
-                            dst_dense_list.push(neighbor);
-                        }
-                        continue;
-                    }
-                    if !same_type || visited.insert(neighbor) {
-                        next_frontier.push(neighbor);
-                        if hop >= min_hops && seen_dst_dense.insert(neighbor) {
-                            src_indices.push(i as u32);
-                            dst_dense_list.push(neighbor);
-                        }
-                    }
-                }
-            }
-            frontier = next_frontier;
-            if frontier.is_empty() {
-                break;
-            }
-        }
-    }
-
-    // Map BFS-produced dense destination ids to string ids for the shared
-    // hydrate+align tail. Dense ids always resolve (they came from the index);
-    // drop any that don't, keeping the (src, dst) arrays parallel.
-    let mut tail_src_indices: Vec<u32> = Vec::with_capacity(src_indices.len());
-    let mut dst_ids: Vec<String> = Vec::with_capacity(dst_dense_list.len());
-    for (&s, &d) in src_indices.iter().zip(dst_dense_list.iter()) {
-        if let Some(id) = dst_type_idx.to_id(d) {
-            tail_src_indices.push(s);
-            dst_ids.push(id.to_string());
-        }
-    }
-
-    expand_hydrate_and_align(
-        wide,
-        tail_src_indices,
-        dst_ids,
-        snapshot,
-        catalog,
-        dst_type,
-        dst_var,
-        dst_filters,
-        params,
-        None,
-    )
-    .await
 }
 
 /// Load full node rows for a set of IDs from a snapshot.
@@ -2406,6 +2710,7 @@ async fn execute_anti_join(
         catalog,
         &mut inner_wide,
         &no_search,
+        None,
     )
     .await?;
 
@@ -3021,7 +3326,79 @@ mod expand_chooser_tests {
             max_frontier_cap: 1024,
             coverage,
             csr_cached: false,
+            probe_factor: 1.0,
         }
+    }
+
+    #[test]
+    fn undirected_probe_factor_doubles_indexed_cost() {
+        // A directed traversal just under the crossover stays indexed (1 hop ×
+        // frontier 100 × fanout 10 = 1,000 < 1.5·|E| = 1,500); the SAME
+        // cardinalities traversed undirected pay both endpoint probes per hop
+        // (2,000 > 1,500) and flip to CSR. Guards against pricing an
+        // undirected traversal at half its probe count.
+        let mut i = inputs(100, 1_000, 100, 1, IndexCoverage::Indexed);
+        assert_eq!(choose_expand_mode(&i), ExpandMode::IndexedScan);
+        i.probe_factor = 2.0;
+        assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
+    }
+
+    #[test]
+    fn hop_policy_switches_on_observed_frontier_over_cap() {
+        // The hard ceiling becomes an execution bound: observed 2000 > 1024
+        // switches regardless of the cost estimate.
+        let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
+        assert!(should_switch_to_csr(2000, 100, 2, false, &i));
+    }
+
+    #[test]
+    fn hop_policy_switches_on_projected_growth() {
+        // The #533 shape at IMDb scale: an UNDIRECTED traversal (probe factor
+        // 2, like `<coStarredWith>`), fanout ≈ 6.5, observed hop-2 frontier 238
+        // growing from 1. Observed growth 238× saturates the projection at |V|
+        // within a hop; the remaining 3 hops (~2×2.9M units) dwarf the CSR
+        // build (~3.75M) — the switch fires at hop 2, one hop before the hard
+        // ceiling would catch it. (The directed variant stays under the build
+        // cost at hop 2 and is caught by the ceiling at hop 3 instead —
+        // layered, both covered below.)
+        let mut i = inputs(1, 2_500_000, 388_000, 4, IndexCoverage::Indexed);
+        i.probe_factor = 2.0;
+        assert!(should_switch_to_csr(238, 1, 3, false, &i));
+
+        // Directed at hop 2: projection (~2.9M) is under the build cost — no
+        // switch yet…
+        i.probe_factor = 1.0;
+        assert!(!should_switch_to_csr(238, 1, 3, false, &i));
+        // …but hop 3's observed frontier (5,418) crosses the 1024 ceiling,
+        // which the policy enforces as an execution bound.
+        assert!(should_switch_to_csr(5_418, 238, 2, false, &i));
+    }
+
+    #[test]
+    fn hop_policy_keeps_genuinely_selective_traversals_indexed() {
+        // A frontier that stays tiny relative to |V| never switches: observed
+        // growth ~2× on a 1M-node graph, 2 remaining hops, ~thousands of
+        // scans vs a 15M-unit build.
+        let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
+        assert!(!should_switch_to_csr(40, 20, 2, false, &i));
+    }
+
+    #[test]
+    fn hop_policy_switches_cheaply_onto_a_warm_csr() {
+        // With the CSR already built this query, any nonzero remaining indexed
+        // work loses to ~free reuse.
+        let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
+        assert!(should_switch_to_csr(40, 20, 2, true, &i));
+    }
+
+    #[test]
+    fn hop_policy_growth_projection_saturates_at_source_count() {
+        // Explosive observed growth must not project past |V_src|: with
+        // saturation the 3-hop estimate is ~3·|V|·fanout; the switch verdict
+        // holds but the estimate stays finite and comparable.
+        let i = inputs(1, 1_000_000, 1_000, 4, IndexCoverage::Indexed);
+        // observed 900 from 1 → growth 900×; |V| = 1000 caps each later hop.
+        assert!(should_switch_to_csr(900, 1, 3, false, &i));
     }
 
     #[test]

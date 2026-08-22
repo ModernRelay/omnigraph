@@ -72,6 +72,7 @@ impl RuntimeCache {
         &self,
         resolved: &ResolvedTarget,
         edge_types: &HashMap<String, (String, String)>,
+        adapter: &dyn crate::storage::StorageAdapter,
     ) -> Result<Arc<GraphIndex>> {
         let key = graph_index_cache_key(resolved, edge_types);
         {
@@ -81,8 +82,11 @@ impl RuntimeCache {
             }
         }
 
-        crate::instrumentation::record_graph_build(edge_types.len());
-        let index = Arc::new(GraphIndex::build(&resolved.snapshot, edge_types).await?);
+        // The graph-build probe fires inside `GraphIndex::build` itself, so a
+        // persisted-artifact load is never counted as a build.
+        let index = Arc::new(
+            GraphIndex::load_or_build(&resolved.snapshot, edge_types, Some(adapter)).await?,
+        );
         let mut cache = self.graph_indices.lock().await;
         if let Some(existing) = cache.entries.get(&key).cloned() {
             return Ok(existing);

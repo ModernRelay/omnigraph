@@ -448,6 +448,12 @@ impl Snapshot {
         self.version
     }
 
+    /// Store root this snapshot's datasets live under (the object-store
+    /// prefix). Consumed by the graph-index artifact path derivation.
+    pub(crate) fn root_uri(&self) -> &str {
+        &self.root_uri
+    }
+
     /// Look up backing-dataset metadata by qualified graph type key.
     pub fn dataset(&self, type_key: &str) -> Option<&DatasetEntry> {
         self.entries.get(type_key)

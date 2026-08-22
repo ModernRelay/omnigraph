@@ -753,10 +753,31 @@ impl StorageAdapter for CountingStorageAdapter {
         self.inner.read_text_if_exists_bounded(uri, max_bytes).await
     }
 
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        // Counted with the text reads: one bounded existence-tolerant GET.
+        self.counts
+            .read_text_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await
+    }
+
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
         self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.counts.write_text.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text(uri, contents).await
+    }
+
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> Result<()> {
+        // Counted with the text writes: one PUT.
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.counts.write_text.fetch_add(1, Ordering::Relaxed);
+        self.inner.write_bytes(uri, contents).await
     }
 
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {

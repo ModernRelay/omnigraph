@@ -468,7 +468,15 @@ them explicit.
   recreated branch (a long-lived reader bound to another branch) does not trigger
   that same-branch refresh, so an e_tag-less recreated branch can still reuse a
   stale entry until a same-branch read refreshes — acceptable because local FS is
-  a dev/test substrate and production carries e_tags.
+  a dev/test substrate and production carries e_tags. The **persisted adjacency
+  artifact** (`__graph_index/csr-current.bin`) carries the SAME key fields as
+  per-edge stamps and therefore inherits the same e_tag-less branch-ref ABA
+  residual — with no refresh fallback of its own, since its stamps are its only
+  freshness authority: on local FS a branch recreated at the same version/identity
+  can be served stale topology from the artifact until the next edge-committing
+  `optimize` rewrites it. Same acceptability argument (dev/test substrate only;
+  production e_tags distinguish the incarnations), documented here so a future
+  hardening pass treats the two sites together.
 - **Commit-graph parent under concurrency — CLOSED (RFC-013 Phase 7):** the graph
   commit is now recorded in the graph-manifest publication CAS, and the publisher resolves
   the new commit's parent INSIDE its retry loop, per attempt, from the just-loaded
