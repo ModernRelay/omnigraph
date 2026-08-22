@@ -29,6 +29,15 @@ omnigraph init --schema schema.pg graph.omni
 
 ## 3. Load data
 
+Data is newline-delimited JSON, one record per line — each names its node type
+and carries the properties under `data`. Save this as `people.jsonl`:
+
+```jsonl
+{"type":"Person","data":{"name":"Ada Lovelace","title":"Engineer"}}
+{"type":"Person","data":{"name":"Grace Hopper","title":"Engineer"}}
+{"type":"Person","data":{"name":"Alan Turing","title":"Mathematician"}}
+```
+
 `load` is the single bulk-write command. `--mode` is required
 (`overwrite | append | merge`):
 
@@ -36,8 +45,9 @@ omnigraph init --schema schema.pg graph.omni
 omnigraph load --data people.jsonl --mode overwrite graph.omni
 ```
 
-`people.jsonl` is newline-delimited JSON, one record per line. For finer-grained
-or inline writes, see [mutations](mutations/index.md).
+For finer-grained or inline writes, see [mutations](mutations/index.md).
+The [CLI load contract](cli/index.md#core-graph-flow) also covers edge
+envelopes, optional IDs, and strict rejection rules.
 
 ## 4. Query
 

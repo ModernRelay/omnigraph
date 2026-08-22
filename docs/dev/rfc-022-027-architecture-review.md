@@ -31,7 +31,7 @@ not precise enough
 **Current Lance revalidation:** all RFC-022–028 substrate contracts were
 re-audited on 2026-07-17 against Lance 9.0.0-rc.1 at
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; see the
-[RC.1 alignment audit](lance.md#last-alignment-audit-2026-07-17-lance-900-rc1-git-rev-cec0b7df).
+[RC.1 alignment audit](lance.md#prior-alignment-audit-2026-07-17-lance-900-rc1-git-rev-cec0b7df).
 Stable V2_2, native branch/tag/cleanup semantics, exact full-table index
 staging, and RFC-023's route-dependent/directional key-filter behavior remain
 aligned. Data Overlay is opt-in and unused. MemWAL now inherits store/session
@@ -1047,7 +1047,7 @@ CAS.
 
 **Affected:** [RFC-026 §4.5.2](../rfcs/0026-memwal-streaming-ingest.md#452-b2b-managed-reclamation-own-the-missing-lance-primitive),
 [§6](../rfcs/0026-memwal-streaming-ingest.md#6-fold-protocol), and
-[§12.6](../rfcs/0026-memwal-streaming-ingest.md#126-common-public-and-b2b-managed-reclamation-activation-gates)
+[§12.6](../rfcs/0026-memwal-streaming-ingest.md#126-private-b2-common-implementation-and-remaining-publicb2b-gates)
 
 **Status:** Design-dispositioned on 2026-07-19 as the optional B2b
 managed-reclamation route; implementation-blocking only if that profile is

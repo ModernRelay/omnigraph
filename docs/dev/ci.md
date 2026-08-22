@@ -2,7 +2,7 @@
 
 `.github/workflows/`:
 
-- **ci.yml**: classifies documentation-only changes, checks AGENTS/doc links, runs the required four-surface graph-vocabulary guard, compiles default features on code changes, runs the canonical `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints` gate (one feature-superset build — omitting the features skips every failpoint test and builds a different fingerprint) on its configured post-merge/tag/manual events, tests the AWS server feature, checks the container entrypoint, and runs bucket-gated RustFS correctness suites. There is no RFC-026/MemWAL job or abandoned v7-v19 binary build.
+- **ci.yml**: classifies documentation-only changes, checks AGENTS/doc links and immutable external Action pins, runs the required four-surface graph-vocabulary guard, compiles default features on code changes, runs the canonical `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints` gate (one feature-superset build — omitting the features skips every failpoint test and builds a different fingerprint) on its configured post-merge/tag/manual events, tests the AWS server feature, checks the container entrypoint, and runs bucket-gated RustFS correctness suites. There is no RFC-026/MemWAL job or abandoned v7-v19 binary build.
   - Pull requests may use reporting-only checks while the full workspace gate
     runs post-merge, on tags, or by manual dispatch. Run the canonical workspace
     test locally before merging non-trivial code. A red post-merge main is

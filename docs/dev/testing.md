@@ -114,7 +114,8 @@ shell owners:
 
 ```bash
 shellcheck scripts/*.sh
-actionlint .github/workflows/ci.yml
+actionlint .github/workflows/*.yml
+python3 scripts/check-workflow-action-pins.py
 ```
 
 Also inspect the `Classify Changes` case table whenever a new fixture format or
