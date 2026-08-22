@@ -322,7 +322,21 @@ pub trait StorageAdapter: Debug + Send + Sync {
         uri: &str,
         max_bytes: u64,
     ) -> Result<Option<String>>;
+    /// Byte sibling of [`Self::read_text_if_exists_bounded`]: read a binary
+    /// object of at most `max_bytes` in one backend GET; `None` is reserved
+    /// for NotFound, and an oversized object is refused before its full body
+    /// materializes. For binary artifacts (the graph-index adjacency) where
+    /// UTF-8 decoding would be wrong, not just wasteful.
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>>;
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()>;
+    /// Byte sibling of [`Self::write_text`]: one PUT of a binary body under
+    /// the same atomic-visibility backend contract (a reader sees the old
+    /// object or the new one, never a truncated in-progress write).
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> Result<()>;
     /// Write a text object only if no object exists at `uri`.
     ///
     /// Returns `Ok(true)` when this call created the object, `Ok(false)`
@@ -712,6 +726,38 @@ impl StorageAdapter for ObjectStorageAdapter {
         Ok(Some(text))
     }
 
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let location = self.object_path(uri)?;
+        let end = max_bytes.checked_add(1).ok_or_else(|| {
+            StorageError::internal(format!(
+                "bounded storage read limit overflows for '{uri}': {max_bytes}"
+            ))
+        })?;
+        let bytes = match self.store.get_range(&location, 0..end).await {
+            Ok(bytes) => bytes,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(storage_backend_error("bounded_read", uri, err)),
+        };
+        let actual = u64::try_from(bytes.len()).map_err(|_| {
+            StorageError::internal(format!(
+                "bounded storage read length exceeds u64 for '{uri}'"
+            ))
+        })?;
+        if actual > max_bytes {
+            return Err(StorageError::ResourceLimit {
+                resource: "storage_bytes".to_string(),
+                limit: max_bytes,
+                actual,
+                uri: uri.to_string(),
+            });
+        }
+        Ok(Some(bytes.to_vec()))
+    }
+
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
         // Atomic visibility is the backend's contract: object stores via
         // PutObject; LocalFileSystem via an internal staged-temp + rename
@@ -721,6 +767,16 @@ impl StorageAdapter for ObjectStorageAdapter {
         let location = self.object_path(uri)?;
         self.store
             .put(&location, PutPayload::from(contents.as_bytes().to_vec()))
+            .await
+            .map_err(|err| storage_backend_error("write", uri, err))?;
+        Ok(())
+    }
+
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> Result<()> {
+        // Same atomic-visibility contract as `write_text`, binary body.
+        let location = self.object_path(uri)?;
+        self.store
+            .put(&location, PutPayload::from(contents.to_vec()))
             .await
             .map_err(|err| storage_backend_error("write", uri, err))?;
         Ok(())

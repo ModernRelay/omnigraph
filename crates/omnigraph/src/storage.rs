@@ -32,7 +32,18 @@ pub trait StorageAdapter: Debug + Send + Sync {
         uri: &str,
         max_bytes: u64,
     ) -> Result<Option<String>>;
+    /// Byte sibling of `read_text_if_exists_bounded` for binary artifacts
+    /// (the graph-index adjacency): one GET, `None` reserved for NotFound,
+    /// oversize refused before the body materializes.
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>>;
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()>;
+    /// Byte sibling of `write_text`: one atomic-visibility PUT of a binary
+    /// body.
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> Result<()>;
     /// Write a text object only if no object exists at `uri`.
     ///
     /// Returns `Ok(true)` when this call created the object, `Ok(false)`
@@ -157,8 +168,27 @@ impl StorageAdapter for ObjectStorageAdapter {
         )
     }
 
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(
+            omnigraph_storage::StorageAdapter::read_bytes_if_exists_bounded(
+                &self.inner,
+                uri,
+                max_bytes,
+            )
+            .await?,
+        )
+    }
+
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
         Ok(omnigraph_storage::StorageAdapter::write_text(&self.inner, uri, contents).await?)
+    }
+
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> Result<()> {
+        Ok(omnigraph_storage::StorageAdapter::write_bytes(&self.inner, uri, contents).await?)
     }
 
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {

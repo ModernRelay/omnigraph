@@ -942,8 +942,22 @@ mod local_create_if_absent_probe {
             self.inner.read_text_if_exists_bounded(uri, max_bytes).await
         }
 
+        async fn read_bytes_if_exists_bounded(
+            &self,
+            uri: &str,
+            max_bytes: u64,
+        ) -> Result<Option<Vec<u8>>> {
+            self.inner
+                .read_bytes_if_exists_bounded(uri, max_bytes)
+                .await
+        }
+
         async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
             self.inner.write_text(uri, contents).await
+        }
+
+        async fn write_bytes(&self, uri: &str, contents: &[u8]) -> Result<()> {
+            self.inner.write_bytes(uri, contents).await
         }
 
         async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {

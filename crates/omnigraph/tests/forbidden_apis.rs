@@ -552,19 +552,21 @@ macro_rules! gateway_surfaces {
 // or an entirely new primitive name before a crate-internal caller can use it.
 gateway_surfaces! {
     "storage.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
-        "read_text", "read_text_if_exists", "read_text_if_exists_bounded", "exists",
+        "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
+        "read_bytes_if_exists_bounded", "exists",
         "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
     "storage.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("object storage primitive")) => [
-        "write_text", "write_text_if_absent", "rename_text", "delete",
+        "write_text", "write_bytes", "write_text_if_absent", "rename_text", "delete",
         "write_text_if_match", "delete_prefix",
     ],
     "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
-        "read_text", "read_text_if_exists", "read_text_if_exists_bounded", "exists",
+        "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
+        "read_bytes_if_exists_bounded", "exists",
         "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
     "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("shared object storage primitive")) => [
-        "write_text", "write_text_if_absent", "rename_text", "delete",
+        "write_text", "write_bytes", "write_text_if_absent", "rename_text", "delete",
         "write_text_if_match", "delete_prefix",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::ReadOrPure => [
@@ -684,12 +686,20 @@ durable_calls! {
     ("db/manifest/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
     ("db/manifest/publisher.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest/publisher.rs", ".execute_reader(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
+    // derived, regenerable topology written ONLY from `optimize`'s tail (never
+    // the query path, which only loads), outside graph visibility — a stale or
+    // partial object is rejected by its identity stamps + payload digest and
+    // rebuilt in memory, so this write can never change a query's result.
+    ("graph_index/persist.rs", ".write_bytes(", 1, WriteProtocol::PhysicalOnly),
+    ("instrumentation.rs", ".write_bytes(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".write_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".write_text_if_match(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".rename_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".delete(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".delete_prefix(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("storage.rs", ".write_bytes(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".write_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".write_text_if_match(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
@@ -697,7 +707,9 @@ durable_calls! {
     ("storage.rs", ".delete(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".delete_prefix(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("omnigraph-storage/lib.rs", ".delete(", 2, WriteProtocol::Composed("storage adapter primitive")),
-    ("omnigraph-storage/lib.rs", ".put(", 2, WriteProtocol::Composed("object storage put primitive")),
+    // 3rd `.put(`: the binary `write_bytes` primitive (graph-index artifact),
+    // same atomic-visibility PUT contract as `write_text`.
+    ("omnigraph-storage/lib.rs", ".put(", 3, WriteProtocol::Composed("object storage put primitive")),
     ("omnigraph-storage/lib.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
     ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
@@ -843,6 +855,7 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".write_text_if_absent(",
     ".write_text_if_match(",
     ".write_text(",
+    ".write_bytes(",
     ".delete(",
     ".delete_prefix(",
     ".put(",

@@ -274,6 +274,10 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     ensure_no_pending_recovery_for_optimize_under_main_gate(db).await?;
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
 
+    // Whether this run advanced any edge table — consumed by the graph-index
+    // artifact gate at the tail (a no-work optimize skips the rebuild+PUT).
+    let mut edge_tables_committed = false;
+
     let table_tasks = table_keys
         .into_iter()
         .filter_map(|table_key| {
@@ -379,6 +383,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         let edge_committed = outcomes
             .iter()
             .any(|outcome| outcome.stat.committed && outcome.stat.type_key.starts_with("edge:"));
+        edge_tables_committed = edge_committed;
         stats.extend(outcomes.into_iter().map(|outcome| outcome.stat));
 
         // Phase D: the graph-visible postcondition is durable. A failed delete
@@ -433,7 +438,68 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         all.push(compact_internal_table(db, table_key, uri).await);
     }
 
+    // Persist the CSR/CSC adjacency artifact for the post-optimize snapshot,
+    // so cold traversals load topology with one GET instead of scanning every
+    // edge table. Optimize is the ONLY writer of this artifact (the query
+    // path only loads); it is derived, regenerable data content-addressed by
+    // the edge tables' physical identity, so a crash mid-write leaves an
+    // object the loader rejects and rebuilds around — best-effort by design,
+    // like the physical `__manifest` compaction above it, and running under
+    // the still-held main branch gate so the snapshot it keys on is settled.
+    if let Err(error) = persist_graph_index_artifact(db, &catalog, edge_tables_committed).await {
+        tracing::warn!(
+            target: "omnigraph::optimize",
+            error = %error,
+            "graph index artifact persist failed; traversals keep building in memory"
+        );
+    }
+
     all.into_iter().collect()
+}
+
+/// Build the full-catalog graph index from a fresh main snapshot and write it
+/// as the persisted adjacency artifact. Skipped when the catalog declares no
+/// edge types (nothing to traverse), and when this run advanced no edge table
+/// AND an artifact already exists: a no-work optimize must not pay a full
+/// edge scan plus a PUT. Accepted tradeoff: edge
+/// data written since the last artifact WITHOUT compaction work leaves the
+/// artifact stale until an edge-committing optimize; stale is safe (loads
+/// reject on the identity stamps and rebuild in memory), it only forgoes the
+/// artifact's speedup for that window.
+async fn persist_graph_index_artifact(
+    db: &Omnigraph,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    edge_tables_committed: bool,
+) -> Result<()> {
+    if catalog.edge_types.is_empty() {
+        return Ok(());
+    }
+    let uri = crate::graph_index::persist::artifact_uri(db.root_uri());
+    if !edge_tables_committed && db.storage_adapter().exists(&uri).await? {
+        tracing::debug!(
+            target: "omnigraph::optimize",
+            "graph index artifact refresh skipped: no edge table advanced and an artifact exists"
+        );
+        return Ok(());
+    }
+    let edge_types: std::collections::HashMap<String, (String, String)> = catalog
+        .edge_types
+        .iter()
+        .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
+        .collect();
+    let snapshot = db.snapshot_for_branch(None).await?;
+    let index = crate::graph_index::GraphIndex::build(&snapshot, &edge_types).await?;
+    let written =
+        crate::graph_index::persist::save(&snapshot, db.storage_adapter(), &edge_types, &index)
+            .await?;
+    if let Some(uri) = written {
+        tracing::debug!(
+            target: "omnigraph::optimize",
+            uri = %uri,
+            "graph index artifact persisted"
+        );
+    }
+    Ok(())
 }
 
 /// Pure planning: classify drift/no-work/productive state without advancing

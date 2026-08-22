@@ -27,10 +27,10 @@
 | Ordered-scan spill envelope | `157,286,400` bytes (150 MiB) resident pool; `107,374,182,400` bytes (100 GiB) scratch quota; `39,321,600` bytes (37.5 MiB) hard sorter-input batch cap | one fresh execution context per ordered diff/feed, branch merge, or export scan. Concurrent scans each own an envelope, so these are not process-global admission limits. In-flight spill writes can overshoot the scratch quota before failure; one row remains indivisible. `LANCE_BYPASS_SPILLING` makes the scan refuse instead of weakening the bound |
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | optimize/cleanup |
 | Graph index cache size | `8` (LRU) | runtime cache |
-| Expand indexed-path frontier ceiling | `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER=1024` | traversal |
+| Expand indexed-path frontier ceiling | `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER=1024` | traversal. Enforced at dispatch AND at the top of every later hop against the observed frontier: a variable-length traversal that outgrows the ceiling mid-flight switches to the CSR path and continues, carrying its visited state |
 | Expand indexed-path hop ceiling | `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS=6` | traversal |
 | Expand CSR-build cost factor | `CSR_BUILD_FACTOR = 1.5` | traversal |
-| Expand mode override | `OMNIGRAPH_TRAVERSAL_MODE` (`indexed`\|`csr`; unset = cost-based auto) | traversal |
+| Expand mode override | `OMNIGRAPH_TRAVERSAL_MODE` (`indexed`\|`csr`; unset = cost-based auto, re-decided per hop with the observed frontier) | traversal. A forced mode never switches mid-traversal |
 | Default body limit | `1 MB` | HTTP server |
 | Load (bulk-write) body limit | `32 MiB` | HTTP server (`/load`, `/load/ndjson`, and the deprecated `/ingest` alias) |
 | Strict-input Arrow preflight | `strict_input_arrow_bytes` ceiling = `KEYED_WRITE_MAX_BYTES` (32 MiB) | a strict load's projected Arrow allocation per declaration group, charged before materialization. Applies to **every** load mode — Overwrite escapes the keyed entity/byte ceilings above but not this preflight; a larger bulk replacement is one overwrite chunk followed by merge chunks |
