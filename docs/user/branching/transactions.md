@@ -165,8 +165,8 @@ This is the workflow agentic loops are designed around: **branches are the unit 
 
 ## See also
 
-- [`docs/user/branches-commits.md`](index.md) — branch and commit-graph mechanics.
+- [`docs/user/branching/index.md`](index.md) — branch and commit-graph mechanics.
 - [`docs/dev/merge.md`](../../dev/merge.md) — three-way merge details and conflict kinds.
-- [`docs/user/query-language.md`](../queries/index.md) — `.gq` syntax for the multi-statement queries used above.
+- [`docs/user/queries/index.md`](../queries/index.md) — `.gq` syntax for the multi-statement queries used above.
 - [`docs/dev/writes.md`](../../dev/writes.md) — the per-query commit pipeline that gives single-query atomicity.
 - [`docs/dev/invariants.md`](../../dev/invariants.md) — the architectural rule.

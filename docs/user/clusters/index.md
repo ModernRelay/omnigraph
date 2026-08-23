@@ -54,6 +54,43 @@ policies:
     applies_to: [knowledge]      # graph-bound; use [cluster] for server-level
 ```
 
+Save the graph schema as `people.pg`:
+
+```pg
+node Person {
+  name: String
+}
+```
+
+Save the stored query as `queries/people.gq`:
+
+```gq
+query find_person($name: String) {
+  match { $p: Person { name: $name } }
+  return { $p.name }
+}
+```
+
+The bearer token below resolves to actor `act-reader`, so the graph policy must
+grant that actor both the outer stored-query gate and the query's inner read
+gate. Save this as `base.policy.yaml`:
+
+```yaml
+version: 1
+groups:
+  readers: [act-reader]
+rules:
+  - id: readers-can-invoke-stored-queries
+    allow:
+      actors: { group: readers }
+      actions: [invoke_query]
+  - id: readers-can-read
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+```
+
 Bring it to life:
 
 ```bash
@@ -73,8 +110,15 @@ disposition; `converged: true` means there is nothing left to do — re-running
 Load data through the normal graph plane (the control plane manages
 *definitions*, not entities):
 
+```jsonl
+{"type":"Person","data":{"name":"Ada"}}
+```
+
+Save that record as `seed.jsonl`, then run:
+
 ```bash
-omnigraph load --data seed.jsonl company-brain/graphs/knowledge.omni
+omnigraph load --data seed.jsonl --mode overwrite \
+  company-brain/graphs/knowledge.omni
 ```
 
 Serve it:
@@ -100,9 +144,16 @@ curl -H 'authorization: Bearer s3cret' \
   -H 'content-type: application/json' -d '{"params":{"name":"Ada"}}'
 ```
 
+That request returns `200` with Ada in the result. A caller without `invoke_query`
+receives the same `404` as an unknown query name, intentionally preventing
+catalog probing. If this example returns `404`, confirm that the query was
+applied with `GET /graphs/knowledge/queries` and that the actor appears in the
+policy group above; see [stored-query authorization](../operations/server.md#stored-query-invocation-post-queriesname).
+
 Bearer tokens and the bind address are deliberately *not* cluster facts —
 they are per-replica, set by flag or environment
-([server.md](../operations/server.md#modes) for the token sources).
+([server.md](../operations/server.md#auth-model-bearer--sha-256) for the token
+sources).
 
 ## 2. The day-2 loop: edit → plan → apply → restart
 

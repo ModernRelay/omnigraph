@@ -59,7 +59,9 @@ iwr -UseBasicParsing https://raw.githubusercontent.com/ModernRelay/omnigraph/mai
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ReleaseChannel edge
 ```
 
-Install from source:
+Install from source (requires the Rust stable toolchain and `protoc` — install
+the Protocol Buffers compiler first with `brew install protobuf` or
+`apt-get install -y protobuf-compiler libprotobuf-dev`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install-source.sh | bash
@@ -98,6 +100,9 @@ curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/
 ```
 
 ## Manual Source Build
+
+Requires the Rust stable toolchain and `protoc` (`brew install protobuf` /
+`apt-get install -y protobuf-compiler libprotobuf-dev`).
 
 macOS / Linux:
 

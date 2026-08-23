@@ -52,7 +52,7 @@ jobs:
             || { echo "no such tag: ${RELEASE_TAG}" >&2; exit 1; }
 
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           # Fully qualified so a branch of the same name can never shadow the tag.
           ref: refs/tags/${{ env.RELEASE_TAG }}
