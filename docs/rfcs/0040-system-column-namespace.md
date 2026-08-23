@@ -112,21 +112,25 @@ or `dst`.
 ### API results
 
 Payloads carry each graph's own column names: existing graphs keep `id`,
-new graphs carry `__id`/`__src`/`__dst`. The graph metadata surface gains
-the graph's system column spellings; that is the discovery mechanism for
-multi-graph clients, not raw storage.
+new graphs carry `__id`/`__src`/`__dst`. The schema introspection
+response (`GET /schema`) gains an optional field carrying the graph's
+system column spellings; reading it is the discovery mechanism for
+multi-graph clients, not raw storage (the spellings cannot appear in the
+`.pg` source itself, since system columns are undeclarable).
 
 ### Existing graphs
 
 Nothing changes at the release boundary. A graph changes only at its
-***upgrade***, the schema apply that renames its system columns and
-rewrites its stored queries, run explicitly by the owner. A schema apply
-that declares a freed name on a pre-upgrade graph is refused with an error
-naming the upgrade as the fix; the upgrade never runs implicitly. The owner
-accepts its consequences: the graph's
-API fields switch, and query text living outside the graph (application
-code, dashboards) must be updated by hand; only stored queries rewrite
-automatically. After it, the graph behaves like a new one.
+***upgrade***, the explicit operation that renames its system columns, run
+by the owner (mechanism in Reference-level design). A schema apply that declares a freed name on a
+pre-upgrade graph is refused with an error naming the upgrade as the fix;
+the upgrade never runs implicitly. Stored queries are configuration, not
+graph state (declared in the cluster config, loaded at boot), so a
+mechanical rewrite tool updates their `.gq` sources beforehand and the
+upgrade refuses while any still uses a legacy spelling. The owner accepts
+the remaining consequences: the graph's API fields switch, and query text
+in application code and dashboards spelling `$x.id` is the owner's to
+update. After it, the graph behaves like a new one.
 
 ## Reference-level design
 
@@ -147,9 +151,10 @@ The compiler models system columns as roles (`SystemFieldRole::Id`/`Src`/
 identities. This RFC extends that to system columns (amending 0028 once,
 see Invariants): no code path may assume a system column's spelling. The
 vintage is concretely the version field of the graph's accepted schema IR.
-New graphs record the new version; ordinary schema applies re-emit the
-accepted version unchanged, so no unrelated apply can flip spellings; only
-the upgrade advances it. One graph is always internally uniform, and a
+New graphs record the new version. Ordinary schema applies re-emit the
+accepted version unchanged (a required change to the resolver, which today
+stamps the current version constant unconditionally on every resolution),
+so no unrelated apply can flip spellings; only the upgrade advances it. One graph is always internally uniform, and a
 graph with no schema apply keeps its IR bytes and hash identical to
 today's. The catalog, a projection of the IR, is the one resolution point,
 and builds its Arrow schemas with the vintage's spelling. A grep of the
@@ -163,7 +168,9 @@ Meta-fields resolve by role. Bare names resolve against declared
 properties, plus, on old-vintage graphs only, the legacy spellings `id`
 (and `src`/`dst` on edges) resolve to the system columns; the vintage keys
 the rule, never physical inspection. A new lint marks a bare name resolving
-to a system column as the legacy spelling. Inside the reserved namespace,
+to a system column as the legacy spelling, surfacing where query
+diagnostics already surface; whether responses carry a structured warnings
+field is settled during implementation. Inside the reserved namespace,
 single underscore belongs to the substrate (`_rowid`), double to OmniGraph
 (`__manifest`, `__graph_index`, now `__id`).
 
@@ -199,17 +206,45 @@ Per-name reservation lists must never come back.
 
 ### The upgrade
 
-One schema apply, atomic with its normal commit discipline: rename the
-system columns, advance the vintage, rewrite stored queries. The rewrite
-operates on the parsed query, never text: binding kinds come from the match
-clause; `$x.id` becomes `$x.@id`, `$e.src`/`$e.dst` the meta-field forms,
-bare `id`/`src`/`dst` in mutation predicates their meta-field forms. It is
-provably unambiguous for every graph the upgrade accepts: this RFC's
-collision validation (above) refuses IRs carrying a user property with
-those names, so every such reference means the system column. A stored query that fails to parse or compile fails the whole apply
-with a named error before any effect. The design assumes Lance column
-renames are metadata-only; verifying that is an implementation gate, with
-an explicit one-shot migration tool as fallback.
+The upgrade is invoked explicitly through one engine operation exposed on
+two surfaces: a CLI command in single-graph mode, and a per-graph field in
+the cluster configuration applied through the normal cluster apply in
+cluster mode (where HTTP schema apply is already disabled). The trigger
+path never invokes it: declaring a freed name on a pre-upgrade graph
+errors and names the upgrade; the layer that knows the invocation surface
+adds its remediation (the CLI command, or the cluster-config field). The upgrade apply renames the system columns
+and advances the vintage, atomic with its normal commit discipline. Stored queries stay outside that
+transaction deliberately: they are configuration the server loads into its
+registry at boot, and the graph transaction has no write authority over
+the operator's `.gq` sources or the cluster ledger. They are rewritten
+before the upgrade by a mechanical tool over the `.gq` sources. The
+rewrite operates on the parsed query, never text: binding kinds come from
+the match clause; `$x.id` becomes `$x.@id`, `$e.src`/`$e.dst` the
+meta-field forms, bare `id`/`src`/`dst` in mutation predicates their
+meta-field forms; a query that fails to parse is reported, never guessed
+at. Validation is assigned to the layers that own the state: in cluster
+mode, cluster apply validates the desired revision's query sources against
+the post-upgrade catalog before invoking the engine operation and refuses
+with a named error listing every stored query still using a legacy
+identity spelling; the existing boot-time registry check remains the
+enforcement on load, and in single-graph mode that same boot check is the
+gate at the next server start. Nothing mutates the registry or the query
+sources except the rewrite tool. The applied revision is always
+internally consistent: meta-fields resolve by role on every vintage, so a
+rewritten query is already valid on the still-old-vintage graph, and one
+cluster apply revision carries the rewritten query resources and the
+upgrade together. A serving process holds the registry it loaded at boot,
+so the upgrade revision is followed by the server restart the cluster
+workflow already requires for schema changes; the boot check refuses a
+stale registry, which closes that window. The
+rewrite is provably unambiguous for every graph the upgrade accepts: it
+runs pre-upgrade, where this RFC's collision validation (above) refuses
+IRs carrying a user property with those names, and an apply declaring a
+freed name pre-upgrade is refused, so no colliding property can appear
+between rewrite and upgrade; every such reference means the system column.
+The design assumes Lance column renames are metadata-only; verifying that
+is an implementation gate, with an explicit one-shot migration tool as
+fallback.
 
 ### Compiler and language
 
@@ -282,11 +317,14 @@ with the strongest external precedent.
 
 ## Unresolved questions
 
-1. Is a Lance column rename metadata-only? Implementation gate for the
-   upgrade; fallback is the migration tool.
+1. Is a Lance column rename metadata-only, and do existing indexes on the
+   renamed column survive it? Index names derive from column spellings and
+   index replacement is by name, so the upgrade may need to rebuild or
+   re-register indexes even if the data needs no rewrite. Implementation
+   gate for the upgrade; fallback is the migration tool.
 2. Do constraint references to endpoint columns adopt the meta-field
    spelling (`@unique(@src, @dst)`) or the storage spelling
-   (`@unique(__src, __dst)`, as the accompanying draft implementation is
-   expected to do)? Settled during implementation review.
+   (`@unique(__src, __dst)`, as the draft implementation is expected to
+   do)? Settled during implementation review.
 3. Release timing relative to other pre-1.0 format work. Settled by the
    maintainers when scheduling the format batch.
