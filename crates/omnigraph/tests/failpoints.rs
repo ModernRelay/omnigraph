@@ -11315,6 +11315,149 @@ node Document {
     );
 }
 
+/// The THIRD ABA window: after the final post-open logical head witness, no
+/// step of the poll may read the branch's numeric-path history live. Version
+/// manifests sit at replaceable numeric paths (unlike UUID-named data and
+/// transaction files), so a future `(begin, end]` history walk placed after
+/// `CHANGE_FEED_POST_HEAD_WITNESS` could classify replacement history. The
+/// current adjacent classifier reads the transaction referenced by the pinned
+/// child manifest and stores its complete plan before this witness; this cell
+/// locks that placement against a future widening. When replacement history at
+/// the same versions is row-set-preserving while the ORIGINAL commit carried a
+/// delete, a live post-witness classifier would silently omit that delete. The
+/// poll may instead fail loudly (reader survival across branch recreation is
+/// not promised), but any page it returns must carry the original delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn change_feed_poll_classifies_intervals_before_the_head_witness() {
+    use omnigraph::changes::{
+        ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart, ChangeOpKind,
+    };
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let schema = r#"
+node Document {
+    title: String @key
+    content: String
+}
+"#;
+    let setup = Omnigraph::init(&uri, schema).await.unwrap();
+    setup
+        .load(
+            "main",
+            r#"{"type":"Document","data":{"title":"base","content":"base"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    setup.branch_create("feature").await.unwrap();
+    // One load -> one fragment holding both rows. The follow-up delete then
+    // only adds a deletion vector, so across the delete commit's interval the
+    // retained manifests' fragment sets are identical — a wrongly-pruned
+    // enumeration derives an EMPTY candidate set and emits nothing.
+    let insert = setup
+        .load_with_receipt(
+            "feature",
+            concat!(
+                r#"{"type":"Document","data":{"title":"keep","content":"kept"}}"#,
+                "\n",
+                r#"{"type":"Document","data":{"title":"victim","content":"doomed"}}"#,
+            ),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let insert_commit_id = insert.commit.graph_commit_id.clone();
+    setup
+        .mutate(
+            "feature",
+            r#"
+query remove_victim() {
+    delete Document where title = "victim"
+}
+"#,
+            "remove_victim",
+            &mixed_params(&[], &[]),
+        )
+        .await
+        .unwrap();
+    drop(setup);
+
+    let reader = Omnigraph::open(&uri).await.unwrap();
+    let control = Omnigraph::open(&uri).await.unwrap();
+    let old_entry = control
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .dataset("node:Document")
+        .unwrap()
+        .clone();
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::CHANGE_FEED_POST_HEAD_WITNESS);
+    let request = ChangeFeedRequest {
+        branch: Some("feature".to_string()),
+        position: ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(insert_commit_id)),
+        scope: ChangeFeedScope::default(),
+        max_changes: None,
+        max_bytes: None,
+        max_commits: None,
+    };
+    let poll_task = tokio::spawn(async move { reader.poll_change_feed(request).await });
+    rendezvous.wait_until_reached().await;
+
+    // Replace the branch with history that is provably row-set-preserving at
+    // the same table versions: two marker-carrying keyed loads, landing the
+    // replacement's numeric version manifests exactly where the original
+    // insert + delete commits left theirs.
+    let replacement = async {
+        control.branch_delete("feature").await?;
+        control.branch_create("feature").await?;
+        control
+            .load(
+                "feature",
+                r#"{"type":"Document","data":{"title":"repl-one","content":"one"}}"#,
+                LoadMode::Merge,
+            )
+            .await?;
+        control
+            .load(
+                "feature",
+                r#"{"type":"Document","data":{"title":"repl-two","content":"two"}}"#,
+                LoadMode::Merge,
+            )
+            .await?;
+        control.snapshot_of(ReadTarget::branch("feature")).await
+    }
+    .await;
+    rendezvous.release();
+
+    let new_snapshot = replacement.expect("delete/recreate replacement must complete");
+    let new_entry = new_snapshot.dataset("node:Document").unwrap();
+    assert_eq!(
+        new_entry.published_dataset_version, old_entry.published_dataset_version,
+        "the regression must exercise same-version branch ABA"
+    );
+
+    if let Ok(page) = poll_task.await.unwrap() {
+        let carries_original_delete = page
+            .blocks
+            .iter()
+            .flat_map(|block| block.changes.iter())
+            .any(|change| change.op == ChangeOpKind::Delete && change.id.contains("victim"));
+        assert!(
+            carries_original_delete,
+            "a page returned across the in-poll delete/recreate must still carry the \
+             original commit's delete; omitting it silently is the classification ABA \
+             this cell pins: {page:?}"
+        );
+    }
+    // A loud refusal is acceptable: reader survival across branch recreation
+    // is not promised — only never-silent retargeting.
+}
+
 async fn setup_diverged_merge_branches(dir: &tempfile::TempDir) -> (String, usize) {
     let uri = dir.path().to_str().unwrap().to_string();
     let db = helpers::init_and_load(dir).await;

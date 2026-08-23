@@ -368,10 +368,15 @@ snapshot.
 
 An optimization may skip this comparison only after inspecting every exact
 table transaction in the interval and proving that every operation is a mature,
-row-set-preserving shape used by OmniGraph. Missing transaction files, cleaned
-version holes, `Overwrite`, `Restore`, delete-capable `Update`, unknown/new
-operation variants, and experimental Lance operations all mean **unknown** and
-fall back to the exact ID comparison. The optimization is never authority.
+row-set-preserving shape used by OmniGraph. A `RewriteRows` `Update` proves this
+only by carrying a durable OmniGraph provenance marker (`omnigraph.no_by_source_delete`,
+stamped on every keyed write, or the `insert_absence` certificate) — the op
+shape alone is insufficient because `repair --force` can adopt an external Lance
+merge that persists a delete-capable `Update{RewriteRows}`. Missing transaction
+files, cleaned version holes, `Overwrite`, `Restore`, an unmarked or
+delete-capable `Update`, unknown/new operation variants, and experimental Lance
+operations all mean **unknown** and fall back to the exact ID comparison. The
+optimization is never authority.
 
 Forbidden delete shortcuts:
 
@@ -658,6 +663,11 @@ Extend existing owners before adding a new test silo: `changes.rs`,
   merge-delete, compaction, and missing transaction files.
 - A source-walk or exhaustive match makes new Lance `Operation` variants fall
   back to exact ID comparison until reviewed.
+- A `RewriteRows` `Update` prunes only with a durable OmniGraph provenance proof
+  (`omnigraph.no_by_source_delete` marker or `insert_absence`); a marker-less
+  `Update` (an external delete-capable merge adopted via `repair --force`) falls
+  back. The write path stamps the marker at the one keyed merge chokepoint and it
+  survives commit → `list_transactions`.
 
 ### G0 — graph semantics
 
@@ -783,8 +793,8 @@ compatible graph schema established out of band.
 
 ## 11. Format and compatibility audit
 
-The C0–C4 core below persists nothing and therefore requires no internal-schema
-or recovery-schema bump:
+The C0–C4 read surfaces below persist nothing and therefore require no
+internal-schema or recovery-schema bump:
 
 - lineage and table pins already exist;
 - graph type identity already exists in accepted SchemaIR and is projected
@@ -793,12 +803,26 @@ or recovery-schema bump:
 - page tokens and cursors are caller-owned wire values;
 - typed errors and new read APIs are additive.
 
+One write-path addition accompanies the candidate-pruning optimization and is
+audited here as §11 requires for any persisted operation summary: every
+**general keyed MergeInsert update** stamps the advisory
+`omnigraph.no_by_source_delete=v1` Lance transaction property (proven strict
+inserts carry the `insert_absence` certificate instead — a separate,
+pre-existing property). The conclusion stands — **no format bump** — because
+the marker is read-advisory in every direction: a missing marker only forces
+the exact-merge fallback, never a correctness change, so pre-marker history and
+foreign transactions degrade to the authority path; older binaries ignore
+unknown transaction properties; and neither recovery nor publication consults
+it. It is an optimization-eligibility proof carried inside Lance's existing
+transaction-property surface, not a stored watermark, feed offset, or
+tombstone.
+
 Opaque page tokens and cursors have separate wire versions and decoders. An
 unsupported version or cross-use is a typed error, not best-effort decoding.
 
-Any implementation that proposes a stored watermark, feed offset, operation
-summary, delete tombstone, or historical SchemaIR changes this conclusion and
-must return to this RFC's format audit before landing.
+Any implementation that proposes a stored watermark, feed offset, a NON-advisory
+operation summary, delete tombstone, or historical SchemaIR changes this
+conclusion and must return to this RFC's format audit before landing.
 
 ## 12. Phasing
 
@@ -847,13 +871,66 @@ whose cost is justified by C1.
 C0 through C3 shipped on the surveyed contract. Details frozen by the
 implementation, recorded here so later phases inherit them:
 
-- **v1 derivation is the exact ordered-merge authority path only.** No
-  row-version candidate pruning and no transaction-interval no-delete proof
-  shipped; both remain the sanctioned optimizations of §4.2/§4.3. The cost
-  instrument (`changes_cost.rs`) pins the O(table-extent) scan term as a
-  growing tripwire that the pruning slice must flip to a flat assertion, and
-  pins bounded per-page opens, Blob-lazy payload work, data-flat caught-up
-  polls, and the one-manifest-snapshot-per-commit backlog term.
+- **Candidate pruning shipped (§4.2/§4.3).** The exact ordered merge remains the
+  authority path. The optimized contract is deliberately narrower: only one
+  **adjacent** Lance version (`end == begin + 1`) can prune. Classification reads
+  the already-open child's one transaction, requires its `read_version` to name
+  the pinned parent exactly, and accepts only `Append` or a `RewriteRows` merge
+  `Update` (an exhaustive, wildcard-free `Operation` match, so a new Lance
+  variant compile-errors into review). A wider graph-visible interval falls back
+  **before any transaction read**; stateless page-size-one resumes therefore
+  never replay a 1,024-version history walk.
+
+  The accepted plan is derived from the transaction footprint, not a full
+  manifest diff and not a secondary index. Lance manifests store fragments in
+  id order, fragment ids never recycle, and Append/Update assigns new fragments
+  consecutively above the parent high-water mark. The implementation
+  binary-searches the child for that suffix, verifies its count, consecutive ids,
+  and resulting high-water mark against the transaction, then binary-searches
+  the parent for the Update's `removed_fragment_ids` and `updated_fragments`.
+  Candidate rows are the new child fragments filtered by
+  `_row_last_updated_at_version ∈ (begin, end]`; before-images come from an
+  id-ordered scan of only those transaction-touched parent fragments. The two
+  streams merge one row at a time through the same typed
+  `rows_equal`/`emitted_image` machinery. There is no `id IN` probe and no BTREE
+  coverage precondition, so absent and partially covered indexes have the same
+  execution shape. Metadata planning costs
+  `O(log F + T log F)` for `F` manifest fragments and `T` touched parent/new
+  fragments; data work is bounded by the new fragments plus rows in touched
+  parent fragments, not total dataset extent. This is the precise shipped claim
+  (not unconditional `O(delta)` for an arbitrarily large touched fragment).
+
+  A `RewriteRows` `Update` is trusted as delete-free only with a **durable
+  per-transaction provenance proof** — the `omnigraph.no_by_source_delete`
+  marker every general keyed MergeInsert update stamps
+  (`table_store::stamp_no_by_source_delete` at the one keyed merge chokepoint),
+  or the RFC-023 `insert_absence` certificate carried by proven strict inserts.
+  The op shape plus D2 and the retained `forbidden_apis.rs` source guard
+  (`no_delete_capable_merge_arm_in_engine_source`, now defense-in-depth) prove
+  only that current engine code builds no by-source-delete arm; they cannot
+  authenticate a persisted `Update` adopted through `repair --force --confirm`.
+  An Update carrying neither proof therefore falls back, as does any removing,
+  unknown, non-adjacent, missing-transaction, identity, or branch mismatch.
+  Pruning additionally requires every new child fragment's
+  `_row_last_updated_at_version` sequence to be inline, decodable, and exactly
+  `physical_rows` long; pinned Lance 10 otherwise silently supplies version 1,
+  which could hide a real update for `begin > 1`.
+
+  Candidate scans derive their row target from the remaining page rows plus one
+  continuation sentinel and their byte target from the remaining page bytes.
+  `OrderedRows` retains one scanner batch and prepares only the current row; the
+  former 8,192-`RawRow` queue, cloned id vector, parent HashMap, and queued Emits
+  are gone. An exhausted page consumes one sentinel to prove continuation but
+  does not materialize its JSON or Blob payload. `changes_cost.rs` pins all of
+  these terms: absent and stale-index extent curves remain flat in data reads;
+  fragment-metadata steps stay logarithmic; adjacent intervals read exactly one
+  transaction; a forced-repair graph commit adopting two raw logical updates
+  resumes across two size-one pages with zero candidate transaction reads on
+  both; and each of two stateless size-one pages over a 2,048-row Blob delta
+  examines exactly two candidates with row target 2 and the caller's byte target
+  while materializing only the emitted image (the sentinel performs no JSON or
+  Blob payload work).
+  The exact-merge fallback retains a companion growing extent tripwire.
 - **Typed structural equality** uses Arrow logical equality on one-row
   slices for non-Blob user columns and physical descriptor identity with an
   exact payload tie-break for Blob columns. Float comparison is bitwise.
