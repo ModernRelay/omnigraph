@@ -872,47 +872,65 @@ C0 through C3 shipped on the surveyed contract. Details frozen by the
 implementation, recorded here so later phases inherit them:
 
 - **Candidate pruning shipped (§4.2/§4.3).** The exact ordered merge remains the
-  authority path, but a proven row-set-preserving interval is now derived in
-  O(delta) (`changes::candidate_scan`). Per changed interval the classifier reads
-  the interval's Lance transactions and requires every op to be `Append` or a
-  `RewriteRows` merge `Update` (an exhaustive, wildcard-free `Operation` match, so
-  a new Lance variant compile-errors into review). When proven, the child scan is
-  scoped by `Scanner::with_fragments` to exactly the fragments the parent lacks
-  (the manifest diff — no data reads to compute) with the
-  `_row_last_updated_at_version ∈ (begin, end]` window dropping carried-over rows,
-  and each candidate is classified against a batched `id IN (chunk)` BTREE probe
-  of the parent using the same typed `rows_equal`/`emitted_image`. A `RewriteRows`
-  `Update` is trusted as delete-free only with a **durable per-transaction
-  provenance proof** — the `omnigraph.no_by_source_delete` marker every
-  **general keyed MergeInsert update** stamps
-  (`table_store::stamp_no_by_source_delete` at the one keyed merge chokepoint;
-  proven strict inserts carry the RFC-023 `insert_absence` certificate instead),
-  or that `insert_absence` certificate itself. The op shape
-  plus the D2 rule and the retained `forbidden_apis.rs` source guard
+  authority path. The optimized contract is deliberately narrower: only one
+  **adjacent** Lance version (`end == begin + 1`) can prune. Classification reads
+  the already-open child's one transaction, requires its `read_version` to name
+  the pinned parent exactly, and accepts only `Append` or a `RewriteRows` merge
+  `Update` (an exhaustive, wildcard-free `Operation` match, so a new Lance
+  variant compile-errors into review). A wider graph-visible interval falls back
+  **before any transaction read**; stateless page-size-one resumes therefore
+  never replay a 1,024-version history walk.
+
+  The accepted plan is derived from the transaction footprint, not a full
+  manifest diff and not a secondary index. Lance manifests store fragments in
+  id order, fragment ids never recycle, and Append/Update assigns new fragments
+  consecutively above the parent high-water mark. The implementation
+  binary-searches the child for that suffix, verifies its count, consecutive ids,
+  and resulting high-water mark against the transaction, then binary-searches
+  the parent for the Update's `removed_fragment_ids` and `updated_fragments`.
+  Candidate rows are the new child fragments filtered by
+  `_row_last_updated_at_version ∈ (begin, end]`; before-images come from an
+  id-ordered scan of only those transaction-touched parent fragments. The two
+  streams merge one row at a time through the same typed
+  `rows_equal`/`emitted_image` machinery. There is no `id IN` probe and no BTREE
+  coverage precondition, so absent and partially covered indexes have the same
+  execution shape. Metadata planning costs
+  `O(log F + T log F)` for `F` manifest fragments and `T` touched parent/new
+  fragments; data work is bounded by the new fragments plus rows in touched
+  parent fragments, not total dataset extent. This is the precise shipped claim
+  (not unconditional `O(delta)` for an arbitrarily large touched fragment).
+
+  A `RewriteRows` `Update` is trusted as delete-free only with a **durable
+  per-transaction provenance proof** — the `omnigraph.no_by_source_delete`
+  marker every general keyed MergeInsert update stamps
+  (`table_store::stamp_no_by_source_delete` at the one keyed merge chokepoint),
+  or the RFC-023 `insert_absence` certificate carried by proven strict inserts.
+  The op shape plus D2 and the retained `forbidden_apis.rs` source guard
   (`no_delete_capable_merge_arm_in_engine_source`, now defense-in-depth) prove
-  only that *current engine code* builds no by-source-delete arm; they cannot
-  authenticate a *persisted* `Update` that `repair --force --confirm` may adopt
-  from an external Lance merge, whose child-only candidate scan would silently
-  drop the removed rows. So an `Update` carrying neither proof falls back to the
-  exact merge, as does any unproven op (delete, overwrite, restore, compaction, a
-  branch/lineage change, a non-advancing or oversized interval, a missing/cleaned
-  transaction). The `changes_cost.rs` tripwire is now `assert_flat` on the pruned
-  path (data reads do not grow with table extent at fixed Δ, with a reconciled
-  `id` BTREE — the production steady state) with a companion growing tripwire for
-  the fallback; bounded per-page opens, Blob-lazy payload work, data-flat
-  caught-up polls, and the one-manifest-snapshot-per-commit backlog term are
-  still pinned. Shipped: the inductive per-write row-set-preserving proof is the
-  read-advisory `no_by_source_delete` marker (stamped unconditionally on every
-  general keyed MergeInsert update; a missing marker only forces the
-  exact-merge fallback, never a correctness change — see the §11 audit note).
-  It is required independently of whether a delete-capable arm ever exists in
-  engine, because the exposure is external *persisted* history adopted by
-  `repair --force`, not engine code. Pruning additionally requires every
-  changed fragment's `_row_last_updated_at_version` sequence to be present and
-  decodable: pinned Lance 10 silently fills the column with 1 when a sequence
-  is missing or fails to load, which would empty the candidate window for
-  `begin > 1`; a fragment failing that loadability gate falls the interval
-  back to the exact merge.
+  only that current engine code builds no by-source-delete arm; they cannot
+  authenticate a persisted `Update` adopted through `repair --force --confirm`.
+  An Update carrying neither proof therefore falls back, as does any removing,
+  unknown, non-adjacent, missing-transaction, identity, or branch mismatch.
+  Pruning additionally requires every new child fragment's
+  `_row_last_updated_at_version` sequence to be inline, decodable, and exactly
+  `physical_rows` long; pinned Lance 10 otherwise silently supplies version 1,
+  which could hide a real update for `begin > 1`.
+
+  Candidate scans derive their row target from the remaining page rows plus one
+  continuation sentinel and their byte target from the remaining page bytes.
+  `OrderedRows` retains one scanner batch and prepares only the current row; the
+  former 8,192-`RawRow` queue, cloned id vector, parent HashMap, and queued Emits
+  are gone. An exhausted page consumes one sentinel to prove continuation but
+  does not materialize its JSON or Blob payload. `changes_cost.rs` pins all of
+  these terms: absent and stale-index extent curves remain flat in data reads;
+  fragment-metadata steps stay logarithmic; adjacent intervals read exactly one
+  transaction; a forced-repair graph commit adopting two raw logical updates
+  resumes across two size-one pages with zero candidate transaction reads on
+  both; and each of two stateless size-one pages over a 2,048-row Blob delta
+  examines exactly two candidates with row target 2 and the caller's byte target
+  while materializing only the emitted image (the sentinel performs no JSON or
+  Blob payload work).
+  The exact-merge fallback retains a companion growing extent tripwire.
 - **Typed structural equality** uses Arrow logical equality on one-row
   slices for non-Blob user columns and physical descriptor identity with an
   exact payload tie-break for Blob columns. Float comparison is bitwise.

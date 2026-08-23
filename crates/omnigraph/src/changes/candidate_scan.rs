@@ -2,25 +2,26 @@
 //! (RFC-030 §4.2/§4.3).
 //!
 //! The authority path in [`super::enumerate`] derives one commit's changes by a
-//! full ordered-by-id merge of both pinned table versions — O(table extent).
-//! When the commit's effect on a table is a mature, row-set-preserving
-//! insert/update shape, the same logical changes can be derived in O(delta): a
-//! candidate scan of the rows the commit touched (by Lance row-version columns)
-//! plus a batched exact-id probe of the parent for before-images. This module
-//! decides, per interval, whether that optimization is available; the caller
-//! falls back to the exact full merge on any doubt.
+//! full ordered-by-id merge of both pinned dataset versions — O(dataset
+//! extent). When one adjacent Lance transaction has a mature,
+//! row-set-preserving insert/update shape, the same logical changes can be
+//! derived from that transaction's physical footprint: candidate rows come
+//! from the newly assigned child-fragment suffix and before-images come from
+//! only the parent fragments the transaction updated or removed. Both sides
+//! are merged as ordered streams. This module decides, per interval, whether
+//! that optimization is available; the caller falls back to the exact full
+//! merge on any doubt.
 //!
-//! **Why the pruned path needs no delete handling.** A single graph commit
-//! advances a touched table by exactly one Lance version (one transaction), and
-//! the parse-time D2 rule keeps inserts/updates and deletes out of the same
-//! mutation. So a commit's effect on one table is *either* a row-set-preserving
-//! insert/update *or* a delete — never both. If every transaction in the
-//! interval is an `Append` or a **provably** row-set-preserving merge `Update`,
-//! then no live logical id can disappear (neither op removes a row), so the
-//! interval has zero logical deletes and the candidate scan is complete. Any
-//! operation that can remove, reuse, or re-stamp rows (`Delete`, `Overwrite`,
-//! `Restore`, compaction `Rewrite`, …) makes the whole interval fall back to the
-//! exact merge, which classifies deletes correctly.
+//! **Why the pruned path needs no delete handling.** Eligibility first requires
+//! one graph-visible dataset interval to advance by exactly one Lance version.
+//! The parse-time D2 rule keeps inserts/updates and deletes out of the same
+//! mutation, so an engine-authored adjacent transaction is either a
+//! row-set-preserving insert/update or a delete — never both. If that one
+//! transaction is an `Append` or a **provably** row-set-preserving merge
+//! `Update`, no live logical id can disappear and the candidate scan is
+//! complete. Any wider interval or operation that can remove, reuse, or
+//! re-stamp rows (`Delete`, `Overwrite`, `Restore`, compaction `Rewrite`, …)
+//! falls back to the exact merge, which classifies deletes correctly.
 //!
 //! A `RewriteRows` `Update` is trusted as row-set-preserving only with a
 //! **durable per-transaction provenance proof** — the `omnigraph.no_by_source_delete`
@@ -34,8 +35,6 @@
 //! authenticates the *persisted* transaction. An unproven `Update` falls back.
 //! See [`transaction_is_row_set_preserving`].
 
-use std::collections::{HashMap, VecDeque};
-
 use datafusion::prelude::{col, lit};
 use lance::Dataset;
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
@@ -43,25 +42,16 @@ use lance_table::format::Fragment;
 
 use super::enumerate::{Emit, next_emit};
 use super::model::ChangeFeedScope;
-use super::row_compare::{OrderedRows, RawRow, rows_equal};
-use crate::db::SubTableEntry;
+use super::row_compare::{OrderedRows, ScanTargets, rows_equal};
+use crate::db::DatasetEntry;
 use crate::error::Result;
 use crate::table_store::{has_insert_absence_certificate, has_no_by_source_delete_marker};
 
-/// Parent probe chunk size: one BTREE-backed `id IN (chunk)` lookup per chunk,
-/// matching the keyed-write delta bound (`UNIQUE_PROBE_CHUNK_KEYS`).
-const PARENT_PROBE_CHUNK: usize = 8_192;
-
-/// Scan bound on the transaction interval, mirroring the branch-merge
-/// pure-insert history walk (`PURE_INSERT_HISTORY_MAX_VERSIONS`). A commit
-/// normally advances a table by one version, so this is a generous ceiling that
-/// still refuses to walk an unbounded interval.
-const CANDIDATE_SCAN_MAX_VERSIONS: u64 = 1_024;
-
 /// Whether one Lance transaction's operation preserves the live logical row set
 /// — i.e. can only add or modify rows in place, never remove, reuse, or re-stamp
-/// a logical id. Only such operations are safe to derive by candidate scan +
-/// parent probe; everything else forces the exact ordered merge.
+/// a logical id. Only such operations are safe to derive from candidate and
+/// transaction-touched parent fragments; everything else forces the exact
+/// ordered merge.
 ///
 /// The match is exhaustive with **no wildcard arm**: a new Lance `Operation`
 /// variant is a compile error that forces this classification to be reviewed
@@ -96,7 +86,8 @@ pub(crate) fn operation_is_row_set_preserving(operation: &Operation) -> bool {
     }
 }
 
-/// Whether one transaction is safe to derive by the O(delta) candidate path.
+/// Whether one transaction is safe to derive by the touched-fragment candidate
+/// path.
 ///
 /// It must have a row-set-preserving operation SHAPE
 /// ([`operation_is_row_set_preserving`]) AND, for a `RewriteRows` `Update`, a
@@ -128,87 +119,147 @@ pub(crate) fn transaction_is_row_set_preserving(transaction: &Transaction) -> bo
     }
 }
 
-/// The changed child fragments if this interval can be derived by the O(delta)
-/// candidate path, or `None` to use the exact ordered merge.
+/// Immutable physical plan for a proven adjacent candidate interval. Both
+/// vectors are bounded by the one transaction's touched-fragment footprint;
+/// neither is a copy of the full manifest.
+#[derive(Debug, Clone)]
+pub(crate) struct CandidatePlan {
+    child_fragments: Vec<Fragment>,
+    parent_fragments: Vec<Fragment>,
+}
+
+/// Return the candidate plan for one adjacent, row-set-preserving Lance
+/// transaction, or `None` to use the exact ordered merge.
 ///
-/// Requires: same table branch and immutable identity; the end version strictly
-/// advances from begin within the scan bound; both pinned handles are at their
-/// exact expected versions and use stable row IDs (so both row-version columns
-/// are active); and every transaction in `(begin, end]` is row-set-preserving.
-/// Any doubt — a branch/lineage change, a non-advancing or oversized interval,
-/// an inactive row-version column, a missing/cleaned transaction, or an unproven
-/// operation — returns `Ok(None)` so the caller uses the exact merge. It never
-/// returns `Err` for a normal miss (e.g. cleaned history).
+/// The adjacency requirement is deliberate. A stateless page may be resumed
+/// many times; walking up to 1,024 historical transactions on every page would
+/// multiply history work by page count. An interval wider than one version now
+/// falls back *before any transaction read*. For the accepted shape we read
+/// only the already-open child's one transaction and require its `read_version`
+/// to name the pinned parent exactly.
 ///
-/// The `(begin, end]` transaction walk is a LIVE read of numeric-path version
-/// manifests — the one replaceable read on the pruned path (data and
-/// transaction files are UUID-named). The sole caller is `plan_intervals`,
-/// which runs it BEFORE the final `reprove_named_branch_heads` witness so a
-/// branch delete/recreate cannot swap the classified history; the
-/// `CHANGE_FEED_POST_HEAD_WITNESS` failpoint cell pins that ordering.
-pub(crate) async fn interval_changed_fragments(
-    from_entry: &SubTableEntry,
-    to_entry: &SubTableEntry,
+/// Fragment discovery uses Lance's manifest invariants: fragments are sorted
+/// by id, ids never recycle, and one Append/Update assigns every new fragment
+/// consecutively above the parent's high-water mark. The child suffix is found
+/// by binary search; affected parent fragments are found by one binary search
+/// per transaction-reported id. Work is therefore
+/// O(log(manifest) + touched_fragments log(manifest)), with allocations bounded
+/// by touched fragments rather than total dataset extent.
+///
+/// `read_transaction` follows the transaction reference already captured in
+/// the pinned child manifest; Lance transaction objects are UUID-named. The
+/// sole caller nevertheless stores the complete plan before the final
+/// named-branch head witness, and emission performs no later history lookup.
+pub(crate) async fn interval_candidate_plan(
+    from_entry: &DatasetEntry,
+    to_entry: &DatasetEntry,
     from_dataset: &Dataset,
     to_dataset: &Dataset,
-) -> Result<Option<Vec<Fragment>>> {
-    if from_entry.table_branch != to_entry.table_branch || from_entry.identity != to_entry.identity
+) -> Result<Option<CandidatePlan>> {
+    if from_entry.native_dataset_branch != to_entry.native_dataset_branch
+        || from_entry.identity != to_entry.identity
     {
         return Ok(None);
     }
-    let Some(version_count) = to_entry
-        .table_version
-        .checked_sub(from_entry.table_version)
-        .filter(|count| *count > 0 && *count <= CANDIDATE_SCAN_MAX_VERSIONS)
-    else {
+    if from_entry.published_dataset_version.checked_add(1)
+        != Some(to_entry.published_dataset_version)
+    {
         return Ok(None);
-    };
-    if to_dataset.version().version != to_entry.table_version
-        || from_dataset.version().version != from_entry.table_version
+    }
+    if to_dataset.version().version != to_entry.published_dataset_version
+        || from_dataset.version().version != from_entry.published_dataset_version
         || !to_dataset.manifest.uses_stable_row_ids()
         || !from_dataset.manifest.uses_stable_row_ids()
     {
         return Ok(None);
     }
 
-    // Walk every transaction in (begin, end]. A build/list error or a missing
-    // transaction is a normal miss (cleaned history) — not prunable, not an
-    // error.
-    let Ok(delta) = to_dataset
-        .delta()
-        .with_begin_version(from_entry.table_version)
-        .with_end_version(to_entry.table_version)
-        .build()
-    else {
+    crate::instrumentation::record_candidate_transaction_read();
+    let Ok(Some(transaction)) = to_dataset.read_transaction().await else {
         return Ok(None);
     };
-    let Ok(transactions) = delta.list_transactions().await else {
-        return Ok(None);
-    };
-    if u64::try_from(transactions.len()).ok() != Some(version_count) {
-        return Ok(None);
-    }
-    if !transactions.iter().all(transaction_is_row_set_preserving) {
+    if transaction.read_version != from_entry.published_dataset_version
+        || !transaction_is_row_set_preserving(&transaction)
+    {
         return Ok(None);
     }
 
-    // The changed fragments are exactly the child fragments the parent does not
-    // have: every proven op only ADDS fragments (append, or rewrite = remove old
-    // + add new), so a child fragment absent from the parent carries this
-    // interval's inserted/updated rows. Computed from the already-loaded
-    // manifests — no object-store data reads — so the candidate scan reads only
-    // O(delta) fragments.
-    let parent_ids: std::collections::HashSet<u64> = from_dataset
-        .fragments()
-        .iter()
-        .map(|fragment| fragment.id)
-        .collect();
-    let changed: Vec<Fragment> = to_dataset
-        .fragments()
-        .iter()
-        .filter(|fragment| !parent_ids.contains(&fragment.id))
-        .cloned()
-        .collect();
+    Ok(candidate_plan_from_transaction(
+        &transaction.operation,
+        from_dataset,
+        to_dataset,
+    ))
+}
+
+fn candidate_plan_from_transaction(
+    operation: &Operation,
+    from_dataset: &Dataset,
+    to_dataset: &Dataset,
+) -> Option<CandidatePlan> {
+    let (new_fragment_count, mut parent_fragment_ids) = match operation {
+        Operation::Append { fragments } => (fragments.len(), Vec::new()),
+        Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+            ..
+        } => {
+            let mut ids = Vec::with_capacity(
+                removed_fragment_ids
+                    .len()
+                    .saturating_add(updated_fragments.len()),
+            );
+            ids.extend(removed_fragment_ids.iter().copied());
+            ids.extend(updated_fragments.iter().map(|fragment| fragment.id));
+            (new_fragments.len(), ids)
+        }
+        _ => return None,
+    };
+    parent_fragment_ids.sort_unstable();
+    parent_fragment_ids.dedup();
+
+    let parent_high_water = from_dataset.manifest.max_fragment_id();
+    let (suffix_start, mut metadata_steps) =
+        first_fragment_after(to_dataset.fragments(), parent_high_water);
+    let child_fragments = &to_dataset.fragments()[suffix_start..];
+    metadata_steps = metadata_steps.saturating_add(child_fragments.len() as u64);
+    if child_fragments.len() != new_fragment_count {
+        crate::instrumentation::record_candidate_fragment_metadata_steps(metadata_steps);
+        return None;
+    }
+
+    let expected_first = match parent_high_water {
+        Some(id) => id.checked_add(1)?,
+        None => 0,
+    };
+    for (offset, fragment) in child_fragments.iter().enumerate() {
+        let expected_id = expected_first.checked_add(u64::try_from(offset).ok()?)?;
+        if fragment.id != expected_id {
+            crate::instrumentation::record_candidate_fragment_metadata_steps(metadata_steps);
+            return None;
+        }
+    }
+    let expected_high_water = if new_fragment_count == 0 {
+        parent_high_water
+    } else {
+        Some(expected_first.checked_add(u64::try_from(new_fragment_count - 1).ok()?)?)
+    };
+    if to_dataset.manifest.max_fragment_id() != expected_high_water {
+        crate::instrumentation::record_candidate_fragment_metadata_steps(metadata_steps);
+        return None;
+    }
+
+    let mut parent_fragments = Vec::with_capacity(parent_fragment_ids.len());
+    for fragment_id in parent_fragment_ids {
+        let (fragment, steps) = find_fragment(from_dataset.fragments(), fragment_id);
+        metadata_steps = metadata_steps.saturating_add(steps);
+        let Some(fragment) = fragment else {
+            crate::instrumentation::record_candidate_fragment_metadata_steps(metadata_steps);
+            return None;
+        };
+        parent_fragments.push(fragment.clone());
+    }
+
     // Row-version metadata is correctness-bearing on the pruned path: the
     // candidate scan filters on `_row_last_updated_at_version`, and pinned
     // Lance 10 silently fills that column with 1 for a fragment whose sequence
@@ -219,10 +270,55 @@ pub(crate) async fn interval_changed_fragments(
     // error. Require every changed fragment to carry loadable, structurally
     // valid last-updated metadata; any gap is a normal miss that falls back to
     // the exact ordered merge (which does not consume the version column).
-    if !changed.iter().all(fragment_version_metadata_is_loadable) {
-        return Ok(None);
+    if !child_fragments
+        .iter()
+        .all(fragment_version_metadata_is_loadable)
+    {
+        crate::instrumentation::record_candidate_fragment_metadata_steps(metadata_steps);
+        return None;
     }
-    Ok(Some(changed))
+    crate::instrumentation::record_candidate_fragment_metadata_steps(metadata_steps);
+    Some(CandidatePlan {
+        child_fragments: child_fragments.to_vec(),
+        parent_fragments,
+    })
+}
+
+/// Binary-search the first manifest fragment above `high_water`, counting the
+/// metadata comparisons for the checked-in fragment-scaling cost gate.
+fn first_fragment_after(fragments: &[Fragment], high_water: Option<u64>) -> (usize, u64) {
+    let Some(high_water) = high_water else {
+        return (0, 0);
+    };
+    let mut left = 0usize;
+    let mut right = fragments.len();
+    let mut steps = 0u64;
+    while left < right {
+        steps = steps.saturating_add(1);
+        let middle = left + (right - left) / 2;
+        if fragments[middle].id <= high_water {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+    (left, steps)
+}
+
+fn find_fragment(fragments: &[Fragment], id: u64) -> (Option<&Fragment>, u64) {
+    let mut left = 0usize;
+    let mut right = fragments.len();
+    let mut steps = 0u64;
+    while left < right {
+        steps = steps.saturating_add(1);
+        let middle = left + (right - left) / 2;
+        match fragments[middle].id.cmp(&id) {
+            std::cmp::Ordering::Less => left = middle + 1,
+            std::cmp::Ordering::Greater => right = middle,
+            std::cmp::Ordering::Equal => return (Some(&fragments[middle]), steps),
+        }
+    }
+    (None, steps)
 }
 
 /// Whether one changed fragment's `_row_last_updated_at_version` sequence is
@@ -253,66 +349,75 @@ fn fragment_version_metadata_is_loadable(fragment: &Fragment) -> bool {
         .is_some_and(|rows| sequence.len() == rows as u64)
 }
 
-/// Fetch full before-image rows for `ids` from the parent handle in one
-/// BTREE-backed `id IN (chunk)` lookup (never per-row round trips, never a
-/// string filter). The returned rows carry `_rowid`/`_rowaddr` and Blob
-/// descriptions so `rows_equal` and `emitted_image` behave exactly as on the
-/// full-merge path.
-async fn probe_parent_images(parent: &Dataset, ids: &[String]) -> Result<HashMap<String, RawRow>> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let filter = col("id").in_list(ids.iter().map(|id| lit(id.clone())).collect(), false);
-    let mut rows = OrderedRows::open_filtered(parent.clone(), None, Some(filter)).await?;
-    let mut images = HashMap::with_capacity(ids.len());
-    while let Some(row) = rows.pop().await? {
-        images.insert(row.id.clone(), row);
-    }
-    Ok(images)
-}
-
-/// The O(delta) emitter for a proven row-set-preserving interval: an id-ordered
-/// scan of the rows the commit touched (by `_row_last_updated_at_version`) plus
-/// a batched parent probe for before-images. It yields only inserts and updates
-/// — a prunable interval has zero logical deletes (see the module docs), so no
-/// delete pass is needed.
+/// Emitter for a proven adjacent row-set-preserving interval. Candidate child
+/// rows and the transaction-touched parent fragments are both scanned in id
+/// order and merged one row at a time. No BTREE is required, so a missing or
+/// partially covered index cannot turn the parent lookup into a hidden
+/// full-dataset scan. At most one prepared row from either stream is retained;
+/// scanner batch targets come from the current page budget.
 pub(crate) struct CandidateUpserts {
-    parent: Dataset,
+    parent_dataset: Dataset,
+    parents: Option<OrderedRows>,
     candidates: OrderedRows,
     scope: ChangeFeedScope,
-    ready: VecDeque<Emit>,
 }
 
 impl CandidateUpserts {
     async fn open(
-        from_entry: &SubTableEntry,
-        to_entry: &SubTableEntry,
+        from_entry: &DatasetEntry,
+        to_entry: &DatasetEntry,
         from_dataset: Dataset,
         to_dataset: Dataset,
-        changed_fragments: Vec<Fragment>,
+        plan: CandidatePlan,
         after_id: Option<&str>,
         scope: ChangeFeedScope,
+        scan_targets: ScanTargets,
     ) -> Result<Self> {
-        // Scan only the fragments this commit wrote (O(delta)), and within them
+        crate::instrumentation::record_candidate_scan_targets(
+            scan_targets.rows(),
+            scan_targets.bytes(),
+        );
+        // Scan only the new fragments this commit wrote, and within them
         // keep rows whose last update lands in (begin, end] — this drops the
         // carried-over rows a fragment rewrite pulled along, leaving exactly the
-        // inserted and updated rows (the parent probe classifies which).
+        // inserted and updated rows (the touched-parent merge classifies which).
         let window = col("_row_last_updated_at_version")
-            .gt(lit(from_entry.table_version))
-            .and(col("_row_last_updated_at_version").lt_eq(lit(to_entry.table_version)));
-        let candidates =
-            OrderedRows::open_scan(to_dataset, after_id, Some(window), Some(changed_fragments))
-                .await?;
+            .gt(lit(from_entry.published_dataset_version))
+            .and(
+                col("_row_last_updated_at_version").lt_eq(lit(to_entry.published_dataset_version)),
+            );
+        let candidates = OrderedRows::open_scan(
+            to_dataset,
+            after_id,
+            Some(window),
+            Some(plan.child_fragments),
+            scan_targets,
+        )
+        .await?;
+        let parents = if plan.parent_fragments.is_empty() {
+            None
+        } else {
+            Some(
+                OrderedRows::open_scan(
+                    from_dataset.clone(),
+                    after_id,
+                    None,
+                    Some(plan.parent_fragments),
+                    scan_targets,
+                )
+                .await?,
+            )
+        };
         Ok(Self {
-            parent: from_dataset,
+            parent_dataset: from_dataset,
+            parents,
             candidates,
             scope,
-            ready: VecDeque::new(),
         })
     }
 
     fn parent_dataset(&self) -> &Dataset {
-        &self.parent
+        &self.parent_dataset
     }
 
     fn child_dataset(&self) -> &Dataset {
@@ -321,118 +426,129 @@ impl CandidateUpserts {
 
     async fn next(&mut self) -> Result<Option<Emit>> {
         loop {
-            if let Some(emit) = self.ready.pop_front() {
-                return Ok(Some(emit));
-            }
-            // Pull the next id-ordered chunk of candidates, then probe the
-            // parent once for the whole chunk.
-            let mut chunk: Vec<RawRow> = Vec::new();
-            while chunk.len() < PARENT_PROBE_CHUNK {
-                match self.candidates.pop().await? {
-                    Some(row) => chunk.push(row),
-                    None => break,
-                }
-            }
-            if chunk.is_empty() {
+            let Some(candidate) = self.candidates.pop().await? else {
                 return Ok(None);
-            }
-            let ids: Vec<String> = chunk.iter().map(|row| row.id.clone()).collect();
-            let parents = probe_parent_images(&self.parent, &ids).await?;
-            for candidate in chunk {
-                let emit = match parents.get(&candidate.id) {
-                    // Absent in the parent -> a new logical id -> insert.
-                    None => Emit::Insert(candidate),
-                    // Present in the parent -> update unless the logical image is
-                    // unchanged (a physical no-op / metadata-only movement).
-                    Some(before) => {
-                        if rows_equal(&self.parent, before, self.candidates.dataset(), &candidate)
-                            .await?
-                        {
-                            continue;
+            };
+            crate::instrumentation::record_candidate_row_examined();
+
+            let mut before = None;
+            if let Some(parents) = self.parents.as_mut() {
+                loop {
+                    let parent_id = parents.peek().await?.map(|row| row.id.clone());
+                    match parent_id {
+                        Some(parent_id) if parent_id < candidate.id => {
+                            // An unrelated row carried by a touched source
+                            // fragment; it cannot be this candidate's before image.
+                            parents.pop().await?;
                         }
-                        Emit::Update {
-                            before: before.clone(),
-                            after: candidate,
+                        Some(parent_id) if parent_id == candidate.id => {
+                            before = parents.pop().await?;
+                            break;
                         }
+                        _ => break,
                     }
-                };
-                if self.scope.wants_op(emit.op()) {
-                    self.ready.push_back(emit);
                 }
+            }
+
+            let emit = match before {
+                None => Emit::Insert(candidate),
+                Some(before) => {
+                    if rows_equal(
+                        &self.parent_dataset,
+                        &before,
+                        self.candidates.dataset(),
+                        &candidate,
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
+                    Emit::Update {
+                        before,
+                        after: candidate,
+                    }
+                }
+            };
+            if self.scope.wants_op(emit.op()) {
+                return Ok(Some(emit));
             }
         }
     }
 }
 
-/// Per-interval change emitter: the O(delta) candidate path when the interval is
-/// provably row-set-preserving, else the exact full ordered merge. Both yield
-/// the same id-ordered `Emit` stream; before-images come from the parent handle
-/// and after-images from the child handle.
+/// Per-interval change emitter: the touched-fragment candidate path when the
+/// interval is provably row-set-preserving, else the exact full ordered merge.
+/// Both yield the same id-ordered `Emit` stream; before-images come from the
+/// parent handle and after-images from the child handle.
+pub(crate) struct FullMergeRows {
+    from: OrderedRows,
+    to: OrderedRows,
+    scope: ChangeFeedScope,
+}
+
 pub(crate) enum EmitSource {
-    FullMerge {
-        from: OrderedRows,
-        to: OrderedRows,
-        scope: ChangeFeedScope,
-    },
-    Pruned(CandidateUpserts),
+    FullMerge(Box<FullMergeRows>),
+    Pruned(Box<CandidateUpserts>),
 }
 
 impl EmitSource {
-    /// Open the emitter for one interval. `changed_fragments` is the pruning
-    /// decision [`interval_changed_fragments`] computed in `plan_intervals`
-    /// UNDER the final head witness — this constructor performs no live
-    /// history read, so a branch delete/recreate after the witness cannot
-    /// reroute the interval.
+    /// Open the emitter for one interval. `candidate_plan` is the pruning
+    /// decision [`interval_candidate_plan`] computed in `plan_intervals` before
+    /// (and therefore covered by) the final head witness. This constructor
+    /// performs no live history read, so a branch delete/recreate after the
+    /// witness cannot reroute the interval.
     pub(crate) async fn plan(
-        from_entry: &SubTableEntry,
-        to_entry: &SubTableEntry,
+        from_entry: &DatasetEntry,
+        to_entry: &DatasetEntry,
         from_dataset: Dataset,
         to_dataset: Dataset,
-        changed_fragments: Option<Vec<Fragment>>,
+        candidate_plan: Option<CandidatePlan>,
         after_id: Option<&str>,
         scope: &ChangeFeedScope,
+        scan_targets: ScanTargets,
     ) -> Result<Self> {
-        if let Some(changed_fragments) = changed_fragments {
-            Ok(Self::Pruned(
+        if let Some(candidate_plan) = candidate_plan {
+            Ok(Self::Pruned(Box::new(
                 CandidateUpserts::open(
                     from_entry,
                     to_entry,
                     from_dataset,
                     to_dataset,
-                    changed_fragments,
+                    candidate_plan,
                     after_id,
                     scope.clone(),
+                    scan_targets,
                 )
                 .await?,
-            ))
+            )))
         } else {
             let from = OrderedRows::open(from_dataset, after_id).await?;
             let to = OrderedRows::open(to_dataset, after_id).await?;
-            Ok(Self::FullMerge {
+            Ok(Self::FullMerge(Box::new(FullMergeRows {
                 from,
                 to,
                 scope: scope.clone(),
-            })
+            })))
         }
     }
 
     pub(crate) async fn next(&mut self) -> Result<Option<Emit>> {
         match self {
-            Self::FullMerge { from, to, scope } => next_emit(from, to, scope).await,
+            Self::FullMerge(full) => next_emit(&mut full.from, &mut full.to, &full.scope).await,
             Self::Pruned(candidates) => candidates.next().await,
         }
     }
 
     pub(crate) fn parent_dataset(&self) -> &Dataset {
         match self {
-            Self::FullMerge { from, .. } => from.dataset(),
+            Self::FullMerge(full) => full.from.dataset(),
             Self::Pruned(candidates) => candidates.parent_dataset(),
         }
     }
 
     pub(crate) fn child_dataset(&self) -> &Dataset {
         match self {
-            Self::FullMerge { to, .. } => to.dataset(),
+            Self::FullMerge(full) => full.to.dataset(),
             Self::Pruned(candidates) => candidates.child_dataset(),
         }
     }
@@ -440,6 +556,8 @@ impl EmitSource {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use lance::dataset::transaction::Operation;
     use lance_table::format::Fragment;
@@ -569,6 +687,25 @@ mod tests {
             },
             &[(NO_BY_SOURCE_DELETE_PROPERTY, NO_BY_SOURCE_DELETE_V1)],
         )));
+    }
+
+    #[test]
+    fn fragment_discovery_is_binary_search_plus_delta() {
+        let fragments = (0..65_536).map(Fragment::new).collect::<Vec<_>>();
+
+        let (suffix, suffix_steps) = first_fragment_after(&fragments, Some(65_530));
+        assert_eq!(suffix, 65_531);
+        assert!(
+            suffix_steps <= 17,
+            "65k-fragment suffix lookup must stay logarithmic, got {suffix_steps} steps"
+        );
+
+        let (fragment, lookup_steps) = find_fragment(&fragments, 42_424);
+        assert_eq!(fragment.map(|fragment| fragment.id), Some(42_424));
+        assert!(
+            lookup_steps <= 17,
+            "65k-fragment parent lookup must stay logarithmic, got {lookup_steps} steps"
+        );
     }
 
     #[test]

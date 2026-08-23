@@ -17,15 +17,15 @@ use std::collections::BTreeSet;
 
 use lance::Dataset;
 
-use super::candidate_scan::EmitSource;
+use super::candidate_scan::{CandidatePlan, EmitSource};
 use super::model::{
     COMMIT_CHANGES_MAX_BYTES, ChangeEntityKind, ChangeFeedScope, ChangeOpKind, EntityEndpoints,
     EntityImage, GraphEntityChange, GraphTypeRef,
 };
-use super::row_compare::{OrderedRows, RawRow, rows_equal, user_schema_fingerprint};
+use super::row_compare::{OrderedRows, RawRow, ScanTargets, rows_equal, user_schema_fingerprint};
 use super::token::{cursor_rejected, opaque_type_id};
 use super::{changed_table_intervals, parse_table_key};
-use crate::db::SubTableEntry;
+use crate::db::DatasetEntry;
 use crate::db::logical_row_image;
 use crate::db::manifest::Snapshot;
 use crate::error::{OmniError, Result};
@@ -128,6 +128,7 @@ async fn emitted_image(
     raw: &RawRow,
     kind: ChangeEntityKind,
 ) -> Result<EntityImage> {
+    crate::instrumentation::record_change_image_materialized();
     let mut properties = logical_row_image(dataset, &raw.slice, 0).await?;
     properties.remove("id");
     let endpoints = if kind == ChangeEntityKind::Edge {
@@ -215,16 +216,16 @@ pub(crate) struct IntervalPlan {
     kind: ChangeEntityKind,
     type_name: String,
     /// The paired manifest entries (begin/end version, branch, identity).
-    pub(crate) from_entry: SubTableEntry,
-    pub(crate) to_entry: SubTableEntry,
+    pub(crate) from_entry: DatasetEntry,
+    pub(crate) to_entry: DatasetEntry,
     pub(crate) from_dataset: Dataset,
     pub(crate) to_dataset: Dataset,
     /// The candidate-pruning decision, computed by `plan_intervals` BEFORE the
-    /// final post-open head witness so its `(begin, end]` transaction walk — a
-    /// live read of replaceable numeric-path version manifests — is covered by
-    /// `reprove_named_branch_heads`. `Some` carries the changed child
-    /// fragments for the O(delta) path; `None` means the exact ordered merge.
-    pub(crate) changed_fragments: Option<Vec<lance_table::format::Fragment>>,
+    /// final post-open head witness. The adjacent transaction is referenced by
+    /// the already-pinned child manifest, and `Some` stores the complete
+    /// transaction-touched parent/child fragment plan so emission performs no
+    /// later history lookup. `None` means the exact ordered merge.
+    pub(crate) candidate_plan: Option<CandidatePlan>,
 }
 
 /// Resolve the exceptional bounded digest position to its exact logical ID.
@@ -343,22 +344,22 @@ async fn plan_intervals(
                 let (kind, type_name) = parse_table_key(table_key);
                 let kind: ChangeEntityKind = kind.into();
                 // Classify the interval HERE — before the head witness below —
-                // because the classifier's `(begin, end]` transaction walk is a
-                // live read of replaceable numeric-path version manifests.
-                // Scope-filtered intervals are never emitted, so they skip the
-                // walk; their stored decision is irrelevant.
-                let changed_fragments =
-                    if scope.wants_kind(kind) && scope.wants_type_name(type_name) {
-                        super::candidate_scan::interval_changed_fragments(
-                            &from,
-                            &to,
-                            &from_dataset,
-                            &to_dataset,
-                        )
-                        .await?
-                    } else {
-                        None
-                    };
+                // and retain the complete physical plan. The one transaction is
+                // referenced by the already-pinned child manifest; no history
+                // lookup is permitted later during emission. Scope-filtered
+                // intervals are never emitted, so their stored decision is
+                // irrelevant.
+                let candidate_plan = if scope.wants_kind(kind) && scope.wants_type_name(type_name) {
+                    super::candidate_scan::interval_candidate_plan(
+                        from,
+                        to,
+                        &from_dataset,
+                        &to_dataset,
+                    )
+                    .await?
+                } else {
+                    None
+                };
                 plans.push(IntervalPlan {
                     opaque_id: opaque_type_id(schema_identity_domain, interval.identity),
                     kind,
@@ -367,7 +368,7 @@ async fn plan_intervals(
                     to_entry: to.clone(),
                     from_dataset,
                     to_dataset,
-                    changed_fragments,
+                    candidate_plan,
                 });
             }
             (None, None) => unreachable!("changed intervals have at least one endpoint"),
@@ -498,25 +499,40 @@ pub(crate) async fn enumerate_commit_changes(
             id: plan.opaque_id.clone(),
             name: plan.type_name.clone(),
         };
-        // Per-interval emitter: the O(delta) candidate path when the commit's
-        // effect is a proven row-set-preserving shape, else the exact full
-        // ordered merge. Both yield the same id-ordered `Emit` stream, so the
-        // budgeting/continuation loop below is identical. Before-images come
-        // from the parent handle, after-images from the child handle. The
-        // pruning decision itself was made by `plan_intervals` under the head
-        // witness — no live history read happens here.
+        // Per-interval emitter: the touched-fragment candidate path when the
+        // commit's effect is a proven adjacent row-set-preserving shape, else
+        // the exact full ordered merge. Both yield the same id-ordered `Emit`
+        // stream, so the budgeting/continuation loop below is identical.
+        // Before-images come from the parent handle, after-images from the
+        // child handle. The pruning decision itself was made by
+        // `plan_intervals` before, and covered by, the final head witness — no
+        // live history read happens here.
         let mut source = EmitSource::plan(
             &plan.from_entry,
             &plan.to_entry,
             plan.from_dataset,
             plan.to_dataset,
-            plan.changed_fragments,
+            plan.candidate_plan,
             after_id.as_deref(),
             scope,
+            ScanTargets::for_page(budget.remaining_rows, budget.remaining_bytes),
         )
         .await?;
 
         while let Some(emit) = source.next().await? {
+            // The source yields one look-ahead change so we can distinguish a
+            // complete block from a truncated one. If the page's row budget (or
+            // an already-used byte budget) is exhausted, that sentinel must not
+            // materialize JSON or Blob payloads merely to prove continuation.
+            if budget.remaining_rows == 0 || (budget.remaining_bytes == 0 && budget.has_emitted()) {
+                return Ok(match last_emitted {
+                    Some(key) if emitted_this_call => CommitEnumeration::Truncated(key),
+                    // A feed can carry an exhausted page-wide budget into the
+                    // next commit. Its caller ends at the previous block
+                    // boundary; no image-size value is needed in that case.
+                    _ => CommitEnumeration::Exhausted { required_bytes: 0 },
+                });
+            }
             let op = emit.op();
             let (id, before, after) = match emit {
                 Emit::Insert(raw) => {
@@ -557,11 +573,11 @@ pub(crate) async fn enumerate_commit_changes(
             // over budget), so a legal committed change — whose two images can
             // exceed the write-path-derived ceiling once managed Blobs inline as
             // base64 — is always deliverable, one per page if needed. The row
-            // budget still bounds packing. `Exhausted` now only signals a
-            // zero-capacity request (`max_changes == 0`), which validation
-            // already rejects; it is retained defensively.
+            // budget still bounds packing. `Exhausted` is retained for a feed
+            // carrying a page-wide budget already consumed by a prior block;
+            // a standalone request's validated budget starts nonzero.
             let over_bytes = encoded_bytes > budget.remaining_bytes;
-            if budget.remaining_rows == 0 || (over_bytes && budget.has_emitted()) {
+            if over_bytes && budget.has_emitted() {
                 return Ok(match last_emitted {
                     Some(key) if emitted_this_call => CommitEnumeration::Truncated(key),
                     _ => CommitEnumeration::Exhausted {

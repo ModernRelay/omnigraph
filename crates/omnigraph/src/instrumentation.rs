@@ -90,6 +90,27 @@ pub struct QueryIoProbes {
     /// invisible to the manifest/data IO counters — a cost test asserts it so a
     /// future forward-child projection (the bounded-visit fix) is measurable.
     pub feed_commits_visited: Arc<AtomicU64>,
+    /// Adjacent-version transaction files read while classifying CDC candidate
+    /// intervals. Wider intervals must fall back before incrementing this
+    /// counter, keeping stateless tiny-page resumes constant in history depth.
+    pub candidate_transaction_reads: Arc<AtomicU64>,
+    /// Manifest fragment entries compared or validated while deriving a CDC
+    /// candidate plan. This exposes the metadata CPU term that object-store I/O
+    /// counters cannot see.
+    pub candidate_fragment_metadata_steps: Arc<AtomicU64>,
+    /// Candidate child rows pulled by the pruned emitter. A max-changes=1 page
+    /// over all-changing rows should inspect only the emitted row plus one
+    /// continuation sentinel.
+    pub candidate_rows_examined: Arc<AtomicU64>,
+    /// Largest row/byte scanner target requested by a candidate emitter in the
+    /// measured operation. Both are maxima (not sums) because parent and child
+    /// streams use the same current-page target.
+    pub candidate_scan_target_rows_peak: Arc<AtomicU64>,
+    pub candidate_scan_target_bytes_peak: Arc<AtomicU64>,
+    /// Complete logical change images materialized (and therefore eligible to
+    /// read managed Blob payloads). A continuation sentinel must not increment
+    /// this counter.
+    pub change_images_materialized: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -215,6 +236,39 @@ pub(crate) fn record_feed_commits_visited(commits: usize) {
         p.feed_commits_visited
             .fetch_add(commits as u64, Ordering::Relaxed)
     });
+}
+
+pub(crate) fn record_candidate_transaction_read() {
+    let _ = current(|p| {
+        p.candidate_transaction_reads
+            .fetch_add(1, Ordering::Relaxed)
+    });
+}
+
+pub(crate) fn record_candidate_fragment_metadata_steps(steps: u64) {
+    if steps > 0 {
+        let _ = current(|p| {
+            p.candidate_fragment_metadata_steps
+                .fetch_add(steps, Ordering::Relaxed)
+        });
+    }
+}
+
+pub(crate) fn record_candidate_row_examined() {
+    let _ = current(|p| p.candidate_rows_examined.fetch_add(1, Ordering::Relaxed));
+}
+
+pub(crate) fn record_candidate_scan_targets(rows: usize, bytes: u64) {
+    let _ = current(|p| {
+        p.candidate_scan_target_rows_peak
+            .fetch_max(rows as u64, Ordering::Relaxed);
+        p.candidate_scan_target_bytes_peak
+            .fetch_max(bytes, Ordering::Relaxed);
+    });
+}
+
+pub(crate) fn record_change_image_materialized() {
+    let _ = current(|p| p.change_images_materialized.fetch_add(1, Ordering::Relaxed));
 }
 
 /// Per-operation staged-write counts, installed for a task via

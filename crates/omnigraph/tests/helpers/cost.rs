@@ -256,6 +256,15 @@ pub struct IoCounts {
     /// CPU/allocation term that grows with the backlog independently of the
     /// manifest/data IO counters.
     pub feed_commits_visited: u64,
+    /// CDC candidate-planning and bounded-page CPU/memory proxies. These are
+    /// explicit production seams because object-store read counts cannot reveal
+    /// repeated transaction-history walks or full-manifest iteration.
+    pub candidate_transaction_reads: u64,
+    pub candidate_fragment_metadata_steps: u64,
+    pub candidate_rows_examined: u64,
+    pub candidate_scan_target_rows_peak: u64,
+    pub candidate_scan_target_bytes_peak: u64,
+    pub change_images_materialized: u64,
 }
 
 impl IoCounts {
@@ -503,6 +512,12 @@ struct OpProbes {
     internal_open_count: Arc<AtomicU64>,
     manifest_scan_count: Arc<AtomicU64>,
     feed_commits_visited: Arc<AtomicU64>,
+    candidate_transaction_reads: Arc<AtomicU64>,
+    candidate_fragment_metadata_steps: Arc<AtomicU64>,
+    candidate_rows_examined: Arc<AtomicU64>,
+    candidate_scan_target_rows_peak: Arc<AtomicU64>,
+    candidate_scan_target_bytes_peak: Arc<AtomicU64>,
+    change_images_materialized: Arc<AtomicU64>,
 }
 
 impl OpProbes {
@@ -523,6 +538,12 @@ impl OpProbes {
             internal_open_count: Arc::new(AtomicU64::new(0)),
             manifest_scan_count: Arc::new(AtomicU64::new(0)),
             feed_commits_visited: Arc::new(AtomicU64::new(0)),
+            candidate_transaction_reads: Arc::new(AtomicU64::new(0)),
+            candidate_fragment_metadata_steps: Arc::new(AtomicU64::new(0)),
+            candidate_rows_examined: Arc::new(AtomicU64::new(0)),
+            candidate_scan_target_rows_peak: Arc::new(AtomicU64::new(0)),
+            candidate_scan_target_bytes_peak: Arc::new(AtomicU64::new(0)),
+            change_images_materialized: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
@@ -532,6 +553,12 @@ impl OpProbes {
             internal_open_count: Arc::clone(&h.internal_open_count),
             manifest_scan_count: Arc::clone(&h.manifest_scan_count),
             feed_commits_visited: Arc::clone(&h.feed_commits_visited),
+            candidate_transaction_reads: Arc::clone(&h.candidate_transaction_reads),
+            candidate_fragment_metadata_steps: Arc::clone(&h.candidate_fragment_metadata_steps),
+            candidate_rows_examined: Arc::clone(&h.candidate_rows_examined),
+            candidate_scan_target_rows_peak: Arc::clone(&h.candidate_scan_target_rows_peak),
+            candidate_scan_target_bytes_peak: Arc::clone(&h.candidate_scan_target_bytes_peak),
+            change_images_materialized: Arc::clone(&h.change_images_materialized),
             // graph_build_count / graph_edges_built unused by this harness.
             ..Default::default()
         };
@@ -564,6 +591,18 @@ impl OpProbes {
             internal_open_count: self.internal_open_count.load(Ordering::Relaxed),
             manifest_scan_count: self.manifest_scan_count.load(Ordering::Relaxed),
             feed_commits_visited: self.feed_commits_visited.load(Ordering::Relaxed),
+            candidate_transaction_reads: self.candidate_transaction_reads.load(Ordering::Relaxed),
+            candidate_fragment_metadata_steps: self
+                .candidate_fragment_metadata_steps
+                .load(Ordering::Relaxed),
+            candidate_rows_examined: self.candidate_rows_examined.load(Ordering::Relaxed),
+            candidate_scan_target_rows_peak: self
+                .candidate_scan_target_rows_peak
+                .load(Ordering::Relaxed),
+            candidate_scan_target_bytes_peak: self
+                .candidate_scan_target_bytes_peak
+                .load(Ordering::Relaxed),
+            change_images_materialized: self.change_images_materialized.load(Ordering::Relaxed),
         }
     }
 }

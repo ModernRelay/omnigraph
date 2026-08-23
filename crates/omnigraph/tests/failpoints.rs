@@ -11318,14 +11318,15 @@ node Document {
 /// The THIRD ABA window: after the final post-open logical head witness, no
 /// step of the poll may read the branch's numeric-path history live. Version
 /// manifests sit at replaceable numeric paths (unlike UUID-named data and
-/// transaction files), so a delete/recreate parked at
-/// `CHANGE_FEED_POST_HEAD_WITNESS` swaps the transactions a live
-/// `(begin, end]` walk would classify. When the replacement history at the
-/// same versions is provably row-set-preserving while the ORIGINAL commit
-/// carried a delete, a live-classifying poll prunes from foreign history and
-/// silently omits that delete — data loss inside a successful page. The poll
-/// may instead fail loudly (reader survival across branch recreation is not
-/// promised), but any page it does return must carry the original delete.
+/// transaction files), so a future `(begin, end]` history walk placed after
+/// `CHANGE_FEED_POST_HEAD_WITNESS` could classify replacement history. The
+/// current adjacent classifier reads the transaction referenced by the pinned
+/// child manifest and stores its complete plan before this witness; this cell
+/// locks that placement against a future widening. When replacement history at
+/// the same versions is row-set-preserving while the ORIGINAL commit carried a
+/// delete, a live post-witness classifier would silently omit that delete. The
+/// poll may instead fail loudly (reader survival across branch recreation is
+/// not promised), but any page it returns must carry the original delete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn change_feed_poll_classifies_intervals_before_the_head_witness() {
@@ -11390,7 +11391,7 @@ query remove_victim() {
         .snapshot_of(ReadTarget::branch("feature"))
         .await
         .unwrap()
-        .entry("node:Document")
+        .dataset("node:Document")
         .unwrap()
         .clone();
 
@@ -11434,30 +11435,27 @@ query remove_victim() {
     rendezvous.release();
 
     let new_snapshot = replacement.expect("delete/recreate replacement must complete");
-    let new_entry = new_snapshot.entry("node:Document").unwrap();
+    let new_entry = new_snapshot.dataset("node:Document").unwrap();
     assert_eq!(
-        new_entry.table_version, old_entry.table_version,
+        new_entry.published_dataset_version, old_entry.published_dataset_version,
         "the regression must exercise same-version branch ABA"
     );
 
-    match poll_task.await.unwrap() {
-        Ok(page) => {
-            let carries_original_delete = page
-                .blocks
-                .iter()
-                .flat_map(|block| block.changes.iter())
-                .any(|change| change.op == ChangeOpKind::Delete && change.id.contains("victim"));
-            assert!(
-                carries_original_delete,
-                "a page returned across the in-poll delete/recreate must still carry the \
-                 original commit's delete; omitting it silently is the classification ABA \
-                 this cell pins: {page:?}"
-            );
-        }
-        // A loud refusal is acceptable: reader survival across branch
-        // recreation is not promised — only never-silent retargeting.
-        Err(_) => {}
+    if let Ok(page) = poll_task.await.unwrap() {
+        let carries_original_delete = page
+            .blocks
+            .iter()
+            .flat_map(|block| block.changes.iter())
+            .any(|change| change.op == ChangeOpKind::Delete && change.id.contains("victim"));
+        assert!(
+            carries_original_delete,
+            "a page returned across the in-poll delete/recreate must still carry the \
+             original commit's delete; omitting it silently is the classification ABA \
+             this cell pins: {page:?}"
+        );
     }
+    // A loud refusal is acceptable: reader survival across branch recreation
+    // is not promised — only never-silent retargeting.
 }
 
 async fn setup_diverged_merge_branches(dir: &tempfile::TempDir) -> (String, usize) {
