@@ -229,14 +229,19 @@ with a named error listing every stored query still using a legacy
 identity spelling; the existing boot-time registry check remains the
 enforcement on load, and in single-graph mode that same boot check is the
 gate at the next server start. Nothing mutates the registry or the query
-sources except the rewrite tool. The applied revision is always
-internally consistent: meta-fields resolve by role on every vintage, so a
-rewritten query is already valid on the still-old-vintage graph, and one
-cluster apply revision carries the rewritten query resources and the
-upgrade together. A serving process holds the registry it loaded at boot,
-so the upgrade revision is followed by the server restart the cluster
-workflow already requires for schema changes; the boot check refuses a
-stale registry, which closes that window. The
+sources except the rewrite tool. Because a serving process holds the
+registry it loaded at boot, the rollout is two ordered revisions, and the
+ordering is what removes every degraded interval: the first revision
+ships the rewritten query sources and is followed by the restart the
+cluster workflow already requires, which is safe because meta-fields
+resolve by role on every vintage, so a rewritten query is already valid
+on the still-old-vintage graph; the upgrade rides a later revision, and
+the serving process's rewritten registry stays valid straight through the
+rename. Combining both into one revision remains permitted but leaves the
+running server's pre-rewrite registry failing against the renamed columns
+until its restart; an operator who accepts that window is choosing it
+knowingly, and the boot check refuses a stale registry on the restart
+either way. The
 rewrite is provably unambiguous for every graph the upgrade accepts: it
 runs pre-upgrade, where this RFC's collision validation (above) refuses
 IRs carrying a user property with those names, and an apply declaring a
