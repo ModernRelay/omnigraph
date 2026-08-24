@@ -84,7 +84,6 @@ url = "2"
 cedar-policy = "4.9"
 sha2 = "0.10"
 subtle = "2"
-pulldown-cmark = "0.13"
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "visit"] }

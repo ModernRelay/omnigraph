@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use omnigraph_vocabulary_guard::{
     CheckOptions, GuardSurface, check_in, render_tsv, resolve_tool_executable,
-    scan_openapi_at_root, scan_public_rust_tree, scan_rust_tree, scan_user_docs_tree,
+    scan_openapi_at_root, scan_public_rust_tree, scan_rust_tree,
 };
 
 #[derive(Debug, Parser)]
@@ -54,7 +54,6 @@ enum Command {
 enum Surface {
     Openapi,
     RustString,
-    UserDocs,
     PublicRust,
     All,
 }
@@ -64,7 +63,6 @@ impl From<Surface> for GuardSurface {
         match value {
             Surface::Openapi => Self::Openapi,
             Surface::RustString => Self::RustString,
-            Surface::UserDocs => Self::UserDocs,
             Surface::PublicRust => Self::PublicRust,
             Surface::All => Self::All,
         }
@@ -92,9 +90,6 @@ fn run() -> Result<(), omnigraph_vocabulary_guard::GuardError> {
             }
             if matches!(surface, Surface::RustString | Surface::All) {
                 observations.extend(scan_rust_tree(&root)?);
-            }
-            if matches!(surface, Surface::UserDocs | Surface::All) {
-                observations.extend(scan_user_docs_tree(&root)?);
             }
             if matches!(surface, Surface::PublicRust | Surface::All) {
                 let cargo_public_api = resolve_tool_executable(&root, &cargo_public_api);

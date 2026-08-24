@@ -34,13 +34,13 @@ Code pull requests run a reporting-only
 remain post-merge, tag-, or dispatch-time owners.
 
 The always-reporting `Graph Vocabulary Guard` is the CI owner for the reviewed
-four-surface vocabulary inventory, including on documentation-only pull
-requests. G1 scans route-reachable OpenAPI; G2 parses the closed set of
-user-visible Rust string sinks; G3 scans rendered Markdown events below
-`docs/user/`; G4 derives externally reachable signatures from the default and
-all-features rustdoc graphs for the seven public library crates. Its package
-tests own deterministic collection, reference cycles and compositions,
-Markdown container/event identity, Rust sink selection, public-signature
+three-surface vocabulary inventory, including on documentation-only pull
+requests. It scans route-reachable OpenAPI, parses the closed set of
+user-visible Rust string sinks, and derives externally reachable signatures
+from the default and all-features rustdoc graphs for the seven public library
+crates. Documentation prose is intentionally outside this exact-occurrence
+gate. Its package tests own deterministic collection, reference cycles and
+compositions, Rust sink selection, public-signature
 normalization, inventory validation, and negative base/current comparison
 cases. The CI check compares every selected observation with
 `tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv` in the current
@@ -72,18 +72,19 @@ moved, or reintroduced alias; the current-tree check then requires the set to
 be empty. Removing one alias therefore cannot license adding another at a
 different boundary or leave a partial migration green.
 
-G4 pins `cargo-public-api` 0.52.0 and `nightly-2026-08-01`; the repository's
+The public-Rust pass pins `cargo-public-api` 0.52.0 and
+`nightly-2026-08-01`; the repository's
 stable toolchain remains the owner of the workspace build. CI caches the
 pinned extractor, nightly toolchain, and dedicated target. Its rows use the
 owning package manifest as the stable source and the complete normalized
 exported signature as the boundary because `cargo-public-api` does not expose
 one unambiguous declaration/re-export source span; the guard does not guess at
-aliases or macro-generated items. G4 always extracts
+aliases or macro-generated items. Public-Rust extraction always scans
 the current and base trees. A path-only shortcut cannot prove that a change is
 irrelevant because Cargo `include!`, build scripts, generated sources, and
 configuration can make any tracked input affect rustdoc. An unreviewed
 workspace library is an error, so adding a crate requires an explicit
-public/internal reachability decision. G1–G3 also execute on every run.
+public/internal reachability decision. All three surfaces execute on every run.
 
 Run the focused evidence with a base that already contains the reviewed
 inventory:
@@ -92,7 +93,7 @@ inventory:
 cargo test -p omnigraph-vocabulary-guard --locked
 git fetch origin main
 BASE_SHA=$(git rev-parse origin/main)
-for surface in openapi rust-string user-docs; do
+for surface in openapi rust-string; do
   cargo run -p omnigraph-vocabulary-guard --locked -- \
     check --surface "$surface" --base "$BASE_SHA" \
     --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
