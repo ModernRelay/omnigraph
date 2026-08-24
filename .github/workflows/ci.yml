@@ -113,7 +113,7 @@ jobs:
     name: Graph Vocabulary Guard
     # Required PR context: keep this job independent of the documentation-only
     # classifier so it always reports. The review-owned inventory protects the
-    # OpenAPI, Rust presentation-string, user-doc, and public-Rust surfaces.
+    # OpenAPI, Rust presentation-string, and public-Rust surfaces.
     runs-on: ubuntu-latest
     # A cold default + relevant all-features rustdoc pass over all seven public
     # library crates is substrate-sized. The first hosted run completed the
@@ -205,12 +205,12 @@ jobs:
       - name: Test vocabulary guard
         run: cargo test -p omnigraph-vocabulary-guard --locked
 
-      - name: Check OpenAPI, Rust-string, and user-doc vocabulary
+      - name: Check OpenAPI and Rust-string vocabulary
         env:
           BASE_SHA: ${{ steps.comparison_base.outputs.sha }}
         run: |
           set -euo pipefail
-          for surface in openapi rust-string user-docs; do
+          for surface in openapi rust-string; do
             cargo run -p omnigraph-vocabulary-guard --locked -- \
               check --surface "$surface" --base "$BASE_SHA" \
               --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \

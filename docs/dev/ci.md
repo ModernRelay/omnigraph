@@ -2,7 +2,7 @@
 
 `.github/workflows/`:
 
-- **ci.yml**: classifies documentation-only changes, checks AGENTS/doc links and immutable external Action pins, runs the required four-surface graph-vocabulary guard, compiles default features on code changes, runs the canonical `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints` gate (one feature-superset build — omitting the features skips every failpoint test and builds a different fingerprint) on its configured post-merge/tag/manual events, tests the AWS server feature, checks the container entrypoint, and runs bucket-gated RustFS correctness suites. There is no RFC-026/MemWAL job or abandoned v7-v19 binary build.
+- **ci.yml**: classifies documentation-only changes, checks AGENTS/doc links and immutable external Action pins, runs the required three-surface graph-vocabulary guard, compiles default features on code changes, runs the canonical `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints` gate (one feature-superset build — omitting the features skips every failpoint test and builds a different fingerprint) on its configured post-merge/tag/manual events, tests the AWS server feature, checks the container entrypoint, and runs bucket-gated RustFS correctness suites. There is no RFC-026/MemWAL job or abandoned v7-v19 binary build.
   - Pull requests may use reporting-only checks while the full workspace gate
     runs post-merge, on tags, or by manual dispatch. Run the canonical workspace
     test locally before merging non-trivial code. A red post-merge main is
@@ -14,24 +14,26 @@
     SHA (the push `before` SHA for ordinary branch pushes, or the checked-out
     commit's first parent for tag/manual runs), tests
     `omnigraph-vocabulary-guard`, and proves an exact inventory bijection for
-    four surfaces in both trees: route-reachable OpenAPI, user-visible Rust
-    strings, rendered events in `docs/user/**/*.md`, and externally reachable
-    public Rust signatures. A missing or stale base asset fails closed. The
-    inventory lives at
-    `tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv`. G4 is
-    derived with exactly `cargo-public-api` 0.52.0 on
+    three surfaces in both trees: route-reachable OpenAPI, user-visible Rust
+    strings, and externally reachable public Rust signatures. Documentation
+    prose is intentionally outside this exact-occurrence gate; its link and
+    structure checks remain separate. A missing or stale base asset fails
+    closed. The inventory lives at
+    `tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv`. The
+    public-Rust surface is derived with exactly `cargo-public-api` 0.52.0 on
     `nightly-2026-08-01`. Every one of the seven public library crates is
     scanned with default features; crates that declare any non-default feature
     are additionally scanned with all features and the two surfaces are
     unioned. A crate with no non-default feature skips that provably identical
     second pass. Workspace checks remain on the repository's stable pin.
     `cargo-public-api` does not emit a unique declaration/re-export source span,
-    so each G4 row uses the owning package manifest as its stable source and the
-    complete normalized exported signature as its review boundary. The guard
+    so each public-Rust row uses the owning package manifest as its stable
+    source and the complete normalized exported signature as its review
+    boundary. The guard
     does not invent a potentially wrong source location for aliases or
     macro-generated items.
-    G4 always extracts both trees: Cargo `include!`, build scripts, generated
-    sources, configuration, and other transitive inputs make a path-based skip
+    Public-Rust extraction always scans both trees: Cargo `include!`, build
+    scripts, generated sources, configuration, and other transitive inputs make a path-based skip
     predicate unsound. Current and base keep isolated build targets; the job's
     pinned-tool and build-target caches reduce warm cost without allowing one
     tree's path-crate artifacts to satisfy the other. Its 75-minute timeout
@@ -63,7 +65,7 @@ will use:
 cargo test -p omnigraph-vocabulary-guard --locked
 git fetch origin main
 BASE_SHA=$(git rev-parse origin/main)
-for surface in openapi rust-string user-docs; do
+for surface in openapi rust-string; do
   cargo run -p omnigraph-vocabulary-guard --locked -- \
     check --surface "$surface" --base "$BASE_SHA" \
     --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
