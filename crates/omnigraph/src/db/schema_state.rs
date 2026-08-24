@@ -51,10 +51,11 @@ pub(crate) async fn refuse_unsupported_schema_versions(
             && !omnigraph_compiler::is_supported_ir_version(envelope.ir_version)
         {
             return Err(schema_lock_conflict(format!(
-                "unsupported ir_version {} in {filename} (supported {} and {}); open will not recover or migrate this schema",
+                "unsupported ir_version {} in {filename} (supported {}, {} and {}); open will not recover or migrate this schema",
                 envelope.ir_version,
                 omnigraph_compiler::SCHEMA_IR_VERSION,
                 omnigraph_compiler::SCHEMA_IR_VERSION_EDGE_KEYS,
+                omnigraph_compiler::SCHEMA_IR_VERSION_FEATURES,
             )));
         }
     }

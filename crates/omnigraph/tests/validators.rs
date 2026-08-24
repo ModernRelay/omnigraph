@@ -442,12 +442,12 @@ async fn merge_load_edge_src_move_rechecks_vacated_src_cardinality() {
     let seed = r#"{"type":"Person","data":{"name":"Alice"}}
 {"type":"Person","data":{"name":"Bob"}}
 {"type":"Company","data":{"name":"Acme"}}
-{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E1"}}"#;
+{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"__id":"E1"}}"#;
     let (_dir, db) = init_with(CARD_MIN_SCHEMA, seed).await;
 
     let err = load_jsonl(
         &db,
-        r#"{"edge":"WorksAt","from":"Bob","to":"Acme","data":{"id":"E1"}}"#,
+        r#"{"edge":"WorksAt","from":"Bob","to":"Acme","data":{"__id":"E1"}}"#,
         LoadMode::Merge,
     )
     .await
@@ -470,13 +470,13 @@ async fn merge_load_duplicate_edge_id_counts_once_per_card() {
 {"type":"Person","data":{"name":"Bob"}}
 {"type":"Company","data":{"name":"Acme"}}
 {"type":"Company","data":{"name":"Beta"}}
-{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E0"}}"#;
+{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"__id":"E0"}}"#;
     let (_dir, db) = init_with(CARDINALITY_SCHEMA, seed).await;
 
     // Same edge id E1 under two srcs in one batch: commit keeps the last
     // (Bob->Beta). Alice stays at her one committed edge (E0).
-    let batch = r#"{"edge":"WorksAt","from":"Alice","to":"Beta","data":{"id":"E1"}}
-{"edge":"WorksAt","from":"Bob","to":"Beta","data":{"id":"E1"}}"#;
+    let batch = r#"{"edge":"WorksAt","from":"Alice","to":"Beta","data":{"__id":"E1"}}
+{"edge":"WorksAt","from":"Bob","to":"Beta","data":{"__id":"E1"}}"#;
     load_jsonl(&db, batch, LoadMode::Merge)
         .await
         .expect("a deduped edge id must not double-count Alice into a @card(0..1) violation");
@@ -492,7 +492,7 @@ async fn merge_load_duplicate_edge_id_counts_once_per_card() {
 async fn mutation_delete_edge_below_card_min_rejected() {
     let seed = r#"{"type":"Person","data":{"name":"Alice"}}
 {"type":"Company","data":{"name":"Acme"}}
-{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E1"}}"#;
+{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"__id":"E1"}}"#;
     let (_dir, mut db) = init_with(CARD_MIN_SCHEMA, seed).await;
 
     let err = mutate_main(

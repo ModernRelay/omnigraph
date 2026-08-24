@@ -221,8 +221,8 @@ fn assert_rebuilt_graph_datasets_use_exact_id_pk(graph: &Path) {
                 .collect::<Vec<_>>();
             assert_eq!(
                 primary_key,
-                ["id"],
-                "rebuilt v8 dataset {type_key} must declare exactly `id` as its Lance unenforced primary key",
+                ["__id"],
+                "rebuilt v8 dataset {type_key} must declare exactly `__id` as its Lance unenforced primary key",
             );
         }
     });

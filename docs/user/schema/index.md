@@ -56,16 +56,25 @@ letter (`worksAt` for `WorksAt`); lookup is otherwise case-insensitive.
 | `[T]` | A list of scalar `T` values |
 | `T?` | A nullable value |
 
-The names `_rowid`, `_rowaddr`, `_rowoffset`,
-`_row_created_at_version`, and `_row_last_updated_at_version` are reserved.
+Property names starting with `_` are reserved for system columns and are
+rejected when a schema is admitted. The reserved namespace covers Lance's
+virtual system columns (`_rowid`, `_rowaddr`, `_rowoffset`,
+`_row_created_at_version`, `_row_last_updated_at_version`) and OmniGraph's
+own implicit stored columns, spelled `__id` on nodes and edges and
+`__src`/`__dst` on edges for graphs created at the current schema version.
+Graphs created before that version keep the earlier spellings `id`, `src`,
+and `dst` for their implicit columns and continue to reserve those three
+property names; on current graphs `id`, `src`, and `dst` are ordinary
+property names. Result payloads carry each graph's own implicit column
+names, and the schema endpoint (`GET /schema`) reports them in its
+`system_columns` field so clients never have to guess.
 `_distance` and `_score` are also reserved for new declarations: search-ordered
 queries rank results by those columns. A graph whose schema already declared
 either name before this reservation keeps opening; only new schemas are
 refused.
 
-On edge types the names `id`, `src`, `dst`, `from`, and `to` are also
-reserved: they name the physical id, the endpoint columns, and the insert
-parameters.
+On edge types the names `from` and `to` are also reserved: they are the
+insert parameters that name the endpoints.
 
 ## Constraints
 

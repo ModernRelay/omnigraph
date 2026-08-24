@@ -101,40 +101,28 @@ edge Knows: Person -> Alien
 fn test_id_fields_are_utf8() {
     let schema = parse_schema(test_schema()).unwrap();
     let catalog = build_catalog(&schema).unwrap();
+    let system = catalog.system_columns;
+    assert_eq!(system.id, "__id");
     let person = &catalog.node_types["Person"];
     assert_eq!(
         person
             .arrow_schema
-            .field_with_name("id")
+            .field_with_name(system.id)
             .unwrap()
             .data_type(),
         &DataType::Utf8
     );
     let knows = &catalog.edge_types["Knows"];
-    assert_eq!(
-        knows
-            .arrow_schema
-            .field_with_name("id")
-            .unwrap()
-            .data_type(),
-        &DataType::Utf8
-    );
-    assert_eq!(
-        knows
-            .arrow_schema
-            .field_with_name("src")
-            .unwrap()
-            .data_type(),
-        &DataType::Utf8
-    );
-    assert_eq!(
-        knows
-            .arrow_schema
-            .field_with_name("dst")
-            .unwrap()
-            .data_type(),
-        &DataType::Utf8
-    );
+    for column in [system.id, system.src, system.dst] {
+        assert_eq!(
+            knows
+                .arrow_schema
+                .field_with_name(column)
+                .unwrap()
+                .data_type(),
+            &DataType::Utf8
+        );
+    }
 }
 
 #[test]

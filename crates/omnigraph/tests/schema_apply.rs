@@ -23,8 +23,8 @@ async fn assert_exact_id_primary_key(db: &Omnigraph, table_key: &str) {
         .collect::<Vec<_>>();
     assert_eq!(
         primary_key,
-        ["id"],
-        "schema apply must preserve exactly `id` as the Lance unenforced primary key for {table_key}"
+        ["__id"],
+        "schema apply must preserve exactly `__id` as the Lance unenforced primary key for {table_key}"
     );
 }
 
@@ -889,14 +889,14 @@ node Document {
     field_names.sort_unstable();
     assert_eq!(
         field_names,
-        ["content", "id", "title"],
+        ["__id", "content", "title"],
         "ranged-descriptor fixture is physical-schema specific"
     );
     let columns = schema
         .fields()
         .iter()
         .map(|field| match field.name().as_str() {
-            "id" | "title" => Arc::new(StringArray::from(vec!["ranged"])) as ArrayRef,
+            "__id" | "title" => Arc::new(StringArray::from(vec!["ranged"])) as ArrayRef,
             "content" => descriptor.clone(),
             other => panic!("unexpected ranged-descriptor fixture field {other}"),
         })
@@ -1599,7 +1599,7 @@ query put_pair($aaaa: String, $zzzz: String, $label: String) {
     .unwrap();
     let canonical_id = r#"["A","Z"]"#;
     assert_eq!(
-        collect_column_strings(&read_table(&db, "node:Pair").await, "id"),
+        collect_column_strings(&read_table(&db, "node:Pair").await, "__id"),
         [canonical_id]
     );
     let alpha_id = db.catalog().property_id("Pair", "alpha").unwrap();
@@ -1615,7 +1615,7 @@ query put_pair($aaaa: String, $zzzz: String, $label: String) {
     assert_eq!(db.catalog().property_id("Pair", "zzzz"), Some(alpha_id));
     assert_eq!(db.catalog().property_id("Pair", "aaaa"), Some(zeta_id));
     assert_eq!(
-        collect_column_strings(&read_table(&db, "node:Pair").await, "id"),
+        collect_column_strings(&read_table(&db, "node:Pair").await, "__id"),
         [canonical_id],
         "schema rewrite must retain the existing physical identity"
     );
@@ -1631,7 +1631,7 @@ query put_pair($aaaa: String, $zzzz: String, $label: String) {
 
     let rows = read_table(&db, "node:Pair").await;
     assert_eq!(count_rows(&db, "node:Pair").await, 1);
-    assert_eq!(collect_column_strings(&rows, "id"), [canonical_id]);
+    assert_eq!(collect_column_strings(&rows, "__id"), [canonical_id]);
     assert_eq!(collect_column_strings(&rows, "label"), ["after"]);
     assert_exact_id_primary_key(&db, "node:Pair").await;
 }

@@ -142,8 +142,9 @@ impl RawRow {
         dataset: &Dataset,
         batch: &RecordBatch,
         row_index: usize,
+        id_col: &str,
     ) -> Result<RawRow> {
-        let mut cursor = BatchCursor::try_new(dataset, batch.clone())?;
+        let mut cursor = BatchCursor::try_new(dataset, batch.clone(), id_col)?;
         cursor.next_row = row_index;
         cursor.next(dataset)?.ok_or_else(|| {
             OmniError::manifest_internal("single-row batch produced no comparison row")
@@ -172,10 +173,10 @@ struct BatchCursor {
 }
 
 impl BatchCursor {
-    fn try_new(dataset: &Dataset, batch: RecordBatch) -> Result<Self> {
+    fn try_new(dataset: &Dataset, batch: RecordBatch, id_col: &str) -> Result<Self> {
         let id_index = batch
             .schema_ref()
-            .index_of("id")
+            .index_of(id_col)
             .map_err(|_| OmniError::manifest_internal("change row is missing string id"))?;
         batch
             .column(id_index)
@@ -311,11 +312,24 @@ pub(crate) struct OrderedRows {
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
     batch: Option<BatchCursor>,
     pending: Option<RawRow>,
+    id_col: &'static str,
 }
 
 impl OrderedRows {
-    pub(crate) async fn open(dataset: Dataset, after_id: Option<&str>) -> Result<Self> {
-        Self::open_scan(dataset, after_id, None, None, ScanTargets::default()).await
+    pub(crate) async fn open(
+        dataset: Dataset,
+        after_id: Option<&str>,
+        id_col: &'static str,
+    ) -> Result<Self> {
+        Self::open_scan(
+            dataset,
+            after_id,
+            None,
+            None,
+            ScanTargets::default(),
+            id_col,
+        )
+        .await
     }
 
     /// The full scan surface. `fragments` scopes the scan to exactly those
@@ -328,6 +342,7 @@ impl OrderedRows {
         extra_filter: Option<Expr>,
         fragments: Option<Vec<Fragment>>,
         targets: ScanTargets,
+        id_col: &'static str,
     ) -> Result<Self> {
         if fragments.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Self {
@@ -335,6 +350,7 @@ impl OrderedRows {
                 stream: None,
                 batch: None,
                 pending: None,
+                id_col,
             });
         }
         let after_id = after_id.map(str::to_string);
@@ -343,13 +359,13 @@ impl OrderedRows {
                 &dataset,
                 None,
                 None,
-                Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
+                Some(vec![ColumnOrdering::asc_nulls_last(id_col.to_string())]),
                 true,
                 move |scanner| {
                     if let Some(fragments) = fragments {
                         scanner.with_fragments(fragments);
                     }
-                    let resume = after_id.map(|after_id| col("id").gt(lit(after_id)));
+                    let resume = after_id.map(|after_id| col(id_col).gt(lit(after_id)));
                     if let Some(filter) = match (resume, extra_filter) {
                         (Some(resume), Some(extra)) => Some(resume.and(extra)),
                         (Some(resume), None) => Some(resume),
@@ -384,6 +400,7 @@ impl OrderedRows {
             stream: Some(stream),
             batch: None,
             pending: None,
+            id_col,
         })
     }
 
@@ -410,7 +427,9 @@ impl OrderedRows {
                 return Ok(());
             };
             match stream.try_next().await {
-                Ok(Some(batch)) => self.batch = Some(BatchCursor::try_new(&self.dataset, batch)?),
+                Ok(Some(batch)) => {
+                    self.batch = Some(BatchCursor::try_new(&self.dataset, batch, self.id_col)?)
+                }
                 Ok(None) => {
                     self.stream = None;
                     return Ok(());

@@ -62,7 +62,8 @@ async fn init_creates_graph() {
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join("__schema_state.json")).unwrap())
             .unwrap();
-    assert_eq!(ir.ir_version, 2);
+    assert_eq!(ir.ir_version, 5);
+    assert!(ir.features.contains("system-columns"));
     let persisted: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.path().join("_schema.ir.json")).unwrap()).unwrap();
     assert!(persisted.get("actor_provenance").is_none());
@@ -119,8 +120,8 @@ async fn init_creates_graph() {
             .collect::<Vec<_>>();
         assert_eq!(
             primary_key,
-            ["id"],
-            "fresh graph table {table_key} must be created with exactly `id` as its Lance unenforced primary key"
+            ["__id"],
+            "fresh graph table {table_key} must be created with exactly `__id` as its Lance unenforced primary key"
         );
         assert!(
             dataset.schema().field("__omnigraph_stream_v1$").is_none(),

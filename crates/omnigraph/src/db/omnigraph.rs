@@ -14,8 +14,8 @@ use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
     DropMode, SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep,
-    SchemaShape, SchemaTypeKind, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
-    plan_schema_migration,
+    SchemaShape, SchemaTypeKind, SystemColumns, build_catalog_from_ir, compile_schema_shape,
+    initialize_schema_ir, plan_schema_migration,
 };
 
 use crate::db::commit_graph::CommitGraphSnapshot;
@@ -362,11 +362,40 @@ impl Omnigraph {
         Self::init_with_storage_impl(uri, schema_source, storage, options).await
     }
 
+    /// Test-only: create a graph whose schema authority records the legacy
+    /// system column vintage, producing physically legacy-shaped tables
+    /// (`id`/`src`/`dst`). Exists so integration suites can exercise a real
+    /// pre-RFC-0040 graph end to end.
+    #[cfg(feature = "failpoints")]
+    pub async fn init_with_legacy_system_columns_for_tests(
+        uri: &str,
+        schema_source: &str,
+    ) -> Result<Self> {
+        Self::init_with_storage_for_vintage(
+            uri,
+            schema_source,
+            storage_for_uri(uri)?,
+            InitOptions::default(),
+            true,
+        )
+        .await
+    }
+
     async fn init_with_storage_impl(
         uri: &str,
         schema_source: &str,
         storage: Arc<dyn StorageAdapter>,
         options: InitOptions,
+    ) -> Result<Self> {
+        Self::init_with_storage_for_vintage(uri, schema_source, storage, options, false).await
+    }
+
+    async fn init_with_storage_for_vintage(
+        uri: &str,
+        schema_source: &str,
+        storage: Arc<dyn StorageAdapter>,
+        options: InitOptions,
+        legacy_system_columns: bool,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
         let lance_access = crate::lance_access::LanceAccessContext::new();
@@ -399,7 +428,15 @@ impl Omnigraph {
                 "schema identity hint is inert during graph initialization"
             );
         }
-        let schema_ir = resolution.schema_ir;
+        let mut schema_ir = resolution.schema_ir;
+        if legacy_system_columns {
+            schema_ir
+                .features
+                .remove(omnigraph_compiler::FEATURE_SYSTEM_COLUMNS);
+            schema_ir.ir_version = omnigraph_compiler::required_ir_version(&schema_ir.features);
+            omnigraph_compiler::validate_schema_ir(&schema_ir)
+                .map_err(|error| OmniError::manifest(error.to_string()))?;
+        }
         let accepted_schema_ir_hash = omnigraph_compiler::schema_ir_hash(&schema_ir)
             .map_err(|error| OmniError::manifest(error.to_string()))?;
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
@@ -2478,6 +2515,7 @@ impl Omnigraph {
             filter,
             to_resolved.branch.clone().or(from_resolved.branch.clone()),
             to_resolved.graph_commit_id.clone(),
+            self.catalog().system_columns,
         )
         .await
     }
@@ -2523,6 +2561,7 @@ impl Omnigraph {
             filter,
             to_snap.branch.clone().or(from_snap.branch.clone()),
             to_snap.graph_commit_id.clone(),
+            self.catalog().system_columns,
         )
         .await
     }
@@ -2616,6 +2655,7 @@ impl Omnigraph {
             resume.as_ref(),
             &mut budget,
             &mut changes,
+            self.catalog().system_columns,
         )
         .await
         .map_err(map_gap)?;
@@ -2740,6 +2780,7 @@ impl Omnigraph {
             &graph_identity,
             &cut,
             &request,
+            self.catalog().system_columns,
         )
         .await
     }
@@ -2831,8 +2872,9 @@ impl Omnigraph {
         &self,
         resolved: &ResolvedTarget,
         edge_types: &std::collections::HashMap<String, (String, String)>,
+        system_columns: SystemColumns,
     ) -> Result<Arc<crate::graph_index::GraphIndex>> {
-        table_ops::graph_index_for_resolved(self, resolved, edge_types).await
+        table_ops::graph_index_for_resolved(self, resolved, edge_types, system_columns).await
     }
 
     /// Ensure every declared BTREE, full-text, and vector index exists.
@@ -3549,6 +3591,7 @@ fn blob_properties_for_table_key<'a>(
 /// table entry and refuse every older snapshot rather than inferring identity
 /// from Lance field IDs or positions, even when no rename occurred.
 fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
+    let system_columns = catalog.system_columns;
     // Canonically ordered walk (DST determinism: hash order must not leak
     // into schema fixups).
     let mut node_names = catalog.node_types.keys().cloned().collect::<Vec<_>>();
@@ -3576,6 +3619,7 @@ fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
             &node_type.arrow_schema,
             &node_type.blob_properties,
             &stable_property_ids,
+            system_columns,
             &format!("node:{name}"),
         )?;
     }
@@ -3604,6 +3648,7 @@ fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
             &edge_type.arrow_schema,
             &edge_type.blob_properties,
             &stable_property_ids,
+            system_columns,
             &format!("edge:{name}"),
         )?;
     }
@@ -3614,6 +3659,7 @@ fn physical_table_schema(
     schema: &Arc<Schema>,
     blob_properties: &HashSet<String>,
     stable_property_ids: &HashMap<String, u64>,
+    system_columns: SystemColumns,
     table_key: &str,
 ) -> Result<Arc<Schema>> {
     let mut id_count = 0;
@@ -3638,7 +3684,7 @@ fn physical_table_schema(
             // conflict-filter behavior RFC-023 pins, and a PK is immutable once
             // a Lance dataset has been created.
             metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
-            if physical.name() == "id" {
+            if physical.name() == system_columns.id {
                 id_count += 1;
                 metadata.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
             } else {
@@ -3648,7 +3694,9 @@ fn physical_table_schema(
                         crate::db::STABLE_PROPERTY_ID_METADATA_KEY.to_string(),
                         stable_property_id.to_string(),
                     );
-                } else if matches!(physical.name().as_str(), "src" | "dst") {
+                } else if physical.name() == system_columns.src
+                    || physical.name() == system_columns.dst
+                {
                     metadata.remove(crate::db::STABLE_PROPERTY_ID_METADATA_KEY);
                 } else {
                     return Err(OmniError::manifest_internal(format!(
@@ -3665,16 +3713,18 @@ fn physical_table_schema(
 
     if id_count != 1 {
         return Err(OmniError::manifest_internal(format!(
-            "physical schema for '{table_key}' must contain exactly one top-level `id` field; found {id_count}"
+            "physical schema for '{table_key}' must contain exactly one top-level `{}` field; found {id_count}",
+            system_columns.id
         )));
     }
     let id = fields
         .iter()
-        .find(|field| field.name() == "id")
+        .find(|field| field.name() == system_columns.id)
         .expect("id_count == 1");
     if id.is_nullable() {
         return Err(OmniError::manifest_internal(format!(
-            "physical schema for '{table_key}' has a nullable `id` field"
+            "physical schema for '{table_key}' has a nullable `{}` field",
+            system_columns.id
         )));
     }
 
@@ -3695,6 +3745,20 @@ fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapsho
 
 fn read_schema_shape_from_source(schema_source: &str) -> Result<SchemaShape> {
     let schema_ast = parse_schema(schema_source)?;
+    compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+}
+
+/// Shape for a schema evolving an existing graph: property-name rules follow
+/// the accepted graph's vintage (RFC 0040), so a legacy graph can restate
+/// historically legal names such as `_row_id`.
+pub(crate) fn read_schema_shape_for_vintage(
+    schema_source: &str,
+    system_columns: omnigraph_compiler::SystemColumns,
+) -> Result<SchemaShape> {
+    let schema_ast = omnigraph_compiler::schema::parser::parse_schema_for_vintage(
+        schema_source,
+        system_columns,
+    )?;
     compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
 }
 
@@ -4606,7 +4670,7 @@ edge WorksAt: Person -> Company
             .fields()
             .iter()
             .map(|field| match field.name().as_str() {
-                "id" => Arc::new(StringArray::from(vec![name])) as Arc<dyn Array>,
+                "id" | "__id" => Arc::new(StringArray::from(vec![name])) as Arc<dyn Array>,
                 "name" => Arc::new(StringArray::from(vec![name])) as Arc<dyn Array>,
                 "age" => Arc::new(Int32Array::from(vec![age])) as Arc<dyn Array>,
                 _ => new_null_array(field.data_type(), 1),
@@ -4808,7 +4872,7 @@ edge WorksAt: Person -> Company
             .open_snapshot_at_table(&snapshot, "node:Person")
             .await
             .unwrap();
-        assert!(db.storage().has_btree_index(&ds, "id").await.unwrap());
+        assert!(db.storage().has_btree_index(&ds, "__id").await.unwrap());
         assert!(db.storage().has_fts_index(&ds, "name").await.unwrap());
     }
 

@@ -42,7 +42,7 @@ const BLOB_HTTP_DATA: &str = r#"{"type":"Document","data":{"title":"readme","con
 {"type":"Document","data":{"title":"empty","content":"base64:"}}
 {"type":"Document","data":{"title":"null"}}
 {"type":"Document","data":{"title":"peer"}}
-{"edge":"Attachment","from":"readme","to":"peer","data":{"id":"attachment-1","payload":"base64:RWRnZQ=="}}"#;
+{"edge":"Attachment","from":"readme","to":"peer","data":{"__id":"attachment-1","payload":"base64:RWRnZQ=="}}"#;
 
 async fn app_for_blob_http_data(data: &str) -> (tempfile::TempDir, axum::Router) {
     let temp = init_graph_with_schema_and_data(BLOB_HTTP_SCHEMA, data).await;

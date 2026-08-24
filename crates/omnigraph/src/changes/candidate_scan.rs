@@ -372,6 +372,7 @@ impl CandidateUpserts {
         after_id: Option<&str>,
         scope: ChangeFeedScope,
         scan_targets: ScanTargets,
+        id_col: &'static str,
     ) -> Result<Self> {
         crate::instrumentation::record_candidate_scan_targets(
             scan_targets.rows(),
@@ -392,6 +393,7 @@ impl CandidateUpserts {
             Some(window),
             Some(plan.child_fragments),
             scan_targets,
+            id_col,
         )
         .await?;
         let parents = if plan.parent_fragments.is_empty() {
@@ -404,6 +406,7 @@ impl CandidateUpserts {
                     None,
                     Some(plan.parent_fragments),
                     scan_targets,
+                    id_col,
                 )
                 .await?,
             )
@@ -506,6 +509,7 @@ impl EmitSource {
         after_id: Option<&str>,
         scope: &ChangeFeedScope,
         scan_targets: ScanTargets,
+        id_col: &'static str,
     ) -> Result<Self> {
         if let Some(candidate_plan) = candidate_plan {
             Ok(Self::Pruned(Box::new(
@@ -518,12 +522,13 @@ impl EmitSource {
                     after_id,
                     scope.clone(),
                     scan_targets,
+                    id_col,
                 )
                 .await?,
             )))
         } else {
-            let from = OrderedRows::open(from_dataset, after_id).await?;
-            let to = OrderedRows::open(to_dataset, after_id).await?;
+            let from = OrderedRows::open(from_dataset, after_id, id_col).await?;
+            let to = OrderedRows::open(to_dataset, after_id, id_col).await?;
             Ok(Self::FullMerge(Box::new(FullMergeRows {
                 from,
                 to,

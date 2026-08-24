@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use omnigraph_compiler::SystemColumns;
+
 use super::enumerate::{
     self, CommitEnumeration, ContinuationKey, PageBudget, enumerate_commit_changes,
 };
@@ -212,6 +214,7 @@ pub(crate) async fn poll(
     graph_identity: &str,
     cut: &ChangeFeedCut,
     request: &ChangeFeedRequest,
+    system_columns: SystemColumns,
 ) -> Result<ChangeFeedPage> {
     let max_changes = request
         .max_changes
@@ -336,6 +339,7 @@ pub(crate) async fn poll(
             resume.as_ref(),
             &mut budget,
             &mut changes,
+            system_columns,
         )
         .await;
         let cause = ChangeCause::from(commit);

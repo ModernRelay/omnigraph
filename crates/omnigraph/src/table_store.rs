@@ -54,6 +54,7 @@ use lance_linalg::distance::MetricType;
 use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
+use omnigraph_compiler::SystemColumns;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::{num::NonZero, sync::Arc};
@@ -2722,6 +2723,7 @@ impl TableStore {
         type_key: &str,
         batch: RecordBatch,
         semantics: KeyedWriteSemantics,
+        system_columns: SystemColumns,
     ) -> Result<StagedWrite> {
         if batch.num_rows() == 0 {
             return Err(OmniError::manifest_internal(
@@ -2744,12 +2746,13 @@ impl TableStore {
                 batch_bytes,
             ));
         }
-        let id_field_id = exact_id_primary_key_field_id(&ds, "stage_keyed_write")?;
+        let id_field_id = exact_id_primary_key_field_id(&ds, system_columns, "stage_keyed_write")?;
         let expected_read_version = ds.version().version;
         let expected_schema_preorder_ids = schema_preorder_field_ids(&ds, "stage_keyed_write")?;
-        let source_ids = validate_keyed_write_batch_ids(&batch, type_key, "stage_keyed_write")?;
+        let source_ids =
+            validate_keyed_write_batch_ids(&batch, system_columns, type_key, "stage_keyed_write")?;
         if semantics == KeyedWriteSemantics::StrictInsert {
-            Self::preflight_strict_insert_ids(&ds, type_key, &source_ids).await?;
+            Self::preflight_strict_insert_ids(&ds, type_key, &source_ids, system_columns).await?;
             return self
                 .stage_absence_proven_strict_insert(
                     ds,
@@ -2759,6 +2762,7 @@ impl TableStore {
                     id_field_id,
                     &expected_schema_preorder_ids,
                     "stage_keyed_write",
+                    system_columns,
                 )
                 .await;
         }
@@ -2769,7 +2773,9 @@ impl TableStore {
         // ceiling before handing the still-logical blob array to Lance. This
         // retains keyed fencing without an Append side door; Overwrite keeps
         // Lance's external-reference behavior because it accepts WriteParams.
-        let batch = self.prepare_keyed_write_batch(type_key, batch).await?;
+        let batch = self
+            .prepare_keyed_write_batch(type_key, batch, system_columns)
+            .await?;
 
         let merged_rows = batch.num_rows() as u64;
         let schema = batch.schema();
@@ -2782,6 +2788,7 @@ impl TableStore {
                 merged_rows,
                 semantics,
                 id_field_id,
+                system_columns,
                 "stage_keyed_write",
             )
             .await?;
@@ -2826,6 +2833,7 @@ impl TableStore {
         &self,
         ds: Dataset,
         chunk: ProvenInsertChunk,
+        system_columns: SystemColumns,
     ) -> Result<StagedWrite> {
         let (
             table_key,
@@ -2848,9 +2856,14 @@ impl TableStore {
                 "stage_proven_strict_insert requires stable target row ids for {table_key} chunk {chunk_index}"
             )));
         }
-        let id_field_id = exact_id_primary_key_field_id(&ds, "stage_proven_strict_insert")?;
-        let source_ids =
-            validate_keyed_write_batch_ids(&batch, table_key, "stage_proven_strict_insert")?;
+        let id_field_id =
+            exact_id_primary_key_field_id(&ds, system_columns, "stage_proven_strict_insert")?;
+        let source_ids = validate_keyed_write_batch_ids(
+            &batch,
+            system_columns,
+            table_key,
+            "stage_proven_strict_insert",
+        )?;
         self.stage_absence_proven_strict_insert(
             ds,
             table_key,
@@ -2859,6 +2872,7 @@ impl TableStore {
             id_field_id,
             &expected_schema_preorder_ids,
             "stage_proven_strict_insert",
+            system_columns,
         )
         .await
     }
@@ -2879,6 +2893,7 @@ impl TableStore {
         id_field_id: i32,
         expected_schema_preorder_ids: &[u32],
         context: &'static str,
+        system_columns: SystemColumns,
     ) -> Result<StagedWrite> {
         if batch.num_rows() == 0 {
             return Err(OmniError::manifest_internal(format!(
@@ -2903,7 +2918,9 @@ impl TableStore {
             ));
         }
 
-        let batch = self.prepare_keyed_write_batch(table_key, batch).await?;
+        let batch = self
+            .prepare_keyed_write_batch(table_key, batch, system_columns)
+            .await?;
         ensure_proven_insert_blobs_are_materialized(&batch, table_key)?;
 
         let mut filter_builder = KeyExistenceFilterBuilder::new(vec![id_field_id]);
@@ -3015,10 +3032,11 @@ impl TableStore {
         &self,
         type_key: &str,
         batch: RecordBatch,
+        system_columns: SystemColumns,
     ) -> Result<RecordBatch> {
         let external_uris = collect_external_blob_uris(&batch)?;
         let preflight = self.preflight_external_blob_uris(&external_uris).await?;
-        self.prepare_keyed_write_batch_with_preflight(type_key, batch, &preflight)
+        self.prepare_keyed_write_batch_with_preflight(type_key, batch, &preflight, system_columns)
             .await
     }
 
@@ -3030,8 +3048,9 @@ impl TableStore {
         table_key: &str,
         batch: RecordBatch,
         preflight: &ExternalBlobPreflight,
+        system_columns: SystemColumns,
     ) -> Result<RecordBatch> {
-        self.validate_keyed_write_batch(table_key, &batch)?;
+        self.validate_keyed_write_batch(table_key, &batch, system_columns)?;
         let external_uris = collect_external_blob_uris(&batch)?;
         let payload_bytes = preflight.materialized_payload_bytes(&external_uris)?;
         if payload_bytes > KEYED_WRITE_MAX_BYTES {
@@ -3082,8 +3101,9 @@ impl TableStore {
         table_key: &str,
         batch: RecordBatch,
         preflight: &ExternalBlobPreflight,
+        system_columns: SystemColumns,
     ) -> Result<RecordBatch> {
-        self.validate_keyed_write_batch(table_key, &batch)?;
+        self.validate_keyed_write_batch(table_key, &batch, system_columns)?;
         canonicalize_external_blob_inputs(batch, preflight)
     }
 
@@ -3091,8 +3111,18 @@ impl TableStore {
     /// touching any Lance/manifest authority. This is deliberately separate
     /// from [`Self::stage_keyed_write`]: Overwrite and deferred first-touch
     /// plans must fail before recovery arm / native-ref creation too.
-    pub fn validate_keyed_write_batch(&self, type_key: &str, batch: &RecordBatch) -> Result<()> {
-        validate_keyed_write_batch_ids(batch, type_key, "prepare keyed write batch")?;
+    pub fn validate_keyed_write_batch(
+        &self,
+        type_key: &str,
+        batch: &RecordBatch,
+        system_columns: SystemColumns,
+    ) -> Result<()> {
+        validate_keyed_write_batch_ids(
+            batch,
+            system_columns,
+            type_key,
+            "prepare keyed write batch",
+        )?;
         Ok(())
     }
 
@@ -3115,10 +3145,13 @@ impl TableStore {
         type_key: &str,
         source: &Dataset,
         semantics: KeyedWriteSemantics,
+        system_columns: SystemColumns,
     ) -> Result<StagedWrite> {
-        let id_field_id = exact_id_primary_key_field_id(&ds, "stage_keyed_write_stream")?;
-        exact_id_primary_key_field_id(source, "stage_keyed_write_stream source")?;
-        let mut id_stream = Self::scan_stream(source, Some(&["id"]), None, None, false).await?;
+        let id_field_id =
+            exact_id_primary_key_field_id(&ds, system_columns, "stage_keyed_write_stream")?;
+        exact_id_primary_key_field_id(source, system_columns, "stage_keyed_write_stream source")?;
+        let mut id_stream =
+            Self::scan_stream(source, Some(&[system_columns.id]), None, None, false).await?;
         let mut merged_rows = 0_u64;
         while let Some(batch) = id_stream.try_next().await.map_err(OmniError::storage)? {
             merged_rows = merged_rows
@@ -3128,10 +3161,15 @@ impl TableStore {
                         "stage_keyed_write_stream source row count overflow",
                     )
                 })?;
-            let source_ids =
-                validate_keyed_write_batch_ids(&batch, type_key, "stage_keyed_write_stream")?;
+            let source_ids = validate_keyed_write_batch_ids(
+                &batch,
+                system_columns,
+                type_key,
+                "stage_keyed_write_stream",
+            )?;
             if semantics == KeyedWriteSemantics::StrictInsert {
-                Self::preflight_strict_insert_ids(&ds, type_key, &source_ids).await?;
+                Self::preflight_strict_insert_ids(&ds, type_key, &source_ids, system_columns)
+                    .await?;
             }
         }
         if merged_rows == 0 {
@@ -3146,6 +3184,7 @@ impl TableStore {
             merged_rows,
             semantics,
             id_field_id,
+            system_columns,
             "stage_keyed_write_stream",
         )
         .await
@@ -3161,9 +3200,10 @@ impl TableStore {
         ds: &Dataset,
         table_key: &str,
         source_ids: &[String],
+        system_columns: SystemColumns,
     ) -> Result<()> {
         crate::instrumentation::record_strict_insert_preflight();
-        if let Some(id) = Self::first_existing_id(ds, source_ids).await? {
+        if let Some(id) = Self::first_existing_id(ds, source_ids, system_columns).await? {
             return Err(OmniError::key_conflict(table_key, id));
         }
         Ok(())
@@ -3174,23 +3214,34 @@ impl TableStore {
     /// fresh-authority discriminator; both paths therefore use the same
     /// structured, scalar-index-eligible predicate and uncovered-fragment
     /// fallback.
-    pub async fn first_existing_id(ds: &Dataset, source_ids: &[String]) -> Result<Option<String>> {
+    pub async fn first_existing_id(
+        ds: &Dataset,
+        source_ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<Option<String>> {
         use datafusion::prelude::{col, lit};
 
-        exact_id_primary_key_field_id(ds, "first_existing_id")?;
+        exact_id_primary_key_field_id(ds, system_columns, "first_existing_id")?;
         if source_ids.is_empty() {
             return Ok(None);
         }
-        let filter =
-            col("id").in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
-        let mut target_ids =
-            Self::scan_stream_with(ds, Some(&["id"]), None, None, false, |scanner| {
+        let filter = col(system_columns.id)
+            .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
+        let mut target_ids = Self::scan_stream_with(
+            ds,
+            Some(&[system_columns.id]),
+            None,
+            None,
+            false,
+            |scanner| {
                 scanner.filter_expr(filter);
                 Ok(())
-            })
-            .await?;
+            },
+        )
+        .await?;
         while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
-            let ids = string_id_column(&batch, "stage_keyed_write strict preflight")?;
+            let ids =
+                string_id_column(&batch, system_columns, "stage_keyed_write strict preflight")?;
             for row in 0..ids.len() {
                 if ids.is_valid(row) {
                     return Ok(Some(ids.value(row).to_string()));
@@ -3207,10 +3258,12 @@ impl TableStore {
         merged_rows: u64,
         semantics: KeyedWriteSemantics,
         id_field_id: i32,
+        system_columns: SystemColumns,
         context: &'static str,
     ) -> Result<(StagedWrite, MergeStats)> {
-        let mut builder = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
-            .map_err(OmniError::lance_internal)?;
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec![system_columns.id.to_string()])
+                .map_err(OmniError::lance_internal)?;
         builder.when_matched(match semantics {
             KeyedWriteSemantics::StrictInsert => WhenMatched::Fail,
             KeyedWriteSemantics::Upsert | KeyedWriteSemantics::KnownPresentUpdate => {
@@ -3281,6 +3334,7 @@ impl TableStore {
         begin_version: u64,
         end_version: u64,
         external_preflight: &ExternalBlobPreflight,
+        system_columns: SystemColumns,
     ) -> Result<SendableRecordBatchStream> {
         use datafusion::prelude::{col, lit};
 
@@ -3295,7 +3349,11 @@ impl TableStore {
                 source.version().version
             )));
         }
-        exact_id_primary_key_field_id(source, "scan_proven_insert_delta_bounded source")?;
+        exact_id_primary_key_field_id(
+            source,
+            system_columns,
+            "scan_proven_insert_delta_bounded source",
+        )?;
 
         let created_in_interval = col("_row_created_at_version")
             .gt(lit(begin_version))
@@ -3331,7 +3389,13 @@ impl TableStore {
         // conservative for blobs: it bounds payload allocation; the stream
         // normalizer below then coalesces those rows into ordinary bounded
         // recovery-transaction chunks.
-        let raw = Self::scan_proven_insert_blob_row_ids(source, begin_version, end_version).await?;
+        let raw = Self::scan_proven_insert_blob_row_ids(
+            source,
+            begin_version,
+            end_version,
+            system_columns,
+        )
+        .await?;
         let materialized = futures::stream::try_unfold(
             (
                 raw,
@@ -3424,6 +3488,7 @@ impl TableStore {
         end_version: u64,
         expected_rows: u64,
         selection: &mut PersistedBlobSelection,
+        system_columns: SystemColumns,
     ) -> Result<()> {
         if begin_version >= end_version {
             return Err(OmniError::manifest_internal(format!(
@@ -3436,10 +3501,19 @@ impl TableStore {
                 source.version().version
             )));
         }
-        exact_id_primary_key_field_id(source, "include_proven_insert_blob_selection source")?;
+        exact_id_primary_key_field_id(
+            source,
+            system_columns,
+            "include_proven_insert_blob_selection source",
+        )?;
 
-        let mut raw =
-            Self::scan_proven_insert_blob_row_ids(source, begin_version, end_version).await?;
+        let mut raw = Self::scan_proven_insert_blob_row_ids(
+            source,
+            begin_version,
+            end_version,
+            system_columns,
+        )
+        .await?;
         let mut observed_rows = 0_u64;
         while let Some(batch) = raw
             .try_next()
@@ -3479,6 +3553,7 @@ impl TableStore {
         source: &Dataset,
         begin_version: u64,
         end_version: u64,
+        system_columns: SystemColumns,
     ) -> Result<SendableRecordBatchStream> {
         use datafusion::prelude::{col, lit};
 
@@ -3489,7 +3564,7 @@ impl TableStore {
         // the exact descriptor rows. Keep vectors and unrelated scalar values
         // out of this planning scan; `take_rows` below fetches the selected
         // full row only when descriptor classification/materialization needs it.
-        let selector_columns = ["id"];
+        let selector_columns = [system_columns.id];
         let raw: SendableRecordBatchStream = Self::scan_stream_with(
             source,
             Some(&selector_columns),
@@ -4509,8 +4584,13 @@ impl TableStore {
         Self::write_dataset(dataset_uri, batch).await
     }
 
-    pub async fn first_row_id_for_filter(&self, ds: &Dataset, filter: &str) -> Result<Option<u64>> {
-        let batches = Self::scan_stream(ds, Some(&["id"]), Some(filter), None, true)
+    pub async fn first_row_id_for_filter(
+        &self,
+        ds: &Dataset,
+        filter: &str,
+        system_columns: SystemColumns,
+    ) -> Result<Option<u64>> {
+        let batches = Self::scan_stream(ds, Some(&[system_columns.id]), Some(filter), None, true)
             .await?
             .try_collect::<Vec<RecordBatch>>()
             .await
@@ -5288,10 +5368,14 @@ fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &
     Ok(())
 }
 
-pub(crate) fn exact_id_primary_key_field_id(ds: &Dataset, context: &'static str) -> Result<i32> {
+pub(crate) fn exact_id_primary_key_field_id(
+    ds: &Dataset,
+    system_columns: SystemColumns,
+    context: &'static str,
+) -> Result<i32> {
     let primary_key = ds.schema().unenforced_primary_key();
     if primary_key.len() == 1
-        && primary_key[0].name == "id"
+        && primary_key[0].name == system_columns.id
         && !primary_key[0].nullable
         && primary_key[0].data_type() == arrow_schema::DataType::Utf8
     {
@@ -5302,8 +5386,9 @@ pub(crate) fn exact_id_primary_key_field_id(ds: &Dataset, context: &'static str)
         .map(|field| field.name.as_str())
         .collect();
     Err(OmniError::manifest_internal(format!(
-        "{context}: dataset must declare exactly ['id'] as a non-null Utf8 Lance unenforced \
-         primary key, got {actual:?}"
+        "{context}: dataset must declare exactly ['{}'] as a non-null Utf8 Lance unenforced \
+         primary key, got {actual:?}",
+        system_columns.id
     )))
 }
 
@@ -5321,16 +5406,24 @@ fn schema_preorder_field_ids(ds: &Dataset, context: &'static str) -> Result<Vec<
         .collect()
 }
 
-fn string_id_column<'a>(batch: &'a RecordBatch, context: &'static str) -> Result<&'a StringArray> {
-    let column = batch.column_by_name("id").ok_or_else(|| {
-        OmniError::manifest_internal(format!("{context}: source batch missing 'id' column"))
+fn string_id_column<'a>(
+    batch: &'a RecordBatch,
+    system_columns: SystemColumns,
+    context: &'static str,
+) -> Result<&'a StringArray> {
+    let column = batch.column_by_name(system_columns.id).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "{context}: source batch missing '{}' column",
+            system_columns.id
+        ))
     })?;
     column
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| {
             OmniError::manifest_internal(format!(
-                "{context}: 'id' column is not Utf8 (got {:?})",
+                "{context}: '{}' column is not Utf8 (got {:?})",
+                system_columns.id,
                 column.data_type()
             ))
         })
@@ -5338,16 +5431,18 @@ fn string_id_column<'a>(batch: &'a RecordBatch, context: &'static str) -> Result
 
 fn validate_keyed_write_batch_ids(
     batch: &RecordBatch,
+    system_columns: SystemColumns,
     table_key: &str,
     context: &'static str,
 ) -> Result<Vec<String>> {
-    let ids = string_id_column(batch, context)?;
+    let ids = string_id_column(batch, system_columns, context)?;
     let mut seen = std::collections::HashSet::with_capacity(ids.len());
     let mut source_ids = Vec::with_capacity(ids.len());
     for row in 0..ids.len() {
         if !ids.is_valid(row) {
             return Err(OmniError::manifest(format!(
-                "{context}: source row has a null 'id'"
+                "{context}: source row has a null '{}'",
+                system_columns.id
             )));
         }
         let id = ids.value(row);

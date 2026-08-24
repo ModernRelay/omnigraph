@@ -367,7 +367,11 @@ async fn entity_from_snapshot(
         .storage()
         .open_snapshot_at_table(snapshot, type_key)
         .await?;
-    let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
+    let filter_sql = format!(
+        "{} = '{}'",
+        db.catalog().system_columns.id,
+        id.replace('\'', "''")
+    );
     let mut batches = db
         .storage()
         .scan_stream_bounded(
@@ -469,7 +473,9 @@ where
         .open_snapshot_at_table(snapshot, table_key)
         .await?;
     let ordering = match row_order {
-        ExportRowOrder::ById => Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
+        ExportRowOrder::ById => Some(vec![ColumnOrdering::asc_nulls_last(
+            catalog.system_columns.id.to_string(),
+        )]),
         ExportRowOrder::Unspecified => None,
     };
     let blob_properties = blob_properties_for_table_key(catalog, table_key)?;
@@ -649,7 +655,7 @@ where
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
-        let fields = std::iter::once("id".to_string()).chain(
+        let fields = std::iter::once(catalog.system_columns.id.to_string()).chain(
             node_type
                 .arrow_schema
                 .fields()
@@ -684,7 +690,7 @@ where
             .edge_types
             .get(edge_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;
-        let fields = std::iter::once("id".to_string()).chain(
+        let fields = std::iter::once(catalog.system_columns.id.to_string()).chain(
             edge_type
                 .arrow_schema
                 .fields()
@@ -705,9 +711,15 @@ where
                 let mut line = b"{\"edge\":".to_vec();
                 json_string_into(&mut line, edge_name)?;
                 line.extend_from_slice(b",\"from\":");
-                json_string_into(&mut line, &named_string_value(batch, "src", row)?)?;
+                json_string_into(
+                    &mut line,
+                    &named_string_value(batch, catalog.system_columns.src, row)?,
+                )?;
                 line.extend_from_slice(b",\"to\":");
-                json_string_into(&mut line, &named_string_value(batch, "dst", row)?)?;
+                json_string_into(
+                    &mut line,
+                    &named_string_value(batch, catalog.system_columns.dst, row)?,
+                )?;
                 line.extend_from_slice(b",\"data\":");
                 line.extend_from_slice(data);
                 line.extend_from_slice(b"}\n");

@@ -2,11 +2,14 @@ use super::*;
 
 use arrow_array::StructArray;
 use arrow_schema::Fields;
+use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::NodeType;
 
-/// Node type per pipeline binding, for projecting a bare `$p` as one struct.
+/// Node type per pipeline binding, for projecting a bare `$p` as one struct,
+/// plus the graph's system column spellings every identity read resolves by.
 pub(super) struct ProjectionContext<'a> {
     node_bindings: HashMap<String, &'a NodeType>,
+    system_columns: SystemColumns,
 }
 
 impl<'a> ProjectionContext<'a> {
@@ -22,7 +25,10 @@ impl<'a> ProjectionContext<'a> {
                     .map(|node_type| (variable, node_type))
             })
             .collect();
-        Self { node_bindings }
+        Self {
+            node_bindings,
+            system_columns: catalog.system_columns,
+        }
     }
 }
 
@@ -487,8 +493,16 @@ fn evaluate_projection(
                         ))
                     })?;
                 let col = wide_batch.column(idx).clone();
+                // The identity member is the logical meta-field `@id` on every
+                // vintage (RFC 0040 Wire surfaces); the physical spelling stays
+                // in the bucket and a declared `id` property keeps its own name.
+                let member = if field.name() == ctx.system_columns.id {
+                    "@id"
+                } else {
+                    field.name()
+                };
                 fields.push(Field::new(
-                    field.name(),
+                    member,
                     col.data_type().clone(),
                     wide_field.is_nullable(),
                 ));
@@ -516,6 +530,7 @@ pub(super) fn apply_ordering(
     // returns at most n indices, discarding the rest. The CALLER owns the
     // precondition that nothing after the sort consumes rows beyond n.
     fetch: Option<usize>,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 
@@ -566,12 +581,13 @@ pub(super) fn apply_ordering(
     // a result row, so the order is total and reproducible. (Aggregate results
     // have no `.id` columns; their group rows are already distinct on the
     // projected group keys.)
+    let id_suffix = format!(".{}", system_columns.id);
     let mut tiebreak_cols: Vec<String> = source
         .schema()
         .fields()
         .iter()
         .map(|f| f.name().to_string())
-        .filter(|name| name.ends_with(".id"))
+        .filter(|name| name.ends_with(&id_suffix))
         .collect();
     tiebreak_cols.sort();
     for name in &tiebreak_cols {
