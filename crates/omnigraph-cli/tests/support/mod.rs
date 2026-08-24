@@ -886,7 +886,7 @@ pub const BLOB_CLI_DATA: &str = r#"{"type":"Document","data":{"title":"readme","
 {"type":"Document","data":{"title":"empty","content":"base64:","note":"valid empty"}}
 {"type":"Document","data":{"title":"null","note":"null"}}
 {"type":"Document","data":{"title":"peer","note":"edge target"}}
-{"edge":"Attachment","from":"readme","to":"peer","data":{"id":"attachment-1","payload":"base64:RWRnZQD/"}}"#;
+{"edge":"Attachment","from":"readme","to":"peer","data":{"__id":"attachment-1","payload":"base64:RWRnZQD/"}}"#;
 
 pub const BLOB_NODE_BYTES: &[u8] = &[0, 1, 2, 3, 4, 255];
 pub const BLOB_EDGE_BYTES: &[u8] = b"Edge\0\xff";
@@ -1095,6 +1095,7 @@ pub fn scrub_volatile(value: &mut serde_json::Value) {
         // identity-bearing per-instance values
         "commit_id",
         "id",
+        "__id",
         "parent_id",
         "merge_parent_id",
         "snapshot",

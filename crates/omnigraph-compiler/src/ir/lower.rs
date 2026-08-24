@@ -326,12 +326,12 @@ fn lower_clauses(
                 pipeline.push(IROp::Filter(IRFilter {
                     left: IRExpr::PropAccess {
                         variable: temp_var,
-                        property: "id".to_string(),
+                        property: catalog.system_columns.id.to_string(),
                     },
                     op: CompOp::Eq,
                     right: IRExpr::PropAccess {
                         variable: traversal.dst.clone(),
-                        property: "id".to_string(),
+                        property: catalog.system_columns.id.to_string(),
                     },
                 }));
             } else if !src_bound && dst_bound {

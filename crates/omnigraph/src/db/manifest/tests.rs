@@ -103,7 +103,7 @@ fn entity_batch(
         .iter()
         .map(|field| -> Arc<dyn arrow_array::Array> {
             match field.name().as_str() {
-                "id" => Arc::new(StringArray::from(vec![id.clone()])),
+                "id" | "__id" => Arc::new(StringArray::from(vec![id.clone()])),
                 "name" => Arc::new(StringArray::from(vec![name.clone()])),
                 "age" => Arc::new(Int32Array::from(vec![age])),
                 _ => arrow_array::new_null_array(field.data_type(), 1),
@@ -2511,7 +2511,7 @@ async fn append_node_row_and_make_update(
         .fields()
         .iter()
         .map(|field| match field.name().as_str() {
-            "id" => {
+            "id" | "__id" => {
                 Arc::new(StringArray::from(vec![id.to_string()])) as Arc<dyn arrow_array::Array>
             }
             "name" => Arc::new(StringArray::from(vec![name.to_string()])),

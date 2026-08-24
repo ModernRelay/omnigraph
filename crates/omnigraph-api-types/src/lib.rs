@@ -1001,6 +1001,30 @@ pub struct SchemaApplyOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchemaOutput {
     pub schema_source: String,
+    /// The graph's system column spellings. Query-result payloads carry
+    /// these exact field names; reading them here is the supported discovery
+    /// mechanism for clients serving graphs of mixed vintages. Optional for
+    /// compatibility with servers predating the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_columns: Option<SystemColumnsOutput>,
+}
+
+/// A graph's system column spellings (see `SchemaOutput::system_columns`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SystemColumnsOutput {
+    pub id: String,
+    pub src: String,
+    pub dst: String,
+}
+
+impl From<omnigraph_compiler::SystemColumns> for SystemColumnsOutput {
+    fn from(columns: omnigraph_compiler::SystemColumns) -> Self {
+        Self {
+            id: columns.id.to_string(),
+            src: columns.src.to_string(),
+            dst: columns.dst.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

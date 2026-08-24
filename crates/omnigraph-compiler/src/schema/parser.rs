@@ -4,6 +4,7 @@ use pest::Parser;
 use pest::error::InputLocation;
 use pest_derive::Parser;
 
+use crate::catalog::schema_ir::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3};
 use crate::error::{
     CompilerError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
 };
@@ -17,6 +18,20 @@ struct SchemaParser;
 
 pub fn parse_schema(input: &str) -> Result<SchemaFile> {
     parse_schema_diagnostic(input).map_err(|e| CompilerError::Parse(e.to_string()))
+}
+
+/// Parse source being admitted for a graph at the given IR version. Property
+/// name rules are keyed on the target graph's vintage (RFC 0040): a legacy
+/// graph keeps its historical rules, so a legally persisted name such as
+/// `_row_id` can still be restated when its schema evolves.
+pub fn parse_schema_for_ir_version(input: &str, ir_version: u32) -> Result<SchemaFile> {
+    let name_rules = if ir_version >= crate::catalog::schema_ir::SCHEMA_IR_VERSION {
+        PropertyNameRules::CurrentVintage
+    } else {
+        PropertyNameRules::LegacyVintage
+    };
+    parse_schema_diagnostic_with_modes(input, ConstraintValidationMode::Admission, name_rules)
+        .map_err(|e| CompilerError::Parse(e.to_string()))
 }
 
 /// Parse source that is already bound to a persisted accepted schema contract.
@@ -41,9 +56,36 @@ enum ConstraintValidationMode {
     PersistedContract,
 }
 
+/// Which vintage's property-name rules apply to this source (RFC 0040).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PropertyNameRules {
+    /// New graphs and current-vintage evolution: the whole leading-underscore
+    /// namespace is reserved.
+    CurrentVintage,
+    /// Legacy-vintage evolution: the exact Lance virtual names are rejected,
+    /// and the legacy system column spellings collide with the physical
+    /// columns those tables still carry.
+    LegacyVintage,
+    /// Persisted sources read back from existing graphs: only the exact Lance
+    /// virtual names, which were never admissible.
+    PersistedContract,
+}
+
 fn parse_schema_diagnostic_with_mode(
     input: &str,
     constraint_mode: ConstraintValidationMode,
+) -> std::result::Result<SchemaFile, ParseDiagnostic> {
+    let name_rules = match constraint_mode {
+        ConstraintValidationMode::Admission => PropertyNameRules::CurrentVintage,
+        ConstraintValidationMode::PersistedContract => PropertyNameRules::PersistedContract,
+    };
+    parse_schema_diagnostic_with_modes(input, constraint_mode, name_rules)
+}
+
+fn parse_schema_diagnostic_with_modes(
+    input: &str,
+    constraint_mode: ConstraintValidationMode,
+    name_rules: PropertyNameRules,
 ) -> std::result::Result<SchemaFile, ParseDiagnostic> {
     let pairs = SchemaParser::parse(Rule::schema_file, input).map_err(pest_error_to_diagnostic)?;
 
@@ -77,9 +119,93 @@ fn parse_schema_diagnostic_with_mode(
     }
 
     let schema = SchemaFile { declarations };
+    validate_property_names(&schema, name_rules).map_err(compiler_error_to_diagnostic)?;
     validate_schema_annotations(&schema).map_err(compiler_error_to_diagnostic)?;
     validate_constraints(&schema, constraint_mode).map_err(compiler_error_to_diagnostic)?;
     Ok(schema)
+}
+
+/// Source is graph-agnostic, so both spelling generations pass here; IR
+/// resolution rejects the one the target graph does not own. A declared
+/// property wins so its own validation (blob rules) still runs.
+fn is_implicit_edge_column_ref(
+    col: &str,
+    is_edge: bool,
+    prop_names: &HashMap<&str, &PropDecl>,
+) -> bool {
+    is_edge
+        && !prop_names.contains_key(col)
+        && (col == SYSTEM_COLUMNS_LEGACY.src
+            || col == SYSTEM_COLUMNS_LEGACY.dst
+            || col == SYSTEM_COLUMNS_V3.src
+            || col == SYSTEM_COLUMNS_V3.dst)
+}
+
+/// New schema admission reserves the whole leading-underscore namespace for
+/// system columns (RFC 0040): engine-owned names take the `__` prefix, the
+/// single-underscore space stays with the storage substrate, and no name is
+/// ever reserved individually again. Legacy-vintage evolution and persisted
+/// contracts keep their historical rules instead (see [`PropertyNameRules`]).
+fn validate_property_names(schema: &SchemaFile, rules: PropertyNameRules) -> Result<()> {
+    let reject_lance_names = |name: &str| -> Result<()> {
+        if super::is_reserved_storage_system_column(name) {
+            return Err(CompilerError::Parse(format!(
+                "property name '{name}' is reserved for a virtual storage system \
+                 column; a graph created with a pre-RC Lance binary must be exported \
+                 with that binary, renamed, and rebuilt"
+            )));
+        }
+        Ok(())
+    };
+    let check = |properties: &[PropDecl], is_edge: bool| -> Result<()> {
+        for prop in properties {
+            let name = prop.name.as_str();
+            match rules {
+                PropertyNameRules::CurrentVintage => {
+                    if super::is_reserved_system_column_name(name) {
+                        return Err(CompilerError::Parse(format!(
+                            "property name '{name}' is reserved for system columns \
+                             (names starting with '_')"
+                        )));
+                    }
+                }
+                PropertyNameRules::LegacyVintage => {
+                    reject_lance_names(name)?;
+                    let legacy = SYSTEM_COLUMNS_LEGACY;
+                    let collides = name == legacy.id
+                        || (is_edge && (name == legacy.src || name == legacy.dst));
+                    if collides {
+                        return Err(CompilerError::Parse(format!(
+                            "property name '{name}' collides with this graph's physical \
+                             column of the same name; the system column upgrade (RFC 0040) \
+                             frees the name"
+                        )));
+                    }
+                    let current = SYSTEM_COLUMNS_V3;
+                    let claims_upgrade_target = name == current.id
+                        || (is_edge && (name == current.src || name == current.dst));
+                    if claims_upgrade_target {
+                        return Err(CompilerError::Parse(format!(
+                            "property name '{name}' is reserved for the system column \
+                             upgrade (RFC 0040)"
+                        )));
+                    }
+                }
+                PropertyNameRules::PersistedContract => {
+                    reject_lance_names(name)?;
+                }
+            }
+        }
+        Ok(())
+    };
+    for decl in &schema.declarations {
+        match decl {
+            SchemaDecl::Interface(interface) => check(&interface.properties, false)?,
+            SchemaDecl::Node(node) => check(&node.properties, false)?,
+            SchemaDecl::Edge(edge) => check(&edge.properties, true)?,
+        }
+    }
+    Ok(())
 }
 
 fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
@@ -510,13 +636,6 @@ fn resolve_interfaces(node: &mut NodeDecl, interfaces: &[&InterfaceDecl]) -> Res
 fn parse_prop_decl(pair: pest::iterators::Pair<Rule>) -> Result<PropDecl> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
-    if super::is_reserved_storage_system_column(&name) {
-        return Err(CompilerError::Parse(format!(
-            "property name '{name}' is reserved for a virtual storage system column; \
-             a graph created with a pre-RC Lance binary must be exported with that binary, \
-             renamed, and rebuilt"
-        )));
-    }
     let type_ref = inner.next().unwrap();
     let prop_type = parse_type_ref(type_ref)?;
 
@@ -1033,8 +1152,7 @@ fn validate_type_constraints(
             }
             Constraint::Unique(cols) => {
                 for col in cols {
-                    // Allow "src" and "dst" as implicit edge columns
-                    if is_edge && (col == "src" || col == "dst") {
+                    if is_implicit_edge_column_ref(col, is_edge, &prop_names) {
                         continue;
                     }
                     let prop = prop_names.get(col.as_str()).ok_or_else(|| {
@@ -1055,7 +1173,7 @@ fn validate_type_constraints(
             }
             Constraint::Index(cols) => {
                 for col in cols {
-                    if is_edge && (col == "src" || col == "dst") {
+                    if is_implicit_edge_column_ref(col, is_edge, &prop_names) {
                         continue;
                     }
                     let prop = prop_names.get(col.as_str()).ok_or_else(|| {

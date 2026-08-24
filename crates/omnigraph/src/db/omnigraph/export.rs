@@ -333,7 +333,11 @@ async fn entity_from_snapshot(
         .storage()
         .open_snapshot_at_table(snapshot, type_key)
         .await?;
-    let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
+    let filter_sql = format!(
+        "{} = '{}'",
+        db.catalog().system_columns.id,
+        id.replace('\'', "''")
+    );
     let batches = db
         .storage()
         .scan(&ds, None, Some(&filter_sql), None)
@@ -410,7 +414,9 @@ where
         .storage()
         .open_snapshot_at_table(snapshot, table_key)
         .await?;
-    let ordering = Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]);
+    let ordering = Some(vec![ColumnOrdering::asc_nulls_last(
+        catalog.system_columns.id.to_string(),
+    )]);
     let blob_properties = blob_properties_for_table_key(catalog, table_key)?;
 
     if blob_properties.is_empty() {
@@ -590,8 +596,8 @@ where
         for row in 0..batch.num_rows() {
             let mut data = serde_json::Map::new();
             data.insert(
-                "id".to_string(),
-                json_value_from_named_column(batch, "id", row)?,
+                catalog.system_columns.id.to_string(),
+                json_value_from_named_column(batch, catalog.system_columns.id, row)?,
             );
             for field in node_type.arrow_schema.fields().iter().skip(1) {
                 data.insert(
@@ -623,12 +629,12 @@ where
             .get(edge_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;
         for row in 0..batch.num_rows() {
-            let from = named_string_value(batch, "src", row)?;
-            let to = named_string_value(batch, "dst", row)?;
+            let from = named_string_value(batch, catalog.system_columns.src, row)?;
+            let to = named_string_value(batch, catalog.system_columns.dst, row)?;
             let mut data = serde_json::Map::new();
             data.insert(
-                "id".to_string(),
-                json_value_from_named_column(batch, "id", row)?,
+                catalog.system_columns.id.to_string(),
+                json_value_from_named_column(batch, catalog.system_columns.id, row)?,
             );
             for field in edge_type.arrow_schema.fields().iter().skip(3) {
                 data.insert(

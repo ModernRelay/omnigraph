@@ -30,6 +30,7 @@ use datafusion::prelude::{Expr, col, lit};
 use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use lance::Dataset;
+use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::{Catalog, EdgeType};
 
 use crate::db::{Omnigraph, Snapshot};
@@ -355,18 +356,24 @@ impl<'a> CommittedState<'a> {
     }
 
     /// Which of `ids` exist as committed rows in `table_key` (by `id`).
-    async fn existing_ids(&self, table_key: &str, ids: &[String]) -> Result<HashSet<String>> {
+    async fn existing_ids(
+        &self,
+        table_key: &str,
+        ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<HashSet<String>> {
         let Some(ds) = self.open(table_key).await? else {
             return Ok(HashSet::new());
         };
         if ids.is_empty() {
             return Ok(HashSet::new());
         }
-        let expr = col("id").in_list(ids.iter().map(|k| lit(k.clone())).collect(), false);
-        let batches = scan_filtered(&ds, &["id"], expr).await?;
+        let expr =
+            col(system_columns.id).in_list(ids.iter().map(|k| lit(k.clone())).collect(), false);
+        let batches = scan_filtered(&ds, &[system_columns.id], expr).await?;
         let mut present = HashSet::new();
         for batch in &batches {
-            let column = string_col(batch, "id")?;
+            let column = string_col(batch, system_columns.id)?;
             for i in 0..column.len() {
                 if !column.is_null(i) {
                     present.insert(column.value(i).to_string());
@@ -399,6 +406,7 @@ impl<'a> CommittedState<'a> {
         table_key: &str,
         columns: &[String],
         keys: &[(Vec<String>, Vec<ScalarValue>)],
+        system_columns: SystemColumns,
     ) -> Result<HashMap<Vec<String>, Vec<String>>> {
         let mut holders: HashMap<Vec<String>, Vec<String>> = HashMap::new();
         if keys.is_empty() || columns.is_empty() {
@@ -407,7 +415,7 @@ impl<'a> CommittedState<'a> {
         let Some(ds) = self.open(table_key).await? else {
             return Ok(holders);
         };
-        let projection: Vec<&str> = std::iter::once("id")
+        let projection: Vec<&str> = std::iter::once(system_columns.id)
             .chain(columns.iter().map(String::as_str))
             .collect();
         for chunk in keys.chunks(UNIQUE_PROBE_CHUNK_KEYS) {
@@ -436,7 +444,7 @@ impl<'a> CommittedState<'a> {
             let expr = expr.expect("columns is non-empty");
             let batches = scan_filtered(&ds, &projection, expr).await?;
             for batch in &batches {
-                let ids = string_col(batch, "id")?;
+                let ids = string_col(batch, system_columns.id)?;
                 let group_columns = columns
                     .iter()
                     .map(|name| {
@@ -467,12 +475,13 @@ impl<'a> CommittedState<'a> {
     }
 
     /// Committed edges `(id, src)` in `edge_table` matching `keys` on `key_col`
-    /// (`"id"` or `"src"`). Index-backed.
+    /// (id or src). Index-backed.
     async fn committed_edges(
         &self,
         edge_table: &str,
         key_col: &str,
         keys: &[String],
+        system_columns: SystemColumns,
     ) -> Result<Vec<(String, String)>> {
         let Some(ds) = self.open_cardinality(edge_table).await? else {
             return Ok(Vec::new());
@@ -481,11 +490,11 @@ impl<'a> CommittedState<'a> {
             return Ok(Vec::new());
         }
         let expr = col(key_col).in_list(keys.iter().map(|k| lit(k.clone())).collect(), false);
-        let batches = scan_filtered(&ds, &["id", "src"], expr).await?;
+        let batches = scan_filtered(&ds, &[system_columns.id, system_columns.src], expr).await?;
         let mut out = Vec::new();
         for batch in &batches {
-            let ids = string_col(batch, "id")?;
-            let srcs = string_col(batch, "src")?;
+            let ids = string_col(batch, system_columns.id)?;
+            let srcs = string_col(batch, system_columns.src)?;
             for i in 0..batch.num_rows() {
                 out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
             }
@@ -501,6 +510,7 @@ impl<'a> CommittedState<'a> {
         edge_table: &str,
         src_nodes: &[String],
         dst_nodes: &[String],
+        system_columns: SystemColumns,
     ) -> Result<Vec<(String, String, String)>> {
         if src_nodes.is_empty() && dst_nodes.is_empty() {
             return Ok(Vec::new());
@@ -510,22 +520,30 @@ impl<'a> CommittedState<'a> {
         };
         let mut expr: Option<Expr> = None;
         if !src_nodes.is_empty() {
-            expr =
-                Some(col("src").in_list(src_nodes.iter().map(|k| lit(k.clone())).collect(), false));
+            expr = Some(
+                col(system_columns.src)
+                    .in_list(src_nodes.iter().map(|k| lit(k.clone())).collect(), false),
+            );
         }
         if !dst_nodes.is_empty() {
-            let dst = col("dst").in_list(dst_nodes.iter().map(|k| lit(k.clone())).collect(), false);
+            let dst = col(system_columns.dst)
+                .in_list(dst_nodes.iter().map(|k| lit(k.clone())).collect(), false);
             expr = Some(match expr {
                 Some(acc) => acc.or(dst),
                 None => dst,
             });
         }
-        let batches = scan_filtered(&ds, &["id", "src", "dst"], expr.unwrap()).await?;
+        let batches = scan_filtered(
+            &ds,
+            &[system_columns.id, system_columns.src, system_columns.dst],
+            expr.unwrap(),
+        )
+        .await?;
         let mut out = Vec::new();
         for batch in &batches {
-            let ids = string_col(batch, "id")?;
-            let srcs = string_col(batch, "src")?;
-            let dsts = string_col(batch, "dst")?;
+            let ids = string_col(batch, system_columns.id)?;
+            let srcs = string_col(batch, system_columns.src)?;
+            let dsts = string_col(batch, system_columns.dst)?;
             for i in 0..batch.num_rows() {
                 out.push((
                     ids.value(i).to_string(),
@@ -572,13 +590,14 @@ pub(crate) async fn overwrite_removed_ids(
     base: &Snapshot,
     table_key: &str,
     change: &TableChange,
+    system_columns: SystemColumns,
 ) -> Result<Vec<String>> {
     if base.dataset(table_key).is_none() {
         return Ok(Vec::new());
     }
     let mut new_ids: HashSet<String> = HashSet::new();
     for batch in change.value_batches() {
-        let column = string_col(batch, "id")?;
+        let column = string_col(batch, system_columns.id)?;
         for i in 0..column.len() {
             if !column.is_null(i) {
                 new_ids.insert(column.value(i).to_string());
@@ -587,8 +606,8 @@ pub(crate) async fn overwrite_removed_ids(
     }
     let ds = base.open_lance_dataset(table_key).await?;
     let mut removed = Vec::new();
-    for batch in &scan_all(&ds, &["id"]).await? {
-        let column = string_col(batch, "id")?;
+    for batch in &scan_all(&ds, &[system_columns.id]).await? {
+        let column = string_col(batch, system_columns.id)?;
         for i in 0..column.len() {
             if !column.is_null(i) && !new_ids.contains(column.value(i)) {
                 removed.push(column.value(i).to_string());
@@ -608,10 +627,10 @@ fn string_col<'b>(batch: &'b RecordBatch, name: &str) -> Result<&'b StringArray>
 }
 
 /// Non-null `id`s across a table's added∪changed delta rows.
-fn delta_id_set(change: &TableChange) -> Result<HashSet<String>> {
+fn delta_id_set(change: &TableChange, system_columns: SystemColumns) -> Result<HashSet<String>> {
     let mut ids = HashSet::new();
     for batch in change.value_batches() {
-        let column = string_col(batch, "id")?;
+        let column = string_col(batch, system_columns.id)?;
         for i in 0..column.len() {
             if !column.is_null(i) {
                 ids.insert(column.value(i).to_string());
@@ -622,11 +641,14 @@ fn delta_id_set(change: &TableChange) -> Result<HashSet<String>> {
 }
 
 /// `(edge_id, src)` for a table's added∪changed delta edge rows.
-fn delta_edge_src(change: &TableChange) -> Result<Vec<(String, String)>> {
+fn delta_edge_src(
+    change: &TableChange,
+    system_columns: SystemColumns,
+) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     for batch in change.value_batches() {
-        let ids = string_col(batch, "id")?;
-        let srcs = string_col(batch, "src")?;
+        let ids = string_col(batch, system_columns.id)?;
+        let srcs = string_col(batch, system_columns.src)?;
         for i in 0..batch.num_rows() {
             out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
         }
@@ -690,6 +712,7 @@ where
     F: FnMut(Violation) -> Result<()>,
 {
     let mut violation_count = 0usize;
+    let system_columns = catalog.system_columns;
     {
         let mut emit = |violation| {
             let next_count = violation_count
@@ -711,8 +734,16 @@ where
                     is_key,
                 } => {
                     if let Some(change) = changeset.get(table_key) {
-                        evaluate_unique(table_key, columns, *is_key, change, committed, &mut emit)
-                            .await?;
+                        evaluate_unique(
+                            table_key,
+                            columns,
+                            *is_key,
+                            change,
+                            committed,
+                            system_columns,
+                            &mut emit,
+                        )
+                        .await?;
                     }
                 }
                 Constraint::EdgeRi {
@@ -732,7 +763,14 @@ where
                     let change = changeset.get(table_key);
                     if change.is_some() || node_deleted(from_type) || node_deleted(to_type) {
                         evaluate_edge_ri(
-                            table_key, from_type, to_type, change, changeset, committed, &mut emit,
+                            table_key,
+                            from_type,
+                            to_type,
+                            change,
+                            changeset,
+                            committed,
+                            system_columns,
+                            &mut emit,
                         )
                         .await?;
                     }
@@ -744,7 +782,13 @@ where
                         };
                         if let Some(edge_type) = catalog.edge_types.get(type_name) {
                             evaluate_cardinality(
-                                table_key, edge_type, change, changeset, committed, &mut emit,
+                                table_key,
+                                edge_type,
+                                change,
+                                changeset,
+                                committed,
+                                system_columns,
+                                &mut emit,
                             )
                             .await?;
                         }
@@ -780,13 +824,14 @@ async fn evaluate_unique<F>(
     is_key: bool,
     change: &TableChange,
     committed: &CommittedState<'_>,
+    system_columns: SystemColumns,
     sink: &mut F,
 ) -> Result<()>
 where
     F: FnMut(Violation) -> Result<()>,
 {
     let mut has_within_batch_violation = false;
-    let delta_ids = delta_id_set(change)?;
+    let delta_ids = delta_id_set(change, system_columns)?;
     let deleted: HashSet<&String> = change.deleted_ids.iter().collect();
 
     // Pass 1: per-batch within-batch dup detection AND coalesce the delta by id
@@ -804,7 +849,7 @@ where
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let ids = string_col(batch, "id")?;
+        let ids = string_col(batch, system_columns.id)?;
         let mut seen_in_batch: HashMap<Vec<String>, String> = HashMap::new();
         for row in 0..batch.num_rows() {
             let id = ids.value(row).to_string();
@@ -857,7 +902,9 @@ where
             .filter(|(_, (key, _))| seen.insert(key))
             .map(|(_, (key, values))| (key.clone(), values.clone()))
             .collect();
-        let holders_by_key = committed.unique_holders(table_key, columns, &probe).await?;
+        let holders_by_key = committed
+            .unique_holders(table_key, columns, &probe, system_columns)
+            .await?;
         for (id, (key, _)) in &entries {
             let Some(holders) = holders_by_key.get(key) else {
                 continue;
@@ -888,6 +935,7 @@ async fn evaluate_edge_ri<F>(
     change: Option<&TableChange>,
     changeset: &ChangeSet,
     committed: &CommittedState<'_>,
+    system_columns: SystemColumns,
     sink: &mut F,
 ) -> Result<()>
 where
@@ -903,9 +951,9 @@ where
     if let Some(change) = change {
         let mut edges = Vec::new();
         for batch in change.value_batches() {
-            let ids = string_col(batch, "id")?;
-            let srcs = string_col(batch, "src")?;
-            let dsts = string_col(batch, "dst")?;
+            let ids = string_col(batch, system_columns.id)?;
+            let srcs = string_col(batch, system_columns.src)?;
+            let dsts = string_col(batch, system_columns.dst)?;
             for i in 0..batch.num_rows() {
                 let id = ids.value(i).to_string();
                 delta_edge_ids.insert(id.clone());
@@ -916,14 +964,29 @@ where
             let srcs: Vec<String> = edges.iter().map(|(_, src, _)| src.clone()).collect();
             let dsts: Vec<String> = edges.iter().map(|(_, _, dst)| dst.clone()).collect();
             let from_exist =
-                merged_node_existence(&from_table, &srcs, changeset, committed).await?;
-            let to_exist = merged_node_existence(&to_table, &dsts, changeset, committed).await?;
+                merged_node_existence(&from_table, &srcs, changeset, committed, system_columns)
+                    .await?;
+            let to_exist =
+                merged_node_existence(&to_table, &dsts, changeset, committed, system_columns)
+                    .await?;
             for (id, src, dst) in &edges {
                 if !from_exist.contains(src) {
-                    sink(orphan_violation(edge_table, id, "src", src, from_type))?;
+                    sink(orphan_violation(
+                        edge_table,
+                        id,
+                        system_columns.src,
+                        src,
+                        from_type,
+                    ))?;
                 }
                 if !to_exist.contains(dst) {
-                    sink(orphan_violation(edge_table, id, "dst", dst, to_type))?;
+                    sink(orphan_violation(
+                        edge_table,
+                        id,
+                        system_columns.dst,
+                        dst,
+                        to_type,
+                    ))?;
                 }
             }
         }
@@ -949,17 +1012,29 @@ where
         let from_set: HashSet<&String> = deleted_from.iter().collect();
         let to_set: HashSet<&String> = deleted_to.iter().collect();
         for (id, src, dst) in committed
-            .edges_referencing(edge_table, &deleted_from, &deleted_to)
+            .edges_referencing(edge_table, &deleted_from, &deleted_to, system_columns)
             .await?
         {
             if delta_edge_ids.contains(&id) || removed.contains(&id) {
                 continue;
             }
             if from_set.contains(&src) {
-                sink(orphan_violation(edge_table, &id, "src", &src, from_type))?;
+                sink(orphan_violation(
+                    edge_table,
+                    &id,
+                    system_columns.src,
+                    &src,
+                    from_type,
+                ))?;
             }
             if to_set.contains(&dst) {
-                sink(orphan_violation(edge_table, &id, "dst", &dst, to_type))?;
+                sink(orphan_violation(
+                    edge_table,
+                    &id,
+                    system_columns.dst,
+                    &dst,
+                    to_type,
+                ))?;
             }
         }
     }
@@ -975,10 +1050,11 @@ async fn merged_node_existence(
     ids: &[String],
     changeset: &ChangeSet,
     committed: &CommittedState<'_>,
+    system_columns: SystemColumns,
 ) -> Result<HashSet<String>> {
     let (added_changed, deleted) = match changeset.get(node_table) {
         Some(change) => (
-            delta_id_set(change)?,
+            delta_id_set(change, system_columns)?,
             change.deleted_ids.iter().cloned().collect::<HashSet<_>>(),
         ),
         None => (HashSet::new(), HashSet::new()),
@@ -992,7 +1068,10 @@ async fn merged_node_existence(
             to_probe.push(id.clone());
         }
     }
-    for id in committed.existing_ids(node_table, &to_probe).await? {
+    for id in committed
+        .existing_ids(node_table, &to_probe, system_columns)
+        .await?
+    {
         exist.insert(id);
     }
     Ok(exist)
@@ -1011,6 +1090,7 @@ async fn evaluate_cardinality<F>(
     change: &TableChange,
     changeset: &ChangeSet,
     committed: &CommittedState<'_>,
+    system_columns: SystemColumns,
     sink: &mut F,
 ) -> Result<()>
 where
@@ -1021,7 +1101,7 @@ where
     if card.min == 0 && card.max.is_none() {
         return Ok(());
     }
-    let delta_edges = delta_edge_src(change)?;
+    let delta_edges = delta_edge_src(change, system_columns)?;
     let removed_ids: Vec<String> = change.deleted_ids.clone();
     let removed_id_set: HashSet<&String> = removed_ids.iter().collect();
 
@@ -1042,10 +1122,10 @@ where
     // upsert that moves an edge's src vacates its old src, which must be
     // recounted or a drop below @card min is missed.
     let removed_edges = committed
-        .committed_edges(edge_table, "id", &removed_ids)
+        .committed_edges(edge_table, system_columns.id, &removed_ids, system_columns)
         .await?;
     let moved_from = committed
-        .committed_edges(edge_table, "id", &changed_ids)
+        .committed_edges(edge_table, system_columns.id, &changed_ids, system_columns)
         .await?;
 
     let deleted_src_nodes: HashSet<String> = changeset
@@ -1067,7 +1147,12 @@ where
 
     let affected_vec: Vec<String> = affected.iter().cloned().collect();
     let committed_for_affected = committed
-        .committed_edges(edge_table, "src", &affected_vec)
+        .committed_edges(
+            edge_table,
+            system_columns.src,
+            &affected_vec,
+            system_columns,
+        )
         .await?;
 
     // Merged edge-id set per src. A committed edge is dropped from its src when
@@ -1197,7 +1282,7 @@ mod tests {
     /// A change-set touching only `Doc.status` with the given values.
     fn status_change(values: &[&str]) -> ChangeSet {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
+            Field::new("__id", DataType::Utf8, false),
             Field::new("status", DataType::Utf8, true),
         ]));
         let ids = (0..values.len())
@@ -1220,7 +1305,7 @@ mod tests {
 
     fn duplicate_slug_change() -> ChangeSet {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
+            Field::new("__id", DataType::Utf8, false),
             Field::new("slug", DataType::Utf8, false),
             Field::new("status", DataType::Utf8, true),
         ]));

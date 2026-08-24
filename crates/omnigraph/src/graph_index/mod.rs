@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use arrow_array::StringArray;
 use futures::TryStreamExt;
+use omnigraph_compiler::SystemColumns;
 
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
@@ -115,6 +116,7 @@ impl GraphIndex {
     pub async fn build(
         snapshot: &Snapshot,
         edge_types: &HashMap<String, (String, String)>, // edge_name → (from_type, to_type)
+        system_columns: SystemColumns,
     ) -> Result<Self> {
         // INVARIANT (A1 graph-index cache key): the topology is a pure function of
         // the edge tables' `src`/`dst` columns and nothing else. `RuntimeCache`
@@ -139,7 +141,7 @@ impl GraphIndex {
 
             let batches: Vec<arrow_array::RecordBatch> = ds
                 .scan()
-                .project(&["src", "dst"])
+                .project(&[system_columns.src, system_columns.dst])
                 .map_err(OmniError::storage)?
                 .try_into_stream()
                 .await
@@ -157,8 +159,8 @@ impl GraphIndex {
 
             let mut edges: Vec<(u32, u32)> = Vec::new();
             for batch in &batches {
-                let srcs = string_column(batch, "src")?;
-                let dsts = string_column(batch, "dst")?;
+                let srcs = string_column(batch, system_columns.src)?;
+                let dsts = string_column(batch, system_columns.dst)?;
 
                 for i in 0..batch.num_rows() {
                     let src_dense = type_indices
@@ -310,7 +312,7 @@ mod tests {
     fn string_column_returns_error_for_bad_schema() {
         let batch = arrow_array::RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
-                "src",
+                "__src",
                 DataType::UInt64,
                 false,
             )])),
@@ -318,7 +320,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = string_column(&batch, "src").unwrap_err();
-        assert!(err.to_string().contains("src"));
+        let err = string_column(&batch, "__src").unwrap_err();
+        assert!(err.to_string().contains("__src"));
     }
 }

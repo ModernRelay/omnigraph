@@ -1774,7 +1774,7 @@ async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
         let mut scanner = table.scan();
         scanner
             .project(&[
-                "id",
+                "__id",
                 ROW_ID,
                 ROW_CREATED_AT_VERSION,
                 ROW_LAST_UPDATED_AT_VERSION,
@@ -1838,7 +1838,7 @@ async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
         );
         let mut predicate_probe = table.scan();
         predicate_probe
-            .project(&["id"])
+            .project(&["__id"])
             .expect("the predicate probe must project a logical column");
         predicate_probe
             .filter(&version_predicate)

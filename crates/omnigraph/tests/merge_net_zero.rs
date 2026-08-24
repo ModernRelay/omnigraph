@@ -41,7 +41,7 @@ node Document {
     note: String?
     first: String
     second: String
-    _row_id: String
+    row_id: String
 }
 "#;
 
@@ -55,7 +55,7 @@ query move_separator($slug: String, $first: String, $second: String) {
 }
 
 query set_near_miss_row_property($slug: String, $value: String) {
-    update Document set { _row_id: $value } where slug = $slug
+    update Document set { row_id: $value } where slug = $slug
 }
 "#;
 
@@ -187,7 +187,7 @@ fn document_row(batches: &[RecordBatch], title: &str) -> RecordBatch {
 #[tokio::test]
 async fn adopt_equality_distinguishes_null_from_empty_string() {
     assert_adopted_string_change(
-        r#"{"type":"Document","data":{"slug":"doc","first":"stable","second":"stable","_row_id":"stable"}}"#,
+        r#"{"type":"Document","data":{"slug":"doc","first":"stable","second":"stable","row_id":"stable"}}"#,
         "set_note",
         &params(&[("$slug", "doc"), ("$note", "")]),
         &[("note", Some(""))],
@@ -198,7 +198,7 @@ async fn adopt_equality_distinguishes_null_from_empty_string() {
 #[tokio::test]
 async fn adopt_equality_frames_columns_instead_of_joining_with_a_separator() {
     assert_adopted_string_change(
-        r#"{"type":"Document","data":{"slug":"doc","first":"a\u001fb","second":"c","_row_id":"stable"}}"#,
+        r#"{"type":"Document","data":{"slug":"doc","first":"a\u001fb","second":"c","row_id":"stable"}}"#,
         "move_separator",
         &params(&[
             ("$slug", "doc"),
@@ -213,10 +213,10 @@ async fn adopt_equality_frames_columns_instead_of_joining_with_a_separator() {
 #[tokio::test]
 async fn adopt_equality_does_not_hide_a_legal_row_prefix_property() {
     assert_adopted_string_change(
-        r#"{"type":"Document","data":{"slug":"doc","first":"stable","second":"stable","_row_id":"before"}}"#,
+        r#"{"type":"Document","data":{"slug":"doc","first":"stable","second":"stable","row_id":"before"}}"#,
         "set_near_miss_row_property",
         &params(&[("$slug", "doc"), ("$value", "after")]),
-        &[("_row_id", Some("after"))],
+        &[("row_id", Some("after"))],
     )
     .await;
 }
@@ -329,7 +329,7 @@ query set_note($title: String, $note: String) {
         .unwrap();
     let base_blob_row = document_row(&base_batches, "blob");
     assert_eq!(base_blob_row.schema(), source_blob_row.schema());
-    for column in ["id", "title", "note", "content"] {
+    for column in ["__id", "title", "note", "content"] {
         assert_eq!(
             base_blob_row.column_by_name(column).unwrap().to_data(),
             source_blob_row.column_by_name(column).unwrap().to_data(),

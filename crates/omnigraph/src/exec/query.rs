@@ -76,6 +76,7 @@ impl Omnigraph {
                 self,
                 &resolved,
                 referenced_edge_types(&ir.pipeline, &catalog),
+                catalog.system_columns,
             )
         } else {
             GraphIndexHandle::none()
@@ -126,7 +127,11 @@ impl Omnigraph {
         // which is keyed to live branch targets); only a CSR-path Expand or an
         // AntiJoin triggers it. Scoped to the edges this query traverses.
         let graph_index = if needs_graph {
-            GraphIndexHandle::direct(&snapshot, referenced_edge_types(&ir.pipeline, &catalog))
+            GraphIndexHandle::direct(
+                &snapshot,
+                referenced_edge_types(&ir.pipeline, &catalog),
+                catalog.system_columns,
+            )
         } else {
             GraphIndexHandle::none()
         };
@@ -473,14 +478,31 @@ pub async fn execute_query(
         .return_exprs
         .iter()
         .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
-    let mut result_batch = project_return(&wide_batch, &ir.return_exprs, params)?;
+    let mut result_batch = project_return(
+        &wide_batch,
+        &ir.return_exprs,
+        params,
+        catalog.system_columns,
+    )?;
 
     // Apply ordering (skip if search mode already ordered the results)
     if !ir.order_by.is_empty() && !is_search_ordered(&search_mode) {
         result_batch = if has_aggregates {
-            apply_ordering(result_batch.clone(), &ir.order_by, &result_batch, params)?
+            apply_ordering(
+                result_batch.clone(),
+                &ir.order_by,
+                &result_batch,
+                params,
+                catalog.system_columns,
+            )?
         } else {
-            apply_ordering(result_batch, &ir.order_by, &wide_batch, params)?
+            apply_ordering(
+                result_batch,
+                &ir.order_by,
+                &wide_batch,
+                params,
+                catalog.system_columns,
+            )?
         };
     }
 
@@ -559,7 +581,7 @@ async fn execute_rrf_query(
     // Build entity-ID → rank maps. A downstream traversal may fan one
     // ranked entity out to several result rows; those rows all have the same
     // search rank and must not consume additional rank ordinals.
-    let id_col_name = format!("{}.id", primary_var);
+    let id_col_name = format!("{}.{}", primary_var, catalog.system_columns.id);
     let primary_ids = extract_id_column_by_name(primary_batch, &id_col_name)?;
     let secondary_ids = extract_id_column_by_name(secondary_batch, &id_col_name)?;
 
@@ -634,7 +656,12 @@ async fn execute_rrf_query(
     )?;
 
     // Project directly from fused batch
-    let mut result_batch = project_return(&fused_batch, &ir.return_exprs, params)?;
+    let mut result_batch = project_return(
+        &fused_batch,
+        &ir.return_exprs,
+        params,
+        catalog.system_columns,
+    )?;
     // `rrf.limit` is the query's row limit. A winning entity can now own more
     // than one row after traversal, so enforce the limit after reconstruction.
     let len = result_batch.num_rows().min(rrf.limit);
@@ -996,8 +1023,13 @@ enum GraphIndexBuilder<'a> {
         &'a Omnigraph,
         &'a crate::db::ResolvedTarget,
         HashMap<String, (String, String)>,
+        SystemColumns,
     ),
-    Direct(&'a Snapshot, HashMap<String, (String, String)>),
+    Direct(
+        &'a Snapshot,
+        HashMap<String, (String, String)>,
+        SystemColumns,
+    ),
 }
 
 impl<'a> GraphIndexHandle<'a> {
@@ -1012,17 +1044,22 @@ impl<'a> GraphIndexHandle<'a> {
         db: &'a Omnigraph,
         resolved: &'a crate::db::ResolvedTarget,
         edge_types: HashMap<String, (String, String)>,
+        system_columns: SystemColumns,
     ) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Cached(db, resolved, edge_types),
+            builder: GraphIndexBuilder::Cached(db, resolved, edge_types, system_columns),
         }
     }
 
-    fn direct(snapshot: &'a Snapshot, edge_types: HashMap<String, (String, String)>) -> Self {
+    fn direct(
+        snapshot: &'a Snapshot,
+        edge_types: HashMap<String, (String, String)>,
+        system_columns: SystemColumns,
+    ) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Direct(snapshot, edge_types),
+            builder: GraphIndexBuilder::Direct(snapshot, edge_types, system_columns),
         }
     }
 
@@ -1034,12 +1071,15 @@ impl<'a> GraphIndexHandle<'a> {
             .get_or_try_init(|| async {
                 match &self.builder {
                     GraphIndexBuilder::None => Ok::<Option<Arc<GraphIndex>>, OmniError>(None),
-                    GraphIndexBuilder::Cached(db, resolved, edge_types) => Ok(Some(
-                        db.graph_index_for_resolved(resolved, edge_types).await?,
+                    GraphIndexBuilder::Cached(db, resolved, edge_types, system_columns) => {
+                        Ok(Some(
+                            db.graph_index_for_resolved(resolved, edge_types, *system_columns)
+                                .await?,
+                        ))
+                    }
+                    GraphIndexBuilder::Direct(snapshot, edge_types, system_columns) => Ok(Some(
+                        Arc::new(GraphIndex::build(snapshot, edge_types, *system_columns).await?),
                     )),
-                    GraphIndexBuilder::Direct(snapshot, edge_types) => Ok(Some(Arc::new(
-                        GraphIndex::build(snapshot, edge_types).await?,
-                    ))),
                 }
             })
             .await?;
@@ -1280,13 +1320,16 @@ fn warn_on_degraded_coverage(
 /// The (key, opposite) endpoint columns for a traversal direction. Out follows
 /// src -> dst (key on src); In follows the reverse. The persisted BTREE exists
 /// on both columns.
-fn endpoint_columns(direction: Direction) -> (&'static str, &'static str) {
+fn endpoint_columns(
+    direction: Direction,
+    system_columns: SystemColumns,
+) -> (&'static str, &'static str) {
     match direction {
-        Direction::Out => ("src", "dst"),
+        Direction::Out => (system_columns.src, system_columns.dst),
         // Both: the primary orientation (used by the cost probe; the indexed
         // execution loop adds the reverse probe itself via endpoint_probes).
-        Direction::In => ("dst", "src"),
-        Direction::Both => ("src", "dst"),
+        Direction::In => (system_columns.dst, system_columns.src),
+        Direction::Both => (system_columns.src, system_columns.dst),
     }
 }
 
@@ -1307,11 +1350,17 @@ fn worse_coverage(
 
 /// All (key, opposite) probes a direction requires: one for Out/In, both
 /// orientations for an undirected traversal.
-fn endpoint_probes(direction: Direction) -> &'static [(&'static str, &'static str)] {
+fn endpoint_probes(
+    direction: Direction,
+    system_columns: SystemColumns,
+) -> Vec<(&'static str, &'static str)> {
     match direction {
-        Direction::Out => &[("src", "dst")],
-        Direction::In => &[("dst", "src")],
-        Direction::Both => &[("src", "dst"), ("dst", "src")],
+        Direction::Out => vec![(system_columns.src, system_columns.dst)],
+        Direction::In => vec![(system_columns.dst, system_columns.src)],
+        Direction::Both => vec![
+            (system_columns.src, system_columns.dst),
+            (system_columns.dst, system_columns.src),
+        ],
     }
 }
 
@@ -1337,7 +1386,7 @@ async fn execute_expand(
 ) -> Result<()> {
     let frontier_rows = wide.num_rows();
     let effective_max_hops = max_hops.unwrap_or(min_hops.max(1));
-    let (key_col, _) = endpoint_columns(direction);
+    let (key_col, _) = endpoint_columns(direction, catalog.system_columns);
     let edge_table_key = format!("edge:{}", edge_type);
 
     // A bound edge needs edge ROWS (per-row cardinality, property columns);
@@ -1430,7 +1479,10 @@ async fn execute_expand(
     // index must not be masked by a healthy src index).
     let mut coverage =
         crate::table_store::TableStore::key_column_index_coverage(&edge_ds, key_col).await;
-    for &(extra_key, _) in endpoint_probes(direction).iter().skip(1) {
+    for &(extra_key, _) in endpoint_probes(direction, catalog.system_columns)
+        .iter()
+        .skip(1)
+    {
         let extra =
             crate::table_store::TableStore::key_column_index_coverage(&edge_ds, extra_key).await;
         coverage = match (coverage, extra) {
@@ -1535,7 +1587,7 @@ async fn execute_expand_bound(
     params: &ParamMap,
     edge_ds: Dataset,
 ) -> Result<()> {
-    let src_id_col_name = format!("{}.id", src_var);
+    let src_id_col_name = format!("{}.{}", src_var, catalog.system_columns.id);
     let src_ids = wide
         .column_by_name(&src_id_col_name)
         .ok_or_else(|| {
@@ -1562,7 +1614,7 @@ async fn execute_expand_bound(
         .collect();
     prop_cols.sort_unstable();
     let mut attach_cols: Vec<&str> = Vec::with_capacity(1 + prop_cols.len());
-    attach_cols.push("id");
+    attach_cols.push(catalog.system_columns.id);
     attach_cols.extend(prop_cols.iter().copied());
     let attach_fields: Vec<Field> = attach_cols
         .iter()
@@ -1592,7 +1644,10 @@ async fn execute_expand_bound(
     let mut matches: Vec<(u32, String, usize, usize, String)> = Vec::new();
     let mut scanned: Vec<RecordBatch> = Vec::new();
 
-    for (probe_idx, &(key_col, opp_col)) in endpoint_probes(direction).iter().enumerate() {
+    for (probe_idx, &(key_col, opp_col)) in endpoint_probes(direction, catalog.system_columns)
+        .iter()
+        .enumerate()
+    {
         let batches = crate::table_store::TableStore::scan_edges_by_endpoint_projected(
             &edge_ds,
             key_col,
@@ -1618,11 +1673,18 @@ async fn execute_expand_bound(
                 .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", opp_col)))?
                 .clone();
             let edge_ids = batch
-                .column_by_name("id")
-                .ok_or_else(|| OmniError::manifest("edge batch missing 'id'".to_string()))?
+                .column_by_name(catalog.system_columns.id)
+                .ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "edge batch missing '{}'",
+                        catalog.system_columns.id
+                    ))
+                })?
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::manifest("edge 'id' is not Utf8".to_string()))?
+                .ok_or_else(|| {
+                    OmniError::manifest(format!("edge '{}' is not Utf8", catalog.system_columns.id))
+                })?
                 .clone();
             for r in 0..batch.num_rows() {
                 // Undirected probes both orientations; a self-loop row would
@@ -1736,7 +1798,7 @@ async fn execute_expand_indexed(
     params: &ParamMap,
     edge_ds: Dataset,
 ) -> Result<()> {
-    let src_id_col_name = format!("{}.id", src_var);
+    let src_id_col_name = format!("{}.{}", src_var, catalog.system_columns.id);
     let src_ids = wide
         .column_by_name(&src_id_col_name)
         .ok_or_else(|| {
@@ -1755,7 +1817,7 @@ async fn execute_expand_indexed(
     // The keyed/opposite endpoint columns for this direction. The edge dataset
     // and the C6 coverage warn are owned by the caller (`execute_expand`), which
     // opens the dataset once and threads it in.
-    let probes = endpoint_probes(direction);
+    let probes = endpoint_probes(direction, catalog.system_columns);
 
     let max = max_hops.unwrap_or(min_hops.max(1));
     // Cross-type edges cannot chain (a Company is not a `WorksAt` source), so a
@@ -1823,7 +1885,7 @@ async fn execute_expand_indexed(
         // Both merges the src-keyed and dst-keyed scans into one map (the
         // per-source `seen_dst` gate below dedups pairs present both ways).
         let mut neighbor_map: HashMap<u32, Vec<u32>> = HashMap::new();
-        for &(key_col, opp_col) in probes {
+        for &(key_col, opp_col) in &probes {
             let batches = crate::table_store::TableStore::scan_edges_by_endpoint(
                 &edge_ds,
                 key_col,
@@ -1971,11 +2033,21 @@ async fn expand_hydrate_and_align(
 
     // id -> row index in the hydrated batch.
     let dst_batch_id_col = dst_batch
-        .column_by_name("id")
-        .ok_or_else(|| OmniError::manifest("hydrated batch missing 'id' column".to_string()))?
+        .column_by_name(catalog.system_columns.id)
+        .ok_or_else(|| {
+            OmniError::manifest(format!(
+                "hydrated batch missing '{}' column",
+                catalog.system_columns.id
+            ))
+        })?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest("hydrated 'id' column is not Utf8".to_string()))?;
+        .ok_or_else(|| {
+            OmniError::manifest(format!(
+                "hydrated '{}' column is not Utf8",
+                catalog.system_columns.id
+            ))
+        })?;
     let mut id_to_row: HashMap<&str, u32> = HashMap::with_capacity(dst_batch_id_col.len());
     for row in 0..dst_batch_id_col.len() {
         id_to_row.insert(dst_batch_id_col.value(row), row as u32);
@@ -2030,7 +2102,7 @@ async fn execute_expand_csr(
     dst_filters: &[IRFilter],
     params: &ParamMap,
 ) -> Result<()> {
-    let src_id_col_name = format!("{}.id", src_var);
+    let src_id_col_name = format!("{}.{}", src_var, catalog.system_columns.id);
     let src_ids = wide
         .column_by_name(&src_id_col_name)
         .ok_or_else(|| {
@@ -2197,7 +2269,7 @@ async fn hydrate_nodes(
 
     // `id IN (ids)` AND any pushable destination filters, as a structured Expr.
     let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
-    let mut filter_expr = col("id").in_list(id_list, false);
+    let mut filter_expr = col(catalog.system_columns.id).in_list(id_list, false);
     if let Some(dst_expr) =
         build_lance_filter_expr(dst_filters, params, Some(&node_type.arrow_schema))
     {
@@ -2306,7 +2378,7 @@ fn try_bulk_anti_join_mask(
     };
     let type_idx = gi.type_index(src_type_name)?;
 
-    let id_col_name = format!("{}.id", outer_var);
+    let id_col_name = format!("{}.{}", outer_var, catalog.system_columns.id);
     let outer_ids = wide
         .column_by_name(&id_col_name)?
         .as_any()

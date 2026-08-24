@@ -89,7 +89,7 @@ async fn node_ids_are_key_values() {
     let db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "node:Person").await;
-    let mut ids = collect_column_strings(&batches, "id");
+    let mut ids = collect_column_strings(&batches, "__id");
     ids.sort();
     assert_eq!(ids, vec!["Alice", "Bob", "Charlie", "Diana"]);
 }
@@ -102,7 +102,7 @@ async fn node_properties_are_correct() {
     let batches = read_table(&db, "node:Person").await;
     let batch = &batches[0];
     let ids = batch
-        .column_by_name("id")
+        .column_by_name("__id")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -140,7 +140,7 @@ node Flagged {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(entity["id"], serde_json::json!("alpha"));
+    assert_eq!(entity["__id"], serde_json::json!("alpha"));
     assert_eq!(entity["active"], serde_json::json!(true));
     assert_eq!(entity["rating"], serde_json::json!(42));
 }
@@ -184,13 +184,13 @@ async fn edge_src_dst_reference_node_ids() {
     let batches = read_table(&db, "edge:Knows").await;
     let batch = &batches[0];
     let srcs = batch
-        .column_by_name("src")
+        .column_by_name("__src")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     let dsts = batch
-        .column_by_name("dst")
+        .column_by_name("__dst")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -216,7 +216,7 @@ async fn edge_ids_are_unique_strings() {
     let batches = read_table(&db, "edge:Knows").await;
     let batch = &batches[0];
     let ids = batch
-        .column_by_name("id")
+        .column_by_name("__id")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -260,7 +260,7 @@ async fn overwrite_replaces_data() {
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 1);
     let ids = batch
-        .column_by_name("id")
+        .column_by_name("__id")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -330,7 +330,7 @@ async fn signals_fixture_loads_correctly() {
         .try_collect()
         .await
         .unwrap();
-    let ids = collect_column_strings(&batches, "id");
+    let ids = collect_column_strings(&batches, "__id");
     // Should contain slug values like "aws", "openai", etc.
     assert!(ids.contains(&"aws".to_string()));
     assert!(ids.contains(&"openai".to_string()));
@@ -775,13 +775,13 @@ async fn mutation_delete_node_cascades_edges() {
             .unwrap();
         for batch in &batches {
             let srcs = batch
-                .column_by_name("src")
+                .column_by_name("__src")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
             let dsts = batch
-                .column_by_name("dst")
+                .column_by_name("__dst")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -1137,7 +1137,7 @@ async fn blob_read_returns_bytes() {
 {"type":"Document","data":{"title":"empty","content":"base64:"}}
 {"type":"Document","data":{"title":"null"}}
 {"type":"Document","data":{"title":"peer"}}
-{"edge":"Attachment","from":"readme","to":"peer","data":{"id":"attachment-1","payload":"base64:RWRnZQ=="}}"#;
+{"edge":"Attachment","from":"readme","to":"peer","data":{"__id":"attachment-1","payload":"base64:RWRnZQ=="}}"#;
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let metacharacter_id = r"quote'\slash";

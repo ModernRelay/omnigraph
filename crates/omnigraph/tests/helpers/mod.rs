@@ -156,7 +156,7 @@ pub async fn assert_stable_property_markers(db: &Omnigraph, table_key: &str) {
     let (entity_kind, type_name) = table_key.split_once(':').unwrap();
     for field in &dataset.schema().fields {
         let marker = field.metadata.get("omnigraph.stable_property_id");
-        if matches!(field.name.as_str(), "id" | "src" | "dst") {
+        if matches!(field.name.as_str(), "__id" | "__src" | "__dst") {
             assert!(
                 marker.is_none(),
                 "physical field {table_key}.{} must not carry graph property identity",

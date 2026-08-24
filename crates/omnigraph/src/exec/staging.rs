@@ -32,6 +32,7 @@ use crate::storage_layer::{
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
 use futures::stream::StreamExt;
+use omnigraph_compiler::SystemColumns;
 
 use crate::db::manifest::{
     RecoveryAuthorityToken, RecoveryLineageIntent, RecoverySidecarHandle, SidecarKind,
@@ -484,12 +485,15 @@ impl MutationStaging {
                     table_key
                 ))
             })?;
-            let table = prepare_pending_table(&table_key, table)?;
+            let table = prepare_pending_table(&table_key, table, db.catalog().system_columns)?;
             // Finish the per-table last-write-wins fold before looking at URI
             // inputs. A superseded row is not part of the graph operation and
             // must not trigger policy checks, source probes, or byte charges.
-            db.storage()
-                .validate_keyed_write_batch(&table_key, &table.batch)?;
+            db.storage().validate_keyed_write_batch(
+                &table_key,
+                &table.batch,
+                db.catalog().system_columns,
+            )?;
             stage_inputs.push((table_key, table, path, expected));
         }
 
@@ -534,6 +538,7 @@ impl MutationStaging {
                             table_key,
                             table.batch.clone(),
                             &external_blob_preflight,
+                            db.catalog().system_columns,
                         )
                         .await?
                 }
@@ -543,6 +548,7 @@ impl MutationStaging {
                         table_key,
                         table.batch.clone(),
                         &external_blob_preflight,
+                        db.catalog().system_columns,
                     )?,
             };
         }
@@ -616,7 +622,11 @@ struct PreparedPendingTable {
 /// Enforce raw accumulated keyed ceilings, then collapse one table to the
 /// single input its Lance writer consumes. Upsert's repeated ids are folded
 /// last-write-wins before external payload accounting or reads.
-fn prepare_pending_table(table_key: &str, table: PendingTable) -> Result<PreparedPendingTable> {
+fn prepare_pending_table(
+    table_key: &str,
+    table: PendingTable,
+    system_columns: SystemColumns,
+) -> Result<PreparedPendingTable> {
     if table.batches.is_empty() {
         return Err(OmniError::manifest_internal(format!(
             "pending table '{table_key}' has no batches"
@@ -662,7 +672,9 @@ fn prepare_pending_table(table_key: &str, table: PendingTable) -> Result<Prepare
 
     let mode = table.mode;
     let batch = match mode {
-        PendingMode::Upsert => dedupe_merge_batches_by_id(&table.schema, table.batches)?,
+        PendingMode::Upsert => {
+            dedupe_merge_batches_by_id(&table.schema, table.batches, system_columns)?
+        }
         PendingMode::StrictInsert | PendingMode::Overwrite => {
             if table.batches.len() == 1 {
                 table.batches.into_iter().next().unwrap()
@@ -741,6 +753,7 @@ async fn stage_pending_table(
                     &table_key,
                     combined,
                     KeyedWriteSemantics::StrictInsert,
+                    db.catalog().system_columns,
                 )
                 .await?
         }
@@ -751,6 +764,7 @@ async fn stage_pending_table(
                     &table_key,
                     combined,
                     KeyedWriteSemantics::Upsert,
+                    db.catalog().system_columns,
                 )
                 .await?
         }
@@ -806,7 +820,7 @@ async fn stage_delete_table(
         // target branch tree after the durable fork intent creates that ref.
         if db
             .storage()
-            .first_row_id_for_filter(&ds, &predicate)
+            .first_row_id_for_filter(&ds, &predicate, db.catalog().system_columns)
             .await?
             .is_none()
         {
@@ -906,6 +920,7 @@ async fn stage_deferred_plan(
                         table_key,
                         batch,
                         KeyedWriteSemantics::StrictInsert,
+                        db.catalog().system_columns,
                     )
                     .await?
             }
@@ -916,6 +931,7 @@ async fn stage_deferred_plan(
                         table_key,
                         batch,
                         KeyedWriteSemantics::Upsert,
+                        db.catalog().system_columns,
                     )
                     .await?
             }
@@ -958,7 +974,9 @@ async fn fresh_conflicting_strict_id(
         return Ok(None);
     }
     let table = db.storage().open_snapshot_at_entry(entry).await?;
-    db.storage().first_existing_id(&table, source_ids).await
+    db.storage()
+        .first_existing_id(&table, source_ids, db.catalog().system_columns)
+        .await
 }
 
 /// Output of [`StagedMutation::commit_all`] after Stage F: the publisher's input
@@ -1537,6 +1555,7 @@ fn schemas_compatible(a: &SchemaRef, b: &SchemaRef) -> bool {
 fn dedupe_merge_batches_by_id(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     if batches.is_empty() {
         return Err(OmniError::manifest_internal(
@@ -1552,18 +1571,20 @@ fn dedupe_merge_batches_by_id(
 
     for (b_idx, batch) in batches.iter().enumerate().rev() {
         let id_col = batch
-            .column_by_name("id")
+            .column_by_name(system_columns.id)
             .ok_or_else(|| {
-                OmniError::manifest_internal(
-                    "dedupe_merge_batches_by_id: batch has no 'id' column".to_string(),
-                )
+                OmniError::manifest_internal(format!(
+                    "dedupe_merge_batches_by_id: batch has no '{}' column",
+                    system_columns.id
+                ))
             })?
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                OmniError::manifest_internal(
-                    "dedupe_merge_batches_by_id: 'id' column is not Utf8".to_string(),
-                )
+                OmniError::manifest_internal(format!(
+                    "dedupe_merge_batches_by_id: '{}' column is not Utf8",
+                    system_columns.id
+                ))
             })?;
         for r_idx in (0..batch.num_rows()).rev() {
             if !id_col.is_valid(r_idx) {

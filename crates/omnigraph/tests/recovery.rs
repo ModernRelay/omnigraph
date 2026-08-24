@@ -83,7 +83,7 @@ async fn node_table_fixture(db: &Omnigraph, type_name: &str) -> (String, serde_j
 /// `__manifest`.
 fn person_batch(rows: &[(&str, &str, Option<i32>)]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
+        Field::new("__id", DataType::Utf8, false),
         Field::new("age", DataType::Int32, true),
         Field::new("name", DataType::Utf8, false),
     ]));
@@ -1725,8 +1725,8 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
         .collect::<Vec<_>>();
     assert_eq!(
         primary_key,
-        ["id"],
-        "restoring an older feature-branch image must preserve exactly `id` as its Lance unenforced primary key"
+        ["__id"],
+        "restoring an older feature-branch image must preserve exactly `__id` as its Lance unenforced primary key"
     );
 
     let db = Omnigraph::open(uri).await.unwrap();

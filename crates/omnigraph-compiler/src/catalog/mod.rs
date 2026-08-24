@@ -15,6 +15,9 @@ use crate::types::{PropType, ScalarType};
 pub struct Catalog {
     pub node_types: HashMap<String, NodeType>,
     pub edge_types: HashMap<String, EdgeType>,
+    /// This graph's system column spellings (RFC 0040); consumers must not
+    /// hardcode any spelling.
+    pub system_columns: schema_ir::SystemColumns,
     /// Maps normalized lowercase edge name -> EdgeType key (e.g. "knows" -> "Knows")
     pub edge_name_index: HashMap<String, String>,
     /// Interface declarations (for Phase 2 polymorphic queries)
@@ -287,6 +290,10 @@ fn bound_to_literal(b: &ConstraintBound) -> LiteralValue {
 }
 
 pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
+    // Source-only catalogs are never bound to an existing graph, so they use
+    // the current spellings; a runtime catalog for a stored graph comes from
+    // `build_catalog_from_ir`, which resolves the graph's own spellings.
+    let system_columns = schema_ir::SYSTEM_COLUMNS_V3;
     let mut node_types = HashMap::new();
     let mut edge_types = HashMap::new();
     let mut edge_name_index = HashMap::new();
@@ -378,8 +385,8 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 }
             }
 
-            // Build Arrow schema: id: Utf8 + all properties
-            let mut fields = vec![Field::new("id", DataType::Utf8, false)];
+            // Build Arrow schema: the identity column + all properties
+            let mut fields = vec![Field::new(system_columns.id, DataType::Utf8, false)];
             for prop in &node.properties {
                 fields.push(Field::new(
                     &prop.name,
@@ -433,9 +440,9 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             let mut properties = HashMap::new();
             let mut blob_properties = HashSet::new();
             let mut fields = vec![
-                Field::new("id", DataType::Utf8, false),
-                Field::new("src", DataType::Utf8, false),
-                Field::new("dst", DataType::Utf8, false),
+                Field::new(system_columns.id, DataType::Utf8, false),
+                Field::new(system_columns.src, DataType::Utf8, false),
+                Field::new(system_columns.dst, DataType::Utf8, false),
             ];
             for prop in &edge.properties {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
@@ -493,6 +500,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
         edge_types,
         edge_name_index,
         interfaces,
+        system_columns,
         identity: CatalogIdentity::SourceUnbound,
     })
 }
@@ -502,6 +510,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
 /// mints or derives an identity from a name.
 pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
     schema_ir::validate_schema_ir(ir)?;
+    let system_columns = ir.system_columns();
 
     let interfaces = ir
         .interfaces
@@ -589,7 +598,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 indices.push(columns);
                 continue;
             }
-            match schema_ir::constraint_from_ir(constraint) {
+            match schema_ir::constraint_from_ir(constraint, system_columns) {
                 Constraint::Key(_) => unreachable!("@key handled in stable property-id order"),
                 Constraint::Unique(columns) => unique_constraints.push(columns),
                 Constraint::Index(columns) => indices.push(columns),
@@ -605,7 +614,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 }
             }
         }
-        let mut fields = vec![Field::new("id", DataType::Utf8, false)];
+        let mut fields = vec![Field::new(system_columns.id, DataType::Utf8, false)];
         fields.extend(node.properties.iter().map(|property| {
             Field::new(
                 &property.name,
@@ -652,16 +661,16 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
         let mut unique_constraints = Vec::new();
         let mut indices = Vec::new();
         for constraint in &edge.constraints {
-            match schema_ir::constraint_from_ir(constraint) {
+            match schema_ir::constraint_from_ir(constraint, system_columns) {
                 Constraint::Unique(columns) => unique_constraints.push(columns),
                 Constraint::Index(columns) => indices.push(columns),
                 _ => {}
             }
         }
         let mut fields = vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("src", DataType::Utf8, false),
-            Field::new("dst", DataType::Utf8, false),
+            Field::new(system_columns.id, DataType::Utf8, false),
+            Field::new(system_columns.src, DataType::Utf8, false),
+            Field::new(system_columns.dst, DataType::Utf8, false),
         ];
         fields.extend(edge.properties.iter().map(|property| {
             Field::new(
@@ -701,6 +710,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
         edge_types,
         edge_name_index,
         interfaces,
+        system_columns,
         identity: CatalogIdentity::Bound(Arc::new(ir.clone())),
     })
 }

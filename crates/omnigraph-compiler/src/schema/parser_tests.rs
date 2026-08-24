@@ -1197,16 +1197,8 @@ fn test_parse_error_diagnostic_has_span() {
 }
 
 #[test]
-fn test_reject_lance_virtual_system_column_property_names() {
-    const RESERVED: [&str; 5] = [
-        "_rowid",
-        "_rowaddr",
-        "_rowoffset",
-        "_row_created_at_version",
-        "_row_last_updated_at_version",
-    ];
-
-    for name in RESERVED {
+fn test_admission_reserves_leading_underscore_property_names() {
+    for name in ["_rowid", "_row_id", "_ROWID", "_foo", "__id", "__manifest"] {
         let declarations = [
             format!("interface I {{ {name}: String }}"),
             format!("node N {{ {name}: String }}"),
@@ -1214,12 +1206,77 @@ fn test_reject_lance_virtual_system_column_property_names() {
         ];
         for source in declarations {
             let error = parse_schema(&source).unwrap_err().to_string();
-            assert!(error.contains("reserved"), "unexpected error: {error}");
+            assert!(
+                error.contains("reserved for system columns"),
+                "unexpected error: {error}"
+            );
             assert!(error.contains(name), "unexpected error: {error}");
-            assert!(error.contains("exported"), "unexpected error: {error}");
         }
     }
 
-    parse_schema("node N { _row_id: String _rowid2: String _ROWID: String }")
-        .expect("only the five exact, case-sensitive Lance names are reserved");
+    // Freed by RFC 0040: the legacy system spellings are ordinary names.
+    parse_schema("node N { id: String @key src: String dst: String }")
+        .expect("'id'/'src'/'dst' are ordinary user property names on admission");
+}
+
+#[test]
+fn test_legacy_vintage_admission_keeps_historical_names_and_reserves_upgrade_targets() {
+    use crate::catalog::schema_ir::{SCHEMA_IR_VERSION, SCHEMA_IR_VERSION_LEGACY_COLUMNS};
+
+    parse_schema_for_ir_version(
+        "node N { _row_id: String }",
+        SCHEMA_IR_VERSION_LEGACY_COLUMNS,
+    )
+    .expect("legacy evolution restates historically legal underscore names");
+
+    let error =
+        parse_schema_for_ir_version("node N { id: String }", SCHEMA_IR_VERSION_LEGACY_COLUMNS)
+            .unwrap_err()
+            .to_string();
+    assert!(
+        error.contains("collides with this graph's physical"),
+        "unexpected error: {error}"
+    );
+
+    for source in [
+        "node N { __id: String }",
+        "node N {} edge E: N -> N { __src: String }",
+        "node N {} edge E: N -> N { __dst: String }",
+    ] {
+        let error = parse_schema_for_ir_version(source, SCHEMA_IR_VERSION_LEGACY_COLUMNS)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("reserved for the system column upgrade"),
+            "unexpected error: {error}"
+        );
+    }
+
+    parse_schema_for_ir_version("node N { __src: String }", SCHEMA_IR_VERSION_LEGACY_COLUMNS)
+        .expect("'__src' collides with nothing on legacy nodes");
+
+    parse_schema_for_ir_version("node N { id: String @key }", SCHEMA_IR_VERSION)
+        .expect("current-vintage targets keep the freed names");
+}
+
+#[test]
+fn test_persisted_contract_keeps_historical_underscore_names() {
+    const LANCE_RESERVED: [&str; 5] = [
+        "_rowid",
+        "_rowaddr",
+        "_rowoffset",
+        "_row_created_at_version",
+        "_row_last_updated_at_version",
+    ];
+
+    for name in LANCE_RESERVED {
+        let source = format!("node N {{ {name}: String }}");
+        let error = parse_persisted_schema_contract(&source)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exported"), "unexpected error: {error}");
+    }
+
+    parse_persisted_schema_contract("node N { _row_id: String _rowid2: String _ROWID: String }")
+        .expect("persisted contracts predate the underscore reservation and stay readable");
 }

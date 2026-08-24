@@ -377,6 +377,7 @@ impl GraphClient {
                 let db = Omnigraph::open(uri).await?;
                 Ok(SchemaOutput {
                     schema_source: db.schema_source().to_string(),
+                    system_columns: Some(db.catalog().system_columns.into()),
                 })
             }
         }

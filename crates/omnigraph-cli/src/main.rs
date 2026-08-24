@@ -921,6 +921,12 @@ async fn main() -> Result<()> {
                     print_json(&output)?;
                 } else {
                     println!("{}", output.schema_source);
+                    if let Some(columns) = &output.system_columns {
+                        println!(
+                            "// system columns: {}, {}, {}",
+                            columns.id, columns.src, columns.dst
+                        );
+                    }
                 }
             }
         },

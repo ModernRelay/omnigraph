@@ -6,7 +6,7 @@ use crate::storage_layer::{
 use crate::table_store::certified_insert_absence_rows;
 
 const MERGE_STAGE_DIR_ENV: &str = "OMNIGRAPH_MERGE_STAGING_DIR";
-const DELETE_FILTER_PREFIX: &str = "id IN (";
+const DELETE_FILTER_IN: &str = " IN (";
 const DELETE_FILTER_SEPARATOR: &str = ", ";
 const DELETE_FILTER_SUFFIX: &str = ")";
 /// The unified validator currently consumes one cross-table `ChangeSet`, so
@@ -91,8 +91,9 @@ struct StagedMergeResult {
 /// the exact UTF-8 byte length of the escaped `id IN (...)` filter handed to
 /// Lance. The chunk boundary is therefore also the recovery boundary: publish
 /// pre-mints and consumes one exact Lance transaction per chunk.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DeleteIdChunks {
+    id_col: &'static str,
     chunks: Vec<DeleteIdChunk>,
     /// Conservative retained-heap estimate for every owned id plus chunk/Vec
     /// bookkeeping. Per-chunk bounds alone would still permit a 1,024-chunk
@@ -107,6 +108,14 @@ struct DeleteIdChunk {
 }
 
 impl DeleteIdChunks {
+    fn new(id_col: &'static str) -> Self {
+        Self {
+            id_col,
+            chunks: Vec::new(),
+            retained_bytes: 0,
+        }
+    }
+
     fn push(&mut self, id: String) -> Result<()> {
         self.push_bounded(id, KEYED_WRITE_MAX_ROWS, KEYED_WRITE_MAX_BYTES)
     }
@@ -128,7 +137,7 @@ impl DeleteIdChunks {
             ));
         }
         let literal_bytes = escaped_delete_literal_bytes(&id)?;
-        let empty_filter_bytes = delete_filter_fixed_bytes()?;
+        let empty_filter_bytes = delete_filter_fixed_bytes(self.id_col)?;
         let first_filter_bytes = empty_filter_bytes
             .checked_add(literal_bytes)
             .ok_or_else(|| OmniError::manifest_internal("branch merge delete filter overflow"))?;
@@ -225,7 +234,7 @@ impl DeleteIdChunks {
 }
 
 impl DeleteIdChunk {
-    fn filter(&self) -> Result<String> {
+    fn filter(&self, id_col: &str) -> Result<String> {
         if self.ids.is_empty() || self.ids.len() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::manifest_internal(format!(
                 "branch merge delete chunk contains {} ids",
@@ -242,7 +251,8 @@ impl DeleteIdChunk {
             OmniError::manifest_internal("branch merge delete filter capacity exceeds usize")
         })?;
         let mut filter = String::with_capacity(capacity);
-        filter.push_str(DELETE_FILTER_PREFIX);
+        filter.push_str(id_col);
+        filter.push_str(DELETE_FILTER_IN);
         for (index, id) in self.ids.iter().enumerate() {
             if index > 0 {
                 filter.push_str(DELETE_FILTER_SEPARATOR);
@@ -270,8 +280,8 @@ impl DeleteIdChunk {
     }
 }
 
-fn delete_filter_fixed_bytes() -> Result<u64> {
-    u64::try_from(DELETE_FILTER_PREFIX.len() + DELETE_FILTER_SUFFIX.len())
+fn delete_filter_fixed_bytes(id_col: &str) -> Result<u64> {
+    u64::try_from(id_col.len() + DELETE_FILTER_IN.len() + DELETE_FILTER_SUFFIX.len())
         .map_err(|_| OmniError::manifest_internal("branch merge delete filter framing exceeds u64"))
 }
 
@@ -356,6 +366,7 @@ struct CursorRow {
     dataset: Dataset,
     batch: RecordBatch,
     row_index: usize,
+    id_col: &'static str,
 }
 
 impl CursorRow {
@@ -363,7 +374,7 @@ impl CursorRow {
     fn typed(&self) -> Result<RawRow> {
         match &self.typed {
             Some(typed) => Ok(typed.clone()),
-            None => RawRow::single(&self.dataset, &self.batch, self.row_index),
+            None => RawRow::single(&self.dataset, &self.batch, self.row_index, self.id_col),
         }
     }
 
@@ -407,28 +418,46 @@ struct OrderedTableCursor {
     /// common rows. New/deleted rows therefore avoid comparison work, while
     /// general three-way cursors retain their eager typed rows.
     eager_signatures: bool,
+    id_col: &'static str,
 }
 
 impl OrderedTableCursor {
-    async fn from_snapshot(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
-        Self::open(snapshot, table_key, true).await
+    async fn from_snapshot(
+        snapshot: &Snapshot,
+        table_key: &str,
+        id_col: &'static str,
+    ) -> Result<Self> {
+        Self::open(snapshot, table_key, true, id_col).await
     }
 
     /// Like `from_snapshot` but builds typed rows lazily for adopt-only
     /// equality. See `eager_signatures`.
-    async fn from_snapshot_lazy(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
-        Self::open(snapshot, table_key, false).await
+    async fn from_snapshot_lazy(
+        snapshot: &Snapshot,
+        table_key: &str,
+        id_col: &'static str,
+    ) -> Result<Self> {
+        Self::open(snapshot, table_key, false, id_col).await
     }
 
-    async fn open(snapshot: &Snapshot, table_key: &str, eager_signatures: bool) -> Result<Self> {
+    async fn open(
+        snapshot: &Snapshot,
+        table_key: &str,
+        eager_signatures: bool,
+        id_col: &'static str,
+    ) -> Result<Self> {
         let dataset = match snapshot.dataset(table_key) {
             Some(_) => Some(snapshot.open_lance_dataset(table_key).await?),
             None => None,
         };
-        Self::from_dataset(dataset, eager_signatures).await
+        Self::from_dataset(dataset, eager_signatures, id_col).await
     }
 
-    async fn from_dataset(dataset: Option<Dataset>, eager_signatures: bool) -> Result<Self> {
+    async fn from_dataset(
+        dataset: Option<Dataset>,
+        eager_signatures: bool,
+        id_col: &'static str,
+    ) -> Result<Self> {
         let stream = if let Some(ds) = &dataset {
             crate::instrumentation::record_ordered_cursor_scan(
                 KEYED_WRITE_MAX_ROWS,
@@ -439,7 +468,7 @@ impl OrderedTableCursor {
                     ds,
                     None,
                     None,
-                    Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
+                    Some(vec![ColumnOrdering::asc_nulls_last(id_col.to_string())]),
                     true,
                     |scanner| {
                         scanner.batch_size(KEYED_WRITE_MAX_ROWS);
@@ -466,6 +495,7 @@ impl OrderedTableCursor {
             current_row: 0,
             peeked: None,
             eager_signatures,
+            id_col,
         })
     }
 
@@ -493,16 +523,17 @@ impl OrderedTableCursor {
                         OmniError::manifest("cursor row missing source dataset".to_string())
                     })?;
                     let typed = if self.eager_signatures {
-                        Some(RawRow::single(&dataset, batch, row_index)?)
+                        Some(RawRow::single(&dataset, batch, row_index, self.id_col)?)
                     } else {
                         None
                     };
                     return Ok(Some(CursorRow {
-                        id: row_id_at(batch, row_index)?,
+                        id: row_id_at(batch, row_index, self.id_col)?,
                         typed,
                         dataset,
                         batch: batch.clone(),
                         row_index,
+                        id_col: self.id_col,
                     }));
                 }
             }
@@ -772,6 +803,7 @@ async fn try_proven_pure_insert_history(
     table_key: &str,
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
+    id_col: &'static str,
 ) -> Result<Option<ProvenPureInsertAdopt>> {
     let Some(base_entry) = base_snapshot.dataset(table_key) else {
         return Ok(None);
@@ -840,7 +872,7 @@ async fn try_proven_pure_insert_history(
     }
     let primary_key = source.schema().unenforced_primary_key();
     if primary_key.len() != 1
-        || primary_key[0].name != "id"
+        || primary_key[0].name != id_col
         || primary_key[0].nullable
         || primary_key[0].data_type() != arrow_schema::DataType::Utf8
     {
@@ -966,9 +998,10 @@ async fn try_proven_pure_insert_adopt(
     table_key: &str,
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
+    id_col: &'static str,
 ) -> Result<Option<ProvenPureInsertAdopt>> {
     let Some(proven) =
-        try_proven_pure_insert_history(table_key, base_snapshot, source_snapshot).await?
+        try_proven_pure_insert_history(table_key, base_snapshot, source_snapshot, id_col).await?
     else {
         return Ok(None);
     };
@@ -1137,6 +1170,7 @@ async fn plan_proven_pure_insert_chunks(
             begin_version,
             end_version,
             external_preflight,
+            db.catalog().system_columns,
         )
         .await?;
     let mut chunk_rows = Vec::new();
@@ -1292,9 +1326,11 @@ async fn compute_adopt_delta(
     let mut append_writer =
         StagedTableWriter::new(&format!("{}_adopt_append", table_key), schema.clone())?;
     let mut upsert_writer = StagedTableWriter::new(&format!("{}_adopt_upsert", table_key), schema)?;
-    let mut deleted_ids = DeleteIdChunks::default();
-    let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key).await?;
-    let mut source = OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key).await?;
+    let id_col = catalog.system_columns.id;
+    let mut deleted_ids = DeleteIdChunks::new(id_col);
+    let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key, id_col).await?;
+    let mut source =
+        OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key, id_col).await?;
 
     let mut needs_update = false;
 
@@ -1382,9 +1418,11 @@ async fn collect_adopt_blob_selection(
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
     blob_selection: &mut crate::table_store::PersistedBlobSelection,
+    id_col: &'static str,
 ) -> Result<()> {
-    let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key).await?;
-    let mut source = OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key).await?;
+    let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key, id_col).await?;
+    let mut source =
+        OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key, id_col).await?;
 
     loop {
         let base_row = base.peek_cloned().await?;
@@ -1450,10 +1488,11 @@ async fn stage_streaming_table_merge(
     let prior_conflict_count = conflicts.len();
     let materializer = target_db.blob_materializer();
     let mut delta_writer = StagedTableWriter::new(&format!("{}_delta", table_key), schema)?;
-    let mut deleted_ids = DeleteIdChunks::default();
-    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
-    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
-    let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key).await?;
+    let id_col = catalog.system_columns.id;
+    let mut deleted_ids = DeleteIdChunks::new(id_col);
+    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key, id_col).await?;
+    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key, id_col).await?;
+    let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key, id_col).await?;
 
     let mut needs_update = false;
 
@@ -1557,11 +1596,12 @@ async fn collect_three_way_blob_selection(
     target_snapshot: &Snapshot,
     conflicts: &mut Vec<MergeConflict>,
     blob_selection: &mut crate::table_store::PersistedBlobSelection,
+    id_col: &'static str,
 ) -> Result<()> {
     let prior_conflict_count = conflicts.len();
-    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
-    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
-    let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key).await?;
+    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key, id_col).await?;
+    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key, id_col).await?;
+    let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key, id_col).await?;
 
     loop {
         let base_row = base.peek_cloned().await?;
@@ -1969,7 +2009,7 @@ async fn build_merge_changeset(
 fn validation_projection(catalog: &Catalog, table_key: &str) -> Vec<String> {
     use omnigraph_compiler::types::{PropType, ScalarType};
     let is_heavy = |ty: &PropType| matches!(ty.scalar, ScalarType::Vector(_) | ScalarType::Blob);
-    let mut cols = vec!["id".to_string()];
+    let mut cols = vec![catalog.system_columns.id.to_string()];
     if let Some(name) = table_key.strip_prefix("node:") {
         if let Some(node_type) = catalog.node_types.get(name) {
             for (prop, ty) in &node_type.properties {
@@ -1979,8 +2019,8 @@ fn validation_projection(catalog: &Catalog, table_key: &str) -> Vec<String> {
             }
         }
     } else if let Some(name) = table_key.strip_prefix("edge:") {
-        cols.push("src".to_string());
-        cols.push("dst".to_string());
+        cols.push(catalog.system_columns.src.to_string());
+        cols.push(catalog.system_columns.dst.to_string());
         if let Some(edge_type) = catalog.edge_types.get(name) {
             for (prop, ty) in &edge_type.properties {
                 if !is_heavy(ty) {
@@ -2163,13 +2203,13 @@ fn proven_fast_forward_needs_no_validation(
         })
 }
 
-fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
+fn row_id_at(batch: &RecordBatch, row: usize, id_col: &str) -> Result<String> {
     let ids = batch
-        .column_by_name("id")
-        .ok_or_else(|| OmniError::manifest("batch missing id column".to_string()))?
+        .column_by_name(id_col)
+        .ok_or_else(|| OmniError::manifest(format!("batch missing '{id_col}' column")))?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest("id column is not Utf8".to_string()))?;
+        .ok_or_else(|| OmniError::manifest(format!("'{id_col}' column is not Utf8")))?;
     Ok(ids.value(row).to_string())
 }
 
@@ -2232,9 +2272,14 @@ async fn classify_adopt(
     // only for a HEAD-advancing publish; pointer/fork adoption still uses the
     // general delta as its validation input.
     if advances_head
-        && let Some(proven) =
-            try_proven_pure_insert_adopt(target_db, table_key, base_snapshot, source_snapshot)
-                .await?
+        && let Some(proven) = try_proven_pure_insert_adopt(
+            target_db,
+            table_key,
+            base_snapshot,
+            source_snapshot,
+            catalog.system_columns.id,
+        )
+        .await?
     {
         return Ok(Some(CandidateTableState::AdoptPureInserts(proven)));
     }
@@ -2750,13 +2795,15 @@ fn plan_merge_transactions(
 #[cfg(test)]
 mod recovery_chain_limit_tests {
     use super::*;
+    use omnigraph_compiler::SYSTEM_COLUMNS_LEGACY;
 
     fn delete_only_candidate(chunk_count: usize) -> CandidateTableState {
-        let filter_bytes =
-            delete_filter_fixed_bytes().unwrap() + escaped_delete_literal_bytes("id").unwrap();
+        let filter_bytes = delete_filter_fixed_bytes(SYSTEM_COLUMNS_LEGACY.id).unwrap()
+            + escaped_delete_literal_bytes("id").unwrap();
         CandidateTableState::RewriteMerged(StagedMergeResult {
             delta_staged: None,
             deleted_ids: DeleteIdChunks {
+                id_col: SYSTEM_COLUMNS_LEGACY.id,
                 chunks: (0..chunk_count)
                     .map(|_| DeleteIdChunk {
                         ids: vec!["id".to_string()],
@@ -2770,7 +2817,7 @@ mod recovery_chain_limit_tests {
 
     #[test]
     fn branch_merge_delete_ids_split_on_row_and_escaped_byte_bounds() {
-        let mut row_bounded = DeleteIdChunks::default();
+        let mut row_bounded = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id);
         for row in 0..=KEYED_WRITE_MAX_ROWS {
             row_bounded.push(format!("id-{row}")).unwrap();
         }
@@ -2778,7 +2825,7 @@ mod recovery_chain_limit_tests {
         assert_eq!(row_bounded.chunks[0].ids.len(), KEYED_WRITE_MAX_ROWS);
         assert_eq!(row_bounded.chunks[1].ids.len(), 1);
         for chunk in &row_bounded.chunks {
-            let filter = chunk.filter().unwrap();
+            let filter = chunk.filter(SYSTEM_COLUMNS_LEGACY.id).unwrap();
             assert_eq!(filter.len() as u64, chunk.filter_bytes);
             assert!(filter.len() as u64 <= KEYED_WRITE_MAX_BYTES);
         }
@@ -2786,7 +2833,7 @@ mod recovery_chain_limit_tests {
         // `a'b` is six bytes as an escaped SQL literal (`'a''b'`) and the
         // `id IN (` / `)` framing is another eight. The exact 14-byte filter
         // fits; adding a second id starts a new chunk rather than exceeding it.
-        let mut byte_bounded = DeleteIdChunks::default();
+        let mut byte_bounded = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id);
         byte_bounded
             .push_bounded("a'b".to_string(), KEYED_WRITE_MAX_ROWS, 14)
             .unwrap();
@@ -2794,10 +2841,20 @@ mod recovery_chain_limit_tests {
             .push_bounded("x".to_string(), KEYED_WRITE_MAX_ROWS, 14)
             .unwrap();
         assert_eq!(byte_bounded.chunk_count(), 2);
-        assert_eq!(byte_bounded.chunks[0].filter().unwrap(), "id IN ('a''b')");
-        assert_eq!(byte_bounded.chunks[1].filter().unwrap(), "id IN ('x')");
+        assert_eq!(
+            byte_bounded.chunks[0]
+                .filter(SYSTEM_COLUMNS_LEGACY.id)
+                .unwrap(),
+            "id IN ('a''b')"
+        );
+        assert_eq!(
+            byte_bounded.chunks[1]
+                .filter(SYSTEM_COLUMNS_LEGACY.id)
+                .unwrap(),
+            "id IN ('x')"
+        );
 
-        let error = DeleteIdChunks::default()
+        let error = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id)
             .push_bounded("a''b".to_string(), KEYED_WRITE_MAX_ROWS, 14)
             .unwrap_err();
         assert!(matches!(
@@ -2809,7 +2866,7 @@ mod recovery_chain_limit_tests {
             } if resource == "branch-merge delete filter bytes"
         ));
 
-        let mut retained_bounded = DeleteIdChunks::default();
+        let mut retained_bounded = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id);
         retained_bounded
             .push_with_bounds("a".to_string(), KEYED_WRITE_MAX_ROWS, 1024, 256)
             .unwrap();
@@ -2836,7 +2893,7 @@ mod recovery_chain_limit_tests {
 
     #[test]
     fn branch_merge_delete_chunks_pre_mint_one_exact_identity_each() {
-        let mut deleted_ids = DeleteIdChunks::default();
+        let mut deleted_ids = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id);
         for row in 0..=KEYED_WRITE_MAX_ROWS {
             deleted_ids.push(format!("id-{row}")).unwrap();
         }
@@ -2913,7 +2970,7 @@ async fn commit_staged_delete_chunks(
     planned_index: &mut usize,
 ) -> Result<SnapshotHandle> {
     for (chunk_index, chunk) in deleted_ids.chunks.iter().enumerate() {
-        let filter = chunk.filter()?;
+        let filter = chunk.filter(deleted_ids.id_col)?;
         let staged_delete = target_db
             .storage()
             .stage_delete(&current, &filter)
@@ -3172,7 +3229,13 @@ async fn commit_keyed_stream_chunks(
             KeyedChunkStage::General(semantics) => {
                 target_db
                     .storage()
-                    .stage_keyed_write(current.clone(), table_key, batch, semantics)
+                    .stage_keyed_write(
+                        current.clone(),
+                        table_key,
+                        batch,
+                        semantics,
+                        target_db.catalog().system_columns,
+                    )
                     .await?
             }
             KeyedChunkStage::ProvenStrictInsert => {
@@ -3184,7 +3247,11 @@ async fn commit_keyed_stream_chunks(
                 )?;
                 target_db
                     .storage()
-                    .stage_proven_strict_insert(current.clone(), chunk)
+                    .stage_proven_strict_insert(
+                        current.clone(),
+                        chunk,
+                        target_db.catalog().system_columns,
+                    )
                     .await?
             }
         };
@@ -3261,6 +3328,7 @@ async fn publish_proven_pure_insert_adopt(
             proven.base_version,
             proven.source_version,
             external_preflight,
+            target_db.catalog().system_columns,
         )
         .await?;
     let schema: SchemaRef = Arc::new(proven.source.schema().into());
@@ -3801,9 +3869,13 @@ impl Omnigraph {
                     continue;
                 }
                 blob_adopt_proof_attempted.insert(table_key.clone());
-                if let Some(proven) =
-                    try_proven_pure_insert_history(table_key, base_snapshot, source_snapshot)
-                        .await?
+                if let Some(proven) = try_proven_pure_insert_history(
+                    table_key,
+                    base_snapshot,
+                    source_snapshot,
+                    catalog.system_columns.id,
+                )
+                .await?
                 {
                     let external_cells_before = blob_selection.external_cell_count();
                     materializer
@@ -3814,6 +3886,7 @@ impl Omnigraph {
                             proven.source_version,
                             proven.inserted_rows,
                             &mut blob_selection,
+                            catalog.system_columns,
                         )
                         .await?;
                     if blob_selection.external_cell_count() == external_cells_before {
@@ -3837,6 +3910,7 @@ impl Omnigraph {
                         base_snapshot,
                         source_snapshot,
                         &mut blob_selection,
+                        catalog.system_columns.id,
                     )
                     .await?;
                 }
@@ -3848,6 +3922,7 @@ impl Omnigraph {
                     target_snapshot,
                     &mut conflicts,
                     &mut blob_selection,
+                    catalog.system_columns.id,
                 )
                 .await?;
             }

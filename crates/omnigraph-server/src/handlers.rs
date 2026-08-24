@@ -1600,11 +1600,14 @@ pub(crate) async fn server_schema_get(
             target_branch: None,
         },
     )?;
-    let schema_source = {
+    let (schema_source, system_columns) = {
         let db = &handle.engine;
-        db.schema_source().to_string()
+        (db.schema_source().to_string(), db.catalog().system_columns)
     };
-    Ok(Json(SchemaOutput { schema_source }))
+    Ok(Json(SchemaOutput {
+        schema_source,
+        system_columns: Some(system_columns.into()),
+    }))
 }
 
 #[utoipa::path(

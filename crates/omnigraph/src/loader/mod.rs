@@ -15,6 +15,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use base64::Engine;
 use lance::blob::BlobArrayBuilder;
+use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::types::PropType;
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -667,7 +668,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         Vec::with_capacity(node_rows.len().saturating_add(strict_nodes.len()));
     for (type_name, rows) in &node_rows {
         let node_type = &catalog.node_types[type_name];
-        let batch = build_node_batch(node_type, rows, &mut node_id_remap)?;
+        let batch = build_node_batch(node_type, rows, &mut node_id_remap, catalog.system_columns)?;
         // Validation (value/enum/unique) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
@@ -718,7 +719,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         Vec::with_capacity(edge_rows.len().saturating_add(strict_edges.len()));
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
-        let batch = build_edge_batch(edge_type, rows, &node_id_remap)?;
+        let batch = build_edge_batch(edge_type, rows, &node_id_remap, catalog.system_columns)?;
         // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
@@ -782,6 +783,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 &snapshot,
                 &table_key,
                 changeset.get(&table_key).expect("key from this changeset"),
+                catalog.system_columns,
             )
             .await?;
             if !removed.is_empty() {
@@ -1149,7 +1151,7 @@ fn parse_strict_graph_rows<R: BufRead>(
                 let from = take_required_string(&mut envelope, "from", line_number)?;
                 let to = take_required_string(&mut envelope, "to", line_number)?;
                 let mut data = take_object_or_empty(&mut envelope, "data", line_number)?;
-                for reserved in ["src", "dst"] {
+                for reserved in [catalog.system_columns.src, catalog.system_columns.dst] {
                     if data.contains_key(reserved) {
                         return Err(OmniError::manifest(format!(
                             "line {line_number}: edge data field '{reserved}' is reserved structural state"
@@ -1171,8 +1173,14 @@ fn parse_strict_graph_rows<R: BufRead>(
                         keyed_input_budget,
                     )?;
                 }
-                data.insert("src".to_string(), JsonValue::String(from));
-                data.insert("dst".to_string(), JsonValue::String(to));
+                data.insert(
+                    catalog.system_columns.src.to_string(),
+                    JsonValue::String(from),
+                );
+                data.insert(
+                    catalog.system_columns.dst.to_string(),
+                    JsonValue::String(to),
+                );
                 rows.edges
                     .entry(canonical)
                     .or_default()
@@ -1366,6 +1374,7 @@ fn build_node_batch(
     node_type: &NodeType,
     rows: &[JsonValue],
     node_id_remap: &mut TypedNodeIdRemap,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     let schema = node_type.arrow_schema.clone();
     let row_refs = rows.iter().collect::<Vec<_>>();
@@ -1437,7 +1446,7 @@ fn build_node_batch(
         .iter()
         .enumerate()
         .map(|(row_index, row)| {
-            let explicit_id = match row.get("id") {
+            let explicit_id = match row.get(system_columns.id) {
                 None => None,
                 Some(JsonValue::String(id)) => Some(id.as_str()),
                 Some(value) => {
@@ -1494,6 +1503,7 @@ fn build_edge_batch(
     edge_type: &omnigraph_compiler::catalog::EdgeType,
     rows: &[(String, String, JsonValue)],
     node_id_remap: &TypedNodeIdRemap,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     let schema = edge_type.arrow_schema.clone();
     let row_refs = rows.iter().map(|(_, _, data)| data).collect::<Vec<_>>();
@@ -1506,7 +1516,7 @@ fn build_edge_batch(
     let ids: Vec<String> = rows
         .iter()
         .map(|(_, _, data)| {
-            data.get("id")
+            data.get(system_columns.id)
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
                 .unwrap_or_else(generate_id)
@@ -1575,13 +1585,13 @@ pub(crate) fn normalize_strict_json_rows(
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{type_name}'")))?;
-        normalize_strict_node_rows(node_type, rows)
+        normalize_strict_node_rows(node_type, rows, catalog.system_columns)
     } else if let Some(type_name) = table_key.strip_prefix("edge:") {
         let edge_type = catalog
             .edge_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{type_name}'")))?;
-        normalize_strict_edge_rows(edge_type, rows)
+        normalize_strict_edge_rows(edge_type, rows, catalog.system_columns)
     } else {
         Err(OmniError::manifest(format!(
             "invalid table key '{table_key}'"
@@ -1589,12 +1599,22 @@ pub(crate) fn normalize_strict_json_rows(
     }
 }
 
-fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBatch> {
+fn normalize_strict_node_rows(
+    node_type: &NodeType,
+    rows: &[JsonValue],
+    system_columns: SystemColumns,
+) -> Result<RecordBatch> {
     let objects = strict_row_objects(rows)?;
     let table_key = format!("node:{}", node_type.name);
     for object in &objects {
-        validate_strict_input_fields(&table_key, object, &node_type.properties, &[])?;
-        validate_optional_row_id(&node_type.name, object)?;
+        validate_strict_input_fields(
+            &table_key,
+            object,
+            &node_type.properties,
+            &[],
+            system_columns,
+        )?;
+        validate_optional_row_id(&node_type.name, object, system_columns)?;
     }
 
     let schema = Arc::clone(&node_type.arrow_schema);
@@ -1656,7 +1676,7 @@ fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Resul
         .iter()
         .enumerate()
         .map(|(row_index, object)| {
-            let explicit_id = optional_row_id(&node_type.name, object)?;
+            let explicit_id = optional_row_id(&node_type.name, object, system_columns)?;
             if let Some(key_columns) = &key_columns {
                 let canonical = canonical_node_id(key_columns, row_index)?.ok_or_else(|| {
                     OmniError::manifest(format!(
@@ -1685,14 +1705,24 @@ fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Resul
     RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }
 
-fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Result<RecordBatch> {
+fn normalize_strict_edge_rows(
+    edge_type: &EdgeType,
+    rows: &[JsonValue],
+    system_columns: SystemColumns,
+) -> Result<RecordBatch> {
     let objects = strict_row_objects(rows)?;
     let table_key = format!("edge:{}", edge_type.name);
     for object in &objects {
-        validate_strict_input_fields(&table_key, object, &edge_type.properties, &["src", "dst"])?;
-        validate_optional_row_id(&edge_type.name, object)?;
-        validate_required_row_string(&edge_type.name, "src", object)?;
-        validate_required_row_string(&edge_type.name, "dst", object)?;
+        validate_strict_input_fields(
+            &table_key,
+            object,
+            &edge_type.properties,
+            &[system_columns.src, system_columns.dst],
+            system_columns,
+        )?;
+        validate_optional_row_id(&edge_type.name, object, system_columns)?;
+        validate_required_row_string(&edge_type.name, system_columns.src, object)?;
+        validate_required_row_string(&edge_type.name, system_columns.dst, object)?;
     }
 
     let schema = Arc::clone(&edge_type.arrow_schema);
@@ -1711,17 +1741,17 @@ fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Resul
     let ids = objects
         .iter()
         .map(|object| {
-            optional_row_id(&edge_type.name, object)
+            optional_row_id(&edge_type.name, object, system_columns)
                 .map(|id| id.map(str::to_string).unwrap_or_else(generate_id))
         })
         .collect::<Result<Vec<_>>>()?;
     let srcs = objects
         .iter()
-        .map(|object| validate_required_row_string(&edge_type.name, "src", object))
+        .map(|object| validate_required_row_string(&edge_type.name, system_columns.src, object))
         .collect::<Result<Vec<_>>>()?;
     let dsts = objects
         .iter()
-        .map(|object| validate_required_row_string(&edge_type.name, "dst", object))
+        .map(|object| validate_required_row_string(&edge_type.name, system_columns.dst, object))
         .collect::<Result<Vec<_>>>()?;
 
     let mut columns = Vec::with_capacity(schema.fields().len());
@@ -1759,6 +1789,7 @@ fn validate_strict_input_fields(
     object: &serde_json::Map<String, JsonValue>,
     properties: &HashMap<String, PropType>,
     structural_fields: &[&str],
+    system_columns: SystemColumns,
 ) -> Result<()> {
     for field in object.keys() {
         if is_reserved_physical_input_field(field) {
@@ -1766,7 +1797,7 @@ fn validate_strict_input_fields(
                 "input field '{field}' is reserved physical state"
             )));
         }
-        if field == "id"
+        if field == system_columns.id
             || structural_fields.contains(&field.as_str())
             || properties.contains_key(field)
         {
@@ -1794,18 +1825,21 @@ fn is_reserved_physical_input_field(field: &str) -> bool {
 fn validate_optional_row_id(
     type_name: &str,
     object: &serde_json::Map<String, JsonValue>,
+    system_columns: SystemColumns,
 ) -> Result<()> {
-    optional_row_id(type_name, object).map(|_| ())
+    optional_row_id(type_name, object, system_columns).map(|_| ())
 }
 
 fn optional_row_id<'a>(
     type_name: &str,
     object: &'a serde_json::Map<String, JsonValue>,
+    system_columns: SystemColumns,
 ) -> Result<Option<&'a str>> {
-    match object.get("id") {
+    match object.get(system_columns.id) {
         Some(JsonValue::String(value)) => Ok(Some(value)),
         Some(value) => Err(OmniError::manifest(format!(
-            "input entity of type '{type_name}' field 'id' must be a string, got {value}"
+            "input entity of type '{type_name}' field '{}' must be a string, got {value}",
+            system_columns.id
         ))),
         None => Ok(None),
     }
@@ -3222,7 +3256,7 @@ edge WorksAt: Person -> Company
         );
 
         let list_schema = arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", DataType::Utf8, false),
+            arrow_schema::Field::new("__id", DataType::Utf8, false),
             arrow_schema::Field::new(
                 "tags",
                 DataType::List(Arc::new(arrow_schema::Field::new(
@@ -3233,7 +3267,7 @@ edge WorksAt: Person -> Company
                 false,
             ),
         ]);
-        let list_row = serde_json::json!({"id": "row", "tags": ["one", "two"]});
+        let list_row = serde_json::json!({"__id": "row", "tags": ["one", "two"]});
         let error = preflight_strict_row_arrow_bytes_with_limit(
             &list_schema,
             list_row.as_object().unwrap(),
@@ -3372,57 +3406,57 @@ node Doc {
         let cases = [
             (
                 "recursive duplicate",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","extra":{"x":1,"x":2}}}"#,
+                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice","extra":{"x":1,"x":2}}}"#,
                 "duplicate JSON member 'x'",
             ),
             (
                 "two objects on one line",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"}} {"type":"Person","data":{"id":"Bob","name":"Bob"}}"#,
+                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice"}} {"type":"Person","data":{"__id":"Bob","name":"Bob"}}"#,
                 "invalid strict JSON",
             ),
             (
                 "node and edge",
-                r#"{"type":"Person","edge":"Knows","data":{"id":"Alice","name":"Alice"}}"#,
+                r#"{"type":"Person","edge":"Knows","data":{"__id":"Alice","name":"Alice"}}"#,
                 "exactly one of 'type' or 'edge'",
             ),
             (
                 "unknown top-level field",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"},"branch":"main"}"#,
+                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice"},"branch":"main"}"#,
                 "unknown top-level graph batch field 'branch'",
             ),
             (
                 "reserved top-level field",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"},"_rowid":7}"#,
+                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice"},"_rowid":7}"#,
                 "reserved physical state",
             ),
             (
                 "unknown data field",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","nickname":"Al"}}"#,
+                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice","nickname":"Al"}}"#,
                 "unknown input field 'nickname'",
             ),
             (
                 "reserved data field",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","_rowid":7}}"#,
+                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice","_rowid":7}}"#,
                 "reserved physical state",
             ),
             (
                 "non-string supplied id",
-                r#"{"type":"Person","data":{"id":7,"name":"Alice"}}"#,
-                "field 'id' must be a string",
+                r#"{"type":"Person","data":{"__id":7,"name":"Alice"}}"#,
+                "field '__id' must be a string",
             ),
             (
                 "noncanonical id",
-                r#"{"type":"Person","data":{"id":"person-1","name":"Alice"}}"#,
+                r#"{"type":"Person","data":{"__id":"person-1","name":"Alice"}}"#,
                 "does not match its canonical @key id 'Alice'",
             ),
             (
                 "nullable wrong type",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","age":"old"}}"#,
+                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice","age":"old"}}"#,
                 "expects Int32",
             ),
             (
                 "edge structural field in data",
-                r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"knows-1","src":"Mallory"}}"#,
+                r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"__id":"knows-1","__src":"Mallory"}}"#,
                 "reserved structural state",
             ),
         ];
@@ -3500,7 +3534,7 @@ node Doc {
 
         let batch = &batches[0];
         let ids = batch
-            .column_by_name("id")
+            .column_by_name("__id")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
@@ -3534,13 +3568,13 @@ node Doc {
 
         let batch = &batches[0];
         let srcs = batch
-            .column_by_name("src")
+            .column_by_name("__src")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         let dsts = batch
-            .column_by_name("dst")
+            .column_by_name("__dst")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
@@ -3691,7 +3725,7 @@ node Doc {
         let mut ages_by_id = HashMap::new();
         for batch in &batches {
             let ids = batch
-                .column_by_name("id")
+                .column_by_name("__id")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<StringArray>()

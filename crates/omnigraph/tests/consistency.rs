@@ -57,7 +57,7 @@ async fn snapshot_returns_stale_data_after_write() {
         .try_collect()
         .await
         .unwrap();
-    let ids_before = collect_column_strings(&batches_before, "id");
+    let ids_before = collect_column_strings(&batches_before, "__id");
     assert!(!ids_before.contains(&"Eve".to_string()));
 
     // Verify Eve IS in new snapshot's data
@@ -69,7 +69,7 @@ async fn snapshot_returns_stale_data_after_write() {
         .try_collect()
         .await
         .unwrap();
-    let ids_after = collect_column_strings(&batches_after, "id");
+    let ids_after = collect_column_strings(&batches_after, "__id");
     assert!(ids_after.contains(&"Eve".to_string()));
 }
 
@@ -136,7 +136,7 @@ async fn load_append_rejects_existing_id_without_update() {
     assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
     let batch = &rows[0];
     let ids = batch
-        .column_by_name("id")
+        .column_by_name("__id")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -871,7 +871,7 @@ node Thing {
 
     let observer = Omnigraph::open(uri).await.unwrap();
     let same_rows = read_table(&observer, "node:Thing").await;
-    let same_ids = collect_column_strings(&same_rows, "id");
+    let same_ids = collect_column_strings(&same_rows, "__id");
     let same_values = collect_column_strings(&same_rows, "value");
     assert_eq!(same_ids, ["SAME"], "the N-way race must publish one row");
     assert_eq!(
@@ -899,7 +899,7 @@ node Thing {
 
     let observer = Omnigraph::open(uri).await.unwrap();
     let rows = read_table(&observer, "node:Thing").await;
-    let ids = collect_column_strings(&rows, "id");
+    let ids = collect_column_strings(&rows, "__id");
     assert_eq!(ids.iter().filter(|id| id.as_str() == "SAME").count(), 1);
     assert!(ids.iter().any(|id| id == "LEFT"), "LEFT missing: {ids:?}");
     assert!(ids.iter().any(|id| id == "RIGHT"), "RIGHT missing: {ids:?}");
@@ -931,7 +931,7 @@ async fn load_merge_upserts_existing_and_inserts_new() {
     let batches = read_table(&db, "node:Person").await;
     let batch = &batches[0];
     let ids = batch
-        .column_by_name("id")
+        .column_by_name("__id")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -1073,8 +1073,8 @@ node Thing {
     value: String
 }
 "#;
-    const DUPLICATES: &str = r#"{"type":"Thing","data":{"id":"DUP","value":"first"}}
-{"type":"Thing","data":{"id":"DUP","value":"second"}}
+    const DUPLICATES: &str = r#"{"type":"Thing","data":{"__id":"DUP","value":"first"}}
+{"type":"Thing","data":{"__id":"DUP","value":"second"}}
 "#;
 
     for mode in [LoadMode::Append, LoadMode::Overwrite] {
@@ -1613,13 +1613,13 @@ query add_friend_since($from: String, $to: String, $since: Date) {
     let mut found = false;
     for batch in &batches {
         let srcs = batch
-            .column_by_name("src")
+            .column_by_name("__src")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         let dsts = batch
-            .column_by_name("dst")
+            .column_by_name("__dst")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()

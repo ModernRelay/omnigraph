@@ -8994,7 +8994,7 @@ mod tests {
 
     fn person_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
+            Field::new("__id", DataType::Utf8, false),
             Field::new("age", DataType::Int32, true),
         ]))
     }
@@ -10396,7 +10396,7 @@ mod tests {
             .stage_create_indices(
                 &after_data,
                 &[IndexBuildSpec::BTree {
-                    column: "id".to_string(),
+                    column: "__id".to_string(),
                     name: None,
                 }],
             )
@@ -10493,7 +10493,7 @@ node Person {
 
         db.load(
             "main",
-            r#"{"type":"Person","data":{"id":"winner","age":22}}"#,
+            r#"{"type":"Person","data":{"__id":"winner","age":22}}"#,
             crate::loader::LoadMode::Append,
         )
         .await
@@ -10589,7 +10589,7 @@ node Person {
             .iter()
             .flat_map(|batch| {
                 let ids = batch
-                    .column_by_name("id")
+                    .column_by_name("__id")
                     .unwrap()
                     .as_any()
                     .downcast_ref::<StringArray>()
@@ -10823,7 +10823,7 @@ node Person { age: I32? }
 
         db.load(
             "main",
-            r#"{"type":"Person","data":{"id":"winner","age":22}}"#,
+            r#"{"type":"Person","data":{"__id":"winner","age":22}}"#,
             crate::loader::LoadMode::Append,
         )
         .await
@@ -10934,7 +10934,7 @@ node Person { age: I32? }
             .iter()
             .flat_map(|batch| {
                 let ids = batch
-                    .column_by_name("id")
+                    .column_by_name("__id")
                     .unwrap()
                     .as_any()
                     .downcast_ref::<StringArray>()

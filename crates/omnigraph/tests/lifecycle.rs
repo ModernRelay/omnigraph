@@ -59,7 +59,7 @@ async fn init_creates_graph() {
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join("__schema_state.json")).unwrap())
             .unwrap();
-    assert_eq!(ir.ir_version, 2);
+    assert_eq!(ir.ir_version, 3);
     assert!(ir.next_identity_id > 1);
     assert!(SchemaIdentityDomain::parse(ir.schema_identity_domain.as_str()).is_ok());
     assert_eq!(state["format_version"].as_u64(), Some(2));
@@ -111,8 +111,8 @@ async fn init_creates_graph() {
             .collect::<Vec<_>>();
         assert_eq!(
             primary_key,
-            ["id"],
-            "fresh graph table {table_key} must be created with exactly `id` as its Lance unenforced primary key"
+            ["__id"],
+            "fresh graph table {table_key} must be created with exactly `__id` as its Lance unenforced primary key"
         );
         assert!(
             dataset.schema().field("__omnigraph_stream_v1$").is_none(),

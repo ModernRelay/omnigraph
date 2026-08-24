@@ -36,6 +36,7 @@ use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilterBuilde
 use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance_table::format::Fragment;
+use omnigraph_compiler::SYSTEM_COLUMNS_LEGACY;
 
 /// A standalone Lance `Session` per test store (this binary is primitive-level
 /// and deliberately does not include the shared `helpers` module).
@@ -433,6 +434,7 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
             "Person",
             person_pk_batch(&[("alice", Some(31)), ("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap();
@@ -484,6 +486,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             "Person",
             person_pk_batch(&[("alice", Some(99))]),
             KeyedWriteSemantics::KnownPresentUpdate,
+            SYSTEM_COLUMNS_LEGACY,
         ),
     )
     .await
@@ -513,6 +516,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             "Person",
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::KnownPresentUpdate,
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap_err();
@@ -535,6 +539,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             "Person",
             person_pk_batch(&[("alice", Some(31))]),
             KeyedWriteSemantics::KnownPresentUpdate,
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap();
@@ -567,6 +572,7 @@ async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
             "Person",
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap();
@@ -663,6 +669,7 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
             "Person",
             person_pk_batch(&[("alice", Some(99))]),
             KeyedWriteSemantics::StrictInsert,
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap_err();
@@ -689,6 +696,7 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
             "Person",
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::StrictInsert,
+            SYSTEM_COLUMNS_LEGACY,
         ),
     )
     .await
@@ -775,6 +783,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
                 0,
             )
             .unwrap(),
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap();
@@ -863,7 +872,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
         "the pre-existing BTREE must not claim the newly inserted fragment"
     );
     assert_eq!(
-        TableStore::first_existing_id(&committed, &["bob".to_string()])
+        TableStore::first_existing_id(&committed, &["bob".to_string()], SYSTEM_COLUMNS_LEGACY)
             .await
             .unwrap(),
         Some("bob".to_string()),
@@ -890,6 +899,7 @@ async fn concurrent_proven_strict_inserts_of_same_key_land_exactly_one_effect() 
                 0,
             )
             .unwrap(),
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap();
@@ -903,6 +913,7 @@ async fn concurrent_proven_strict_inserts_of_same_key_land_exactly_one_effect() 
                 1,
             )
             .unwrap(),
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap();
@@ -948,6 +959,7 @@ async fn proven_insert_chunk_rejects_target_version_reuse_before_staging() {
             "Person",
             person_pk_batch(&[("carol", Some(40))]),
             KeyedWriteSemantics::StrictInsert,
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap();
@@ -958,7 +970,7 @@ async fn proven_insert_chunk_rejects_target_version_reuse_before_staging() {
     let version_before_rejection = advanced.version().version;
 
     let error = store
-        .stage_proven_strict_insert(advanced, chunk)
+        .stage_proven_strict_insert(advanced, chunk, SYSTEM_COLUMNS_LEGACY)
         .await
         .unwrap_err();
     assert!(
@@ -1011,7 +1023,7 @@ async fn proven_insert_rejects_prepared_blob_descriptors_before_staging() {
     let version_before_rejection = target.version().version;
 
     let error = store
-        .stage_proven_strict_insert(target, chunk)
+        .stage_proven_strict_insert(target, chunk, SYSTEM_COLUMNS_LEGACY)
         .await
         .unwrap_err();
     assert!(
@@ -1053,6 +1065,7 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                     0,
                 )
                 .unwrap(),
+                SYSTEM_COLUMNS_LEGACY,
             )
             .await
             .unwrap();
@@ -1062,6 +1075,7 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                 "Person",
                 person_pk_batch(&[("bob", Some(26))]),
                 KeyedWriteSemantics::StrictInsert,
+                SYSTEM_COLUMNS_LEGACY,
             )
             .await
             .unwrap();
@@ -1098,7 +1112,7 @@ fn keyed_batch_validation_requires_non_null_utf8_unique_physical_ids() {
 
     let duplicate = person_pk_batch(&[("alice", Some(30)), ("alice", Some(31))]);
     let duplicate_error = store
-        .validate_keyed_write_batch("node:Person", &duplicate)
+        .validate_keyed_write_batch("node:Person", &duplicate, SYSTEM_COLUMNS_LEGACY)
         .unwrap_err();
     assert!(matches!(
         duplicate_error,
@@ -1123,7 +1137,7 @@ fn keyed_batch_validation_requires_non_null_utf8_unique_physical_ids() {
     .unwrap();
     assert!(
         store
-            .validate_keyed_write_batch("node:Person", &null_id)
+            .validate_keyed_write_batch("node:Person", &null_id, SYSTEM_COLUMNS_LEGACY)
             .unwrap_err()
             .to_string()
             .contains("null 'id'")
@@ -1143,7 +1157,7 @@ fn keyed_batch_validation_requires_non_null_utf8_unique_physical_ids() {
     .unwrap();
     assert!(
         store
-            .validate_keyed_write_batch("node:Person", &non_utf8)
+            .validate_keyed_write_batch("node:Person", &non_utf8, SYSTEM_COLUMNS_LEGACY)
             .unwrap_err()
             .to_string()
             .contains("not Utf8")
@@ -1166,6 +1180,7 @@ async fn keyed_write_rejects_missing_or_non_id_primary_key() {
             "Person",
             person_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap_err();
@@ -1192,7 +1207,13 @@ async fn keyed_write_rejects_missing_or_non_id_primary_key() {
         .await
         .unwrap();
     let wrong_error = store
-        .stage_keyed_write(wrong, "Person", wrong_batch, KeyedWriteSemantics::Upsert)
+        .stage_keyed_write(
+            wrong,
+            "Person",
+            wrong_batch,
+            KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+        )
         .await
         .unwrap_err();
     assert!(wrong_error.to_string().contains("got [\"age\"]"));
@@ -1221,6 +1242,7 @@ async fn keyed_write_stream_stages_source_dataset_without_wide_collection() {
             "Person",
             &source,
             KeyedWriteSemantics::StrictInsert,
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap();
@@ -1257,6 +1279,7 @@ async fn proven_insert_delta_scan_is_interval_exact_and_batch_bounded() {
             begin_version,
             end_version,
             &external_preflight,
+            SYSTEM_COLUMNS_LEGACY,
         )
         .await
         .unwrap();
@@ -1325,6 +1348,7 @@ async fn proven_insert_delta_scan_normalizes_oversized_raw_emission() {
                 begin_version,
                 end_version,
                 &external_preflight,
+                SYSTEM_COLUMNS_LEGACY,
             )
             .await
             .unwrap();

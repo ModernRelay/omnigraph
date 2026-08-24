@@ -7,6 +7,7 @@ use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use lance_file::version::LanceFileVersion;
+use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
@@ -325,7 +326,13 @@ async fn build_initial_entries(
         let table_path = table_path_for_identity(&table_key, identity)?;
         let full_path = format!("{}/{}", root_uri, table_path);
 
-        let ds = create_empty_dataset(&full_path, &node_type.arrow_schema, control_session).await?;
+        let ds = create_empty_dataset(
+            &full_path,
+            &node_type.arrow_schema,
+            catalog.system_columns,
+            control_session,
+        )
+        .await?;
         let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
 
         entries.push(DatasetEntry {
@@ -356,7 +363,13 @@ async fn build_initial_entries(
         let table_path = table_path_for_identity(&table_key, identity)?;
         let full_path = format!("{}/{}", root_uri, table_path);
 
-        let ds = create_empty_dataset(&full_path, &edge_type.arrow_schema, control_session).await?;
+        let ds = create_empty_dataset(
+            &full_path,
+            &edge_type.arrow_schema,
+            catalog.system_columns,
+            control_session,
+        )
+        .await?;
         let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
 
         entries.push(DatasetEntry {
@@ -377,6 +390,7 @@ async fn build_initial_entries(
 async fn create_empty_dataset(
     uri: &str,
     schema: &SchemaRef,
+    system_columns: SystemColumns,
     control_session: &Arc<lance::session::Session>,
 ) -> Result<Dataset> {
     // Keep initialization self-contained even for manifest-level callers that
@@ -384,7 +398,7 @@ async fn create_empty_dataset(
     // catalogs already carry this metadata, but there must never be a
     // create-then-annotate window: Lance makes the PK metadata immutable after
     // dataset creation and RFC-023 activates it only for new format-v6 graphs.
-    let schema = keyed_graph_table_schema(schema)?;
+    let schema = keyed_graph_table_schema(schema, system_columns)?;
     let batch = RecordBatch::new_empty(schema.clone());
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
     let params = WriteParams {
@@ -404,7 +418,10 @@ async fn create_empty_dataset(
     Ok(dataset)
 }
 
-fn keyed_graph_table_schema(schema: &SchemaRef) -> Result<SchemaRef> {
+fn keyed_graph_table_schema(
+    schema: &SchemaRef,
+    system_columns: SystemColumns,
+) -> Result<SchemaRef> {
     let mut id_count = 0;
     let fields = schema
         .fields()
@@ -413,7 +430,7 @@ fn keyed_graph_table_schema(schema: &SchemaRef) -> Result<SchemaRef> {
             let mut field = field.as_ref().clone();
             let mut metadata = field.metadata().clone();
             metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
-            if field.name() == "id" {
+            if field.name() == system_columns.id {
                 id_count += 1;
                 metadata.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
             } else {
@@ -426,17 +443,19 @@ fn keyed_graph_table_schema(schema: &SchemaRef) -> Result<SchemaRef> {
 
     if id_count != 1 {
         return Err(OmniError::manifest_internal(format!(
-            "graph table initialization requires exactly one top-level `id` field; found {id_count}"
+            "graph table initialization requires exactly one top-level `{}` field; found {id_count}",
+            system_columns.id
         )));
     }
     let id = fields
         .iter()
-        .find(|field| field.name() == "id")
+        .find(|field| field.name() == system_columns.id)
         .expect("id_count == 1");
     if id.is_nullable() {
-        return Err(OmniError::manifest_internal(
-            "graph table initialization requires a non-null `id` field",
-        ));
+        return Err(OmniError::manifest_internal(format!(
+            "graph table initialization requires a non-null `{}` field",
+            system_columns.id
+        )));
     }
 
     Ok(std::sync::Arc::new(Schema::new_with_metadata(

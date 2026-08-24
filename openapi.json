@@ -5221,6 +5221,17 @@
         "properties": {
           "schema_source": {
             "type": "string"
+          },
+          "system_columns": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SystemColumnsOutput",
+                "description": "The graph's system column spellings. Query-result payloads carry\nthese exact field names; reading them here is the supported discovery\nmechanism for clients serving graphs of mixed vintages. Optional for\ncompatibility with servers predating the field."
+              }
+            ]
           }
         }
       },
@@ -5289,6 +5300,26 @@
             "format": "int32",
             "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at.",
             "minimum": 0
+          }
+        }
+      },
+      "SystemColumnsOutput": {
+        "type": "object",
+        "description": "A graph's system column spellings (see `SchemaOutput::system_columns`).",
+        "required": [
+          "id",
+          "src",
+          "dst"
+        ],
+        "properties": {
+          "dst": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "src": {
+            "type": "string"
           }
         }
       }

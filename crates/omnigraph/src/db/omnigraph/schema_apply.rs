@@ -51,7 +51,10 @@ fn resolve_desired_schema_ir(
     accepted_ir: &SchemaIR,
     desired_schema_source: &str,
 ) -> Result<SchemaIR> {
-    let desired_shape = read_schema_shape_from_source(desired_schema_source)?;
+    let desired_shape = crate::db::omnigraph::read_schema_shape_for_ir_version(
+        desired_schema_source,
+        accepted_ir.ir_version,
+    )?;
     let resolution = omnigraph_compiler::resolve_schema_ir(accepted_ir, &desired_shape)
         .map_err(|error| OmniError::manifest(error.to_string()))?;
     for diagnostic in &resolution.diagnostics {

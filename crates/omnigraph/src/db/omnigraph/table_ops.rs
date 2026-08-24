@@ -10,15 +10,20 @@ pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index
         .iter()
         .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
         .collect();
-    db.runtime_cache.graph_index(&resolved, &edge_types).await
+    db.runtime_cache
+        .graph_index(&resolved, &edge_types, catalog.system_columns)
+        .await
 }
 
 pub(super) async fn graph_index_for_resolved(
     db: &Omnigraph,
     resolved: &ResolvedTarget,
     edge_types: &std::collections::HashMap<String, (String, String)>,
+    system_columns: SystemColumns,
 ) -> Result<Arc<crate::graph_index::GraphIndex>> {
-    db.runtime_cache.graph_index(resolved, edge_types).await
+    db.runtime_cache
+        .graph_index(resolved, edge_types, system_columns)
+        .await
 }
 
 pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> {
@@ -205,7 +210,7 @@ pub(super) async fn ensure_indices_for_branch(
                 .open_dataset_head(&full_path, active_branch.as_deref())
                 .await?
         };
-        let work = plan_index_work_edge_on_dataset(db, &ds).await?;
+        let work = plan_index_work_edge_on_dataset(db, &ds, catalog.system_columns).await?;
         if work.needs_commit() {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
                 identity: entry.identity,
@@ -690,9 +695,13 @@ async fn plan_index_work_node(
     }
 
     let mut work = PlannedIndexWork::default();
-    if !db.storage().has_btree_index(ds, "id").await? {
+    if !db
+        .storage()
+        .has_btree_index(ds, catalog.system_columns.id)
+        .await?
+    {
         work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
-            column: "id".to_string(),
+            column: catalog.system_columns.id.to_string(),
             name: None,
         });
     }
@@ -766,7 +775,7 @@ pub(super) async fn index_work_status_on_dataset_for_catalog(
         plan_index_work_node(db, catalog, type_name, table_key, ds).await?
     } else if table_key.starts_with("edge:") {
         // Intentional asymmetry: edges only receive the id/src/dst BTREEs.
-        plan_index_work_edge_on_dataset(db, ds).await?
+        plan_index_work_edge_on_dataset(db, ds, catalog.system_columns).await?
     } else {
         return Err(OmniError::manifest(format!(
             "invalid table key '{}'",
@@ -782,12 +791,13 @@ pub(super) async fn index_work_status_on_dataset_for_catalog(
 async fn plan_index_work_edge_on_dataset(
     db: &Omnigraph,
     ds: &SnapshotHandle,
+    system_columns: SystemColumns,
 ) -> Result<PlannedIndexWork> {
     if db.storage().count_rows(ds, None).await? == 0 {
         return Ok(PlannedIndexWork::default());
     }
     let mut work = PlannedIndexWork::default();
-    for column in ["id", "src", "dst"] {
+    for column in [system_columns.id, system_columns.src, system_columns.dst] {
         if !db.storage().has_btree_index(ds, column).await? {
             work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
                 column: column.to_string(),
@@ -1422,7 +1432,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     let work = if let Some(type_name) = table_key.strip_prefix("node:") {
         plan_index_work_node(db, catalog, type_name, table_key, ds).await?
     } else if table_key.starts_with("edge:") {
-        plan_index_work_edge_on_dataset(db, ds).await?
+        plan_index_work_edge_on_dataset(db, ds, catalog.system_columns).await?
     } else {
         return Err(OmniError::manifest(format!(
             "invalid table key '{}'",

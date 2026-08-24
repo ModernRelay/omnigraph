@@ -1713,7 +1713,7 @@ async fn index_build_tolerates_null_vector_rows() {
         "one reconciliation publishes exactly one graph commit"
     );
     let ds = after.open_dataset("node:Doc").await.unwrap();
-    assert!(ds.has_btree_index("id").await.unwrap());
+    assert!(ds.has_btree_index("__id").await.unwrap());
     assert!(ds.has_fts_index("slug").await.unwrap());
     assert!(ds.has_btree_index("n").await.unwrap());
     assert!(!ds.has_vector_index("embedding").await.unwrap());
@@ -1763,7 +1763,7 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     // Postcondition: optimize's reconciler materialized the declared index.
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("node:Doc").await.unwrap();
-    assert!(ds.has_btree_index("id").await.unwrap());
+    assert!(ds.has_btree_index("__id").await.unwrap());
     assert!(ds.has_fts_index("slug").await.unwrap());
     assert!(ds.has_btree_index("rank").await.unwrap());
     assert_eq!(

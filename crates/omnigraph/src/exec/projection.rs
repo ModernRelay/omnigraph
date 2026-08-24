@@ -1,5 +1,7 @@
 use super::*;
 
+use omnigraph_compiler::SystemColumns;
+
 pub(super) fn apply_filter(
     batch: &mut RecordBatch,
     filter: &IRFilter,
@@ -343,6 +345,7 @@ pub(super) fn project_return(
     wide_batch: &RecordBatch,
     projections: &[IRProjection],
     params: &ParamMap,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     if projections.is_empty() {
         return Err(OmniError::manifest(
@@ -355,14 +358,14 @@ pub(super) fn project_return(
         .iter()
         .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
     if has_aggregates {
-        return aggregate_return(wide_batch, projections, params);
+        return aggregate_return(wide_batch, projections, params, system_columns);
     }
 
     let mut fields = Vec::with_capacity(projections.len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projections.len());
 
     for proj in projections {
-        let (name, col) = evaluate_projection(wide_batch, &proj.expr, params)?;
+        let (name, col) = evaluate_projection(wide_batch, &proj.expr, params, system_columns)?;
         let field_name = proj.alias.as_deref().unwrap_or(&name);
         fields.push(Field::new(
             field_name,
@@ -381,6 +384,7 @@ fn evaluate_projection(
     wide_batch: &RecordBatch,
     expr: &IRExpr,
     params: &ParamMap,
+    system_columns: SystemColumns,
 ) -> Result<(String, ArrayRef)> {
     match expr {
         IRExpr::PropAccess { variable, property } => {
@@ -402,7 +406,7 @@ fn evaluate_projection(
             Ok((name.clone(), arr))
         }
         IRExpr::Variable(name) => {
-            let col_name = format!("{}.id", name);
+            let col_name = format!("{}.{}", name, system_columns.id);
             let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
                 OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
             })?;
@@ -422,6 +426,7 @@ pub(super) fn apply_ordering(
     orderings: &[IROrdering],
     source: &RecordBatch,
     _params: &ParamMap,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 
@@ -472,12 +477,13 @@ pub(super) fn apply_ordering(
     // a result row, so the order is total and reproducible. (Aggregate results
     // have no `.id` columns; their group rows are already distinct on the
     // projected group keys.)
+    let id_suffix = format!(".{}", system_columns.id);
     let mut tiebreak_cols: Vec<String> = source
         .schema()
         .fields()
         .iter()
         .map(|f| f.name().to_string())
-        .filter(|name| name.ends_with(".id"))
+        .filter(|name| name.ends_with(&id_suffix))
         .collect();
     tiebreak_cols.sort();
     for name in &tiebreak_cols {
@@ -511,6 +517,7 @@ fn aggregate_return(
     wide: &RecordBatch,
     projections: &[IRProjection],
     params: &ParamMap,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     let num_rows = wide.num_rows();
 
@@ -532,7 +539,7 @@ fn aggregate_return(
     for (i, proj) in projections.iter().enumerate() {
         match &proj.expr {
             IRExpr::Aggregate { func, arg } => {
-                let (name, col) = evaluate_projection(wide, arg, params)?;
+                let (name, col) = evaluate_projection(wide, arg, params, system_columns)?;
                 let alias = proj.alias.as_deref().unwrap_or(&name);
                 agg_projs.push(AggProj {
                     proj_idx: i,
@@ -542,7 +549,7 @@ fn aggregate_return(
                 });
             }
             _ => {
-                let (name, col) = evaluate_projection(wide, &proj.expr, params)?;
+                let (name, col) = evaluate_projection(wide, &proj.expr, params, system_columns)?;
                 let alias = proj.alias.as_deref().unwrap_or(&name);
                 group_keys.push(GroupKey {
                     proj_idx: i,

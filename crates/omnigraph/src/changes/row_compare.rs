@@ -102,8 +102,9 @@ impl RawRow {
         dataset: &Dataset,
         batch: &RecordBatch,
         row_index: usize,
+        id_col: &str,
     ) -> Result<RawRow> {
-        prepare_batch(dataset, &batch.slice(row_index, 1))?
+        prepare_batch(dataset, &batch.slice(row_index, 1), id_col)?
             .pop_front()
             .ok_or_else(|| {
                 OmniError::manifest_internal("single-row batch produced no comparison row")
@@ -118,21 +119,26 @@ pub(crate) struct OrderedRows {
     dataset: Dataset,
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
     pending: VecDeque<RawRow>,
+    id_col: &'static str,
 }
 
 impl OrderedRows {
-    pub(crate) async fn open(dataset: Dataset, after_id: Option<&str>) -> Result<Self> {
+    pub(crate) async fn open(
+        dataset: Dataset,
+        after_id: Option<&str>,
+        id_col: &'static str,
+    ) -> Result<Self> {
         let after_id = after_id.map(str::to_string);
         let stream = Box::pin(
             TableStore::scan_stream_with(
                 &dataset,
                 None,
                 None,
-                Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
+                Some(vec![ColumnOrdering::asc_nulls_last(id_col.to_string())]),
                 true,
                 move |scanner| {
                     if let Some(after_id) = after_id {
-                        scanner.filter_expr(col("id").gt(lit(after_id)));
+                        scanner.filter_expr(col(id_col).gt(lit(after_id)));
                     }
                     // Descriptor-sized batches bounded by rows AND bytes, the
                     // same shape as every other production ordered-by-id scan.
@@ -159,6 +165,7 @@ impl OrderedRows {
             dataset,
             stream: Some(stream),
             pending: VecDeque::new(),
+            id_col,
         })
     }
 
@@ -178,7 +185,9 @@ impl OrderedRows {
                 return Ok(());
             };
             match stream.try_next().await {
-                Ok(Some(batch)) => self.pending = prepare_batch(&self.dataset, &batch)?,
+                Ok(Some(batch)) => {
+                    self.pending = prepare_batch(&self.dataset, &batch, self.id_col)?
+                }
                 Ok(None) => {
                     self.stream = None;
                     return Ok(());
@@ -198,9 +207,9 @@ impl OrderedRows {
 /// physical descriptor identities for Blob columns. Pure in-memory work — Blob
 /// payloads are never touched here, and the data-file resolution below reads
 /// only the already-loaded `dataset` manifest (no object-store call).
-fn prepare_batch(dataset: &Dataset, batch: &RecordBatch) -> Result<VecDeque<RawRow>> {
+fn prepare_batch(dataset: &Dataset, batch: &RecordBatch, id_col: &str) -> Result<VecDeque<RawRow>> {
     let ids = batch
-        .column_by_name("id")
+        .column_by_name(id_col)
         .and_then(|column| column.as_any().downcast_ref::<StringArray>())
         .ok_or_else(|| OmniError::manifest_internal("change row is missing string id"))?;
 

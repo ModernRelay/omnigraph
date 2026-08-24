@@ -1173,7 +1173,7 @@ impl Omnigraph {
         scanner
             .project(&[cell.property.as_str()])
             .map_err(OmniError::storage)?;
-        scanner.filter_expr(col("id").eq(lit(cell.id.clone())));
+        scanner.filter_expr(col(catalog.system_columns.id).eq(lit(cell.id.clone())));
         scanner.blob_handling(BlobHandling::BlobsDescriptions);
         scanner.with_row_id();
         scanner.limit(Some(2), None).map_err(OmniError::storage)?;

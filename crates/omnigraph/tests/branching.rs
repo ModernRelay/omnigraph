@@ -52,7 +52,7 @@ node Person {
 }
 
 edge Knows: Person -> Person {
-    @unique(src, dst)
+    @unique(__src, __dst)
 }
 "#;
 
@@ -182,8 +182,8 @@ async fn assert_exact_id_primary_key_on_branch(db: &Omnigraph, branch: &str, tab
         .collect::<Vec<_>>();
     assert_eq!(
         primary_key,
-        ["id"],
-        "branch {branch} table {table_key} must preserve exactly `id` as its Lance unenforced primary key"
+        ["__id"],
+        "branch {branch} table {table_key} must preserve exactly `__id` as its Lance unenforced primary key"
     );
 }
 
@@ -2799,8 +2799,8 @@ async fn branch_merge_reports_unique_violation_conflict() {
 }
 
 /// Regression for the MR-983 follow-up: the branch-merge path must enforce an
-/// edge composite `@unique(src, dst)` as a true composite key, consistent with
-/// the intake path. Two branches inserting the *same* (src, dst) pair must
+/// edge composite `@unique(__src, __dst)` as a true composite key, consistent with
+/// the intake path. Two branches inserting the *same* (__src, __dst) pair must
 /// conflict on merge.
 #[tokio::test]
 async fn branch_merge_reports_composite_unique_violation_conflict() {
@@ -2842,9 +2842,9 @@ async fn branch_merge_reports_composite_unique_violation_conflict() {
     }
 }
 
-/// Sibling to the above: pairs sharing `src` but differing on `dst` are unique
-/// on the (src, dst) tuple and must merge cleanly. Guards against the composite
-/// degrading back into a single-field `@unique(src)` on the merge path.
+/// Sibling to the above: pairs sharing `__src` but differing on `__dst` are unique
+/// on the (__src, __dst) tuple and must merge cleanly. Guards against the composite
+/// degrading back into a single-field `@unique(__src)` on the merge path.
 #[tokio::test]
 async fn branch_merge_allows_distinct_composite_unique_pairs() {
     let dir = tempfile::tempdir().unwrap();
@@ -3202,7 +3202,9 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
     let snap = snapshot_main(&main).await.unwrap();
     let ds = snap.open_dataset("node:Person").await.unwrap();
     let mut scanner = ds.scan();
-    scanner.project(&["id", "_row_created_at_version"]).unwrap();
+    scanner
+        .project(&["__id", "_row_created_at_version"])
+        .unwrap();
     let batches: Vec<_> = scanner
         .try_into_stream()
         .await
@@ -3216,7 +3218,7 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
         std::collections::HashMap::new();
     for batch in &batches {
         let ids = batch
-            .column_by_name("id")
+            .column_by_name("__id")
             .unwrap()
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
@@ -3257,11 +3259,11 @@ async fn edge_tables_have_id_btree_after_ensure_indices() {
     let indices = ds.load_indices().await.unwrap();
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
 
-    // Should have BTree on id, src, dst = 3 indices
+    // Should have BTree on __id, __src, __dst = 3 indices
     let index_names: Vec<_> = user_indices.iter().map(|idx| idx.fields.clone()).collect();
     assert!(
         user_indices.len() >= 3,
-        "Edge table should have at least 3 indices (id, src, dst), got {:?}",
+        "Edge table should have at least 3 indices (__id, __src, __dst), got {:?}",
         index_names
     );
 }
@@ -3307,7 +3309,7 @@ async fn merge_delta_only_bumps_changed_rows() {
     let ds = snap.open_dataset("node:Person").await.unwrap();
     let mut scanner = ds.scan();
     scanner
-        .project(&["id", "_row_last_updated_at_version"])
+        .project(&["__id", "_row_last_updated_at_version"])
         .unwrap();
     let batches: Vec<_> = scanner
         .try_into_stream()

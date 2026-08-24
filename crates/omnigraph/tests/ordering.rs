@@ -118,14 +118,14 @@ async fn ordering_parallel_edge_tie_breaks_by_physical_edge_id() {
         &db,
         r#"{"type":"Person","data":{"name":"Alice","age":30}}
 {"type":"Person","data":{"name":"Bob","age":25}}
-{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"edge-b","label":"loaded-first"}}"#,
+{"edge":"Knows","from":"Alice","to":"Bob","data":{"__id":"edge-b","label":"loaded-first"}}"#,
         LoadMode::Overwrite,
     )
     .await
     .unwrap();
     load_jsonl(
         &db,
-        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"edge-a","label":"id-first"}}"#,
+        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"__id":"edge-a","label":"id-first"}}"#,
         LoadMode::Merge,
     )
     .await

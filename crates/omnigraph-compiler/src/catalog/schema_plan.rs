@@ -196,10 +196,19 @@ pub fn plan_schema_migration(
         .into());
     }
     validate_evolution_identity(accepted, desired)?;
+    if accepted.ir_version != desired.ir_version {
+        return Err(crate::error::SchemaIdentityError::Resolution(format!(
+            "migration planning requires matching ir_version (accepted {}, desired {}); \
+             system column spellings never change under evolution",
+            accepted.ir_version, desired.ir_version
+        ))
+        .into());
+    }
+    let system_columns = accepted.system_columns();
     let mut steps = Vec::new();
     plan_interfaces(&accepted.interfaces, &desired.interfaces, &mut steps);
-    plan_nodes(&accepted.nodes, &desired.nodes, &mut steps);
-    plan_edges(&accepted.edges, &desired.edges, &mut steps);
+    plan_nodes(&accepted.nodes, &desired.nodes, &mut steps, system_columns);
+    plan_edges(&accepted.edges, &desired.edges, &mut steps, system_columns);
 
     if steps.is_empty() && accepted != desired {
         steps.push(SchemaMigrationStep::UnsupportedChange {
@@ -409,7 +418,12 @@ fn plan_interfaces(
     }
 }
 
-fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMigrationStep>) {
+fn plan_nodes(
+    accepted: &[NodeIR],
+    desired: &[NodeIR],
+    steps: &mut Vec<SchemaMigrationStep>,
+    system_columns: super::schema_ir::SystemColumns,
+) {
     let accepted_by_id = accepted
         .iter()
         .map(|node| (node.type_id, node))
@@ -475,6 +489,7 @@ fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMig
             &existing.constraints,
             &node.constraints,
             steps,
+            system_columns,
         );
     }
 
@@ -498,7 +513,12 @@ fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMig
     }
 }
 
-fn plan_edges(accepted: &[EdgeIR], desired: &[EdgeIR], steps: &mut Vec<SchemaMigrationStep>) {
+fn plan_edges(
+    accepted: &[EdgeIR],
+    desired: &[EdgeIR],
+    steps: &mut Vec<SchemaMigrationStep>,
+    system_columns: super::schema_ir::SystemColumns,
+) {
     let accepted_by_id = accepted
         .iter()
         .map(|edge| (edge.type_id, edge))
@@ -566,6 +586,7 @@ fn plan_edges(accepted: &[EdgeIR], desired: &[EdgeIR], steps: &mut Vec<SchemaMig
             &existing.constraints,
             &edge.constraints,
             steps,
+            system_columns,
         );
     }
 
@@ -842,6 +863,7 @@ fn plan_constraints(
     accepted: &[ConstraintIR],
     desired: &[ConstraintIR],
     steps: &mut Vec<SchemaMigrationStep>,
+    system_columns: super::schema_ir::SystemColumns,
 ) {
     let desired_map = desired
         .iter()
@@ -879,7 +901,7 @@ fn plan_constraints(
                 let step = SchemaMigrationStep::AddConstraint {
                     type_kind,
                     type_name: type_name.to_string(),
-                    constraint: constraint_from_ir(&constraint),
+                    constraint: constraint_from_ir(&constraint, system_columns),
                 };
                 if !steps.contains(&step) {
                     steps.push(step);

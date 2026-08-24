@@ -11,10 +11,18 @@
 
 `<ident>: <TypeRef> [annotation*]`
 
-The exact names `_rowid`, `_rowaddr`, `_rowoffset`,
-`_row_created_at_version`, and `_row_last_updated_at_version` are reserved for
-Lance virtual system columns and cannot be declared as interface, node, or edge
-properties. Similar names such as `_row_id` remain valid.
+Property names starting with `_` are reserved for system columns and are
+rejected when a schema is admitted. The reserved namespace covers Lance's
+virtual system columns (`_rowid`, `_rowaddr`, `_rowoffset`,
+`_row_created_at_version`, `_row_last_updated_at_version`) and OmniGraph's
+own implicit stored columns, spelled `__id` on nodes and edges and
+`__src`/`__dst` on edges for graphs created at the current schema version.
+Graphs created before that version keep the earlier spellings `id`, `src`,
+and `dst` for their implicit columns and continue to reserve those three
+property names; on current graphs `id`, `src`, and `dst` are ordinary
+property names. Result payloads carry each graph's own implicit column
+names, and the schema endpoint (`GET /schema`) reports them in its
+`system_columns` field so clients never have to guess.
 
 ## Built-in scalar types
 

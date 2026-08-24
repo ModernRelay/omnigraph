@@ -98,10 +98,10 @@ const RANKED_EDGE_DATA: &str = r#"{"type":"RankedDoc","data":{"slug":"rank-1","e
 {"type":"RankedDoc","data":{"slug":"rank-2","embedding":[1.0,0.0,0.0,0.0]}}
 {"type":"RankedDoc","data":{"slug":"rank-3","embedding":[2.0,0.0,0.0,0.0]}}
 {"type":"RankedDoc","data":{"slug":"sink","embedding":[9.0,0.0,0.0,0.0]}}
-{"edge":"RankedLink","from":"rank-3","to":"sink","data":{"id":"edge-c","label":"C"}}
-{"edge":"RankedLink","from":"rank-2","to":"sink","data":{"id":"edge-b","label":"B"}}
-{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a2","label":"A2"}}
-{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a1","label":"A1"}}"#;
+{"edge":"RankedLink","from":"rank-3","to":"sink","data":{"__id":"edge-c","label":"C"}}
+{"edge":"RankedLink","from":"rank-2","to":"sink","data":{"__id":"edge-b","label":"B"}}
+{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"__id":"edge-a2","label":"A2"}}
+{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"__id":"edge-a1","label":"A1"}}"#;
 
 const RANKED_EDGE_QUERIES: &str = r#"
 query nearest_edges($q: Vector(4)) {

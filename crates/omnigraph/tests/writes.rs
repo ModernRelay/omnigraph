@@ -1623,14 +1623,14 @@ edge WorksAt: Person -> Company @card(0..1)
     let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"type": "Company", "data": {"name": "Bigco"}}
-{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
+{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"__id": "w1"}}
 "#;
     load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     // Merge-update the same edge id w1 to point at Bigco. Counted naively
     // as union, Alice has 2 WorksAt (committed Acme + pending Bigco) which
     // would trip @card(0..1). With merge dedupe, Alice has 1 WorksAt.
-    let merge_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"id": "w1"}}
+    let merge_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"__id": "w1"}}
 "#;
     load_jsonl(&db, merge_data, LoadMode::Merge)
         .await
@@ -1677,8 +1677,8 @@ edge WorksAt: Person -> Company @card(0..1)
     // the first in the end-of-query dedupe. If pending-counting doesn't
     // dedupe, Alice has 2 pending edges → @card(0..1) trips → load
     // fails. With dedupe, Alice has 1 → load succeeds.
-    let dup_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
-{"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"id": "w1"}}
+    let dup_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"__id": "w1"}}
+{"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"__id": "w1"}}
 "#;
     load_jsonl(&db, dup_data, LoadMode::Merge)
         .await

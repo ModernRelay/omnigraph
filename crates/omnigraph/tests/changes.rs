@@ -944,11 +944,11 @@ query set_body($slug: String, $body: String) {
 /// The legacy signature skipped every `_row_`-prefixed column and hid the
 /// update; the typed comparator skips only the reserved five.
 #[tokio::test]
-async fn cross_branch_diff_detects_underscore_prefixed_property_update() {
-    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    _row_notes: String?\n}";
+async fn cross_branch_diff_detects_row_prefix_named_property_update() {
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    row_notes: String?\n}";
     const SET_NOTES: &str = r#"
 query set_notes($slug: String, $notes: String) {
-    update Doc set { _row_notes: $notes } where slug = $slug
+    update Doc set { row_notes: $notes } where slug = $slug
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -956,7 +956,7 @@ query set_notes($slug: String, $notes: String) {
     let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
     db.load_with_receipt(
         "main",
-        r#"{"type":"Doc","data":{"slug":"x","_row_notes":"before"}}"#,
+        r#"{"type":"Doc","data":{"slug":"x","row_notes":"before"}}"#,
         LoadMode::Overwrite,
     )
     .await
@@ -1820,7 +1820,7 @@ edge Refs: Note -> Note {
             "\n",
             r#"{"type":"Note","data":{"slug":"note-c","body":"same"}}"#,
             "\n",
-            r#"{"edge":"Refs","from":"note-a","to":"note-b","data":{"id":"ref-1","label":"old"}}"#,
+            r#"{"edge":"Refs","from":"note-a","to":"note-b","data":{"__id":"ref-1","label":"old"}}"#,
         ),
         LoadMode::Merge,
     )
@@ -1837,7 +1837,7 @@ edge Refs: Note -> Note {
                 "\n",
                 r#"{"type":"Note","data":{"slug":"note-c","body":"same"}}"#,
                 "\n",
-                r#"{"edge":"Refs","from":"note-a","to":"note-b","data":{"id":"ref-1","label":"new"}}"#,
+                r#"{"edge":"Refs","from":"note-a","to":"note-b","data":{"__id":"ref-1","label":"new"}}"#,
             ),
             LoadMode::Merge,
         )

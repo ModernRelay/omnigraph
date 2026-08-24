@@ -585,7 +585,7 @@ async fn node_string_value(
 ) -> Option<Option<String>> {
     for batch in read_table(db, &format!("node:{type_name}")).await {
         let ids = batch
-            .column_by_name("id")
+            .column_by_name("__id")
             .unwrap()
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
@@ -662,15 +662,15 @@ async fn three_way_merge_detects_empty_string_to_null_change() {
 /// signature skipped every `_row`-prefixed column, so feature's change was
 /// invisible and silently dropped. RED before the merge comparator fix.
 #[tokio::test]
-async fn three_way_merge_detects_underscore_prefixed_property_change() {
-    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    _row_notes: String?\n}";
-    const SET_NOTES: &str = "query set_notes($slug: String, $notes: String) {\n    update Doc set { _row_notes: $notes } where slug = $slug\n}";
+async fn three_way_merge_detects_row_prefix_named_property_change() {
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    row_notes: String?\n}";
+    const SET_NOTES: &str = "query set_notes($slug: String, $notes: String) {\n    update Doc set { row_notes: $notes } where slug = $slug\n}";
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
     main.load(
         "main",
-        "{\"type\":\"Doc\",\"data\":{\"slug\":\"x\",\"_row_notes\":\"before\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"y\",\"_row_notes\":\"before\"}}",
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"x\",\"row_notes\":\"before\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"y\",\"row_notes\":\"before\"}}",
         LoadMode::Overwrite,
     )
     .await
@@ -700,7 +700,7 @@ async fn three_way_merge_detects_underscore_prefixed_property_change() {
     assert_eq!(outcome, MergeOutcome::Merged);
 
     assert_eq!(
-        node_string_value(&main, "Doc", "x", "_row_notes").await,
+        node_string_value(&main, "Doc", "x", "row_notes").await,
         Some(Some("after".to_string())),
         "a change to a legal _row_-prefixed property must survive the merge"
     );

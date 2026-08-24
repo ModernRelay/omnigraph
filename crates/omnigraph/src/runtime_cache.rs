@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use lance::Dataset;
 use lance::session::Session;
+use omnigraph_compiler::SystemColumns;
 use tokio::sync::Mutex;
 
 use crate::db::ResolvedTarget;
@@ -72,6 +73,7 @@ impl RuntimeCache {
         &self,
         resolved: &ResolvedTarget,
         edge_types: &HashMap<String, (String, String)>,
+        system_columns: SystemColumns,
     ) -> Result<Arc<GraphIndex>> {
         let key = graph_index_cache_key(resolved, edge_types);
         {
@@ -82,7 +84,8 @@ impl RuntimeCache {
         }
 
         crate::instrumentation::record_graph_build(edge_types.len());
-        let index = Arc::new(GraphIndex::build(&resolved.snapshot, edge_types).await?);
+        let index =
+            Arc::new(GraphIndex::build(&resolved.snapshot, edge_types, system_columns).await?);
         let mut cache = self.graph_indices.lock().await;
         if let Some(existing) = cache.entries.get(&key).cloned() {
             return Ok(existing);
