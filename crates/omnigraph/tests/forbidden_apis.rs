@@ -236,7 +236,7 @@ write_surfaces! {
         "ensure_indices", "ensure_indices_on",
         "rebuild_full_text_indices_on", "rebuild_full_text_indices_on_as",
     ],
-    "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test"],
+    "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test", "init_with_legacy_system_columns_for_tests"],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
     "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
