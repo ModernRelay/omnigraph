@@ -75,8 +75,9 @@ pub async fn read_serving_snapshot(
 }
 
 /// Read the applied revision directly from a storage root URI — config-free
-/// serving: a `--cluster s3://bucket/prefix` server needs no local files at
-/// all, only the bucket and credentials. The ledger and catalog ARE the
+/// serving: a `--cluster s3://bucket/prefix` or
+/// `--cluster az://container/prefix` server needs no local files at all, only
+/// the object-store location and credentials. The ledger and catalog ARE the
 /// deployment artifact.
 pub async fn read_serving_snapshot_from_storage(
     storage_root: &str,
@@ -94,15 +95,21 @@ pub async fn read_serving_snapshot_from_storage(
 ///
 /// Cheap by construction: a URI that does not match the `<root>/graphs/<id>.omni`
 /// shape returns `None` without any I/O, so ordinary `init` targets
-/// (`./kb.omni`, `s3://bucket/kb.omni`) never probe storage. Works for
-/// `file://` and `s3://` via the storage adapter.
-pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Option<String> {
-    let root = cluster_root_of_graph_layout(graph_uri)?;
-    let store = ClusterStore::for_storage_root(&root).ok()?;
-    store
-        .has_state()
-        .await
-        .then(|| store.display_root().to_string())
+/// (`./kb.omni`, `s3://bucket/kb.omni`, `az://container/kb.omni`) never probe
+/// storage. Works for `file://`, `s3://`, and `az://` via the storage adapter.
+pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Result<Option<String>, Diagnostic> {
+    let Some(root) = cluster_root_of_graph_layout(graph_uri) else {
+        return Ok(None);
+    };
+    let store = ClusterStore::for_storage_root(&root)?;
+    let has_state = store.has_state().await.map_err(|error| {
+        Diagnostic::error(
+            "cluster_state_probe_error",
+            omnigraph_storage::redacted_storage_uri(&root),
+            format!("could not inspect cluster state: {error}"),
+        )
+    })?;
+    Ok(has_state.then(|| store.display_root().to_string()))
 }
 
 /// Resolve a graph's **storage URI** (`<root>/graphs/<id>.omni`) from a cluster's
@@ -116,8 +123,8 @@ pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Option<String> {
 /// reaches for `repair`. It reads the state ledger, confirms the graph is in the
 /// applied revision, and returns `graph_root(id)`.
 ///
-/// `cluster` is a config directory or a storage-root URI (`s3://…`, config-free),
-/// mirroring the server's `--cluster` dispatch.
+/// `cluster` is a config directory or a storage-root URI (`s3://…` or
+/// `az://…`, config-free), mirroring the server's `--cluster` dispatch.
 pub async fn resolve_graph_storage_uri(
     cluster: &str,
     graph_id: &str,
@@ -468,12 +475,32 @@ mod tests {
             cluster_root_of_graph_layout("s3://bucket/prefix/graphs/kb.omni").as_deref(),
             Some("s3://bucket/prefix")
         );
+        assert_eq!(
+            cluster_root_of_graph_layout("az://container/prefix/graphs/kb.omni").as_deref(),
+            Some("az://container/prefix")
+        );
         assert_eq!(cluster_root_of_graph_layout("./kb.omni"), None);
         assert_eq!(cluster_root_of_graph_layout("s3://bucket/kb.omni"), None);
+        assert_eq!(cluster_root_of_graph_layout("az://container/kb.omni"), None);
         // nested id under graphs/ is not the cluster layout
         assert_eq!(cluster_root_of_graph_layout("/c/graphs/a/b.omni"), None);
         // not a .omni graph
         assert_eq!(cluster_root_of_graph_layout("/c/graphs/kb"), None);
+    }
+
+    #[tokio::test]
+    async fn config_free_serving_rejects_unknown_storage_schemes() {
+        let diagnostics = read_serving_snapshot_from_storage(
+            "https://account.blob.core.windows.net/container/cluster",
+        )
+        .await
+        .expect_err("an Azure HTTPS alias must not fall through to local storage");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "storage_root_invalid"),
+            "{diagnostics:?}"
+        );
     }
 
     #[tokio::test]
@@ -484,18 +511,42 @@ mod tests {
         let graph_uri = format!("{}/graphs/kb.omni", root.to_string_lossy());
 
         // No __cluster/state.json yet → not a cluster.
-        assert_eq!(cluster_root_for_graph_uri(&graph_uri).await, None);
+        assert_eq!(cluster_root_for_graph_uri(&graph_uri).await.unwrap(), None);
 
         // Lay down the state ledger → now it's a cluster-managed location.
         std::fs::create_dir_all(root.join("__cluster")).unwrap();
         std::fs::write(root.join(CLUSTER_STATE_FILE), "{}").unwrap();
-        let detected = cluster_root_for_graph_uri(&graph_uri).await;
+        let detected = cluster_root_for_graph_uri(&graph_uri).await.unwrap();
         assert!(detected.is_some(), "expected cluster root to be detected");
 
         // A non-cluster-shaped target never probes and is always None.
         assert_eq!(
-            cluster_root_for_graph_uri(&format!("{}/plain.omni", root.to_string_lossy())).await,
+            cluster_root_for_graph_uri(&format!("{}/plain.omni", root.to_string_lossy()))
+                .await
+                .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn cluster_root_probe_rejects_unsupported_shaped_uri() {
+        let error = cluster_root_for_graph_uri(
+            "https://account.blob.core.windows.net/container/graphs/kb.omni",
+        )
+        .await
+        .expect_err("an unsupported storage scheme must not mean not-a-cluster");
+        assert_eq!(error.code, "storage_root_invalid");
+    }
+
+    #[tokio::test]
+    async fn cluster_root_probe_keeps_local_enotdir_loud() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("__cluster"), "not a directory").unwrap();
+        let graph_uri = format!("{}/graphs/kb.omni", temp.path().to_string_lossy());
+
+        let error = cluster_root_for_graph_uri(&graph_uri)
+            .await
+            .expect_err("an inconclusive state-ledger probe must not mean not-a-cluster");
+        assert_eq!(error.code, "cluster_state_probe_error");
     }
 }

@@ -1,0 +1,293 @@
+name: Omnigraph Package
+
+# Local copy of the formerly shared ModernRelay packaging workflow. Keep the
+# CodeBuild, S3 artifact, ECR digest, manifest, and provenance contracts intact;
+# this repository owns the exact binary set required by its Dockerfile.
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+      source_ref:
+        required: true
+        type: string
+      omnigraph_ecr_repository:
+        required: false
+        type: string
+        default: omnigraph-server
+      features:
+        description: Space-separated list of Cargo features to pass to `cargo build --features`. Leave empty for the default build.
+        required: false
+        type: string
+        default: ""
+      image_tag_suffix:
+        description: Suffix appended to the image tag (and release artifact name) to distinguish feature-enabled builds, e.g. `-aws`. Must be empty or start with `-`.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      AWS_REGION:
+        required: true
+      AWS_ROLE_TO_ASSUME:
+        required: true
+      AWS_CODEBUILD_PACKAGE_PROJECT:
+        required: true
+      AWS_ARTIFACT_BUCKET:
+        required: true
+
+jobs:
+  codebuild_package:
+    name: Package via CodeBuild (AL2023)
+    # Compile, archive, Docker build, and ECR push all happen in CodeBuild.
+    # This runner only prepares the source, starts the build, and attests its
+    # exact returned artifacts.
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_CODEBUILD_PACKAGE_PROJECT: ${{ secrets.AWS_CODEBUILD_PACKAGE_PROJECT }}
+      AWS_ARTIFACT_BUCKET: ${{ secrets.AWS_ARTIFACT_BUCKET }}
+      OMNIGRAPH_ECR_REPOSITORY: ${{ inputs.omnigraph_ecr_repository }}
+      OMNIGRAPH_FEATURES: ${{ inputs.features }}
+      OMNIGRAPH_IMAGE_TAG_SUFFIX: ${{ inputs.image_tag_suffix }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+
+      - name: Resolve source commit
+        id: source_commit
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "prefix=builds/$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create source bundle
+        id: source_bundle
+        env:
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+          BUNDLE_PATH: ${{ runner.temp }}/omnigraph-source.zip
+          BUILDSPEC_PATH: ${{ runner.temp }}/buildspec.generated.yml
+        run: |
+          cat > "${BUILDSPEC_PATH}" <<'YAML'
+          version: 0.2
+
+          env:
+            shell: bash
+
+          phases:
+            install:
+              commands:
+                - set -euo pipefail
+                - dnf install -y clang gcc gcc-c++ make protobuf-compiler protobuf-devel tar gzip
+                - curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
+                - source "$HOME/.cargo/env"
+                - rustc --version
+                - cargo --version
+            pre_build:
+              commands:
+                - set -euo pipefail
+                - source "$HOME/.cargo/env"
+                - cargo fetch --locked
+            build:
+              commands:
+                # CodeBuild runs each command in a fresh shell. Keep the build
+                # and publish phase in one block so intermediate state survives.
+                - |
+                  set -euo pipefail
+                  source "$HOME/.cargo/env"
+
+                  test -n "${OMNIGRAPH_SOURCE_VERSION:-}"
+                  test -n "${OMNIGRAPH_ECR_REPOSITORY:-}"
+                  test -n "${OMNIGRAPH_ARTIFACT_BUCKET:-}"
+
+                  tag_suffix="${OMNIGRAPH_IMAGE_TAG_SUFFIX:-}"
+                  image_tag="${OMNIGRAPH_SOURCE_VERSION}${tag_suffix}"
+                  archive_name="omnigraph-linux-x86_64${tag_suffix}.tar.gz"
+                  sums_name="SHA256SUMS${tag_suffix}"
+                  image_json_name="image${tag_suffix}.json"
+
+                  features_arg=""
+                  if [ -n "${OMNIGRAPH_FEATURES:-}" ]; then
+                    features_arg="--features ${OMNIGRAPH_FEATURES}"
+                  fi
+                  echo "Building Omnigraph with features='${OMNIGRAPH_FEATURES:-}' tag_suffix='${tag_suffix}' image_tag='${image_tag}'"
+                  cargo build --release --locked \
+                    -p omnigraph-cli \
+                    -p omnigraph-server \
+                    -p omnigraph-azure-admission \
+                    $features_arg
+
+                  mkdir -p release
+                  install -m 0755 target/release/omnigraph release/omnigraph
+                  install -m 0755 target/release/omnigraph-server release/omnigraph-server
+                  install -m 0755 target/release/omnigraph-azure-admission release/omnigraph-azure-admission
+                  tar -C release -czf "release/${archive_name}" omnigraph omnigraph-server omnigraph-azure-admission
+                  (cd release && sha256sum "${archive_name}" > "${sums_name}")
+
+                  account_id="$(aws sts get-caller-identity --query Account --output text)"
+                  registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                  image_uri="${registry}/${OMNIGRAPH_ECR_REPOSITORY}"
+
+                  aws ecr get-login-password --region "${AWS_REGION}" \
+                    | docker login --username AWS --password-stdin "${registry}"
+                  docker build -t "${image_uri}:${image_tag}" .
+                  docker push "${image_uri}:${image_tag}"
+
+                  image_digest=""
+                  for _ in $(seq 1 10); do
+                    image_digest="$(aws ecr describe-images \
+                      --repository-name "${OMNIGRAPH_ECR_REPOSITORY}" \
+                      --image-ids imageTag="${image_tag}" \
+                      --query 'imageDetails[0].imageDigest' \
+                      --output text 2>/dev/null || true)"
+                    if [ -n "${image_digest}" ] && [ "${image_digest}" != "None" ]; then
+                      break
+                    fi
+                    sleep 3
+                  done
+                  test -n "${image_digest}"
+
+                  image_ref="${image_uri}@${image_digest}"
+                  artifact_prefix="s3://${OMNIGRAPH_ARTIFACT_BUCKET}/builds/${OMNIGRAPH_SOURCE_VERSION}"
+                  printf '{"source_sha":"%s","image_ref":"%s","image_digest":"%s","artifact_prefix":"%s","features":"%s","image_tag_suffix":"%s"}\n' \
+                    "${OMNIGRAPH_SOURCE_VERSION}" "${image_ref}" "${image_digest}" "${artifact_prefix}" "${OMNIGRAPH_FEATURES:-}" "${tag_suffix}" \
+                    > "release/${image_json_name}"
+
+                  aws s3 cp "release/${image_json_name}" "${artifact_prefix}/${image_json_name}"
+                  aws s3 cp "release/${archive_name}" "${artifact_prefix}/${archive_name}"
+                  aws s3 cp "release/${sums_name}" "${artifact_prefix}/${sums_name}"
+          YAML
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import zipfile
+
+          bundle_path = os.environ["BUNDLE_PATH"]
+          buildspec_path = os.environ["BUILDSPEC_PATH"]
+          files = subprocess.check_output(["git", "ls-files", "-z"], text=False).decode().split("\0")
+          with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for path in files:
+                  if path:
+                      archive.write(path, arcname=path)
+              archive.write(buildspec_path, arcname="buildspec.generated.yml")
+          PY
+          source_key="sources/${SOURCE_SHA}/omnigraph-source.zip"
+          echo "path=${BUNDLE_PATH}" >> "$GITHUB_OUTPUT"
+          echo "key=${source_key}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload source bundle
+        run: |
+          aws s3 cp \
+            "${{ steps.source_bundle.outputs.path }}" \
+            "s3://${AWS_ARTIFACT_BUCKET}/${{ steps.source_bundle.outputs.key }}"
+
+      - name: Start CodeBuild package job
+        id: start
+        run: |
+          build_id="$(aws codebuild start-build \
+            --project-name "${AWS_CODEBUILD_PACKAGE_PROJECT}" \
+            --source-type-override S3 \
+            --source-location-override "${AWS_ARTIFACT_BUCKET}/${{ steps.source_bundle.outputs.key }}" \
+            --buildspec-override buildspec.generated.yml \
+            --environment-variables-override \
+              name=OMNIGRAPH_SOURCE_VERSION,value="${{ steps.source_commit.outputs.sha }}",type=PLAINTEXT \
+              name=OMNIGRAPH_ECR_REPOSITORY,value="${OMNIGRAPH_ECR_REPOSITORY}",type=PLAINTEXT \
+              name=OMNIGRAPH_ARTIFACT_BUCKET,value="${AWS_ARTIFACT_BUCKET}",type=PLAINTEXT \
+              name=OMNIGRAPH_FEATURES,value="${OMNIGRAPH_FEATURES}",type=PLAINTEXT \
+              name=OMNIGRAPH_IMAGE_TAG_SUFFIX,value="${OMNIGRAPH_IMAGE_TAG_SUFFIX}",type=PLAINTEXT \
+            --query 'build.id' \
+            --output text)"
+          echo "build_id=${build_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for CodeBuild completion
+        run: |
+          build_id="${{ steps.start.outputs.build_id }}"
+          while true; do
+            status="$(aws codebuild batch-get-builds --ids "${build_id}" --query 'builds[0].buildStatus' --output text)"
+            echo "CodeBuild status: ${status}"
+            case "${status}" in
+              SUCCEEDED)
+                exit 0
+                ;;
+              FAILED|FAULT|STOPPED|TIMED_OUT)
+                aws codebuild batch-get-builds --ids "${build_id}" --query 'builds[0].logs.deepLink' --output text
+                exit 1
+                ;;
+            esac
+            sleep 15
+          done
+
+      - name: Download packaged release artifacts
+        env:
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+          RELEASE_DIR: ${{ runner.temp }}/release
+          TAG_SUFFIX: ${{ inputs.image_tag_suffix }}
+        run: |
+          mkdir -p "${RELEASE_DIR}"
+          base_uri="s3://${AWS_ARTIFACT_BUCKET}/builds/${SOURCE_SHA}"
+          aws s3 cp "${base_uri}/image${TAG_SUFFIX}.json" "${RELEASE_DIR}/image${TAG_SUFFIX}.json"
+          aws s3 cp "${base_uri}/omnigraph-linux-x86_64${TAG_SUFFIX}.tar.gz" "${RELEASE_DIR}/omnigraph-linux-x86_64${TAG_SUFFIX}.tar.gz"
+          aws s3 cp "${base_uri}/SHA256SUMS${TAG_SUFFIX}" "${RELEASE_DIR}/SHA256SUMS${TAG_SUFFIX}"
+
+      - name: Validate release manifest
+        env:
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+          RELEASE_DIR: ${{ runner.temp }}/release
+          TAG_SUFFIX: ${{ inputs.image_tag_suffix }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          source_sha = os.environ["SOURCE_SHA"]
+          release_dir = Path(os.environ["RELEASE_DIR"])
+          tag_suffix = os.environ.get("TAG_SUFFIX", "")
+          payload = json.loads((release_dir / f"image{tag_suffix}.json").read_text())
+          required = ["source_sha", "image_ref", "image_digest", "artifact_prefix"]
+          missing = [key for key in required if not payload.get(key)]
+          if missing:
+              raise SystemExit(f"image.json missing required keys: {missing}")
+          if payload["source_sha"] != source_sha:
+              raise SystemExit(
+                  f"image.json source_sha mismatch: {payload['source_sha']} != {source_sha}"
+              )
+          if not payload["image_ref"].endswith(payload["image_digest"]):
+              raise SystemExit("image_ref is not pinned to image_digest")
+          expected_prefix = f"s3://{os.environ['AWS_ARTIFACT_BUCKET']}/builds/{source_sha}"
+          if payload["artifact_prefix"] != expected_prefix:
+              raise SystemExit(
+                  f"artifact_prefix mismatch: {payload['artifact_prefix']} != {expected_prefix}"
+              )
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          PY
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/image${{ inputs.image_tag_suffix }}.json
+            ${{ runner.temp }}/release/omnigraph-linux-x86_64${{ inputs.image_tag_suffix }}.tar.gz
+            ${{ runner.temp }}/release/SHA256SUMS${{ inputs.image_tag_suffix }}
+
+      - name: Print CodeBuild logs link
+        if: always()
+        run: |
+          aws codebuild batch-get-builds \
+            --ids "${{ steps.start.outputs.build_id }}" \
+            --query 'builds[0].logs.deepLink' \
+            --output text

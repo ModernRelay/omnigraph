@@ -108,7 +108,7 @@ impl Drop for StateLockGuard {
                     let _ = std::fs::remove_file(path);
                 }
             }
-            StorageKind::S3 => {
+            StorageKind::S3 | StorageKind::Azure => {
                 let adapter = Arc::clone(&self.adapter);
                 let uri = self.uri.clone();
                 let lock_id = self.lock_id().to_string();

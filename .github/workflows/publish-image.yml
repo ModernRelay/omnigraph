@@ -64,7 +64,11 @@ jobs:
             apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
             # --features omnigraph-server/aws: include the AWS Secrets Manager
             # bearer-token source so one public image serves both token modes.
-            cargo build --release --locked -p omnigraph-cli -p omnigraph-server --features omnigraph-server/aws
+            cargo build --release --locked \
+              -p omnigraph-cli \
+              -p omnigraph-server \
+              -p omnigraph-azure-admission \
+              --features omnigraph-server/aws
           '
 
       - name: Log in to GHCR
@@ -77,6 +81,12 @@ jobs:
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           image="ghcr.io/${owner}/omnigraph-server"
           docker build -t "${image}:${RELEASE_TAG}" .
+          docker run --rm --entrypoint /usr/local/bin/omnigraph \
+            "${image}:${RELEASE_TAG}" version
+          docker run --rm --entrypoint /usr/local/bin/omnigraph-server \
+            "${image}:${RELEASE_TAG}" --help >/dev/null
+          docker run --rm --entrypoint /usr/local/bin/omnigraph-azure-admission \
+            "${image}:${RELEASE_TAG}" --help >/dev/null
           docker push "${image}:${RELEASE_TAG}"
 
           # Move `latest` only on real tag pushes — a dispatch backfill of an

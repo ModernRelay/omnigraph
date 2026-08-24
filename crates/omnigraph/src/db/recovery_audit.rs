@@ -192,6 +192,7 @@ async fn create_recoveries_dataset(root_uri: &str) -> Result<Dataset> {
     let control_session = crate::lance_access::control_session();
     let params = WriteParams {
         mode: WriteMode::Create,
+        store_params: Some(crate::storage::lance_store_params_for_uri(&uri)?),
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
         auto_cleanup: None,

@@ -8,6 +8,7 @@ VERSION="${VERSION:-}"
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR=""
 SELECTED_CHANNEL=""
+ADMISSION_INSTALLED=0
 
 log() {
   printf '==> %s\n' "$*"
@@ -86,6 +87,14 @@ install_from_dir() {
   mkdir -p "$INSTALL_DIR"
   install -m 0755 "$1/omnigraph" "$INSTALL_DIR/omnigraph"
   install -m 0755 "$1/omnigraph-server" "$INSTALL_DIR/omnigraph-server"
+  if [ -f "$1/omnigraph-azure-admission" ]; then
+    install -m 0755 "$1/omnigraph-azure-admission" "$INSTALL_DIR/omnigraph-azure-admission"
+    ADMISSION_INSTALLED=1
+  else
+    # Releases before native Azure support contain only the CLI and server.
+    rm -f "$INSTALL_DIR/omnigraph-azure-admission"
+    ADMISSION_INSTALLED=0
+  fi
 }
 
 verify_checksum() {
@@ -158,8 +167,17 @@ Installed:
 Verify:
   $INSTALL_DIR/omnigraph version
   $INSTALL_DIR/omnigraph-server --help
+EOF
+
+  if [ "$ADMISSION_INSTALLED" -eq 1 ]; then
+    cat <<EOF
+  $INSTALL_DIR/omnigraph-azure-admission
+
+Verify Azure admission:
+  $INSTALL_DIR/omnigraph-azure-admission --help
 
 EOF
+  fi
 
   if [ -n "$SELECTED_CHANNEL" ]; then
     printf 'Installed from release channel: %s\n' "$SELECTED_CHANNEL"

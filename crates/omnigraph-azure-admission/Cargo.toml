@@ -1,0 +1,30 @@
+[package]
+name = "omnigraph-azure-admission"
+version = "0.10.0"
+edition = "2024"
+description = "Azure Blob lease admission wrapper for OmniGraph deployments."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+publish = false
+
+[dependencies]
+base64 = { workspace = true }
+clap = { workspace = true }
+hmac = { workspace = true }
+httpdate = { workspace = true }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.10.0" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["process", "signal"] }
+
+[lints]
+workspace = true

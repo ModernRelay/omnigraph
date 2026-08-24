@@ -6,15 +6,19 @@ internal deploy automation.
 
 ## Runtime Modes
 
-Omnigraph supports two broad deployment shapes:
+Omnigraph supports these broad storage shapes:
 
 - local directory graphs
 - `s3://` graphs on AWS S3 or S3-compatible object stores
+- `az://` graphs on native Azure Blob Storage as a qualification preview, not a
+  production-supported deployment (code, Azurite validation, and the safe live
+  managed-identity smoke test are complete; adversarial qualification is
+  pending)
 
 The server binary and container image expose the same HTTP surface.
 
 The server has a single **boot source**: a **cluster directory**
-(`omnigraph-server --cluster <dir | s3://…>`), which serves the cluster control
+(`omnigraph-server --cluster <dir | s3://… | az://…>`), which serves the cluster control
 plane's applied revision — see
 [cluster-config.md](clusters/config.md#serving-from-the-cluster-the-mode-switch).
 
@@ -24,8 +28,14 @@ Build or install:
 
 - `omnigraph`
 - `omnigraph-server`
+- `omnigraph-azure-admission` (Unix process-admission wrapper for Azure
+  deployments)
 
-On Windows, the binaries are `omnigraph.exe` and `omnigraph-server.exe`.
+Starting with v0.10.0, Windows release archives also contain
+`omnigraph-azure-admission.exe` alongside `omnigraph.exe` and
+`omnigraph-server.exe`. Its `inspect` and `break` commands are portable, but
+child-process supervision through `run` is supported only in the Unix
+deployment images used by the reference topology.
 
 The server boots from a cluster only (RFC-011) — there is no positional
 `<URI>` / single-graph boot. Point it at a local cluster directory:
@@ -42,6 +52,27 @@ AWS_REGION="us-east-1" \
 omnigraph-server --cluster s3://my-bucket/clusters/company-brain \
   --bind 0.0.0.0:8080
 ```
+
+In an Azure environment that supplies the managed-identity endpoint and header,
+start an Azure-rooted server through the same admission wrapper used by every
+other writer:
+
+```bash
+OMNIGRAPH_SERVER_BEARER_TOKEN="change-me" \
+AZURE_STORAGE_ACCOUNT_NAME="companybrainprod" \
+AZURE_STORAGE_CLIENT_ID="<user-assigned-managed-identity-client-id>" \
+omnigraph-azure-admission run \
+  --mode server \
+  --root az://omnigraph/clusters/company-brain \
+  -- \
+  omnigraph-server --cluster az://omnigraph/clusters/company-brain \
+    --bind 0.0.0.0:8080
+```
+
+All mutation-capable Azure deployments must admit the server, bootstrap/apply,
+direct CLI data writes, and maintenance through
+`omnigraph-azure-admission`. The checked-in container entrypoint does this
+automatically for an `az://` `OMNIGRAPH_CLUSTER` or `--cluster` argument.
 
 The server serves every graph in the cluster's applied revision under
 `/graphs/{id}/...`. See [clusters](clusters/index.md) for authoring and
@@ -120,14 +151,57 @@ shape above) — the simplest AWS architecture.
    --as <you> --config /var/lib/omnigraph/cluster` → redeploy/restart the
    service.
 
+### Azure Container Apps
+
+> **Qualification status:** the implementation, packaging, Azurite integration,
+> reference infrastructure, and safe live managed-identity smoke test are
+> complete. Adversarial lease, concurrency, and termination qualification has
+> not yet been completed, so this remains a preview and not a
+> production-supported deployment.
+
+The checked-in [Azure reference deployment](../../deploy/azure/README.md)
+provisions a private Blob container, managed identity, ACR, Container Apps
+environment, one manual bootstrap/apply Job, and one HTTPS server app. Run its
+non-destructive validation before deployment:
+
+```bash
+deploy/azure/deploy.sh validate \
+  --bundle ./company-brain \
+  --server-image ghcr.io/modernrelay/omnigraph-server@sha256:<digest>
+```
+
+The deployment builds an immutable image containing the declared cluster
+bundle. It first runs a bounded, read-only managed-identity readiness phase,
+then runs validate/import/apply once under an infinite Blob admission lease,
+positively confirms lease release, and only then activates the server. Only the
+pre-acquire readiness phase may retry; an apply failure requires lease
+inspection and the recovery runbook. It uses managed identity and gives the
+application no storage account key.
+
+`minReplicas = maxReplicas = 1` is a sizing target, not the correctness fence:
+Azure can temporarily create another replica. The root-derived Blob lease is
+what prevents a second wrapped process from opening the cluster. Direct CLI
+writes that bypass the wrapper, unwrapped binaries, overlapping maintenance,
+and zero-downtime mutation serving are outside this topology. See the reference
+README for the explicit stuck-lease recovery runbook.
+
+Restart this writer with a deliberate stop-then-start, not
+`az containerapp revision restart`. Azure may overlap replicas during that
+command; the replacement then remains unready behind the old replica's lease.
+Deactivate the revision, confirm zero replicas and an unlocked lease, and only
+then reactivate it.
+
 ### Constraints (current honest list)
 
 - **No hot reload** — applied changes serve on the next restart.
-- **Single-writer apply** — run `cluster apply` from one place at a time
-  (the state lock enforces this; CI or one operator shell, not both).
-- **Multi-replica serving off a shared volume (EFS) is documented but
-  unvalidated** — boot is lock-free read-only so it should compose, but it
-  is not yet exercised by tests.
+- **Single writer** — the cluster state lock serializes `cluster apply`, but it
+  is not a graph-writer fence. Keep all mutation-capable servers, CLI writes,
+  apply jobs, and maintenance behind one external writer owner; the Azure
+  reference uses its cluster-wide Blob admission lease.
+- **No inferred multi-replica mutation serving** — a server may accept graph
+  writes after its read-only boot phase, so lock-free startup does not make
+  multiple replicas safe. A structurally read-only role and read-replica
+  topology require separate design and evidence.
 
 ## Testing against S3 locally
 
@@ -169,6 +243,30 @@ omnigraph-server --cluster s3://omnigraph-local/clusters/demo \
 The same `AWS_*` contract applies to a production object store — swap the
 endpoint and credentials. CI exercises this path against containerized RustFS.
 
+## Testing against Azure Blob locally
+
+Run the exact Azurite version used by CI, create a private test container, and
+select OmniGraph's captured emulator inputs:
+
+```bash
+docker run -d --name omnigraph-azurite -p 10000:10000 \
+  mcr.microsoft.com/azure-storage/azurite:3.35.0@sha256:647c63a91102a9d8e8000aab803436e1fc85fbb285e7ce830a82ee5d6661cf37 \
+  azurite-blob --blobHost 0.0.0.0 --blobPort 10000
+
+export AZURE_STORAGE_USE_EMULATOR=true
+export AZURE_STORAGE_ACCOUNT_NAME=devstoreaccount1
+export AZURITE_BLOB_STORAGE_URL=http://127.0.0.1:10000
+```
+
+Create the container with an Azure Blob client using Azurite's documented
+development account, then use `az://<container>/<prefix>` anywhere an
+object-storage graph or cluster root is accepted. CI sets
+`OMNIGRAPH_AZURE_TEST_CONTAINER=omnigraph-tests` and refuses a skipped Azure
+owner, so the emulator job cannot pass vacuously. OmniGraph converts this
+selection into one ordinary explicit HTTP endpoint containing the account path
+and passes the same immutable options to Lance and the control-object adapter;
+neither builder re-reads the emulator environment after capture.
+
 ## Container Deployment
 
 Pull the prebuilt public image (published for every `v*` release by
@@ -179,9 +277,13 @@ docker pull modernrelay/omnigraph-server:v0.9.0          # Docker Hub
 # or: docker pull ghcr.io/modernrelay/omnigraph-server:v0.9.0
 ```
 
-Or build it yourself:
+Or build the three Linux release binaries first, then assemble the runtime-only
+image. Run this on a Debian Bookworm-compatible Linux builder (the release
+workflow provides that environment):
 
 ```bash
+cargo build --release --locked \
+  -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission
 docker build -t omnigraph-server:local .
 ```
 
@@ -216,6 +318,11 @@ When no positional args are given, the image entrypoint
 | `OMNIGRAPH_CLUSTER` | Cluster boot source — a config directory or a storage-root URI, forwarded as `--cluster`. The only boot source. |
 | `OMNIGRAPH_BIND` | Listen address (default `0.0.0.0:8080`). |
 | `OMNIGRAPH_REQUIRE_ALL_GRAPHS` | When truthy, forwarded as `--require-all-graphs`: any graph-local quarantine or startup failure aborts cluster boot instead of serving the healthy subset. |
+| `OMNIGRAPH_AZURE_ADMISSION_GRACE_SECONDS` | Azure only: graceful child/process-group drain budget before the wrapper may release its exact lease (default `90`). Container Apps termination grace must be longer. |
+
+The Azure reference deployment uses a 90-second wrapper drain budget and a
+150-second Container Apps termination budget, leaving explicit time for lease
+release after the child group exits.
 
 Per-graph and server-level Cedar policy come from the cluster's applied
 revision (authored in `cluster.yaml` and published with `cluster apply`),
@@ -256,9 +363,10 @@ The server binary ships in two flavors:
 | **Default** (on-prem / local dev) | `cargo build --release` | Core server, no AWS SDK |
 | **AWS** | `cargo build --release --features aws` | Adds AWS Secrets Manager backend for bearer tokens |
 
-Tagged release archives contain the default `omnigraph` and
-`omnigraph-server` binaries on macOS / Linux, and `omnigraph.exe` plus
-`omnigraph-server.exe` on Windows. AWS-enabled server binaries are built from
+Starting with v0.10.0, tagged release archives contain the default `omnigraph`,
+`omnigraph-server`, and `omnigraph-azure-admission` binaries. The admission
+binary's child-supervision mode is supported only on Unix deployment images.
+AWS-enabled server binaries are built from
 source with `cargo build --release --features aws -p omnigraph-server` when
 needed.
 

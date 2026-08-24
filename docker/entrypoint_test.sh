@@ -18,12 +18,24 @@ cat > "$work/bin/omnigraph-server" <<'EOF'
 #!/bin/sh
 echo "ARGS: $*"
 EOF
-chmod +x "$work/bin/omnigraph-server"
+cat > "$work/bin/omnigraph-azure-admission" <<'EOF'
+#!/bin/sh
+echo "ADMISSION: $*"
+EOF
+cat > "$work/bin/tini" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--" ]; then shift; fi
+exec "$@"
+EOF
+chmod +x "$work/bin/omnigraph-server" "$work/bin/omnigraph-azure-admission" "$work/bin/tini"
 
 # Run the real entrypoint with SERVER_BIN pointed at the stub.
 ep="$work/entrypoint.sh"
 sed "s#SERVER_BIN=\"/usr/local/bin/omnigraph-server\"#SERVER_BIN=\"$work/bin/omnigraph-server\"#" \
-  "$entrypoint" > "$ep"
+  "$entrypoint" \
+  | sed "s#ADMISSION_BIN=\"/usr/local/bin/omnigraph-azure-admission\"#ADMISSION_BIN=\"$work/bin/omnigraph-azure-admission\"#" \
+  | sed "s#TINI_BIN=\"/usr/bin/tini\"#TINI_BIN=\"$work/bin/tini\"#" \
+  > "$ep"
 
 fail=0
 check() {
@@ -61,6 +73,18 @@ check "explicit args passthrough" \
 got=$(OMNIGRAPH_CLUSTER="/var/lib/omnigraph/company-brain" OMNIGRAPH_BIND="0.0.0.0:8080" sh "$ep")
 check "CLUSTER only (Phase 5 mode switch)" \
   "ARGS: --cluster /var/lib/omnigraph/company-brain --bind 0.0.0.0:8080" "$got"
+
+got=$(OMNIGRAPH_CLUSTER="az://omnigraph/clusters/company-brain" OMNIGRAPH_BIND="0.0.0.0:8080" sh "$ep")
+check "Azure cluster enters admission before server" \
+  "ADMISSION: run --mode server --root az://omnigraph/clusters/company-brain --grace-seconds 90 -- $work/bin/omnigraph-server --cluster az://omnigraph/clusters/company-brain --bind 0.0.0.0:8080" "$got"
+
+got=$(sh "$ep" --cluster az://omnigraph/clusters/company-brain --bind 1.2.3.4:9)
+check "explicit Azure cluster enters admission before server" \
+  "ADMISSION: run --mode server --root az://omnigraph/clusters/company-brain --grace-seconds 90 -- $work/bin/omnigraph-server --cluster az://omnigraph/clusters/company-brain --bind 1.2.3.4:9" "$got"
+
+got=$(sh "$ep" --cluster=az://omnigraph/clusters/company-brain --bind 1.2.3.4:9)
+check "explicit equals-form Azure cluster enters admission before server" \
+  "ADMISSION: run --mode server --root az://omnigraph/clusters/company-brain --grace-seconds 90 -- $work/bin/omnigraph-server --cluster=az://omnigraph/clusters/company-brain --bind 1.2.3.4:9" "$got"
 
 # Exclusivity: OMNIGRAPH_CLUSTER refuses every combination, exit 64.
 for combo in "OMNIGRAPH_TARGET_URI=s3://b/g" "OMNIGRAPH_CONFIG=/etc/o.yaml" "OMNIGRAPH_TARGET=active"; do

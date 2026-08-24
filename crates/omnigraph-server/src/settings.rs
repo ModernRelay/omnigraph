@@ -16,11 +16,12 @@ pub(crate) async fn load_cluster_settings(
 ) -> Result<ServerConfig> {
     // `--cluster` accepts either a config directory (the ledger location is
     // resolved through cluster.yaml's `storage:` key) or a storage-root URI
-    // directly (`s3://bucket/prefix`) — config-free serving: the ledger and
+    // directly (`s3://bucket/prefix` or `az://container/prefix`) — config-free serving: the ledger and
     // catalog on the bucket ARE the deployment artifact.
-    // Any scheme-qualified argument (s3://, file://) is a storage root; a
+    // Any supported scheme-qualified argument (s3://, az://, file://) is a storage root; a
     // bare path is a config directory.
     let cluster_arg = cluster_dir.to_string_lossy();
+    let diagnostic_cluster = omnigraph::storage::redacted_storage_uri(cluster_arg.as_ref());
     let snapshot = if cluster_arg.contains("://") {
         omnigraph_cluster::read_serving_snapshot_from_storage(cluster_arg.as_ref()).await
     } else {
@@ -39,7 +40,7 @@ pub(crate) async fn load_cluster_settings(
             .join("\n  ");
         eyre!(
             "the cluster at '{}' is not ready to serve:\n  {details}",
-            cluster_dir.display()
+            diagnostic_cluster
         )
     })?;
     for diagnostic in &snapshot.diagnostics {
@@ -204,7 +205,7 @@ pub(crate) async fn load_cluster_settings(
 }
 
 /// RFC-011 cluster-only boot: the server serves exclusively from a
-/// cluster's applied revision (`--cluster <dir | s3://…>`). The legacy
+/// cluster's applied revision (`--cluster <dir | s3://… | az://…>`). The legacy
 /// omnigraph.yaml / `--target` / positional-URI single-graph boot paths
 /// were removed — a deployment serves from exactly one source.
 pub async fn load_server_settings(
@@ -215,7 +216,7 @@ pub async fn load_server_settings(
 ) -> Result<ServerConfig> {
     let Some(cluster_dir) = cli_cluster else {
         bail!(
-            "omnigraph-server boots from a cluster: pass --cluster <dir|s3://…> \
+            "omnigraph-server boots from a cluster: pass --cluster <dir|s3://…|az://…> \
              (the cluster's applied revision is the deployment artifact). The legacy \
              single-graph boot (positional <URI>, --target, --config omnigraph.yaml) \
              has been removed."
@@ -573,6 +574,21 @@ mod tests {
             error.to_string().contains("boots from a cluster"),
             "expected cluster-required error, got: {error}",
         );
+    }
+
+    #[tokio::test]
+    async fn server_settings_redact_cluster_uri_credentials() {
+        let secret = "TOPSECRET-SERVER-SAS";
+        let cluster = std::path::PathBuf::from(format!(
+            "az://omnigraph/clusters/company-brain?sv=2026-01-01&sig={secret}"
+        ));
+        let error = super::load_server_settings(Some(&cluster), None, false, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(secret));
+        assert!(error.contains("az://omnigraph/clusters/company-brain"));
+        assert!(error.contains("query redacted"));
     }
 
     #[test]

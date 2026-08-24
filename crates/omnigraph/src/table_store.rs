@@ -2210,6 +2210,7 @@ impl TableStore {
                 let control_session = crate::lance_access::control_session();
                 let params = WriteParams {
                     mode: WriteMode::Create,
+                    store_params: Some(crate::storage::lance_store_params_for_uri(dataset_uri)?),
                     enable_stable_row_ids: true,
                     data_storage_version: Some(LanceFileVersion::V2_2),
                     allow_external_blob_outside_bases: true,
@@ -3431,11 +3432,13 @@ impl TableStore {
             ));
         }
 
+        let store_params = crate::storage::lance_store_params_for_uri(dataset_uri)?;
         let dataset = CommitBuilder::new(dataset_uri)
             .use_stable_row_ids(true)
             .with_storage_format(LanceFileVersion::V2_2)
             .enable_v2_manifest_paths(true)
             .with_session(self.session.clone())
+            .with_store_params(store_params)
             .with_skip_auto_cleanup(true)
             .with_max_retries(0)
             .execute(staged.transaction)
@@ -3508,6 +3511,7 @@ impl TableStore {
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
         let params = WriteParams {
             mode: WriteMode::Create,
+            store_params: Some(crate::storage::lance_store_params_for_uri(dataset_uri)?),
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,
@@ -4210,6 +4214,7 @@ impl TableStore {
         let control_session = crate::lance_access::control_session();
         let params = WriteParams {
             mode: WriteMode::Create,
+            store_params: Some(crate::storage::lance_store_params_for_uri(dataset_uri)?),
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,

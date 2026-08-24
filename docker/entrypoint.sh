@@ -2,9 +2,45 @@
 set -eu
 
 SERVER_BIN="/usr/local/bin/omnigraph-server"
+ADMISSION_BIN="/usr/local/bin/omnigraph-azure-admission"
+TINI_BIN="/usr/bin/tini"
+admission_grace="${OMNIGRAPH_AZURE_ADMISSION_GRACE_SECONDS:-90}"
+
+exec_server() {
+  cluster_root=$1
+  shift
+  case "$cluster_root" in
+    az://*)
+      exec "$TINI_BIN" -- "$ADMISSION_BIN" run \
+        --mode server \
+        --root "$cluster_root" \
+        --grace-seconds "$admission_grace" \
+        -- "$SERVER_BIN" "$@"
+      ;;
+    *) exec "$SERVER_BIN" "$@" ;;
+  esac
+}
 
 if [ "$#" -gt 0 ]; then
-  exec "$SERVER_BIN" "$@"
+  explicit_cluster=""
+  want_cluster=0
+  for arg in "$@"; do
+    if [ "$want_cluster" -eq 1 ]; then
+      explicit_cluster=$arg
+      break
+    fi
+    if [ "$arg" = "--cluster" ]; then
+      want_cluster=1
+      continue
+    fi
+    case "$arg" in
+      --cluster=*)
+        explicit_cluster=${arg#--cluster=}
+        break
+        ;;
+    esac
+  done
+  exec_server "$explicit_cluster" "$@"
 fi
 
 bind="${OMNIGRAPH_BIND:-0.0.0.0:8080}"
@@ -22,7 +58,7 @@ if [ -n "${OMNIGRAPH_CLUSTER:-}" ]; then
     ""|0|false|FALSE) ;;
     *) set -- "$@" --require-all-graphs ;;
   esac
-  exec "$SERVER_BIN" "$@"
+  exec_server "${OMNIGRAPH_CLUSTER}" "$@"
 fi
 
 # URI comes from the env var (the positional arg wins over any config

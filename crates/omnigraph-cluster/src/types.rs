@@ -389,7 +389,8 @@ pub(crate) struct RawClusterConfig {
     /// Storage root URI for everything the cluster stores: the state
     /// ledger, catalog, sidecars, approvals, and derived graph roots.
     /// Absent ⇒ `file://<config-dir>` (the original layout, byte-compatible).
-    /// `s3://bucket/prefix` puts the whole cluster on object storage.
+    /// `s3://bucket/prefix` or `az://container/prefix` puts the whole cluster
+    /// on object storage.
     #[serde(default)]
     pub(crate) storage: Option<String>,
     #[serde(default)]

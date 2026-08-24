@@ -1,6 +1,6 @@
 //! Compatibility facade over the shared storage implementation.
 //!
-//! `omnigraph-storage` owns the only local/S3 implementation so lower
+//! `omnigraph-storage` owns the only local/S3/Azure implementation so lower
 //! control-plane crates do not depend back on the engine. This module keeps
 //! the v10 engine API intact: the public trait and constructors still return
 //! [`crate::error::Result`] / [`crate::error::OmniError`].
@@ -12,7 +12,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-pub use omnigraph_storage::{ListDirBounds, StorageKind, join_uri};
+pub use omnigraph_storage::{ListDirBounds, StorageKind, join_uri, redacted_storage_uri};
 
 #[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
@@ -123,6 +123,15 @@ impl ObjectStorageAdapter {
         })
     }
 
+    /// Azure Blob backend scoped to the container named in `root_uri`.
+    /// Authentication and endpoint selection come from the canonical Azure
+    /// environment snapshot shared with Lance dataset I/O.
+    pub fn azure_from_root_uri(root_uri: &str) -> Result<Self> {
+        Ok(Self {
+            inner: omnigraph_storage::ObjectStorageAdapter::azure_from_root_uri(root_uri)?,
+        })
+    }
+
     /// In-memory backend for tests and embedded experiments. Implements the
     /// full contract including true conditional updates.
     pub fn in_memory() -> Self {
@@ -223,15 +232,35 @@ impl StorageAdapter for ObjectStorageAdapter {
     }
 }
 
-pub fn storage_kind_for_uri(uri: &str) -> StorageKind {
-    omnigraph_storage::storage_kind_for_uri(uri)
+pub fn storage_kind_for_uri(uri: &str) -> Result<StorageKind> {
+    Ok(omnigraph_storage::storage_kind_for_uri(uri)?)
 }
 
 pub fn storage_for_uri(uri: &str) -> Result<Arc<dyn StorageAdapter>> {
-    match storage_kind_for_uri(uri) {
+    match storage_kind_for_uri(uri)? {
         StorageKind::Local => Ok(Arc::new(ObjectStorageAdapter::local())),
         StorageKind::S3 => Ok(Arc::new(ObjectStorageAdapter::s3_from_root_uri(uri)?)),
+        StorageKind::Azure => Ok(Arc::new(ObjectStorageAdapter::azure_from_root_uri(uri)?)),
     }
+}
+
+/// Exact Lance object-store parameters for one physical dataset URI.
+///
+/// Azure's public URI deliberately omits the storage account. Passing the
+/// canonical, process-captured selection explicitly keeps Lance's dataset
+/// client on the same account and endpoint as the control-object adapter.
+/// Local and S3 retain Lance's existing provider defaults.
+pub(crate) fn lance_store_params_for_uri(uri: &str) -> Result<lance::io::ObjectStoreParams> {
+    let mut params = lance::io::ObjectStoreParams::default();
+    if storage_kind_for_uri(uri)? == StorageKind::Azure {
+        let azure_root = omnigraph_storage::CanonicalAzureRoot::from_env(uri)?;
+        params.storage_options_accessor = Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_static_options(
+                azure_root.lance_storage_options()?,
+            ),
+        ));
+    }
+    Ok(params)
 }
 
 pub fn normalize_root_uri(uri: &str) -> Result<String> {

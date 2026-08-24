@@ -38,7 +38,7 @@ to ask questions, share feedback, and follow development.
 | **Built for fleets of agents** | Hundreds of agents enrich the graph on **parallel isolated branches**; changes are reviewed and merged safely, Git-style, across the whole graph. |
 | **Multimodal retrieval** | Graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** query runtime, for context assembly. |
 | **Security as code** | Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking. |
-| **Runs on your infrastructure** | Any S3-compatible object store: **on-prem via RustFS / MinIO**, or AWS S3 / R2 / GCS. VPC, on-prem, hybrid; your data never leaves your store. |
+| **Runs on your infrastructure** | Local storage or any S3-compatible object store (**RustFS / MinIO**, AWS S3 / R2 / GCS). Native Azure Blob support is available as a qualification preview; code, Azurite validation, and a live managed-identity smoke proof are complete, while adversarial qualification remains pending. VPC, on-prem, hybrid; your data never leaves your store. |
 | **Open, versioned storage** | [`Lance`](https://github.com/lance-format/lance) columnar format: branchable, time-travelable, with native blob-as-data (docs, images, video). |
 
 ## What you can build
@@ -134,8 +134,12 @@ policies:
 ```
 
 **2. Stand up your object store.** On-prem, run RustFS (or MinIO); Omnigraph
-writes [Lance](https://github.com/lance-format/lance) to it over the standard S3
-API. In the cloud, point the same `AWS_*` env at S3 / R2 / GCS instead.
+writes [Lance](https://github.com/lance-format/lance) over the standard S3 API.
+In the cloud, use S3 / R2 / GCS through `AWS_*`. Native `az://` roots are also
+available as a qualification preview. Every Azure writer, including
+`cluster apply` and the server, must use the checked-in admission wrapper;
+follow the [Azure deployment guide](docs/user/deployment.md#azure-container-apps)
+instead of running the bare commands below.
 
 **3. Converge and run.** `apply` creates each graph, applies its schema, and
 publishes queries and policies into the content-addressed catalog. It is
@@ -150,10 +154,11 @@ omnigraph cluster apply      # converge
 omnigraph-server --cluster company-brain --bind 0.0.0.0:8080
 ```
 
-See the [cluster guide](docs/user/clusters/index.md) for the day-2 loop
+The bare commands above describe local and S3 deployments. See the
+[cluster guide](docs/user/clusters/index.md) for the day-2 loop
 (edit → plan → apply → restart), approval gates for destructive changes, drift
 inspection, and recovery; the [deployment guide](docs/user/deployment.md) for
-containers, AWS/Railway, auth, and the full `AWS_*` contract.
+containers, AWS/Railway/Azure, auth, and the object-store environment contracts.
 
 ## Query and mutate
 
@@ -242,7 +247,8 @@ Notes:
 ## Workspace Crates
 
 - `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering (zero Lance dependency)
-- `crates/omnigraph-storage`: shared local/S3 control-object storage implementation and concrete backend handle
+- `crates/omnigraph-storage`: shared local/S3/Azure control-object storage implementation and concrete backend handle
+- `crates/omnigraph-azure-admission`: narrow Azure Blob lease wrapper for the single-writer reference deployment
 - `crates/omnigraph` (package `omnigraph-engine`): storage/runtime, branching, merge, change detection, query execution, and embeddings
 - `crates/omnigraph-policy`: Cedar policy compilation and enforcement
 - `crates/omnigraph-api-types`: shared HTTP wire DTOs used by both the server and the CLI

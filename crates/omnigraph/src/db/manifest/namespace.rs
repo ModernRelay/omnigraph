@@ -90,7 +90,7 @@ impl StagedTableNamespace {
         &self.table_id[0]
     }
 
-    fn table_uri(&self) -> String {
+    fn table_uri(&self) -> Result<String> {
         table_uri_for_path(&self.root_uri, &self.table_path, self.branch.as_deref())
     }
 
@@ -113,8 +113,9 @@ impl StagedTableNamespace {
         // A staged-table namespace opens a DATA table (its `table_uri` is the
         // per-table physical path), so its opens count in the data-table
         // bucket, not the internal/manifest one.
+        let table_uri = self.table_uri()?;
         crate::instrumentation::open_dataset(
-            &self.table_uri(),
+            &table_uri,
             crate::instrumentation::VersionResolution::Latest,
             None,
             crate::instrumentation::table_wrapper(),
@@ -200,7 +201,8 @@ impl LanceNamespace for BranchManifestNamespace {
             &self.root_uri,
             &entry.dataset_path,
             entry.native_dataset_branch.as_deref(),
-        );
+        )
+        .map_err(|e| namespace_internal_error(e.to_string()))?;
 
         Ok(DescribeTableResponse {
             table: Some(entry.type_key.clone()),
@@ -349,7 +351,9 @@ impl LanceNamespace for StagedTableNamespace {
             .open_head()
             .await
             .map_err(|e| namespace_internal_error(e.to_string()))?;
-        let table_uri = self.table_uri();
+        let table_uri = self
+            .table_uri()
+            .map_err(|e| namespace_internal_error(e.to_string()))?;
         Ok(DescribeTableResponse {
             table: Some(self.table_key().to_string()),
             namespace: Some(Vec::new()),
@@ -466,8 +470,14 @@ impl LanceNamespace for StagedTableNamespace {
             _ => ManifestNamingScheme::V2,
         };
         let control_session = crate::lance_access::control_session();
-        let (object_store, base_path, _) = DatasetBuilder::from_uri(self.table_uri())
+        let table_uri = self
+            .table_uri()
+            .map_err(|e| namespace_internal_error(e.to_string()))?;
+        let store_params = crate::storage::lance_store_params_for_uri(&table_uri)
+            .map_err(|e| namespace_internal_error(e.to_string()))?;
+        let (object_store, base_path, _) = DatasetBuilder::from_uri(&table_uri)
             .with_session(control_session)
+            .with_store_params(store_params)
             .build_object_store()
             .await
             .map_err(|e| namespace_internal_error(e.to_string()))?;

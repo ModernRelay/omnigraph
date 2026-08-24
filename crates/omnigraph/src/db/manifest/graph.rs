@@ -131,8 +131,10 @@ pub(super) async fn init_manifest_graph(
             OmniError::manifest_internal(format!("attach stamp metadata to init batch: {e}"))
         })?;
     let reader = RecordBatchIterator::new(vec![Ok(manifest_batch)], schema);
+    let manifest_path = manifest_uri(root);
     let params = WriteParams {
         mode: WriteMode::Create,
+        store_params: Some(crate::storage::lance_store_params_for_uri(&manifest_path)?),
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
         auto_cleanup: None,
@@ -140,7 +142,6 @@ pub(super) async fn init_manifest_graph(
         session: Some(Arc::clone(control_session)),
         ..Default::default()
     };
-    let manifest_path = manifest_uri(root);
     let dataset = Dataset::write(reader, &manifest_path, Some(params))
         .await
         .map_err(|e| ManifestInitError::ManifestCreateOutcomeUnknown(OmniError::storage(e)))?;
@@ -389,6 +390,7 @@ async fn create_empty_dataset(
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
     let params = WriteParams {
         mode: WriteMode::Create,
+        store_params: Some(crate::storage::lance_store_params_for_uri(uri)?),
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
         allow_external_blob_outside_bases: true,

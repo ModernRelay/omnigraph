@@ -12,6 +12,7 @@ $assetName = "omnigraph-windows-x86_64.zip"
 $assetStem = "omnigraph-windows-x86_64"
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("omnigraph-install-" + [System.Guid]::NewGuid().ToString("N"))
 $selectedChannel = ""
+$admissionInstalled = $false
 
 function Write-Log {
   param([string]$Message)
@@ -76,6 +77,16 @@ function Install-FromDirectory {
   New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
   Copy-Item -Path (Join-Path $SourceDir "omnigraph.exe") -Destination (Join-Path $InstallDir "omnigraph.exe") -Force
   Copy-Item -Path (Join-Path $SourceDir "omnigraph-server.exe") -Destination (Join-Path $InstallDir "omnigraph-server.exe") -Force
+  $sourceAdmission = Join-Path $SourceDir "omnigraph-azure-admission.exe"
+  $destinationAdmission = Join-Path $InstallDir "omnigraph-azure-admission.exe"
+  if (Test-Path $sourceAdmission) {
+    Copy-Item -Path $sourceAdmission -Destination $destinationAdmission -Force
+    $script:admissionInstalled = $true
+  } else {
+    # Releases before native Azure support contain only the CLI and server.
+    Remove-Item -Path $destinationAdmission -Force -ErrorAction SilentlyContinue
+    $script:admissionInstalled = $false
+  }
 }
 
 function Install-FromRelease {
@@ -120,6 +131,7 @@ function Install-FromRelease {
 function Print-Summary {
   $omnigraphPath = Join-Path $InstallDir "omnigraph.exe"
   $serverPath = Join-Path $InstallDir "omnigraph-server.exe"
+  $admissionPath = Join-Path $InstallDir "omnigraph-azure-admission.exe"
 
   Write-Host ""
   Write-Host "Installed:"
@@ -129,6 +141,12 @@ function Print-Summary {
   Write-Host "Verify:"
   Write-Host "  $omnigraphPath version"
   Write-Host "  $serverPath --help"
+  if ($admissionInstalled) {
+    Write-Host "  $admissionPath"
+    Write-Host ""
+    Write-Host "Verify Azure admission:"
+    Write-Host "  $admissionPath --help"
+  }
   Write-Host ""
 
   if ($selectedChannel -ne "") {

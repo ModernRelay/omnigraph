@@ -30,7 +30,7 @@ flowchart LR
     og[OmniGraph<br/>kernel]:::omnigraph
 
     cedar[Cedar policy<br/>engine]:::external
-    s3[Object store<br/>local FS / S3 / RustFS]:::store
+    s3[Object store<br/>local FS / S3-compatible / Azure Blob]:::store
 
     cli --> og
     http --> og
@@ -75,7 +75,7 @@ flowchart TB
     end
 
     subgraph object_store[Object store]
-        os[local FS · S3 · RustFS · MinIO]:::l1
+        os[local FS · S3 · RustFS · MinIO · Azure Blob]:::l1
     end
 
     CLIs -- "string + params" --> compiler
@@ -371,7 +371,8 @@ Throughout the docs, capabilities are split into:
 ## Workspace crates
 
 - `omnigraph-compiler` — schema and query grammars, catalog, IR, lowering, type checker, lint, migration planner, OpenAI-style embedding client.
-- `omnigraph-storage` — the shared local/S3 control-object storage implementation and concrete backend handle used below the engine/cluster split.
+- `omnigraph-storage` — the shared local/S3/Azure control-object storage implementation and concrete backend handle used below the engine/cluster split.
+- `omnigraph-azure-admission` — the narrow Azure Blob lease/process wrapper used by the Azure reference deployment; it is not a graph storage path.
 - `omnigraph` (engine; package `omnigraph-engine` — published on crates.io through 0.8.0, currently paused, see [versioning.md](versioning.md)) — the Lance-backed runtime: graph manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client.
 - `omnigraph-policy` — Cedar policy compilation and engine-facing enforcement.
 - `omnigraph-api-types` — shared HTTP wire DTOs used by the server and CLI.

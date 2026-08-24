@@ -53,17 +53,24 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     pub(crate) profile: Option<String>,
 
-    /// Address a single graph's storage directly: a `file://` /
-    /// `s3://` store URI. Explicit, ad-hoc direct access — bypasses any
-    /// server. Exclusive with a positional URI / `--server`.
+    /// Address a single graph's storage directly: a `file://`, `s3://`, or
+    /// `az://` store URI. Azure is a qualification preview: code, Azurite,
+    /// and a safe live managed-identity smoke are complete; adversarial
+    /// qualification remains pending.
+    /// Explicit, ad-hoc direct access — bypasses any server. Azure write
+    /// commands still require the root-scoped external admission wrapper.
+    /// Exclusive with a positional URI / `--server`.
     #[arg(long, global = true, value_name = "URI")]
     pub(crate) store: Option<String>,
 
     /// Address a cluster-managed graph's storage for maintenance:
     /// a cluster directory or storage-root URI — named via `clusters:` in
-    /// ~/.omnigraph/config.yaml, or a literal `file://`/`s3://` root. Pair
+    /// ~/.omnigraph/config.yaml, or a literal `file://`/`s3://`/`az://` root. Pair
     /// with `--graph <id>` to select the graph. Used by optimize / repair /
-    /// cleanup; exclusive with a positional URI / `--store` / `--server`.
+    /// cleanup. Azure is a qualification preview pending adversarial live
+    /// qualification, and its maintenance still requires the cluster-root
+    /// external admission wrapper. Exclusive with a positional URI / `--store` /
+    /// `--server`.
     #[arg(long, global = true, value_name = "DIR|URI")]
     pub(crate) cluster: Option<String>,
 
@@ -267,7 +274,9 @@ pub(crate) enum Command {
     Init {
         #[arg(long)]
         schema: PathBuf,
-        /// Graph URI (local path or s3://)
+        /// Graph URI (local path, s3://, or az://). Azure is a qualification
+        /// preview pending adversarial live qualification; initialization is
+        /// a write and requires the root-scoped external admission wrapper.
         uri: String,
         /// Replace orphan schema artifacts only after proving that the URI
         /// has no `__manifest`. Without this flag, init refuses a URI that

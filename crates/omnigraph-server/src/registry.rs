@@ -37,7 +37,7 @@ use crate::queries::QueryRegistry;
 pub struct GraphHandle {
     /// Registry key. In Cluster mode `key.tenant_id` is always `None`.
     pub key: GraphKey,
-    /// The URI the engine was opened from (`s3://...` or local path).
+    /// The URI the engine was opened from (`s3://...`, `az://...`, or local path).
     /// Stable for the engine's lifetime; surfaced in responses like
     /// `BranchCreateOutput.uri`.
     pub uri: String,

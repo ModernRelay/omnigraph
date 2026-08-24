@@ -1,6 +1,6 @@
 //! The cluster's storage layer: every stored byte (state ledger, lock,
 //! recovery sidecars, approval artifacts, catalog payloads) goes through the
-//! shared `StorageAdapter`, so `file://` and `s3://` are one code path
+//! shared `StorageAdapter`, so `file://`, `s3://`, and `az://` are one code path
 //! (RFC-006). Declared configuration — `cluster.yaml` and the schema/query/
 //! policy sources it references — deliberately does NOT live here: config is
 //! read from the operator's working tree (Terraform's config-local /
@@ -13,8 +13,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use omnigraph_storage::{
-    StorageAdapter, StorageHandle, StorageKind, storage_for_uri, storage_handle_for_uri,
-    storage_kind_for_uri,
+    StorageAdapter, StorageError, StorageHandle, StorageKind, normalize_root_uri,
+    redacted_storage_uri, storage_handle_for_uri, storage_kind_for_uri,
 };
 
 use crate::state_lock::{StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock};
@@ -31,7 +31,8 @@ pub(crate) struct ClusterStore {
     /// public adapter trait, callers cannot implement this handle.
     storage: StorageHandle,
     /// Normalized storage-root URI, no trailing slash: `file:///abs/dir`
-    /// (the default config-dir layout) or `s3://bucket/prefix`.
+    /// (the default config-dir layout), `s3://bucket/prefix`, or
+    /// `az://container/prefix`.
     root: String,
     /// What observations/diagnostics display for stored locations: the plain
     /// local path for `file://` roots (byte-compatible with the pre-store
@@ -66,31 +67,45 @@ impl ClusterStore {
     }
 
     /// An explicit `storage:` root. `file://` URIs and plain paths normalize
-    /// to the local backend; `s3://bucket/prefix` to the S3 backend (env-
-    /// driven credentials/endpoint — the same contract as graph storage).
+    /// to the local backend; `s3://bucket/prefix` and
+    /// `az://container/prefix` use their object-store backends (env-driven
+    /// credentials/endpoint — the same contract as graph storage).
     pub(crate) fn for_storage_root(root_uri: &str) -> Result<Self, Diagnostic> {
-        let trimmed = root_uri.trim_end_matches('/');
-        if storage_kind_for_uri(trimmed) == StorageKind::Local {
-            let path = trimmed.trim_start_matches("file://");
-            return Ok(Self::for_config_dir(Path::new(path)));
-        }
-        let storage = storage_handle_for_uri(trimmed).map_err(|err| {
+        let diagnostic_root = redacted_storage_uri(root_uri);
+        let normalized = normalize_root_uri(root_uri).map_err(|err| {
             Diagnostic::error(
                 "storage_root_invalid",
                 "storage",
-                format!("could not initialize storage for '{root_uri}': {err}"),
+                format!("could not initialize storage for '{diagnostic_root}': {err}"),
+            )
+        })?;
+        let kind = storage_kind_for_uri(&normalized).map_err(|err| {
+            Diagnostic::error(
+                "storage_root_invalid",
+                "storage",
+                format!("could not initialize storage for '{diagnostic_root}': {err}"),
+            )
+        })?;
+        if kind == StorageKind::Local {
+            return Ok(Self::for_config_dir(Path::new(&normalized)));
+        }
+        let storage = storage_handle_for_uri(&normalized).map_err(|err| {
+            Diagnostic::error(
+                "storage_root_invalid",
+                "storage",
+                format!("could not initialize storage for '{diagnostic_root}': {err}"),
             )
         })?;
         Ok(Self {
             adapter: storage.adapter(),
             storage,
-            root: trimmed.to_string(),
-            display_root: trimmed.to_string(),
+            root: normalized.clone(),
+            display_root: normalized,
         })
     }
 
     pub(crate) fn kind(&self) -> StorageKind {
-        storage_kind_for_uri(&self.root)
+        self.storage.kind()
     }
 
     fn uri(&self, relative: &str) -> String {
@@ -103,27 +118,37 @@ impl ClusterStore {
 
     /// Derived graph root for `<id>`: `<storage>/graphs/<id>.omni`. A plain
     /// local path for `file://` roots (byte-compatible, directly usable by
-    /// the engine); the S3 URI the engine opens natively otherwise.
+    /// the engine); the remote URI the engine opens natively otherwise.
     pub(crate) fn graph_root(&self, graph_id: &str) -> String {
         match self.kind() {
             StorageKind::Local => format!("{}/graphs/{graph_id}.omni", self.display_root),
-            StorageKind::S3 => format!("{}/graphs/{graph_id}.omni", self.root),
+            StorageKind::S3 | StorageKind::Azure => {
+                format!("{}/graphs/{graph_id}.omni", self.root)
+            }
         }
     }
 
-    /// Display-form storage root (plain local path for `file://`, URI for S3).
+    /// Display-form storage root (plain local path for `file://`, URI for
+    /// remote object stores).
     pub(crate) fn display_root(&self) -> &str {
         &self.display_root
     }
 
     /// Whether this root holds the cluster state ledger (`__cluster/state.json`)
     /// — i.e. is an actual cluster, not just any directory. Probed via the
-    /// adapter (`file://` or `s3://`), failures read as "not a cluster".
-    pub(crate) async fn has_state(&self) -> bool {
-        self.adapter
-            .exists(&self.uri(CLUSTER_STATE_FILE))
-            .await
-            .unwrap_or(false)
+    /// the backend (`file://`, `s3://`, or `az://`). Only a successful negative
+    /// probe means "not a cluster"; filesystem, transport, and authorization
+    /// failures stay loud so callers cannot bypass cluster ownership checks.
+    pub(crate) async fn has_state(&self) -> omnigraph_storage::Result<bool> {
+        match self.kind() {
+            StorageKind::Local => Path::new(&self.display_root)
+                .join(CLUSTER_STATE_FILE)
+                .try_exists()
+                .map_err(StorageError::from),
+            StorageKind::S3 | StorageKind::Azure => {
+                self.adapter.exists(&self.uri(CLUSTER_STATE_FILE)).await
+            }
+        }
     }
 
     /// `read_text_versioned`, returning None for a missing object (probed
@@ -221,7 +246,8 @@ impl ClusterStore {
     }
 
     /// Recursive prefix delete for graph roots (approved deletes). Idempotent;
-    /// S3 non-atomicity is tolerated by the delete protocol's retry shape.
+    /// Object-store non-atomicity is tolerated by the delete protocol's retry
+    /// shape.
     pub(crate) async fn delete_graph_root(&self, graph_uri: &str) -> Result<(), String> {
         self.adapter
             .delete_prefix(graph_uri)
@@ -232,17 +258,19 @@ impl ClusterStore {
     /// Existence probe for graph roots in sweep classification. A bare local
     /// path or any URI works — resolved through the same adapter machinery
     /// the engine uses.
-    pub(crate) async fn graph_root_exists(&self, graph_uri: &str) -> bool {
-        match storage_kind_for_uri(graph_uri) {
-            StorageKind::Local => Path::new(graph_uri.trim_start_matches("file://")).exists(),
-            StorageKind::S3 => match storage_for_uri(graph_uri) {
-                Ok(adapter) => !adapter
-                    .list_dir(graph_uri)
-                    .await
-                    .map(|entries| entries.is_empty())
-                    .unwrap_or(true),
-                Err(_) => false,
-            },
+    pub(crate) async fn graph_root_exists(
+        &self,
+        graph_uri: &str,
+    ) -> omnigraph_storage::Result<bool> {
+        match storage_kind_for_uri(graph_uri)? {
+            StorageKind::Local => Path::new(graph_uri.trim_start_matches("file://"))
+                .try_exists()
+                .map_err(StorageError::from),
+            // `exists` falls back from an exact-object HEAD to a recursive,
+            // bounded-to-the-first-result prefix listing. A partially deleted
+            // graph whose root contains only nested Lance objects therefore
+            // remains present, while list/authorization failures stay loud.
+            StorageKind::S3 | StorageKind::Azure => self.adapter.exists(graph_uri).await,
         }
     }
 
@@ -547,9 +575,10 @@ impl ClusterStore {
     /// (`expected_cas` = `sha256:<hex>` from the snapshot the command read);
     /// the physical swap is token-conditioned on a fresh read, so a writer
     /// that raced us between the fresh read and the put loses with
-    /// `state_cas_mismatch` — never a silent overwrite. On S3 the token is
-    /// the object's ETag and the put is conditional (If-Match); locally it
-    /// is a content token over the same temp+rename flow as before the port.
+    /// `state_cas_mismatch` — never a silent overwrite. On S3 and Azure the
+    /// token is the object's ETag and the put is conditional (If-Match);
+    /// locally it is a content token over the same temp+rename flow as before
+    /// the port.
     pub(crate) async fn write_state(
         &self,
         state: &ClusterState,

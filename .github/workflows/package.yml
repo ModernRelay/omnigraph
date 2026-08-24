@@ -9,8 +9,8 @@ name: Package
 #     AWS_ARTIFACT_BUCKET are set. Stored as secrets (not variables) so the
 #     AWS account ID embedded in the role ARN and bucket name stays masked in
 #     public workflow logs.
-#   - The shared workflow at ModernRelay/.github declares these as
-#     on.workflow_call.secrets (see fix/omnigraph-package-use-secrets).
+#   - The checked-in reusable workflow declares these as
+#     on.workflow_call.secrets.
 #
 # Each invocation produces two ECR tags per source commit:
 #   - <source_sha>         (default features)
@@ -28,7 +28,7 @@ on:
 jobs:
   package_default:
     name: Package default build
-    uses: ModernRelay/.github/.github/workflows/omnigraph-package.yml@fa42b9641a86884b3752a8659ff6daed79b6e777 # main
+    uses: ./.github/workflows/omnigraph-package.yml
     permissions:
       id-token: write
       contents: read
@@ -40,7 +40,7 @@ jobs:
 
   package_aws:
     name: Package aws-feature build
-    uses: ModernRelay/.github/.github/workflows/omnigraph-package.yml@fa42b9641a86884b3752a8659ff6daed79b6e777 # main
+    uses: ./.github/workflows/omnigraph-package.yml
     permissions:
       id-token: write
       contents: read

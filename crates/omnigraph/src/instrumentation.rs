@@ -26,7 +26,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
-use lance::io::{ObjectStoreParams, WrappingObjectStore};
+use lance::io::WrappingObjectStore;
 
 use crate::error::{OmniError, Result};
 use crate::storage::{ListDirBounds, StorageAdapter};
@@ -681,10 +681,11 @@ pub(crate) async fn open_dataset(
         .unwrap_or_else(crate::lance_access::control_session);
     builder = builder.with_session(session);
     if let Some(wrapper) = wrapper {
-        builder = builder.with_store_params(ObjectStoreParams {
-            object_store_wrapper: Some(wrapper),
-            ..Default::default()
-        });
+        let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
+        store_params.object_store_wrapper = Some(wrapper);
+        builder = builder.with_store_params(store_params);
+    } else {
+        builder = builder.with_store_params(crate::storage::lance_store_params_for_uri(uri)?);
     }
     builder.load().await.map_err(|error| match error {
         // Only the two shapes cleanup/drop legitimately leaves behind for a

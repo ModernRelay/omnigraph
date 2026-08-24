@@ -63,9 +63,21 @@ pub(crate) async fn sweep_graph_create_sidecar(
     // intent; retire it (deferred to the command's post-CAS cleanup, like
     // every other completed sidecar — a failed CAS simply re-sweeps it) and
     // let the command's own plan re-propose the create.
-    if !backend.graph_root_exists(&sidecar.graph_uri).await {
-        outcome.completed_sidecars.push(path);
-        return;
+    match backend.graph_root_exists(&sidecar.graph_uri).await {
+        Ok(false) => {
+            outcome.completed_sidecars.push(path);
+            return;
+        }
+        Ok(true) => {}
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                "cluster_recovery_storage_error",
+                graph_address,
+                format!("could not inspect interrupted graph create: {error}"),
+            ));
+            outcome.pending_graphs.insert(sidecar.graph_id);
+            return;
+        }
     }
 
     match Omnigraph::open_read_only(&sidecar.graph_uri).await {
@@ -317,17 +329,29 @@ pub(crate) async fn sweep_graph_delete_sidecar(
 ) {
     let graph_address = graph_address(&sidecar.graph_id);
 
-    if backend.graph_root_exists(&sidecar.graph_uri).await {
-        // Row 8: the delete never completed. Prefix removal is idempotent and
-        // works on partial roots, so the repair is simply the re-proposed,
-        // still-approved delete on a later run — retire the stale intent.
-        diagnostics.push(Diagnostic::warning(
-            "graph_delete_incomplete",
-            graph_address,
-            "a previous graph delete did not complete; it will be re-proposed by plan and can be retried under its approval",
-        ));
-        outcome.completed_sidecars.push(path);
-        return;
+    match backend.graph_root_exists(&sidecar.graph_uri).await {
+        Ok(true) => {
+            // Row 8: the delete never completed. Prefix removal is idempotent and
+            // works on partial roots, so the repair is simply the re-proposed,
+            // still-approved delete on a later run — retire the stale intent.
+            diagnostics.push(Diagnostic::warning(
+                "graph_delete_incomplete",
+                graph_address,
+                "a previous graph delete did not complete; it will be re-proposed by plan and can be retried under its approval",
+            ));
+            outcome.completed_sidecars.push(path);
+            return;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                "cluster_recovery_storage_error",
+                graph_address,
+                format!("could not inspect interrupted graph delete: {error}"),
+            ));
+            outcome.pending_graphs.insert(sidecar.graph_id);
+            return;
+        }
     }
 
     if !state

@@ -7857,6 +7857,7 @@ async fn open_lance_head_if_present(
         let control_session = crate::lance_access::control_session();
         match lance::dataset::builder::DatasetBuilder::from_uri(table_path)
             .with_session(control_session)
+            .with_store_params(crate::storage::lance_store_params_for_uri(table_path)?)
             .load()
             .await
         {

@@ -256,33 +256,46 @@ pub(crate) fn validate_cluster_header(
         }
     }
 
-    if let Some(storage) = raw.storage.as_deref() {
+    let storage_root = if let Some(storage) = raw.storage.as_deref() {
         let trimmed = storage.trim();
         if trimmed.is_empty() {
             diagnostics.push(Diagnostic::error(
                 "invalid_storage_root",
                 "storage",
-                "storage must be a non-empty URI (e.g. s3://bucket/prefix) when provided",
+                "storage must be a non-empty path or URI (for example s3://bucket/prefix or az://container/prefix) when provided",
             ));
-        } else if let Some(rest) = trimmed.strip_prefix("s3://") {
-            if rest.trim_start_matches('/').is_empty() {
-                diagnostics.push(Diagnostic::error(
-                    "invalid_storage_root",
-                    "storage",
-                    "storage s3:// URI must name a bucket",
-                ));
+            None
+        } else if trimmed
+            .strip_prefix("s3://")
+            .is_some_and(|rest| rest.trim_start_matches('/').is_empty())
+        {
+            diagnostics.push(Diagnostic::error(
+                "invalid_storage_root",
+                "storage",
+                "storage s3:// URI must name a bucket",
+            ));
+            None
+        } else {
+            let diagnostic_root = omnigraph_storage::redacted_storage_uri(trimmed);
+            match omnigraph_storage::normalize_root_uri(trimmed) {
+                Ok(root) => Some(root),
+                Err(err) => {
+                    diagnostics.push(Diagnostic::error(
+                        "invalid_storage_root",
+                        "storage",
+                        format!("invalid storage root '{diagnostic_root}': {err}"),
+                    ));
+                    None
+                }
             }
         }
-    }
+    } else {
+        None
+    };
 
     ClusterSettings {
         state_lock: raw.state.lock.unwrap_or(true),
-        storage_root: raw
-            .storage
-            .as_deref()
-            .map(str::trim)
-            .filter(|storage| !storage.is_empty())
-            .map(|storage| storage.trim_end_matches('/').to_string()),
+        storage_root,
     }
 }
 
@@ -322,38 +335,60 @@ pub(crate) async fn observe_declared_graphs(
         let graph_uri = backend.graph_root(&graph.id);
         let observed_at = now_rfc3339();
 
-        if !backend.graph_root_exists(&graph_uri).await {
-            state.applied_revision.resources.remove(&graph_address);
-            state.applied_revision.resources.remove(&schema_address);
-            state.observations.insert(
-                graph_address.clone(),
-                graph_observation_json(GraphObservationJson {
-                    address: &graph_address,
-                    graph_uri: &graph_uri,
-                    observed_at: &observed_at,
-                    exists: false,
-                    graph_manifest_version: None,
-                    schema_digest: None,
-                    desired_schema_digest: &graph.schema_digest,
-                    schema_matches_desired: Some(false),
-                    error: Some("derived graph root is missing"),
-                }),
-            );
-            set_resource_status(
-                state,
-                &graph_address,
-                ResourceLifecycleStatus::Drifted,
-                "graph_missing",
-                "derived graph root is missing",
-            );
-            set_resource_status(
-                state,
-                &schema_address,
-                ResourceLifecycleStatus::Drifted,
-                "graph_missing",
-                "derived graph root is missing",
-            );
-            continue;
+        match backend.graph_root_exists(&graph_uri).await {
+            Err(error) => {
+                graph_error_count += 1;
+                let message = format!("could not inspect derived graph root: {error}");
+                set_resource_status(
+                    state,
+                    &graph_address,
+                    ResourceLifecycleStatus::Error,
+                    "graph_observation_error",
+                    &message,
+                );
+                set_resource_status(
+                    state,
+                    &schema_address,
+                    ResourceLifecycleStatus::Error,
+                    "graph_observation_error",
+                    &message,
+                );
+                continue;
+            }
+            Ok(true) => {}
+            Ok(false) => {
+                state.applied_revision.resources.remove(&graph_address);
+                state.applied_revision.resources.remove(&schema_address);
+                state.observations.insert(
+                    graph_address.clone(),
+                    graph_observation_json(GraphObservationJson {
+                        address: &graph_address,
+                        graph_uri: &graph_uri,
+                        observed_at: &observed_at,
+                        exists: false,
+                        graph_manifest_version: None,
+                        schema_digest: None,
+                        desired_schema_digest: &graph.schema_digest,
+                        schema_matches_desired: Some(false),
+                        error: Some("derived graph root is missing"),
+                    }),
+                );
+                set_resource_status(
+                    state,
+                    &graph_address,
+                    ResourceLifecycleStatus::Drifted,
+                    "graph_missing",
+                    "derived graph root is missing",
+                );
+                set_resource_status(
+                    state,
+                    &schema_address,
+                    ResourceLifecycleStatus::Drifted,
+                    "graph_missing",
+                    "derived graph root is missing",
+                );
+                continue;
+            }
         }
 
         match observe_live_graph(&graph_uri).await {

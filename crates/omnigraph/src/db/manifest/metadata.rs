@@ -167,8 +167,8 @@ impl TableVersionMetadata {
     }
 }
 
-fn object_store_path_from_uri(uri: &str) -> Result<String> {
-    match storage_kind_for_uri(uri) {
+pub(super) fn object_store_path_from_uri(uri: &str) -> Result<String> {
+    match storage_kind_for_uri(uri)? {
         StorageKind::Local => {
             if uri.strip_prefix("file://").is_some() {
                 let path = url::Url::parse(uri)
@@ -186,9 +186,28 @@ fn object_store_path_from_uri(uri: &str) -> Result<String> {
         }
         StorageKind::S3 => {
             let url = url::Url::parse(uri).map_err(|e| {
-                OmniError::manifest_internal(format!("invalid s3 uri '{}': {}", uri, e))
+                OmniError::manifest_internal(format!(
+                    "invalid remote object-store uri '{}': {}",
+                    uri, e
+                ))
             })?;
             Ok(url.path().trim_start_matches('/').to_string())
+        }
+        StorageKind::Azure => {
+            let url = url::Url::parse(uri).map_err(|e| {
+                OmniError::manifest_internal(format!(
+                    "invalid remote object-store uri '{}': {}",
+                    uri, e
+                ))
+            })?;
+            object_store::path::Path::from_url_path(url.path())
+                .map(|path| path.to_string())
+                .map_err(|e| {
+                    OmniError::manifest_internal(format!(
+                        "invalid remote object-store path in '{}': {}",
+                        uri, e
+                    ))
+                })
         }
     }
 }

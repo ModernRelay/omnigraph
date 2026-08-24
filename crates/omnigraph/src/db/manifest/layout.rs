@@ -150,7 +150,11 @@ pub(super) fn table_id_to_key(request_id: Option<&Vec<String>>) -> lance_namespa
     }
 }
 
-pub(super) fn table_uri_for_path(root_uri: &str, table_path: &str, branch: Option<&str>) -> String {
+pub(super) fn table_uri_for_path(
+    root_uri: &str,
+    table_path: &str,
+    branch: Option<&str>,
+) -> Result<String> {
     let mut dataset_location = join_uri(root_uri, table_path);
     if let Some(branch) = branch.filter(|branch| *branch != "main") {
         dataset_location = join_uri(&dataset_location, "tree");
@@ -158,11 +162,11 @@ pub(super) fn table_uri_for_path(root_uri: &str, table_path: &str, branch: Optio
             dataset_location = join_uri(&dataset_location, segment);
         }
     }
-    match storage_kind_for_uri(root_uri) {
-        StorageKind::Local => url::Url::from_file_path(&dataset_location)
+    match storage_kind_for_uri(root_uri)? {
+        StorageKind::Local => Ok(url::Url::from_file_path(&dataset_location)
             .map(|uri| uri.to_string())
-            .unwrap_or(dataset_location),
-        StorageKind::S3 => dataset_location,
+            .unwrap_or(dataset_location)),
+        StorageKind::S3 | StorageKind::Azure => Ok(dataset_location),
     }
 }
 

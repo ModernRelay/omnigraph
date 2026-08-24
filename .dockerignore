@@ -3,3 +3,4 @@
 !docker/entrypoint.sh
 !target/release/omnigraph-server
 !target/release/omnigraph
+!target/release/omnigraph-azure-admission
