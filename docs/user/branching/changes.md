@@ -1,143 +1,113 @@
-# Change Detection / Diff
+# Changes and Change Feeds
 
-Diffing two read targets uses a three-level algorithm:
+OmniGraph can describe what one commit changed or deliver an ordered feed of
+changes on a branch. Both surfaces report logical nodes and edges, not storage
+details.
 
-1. **Graph-manifest diff**: skip datasets whose legacy `(table_version, table_branch)` fields are unchanged.
-2. **Lineage check**:
-   - Same branch lineage → fast path: use the per-row `_row_last_updated_at_version` column to classify Insert/Update/Delete.
-   - Different lineages → ID-based streaming comparison.
-3. **Entity-level diff**: streaming, no full materialization.
+## Inspect one commit
 
-## Public API
-
-- `diff_between(from: ReadTarget, to: ReadTarget, filter: Option<ChangeFilter>) -> ChangeSet`
-- `diff_commits(from_commit_id, to_commit_id, filter)` — cross-branch safe.
-
-## Types
-
-```
-ChangeOp: Insert | Update | Delete
-EntityKind: Node | Edge
-EntityChange { kind, type_name, id, op, published_dataset_version, endpoints?: {src, dst} }
-ChangeFilter { kinds?, type_names?, ops? }
-ChangeSet { from_graph_manifest_version, to_graph_manifest_version, graph_branch?, changes[], stats }
+```bash
+omnigraph commit changes <commit-id> --store graph.omni --json
 ```
 
-## Ordering
+The equivalent HTTP route is
+`GET /graphs/{graph_id}/commits/{commit_id}/changes`. The commit is compared
+with its first parent. Each response includes:
 
-Changed dataset lifetimes are grouped by entity kind and type name (edges before
-nodes), with immutable dataset identity as the hidden tie-breaker when one type
-name identifies multiple lifetimes across the compared snapshots. Entity order
-within one dataset is not a public guarantee; callers that need their own total
-order must sort the returned changes explicitly.
+- `cause`: the commit id, parent, optional merged parent, authored branch,
+  optional actor, and authorship time in Unix microseconds.
+- `changes`: inserts with `after`, updates with `before` and `after`,
+  and deletes with `before`. Each image contains `properties`; an edge image
+  also contains `endpoints: {from, to}`.
 
-## Commit changes: exact per-commit entity diffs
+Filter with repeatable `--kind node|edge`, `--type <name>`, and
+`--op insert|update|delete` options. `--limit` defaults to 1,000 and may be
+at most 8,192. Results are deterministic by entity kind, type identity, logical
+id, and operation.
 
-`GET /graphs/{graph_id}/commits/{commit_id}/changes` (CLI:
-`omnigraph commit changes <commit_id>`, SDK: `commit_changes_page`) returns
-the entity changes one commit made **relative to its first parent**, in graph
-vocabulary only:
+Large results are paginated. The CLI normally follows every
+`next_page_token`; passing `--page-token` fetches exactly one page. A page
+token continues that one commit result and is not a change-feed cursor.
 
-- One **cause** per block: `graph_commit_id`, `parent_commit_id`,
-  `merged_parent_commit_id` (merge commits are diffed against their first
-  parent; the merged parent rides along for DAG-aware callers),
-  `authored_branch` (the branch the commit originally landed on), `actor_id`,
-  and `authored_at` — authorship time in Unix epoch microseconds, minted
-  before dataset effects and stable across retries. It is deliberately not a
-  commit or publication timestamp.
-- Changes carry `kind` (node | edge), `type` (`id` — an opaque graph type
-  identity that survives a supported rename and changes after drop/re-add —
-  plus `name`), the logical `id`, `op`, and exact logical images: an insert
-  has only `after`, an update exact `before` **and** `after`, a delete only
-  `before`. Edge images embed `endpoints: {from, to}` per image.
-- No response ever exposes backing datasets, incarnations, physical versions,
-  fragments, or row addresses.
+A parentless commit returns `409` with reason `parentless_commit`. A diff
+that crosses a schema boundary returns `409` with reason
+`schema_boundary`; take a new baseline instead of treating either response
+as an empty change.
 
-Order within a block is frozen: nodes before edges, then opaque type
-identity, then `id`, then operation rank (insert < update < delete). Physical
-no-ops — rewrites of identical values, compaction moving data — never surface
-as changes; a physical-only commit (for example `optimize`) is an **empty
-block**.
+## Follow a branch
 
-Large blocks paginate: a page carries `next_page_token` until the block is
-complete. The token continues *that bounded response only* — it is never a
-feed cursor — and binds the exact commit and filter scope. Filters
-(`kind`, `type`, `op`; all repeatable) select graph concepts only; unknown
-query parameters are rejected with 400.
+```bash
+# Start at the current head. Existing history is not replayed.
+omnigraph changes poll --start now --store graph.omni --json
 
-The CLI auto-consumes those pages without rebuilding one in-memory result:
-JSON keeps one output array open and human output prints each change before the
-next page is fetched. `--page-token` instead fetches and prints exactly one raw
-page. If a later auto-pagination request fails, the command exits nonzero and
-stdout may contain the already-emitted prefix; redirect through a temporary
-file and rename it after exit 0 when an all-or-nothing output file is required.
-The embedded API exposes the bounded `commit_changes_page` primitive directly.
+# Replay the branch's first-parent history.
+omnigraph changes poll --start beginning --store graph.omni --json
 
-The parentless genesis commit has no diff (409, `parentless_commit`):
-bootstrap from a baseline instead. A commit whose parent/child pair crosses a
-schema change (a property add/drop rewriting a dataset, or dropping a type that
-still holds data) is refused (409, `schema_boundary`) rather than guessed —
-schema evolution is never synthesized into entity changes.
-
-## The change feed
-
-`GET /graphs/{graph_id}/changes` (CLI: `omnigraph changes poll`) streams
-those blocks in **first-parent order** along one branch:
-
-```
-omnigraph changes poll --start beginning --json      # replay history
-omnigraph changes poll --cursor <cursor> --json      # resume durably
+# Continue after a known commit, or resume from a saved cursor.
+omnigraph changes poll --start after:<commit-id> --store graph.omni --json
+omnigraph changes poll --cursor <cursor> --store graph.omni --json
 ```
 
-- The first request picks an explicit start: `now` (default — capture the
-  head, no replay), `beginning` (including inherited history on a named
-  branch), or `after:<commit_id>` (an exact commit on the branch's
-  first-parent chain). A missing cursor is never an implicit `beginning`.
-- Each poll captures the branch head as its **cut**; commits landing mid-poll
-  wait for the next poll. Empty blocks advance the feed.
-- The durable **cursor** appears only on a terminal page and only after
-  complete commits — a page that ends inside a block carries only
-  `next_page_token`, so a partial block can never be checkpointed. The CLI
-  consumes page tokens incrementally and prints the cursor only after the
-  terminal page; the embedded API returns one bounded page at a time.
-  `caught_up` on a terminal page says whether more complete commits already
-  wait. A later-page CLI failure can leave a partial stdout prefix but never
-  prints or advances the terminal cursor.
-- The server persists **no consumer state**: the cursor is opaque,
-  caller-owned, and valid from any handle or process. It binds the graph,
-  the branch and its incarnation (deleting and recreating a branch invalidates
-  its cursors), and the filter scope; any mismatch — or using a page token as
-  a cursor — is a typed 400 with the stable prefix `change cursor rejected:`.
-- Delivery is **at least once**: retrying a cursor may replay the complete
-  next commit. Apply blocks idempotently by `graph_commit_id` and persist the
-  cursor together with its blocks.
+`now` is the default when neither `--start` nor `--cursor` is supplied.
+Use `--branch` to follow a branch other than `main`. The same kind, type,
+operation filters, and `--limit` supported by `commit changes` are available
+here.
 
-## Change baselines
+Each poll captures a fixed branch head and returns complete commits in
+first-parent order. A commit with no logical entity changes may still appear
+as an empty block and advance the feed.
 
-A cursor is not a retention lease: `cleanup` may reclaim dataset versions a
-retained commit pins. When the feed can no longer continue contiguously it
-returns **410** with `change_feed_gap` (`cursor`,
-`first_unreadable_commit_id`); direct diffs of a reclaimed commit return the
-same gap. Retrying cannot succeed — recovery is the baseline handshake:
+The durable `cursor` appears only on the terminal page, after every returned
+commit block is complete. A page ending partway through a commit has only a
+`next_page_token`. On the terminal page, `caught_up` says whether the poll
+reached its captured head. The CLI consumes feed page tokens itself and prints
+the cursor only after reaching that terminal page.
 
+Delivery is at least once: retrying a cursor may replay the next complete
+commit. Apply each block idempotently by `graph_commit_id`, then persist the
+terminal cursor atomically with the applied blocks.
+
+Cursors are opaque and caller-owned; the server stores no consumer position.
+A cursor is bound to its graph, branch lifetime, and filter scope. Reusing it
+with a different scope, or using a page token as a cursor, returns `400`.
+
+The HTTP route is `GET /graphs/{graph_id}/changes`. Its `cursor`, `start`,
+and `page_token` parameters are mutually exclusive.
+
+## Recover from a retention gap
+
+A cursor does not prevent `cleanup` from reclaiming old history. When a feed
+or commit diff can no longer be read, the server returns `410` with
+`change_feed_gap`, including `first_unreadable_commit_id` and, when
+available, the rejected `cursor`. Retrying the same cursor cannot close the
+gap; install a new baseline:
+
+```bash
+omnigraph changes baseline --out snapshot.jsonl --store graph.omni --json
 ```
-omnigraph changes baseline --out snapshot.jsonl --json
+
+If a poll has already accumulated complete readable blocks before it reaches a
+gap, it first returns those blocks with `caught_up: false`; polling the
+returned cursor then produces the deterministic `410`.
+
+The HTTP equivalent is `POST /graphs/{graph_id}/changes/baseline`. Send `{}`
+for the default `main` scope or include branch and filter fields. The
+`application/x-ndjson` response streams an exact entity snapshot followed by
+one terminal record:
+
+```json
+{"baseline":{"snapshot_commit_id":"...","resume_cursor":"..."}}
 ```
 
-`POST /graphs/{graph_id}/changes/baseline` streams one exact data-only entity
-snapshot pinned at a coherently captured head, then exactly one terminal
-record `{"baseline": {snapshot_commit_id, resume_cursor}}`. The terminal
-record is sent only after every snapshot record succeeded, so an interrupted
-stream never yields a usable cursor. Install the snapshot durably **before**
-the cursor; a commit landing after the capture is the first block the resumed
-feed yields. A baseline is a full data export and requires the `export`
-policy action (the feed and commit diffs require `read`).
+An interrupted stream has no terminal record and therefore no usable cursor.
+Install the complete snapshot durably before saving `resume_cursor`; the
+resumed feed begins with commits after the captured snapshot.
 
-The snapshot honors the scope's `kind` and `type` filters; `op` binds only
-the resume cursor's feed scope.
+Baseline kind and type filters select the snapshot contents. An operation
+filter applies only to the resumed feed. Baselines require the `export`
+policy action; commit changes and feed polling require `read`.
 
-The CLI's durable `--out` installer is currently POSIX-only. It fails before
-capture on other platforms because the contract requires a file fsync,
-atomic replacement, and parent-directory fsync before printing the cursor;
-Windows needs a future write-through replacement implementation rather than a
-weaker success claim.
+The CLI's durable `--out` installation is available on POSIX platforms. The
+file contains only snapshot entity records, not the terminal handshake. The CLI
+syncs and atomically replaces it before printing
+`{"snapshot_commit_id":"...","resume_cursor":"..."}` to JSON stdout.

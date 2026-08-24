@@ -1,105 +1,117 @@
-# Maintenance: Optimize, Repair & Cleanup
+# Maintenance
 
-Native Azure roots (`az://<container>/<prefix>`) are implemented as direct
-storage targets in the same places this guide names `s3://`; they are non-local
-and therefore use the same explicit destructive-confirmation gates. Azure is a
-qualification preview, not a production-supported deployment: the safe live
-managed-identity smoke test is complete, while adversarial qualification
-remains pending. Every Azure maintenance writer must run under root-scoped
-admission. Use the canonical cluster root for a cluster-managed graph, or the
-standalone graph root otherwise.
+OmniGraph provides three direct-storage maintenance commands:
 
-**Addressing.** `optimize`, `repair`, and `cleanup` are **direct** (storage-native) CLI commands: they run with direct storage access against a positional `file://`/`s3://`/`az://` URI or **`--cluster <dir|s3://…|az://…> --graph <id>`** (which resolves the graph's storage URI from the served cluster state, so you needn't know the `<storage>/graphs/<id>.omni` layout). They never run through a server, and reject `--server` or a remote (`http(s)://`) URI with a declared error. There are no server routes for them by design — to maintain a server-backed graph, run them out-of-band against the graph's storage URI. See the *Command capabilities* section of [cli-reference.md](../cli/reference.md).
+- `optimize` compacts data and reconciles declared indexes.
+- `repair` classifies storage drift and can publish an approved repair.
+- `cleanup` permanently removes old versions.
 
-## `optimize` — non-destructive
+They do not run through the HTTP server. Address a standalone graph directly,
+or select a graph from a cluster root:
 
-- Compacts every node and edge dataset on `main`, then reindexes them, then **publishes every changed dataset together in one `__manifest` commit** so the graph manifest tracks the compacted-and-reindexed state atomically. Reads pin the graph manifest version, so without this publish the work would be invisible to readers *and* would break the version precondition of the next schema apply / strict update/delete ("stale view … refresh and retry"). One `optimize` creates at most one graph lineage commit for this graph-visible publication, even when several datasets change; a steady-state run creates none.
-- Rewrites small fragments into fewer large ones; old fragments remain reachable via older versions until `cleanup` runs.
-- **Also compacts the internal `__manifest` dataset** (RFC-013 step 2), which accumulates one fragment per commit — it now carries the graph lineage and actor rows inline (RFC-013 Phase 7: `graph_commit` / `graph_head` rows), so on the authenticated write path every commit's actor lands here too — and otherwise makes every write's metadata scan grow with history. (The `_graph_commits.lance` / `_graph_commit_actors.lance` datasets are retired, so there is no separate lineage dataset to compact.) It takes a simpler path than the backing node/edge datasets: `__manifest` is read at its latest version, so compaction just advances its version in place — **no graph-manifest publish and no recovery sidecar**. (The sidecar-free property is not because it is one commit — `compact_files` can emit a `ReserveFragments` commit before the `Rewrite`, and the auto-cleanup strip below is a further commit — but because every one of those commits is content-preserving and the dataset is read at its latest version, so a crash at any point leaves it readable and content-identical and the next `optimize` re-plans.) It appears in the returned stats with `type_key: "__manifest"`. It is **not yet covered by `cleanup`**, so its version chain still grows until the cleanup half lands (it requires a cleanup-resurrection safeguard first); run `optimize` on a cadence to keep per-write metadata scans flat.
-- **`optimize` is non-destructive by construction — it never garbage-collects versions, on any dataset (data or internal).** Compaction rewrites fragments and advances the version; old versions stay reachable until you run `cleanup`. This holds even for a graph created by an older binary that stored an on-by-default Lance `auto_cleanup` hook: `compact_files` / `optimize_indices` commit with the hook enabled and expose no skip override, so before compacting **any** dataset `optimize` strips its stale `lance.auto_cleanup.*` config first, so Lance's commit-time GC hook cannot fire and silently prune `__manifest`-pinned versions. (Graphs created by current binaries store no such config; the strip is the upgrade-path safety net.) The internal-dataset path additionally tolerates a concurrent live writer: it runs a **bounded** rebase-and-retry, so transient contention does not fail the operator's `optimize` or the live write — but sustained contention past the retry budget surfaces a loud conflict error rather than looping forever (bounded and observable, not a silent give-up). The data-dataset path holds the per-dataset write queue while it compacts, so it does not contend with mutations on that dataset in the first place.
-- **Reindex (index coverage maintenance).** A scalar/FTS/vector index only covers the fragments it was built over. Rows appended after the index was built (e.g. by `load --mode merge`, whose commit does not rebuild an already-existing index) are scanned unindexed, and compaction itself rewrites fragments out of an index's coverage. `optimize` runs Lance's incremental `optimize_indices` after compaction to fold those fragments back in (a delta merge, not a full retrain), restoring full coverage so equality/range/traversal predicates stay index-accelerated. This is why a dataset with **no compaction work but stale index coverage still commits** a new version under `optimize`. Run `optimize` on a cadence at least as frequent as your freshness window so recently-loaded rows do not linger in the unindexed flat-scan tail.
-- **Create declared-but-missing indexes (the index reconciler).** `@index`/`@key` declares intent; `schema apply`, `load`, and `mutate` build no physical indexes inline. They record or publish only their exact logical/data effects and leave all index materialization to `ensure_indices`/`optimize`. `optimize` materializes every buildable declared-but-missing index over the compacted layout — so it is the convergence path for an `@index` added after data exists, or a vector index whose embeddings arrived via a later `embed`. A property still not buildable (no vectors yet) is reported in the dataset's `pending_indexes` stat (visible in `--json`), not treated as a failure; the next `optimize` retries. So `optimize` is the single operator-facing index reconciler: it compacts, restores coverage, **and** builds declared-but-missing indexes.
-- Optimize plans under one schema/main/all-dataset envelope, writes one identity-bearing v9 recovery envelope with a bounded maintenance payload for the complete productive dataset set, runs per-dataset compact→reindex work in bounded parallelism, and publishes the resulting pointers together. A crash after every dataset effect rolls the batch forward on the next read-write open; a partial effect set is compensated before any pointer becomes graph-visible. Because this record does not prove exact maintenance transaction identity or distributed ownership, destructive recovery is supported only within the documented single-writer-process boundary; it is not a multi-process recovery fence.
-- **Requires a recovered graph.** `optimize` refuses (errors) when a pending crash-recovery operation is present — operating on an unrecovered graph could publish a partial write that recovery would roll back. Reopen the graph to run recovery, then re-run `optimize`.
-- **Uncovered drift is skipped, not interpreted.** If a dataset's underlying HEAD version is ahead of its published version in `__manifest` and no crash-recovery record covers that movement, `optimize` reports `skipped: DriftNeedsRepair` with the published/HEAD versions and leaves the dataset untouched. Run `omnigraph repair` to classify the drift. Verified maintenance can be explicitly published; suspicious or unverifiable movement requires deliberate `--force --confirm` after review, or restoration/rebuild from a verified export or backup.
-- Bounded by `OMNIGRAPH_MAINTENANCE_CONCURRENCY` (default 8).
-- Returns per-dataset stats: `type_key, fragments_removed, fragments_added,
-  committed, skipped, published_dataset_version, lance_head_version,
-  pending_indexes`. Each pending index identifies its `type_key` and `property`
-  plus the reason it could not be built — for example, a vector property with
-  no trainable vectors yet.
-- **Blob-bearing datasets use the normal compaction and reindex path.** Lance 10.0.0
-  preserves null, valid-empty, and non-empty Blob-v2 values through compaction,
-  so OmniGraph has no blob-specific skip or capability gate. Fragment
-  reclamation and index-coverage repair therefore apply to blob-bearing datasets
-  like every other dataset.
+```bash
+omnigraph optimize ./graph.omni
+omnigraph optimize --cluster s3://company/omnigraph --graph knowledge
+```
 
-## `repair` — explicit
+Stop overlapping writers while running maintenance. Azure writers must also
+run through `omnigraph-azure-admission`; Azure support remains a qualification
+preview pending the adversarial live-Azure matrix.
 
-- Handles **uncovered published/HEAD drift**: a dataset's underlying HEAD version is ahead of the published version in the graph manifest and no crash-recovery record explains the movement.
-- Preview by default. `omnigraph repair --json <uri>` reports each dataset's `classification`, `action`, published/HEAD versions, underlying operation names, and any classification error. `--confirm` publishes only verified maintenance drift; if any suspicious or unverifiable dataset is refused, the CLI prints the per-dataset output and exits non-zero. `--force --confirm` also publishes suspicious or unverifiable drift after operator review.
-- Classifies drift by reading the dataset's transaction history from
-  `published_dataset_version + 1` through the current HEAD. Only
-  fragment-reservation and rewrite (compaction) operations are verified
-  maintenance. Semantic operations such as append, delete, update, merge, or
-  missing transaction history are not auto-healed.
-- Publishes repair by advancing `__manifest` to the existing head; it does **not** rewrite data. If the publish succeeds, normal reads and strict writes use the repaired version. If it fails, no new data-side partial state was created.
-- Requires a clean recovery state. A pending crash-recovery operation still belongs to automatic recovery, not manual repair.
+## Optimize
 
-## `cleanup` — destructive
+```bash
+omnigraph optimize ./graph.omni
+omnigraph optimize ./graph.omni --json
+```
 
-- Garbage-collects old versions per dataset.
-- Removes versions (and their unique fragments) older than the retention policy.
-- Policy options `keep_versions` and `older_than` — at least one is required.
-  `keep_versions=N` derives its requested cutoff from the newest `N` available
-  versions per dataset (the current HEAD is always retained, including for
-  `N=0`); live-branch safety floors may retain additional intervening versions.
-  When both options are set, a version is removed only if it is older than both
-  cutoffs.
-- Returns per-dataset stats through `type_key, bytes_removed,
-  old_versions_removed, error`.
-- **Fault-isolated per dataset after the graph-wide safety preflight.** A single
-  dataset's transient version-GC failure is recorded on that dataset's stats row
-  (with an `error`), logged, and reported by the CLI without aborting healthy
-  datasets. Orphan-reclaim failures are also logged and retried on a later cleanup,
-  but the current stats/CLI surface does not attach them to
-  `DatasetCleanupStats.error`. The recovery and live-branch checks below are
-  preflight invariants instead: either must succeed before any version GC runs.
-  Rerun `cleanup` to converge either kind of per-dataset failure.
-- CLI guards with `--confirm`; without it, prints a preview line.
-- **Non-local consent.** Against a non-local target (an `s3://` or `az://` store/cluster), `cleanup` additionally requires `--yes` on top of `--confirm`: a TTY is prompted, and a non-interactive run (no TTY, or `--json`) refuses rather than destroying. A local (`file://`) target needs only `--confirm`. The same `--yes` gate applies to overwrite `load` and `branch delete`; every maintenance run echoes its resolved target to stderr (suppress with `--quiet`).
-- **Recovery floor:** `--keep < 3` may garbage-collect versions that a later
-  rollback would otherwise use. `--keep 10` is the recommended conservative
-  count; there is no implicit default, so pass a policy explicitly.
-- **Requires clean recovery state.** If any durable recovery intent is pending,
-  cleanup refuses before orphan reconciliation or version GC. Reopen the graph
-  read-write (or restart the server) to resolve recovery, then rerun cleanup;
-  deleting transaction/version history while an intent is pending would make
-  exact effect ownership unverifiable.
-- **Preserves live lazy branches.** A graph branch initially inherits each data
-  dataset directly from an exact main-dataset version; until that dataset is first
-  written on the branch, there is no native Lance dataset branch for Lance's
-  cleanup to discover. Under the same schema, branch, and dataset gates used for
-  version GC, cleanup therefore reads every live graph-branch snapshot and caps
-  each main dataset's cutoff at its oldest inherited version. Native per-dataset
-  forks remain protected by Lance itself. If any live branch snapshot cannot be
-  classified, cleanup refuses before garbage-collecting any dataset rather than
-  guessing that its referenced versions are disposable.
-- **Refuses uncovered main-dataset drift.** Every graph-manifest-visible main version
-  must open and equal Lance HEAD during the graph-wide preflight. If an external
-  or interrupted operation advanced HEAD without a recovery sidecar, classify
-  it with `omnigraph repair` before cleanup. Version GC never guesses around
-  unexplained drift.
-- **Orphaned-branch reconciliation:** before the version GC, cleanup reclaims any per-dataset Lance branch absent from the graph-manifest branch list. These orphans arise when a `branch_delete` flips graph-manifest authority but a downstream best-effort reclaim does not complete (see [branches-commits.md](../branching/index.md)). The reconciler is idempotent (it no-ops once nothing is orphaned), runs regardless of the `keep_versions` / `older_than` values (those gate version GC only), and never reclaims `main` or system-branch forks. Reclaimed forks are logged. Graph lineage has no separate branch dataset: it lives in `__manifest`.
+Optimize rewrites small fragments into fewer larger fragments, refreshes index
+coverage, and builds declared indexes that are ready to build. It does not
+delete old versions, so snapshots and retained history remain available.
 
-## Tombstones
+A vector index whose property has no usable vectors remains pending rather than
+failing the run. Run optimize again after loading or generating vectors.
 
-Logical dataset-delete markers in `__manifest` that exclude a dataset version from snapshot reconstruction.
+Optimize refuses unexplained drift or an unresolved interrupted write. Reopen
+the graph read-write (or restart its server) to finish ordinary recovery; use
+`repair` only for drift that remains unexplained.
 
-## Internal schema versions
+## Repair
 
-The on-disk format is strict-single-version. A binary refuses a graph whose
-internal schema stamp differs from the version it supports; storage-format
-changes use export/import rebuild rather than automatic in-place migration.
-See the [upgrade guide](upgrade.md) and
-[versioning policy](../../dev/versioning.md).
+Repair is a deliberate operator action for a node or edge type whose backing
+dataset is ahead of the graph's visible version without a matching
+interrupted operation. Preview first:
+
+```bash
+omnigraph repair ./graph.omni --json
+```
+
+After reviewing every classification, publish only verified maintenance drift:
+
+```bash
+omnigraph repair ./graph.omni --confirm
+```
+
+Suspicious or unverifiable drift is refused. `--force --confirm` can publish it,
+but should be used only when an operator has independently established that the
+the new state of the backing dataset is correct. Repair publishes an existing state; it
+does not rewrite lost or corrupt data.
+
+If you cannot verify suspicious drift, restore or rebuild from a trusted export
+or backup.
+
+## Cleanup
+
+Cleanup permanently removes old versions from the backing datasets for node and
+edge types, plus data reachable only through those versions. Without
+`--confirm`, the CLI only echoes the requested retention policy and exits before
+opening the graph; it does not enumerate candidate versions:
+
+```bash
+omnigraph cleanup --keep 10 --older-than 7d ./graph.omni
+```
+
+Run the reviewed policy with `--confirm`:
+
+```bash
+omnigraph cleanup --keep 10 --older-than 7d --confirm ./graph.omni
+```
+
+At least one retention option is required:
+
+| Option | Meaning |
+|---|---|
+| `--keep N` | Request retention of the newest `N` versions per node or edge type |
+| `--older-than DURATION` | Remove only versions older than the duration |
+
+When both are present, a version must be outside both retention windows before
+it can be removed. Live branches and other storage references may keep
+additional versions. `--keep 10` is a conservative starting point; choose a
+policy that matches your rollback and audit needs.
+
+For `s3://` and `az://` targets, destructive execution also requires an
+interactive confirmation or `--yes`. Non-interactive and JSON runs refuse
+without `--yes`.
+
+Before cleanup:
+
+1. stop writers and long-lived Blob readers;
+2. verify important branches and snapshots;
+3. make or verify a backup/export;
+4. resolve interrupted operations and any drift reported by `repair`;
+5. review the exact retention command and confirmation target.
+
+Cleanup fails closed if it cannot prove that pending recovery, live branches,
+or storage drift are safe. A failure to clean one backing dataset is reported in
+the result; fix the cause and rerun cleanup to converge.
+
+## Suggested cadence
+
+- Run `optimize` after large loads or on a regular cadence for write-heavy
+  graphs.
+- Run `repair` only when a command reports uncovered drift.
+- Run `cleanup` from an explicit retention policy after backups and rollback
+  requirements have been reviewed.
+
+Storage-format upgrades use export and rebuild, not maintenance. See
+[Upgrading](upgrade.md).

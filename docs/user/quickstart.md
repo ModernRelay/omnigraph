@@ -6,15 +6,24 @@ path for an `s3://…` URI to run the same flow against object storage.
 
 [Install](install.md) the `omnigraph` CLI first.
 
+The example builds a small evidence graph in which sources support a claim.
+
 ## 1. Write a schema
 
 A schema (`.pg`) declares your node and edge types. Save this as `schema.pg`:
 
-```
-node Person {
-  name: String
-  title: String?
+```pg
+node Source {
+  slug: String @key
+  title: String
 }
+
+node Claim {
+  slug: String @key
+  statement: String
+}
+
+edge Supports: Source -> Claim
 ```
 
 See the [schema language](schema/index.md) for types, constraints, and edges.
@@ -29,43 +38,53 @@ omnigraph init --schema schema.pg graph.omni
 
 ## 3. Load data
 
-Data is newline-delimited JSON, one record per line — each names its node type
-and carries the properties under `data`. Save this as `people.jsonl`:
+Data is newline-delimited JSON, one node or edge per line. Save this as
+`evidence.jsonl`:
 
 ```jsonl
-{"type":"Person","data":{"name":"Ada Lovelace","title":"Engineer"}}
-{"type":"Person","data":{"name":"Grace Hopper","title":"Engineer"}}
-{"type":"Person","data":{"name":"Alan Turing","title":"Mathematician"}}
+{"type":"Claim","data":{"slug":"lower-latency","statement":"The migration reduced request latency."}}
+{"type":"Source","data":{"slug":"load-test","title":"Load test report"}}
+{"type":"Source","data":{"slug":"production-metrics","title":"Production metrics"}}
+{"edge":"Supports","from":"load-test","to":"lower-latency"}
+{"edge":"Supports","from":"production-metrics","to":"lower-latency"}
 ```
 
-`load` is the single bulk-write command. `--mode` is required
-(`overwrite | append | merge`):
+The keyed `slug` values become node IDs, so the edges can refer to
+`load-test`, `production-metrics`, and `lower-latency`. One load can contain
+several node and edge types and publishes them as one graph commit. `--mode` is
+required (`overwrite | append | merge`):
 
 ```bash
-omnigraph load --data people.jsonl --mode overwrite graph.omni
+omnigraph load --data evidence.jsonl --mode overwrite graph.omni
 ```
 
-For finer-grained or inline writes, see [mutations](mutations/index.md).
-The [CLI load contract](cli/index.md#core-graph-flow) also covers edge
-envelopes, optional IDs, and strict rejection rules.
+For finer-grained writes and the node/edge JSONL shapes, see
+[mutations and loading](mutations/index.md).
 
 ## 4. Query
 
 Write a query (`.gq`) — save as `queries.gq`:
 
 ```gq
-query find_people($title: String) {
-  match { $p: Person { title: $title } }
-  return { $p.name }
+query sources_for_claim($claim: String) {
+  match {
+    $source: Source
+    $claim_node: Claim { slug: $claim }
+    $source supports $claim_node
+  }
+  return { $source.title as source }
+  order { source asc }
 }
 ```
 
 Run it:
 
 ```bash
-omnigraph query find_people --query queries.gq \
-  --params '{"title":"Engineer"}' --format table --store graph.omni
+omnigraph query sources_for_claim --query queries.gq \
+  --params '{"claim":"lower-latency"}' --format table --store graph.omni
 ```
+
+This returns `Load test report` and `Production metrics`.
 
 The query name is positional; `--query` points at the `.gq` source and
 `--store` addresses the graph's storage directly.
@@ -75,13 +94,25 @@ The [query language](queries/index.md) covers `match`/`return`/`order`, and
 
 ## 5. Work on a branch
 
-Branches isolate changes until you merge them — Git-style, across the whole graph:
+Branches isolate changes until you merge them — Git-style, across the whole
+graph. Save an additional source and evidence link as `benchmark.jsonl`:
+
+```jsonl
+{"type":"Source","data":{"slug":"independent-benchmark","title":"Independent benchmark"}}
+{"edge":"Supports","from":"independent-benchmark","to":"lower-latency"}
+```
+
+`branch` commands reserve their positional argument for the branch name, so
+they address the graph with `--store` (the same flag `query` uses above):
 
 ```bash
-omnigraph branch create review/new-hires --store graph.omni
-omnigraph load --data new-hires.jsonl --mode append --branch review/new-hires graph.omni
-# inspect the branch, then integrate it
-omnigraph branch merge review/new-hires --into main --store graph.omni
+omnigraph branch create review/add-benchmark --store graph.omni
+omnigraph load --data benchmark.jsonl --mode append \
+  --branch review/add-benchmark graph.omni
+omnigraph query sources_for_claim --query queries.gq \
+  --params '{"claim":"lower-latency"}' \
+  --branch review/add-benchmark --store graph.omni
+omnigraph branch merge review/add-benchmark --into main --store graph.omni
 ```
 
 See [branches & commits](branching/index.md) and [merging](branching/merge.md).

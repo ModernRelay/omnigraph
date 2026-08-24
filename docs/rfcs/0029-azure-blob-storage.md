@@ -1,12 +1,21 @@
-# RFC 0029: Native Azure Blob storage
+---
+rfc: "0029"
+title: "Native Azure Blob storage"
+track: public
+status: accepted
+implementation: in-progress
+authors:
+  - Roey Zalta (@roy2392)
+created: 2026-08-05
+updated: 2026-08-23
+discussion: "https://github.com/ModernRelay/omnigraph/issues/509"
+supersedes: []
+superseded_by: []
+blocked_on:
+  - Adversarial live-Azure qualification matrix
+---
 
-| | |
-|---|---|
-| **Status** | Accepted |
-| **Author track** | Public contribution |
-| **Author(s)** | Roey Zalta ([@roy2392](https://github.com/roy2392)) |
-| **Discussion** | [ModernRelay/omnigraph#509](https://github.com/ModernRelay/omnigraph/issues/509) (migrated from the retired Discussions forum) |
-| **Implementation** | Code, Azurite validation, and a live managed-identity smoke proof complete; adversarial qualification pending |
+# RFC 0029: Native Azure Blob storage
 
 The backend, admission wrapper, hermetic Azurite coverage, packaging, and
 reference deployment are implemented on the development line. A live Container
@@ -93,7 +102,7 @@ This RFC does not:
 - make `abfs://`, `abfss://`, or HTTPS Blob URLs public OmniGraph storage URI
   aliases;
 - make `az://` an allowed external Blob-cell value; that is a separate
-  [RFC-033](0033-blob-management.md) policy and evidence decision from placing
+  [RFC 0033](0033-blob-management.md) policy and evidence decision from placing
   an OmniGraph root on Azure Blob Storage.
 
 ## Guide-level explanation

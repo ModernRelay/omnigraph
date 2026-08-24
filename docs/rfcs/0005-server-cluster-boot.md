@@ -1,9 +1,23 @@
-# RFC: Server Boots from Cluster State — Phase 5 of the Cluster Control Plane
+---
+rfc: "0005"
+title: "Server boot from cluster state"
+track: maintainer
+status: accepted
+implementation: complete
+authors:
+  - OmniGraph maintainers
+created: 2026-06-10
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
 
-**Status:** Landed (5A policy bindings #175; 5B/5C the `--cluster` boot mode — one PR)
+# RFC 0005: Server boot from cluster state
+
 **Implementation deviations:** (1) cluster mode reuses `ServerConfigMode::Multi` (a new settings *source*, not a new enum variant; `config_path` carries the cluster dir). (2) Stored queries load via `QueryRegistry::from_specs` from verified blob *content*, not blob paths. (3) More than one policy bundle binding a single scope is a boot error (the serving pipeline holds one bundle per graph + one server-level; stacking is a later slice). (4) `GET /graphs` keeps its closed-by-default contract — without a cluster-bound bundle there is no server-level Cedar engine, so enumeration refuses. (5) Graph-attributed startup failures quarantine that graph by default; operators can restore all-or-nothing boot with `--require-all-graphs` / `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`.
-**Date:** 2026-06-10
-**Builds on:** Phase 4 complete ([rfc-004-cluster-graph-schema-apply.md](rfc-004-cluster-graph-schema-apply.md), Landed): `cluster apply` converges graphs, schemas, stored queries, and policies into the cluster catalog. Normative context: [cluster-config-specs.md](cluster-config-specs.md) (the migration model's "window 2"), [cluster-axioms.md](cluster-axioms.md) (axiom 15), [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md) (Phase 5 rollout, Compatibility Stance #7–#9, exit criterion 7).
+**Builds on:** Phase 4 complete ([RFC 0004](0004-cluster-graph-schema-apply.md)): `cluster apply` converges graphs, schemas, stored queries, and policies into the cluster catalog. Current normative context: [cluster control plane](../dev/control-plane.md).
 **Target release:** unversioned (phased — see Sequencing).
 
 ## Summary
@@ -136,8 +150,6 @@ Answers implementation-spec exit criterion 7 (server startup + migration path) i
 
 ## References
 
-- [rfc-004-cluster-graph-schema-apply.md](rfc-004-cluster-graph-schema-apply.md) — the convergence machinery this serves
-- [cluster-config-specs.md](cluster-config-specs.md) §Migration model — window 2 is this RFC
-- [cluster-axioms.md](cluster-axioms.md) — axioms 5, 12, 14, 15
-- [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md) — Phase 5 rollout, Compatibility Stance #7–#9, blast-radius rows for the server registry
+- [RFC 0004](0004-cluster-graph-schema-apply.md) — the convergence machinery this serves
+- [Cluster control plane](../dev/control-plane.md) — current applied-state and serving contract
 - `crates/omnigraph-server/src/lib.rs` (`load_server_settings`, `ServerConfigMode`, `GraphRegistry`) — the boot pipeline this extends without forking

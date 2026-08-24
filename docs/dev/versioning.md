@@ -1,131 +1,120 @@
-# Versioning & compatibility policy
+# Versioning and compatibility
 
-**Audience:** engine / storage / release maintainers
-**Status:** living document
+**Audience:** storage, API, and release maintainers
+**Authority:** current compatibility policy
 
-OmniGraph has four independent version axes. They have different compatibility
-contracts and must not be conflated.
+OmniGraph has independent release, wire, graph-storage, recovery, and Lance
+version axes. Never derive one axis from another.
 
-| Axis | Policy | Mechanism |
+| Axis | Policy | Guard |
 |---|---|---|
-| **Release (semver)** | All published crates move in lockstep. | A release bump updates every crate manifest, `Cargo.lock`, generated API metadata, and the surveyed version in [AGENTS.md](../../AGENTS.md). |
-| **CLI ↔ server wire** | Additive and rolling-safe by default; the unreleased v0.10 vocabulary cutover is an explicit breaking exception. | Optional JSON DTO fields plus the OpenAPI drift test normally; deploy the v0.10 CLI and server together because no compatibility aliases or version gate bridge the renamed contracts. |
-| **Storage (internal graph-manifest schema)** | Strict single version; upgrade by export/init/load, never in-place migration. | `omnigraph:internal_schema_version` metadata plus `refuse_if_stamp_unsupported`, with `MIN_SUPPORTED == CURRENT`. |
-| **Lance on-disk format** | Pinned to one Lance version and bumped deliberately. | `data_storage_version: V2_2` at write sites plus the checks in [lance.md](lance.md). |
+| Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
+| CLI ↔ server wire | Additive and rolling-safe; no global version handshake. | Shared optional DTO fields and OpenAPI drift tests. |
+| Graph storage | Strict single version; rebuild across an incompatible change. | Main-manifest stamp with `MIN_SUPPORTED == CURRENT`. |
+| Recovery sidecar | Independently versioned persisted protocol. | Sidecar grammar/version refusal before classification. |
+| Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
 ## Current storage contract
 
-The current binary reads and writes exactly **internal graph-manifest schema v6**.
+The current binary reads and writes exactly **internal manifest schema v6**.
+`INTERNAL_MANIFEST_SCHEMA_VERSION` and `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION`
+are both 6.
 
-- **v4** is the last released format, shipped by OmniGraph v0.8.x.
-- **v5** is an unreleased development format that introduced SchemaIR v2,
-  immutable stable-dataset/incarnation identity, identity-keyed graph-manifest
-  rows, and identity-derived dataset paths.
-- **v6** is the current format. It shipped in OmniGraph 0.9.x and remains the
-  format written by 0.10.x. It preserves v5 and makes every backing dataset's exact
-  non-null physical `id` field Lance's unenforced primary key; supported strict
-  insert/upsert writers use the exact-`id`, filter-bearing adapter. The Lance
-  10 dependency bump is not a new OmniGraph format strand.
-- **v7-v19** were unreleased development formats belonging to the rejected
-  RFC-026 MemWAL experiment. They are abandoned and are not compatibility
-  obligations. The v6 binary refuses them as future formats before recovery or
-  backing-dataset decoding.
+- v4 was the last released pre-identity format, used by OmniGraph 0.8.x.
+- v5 was an unreleased development format that introduced SchemaIR v2,
+  stable table/incarnation identity, identity-keyed manifest rows, and
+  identity-derived paths.
+- v6 preserves v5 and adds exact non-null physical `id` fencing through
+  Lance's unenforced primary-key metadata. It is the 0.9.x/0.10.x format.
+- unreleased v7–v19 belonged to the rejected MemWAL experiment. They are
+  abandoned future stamps, not migration inputs for a v6 binary.
 
-The exact v6 meaning is the one established immediately before RFC-026. A fresh
-v6 root has no `_stream_tokens.lance`, `_mem_wal`, legacy stream-control graph-manifest rows,
-stream profile, hidden stream metadata column, fold attribution, or stream
-recovery protocol.
+A lower stamp is refused with export/rebuild guidance. A higher stamp is
+refused before recovery or table decoding. There is no in-place migration
+dispatcher.
 
-Recovery sidecars use a separate version space. The ordinary graph writers emit
-**recovery sidecar schema v9** for identity-aware Mutation/Load, BranchMerge,
-SchemaApply, EnsureIndices, and Optimize recovery. Do not lower that number to
-6 merely because the graph-manifest schema is v6.
+## Recovery version
 
-The rationale and historical links are in
-[Streaming ingestion after RFC-026](wal-removal.md).
+Active graph writers emit **recovery sidecar schema v9**. The retained
+writer-payload field names refer to earlier payload designs but the outer
+artifact is v9 and every table slot carries stable lifetime identity.
 
-## Why storage is strict-single-version
+Never change the recovery ceiling merely because the manifest schema changes,
+or lower it to match v6. See [recovery.md](recovery.md).
 
-`Omnigraph::open` reads main's graph-manifest stamp before decoding graph or recovery
-state:
+## Lance contract
 
-- a stamp below v6 is refused with rebuild guidance;
-- a stamp above v6 is refused with an upgrade-binary message;
-- an absent stamp on a graph manifest with the modern (v5+) column layout is refused
-  as either an interrupted older-binary init (those binaries stamped in a
-  separate commit after creating `__manifest`) or damaged/externally modified
-  metadata. The remaining metadata cannot distinguish those cases, so the
-  guard fails closed. It advises deletion and re-init only when the operator
-  independently knows initialization never completed; otherwise it says to
-  preserve the root for investigation or recovery. An absent stamp on a
-  pre-modern layout is the genuine pre-stamp world, treated as v1; a stamp
-  that is present but not a version number is refused naming the raw value.
-  Current binaries cannot produce the interrupted-init state: the `__manifest`
-  Create commit is the graph-manifest dataset's entire birth — entries, genesis lineage, and
-  the stamp ride that single commit, so the stamp is atomic with graph-manifest
-  birth.
+The workspace resolves the complete Lance package family to **10.0.0** and
+explicitly writes stable data storage version **V2_2**. A dependency bump alone
+does not change the OmniGraph manifest format. Adopting a new Lance file format
+or a behavior that changes persisted graph meaning does.
 
-There is no in-place migration dispatcher. A released v4 graph is exported with
-its v0.8.x binary, initialized as a fresh v6 graph, and loaded through the
-current writer. That rebuild preserves logical entities, vectors, blobs, and schema
-shape while intentionally starting fresh physical histories and identities.
+Current compatibility fences and the required upstream reading set are in
+[lance.md](lance.md).
 
-This is a liability decision. A migration framework permanently multiplies
-legacy readers, crash paths, and version-pair tests. The stamp guard is the seam
-for a future converter if a concrete deployment justifies that cost.
+## Why rebuild instead of migrate
 
-## Gating altitude
+An in-place migration permanently adds legacy readers, crash windows, and
+version-pair tests. The present strand model keeps one readable physical shape:
+export the old logical graph with the old binary, initialize a fresh current
+graph, and load the export. Rows, vectors, Blob values, and schema meaning are
+preserved; physical histories and stable identities intentionally restart.
 
-The stamp is a graph-wide property and is checked on main. Branches inherit the
-format when created. A branch with a different stamp is reachable only through
-unsupported concurrent multi-version writers.
+The operator procedure is documented in
+[the upgrade guide](../user/operations/upgrade.md).
 
-Format refusal must happen before recovery-sidecar or backing-dataset decoding. In
-particular, the current binary never tries to interpret abandoned v7-v19 state
-as v6 and never cleans it opportunistically.
+## Wire compatibility
 
-## Why the wire is additive
+CLI and server deployments may roll independently. Wire changes therefore stay
+additive:
 
-CLI and server versions roll independently, so their JSON boundary remains
-additive. New fields are optional, old clients ignore unknown fields, and the
-OpenAPI drift test guards unintended breaking changes. Storage strictness does
-not justify a wire-version gate.
+- new request fields are optional or have a server-side default;
+- new response fields do not change existing field meaning;
+- enum growth must be represented in a rolling-safe shape when old clients use
+  closed switches;
+- intentional API changes regenerate and commit `openapi.json`.
 
-The unreleased v0.10 graph-vocabulary cutover is the one declared exception:
-it removes legacy fields instead of dual-emitting them. A v0.9 CLI and v0.10
-server (or the reverse) are unsupported; operators upgrade those binaries as
-one unit. The exception is release-noted and covered by exact OpenAPI and CLI
-JSON tests. It does not weaken the default rule for later incremental features.
-
-An optional field or header is safe only when an older peer may ignore it
-without changing correctness. Behavior-bearing opt-ins use a fail-closed
-capability shape instead. For example, graph-head conditional mutations use a
-dedicated route: an older server returns 404 before execution rather than
-ignoring an unknown header and writing unconditionally.
-
-## When changing an axis
-
-- **Storage format:** bump the internal schema version, keep
-  `MIN_SUPPORTED == CURRENT` unless a real migration is introduced, update the
-  format history and release notes, and add genuine-binary refusal/rebuild
-  evidence for a released boundary.
-- **Recovery grammar:** bump the recovery-sidecar ceiling only when persisted
-  recovery meaning changes. Never derive it from the internal schema version.
-- **Wire:** keep changes additive and regenerate `openapi.json`; any deliberate
-  exception requires an explicit release-boundary statement and matched-client
-  deployment instructions like the v0.10 vocabulary cutover above.
-- **Lance:** on a bump, run `lance_surface_guards.rs` first (see
-  [testing.md](testing.md)), review every intervening upstream commit, then
-  refresh [lance.md](lance.md)'s index and add a dated audit stanza in the
-  same change.
-- **Release:** update all published crates and generated metadata in lockstep.
+Storage strictness is not a reason to add a wire-version gate.
 
 ## Registry publication status
 
-crates.io publication is **paused** as of 2026-08. Access to the account
-owning the historical `omnigraph-*` crate names was lost, so those names are
-frozen at their 0.8.0 versions and no current release publishes to the
-registry; recovery of the account is being pursued. The name `omnigraph-db`
-is reserved (0.0.1) as a fallback. Binaries ship via the installer, Homebrew,
-Docker, and GitHub Releases; the TypeScript SDK ships via npm. Docs must not
-instruct users to `cargo install` until this paragraph is updated.
+crates.io publication is paused as of 2026-08 because access to the account
+owning the historical `omnigraph-*` names is unavailable. Those registry
+packages remain frozen at 0.8.0; `omnigraph-db` is reserved at 0.0.1 as a
+fallback. Current binaries ship through the installer, Homebrew, Docker, and
+GitHub Releases, and the TypeScript SDK ships through npm. Do not document
+`cargo install` until this status changes.
+
+## Changing an axis
+
+### Graph storage
+
+1. Write an RFC for the irreversible format decision.
+2. Bump the manifest stamp and keep `MIN_SUPPORTED == CURRENT` unless a real
+   converter is implemented.
+3. Refuse old/future formats before decoding.
+4. Add genuine old-binary/new-binary refusal and rebuild evidence.
+5. Update the upgrade guide and release notes.
+
+### Recovery
+
+1. Bump only when persisted ownership or classification meaning changes.
+2. Keep writer-kind validation exhaustive.
+3. Add malformed, old, future, crash, roll-forward, and compensation tests.
+4. Never infer missing lifetime identity from aliases.
+
+### Lance
+
+1. Read every full page in the relevant domains from [lance.md](lance.md).
+2. Review the complete upstream release/source delta.
+3. Run `lance_surface_guards.rs` first, then the focused engine suites and
+   canonical workspace test.
+4. Update only the current compatibility-fence table.
+5. Put bump evidence and historical findings in the release note or RFC that
+   consumed them, not an accumulating live-doc audit ledger.
+
+### Wire and release
+
+Regenerate OpenAPI for wire changes. Release changes update every shipped
+artifact, installer/package metadata, and the surveyed version in
+[AGENTS.md](../../AGENTS.md) in the same change.

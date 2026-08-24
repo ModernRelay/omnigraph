@@ -1,24 +1,29 @@
 ---
-type: spec
-title: "RFC-024 — Durable table heads"
-description: Materialize one live-or-tombstoned current-state row per stable table identity inside each manifest branch and prove bounded physical lookup without weakening derived-index correctness.
-status: research-blocked
-tags: [eng, rfc, manifest, write-path, versioning, migration, lance]
-timestamp: 2026-07-10
-owner: OmniGraph maintainers
+rfc: "0024"
+title: "Durable table heads"
+track: maintainer
+status: draft
+implementation: not-started
+authors:
+  - OmniGraph maintainers
+created: 2026-07-10
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on:
+  - Bounded physical lookup evidence
 ---
 
-# RFC-024: Durable table heads
+# RFC 0024: Durable table heads
 
-> **Current disposition (2026-08-06):** this proposal remains research-blocked
-> and no durable-head format ships. RFC-026 was rejected and its unreleased
+> **Current disposition (2026-08-06):** this draft remains blocked on research
+> evidence
+> and no durable-head format ships. RFC 0026 was rejected and its unreleased
 > internal formats v7-v19 were abandoned; the current binary serves manifest
 > v6 and still resolves current table state by folding the identity-bearing
 > manifest journal.
 
-**Status:** Research blocked — Gate A physical lookup rejected
-**Date:** 2026-07-10
-**Author track:** Maintainer design series
 **Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance table layout,
 transaction, branching, indexing, compaction, cleanup, and object-store
@@ -31,28 +36,29 @@ uncompacted endpoint, while compacted cold scan bytes still grow. The
 representative RustFS table in §7.4 remains explicitly historical beta.21
 evidence; its bucket-gated RC.1 cell was not available for this audit. The
 candidate remains rejected for the same physical-cost reason.
-**Historical development consequence (2026-07-19):** RFC-026 Phase A activated
+**Historical development consequence (2026-07-19):** RFC 0026 Phase A activated
 internal schema v7 and private Phase B1 subsequently activated v8; neither added
 table-head rows or lookup. The candidate remains rejected and v8 still resolves
 current table state by folding the identity-bearing manifest journal.
-**Relationship to RFC-022:** this RFC is the durable-heads decision split from
-the earlier monolithic RFC-022 draft. [RFC-022](0022-unified-write-path.md)
+**Relationship to RFC 0022:** this RFC is the durable-heads decision split from
+the earlier monolithic RFC 0022 draft. [RFC 0022](0022-unified-write-path.md)
 defines the shared publisher/recovery protocol; this RFC owns the heads-format
 rows, lookup, and publication boundary. Stable table identity and incarnation come from
-[RFC-028](0028-stable-schema-identity.md), which is a prerequisite; this RFC
+[RFC 0028](0028-stable-schema-identity.md), which is a prerequisite; this RFC
 owns only head storage, lookup, and publication. It deliberately excludes
 checkpoint retention, which
-[RFC-025](0025-checkpoint-retention.md) reviews separately. Key fencing in
-[RFC-023](0023-key-conflict-fencing.md) is also independently reviewable;
+[RFC 0025](0025-checkpoint-retention.md) reviews separately. Key fencing in
+[RFC 0023](0023-key-conflict-fencing.md) is also independently reviewable;
 the two may share a release but do not block one another's evidence gates.
 **Audience:** engine, manifest, migration, branch, and release maintainers
-**Open architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
-Findings marked **BLOCKER** must be dispositioned before acceptance.
+Architecture-review findings marked **BLOCKER** must be dispositioned before
+acceptance; the separate review ledger has been retired after its durable
+findings were incorporated here.
 
 ---
 
 Throughout this draft, **heads format** means the first internal schema that
-contains the table-head contract. RFC-028 now occupies internal schema v5, so
+contains the table-head contract. RFC 0028 now occupies internal schema v5, so
 this RFC deliberately does not reserve a numeral. The exact later number is
 assigned when the independently accepted capabilities for a release are known.
 
@@ -93,7 +99,7 @@ Normative decisions:
    return to the history fold.
 6. A new graph's first valid state contains complete identity-bearing journal
    rows and heads; an existing graph reaches the format only by export/init/load.
-7. If RFC-023 is co-released, target initialization also verifies PK fencing;
+7. If RFC 0023 is co-released, target initialization also verifies PK fencing;
    durable heads do not depend on that decision.
 8. Checkpoint/retention markers are deferred to a separate RFC.
 
@@ -123,7 +129,7 @@ In scope:
 - atomic publisher, recovery, and current-read semantics;
 - bounded physical access proof;
 - strict-format refusal and export/init/load rebuild activation;
-- optional co-release integration with RFC-023's new-graph PK activation.
+- optional co-release integration with RFC 0023's new-graph PK activation.
 
 Out of scope:
 
@@ -153,14 +159,14 @@ object_type = "table_head"
 
 `stable_table_id` and `incarnation_id` are the graph-scoped nonzero `u64`
 identities defined and minted by
-[RFC-028](0028-stable-schema-identity.md). `stable_table_id` is the node or edge
+[RFC 0028](0028-stable-schema-identity.md). `stable_table_id` is the node or edge
 type ID; it survives a supported rename and is never derived from the display
 name, `kind:name`, path, or Lance field ID. This RFC consumes those values and
 does not define a competing allocator or identity registry.
 
 The head row is mutable under `WhenMatched::UpdateAll`, just like
 `graph_head:<branch>`. There is one object ID per stable identity. Under
-RFC-028's current drop/re-add rule, the old identity remains tombstoned and the
+RFC 0028's current drop/re-add rule, the old identity remains tombstoned and the
 new declaration receives a distinct head object; there is still never more than
 one candidate head for one stable identity.
 
@@ -245,8 +251,8 @@ other row.
 - no name comparison revives an old head.
 
 Any future explicit rematerialization that preserves stable type identity but
-changes incarnation must first be specified by RFC-028 or a successor. The head
-transition then follows that accepted schema outcome; RFC-024 never invents it.
+changes incarnation must first be specified by RFC 0028 or a successor. The head
+transition then follows that accepted schema outcome; RFC 0024 never invents it.
 
 ### 3.4 Journal identity
 
@@ -287,7 +293,7 @@ The heads-format publisher constructs one merge-insert source containing:
 - immutable, identity-bearing table-version rows;
 - immutable, identity-bearing table-tombstone/transition rows;
 - mutable table-head rows;
-- when the RFC-022 plan carries `LineageIntent`, the immutable `graph_commit`
+- when the RFC 0022 plan carries `LineageIntent`, the immutable `graph_commit`
   and mutable `graph_head:<branch>` rows;
 - for metadata-only plans, their specific CAS authority/operation rows without
   manufacturing graph lineage.
@@ -305,7 +311,7 @@ complete expected token:
  current_head_witness, table_version, schema_ir_hash)
 ```
 
-Any difference returns control to full RFC-022 revalidation before effects; a
+Any difference returns control to full RFC 0022 revalidation before effects; a
 publisher retry may not reparent a prepared table effect across the mismatch.
 The desired head token is derived from the exact achieved dataset/ref after the
 effect, never copied forward from a stale expected head.
@@ -483,8 +489,8 @@ The heads capability comprises:
 3. publisher and recovery rules that update those rows atomically; and
 4. the graph-level internal-schema stamp that declares the capability.
 
-It does **not** comprise identity minting (RFC-028), PK fencing (RFC-023), or
-checkpoint/retention markers (RFC-025).
+It does **not** comprise identity minting (RFC 0028), PK fencing (RFC 0023), or
+checkpoint/retention markers (RFC 0025).
 
 Serving remains strict-single-version:
 
@@ -495,7 +501,7 @@ Serving remains strict-single-version:
 - missing or partial head state under a heads-format stamp is corruption;
 - there is no mixed-format serving period or compatibility reader.
 
-If RFC-023 or another capability is independently accepted for the same
+If RFC 0023 or another capability is independently accepted for the same
 release, one new format may initialize all of them after the combined
 initialization/recovery matrix passes. If capabilities release separately,
 each format bump requires its own rebuild under the strand policy. Co-release
@@ -508,7 +514,7 @@ is operator-cost coordination, not a dependency between heads and fencing.
 Initialization constructs the identity-capable schema and complete heads before
 the graph becomes writable:
 
-1. RFC-028 mints the target graph identity, stable IDs, and incarnations;
+1. RFC 0028 mints the target graph identity, stable IDs, and incarnations;
 2. every initial node/edge table is created with its accepted logical identity
    and exact physical schema;
 3. the first valid manifest publish writes one identity-bearing registration
@@ -530,7 +536,7 @@ An existing graph reaches the heads format only through the standard strand:
 1. quiesce and export the selected source branch with a binary that reads the
    old format;
 2. initialize a different graph root with the heads-capable binary;
-3. import through ordinary RFC-022 `load` staging/recovery;
+3. import through ordinary RFC 0022 `load` staging/recovery;
 4. verify head/current-state equivalence to the imported rows and any
    co-released capability, then cut clients over.
 
@@ -545,7 +551,7 @@ branch that matters is exported into a separate target graph today.
 A failed target initialization or import does not mutate the source. Before the
 target receives a complete format stamp it is not a serveable graph; discard or
 repair it and retry. After initialization, import failures use the ordinary
-RFC-022 sidecar protocol:
+RFC 0022 sidecar protocol:
 
 - unresolved table effects block later writes and recover all-or-nothing;
 - head, journal, graph lineage, and graph head publish together;
@@ -603,7 +609,7 @@ No migration claimant, per-branch conversion ledger, old-format writer mode, or
 - the target's first valid manifest contains exactly one live head and one
   identity-bearing registration event per initial table;
 - crashes during target init never make a partial target serveable, and import
-  crashes converge through ordinary RFC-022 recovery;
+  crashes converge through ordinary RFC 0022 recovery;
 - a separately rebuilt branch has the documented independent graph identity
   and no inherited commit history;
 - a post-activation branch inherits complete heads while native ref-incarnation
@@ -643,9 +649,9 @@ coverage and does run against RustFS in CI.
 
 - exact heads-format metadata schema and object IDs;
 - one head row per stable identity;
-- RFC-028 stable-ID/incarnation types plus `current_head_witness` in head
+- RFC 0028 stable-ID/incarnation types plus `current_head_witness` in head
   and identity-bearing journal event schemas;
-- RFC-023 PK metadata on node and edge tables when the release combines them;
+- RFC 0023 PK metadata on node and edge tables when the release combines them;
 - heads-format publisher source always pairs a journal/tombstone event with a head row.
 
 ## 13. Decisions and gate disposition
@@ -658,7 +664,7 @@ coverage and does run against RustFS in CI.
 - A separate heads dataset and a mutable in-process tip authority are rejected.
 - Existing graphs use strict-strand export/init/load; there is no in-place
   all-branch heads migration.
-- RFC-023 PK activation is verified at target initialization only when
+- RFC 0023 PK activation is verified at target initialization only when
   deliberately co-released.
 - Checkpoint retention is deferred.
 - The first in-manifest BTREE candidate is rejected: flat indexed scan work is
@@ -668,7 +674,7 @@ coverage and does run against RustFS in CI.
 
 ### Gate status
 
-1. **Closed prerequisite:** [RFC-028](0028-stable-schema-identity.md)'s accepted
+1. **Closed prerequisite:** [RFC 0028](0028-stable-schema-identity.md)'s accepted
    and implemented identity/incarnation contract.
 2. **Rejected candidate:** the in-manifest BTREE has correct bounded scan work
    and bounded observable uncovered tails, but fails the complete physical cost

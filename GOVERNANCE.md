@@ -37,7 +37,7 @@ The lane is set by **blast radius and design impact**, not line count.
 - **L — design.** Creates or changes a design: new user-facing surface
   (query/schema/CLI/HTTP), on-disk or wire formats, a new substrate
   dependency, anything irreversible, or anything touching an accepted RFC.
-  Path: **issue → `accepted` → RFC PR → merged → code PRs**.
+  Path: **issue → `accepted` → draft RFC → RFC `accepted` → code PRs**.
 
 If you cannot tell S from M, it is M. A reviewer who reclassifies a change
 upward closes the PR and restarts it on the correct path — that is about
@@ -49,10 +49,10 @@ Labels are the state machine; an issue has exactly one status label.
 
 - `needs-triage` — default on arrival. No work should start.
 - `accepted` — a maintainer agreed the change should exist; a code PR may
-  follow. For size L, this is also the state after the RFC merges.
+  follow for size M. Size L still requires an accepted RFC.
 - `needs-rfc` — size L, accepted with the design outstanding. It replaces
-  `accepted` until the RFC PR merges (writing the RFC is authorized); the
-  issue then returns to `accepted`, and code may start.
+  `accepted` while the RFC is drafted and reviewed; the issue returns to
+  `accepted` only when the RFC's lifecycle becomes `accepted`.
 - `blocked` — accepted, but waiting on something named in the thread.
 - `declined` — closed, with a reason.
 
@@ -67,12 +67,13 @@ tracking) and its **document** (`docs/rfcs/NNNN-title.md`). Numbering,
 statuses, and the template live in
 [docs/rfcs/README.md](docs/rfcs/README.md).
 
-- **Merging the RFC PR is the green light to write code.** An accepted issue
-  alone is not enough for an L change — it only authorizes writing the RFC.
-- **A merged RFC sanctions its implementation PRs directly**: code PRs
+- **RFC lifecycle is explicit.** A draft may merge so review and evidence have
+  one durable home; merge alone is not acceptance. Code starts only after a
+  maintainer changes the RFC's frontmatter to `status: accepted`.
+- **An accepted RFC sanctions its implementation PRs directly**: code PRs
   reference the RFC, and the RFC's issue is the umbrella that tracks them.
 - **Amending an accepted RFC is itself a size-L change**: issue → `accepted`
-  → amendment PR → merged → code. Discovering mid-implementation that the
+  → amendment PR → accepted amendment → code. Discovering mid-implementation that the
   design is wrong is normal and welcome — stop, amend, then continue. A code
   PR that rewrites an accepted RFC on the way through is rejected regardless
   of the code's quality.
@@ -90,7 +91,7 @@ draft means unfinished, not unreviewed.
 
 ### A ready PR must
 
-- reference its `accepted` issue or a merged RFC — or be size S;
+- reference its `accepted` issue or an accepted RFC — or be size S;
 - keep to one kind of content: an RFC PR touches only `docs/rfcs/`; a
   contributor code PR does not modify RFC documents (amend first, then code);
 - be green on CI (build, `fmt`, `clippy`, tests, and the repo's drift
@@ -107,8 +108,9 @@ reviewable. Reclassified changes restart on the correct path rather than
 being renegotiated in the thread. Low-effort PRs with no evident mental model
 and no testing beyond the happy path may be closed without detailed review.
 
-Enforcement is by convention and review to start; automated checks (an
-RFC-path guard, an issue-link check) may be added as volume warrants.
+Review enforces issue linkage. CI also validates RFC location, numbering,
+metadata, lifecycle values, registry entries, and documentation links with
+`scripts/check-docs.py`.
 
 ## Code of conduct & security
 

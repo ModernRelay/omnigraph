@@ -1,157 +1,119 @@
-# Authorization (Cedar policy)
+# Authorization and actors
 
-OmniGraph integrates AWS Cedar (`cedar-policy = 4.9`) for ABAC.
+OmniGraph uses Cedar policy bundles to authorize graph and server actions.
+Policies are declared in `cluster.yaml`, applied with the cluster, and loaded
+when the server starts.
 
-## Policy actions
+## Actions
 
-Per-graph actions (bind to `Omnigraph::Graph::"<graph_id>"`):
+Graph-scoped actions:
 
-1. `read` — query / snapshot / list branches & commits
-2. `export` — NDJSON export
-3. `change` — mutations
-4. `schema_apply` — apply schema migrations
-5. `branch_create`
-6. `branch_delete`
-7. `branch_merge`
-8. `admin` — reserved for policy-management surfaces (hot reload, audit log, approvals). No call site today.
-9. `invoke_query` — gates invoking a server-side stored query (the `queries:` registry). Graph-scoped (like `admin`) — per-branch access is enforced by the inner `read` / `change` gate, so a rule that sets `branch_scope` on `invoke_query` is rejected. Coarse in this release: an `invoke_query` allow rule permits any stored query on the graph; a future, additive refinement adds an optional per-query-name scope without changing rules written against the coarse action. Enforced at `POST /queries/{name}` (see [server](server.md)). A stored *mutation* is double-gated: `invoke_query` to reach the tool, plus `change` for the write itself (the engine `_as` writers still enforce per the query body).
+| Action | Covers |
+|---|---|
+| `read` | Queries, snapshots, branches, and commits |
+| `export` | Snapshot export |
+| `change` | Mutations and loads |
+| `schema_apply` | Schema changes |
+| `branch_create` | Branch creation |
+| `branch_delete` | Branch deletion |
+| `branch_merge` | Branch merge |
+| `invoke_query` | Entry to a stored query |
+| `admin` | Reserved graph administration |
 
-Server-scoped action (v0.6.0+; binds to `Omnigraph::Server::"root"`):
+`graph_list` is server-scoped and controls `GET /graphs`.
 
-10. `graph_list` — `GET /graphs` registry enumeration (multi-graph mode)
+A stored mutation requires both `invoke_query` and `change`. A stored read
+requires `invoke_query` and `read`.
 
-Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A policy bundle cannot mix server-scoped and per-graph actions; split them into separate files and cluster policy entries. (Runtime `graph_create` / `graph_delete` over HTTP are reserved but not shipped; operators add/remove graphs by editing the cluster's `cluster.yaml`, running `omnigraph cluster apply`, and restarting the server.)
-
-## Scope kinds
-
-- `branch_scope` — applied to source branch (`read`, `export`, `change`)
-- `target_branch_scope` — applied to destination (`schema_apply`, branch ops, run ops)
-- `protected_branches` — named list with special rules; rule scopes are `any | protected | unprotected`
-- Graph-scoped per-graph actions (`admin`, `invoke_query`) take **neither** scope; a rule that sets one is rejected at validation.
-
-## Per-graph vs. server-level policy
-
-A server boots from a cluster (`--cluster <dir>`), and the cluster's
-`cluster.yaml` declares its policy bundles in a `policies:` section. Each bundle
-has exactly one runtime kind: it applies either to one or more graph ids
-(per-graph rules — `read`, `change`, `branch_*`, `schema_apply`) or to the
-literal `cluster` (server-level rules — `graph_list`), never both. One scope may
-have only one bundle; combine rules that govern the same scope into that file.
+## Bind a policy
 
 ```yaml
 # cluster.yaml
 policies:
-  server:
-    file: server.policy.yaml
-    applies_to: [cluster]              # server-level rules only
-  graphs:
+  graph-access:
     file: graph.policy.yaml
-    applies_to: [knowledge, alpha]     # one graph policy shared by two graphs
+    applies_to: [knowledge]
+  server-access:
+    file: server.policy.yaml
+    applies_to: [cluster]
 ```
 
-A graph with no bundle bound to it has no engine-layer Cedar enforcement. Each
-graph's HTTP request flows through its bound bundle; the management endpoint
-(`GET /graphs`) flows through the `cluster`-scoped bundle. When no bundle binds
-`cluster`, `GET /graphs` is denied in every runtime state, including
-`--unauthenticated`; with bearer tokens configured it returns 403 after admission
-control because `graph_list` is not a `read`-equivalent action. The operator must
-bind a `cluster`-scoped bundle granting `graph_list` to expose `/graphs`.
+A bundle may target graph IDs or the `cluster` scope, but not both. Only one
+bundle may bind a given scope.
 
-Example `cluster`-scoped bundle:
+Example graph policy:
 
 ```yaml
 version: 1
 groups:
-  admins: [act-andrew]
+  readers: [act-alice, act-bob]
 rules:
-  - id: admins-can-list-graphs
+  - id: readers-can-read
     allow:
-      actors: { group: admins }
-      actions: [graph_list]
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+  - id: readers-can-invoke
+    allow:
+      actors: { group: readers }
+      actions: [invoke_query]
 ```
 
-Each per-graph rule may use at most one of `branch_scope` or
-`target_branch_scope`. Server-scoped rules (`graph_list`) take neither — they
-have no branch context.
+Graph rules may use `branch_scope` for a source branch or
+`target_branch_scope` for a destination branch. Values are `any`, `protected`,
+or `unprotected`; a rule may not set both. Server actions and graph-wide
+`invoke_query` rules do not take branch scopes.
 
-## Actor for direct-engine writes
+## Validate and test
 
-The default actor identity for CLI direct-engine (`--store`) writes is
-`operator.actor` in `~/.omnigraph/config.yaml`. Override per-invocation with
-`--as <ACTOR>` — `--as` wins, otherwise `operator.actor`, otherwise no actor.
-Remote HTTP writes ignore both — they resolve their actor server-side from the
-bearer token. (Direct-store access carries no Cedar policy; policy
-lives in the cluster/server.)
+Policy commands read the applied bundle from a cluster:
 
-## CLI
+```bash
+omnigraph policy validate --cluster ./company-brain --graph knowledge
+omnigraph policy test --tests policy.tests.yaml \
+  --cluster ./company-brain --graph knowledge
+omnigraph policy explain \
+  --cluster ./company-brain --graph knowledge \
+  --actor act-alice --action read --branch main
+```
 
-Policy tooling reads a cluster's applied policy bundles: pass `--cluster <dir>`,
-and `--graph <id>` to pick a graph's bundle when several apply.
+Run `cluster apply` and restart servers after changing a policy source.
 
-- `omnigraph policy validate` — parse + count actors, exit 1 on parse error.
-- `omnigraph policy test --tests <file>` — run the declarative cases in `<file>` against the selected bundle, exit 1 on any expectation mismatch.
-- `omnigraph policy explain --actor … --action … [--branch …] [--target-branch …]` — show decision and matched rule.
-- `omnigraph --as <ACTOR> <subcommand>` — set the actor for the duration of one invocation. Effective for `change`, `load` (and its deprecated `ingest` alias), `branch create|delete|merge`, and `schema apply` against a direct (`--store`) graph. **Rejected** on a served write (`--server`): the actor is bearer-token-resolved server-side, so `--as` can't set it there.
+## Actor identity
 
-## Enforcement
+For HTTP requests, the server maps the bearer token to an actor. Headers,
+query parameters, and request bodies cannot override that identity.
 
-Policy is a property of the **engine**, not the transport. Every mutating
-write — `mutate_as`, `load_as` (the deprecated `ingest_as` shims route
-through it), `apply_schema_as`,
-`branch_create_as`, `branch_create_from_as`, `branch_delete_as`,
-`branch_merge_as` — consults the policy gate at the head of the method.
-The gate fires identically whether the call
-originates from the HTTP server, the CLI, or an embedded SDK consumer.
-When no policy is installed (the dev/embedded default) the gate
-is a strict no-op; when one is installed and the call site forgets to
-thread an actor through, the gate fails closed rather than silently
-bypassing.
+For direct CLI writes, actor resolution is:
 
-## Server runtime states
+1. `--as <ACTOR>`;
+2. `operator.actor` in `~/.omnigraph/config.yaml`;
+3. no actor.
 
-The HTTP server classifies its startup configuration into one of three
-states based on whether bearer tokens are configured and whether a
-policy file is set. The state determines what happens to a request that
-reaches the authorization gate without a matching policy permit.
+When a policy is installed, a missing actor is denied. Served writes reject
+`--as` because only the server may resolve their actor.
 
-| State | Tokens | Policy file | Behavior |
-|---|---|---|---|
-| **Open** | no | no | Every request is permitted. Refuses to start unless `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` is set — the operator must explicitly opt in. |
-| **DefaultDeny** | yes | no | Every authenticated request for an action other than `read` is rejected with HTTP 403. Closes the "tokens but forgot the policy file" trap — an operator who sets up auth and forgot to point at a policy file used to ship the illusion of protection. |
-| **PolicyEnabled** | yes | yes | Authenticated requests that reach a configured policy engine are evaluated by Cedar. Server-scoped actions still require a `cluster`-scoped policy bundle. |
+Successful graph commits record the actor for the whole atomic change. Inspect
+the audit trail with:
 
-The server refuses to start for the "no tokens, no policy, no flag" cell
-and for "policy file, no tokens" — instead of silently shipping an open
-instance or a policy-protected server that can only 401.
+```bash
+omnigraph commit list --store ./graph.omni --json
+omnigraph commit show <COMMIT_ID> --store ./graph.omni --json
+```
 
-Server-side, request authorization still runs at the HTTP boundary —
-that's where actor identity is resolved from the bearer token and where
-admission control / per-actor rate limits live. Engine-layer enforcement
-is the **defense in depth** layer: it catches CLI direct-engine writes,
-embedded SDK consumers, and any future transport that hasn't (or won't)
-re-implement the HTTP boundary's authorization. Both layers consult the same
-Cedar policy, so decisions cannot disagree.
+## Server startup modes
 
-## Coarse vs. fine enforcement
-
-There are two enforcement points, each with non-overlapping
-responsibilities:
-
-| Layer | Question it answers | Where it fires |
+| Tokens | Policy | Startup and authorization |
 |---|---|---|
-| **Engine-layer (coarse)** | Can this actor invoke this action against this branch / branch-transition? | The policy gate at the head of every `_as` writer; one Cedar decision per call. |
-| **Query-layer (fine)** | For the entities and types this action actually touches, which can the actor see or modify? | Per-entity predicates pushed into the query plan. **Not yet implemented.** |
+| none | none | Requires explicit `--unauthenticated`; otherwise startup fails |
+| configured | none | Only the `read` action is allowed; all other actions are denied |
+| configured | configured | The policy decides each action |
+| none | configured | Startup fails because no request could establish an actor |
 
-The engine-layer gate keeps its resource scope deliberately at branch
-granularity (graph, branch, target branch, branch transition).
-Per-type and per-entity authority is the query-layer's job; conflating them
-in the engine-layer scope would create two places per-type policy could be
-evaluated and a drift surface between them.
+`GET /graphs` is denied unless a `cluster`-scoped policy grants `graph_list`,
+including when graph policies exist.
 
-## Actor identity (signed-claim-only)
-
-The actor identity used for every policy decision comes from the matched bearer token — never from a client-supplied request header, query parameter, or body field. The server resolves the token at the auth middleware boundary, looks up the actor it was minted for, and overwrites whatever the handler may have placed in the policy request. Clients cannot set `actor_id` directly.
-
-This is intentional. Trusting client-supplied identity for authorization is "asking the attacker if they're an admin" — Supabase's RLS history names the same footgun. The chokepoint lives at the server's auth boundary: a request with `Authorization: Bearer <token-for-actor-A>` plus `X-Actor-Id: actor-B` always evaluates as actor A, never as actor B.
-
-If you find yourself wanting to let clients override `actor_id` for impersonation, delegation, or service-account flows — that's a feature, but it needs explicit design (e.g., signed delegation claims, an `On-Behalf-Of` audit trail). It is not a convenience knob.
+Policy is enforced for graph writes inside the engine as well as at the HTTP
+boundary. This keeps direct and embedded writers subject to the same action
+checks when a policy engine is installed. Per-entity and per-property
+authorization is not currently supported; authorization is graph/branch scoped.

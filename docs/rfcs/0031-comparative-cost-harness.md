@@ -1,18 +1,21 @@
 ---
-type: spec
-title: "RFC-031 — Comparative cost harness"
-description: A checked-in harness that measures time, storage requests, bytes, and memory for the same logical work across two builds and two access paths, so release-gating cost regressions are caught by evidence instead of noticed by accident.
+rfc: "0031"
+title: "Comparative cost harness"
+track: maintainer
 status: draft
-tags: [eng, rfc, benchmark, performance, cost, release-gate, tooling, omnigraph]
-timestamp: 2026-08-05
-owner: OmniGraph maintainers
+implementation: not-started
+authors:
+  - OmniGraph maintainers
+created: 2026-08-05
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-031: Comparative cost harness
+# RFC 0031: Comparative cost harness
 
-**Status:** Draft
-**Date:** 2026-08-05
-**Author track:** Maintainer design series
 **Depends on:** nothing. Deliberately additive tooling; no product behavior,
 format, or protocol change. A test-only metrics feature/recorder is in scope.
 **Complements, does not replace:** `crates/omnigraph/tests/helpers/cost.rs` and
@@ -31,7 +34,7 @@ current-format graph costs ~55 more S3 requests than against 0.8.1 — a fixed
 toll paid at graph open, introduced somewhere across fifteen format strands,
 noticed by nobody. A companion run through the cluster server showed the same
 toll amortized to zero, and isolated a separate 4× request increase confined to
-export. That measured edge build belonged to the subsequently removed RFC-026
+export. That measured edge build belonged to the subsequently removed RFC 0026
 lineage; 0.9.0 returned to manifest schema v6. The numbers are historical
 evidence of an instrumentation gap, not a claim about current-main cost.
 
@@ -61,7 +64,7 @@ artifacts prove insufficient (§4.4).
 **Amendment note (2026-08-16).** §11 records what has been built against this
 RFC since it was drafted: two concurrent implementations of its counting idea
 (PR #503 on real backends, and a counting pass hosted on the deterministic
-simulation harness recorded in [RFC-0037](0037-deterministic-simulation-harness.md)),
+simulation harness recorded in [RFC 0037](0037-deterministic-simulation-harness.md)),
 the first measurement placing both on one ruler, and the division of roles
 that follows. Nothing in §§1-10 is
 retracted; §11 narrows where the counting side goes next.
@@ -306,7 +309,7 @@ incrementally from an explicit cursor/index rather than list an unbounded
 history on every report. SQLite or hosted telemetry may later be a rebuildable
 query view over those objects; neither is an authority or a dependency of the
 release gate. Lance's process-local metrics are likewise a measurement oracle,
-not the historical record store. RFC-032 may reuse the envelope library for its
+not the historical record store. RFC 0032 may reuse the envelope library for its
 own local records without depending on shared storage.
 
 ## 5. Where it lives
@@ -606,7 +609,7 @@ The harness must prove itself before its numbers are trusted:
 Added after the original draft. Records results from DST v1, the first
 iteration of the project's deterministic simulation testing (bench runs 001
 and 002), and from PR #503. Design authority for the hosting harness is the
-merged [RFC-0037](0037-deterministic-simulation-harness.md) design record
+merged [RFC 0037](0037-deterministic-simulation-harness.md) design record
 (PR #507); like this amendment, it documents machinery already built and
 measured.
 

@@ -1,59 +1,82 @@
-# RFC NNNN: <title>
+---
+rfc: "NNNN"
+title: "Short descriptive title"
+track: maintainer
+status: draft
+implementation: not-started
+authors:
+  - Name or handle
+created: YYYY-MM-DD
+updated: YYYY-MM-DD
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
 
-> This template is for the public contribution track. See
-> [README.md](README.md#maintainer-design-series-lifecycle)
-> for the separately versioned maintainer design-series lifecycle.
+# RFC NNNN: Short descriptive title
 
-| | |
-|---|---|
-| **Status** | Proposed |
-| **Author track** | Public contribution |
-| **Author(s)** | <your name / handle> |
-| **Discussion** | <link to the originating Discussion, if any> |
-| **Implementation** | <issue/PR links, filled in as work lands> |
-
-> Status is maintained by maintainers: `Proposed` while the PR is open,
-> `Accepted` on merge, `Declined` on close, `Superseded by NNNN` later.
+Delete every instruction paragraph when it has been answered. Keep the RFC
+focused on the decision and evidence; implementation walkthroughs belong in
+developer docs unless they are necessary to define the contract.
 
 ## Summary
 
-One paragraph: what this changes, in plain terms.
+State the decision in one or two paragraphs. Name the behavior or contract that
+will exist if accepted and the boundary that will not change.
 
 ## Motivation
 
-What problem does this solve, and why is it worth the ongoing cost? Tie it to a
-concrete need (a Discussion, a recurring issue, a user request). Per the
-project's first principle, argue the *long-run liability*, not just the
-short-term convenience.
+Describe the concrete problem, evidence that it exists, and why solving it is
+worth the long-term maintenance cost. Explain why an issue or local refactor is
+not enough.
 
-## Guide-level explanation
+## User and operational behavior
 
-Explain the change as you'd teach it to a user or contributor: new commands,
-syntax, API shapes, behavior. Examples first.
+Show the observable behavior first: commands, APIs, errors, compatibility,
+failure posture, and operator responsibilities. Omit code structure unless it
+changes the contract.
 
-## Reference-level design
+## Design
 
-The precise design: data structures, IR/AST/planner changes, storage/format
-impact, migration path, error behavior. Enough that a reviewer can find the
-holes.
+Specify the durable architecture, data or protocol shapes, authority boundaries,
+and important sequencing. Separate inherited Lance behavior from behavior
+OmniGraph adds.
 
-## Invariants & deny-list check
+## Invariants
 
-Which Hard Invariants in [../dev/invariants.md](../dev/invariants.md) does this
-touch? Does it brush against any deny-list item — and if so, why is this the
-justified exception? State explicitly that no invariant is weakened, or which
-Known Gap moves.
+List the affected [architectural invariants](../dev/invariants.md) and explain
+why none is weakened. Call out every relevant deny-list item and any known gap
+that changes.
 
-## Drawbacks & alternatives
+## Compatibility and reversibility
 
-What does this cost, what did you reject, and why. "Do nothing" is a valid
-alternative to weigh.
+Cover storage and wire compatibility, migration, downgrade/refusal behavior,
+support boundaries, and the practical cost of reverting this decision.
 
-## Reversibility
+## Alternatives
 
-Is this reversible? On-disk/wire/format and substrate choices are near-permanent
-and demand more evidence; a CLI flag or doc is cheap to undo. Say which this is.
+Record the strongest alternatives, including doing nothing, and the evidence or
+liability that ruled each one out.
+
+## Evidence and tests
+
+Name existing test owners to extend, new evidence that is genuinely required,
+fixed acceptance thresholds, and upstream surfaces that were surveyed. Follow
+[the testing map](../dev/testing.md) and, for Lance-dependent work,
+[the Lance reading protocol](../dev/lance.md).
+
+## Rollout
+
+Give ordered, independently safe phases. State what can ship at each stop, what
+remains unavailable, and how `implementation` will advance.
 
 ## Unresolved questions
 
-What's deliberately left open for review to settle.
+List only decisions that must be settled before acceptance. Evidence gates
+belong in `blocked_on`; optional future work belongs out of scope.
+
+## Decision log
+
+Record dated material review outcomes and later amendments here. Do not create
+a separate review, final, or pre-merge copy of the RFC.

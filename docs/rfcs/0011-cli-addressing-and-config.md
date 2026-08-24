@@ -1,20 +1,35 @@
-# RFC-011: CLI refactoring — one addressing & config model
+---
+rfc: "0011"
+title: "CLI addressing and configuration"
+track: maintainer
+status: accepted
+implementation: complete
+authors:
+  - OmniGraph maintainers
+created: 2026-06-14
+updated: 2026-08-23
+discussion: null
+supersedes: ["0010"]
+superseded_by: []
+blocked_on: []
+---
 
-**Status:** Accepted — implemented (the `omnigraph.yaml` excision landed as
-#250/#251/#252; D1–D4, D6, D7, D9, D10 shipped). Two items remain: **D11**
-(server-side maintenance jobs) is gated on the bulk-data-plane RFC #219; **D5**
-(combined admin scope) stays deferred by design.
-**Date:** 2026-06-14
+# RFC 0011: CLI addressing and configuration
+
+> **Implementation note:** The `omnigraph.yaml` excision landed in
+> #250/#251/#252; D1–D4, D6, D7, D9, and D10 shipped. D11 (server-side
+> maintenance jobs) is outside this RFC's completed core and remains gated on
+> bulk-data-plane work; D5 (combined admin scope) remains deferred by design.
 **Audience:** CLI/server maintainers
-**Builds on:** [rfc-007-operator-config.md](rfc-007-operator-config.md)
+**Builds on:** [RFC 0007](0007-operator-config.md)
 (per-operator config, keyed credentials, named servers),
-[rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md)
+[RFC 0008](0008-retire-omnigraph-yaml.md)
 (the legacy file this RFC finishes removing),
-[rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md)
+[RFC 0009](0009-unified-access-paths.md)
 (`GraphClient` — embedded ≡ remote at the execution layer),
-[rfc-010-cli-planes-restructure.md](rfc-010-cli-planes-restructure.md)
+[RFC 0010](0010-cli-planes.md)
 (declared planes + the wrong-plane guard this RFC subsumes).
-**Sequencing:** lands as / after RFC-008 stage 5 (the `omnigraph.yaml` removal).
+**Sequencing:** lands as / after RFC 0008 stage 5 (the `omnigraph.yaml` removal).
 
 ## Summary
 
@@ -102,7 +117,7 @@ Every term is one concept. The rest of this RFC uses them precisely.
   (`OMNIGRAPH_PROFILE`).
 - **Credential** — a bearer token keyed to a **server name**, resolved via
   `OMNIGRAPH_TOKEN_<NAME>` or `~/.omnigraph/credentials` (`0600`); sent only to
-  the server it is keyed to. (Per RFC-007 — the operator config holds endpoints,
+  the server it is keyed to. (Per RFC 0007 — the operator config holds endpoints,
   never tokens.)
 
 ### What you run — definitions vs payloads
@@ -343,7 +358,7 @@ defaults:
   default_graph: knowledge
   output: table
 servers:
-  prod:    { url: https://graph.example.com }    # token keyed by name (RFC-007); no creds here
+  prod:    { url: https://graph.example.com }    # token keyed by name (RFC 0007); no creds here
   staging: { url: https://staging.example.com }
 profiles:                                          # optional, only for multiple environments
   staging: { server: staging, default_graph: knowledge }
@@ -423,7 +438,7 @@ for graph-scoped server/cluster verbs); `--uri` http-scheme dispatch; `--via`
 
 The same ontology applies to `omnigraph-server` boot: with `omnigraph.yaml` gone,
 a server boots from a single bare graph URI **or** a cluster (`--cluster <dir|s3>`,
-RFC-005), never a `graphs:` map. The store/server/cluster ontology is then
+RFC 0005), never a `graphs:` map. The store/server/cluster ontology is then
 consistent across CLI and server.
 
 ## Migration & compatibility
@@ -477,7 +492,7 @@ deferred (see below); they do not block the model.
 1. **Local-dev path → embedded `--store` scope.** Local dev runs the engine
    in-process against a `--store <file>` (or a store-scoped profile); `omnigraph
    serve` stays available but is not required. Consistent with embedded ≡ remote
-   (RFC-009).
+   (RFC 0009).
 2. **Primitives are one flag, typed by content.** `--server` and `--cluster`
    accept either a config name or a literal URI: a value containing `://` is a
    literal (bypasses the registry); otherwise it is a config-name lookup (error if
@@ -507,7 +522,7 @@ deferred (see below); they do not block the model.
    prompt — destructive without `--yes` errors.
 10. **Cluster graphs evolve only via `cluster apply`.** `schema apply` (an `any`
    verb) targets standalone graphs; against a cluster-managed graph it errors and
-   points at `cluster apply` (which records ledger/recovery/approvals — RFC-004).
+   points at `cluster apply` (which records ledger/recovery/approvals — RFC 0004).
    Mirrors `init`'s refusal of a cluster-managed path.
 11. **Maintenance moves server-side (committed direction).** `optimize`/`cleanup`
    (and healthy-path `repair`) become server/cluster-managed async jobs —
@@ -567,9 +582,9 @@ normal operator's setup mostly cannot issue them by accident at all.
 
 ## Relationship to prior work
 
-The completion of the config/CLI lineage: RFC-007 added the operator config and
-keyed credentials; RFC-008 demoted `omnigraph.yaml`; RFC-009 unified execution
-behind `GraphClient`; RFC-010 declared the planes. This RFC removes the last
+The completion of the config/CLI lineage: RFC 0007 added the operator config and
+keyed credentials; RFC 0008 demoted `omnigraph.yaml`; RFC 0009 unified execution
+behind `GraphClient`; RFC 0010 declared the planes. This RFC removes the last
 legacy addressing surface so the plane model becomes a clean function of the three
 real entities, and folds the planes into a single capability rule. It is adjacent
 to the bulk-data-plane proposal in
@@ -618,7 +633,7 @@ omnigraph
    ├─ policy { validate | test | explain }   offline Cedar tooling
    ├─ profile { list | show }                read-only; NO mutating `use` (no sticky state)
    ├─ alias <name> [args]                    personal shortcut; expands to its bound stored-query call (D4)
-   ├─ config { migrate }                     finish the omnigraph.yaml split (RFC-008)
+   ├─ config { migrate }                     finish the omnigraph.yaml split (RFC 0008)
    ├─ login / logout                         per-server bearer credentials
    ├─ embed                                  offline embedding pipeline
    ├─ lint --query <path> --schema <path>    file-only query lint
@@ -683,7 +698,7 @@ is *today*.
 | **Session** | no graph | — |
 
 `--server`/`--graph` are gated strictly to the data plane; `guard_addressing`
-(`planes.rs:128`) rejects them elsewhere (RFC-010 Slice 1).
+(`planes.rs:128`) rejects them elsewhere (RFC 0010 Slice 1).
 
 ### Command tree by plane (today)
 
@@ -721,7 +736,7 @@ argv-shim → `lint`; `get` aliases `schema show`; `ingest` is hidden but runs.
 | `<URI>` / `--uri` | nothing (explicit) | the literal URI | — |
 | `--target <name>` | `omnigraph.yaml` `graphs:` | that graph's `uri` (local / S3 / **http**) | `config.rs::resolve_target_uri` |
 | `--server <name>` (+`--graph`) | `~/.omnigraph/config.yaml` `servers:` | a remote server URL | `helpers.rs::resolve_server_flag` |
-| `--cluster <dir\|s3> --cluster-graph <id>` | served cluster state | the graph's storage URI | `helpers.rs` (RFC-010 Slice 3) |
+| `--cluster <dir\|s3> --cluster-graph <id>` | served cluster state | the graph's storage URI | `helpers.rs` (RFC 0010 Slice 3) |
 
 Precedence (`resolve_target_uri`): explicit `<URI>`/`--uri` → `--target` →
 `cli.graph` default → error. `is_remote_uri` (`helpers.rs:15`) then selects
@@ -738,7 +753,7 @@ Precedence (`resolve_target_uri`): explicit `<URI>`/`--uri` → `--target` →
 ## Audit comments
 
 Reviewed against the current CLI taxonomy, `planes.rs`, `cli.rs`, `helpers.rs`,
-`client.rs`, RFC-007/RFC-010, and the user-facing CLI/server docs.
+`client.rs`, RFC 0007/RFC 0010, and the user-facing CLI/server docs.
 
 ### Validated
 

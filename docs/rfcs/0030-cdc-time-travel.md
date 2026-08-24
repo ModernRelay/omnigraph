@@ -1,24 +1,26 @@
 ---
-type: spec
-title: "RFC-030 — Graph change feed and retained-history contract"
-description: Defines graph-vocabulary commit diffs and a graph change feed with bounded page tokens, durable cursors, and no public storage-table machinery.
-status: implemented
-tags: [eng, rfc, cdc, change-feed, time-travel, provenance, lineage, audit, omnigraph]
-timestamp: 2026-08-05
-owner: OmniGraph maintainers
+rfc: "0030"
+title: "Graph change feed and retained-history contract"
+track: maintainer
+status: accepted
+implementation: partial
+authors:
+  - OmniGraph maintainers
+created: 2026-08-05
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-030: Graph change feed and retained-history contract
+# RFC 0030: Graph change feed and retained-history contract
 
-**Status:** Implemented for C0–C3. The §4.4 ordering, client-pagination, and
-continuation-size gates are closed as recorded in §14. C4+ remain design-stage.
+C0–C3 are implemented. The §4.4 ordering, client-pagination, and
+continuation-size gates are closed as recorded in §14; C4+ remain design-stage.
 
-**Date:** 2026-08-05
-
-**Author track:** Maintainer design series
-
-**Depends on:** RFC-013 Phase 7 graph lineage, RFC-022 snapshot capture and
-publication, RFC-023 exact-`id` table fencing, and RFC-028 immutable table
+**Depends on:** RFC 0013 Phase 7 graph lineage, RFC 0022 snapshot capture and
+publication, RFC 0023 exact-`id` table fencing, and RFC 0028 immutable table
 identity.
 
 **Surveyed:** OmniGraph `main` at commit
@@ -111,7 +113,7 @@ originally surveyed here. There is no merged deleted-row API. Draft
 [Lance PR #5002](https://github.com/lance-format/lance/pull/5002) explores
 `_row_deleted_at_version`; its continuation
 [PR #6671](https://github.com/lance-format/lance/pull/6671) closed without
-merging. RFC-030 keeps an adoption seam for a future complete upstream delete
+merging. RFC 0030 keeps an adoption seam for a future complete upstream delete
 surface but does not depend on either proposal.
 
 Two details are load-bearing:
@@ -785,7 +787,7 @@ compatible graph schema established out of band.
   may wrap it later without changing semantics.
 - **Branch lifecycle events:** branch create/delete are control-plane events,
   not graph content commits.
-- **Retention pins/checkpoints:** RFC-025's domain.
+- **Retention pins/checkpoints:** RFC 0025's domain.
 - **Cross-rebuild history:** export/import rebuild preserves logical graph data,
   not the old storage strand's commit feed.
 - **History-flat arbitrary catch-up:** requires measured substrate support; no
@@ -904,7 +906,7 @@ implementation, recorded here so later phases inherit them:
   per-transaction provenance proof** — the `omnigraph.no_by_source_delete`
   marker every general keyed MergeInsert update stamps
   (`table_store::stamp_no_by_source_delete` at the one keyed merge chokepoint),
-  or the RFC-023 `insert_absence` certificate carried by proven strict inserts.
+  or the RFC 0023 `insert_absence` certificate carried by proven strict inserts.
   The op shape plus D2 and the retained `forbidden_apis.rs` source guard
   (`no_delete_capable_merge_arm_in_engine_source`, now defense-in-depth) prove
   only that current engine code builds no by-source-delete arm; they cannot
@@ -1035,8 +1037,8 @@ implementation, recorded here so later phases inherit them:
   `LANCE_BYPASS_SPILLING` causes a refusal instead of silently weakening the
   contract. This one chokepoint also bounds branch merge, finite diff, and
   export, which share the ordered scan. See
-  [merge-complexity.md](../dev/merge-complexity.md) for the source-level cost
-  audit and retained caveats.
+  [the merge implementation guide](../dev/merge.md) for the current source-level
+  design and retained caveats.
 - **Second review round (shipped).** A second independent review found three
   correctness gaps and four polish items, now fixed:
   - **Managed-Blob identity is the immutable data-file path, not the fragment

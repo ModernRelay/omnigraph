@@ -2221,7 +2221,7 @@ async fn stage_overwrite_does_not_advance_head_until_commit() {
 /// `_rowid` stability (change-feed validators, index reconcilers) would
 /// observe silent corruption.
 ///
-/// Pinned invariant — see `docs/storage.md` "Stable row IDs".
+/// Pinned invariant — see `docs/dev/lance.md` "Stable row IDs".
 #[tokio::test]
 async fn stage_overwrite_preserves_stable_row_ids() {
     let dir = tempfile::tempdir().unwrap();

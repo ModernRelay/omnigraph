@@ -1,26 +1,34 @@
 ---
-type: spec
-title: "RFC-027 — Lineage-based merge deltas"
-description: Research specification for replacing full-width branch-merge classification with Lance row-version lineage, explicitly blocked on a sublinear deletion-delta source and enforceable I/O cost gates.
-status: research-blocked
-tags: [eng, rfc, merge, lineage, change-feed, performance, lance, omnigraph]
-timestamp: 2026-07-10
-owner: OmniGraph maintainers
+rfc: "0027"
+title: "Lineage-based merge deltas"
+track: maintainer
+status: draft
+implementation: not-started
+authors:
+  - OmniGraph maintainers
+created: 2026-07-10
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on:
+  - Sublinear deletion-delta discovery
+  - Enforceable I/O cost gates
 ---
 
-# RFC-027 — Lineage-based merge deltas
+# RFC 0027: Lineage-based merge deltas
 
-**Status:** Research blocked — deletion-delta discovery
-**Date:** 2026-07-10
-**Author track:** Maintainer design series
-**Depends on:** [RFC-022](0022-unified-write-path.md)'s unified branch-merge
+> **Current disposition:** This draft remains blocked on deletion-delta
+> discovery and evidence that the replacement is sublinear in practice.
+
+**Depends on:** [RFC 0022](0022-unified-write-path.md)'s unified branch-merge
 pipeline and capture-once write view
 **Surveyed:** omnigraph 0.8.1; Lance 9.0.0-rc.1 at git rev
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance row-lineage,
 transaction, branching, and read/write specifications
 **Audience:** merge, storage, and performance maintainers
-**Open architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
-Findings marked **BLOCKER** must be dispositioned before acceptance.
+The former cross-RFC architecture review's owned blockers and evidence gates
+are incorporated below and remain prerequisites for acceptance.
 
 ---
 
@@ -68,7 +76,7 @@ For each table touched since the merge base:
 2. classify insert, update, and delete without loading unrelated user columns;
 3. join the two candidate sets into the existing merge truth table;
 4. fetch complete rows only for candidates whose disposition needs values;
-5. stage the resulting delta through RFC-022 and publish once.
+5. stage the resulting delta through RFC 0022 and publish once.
 
 The semantic oracle remains `merge_truth_table`. This RFC changes candidate
 discovery and I/O, not conflict kinds, delete/update precedence, constraint
@@ -131,7 +139,7 @@ Write immutable per-commit deleted-ID rows in the same manifest CAS as the graph
 commit. This is first-class commit metadata, not a side channel. It adds storage
 and format liability and therefore needs its own accepted format-capability
 decision, or an explicit co-release decision with independently accepted
-siblings, before use. It is not implicitly part of RFC-028's identity format or
+siblings, before use. It is not implicitly part of RFC 0028's identity format or
 any other sibling's provisional format number.
 
 Until one option passes the cost and correctness gates, delete-bearing histories
@@ -175,7 +183,7 @@ lookups or SIP; they do not synthesize string `IN` filters or read embedding/blo
 columns for candidates whose disposition needs only identity.
 
 The merge base, physical entries, and candidate cuts are captured once before
-heavy work. After acquiring publish queues, RFC-022's OCC/read-set rule either
+heavy work. After acquiring publish queues, RFC 0022's OCC/read-set rule either
 confirms the cut or restarts discovery; it never publishes a delta classified
 against a moved side.
 

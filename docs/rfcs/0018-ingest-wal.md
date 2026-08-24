@@ -1,25 +1,31 @@
 ---
-type: spec
-title: "RFC-018 — Streaming-ingest WAL on Lance MemWAL"
-description: Historical proposal for a durability-first Lance MemWAL ingest path; superseded by RFC-026 and rejected with it after implementation and benchmarking.
+rfc: "0018"
+title: "Streaming-ingest WAL on Lance MemWAL"
+track: maintainer
 status: rejected
-tags: [eng, rfc, wal, ingest, lance, omnigraph]
-timestamp: 2026-07-02
-owner: OmniGraph maintainers
+implementation: removed
+authors:
+  - OmniGraph maintainers
+created: 2026-07-02
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: ["0026"]
+blocked_on: []
 ---
 
-# RFC-018 — Streaming-ingest WAL on Lance MemWAL
+# RFC 0018: Streaming-ingest WAL on Lance MemWAL
 
-**Status:** Rejected. Superseded by [RFC-026](0026-memwal-streaming-ingest.md),
-then rejected with it; see [the removal decision](../dev/wal-removal.md).
-**Date:** 2026-07-02
-**Author track:** Maintainer design series
+> **Disposition:** Superseded by [RFC 0026](0026-memwal-streaming-ingest.md),
+> then rejected with it; see the current
+> [ingestion contract](../dev/ingestion.md).
+
 **Surveyed version:** 0.7.2 (branch `dst-extract-crate`); Lance pinned at 7.0.0
 **Upstream surveyed:** Lance v8.0.0 (released; RC votes closed 2026-07-01), v9.0.0-beta.10; MemWAL spec (`lance.org/format/table/mem_wal/`, fetched in full 2026-07-02); discussions #7260, #7264, #7222, #7176
 **Audience:** OmniGraph maintainers
 
-> **Supersession note (2026-07-10):** RFC-026 carries the streaming-ingest
-> design forward under RFC-022's unified graph-write protocol. It also corrects
+> **Supersession note (2026-07-10):** RFC 0026 carries the streaming-ingest
+> design forward under RFC 0022's unified graph-write protocol. It also corrects
 > this draft's characterization of MemWAL: MemWAL is a strategic Lance
 > architecture and a major substrate investment, not an experimental direction.
 > The integration risk is its evolving API and format surface across Lance
@@ -47,7 +53,7 @@ This RFC adds one, with a hard constraint set:
 
 1. **The WAL sits in FRONT of the commit point, never beside it.** The
    `__manifest` CAS remains the single linearization point for graph
-   visibility and lineage (the RFC-013 Phase 7 conclusion). The WAL is an
+   visibility and lineage (the RFC 0013 Phase 7 conclusion). The WAL is an
    ingestion buffer whose contents *become* graph state only through the
    existing publish seam. No second metadata authority is created.
 2. **No custom WAL.** Lance ships MemWAL — a complete spec'd LSM layer
@@ -79,7 +85,7 @@ Today one graph write costs, serially: per touched table a staged write +
 `commit_staged` (a Lance commit, itself several object-store round trips),
 then one `ManifestBatchPublisher::publish` (merge-insert CAS on `__manifest`).
 Latency is the sum of the chain; throughput per branch is bounded by the
-shared `graph_head:<branch>` row (the deliberate RFC-013 §7.1 contention
+shared `graph_head:<branch>` row (the deliberate RFC 0013 §7.1 contention
 point) at the object store's conditional-write rate — single-digit commits/sec
 on S3. `write_cost.rs` keeps this *flat in history*, which is the right
 guarantee for the interactive path, but nothing can make it *cheap per op*:
@@ -273,7 +279,7 @@ fold time** (the fold pipeline calls the embedding client on the folded
 batch, same code path as `load`). Consequence: memtable-maintained *vector*
 indexes cannot cover not-yet-embedded rows — fresh-tier vector search over an
 `@embed`-sourced column sees rows only post-fold (fresh-tier FTS and scans
-are unaffected). Documented per-column; RFC-015 owns the deeper embedding
+are unaffected). Documented per-column; RFC 0015 owns the deeper embedding
 pipeline.
 
 ## 5. Reconciliation with Lance v8.0.0 (Phase 0 — the bump)

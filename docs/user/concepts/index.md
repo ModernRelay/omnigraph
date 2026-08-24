@@ -1,49 +1,64 @@
 # Concepts
 
-OmniGraph is a typed property-graph engine built as a coordination layer over the
-[Lance](https://lance.org) columnar storage format. It gives you a schema-checked
-graph with vector, full-text, and graph queries in one runtime, plus Git-style
-branches and commits across the whole graph.
+OmniGraph is a typed property-graph database. A graph contains **nodes**,
+**edges**, and a schema that defines their properties and constraints. The same
+graph can be queried with structured graph patterns, full-text search, and
+vector search.
 
-## The data model
+## Graph model
 
-- A graph has **node types** and **edge types**, declared in a
-  [schema](../schema/index.md).
-- Each node type and each edge type is stored as its **own Lance dataset** —
-  columnar, versioned, on local disk or object storage.
-- A single `__manifest` graph-manifest dataset coordinates all of those datasets, so the graph has
-  one coherent version even though it spans many datasets.
+- A **node type** describes an entity such as `Person` or `Document`.
+- An **edge type** connects two node types, such as `WorksAt: Person -> Company`.
+- A **property** has a declared type and can be nullable.
+- Constraints such as keys, uniqueness, ranges, and edge cardinality are checked
+  on every write path.
 
-This split is what lets a graph commit be **atomic across every type at once**: a
-publish flips every relevant dataset's version together in one graph-manifest write, so
-readers never see a half-applied change. See [storage](storage.md) for the layout.
+Schemas use the [`.pg` language](../schema/index.md). Reads and mutations use the
+[`.gq` language](../queries/index.md).
 
-## Two layers: inherited vs. added
+## Consistency
 
-Throughout the docs, capabilities are framed as **L1** (inherited from Lance) or
-**L2** (added by OmniGraph):
+Every query reads one consistent snapshot of the whole graph. A concurrent
+write cannot become visible halfway through a query.
 
-| | L1 — from Lance | L2 — added by OmniGraph |
-|---|---|---|
-| Storage | Columnar Arrow datasets on object storage | Per-type datasets coordinated as one graph |
-| Versioning | Per-dataset versions + time travel | [Snapshots](../branching/time-travel.md) across all types at once |
-| Branches | Per-dataset branches | [Graph-level branches](../branching/index.md), atomic across types |
-| Commits | Per-dataset commits | [Commit DAG](../branching/index.md) for the whole graph; three-way [merge](../branching/merge.md) |
-| Indexes | Scalar / vector / full-text indexes | Built per relevant property; graph topology index for traversal |
-| Search | Vector + full-text primitives | [`nearest` / `bm25` / `rrf`](../search/index.md) in one query, plus graph traversal |
-| Querying | — | The [`.gq` query language](../queries/index.md) and [`.pg` schema language](../schema/index.md) |
+One mutation query or load publishes one graph commit. If it fails, none of its
+changes become visible. Separate mutation queries are separate commits.
 
-## How the pieces fit
+[Branches](../branching/index.md) provide isolated, durable workspaces for
+multi-step changes. Each change on a branch is still its own commit; merging the
+branch makes the combined result visible on the target in one atomic step.
 
-- The **schema** (`.pg`) and **query** (`.gq`) languages are compiled to a typed
-  intermediate representation.
-- The **engine** runs queries and mutations against Lance, coordinates the graph manifest,
-  maintains the commit graph, and builds indexes.
-- The **CLI** ([`omnigraph`](../cli/index.md)) and the
-  **HTTP server** ([`operations/server.md`](../operations/server.md)) are two front
-  ends over the same engine, so embedded and remote behavior match.
-- [Cedar policy](../operations/policy.md) enforcement is engine-wide — every writer
-  goes through the same authorization gate regardless of front end.
+## History
 
-For deployment-scale topics — multi-graph servers, control-plane operations,
-recovery — see [clusters](../clusters/index.md).
+Commits form a graph-wide history. You can:
+
+- inspect commits and their actors;
+- read a branch head or an earlier commit;
+- compare two points in history;
+- merge branches with entity-level conflict reporting.
+
+History remains available until destructive cleanup removes the storage
+versions it needs. Live branches can retain older versions, so delete branches
+you no longer need.
+
+## Storage and indexes
+
+A graph is stored at one local, S3, or Azure Blob root. That root is the graph's
+consistency and history boundary; cross-graph transactions are not supported.
+See [storage](storage.md) for supported URI forms and backend configuration.
+
+Indexes improve performance but do not define logical correctness. A declared
+index may be missing or cover only part of recent data; queries still return
+matching entities outside its coverage. Run `omnigraph optimize` to compact
+data and refresh index coverage.
+
+## Access paths
+
+The embedded engine, CLI, and HTTP server share the same graph semantics. The
+server adds bearer authentication and Cedar authorization; direct storage
+access does not pass through server authentication.
+
+- [Quickstart](../quickstart.md)
+- [CLI guide](../cli/index.md)
+- [HTTP server](../operations/server.md)
+- [Clusters](../clusters/index.md)

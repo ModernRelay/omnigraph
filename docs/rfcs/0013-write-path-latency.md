@@ -1,4 +1,20 @@
-# RFC-013: Write-path latency — capture-once `WriteTxn`, manifest-authoritative publish, bounded history, and a measured cost contract
+---
+rfc: "0013"
+title: "Write-path latency and bounded history cost"
+track: maintainer
+status: superseded
+implementation: partial
+authors:
+  - Write-path latency investigation
+created: 2026-06-19
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: ["0022", "0028"]
+blocked_on: []
+---
+
+# RFC 0013: Write-path latency and bounded history cost
 
 > **Status update (storage-versioning strand-and-retire work):** the
 > `_graph_commits.lance` / `_graph_commit_actors.lance` datasets are now **retired**
@@ -6,30 +22,29 @@
 > the `CommitGraph` is a pure `__manifest` projection). References to those tables
 > below are historical: the remaining `optimize` / `cleanup` internal-table scope is
 > **`__manifest`-only**, and the per-write `_graph_commits` scan term is gone. See
-> [invariants.md](invariants.md) and [versioning.md](versioning.md).
+> [invariants.md](../dev/invariants.md) and [versioning.md](../dev/versioning.md).
 >
-> **RFC-028 identity update (2026-07-15):** table-version object IDs and folds now
+> **RFC 0028 identity update (2026-07-15):** table-version object IDs and folds now
 > use `(stable_table_id, table_incarnation_id, version)`. Any older passage below
 > that keys a current table lifetime by mutable `table_key` is historical.
 >
-> **RFC-026 disposition (2026-08-06):** the MemWAL/LSM thread mentioned in this
+> **RFC 0026 disposition (2026-08-06):** the MemWAL/LSM thread mentioned in this
 > record was implemented experimentally and rejected. Current bounded graph
-> batches reuse ordinary commit-visible Load; see [wal-removal.md](wal-removal.md).
+> batches reuse ordinary commit-visible Load; see the current
+> [ingestion contract](../dev/ingestion.md).
 
-**Status:** Historical design record (partially implemented); current write and
-identity contracts are [RFC-022](../rfcs/0022-unified-write-path.md) and
-[RFC-028](../rfcs/0028-stable-schema-identity.md).
-**Author(s):** write-path latency investigation (handoff + multi-agent validation)
-**Date:** 2026-06-19
+> **Disposition:** This is a historical, partially implemented design record.
+> Current write and identity contracts are [RFC 0022](0022-unified-write-path.md)
+> and [RFC 0028](0028-stable-schema-identity.md).
+
 **Audience:** engine / storage maintainers
 **Builds on:**
-[rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md) (`GraphClient` — embedded ≡ remote),
+[RFC 0009](0009-unified-access-paths.md) (`GraphClient` — embedded ≡ remote),
 the query-latency work (PR #268, read-path warm-up — the read-side twin of this change),
 the iss-991 handoff (manifest-authoritative graph lineage / Phase 7),
-[writes.md](writes.md), [execution.md](execution.md), [invariants.md](invariants.md).
+[writes.md](../dev/writes.md), [execution.md](../dev/execution.md),
+[invariants.md](../dev/invariants.md).
 **Tracking (dev graph `modernrelay`):** primary `iss-write-s3-roundtrip-amplification`; depth term `iss-991`; substrate seam `iss-863`/`iss-864`; branch-create `iss-691`; recovery `iss-856`/`iss-recovery-sweep-live-writer-rollback`/`iss-merge-recovery-partial-rollforward`; MemWAL `iss-681`; read twin `gap-read-path-rederivation`.
-
-> Status maintained by maintainers: `Proposed` while open, `Accepted` on merge.
 
 ---
 
@@ -912,7 +927,7 @@ compaction is monotonic), so there is one fewer pattern for the unification to a
 ## 7. Invariants & deny-list check
 
 Touches and *strengthens* (does not weaken) invariants in
-[invariants.md](invariants.md):
+[invariants.md](../dev/invariants.md):
 
 - **§2 (manifest-atomic visibility):** preserved; lineage now rides the same CAS
   (strengthens — closes the "manifest→commit-graph atomicity" gap).
@@ -1440,7 +1455,7 @@ new item (Q6), surfaced by peer review, remains genuinely open.
 **Newly surfaced (open):**
 
 8. **CAS-resurrection after cleanup → CONFIRMED VULNERABLE [S]; boundary watermark
-   is a HARD PREREQUISITE for step 2.** SlateDB found this race (RFC-0026 / issue
+   is a HARD PREREQUISITE for step 2.** SlateDB found this race (RFC 0026 / issue
    #352): a writer that stalls between computing manifest id `N+1` and creating it
    can, *after GC deletes `N+1`*, re-create it and observe **false success**.
    Lance 7.0.0 was traced directly and is **not immune**: version creation is a plain
@@ -1469,13 +1484,13 @@ Validated read-only against OSS prior art and the DB/distributed-systems canon:
 
 - **SlateDB** (canonical object-store LSM) — tenet-by-tenet ✅ on capture-once
   snapshot, monotonic-ID manifest (no pointer file — *explicitly rejected* in their
-  RFC-0001), the **epoch fence** (exact match: `FenceableTransactionalObject`,
+  RFC 0001), the **epoch fence** (exact match: `FenceableTransactionalObject`,
   hard-fail, TTL-lease *explicitly rejected* — adopt as specified), background
   epoch-coordinated compaction/GC, and recovery-on-open. **Adopt-items OmniGraph is
   missing / under-specifies:** (1) the **boundary-file** CAS-resurrection guard (Q8);
   (2) **group-commit batching** — coalesce pending `PublishPlan`s into one manifest
   CAS, directly mitigating the Q1 / §6.5 contention; (3) SlateDB *peels* compaction
-  state *out* of the manifest (RFC-0013) — the **opposite** of Phase 7's fold-*in*;
+  state *out* of the manifest (RFC 0013) — the **opposite** of Phase 7's fold-*in*;
   §11 should defend "fold-in (lineage must be atomic with visibility) beats peel-out
   for us"; (4) **write back-pressure** when cleanup lags (`l0_max_ssts`). **Citation
   correction:** SlateDB has the per-RPC counter (`InstrumentedObjectStore`) but

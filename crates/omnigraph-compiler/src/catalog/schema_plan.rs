@@ -115,8 +115,8 @@ pub enum SchemaMigrationStep {
     /// and retains data on disk; Hard mode drops the Lance dataset and
     /// requires `--allow-data-loss`.
     ///
-    /// Dormant in this commit — emitted by the planner in a later
-    /// commit (see `docs/schema-lint-v1-plan.md`).
+    /// The planner emits Soft mode; apply promotes it to Hard mode when
+    /// the caller explicitly allows data loss.
     DropType {
         type_kind: SchemaTypeKind,
         name: String,
@@ -482,14 +482,13 @@ fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMig
         .iter()
         .filter(|node| !consumed.contains(&node.type_id))
     {
-        // Node type removed from the desired schema: emit
-        // DropType { Node, Soft } per docs/dev/schema-lint-v1-plan.md
-        // commit #4. Soft = remove the table's entry from the current
+        // Node type removed from the desired schema: emit Soft mode.
+        // Soft removes the table's entry from the current
         // __manifest version; data files retained; previous manifest
         // versions still reference the table, so Lance time travel
         // restores it until cleanup_old_versions ages out the older
-        // __manifest entries. Hard mode (immediate dataset deletion)
-        // lands in commit #5 gated by --allow-data-loss.
+        // __manifest entries. Apply promotes the step to Hard mode when
+        // --allow-data-loss is set.
         steps.push(SchemaMigrationStep::DropType {
             type_kind: SchemaTypeKind::Node,
             name: leftover.name.clone(),
@@ -573,9 +572,8 @@ fn plan_edges(accepted: &[EdgeIR], desired: &[EdgeIR], steps: &mut Vec<SchemaMig
         .iter()
         .filter(|edge| !consumed.contains(&edge.type_id))
     {
-        // Edge type removed from the desired schema: emit
-        // DropType { Edge, Soft } per docs/dev/schema-lint-v1-plan.md
-        // commit #4. Same Soft mechanics as node-type drops — manifest
+        // Edge type removed from the desired schema: emit Soft mode.
+        // The mechanics match node-type drops: the manifest
         // entry tombstoned, data files retained, reversible via Lance
         // time travel until cleanup.
         steps.push(SchemaMigrationStep::DropType {
@@ -732,17 +730,15 @@ fn plan_properties(
         .iter()
         .filter(|property| !consumed.contains(&property.property_id))
     {
-        // Property removed from the desired schema: emit
-        // DropProperty { Soft } per docs/schema-lint-v1-plan.md
-        // commit #3. The Soft mode reuses the existing
+        // Property removed from the desired schema: emit Soft mode.
+        // Soft mode reuses the existing
         // stage_overwrite rewrite path — batch_for_schema_apply_rewrite
         // iterates target_schema.fields(), so the dropped column is
         // naturally projected away. The prior Lance version retains
         // the column until cleanup_old_versions runs, matching the
         // OG-DS-104 destructive-tier expectation that data remains
-        // recoverable via time travel until cleanup. Hard mode (with
-        // immediate compact_files + cleanup_old_versions) lands in
-        // commit #5, gated by --allow-data-loss.
+        // recoverable via time travel until cleanup. Apply promotes the
+        // step to Hard mode when --allow-data-loss is set.
         steps.push(SchemaMigrationStep::DropProperty {
             type_kind,
             type_name: type_name.to_string(),

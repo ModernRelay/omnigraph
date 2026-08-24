@@ -1,71 +1,99 @@
 # Search
 
-OmniGraph runs vector, full-text, and hybrid search in the same runtime as graph
-traversal — a single [query](../queries/index.md) can combine a vector `nearest`,
-a `bm25` text score, and an `Expand` traversal. Search functions are used inside
-`match` (to filter), or as expressions inside `return` / `order` (to score and
-rank).
+OmniGraph combines vector, full-text, and graph patterns in one `.gq` query.
+Search expressions can filter or order a matched node set; a `limit` is required
+for nearest-neighbor ordering.
 
 ## Functions
 
-| Function | Purpose | Backing index |
-|---|---|---|
-| `nearest($x.vec, $q)` | k-NN vector search (cosine) | vector index (IVF / HNSW) |
-| `search(field, q)` | Generic full-text search | inverted (FTS) index |
-| `fuzzy(field, q [, max_edits])` | Levenshtein-tolerant text search | inverted index |
-| `match_text(field, q)` | Pattern match | inverted index |
-| `bm25(field, q)` | BM25 relevance scoring | inverted index |
-| `rrf(rank_a, rank_b [, k])` | Reciprocal Rank Fusion of two rankings (default `k=60`) | fuses scored rankings |
+| Function | Meaning |
+|---|---|
+| `nearest($d.embedding, $q)` | Rank vectors by L2 distance. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
+| `search($d.body, $q)` | Full-text token search. |
+| `fuzzy($d.body, $q [, max_edits])` | Full-text search with edit-distance tolerance. |
+| `match_text($d.body, $q)` | Match a full-text query in a `match` block. |
+| `bm25($d.body, $q)` | BM25 relevance score. |
+| `rrf(rank_a, rank_b [, k])` | Fuse two rankings with Reciprocal Rank Fusion. The default `k` is 60. |
 
-- `nearest()` requires a `limit`. The query vector is resolved from the param map,
-  or embedded from a text input at runtime via the configured
-  [embedding client](embeddings.md).
-- Match filters apply **before** the search: combining a `match` predicate with
-  `nearest()` (or `bm25()`) returns the top-`limit` of the *matching* rows —
-  never a post-filtered remainder of the global top-k. A selective filter
-  narrows the candidate set; it cannot starve the result count. This holds for
-  both predicate forms — inline props (`$d: Doc { status: "open" }`) and
-  standalone filter lines, including range predicates (`$d.priority <= 2`).
-- Scores and ranks propagate as ordinary columns, so you can `return` a score and
-  `order` by it.
+Filters in the `match` block are applied before ranking, so `limit 10` means the
+top ten matches that satisfy the graph and property filters.
 
-## Exact string predicates vs. search functions
-
-The search functions above match **tokens** (after lowercasing, stemming, and
-stop-word removal). For exact matching on the stored string — prefix
-autocomplete, substring lookup — use the filter predicates
-[`starts_with` and String `contains`](../queries/index.md#string-predicates)
-instead. They are exact and case-sensitive, work with or without an index, and
-are accelerated by a covering BTREE (`starts_with`) or NGRAM (`contains`)
-index when the filtered variable is scanned directly. One tool per question:
-
-| Question | Use | Acceleration |
-|---|---|---|
-| "is this the prefix?" (autocomplete) | `starts_with` filter | BTREE, exact probe |
-| "does it contain this substring?" | String `contains` filter | NGRAM probe + recheck |
-| "did they misspell a word?" | `fuzzy()` | inverted index |
-| "what's most relevant?" | `bm25()` / `rrf()` | inverted index |
-
-## Hybrid ranking with `rrf`
-
-Reciprocal Rank Fusion combines two independent rankings (typically one vector and
-one text) into a single fused ranking, without needing the two score scales to be
-comparable. Rank each retrieval separately, then fuse:
+## Vector search
 
 ```gq
-query hybrid($q: String) {
-  match { $d: Document { } }
-  return {
-    $d,
-    rrf( nearest($d.embedding, $q), bm25($d.body, $q) ) as score
-  }
-  order { score desc }
+query similar($q: Vector(4)) {
+  match { $d: Document }
+  return { $d.slug, $d.title }
+  order { nearest($d.embedding, $q) }
   limit 10
 }
 ```
 
-## Indexes and embeddings
+Raw vectors are ranked with L2 distance. Vectors produced by OmniGraph's
+embedding client are normalized, so L2 and cosine similarity produce the same
+ordering for those generated vectors. See [Embeddings](embeddings.md) for text
+queries and provider configuration.
 
-Search functions only work when the backing index exists — see
-[indexes](indexes.md) for building vector and inverted indexes, and
-[embeddings](embeddings.md) for generating the vectors `nearest` searches over.
+## Full-text search
+
+Use full-text functions for token search, fuzzy terms, and relevance. Use the
+query language's exact `contains` and `starts_with` predicates for literal,
+case-sensitive substring and prefix matching.
+
+```gq
+query relevant($q: String) {
+  match { $d: Document }
+  return { $d.slug, bm25($d.body, $q) as score }
+  order { bm25($d.body, $q) desc }
+  limit 10
+}
+```
+
+Exact String predicates remain correct without an index. A free-text index does
+not accelerate equality, `starts_with`, or literal substring `contains`.
+
+## Hybrid ranking
+
+Reciprocal Rank Fusion combines rankings without assuming their raw scores use
+the same scale:
+
+```gq
+query hybrid($vector: Vector(4), $text: String) {
+  match { $d: Document }
+  return { $d.slug, $d.title }
+  order { rrf(nearest($d.embedding, $vector), bm25($d.body, $text)) }
+  limit 10
+}
+```
+
+Ranking order is preserved through ordinary node projections and single-hop edge
+expansion. More complex plans may not expose every intermediate score as a
+normal column; order directly by the search expression when ranking is the goal.
+
+## Indexes
+
+`@index` and `@key` declare index intent. For a single-property node declaration,
+OmniGraph currently creates:
+
+| Property | Index use |
+|---|---|
+| Enum, number, Boolean, Date, or DateTime | Equality, range, membership, and null filters |
+| Free-text String | Full-text functions |
+| Vector | `nearest` |
+
+Node ids and edge ids/endpoints are indexed automatically. Lists and Blobs do
+not receive property indexes. Composite declarations and edge-property
+declarations do not currently create property indexes.
+
+Indexes are derived performance data. A new declaration may still be pending,
+and newly written entities may fall outside existing coverage. Queries remain
+correct by scanning missing or uncovered data; vector search falls back to an
+exact scan when needed. Run:
+
+```bash
+omnigraph optimize graph.omni
+```
+
+after a large load or merge, and on a regular maintenance cadence, to refresh
+coverage and compact data. An empty vector property remains pending until it has a
+non-null vector to index.

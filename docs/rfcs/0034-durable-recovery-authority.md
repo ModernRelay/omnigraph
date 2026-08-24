@@ -1,21 +1,24 @@
 ---
-type: spec
-title: "RFC-034 — Durable recovery authority and outcomes"
-description: Define the one engine-owned recovery protocol, its authority modes, bounded work units, and truthful durable outcomes without prescribing server activation or supervision.
+rfc: "0034"
+title: "Durable recovery authority and outcomes"
+track: maintainer
 status: draft
-tags: [eng, rfc, recovery, storage, concurrency, lance, fencing, omnigraph]
-timestamp: 2026-08-13
-owner: OmniGraph maintainers
+implementation: not-started
+authors:
+  - OmniGraph maintainers
+created: 2026-08-13
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-034: Durable recovery authority and outcomes
+# RFC 0034: Durable recovery authority and outcomes
 
-- **Status:** Draft
-- **Date:** 2026-08-13
-- **Author track:** Maintainer design series
-- **Depends on:** RFC-022 unified graph-write protocol; RFC-023 exact effect
+- **Depends on:** RFC 0022 unified graph-write protocol; RFC 0023 exact effect
   fencing; internal manifest schema v6 and recovery-v9; Lance 10.0.0.
-- **Consumed by:** RFC-036 atomic runtime activation and availability
+- **Consumed by:** RFC 0036 atomic runtime activation and availability
   supervision.
 - **Replaces:** the destructive in-place recovery boundary proposed by PR #488.
 - **Audience:** engine, storage, schema, branch, maintenance, operations, and
@@ -137,7 +140,7 @@ because it differs from today's behavior.
 
 The design MUST:
 
-- preserve RFC-022's exact ownership and one graph-manifest visibility
+- preserve RFC 0022's exact ownership and one graph-manifest visibility
   boundary;
 - expose one canonical recovery implementation to startup, operator, and
   managed-runtime callers;
@@ -172,8 +175,8 @@ This RFC does not define:
 - a custom WAL, transaction manager, recovery queue, or buffer pool; or
 - a new recovery, manifest, schema, or Lance format.
 
-RFC-035 owns served-operation lifetime and shutdown. RFC-036 owns runtime
-activation and supervision. RFC-038 owns typed storage-failure classification,
+RFC 0035 owns served-operation lifetime and shutdown. RFC 0036 owns runtime
+activation and supervision. RFC 0038 owns typed storage-failure classification,
 which remains independent: an observed failure condition and durable recovery
 progress are different contracts, and neither alone authorizes replay.
 
@@ -283,7 +286,7 @@ The permit is retained through final durable verification and handoff. Without
 replica quiescence V1 refuses Restore, native ref/path deletion, and destructive
 cleanup. This is an operational boundary, not distributed fencing.
 
-RFC-035 can prove only process-local admission and drain. That proof is useful
+RFC 0035 can prove only process-local admission and drain. That proof is useful
 inside the offline entry point but is not proof that another process is
 quiescent. Managed live compensation remains unsupported until a future
 distributed fence or external replica-quiescence authority has its own RFC and
@@ -345,7 +348,7 @@ Exact Rust ownership may differ, but:
   guard.
 
 `RecoveryDisposition` is the one vocabulary consumed by startup, embedded
-open, offline recovery, and RFC-036 supervision:
+open, offline recovery, and RFC 0036 supervision:
 
 - `Clean` means final verification found no remaining or unknown unit;
 - `RollForwardRequired` means at least one adapter-proved forward unit remains,
@@ -388,7 +391,7 @@ publishing.
 
 ## 6. Adapter-defined recovery actions
 
-Automatic forward eligibility is defined by each RFC-022 writer adapter, not a
+Automatic forward eligibility is defined by each RFC 0022 writer adapter, not a
 generic `HEAD > pin` rule.
 
 | Classification | Forward action | Mode |
@@ -516,7 +519,7 @@ remains unknown, the unit requires operator action.
 
 A typed substrate failure classification may inform an external scheduler, but
 this RFC never equates `Unknown` with transient or treats classification as
-retry authority. RFC-038 owns that separate classification.
+retry authority. RFC 0038 owns that separate classification.
 
 Orphan-control disposition explicitly reports any main-lineage publication,
 audit append, and cleanup. No caller may reduce it to an unqualified boolean
@@ -531,8 +534,8 @@ unknown until recapture.
 
 The engine does not claim to keep an async task alive after its caller drops
 it. A managed runtime invoking effectful recovery MUST own the task through a
-terminal engine result; RFC-036 defines that recovery-task ownership, while
-RFC-035 owns served requests and writes. An offline tool remains the owning
+terminal engine result; RFC 0036 defines that recovery-task ownership, while
+RFC 0035 owns served requests and writes. An offline tool remains the owning
 caller. In both cases durable intent makes
 process termination recoverable, but process loss is not reported as a clean
 in-process cancellation.
@@ -598,8 +601,8 @@ Exclusive recovery is available only through the V1 quiesced offline entry
 point. A method cannot infer authority from the fact that an `Omnigraph` was
 opened read-write.
 
-The concrete server activation and operator transport are RFC-036 concerns.
-The concrete close/drain proof and owned-task lifetime are RFC-035 concerns.
+The concrete server activation and operator transport are RFC 0036 concerns.
+The concrete close/drain proof and owned-task lifetime are RFC 0035 concerns.
 
 ## 12. Cost and observability
 
@@ -698,7 +701,7 @@ activation/cancellation test belongs to this RFC.
 - Recovery authority is not client authorization and never accepts actor
   identity from an HTTP request.
 - Recovered lineage/audit preserves the original/recovery actor contract from
-  RFC-022.
+  RFC 0022.
 - Read-only replicas receive no write/recovery capability even with broad
   credentials.
 - Public summaries redact placement and credentials; full bounded diagnostics

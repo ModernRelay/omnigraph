@@ -1,8 +1,7 @@
-//! Schema-lint chassis (MR-694).
+//! Stable schema-migration diagnostics.
 //!
 //! Stable diagnostic codes (`OG-XXX-NNN`) for schema-migration plans,
-//! the foundation for per-rule severity config, suppression directives,
-//! and pre-migration checks that subsequent PRs layer on.
+//! attached to migration-plan rejections.
 //!
 //! ## v0 surface
 //!
@@ -15,11 +14,8 @@
 //! - The CLI renders the code in `omnigraph schema plan` output; the
 //!   apply path includes it in the user-visible error message.
 //!
-//! Future PRs add: severity config from `omnigraph.yaml`, `@allow(...)`
-//! suppression annotations, pre-migration checks (MR-941), the CD / VE /
-//! LK / NM families (MR-942..945), and CI integration (MR-946).
-//!
-//! See: docs/schema-lint.md, https://atlasgo.io/lint/analyzers
+//! The user-visible code contract is documented in
+//! `docs/user/schema/index.md`.
 
 pub mod codes;
 pub mod diagnostic;

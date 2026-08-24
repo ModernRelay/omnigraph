@@ -1,16 +1,16 @@
-//! Identity types for the multi-graph server (MR-668) + forward-compatible
-//! shapes for Cloud mode (RFC 0003) and OAuth provider (RFC 0004).
+//! Identity types for the multi-graph server (MR-668) plus forward-compatible
+//! shapes for the Cloud/OAuth work tracked by MR-956.
 //!
 //! Per decision 13 in the implementation plan: ship the type shapes that
 //! Cloud mode will consume, without committing to any trait shape
-//! (`TokenVerifier` stays draft in RFC 0001). Every Cluster-mode call site
+//! (`TokenVerifier` stays draft in MR-956). Every Cluster-mode call site
 //! constructs these types with their Cluster-mode-specific values:
 //!
 //! - `tenant_id: None` (Cloud will set `Some(...)` from the OAuth `org_id` claim)
 //! - `scopes: vec![Scope::Full]` (Cloud will populate from the OAuth `scope` claim)
 //! - `source: AuthSource::Static` (Cloud / OIDC will set `AuthSource::Oidc`)
 //!
-//! The enums use `#[non_exhaustive]` so RFC 0001 step 1 / RFC 0004 can
+//! The enums use `#[non_exhaustive]` so MR-956 can
 //! add variants without breaking exhaustive matches in callers.
 
 use std::fmt;
@@ -29,7 +29,7 @@ pub const TENANT_ID_MAX_LEN: usize = 64;
 /// Cloud-mode tenant identifier. Validated with the same regex as
 /// `GraphId` so the two interchange syntactically.
 ///
-/// `None` in Cluster mode; Cloud mode (RFC 0003) sets `Some(...)` from
+/// `None` in Cluster mode; the Cloud/OAuth work in MR-956 sets `Some(...)` from
 /// the OAuth `org_id` claim. Constructed only via `try_from` so callers
 /// cannot bypass validation.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize)]
@@ -106,7 +106,7 @@ fn tenant_id_regex() -> &'static Regex {
 }
 
 /// Registry HashMap key. Cluster mode populates `tenant_id: None`;
-/// Cloud mode (RFC 0003) populates `tenant_id: Some(...)`.
+/// The Cloud/OAuth work in MR-956 populates `tenant_id: Some(...)`.
 ///
 /// The `Option<TenantId>` field is the **single forward-compatibility seam**
 /// between Cluster and Cloud modes. Every handler reaches the engine via
@@ -127,7 +127,7 @@ impl GraphKey {
         }
     }
 
-    /// Cloud-mode constructor — reserved for RFC 0003; included here so
+    /// Cloud-mode constructor — reserved for MR-956; included here so
     /// the seam is visible even though no Cluster-mode code path calls it.
     pub fn cloud(tenant_id: TenantId, graph_id: GraphId) -> Self {
         Self {
@@ -147,11 +147,11 @@ impl fmt::Display for GraphKey {
 }
 
 /// Authorization scope. Cluster mode: every authenticated actor gets
-/// `Scope::Full`. Cloud mode (RFC 0004) adds OAuth-style scopes via the
+/// `Scope::Full`. MR-956 adds OAuth-style scopes via the
 /// dashboard-configured `graph:read`, `graph:write`, `graph:admin`,
 /// `graph:*` set; those become additional variants here.
 ///
-/// `#[non_exhaustive]` so RFC 0004 can extend without breaking matches.
+/// `#[non_exhaustive]` so MR-956 can extend without breaking matches.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum Scope {
@@ -162,10 +162,10 @@ pub enum Scope {
 
 /// How the actor was authenticated. Cluster mode: every actor authenticates
 /// via the existing SHA-256 hash compare against a static token set, so
-/// `AuthSource::Static`. RFC 0001 step 1 adds `AuthSource::Oidc` when the
+/// `AuthSource::Static`. MR-956 adds `AuthSource::Oidc` when the
 /// `OidcJwtVerifier` ships.
 ///
-/// `#[non_exhaustive]` so RFC 0001 can extend without breaking matches.
+/// `#[non_exhaustive]` so MR-956 can extend without breaking matches.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum AuthSource {

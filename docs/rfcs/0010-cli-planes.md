@@ -1,18 +1,31 @@
-# RFC: Restructure the CLI Around Explicit Planes
+---
+rfc: "0010"
+title: "Explicit CLI planes"
+track: maintainer
+status: superseded
+implementation: partial
+authors:
+  - OmniGraph maintainers
+created: 2026-06-13
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: ["0011"]
+blocked_on: []
+---
 
-**Status:** Proposed
-**Date:** 2026-06-13
+# RFC 0010: Explicit CLI planes
 **Audience:** CLI/server/cluster maintainers
-**Builds on:** [rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md)
+**Builds on:** [RFC 0009](0009-unified-access-paths.md)
 (Phases 3a–3c landed — the embedded/remote data-plane fork is now one
-`GraphClient` enum; this RFC **expands RFC-009 Phase 4** from a narrow
+`GraphClient` enum; this RFC **expands RFC 0009 Phase 4** from a narrow
 embedded-vs-remote capability table into the full plane model, and leaves
 Phase 5 route alignment where it is),
-[rfc-007-operator-config.md](rfc-007-operator-config.md) (operator
+[RFC 0007](0007-operator-config.md) (operator
 `--server`/`--graph`/`--target` addressing — the surfaces this RFC makes
 uniform across planes),
-[rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md).
-**Sequencing:** post-v0.7.0, after RFC-009 Phase 3c (done).
+[RFC 0008](0008-retire-omnigraph-yaml.md).
+**Sequencing:** post-v0.7.0, after RFC 0009 Phase 3c (done).
 
 ## Summary
 
@@ -29,7 +42,7 @@ This RFC makes the plane model **explicit and coherent** with three moves:
 1. **One graph-addressing model** across every verb (`--target`/`--graph`/
    positional URI/`--server`), resolving to a storage URI for maintenance and a
    remote client for data — instead of two different ways to name one graph.
-2. **A declared, per-subcommand capability surface** (RFC-009 Phase 4): each
+2. **A declared, per-subcommand capability surface** (RFC 0009 Phase 4): each
    verb declares its plane(s); wrong-plane invocations get an honest "this is
    storage-plane, `--server` doesn't apply" error from one table, not scattered
    `bail!`s.
@@ -52,7 +65,7 @@ three different ways:
 
 1. **Two names for one graph.** Data verbs resolve `--server prod --graph
    knowledge` through `GraphClient::resolve*` (the embedded/remote fork collapsed
-   in RFC-009 Phases 3a–3c; only the two `GraphClient` factories call
+   in RFC 0009 Phases 3a–3c; only the two `GraphClient` factories call
    `apply_server_flag`). Maintenance verbs instead use
    `resolve_uri`/`resolve_local_uri` and accept only a positional URI or
    `--target` — so to compact the graph you *query* as `--server prod --graph
@@ -62,7 +75,7 @@ three different ways:
    > **Note (`graphs list`).** It is routed through `GraphClient` only to share
    > the addressing/token resolver; its embedded arm fails loudly, so it is
    > **remote-only today** (the later capability table and *Relationship to
-   > RFC-009* record it as remote-now / embedded-cluster-later).
+   > RFC 0009* record it as remote-now / embedded-cluster-later).
 
 2. **Plane restrictions are accidental, not declared.** `graphs list` is
    server-only and `optimize`/`repair`/`cleanup`/`init` are storage-only purely
@@ -156,7 +169,7 @@ error: `optimize` is a storage-plane command; `--server` addresses the data
 
 $ omnigraph graphs list ./local.omni
 error: `graphs list` needs a remote multi-graph server (http/https) today.
-       (Embedded cluster-catalog enumeration is planned — RFC-009.)
+       (Embedded cluster-catalog enumeration is planned — RFC 0009.)
 ```
 
 ### `--help` teaches the model
@@ -219,7 +232,7 @@ not quietly consult both and invent a precedence. The rule:
   > the applied-state-vs-declared-config open question below); the
   > operator/legacy `--target` path lands first.
 
-### A declared, per-subcommand capability surface (RFC-009 Phase 4, expanded)
+### A declared, per-subcommand capability surface (RFC 0009 Phase 4, expanded)
 
 One table, **per subcommand** (family-level rows hide exactly the cases the
 table exists to make non-accidental):
@@ -235,7 +248,7 @@ table exists to make non-accidental):
 | `queries validate` | — | — | ✅ | — | opens the graph to typecheck |
 | `init` | — | — | ✅ | — | cluster-managed graphs → `cluster apply` |
 | `optimize`, `repair`, `cleanup` | — | — | ✅ | — | |
-| `graphs list` | (later) | ✅ | — | — | remote today; embedded-cluster later (RFC-009) |
+| `graphs list` | (later) | ✅ | — | — | remote today; embedded-cluster later (RFC 0009) |
 | `queries list` | — | — | — | ✅ | reads the registry config; no graph |
 | `lint` | — | — | ✅ | ✅ | `--schema` file, or opens a local graph |
 | `policy validate/test/explain` | — | — | — | ✅ | reads policy files + config |
@@ -303,15 +316,15 @@ Pin the new wrong-plane error strings deliberately: this RFC is intentionally
 replacing accidental `Omnigraph::open` strings with stable capability errors, and
 those strings become observable behavior (Hyrum).
 
-## Relationship to RFC-009
+## Relationship to RFC 0009
 
-RFC-009 Phase 4 was scoped as "declared plane capabilities" for the
+RFC 0009 Phase 4 was scoped as "declared plane capabilities" for the
 embedded-vs-remote axis only. This RFC **subsumes and broadens** that phase into
 the full three-plane, per-subcommand model (adds uniform maintenance addressing,
-the authority rule, and help grouping). RFC-009 Phase 5 (remote `load` →
-`/load` route alignment) is unaffected and remains in RFC-009.
+the authority rule, and help grouping). RFC 0009 Phase 5 (remote `load` →
+`/load` route alignment) is unaffected and remains in RFC 0009.
 
-**`graphs list` reconciliation:** RFC-009's answered open question (pinned in
+**`graphs list` reconciliation:** RFC 0009's answered open question (pinned in
 `parity_matrix.rs`'s exclusions comment) targets `graphs list` becoming
 Both-capability once the embedded arm enumerates the cluster catalog. This RFC
 **aligns** with that rather than superseding it: the capability table shows
@@ -352,15 +365,15 @@ Before implementation, tighten these points:
    use the explicit `--cluster <dir> --graph <id>` resolver. See *Authority
    rule* under Proposed shape.
 
-2. **`graphs list` conflicts with RFC-009's target shape.** This RFC classifies
-   `graphs list` as remote-only, while RFC-009's answered open question says it
+2. **`graphs list` conflicts with RFC 0009's target shape.** This RFC classifies
+   `graphs list` as remote-only, while RFC 0009's answered open question says it
    becomes Both-capability once the embedded arm enumerates the cluster catalog.
    Pick one direction here: either this RFC explicitly supersedes that target,
    or the capability table should show `graphs list` as remote today and
    embedded-cluster later.
 
    **Resolution (accepted):** align, don't supersede. The table shows `graphs
-   list` remote-today / embedded-cluster-later. See *Relationship to RFC-009*.
+   list` remote-today / embedded-cluster-later. See *Relationship to RFC 0009*.
 
 3. **The capability table should be per subcommand, not per family.** The
    family-level rows hide the exact cases the table is supposed to make

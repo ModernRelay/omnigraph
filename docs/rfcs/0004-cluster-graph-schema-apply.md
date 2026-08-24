@@ -1,9 +1,23 @@
-# RFC: Cluster Graph & Schema Apply — Phase 4 of the Cluster Control Plane
+---
+rfc: "0004"
+title: "Cluster graph and schema apply"
+track: maintainer
+status: accepted
+implementation: complete
+authors:
+  - OmniGraph maintainers
+created: 2026-06-10
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
 
-**Status:** Landed (4A #170, 4B #171, 4C — all shipped)
+# RFC 0004: Cluster graph and schema apply
+
 **Implementation deviations:** (1) D3 row 8 retires the stale delete sidecar and lets the still-approved delete re-propose and retry, instead of a pending-block — prefix removal is idempotent, so the retry is the repair. (2) The approver/actor flag is the CLI's existing global `--as`, not a dedicated `--actor`/`--by`. (3) Consumed approval artifacts are rewritten with `consumed_at` rather than moved into state — the file and the ledger record both survive independently (axiom 11).
-**Date:** 2026-06-10
-**Builds on:** cluster Stages 1–3B (shipped: validate/plan/status/refresh/import/force-unlock, config-only `cluster apply` with content-addressed catalog publish, catalog payload verification, failpoint-proven crash/CAS recovery for the apply protocol). Normative context: [cluster-config-specs.md](cluster-config-specs.md), [cluster-axioms.md](cluster-axioms.md), [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md).
+**Builds on:** cluster Stages 1–3B (shipped: validate/plan/status/refresh/import/force-unlock, config-only `cluster apply` with content-addressed catalog publish, catalog payload verification, failpoint-proven crash/CAS recovery for the apply protocol). Current normative context: [cluster control plane](../dev/control-plane.md).
 **Target release:** unversioned (phased — see Sequencing); no cluster functionality is in a tagged release yet.
 
 ## Summary
@@ -30,7 +44,7 @@ The implementation spec's hard gate for this phase — failpoint recovery tests 
 - **External or Lance-backed state backends**; the local JSON backend + lock/CAS remains the substrate.
 - **A cluster manifest publisher.** Deferred, per the spec: it becomes interesting only if the sidecar + repair path proves too weak for the accepted safety contract. Nothing in this design forecloses it.
 - **Multi-graph atomic apply groups.** Cross-graph convergence remains statusful-partial per resource; one graph's failure never pretends to fence another's success.
-- **Graph rename.** RFC-028 closes type/property rename identity inside one graph; graph-root identity and cluster-resource rename are a separate contract and remain explicitly out of scope (see Open Questions).
+- **Graph rename.** RFC 0028 closes type/property rename identity inside one graph; graph-root identity and cluster-resource rename are a separate contract and remain explicitly out of scope (see Open Questions).
 
 ## Background
 
@@ -199,13 +213,11 @@ Each stage is a separate PR with boundary-matched tests (the Stage 1–3B discip
 1. **Bootstrap authority.** The first apply against a fresh cluster has no policy engine to consult and no actor registry; today the answer is "whoever holds the object store wins." The durable story (out-of-band privileged bootstrap actor, per the high-level spec §open-questions) is unresolved and blocks nothing in this phase, since graph-level Cedar still gates wherever installed.
 2. **Approval expiry.** Artifacts are digest-bound, so config drift invalidates them naturally; is wall-clock expiry also wanted (operator hygiene), or does digest binding suffice?
 3. **Sweep on read-only commands.** This RFC has `status`/`plan` only *warn* about pending sidecars. If operator feedback shows the warn-but-don't-repair posture causes confusion, promoting `plan` to run the sweep (it already takes the lock) is a compatible change.
-4. **Graph rename.** Deliberately out of scope. RFC-028 stabilizes schema declarations *inside* one graph; it does not define cluster resource/root identity across a graph rename. A rename today is delete + create — i.e., gated, lossy, and honest about it.
+4. **Graph rename.** Deliberately out of scope. RFC 0028 stabilizes schema declarations *inside* one graph; it does not define cluster resource/root identity across a graph rename. A rename today is delete + create — i.e., gated, lossy, and honest about it.
 5. **Engine `destroy_graph` primitive.** 4C's prefix removal is correct but unatomic; if the engine grows a graph-destroy primitive with its own recovery, D6 collapses onto it (the cluster code is shaped to delegate).
 
 ## References
 
-- [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md) — phases, exit criteria, high-risk decisions, approval tiers
-- [cluster-axioms.md](cluster-axioms.md) — axioms 5, 8, 9, 11, 12, 15
-- [cluster-config-specs.md](cluster-config-specs.md) — the data-aware provider peek; state/ledger model
+- [Cluster control plane](../dev/control-plane.md) — current authority, durable layout, lifecycle, concurrency, and serving contract
 - `crates/omnigraph/src/db/manifest/recovery.rs` — the engine sidecar + classifier this design mirrors in vocabulary and deliberately does not duplicate in mechanics
-- [writes.md](writes.md), [invariants.md](invariants.md) — engine recovery protocol and the deny-list this design is checked against
+- [writes.md](../dev/writes.md), [invariants.md](../dev/invariants.md) — engine recovery protocol and the deny-list this design is checked against

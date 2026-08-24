@@ -138,7 +138,7 @@ writes [Lance](https://github.com/lance-format/lance) over the standard S3 API.
 In the cloud, use S3 / R2 / GCS through `AWS_*`. Native `az://` roots are also
 available as a qualification preview. Every Azure writer, including
 `cluster apply` and the server, must use the checked-in admission wrapper;
-follow the [Azure deployment guide](docs/user/deployment.md#azure-container-apps)
+follow the [Azure deployment guide](docs/user/deployment.md#azure-blob-preview)
 instead of running the bare commands below.
 
 **3. Converge and run.** `apply` creates each graph, applies its schema, and
@@ -207,22 +207,37 @@ object store). For dev and experiments; production is the deployed cluster above
 
 ```bash
 cat > schema.pg <<'PG'
-node Signal  { slug: String @key, title: String }
-node Pattern { slug: String @key, name: String }
-edge Indicates: Signal -> Pattern
+node Source {
+  slug: String @key
+  title: String
+}
+
+node Claim {
+  slug: String @key
+  statement: String
+}
+
+edge Supports: Source -> Claim
 PG
 printf '%s\n' \
-  '{"type":"Signal","data":{"slug":"s1","title":"OSS model adoption surging"}}' \
-  '{"type":"Pattern","data":{"slug":"p1","name":"adoption"}}' \
-  '{"edge":"Indicates","from":"s1","to":"p1"}' > data.jsonl
+  '{"type":"Claim","data":{"slug":"lower-latency","statement":"The migration reduced request latency."}}' \
+  '{"type":"Source","data":{"slug":"load-test","title":"Load test report"}}' \
+  '{"edge":"Supports","from":"load-test","to":"lower-latency"}' > data.jsonl
 
 omnigraph init  --schema schema.pg ./graph.omni
 omnigraph load  --data data.jsonl --mode overwrite --store ./graph.omni
 
-# "What pattern does signal s1 indicate?"
+# "Which sources support the lower-latency claim?"
 omnigraph query --store ./graph.omni \
-  -e 'query indicates() { match { $s: Signal { slug: "s1" }  $s indicates $p } return { $p.name } }'
-# → adoption
+  --params '{"claim":"lower-latency"}' \
+  -e 'query sources_for_claim($claim: String) {
+    match {
+      $claim_node: Claim { slug: $claim }
+      $source supports $claim_node
+    }
+    return { $source.title as source }
+  }'
+# → Load test report
 ```
 
 ## Docs

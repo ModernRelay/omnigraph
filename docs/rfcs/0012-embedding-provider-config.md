@@ -1,10 +1,23 @@
-# RFC: Provider-Independent Embedding Configuration
+---
+rfc: "0012"
+title: "Provider-independent embedding configuration"
+track: maintainer
+status: accepted
+implementation: complete
+authors:
+  - OmniGraph maintainers
+created: 2026-06-15
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
 
-**Status:** Accepted — Phases 1-5 implemented
-**Date:** 2026-06-15
+# RFC 0012: Provider-independent embedding configuration
 **Builds on:** the engine embedding client (`crates/omnigraph/src/embedding.rs`), the `@embed` catalog
 annotation (`omnigraph-compiler/src/catalog`), the cluster `providers.embedding` surface
-([cluster-config-specs.md](cluster-config-specs.md), [rfc-007-operator-config.md](rfc-007-operator-config.md)
+([cluster control plane](../dev/control-plane.md), [RFC 0007](0007-operator-config.md)
 for the secret-resolution pattern).
 **Target release:** staged — NFR floor first, then the provider-independent config core; ingest-time `@embed`
 execution is a separate later phase.
@@ -223,9 +236,11 @@ the design constraint; deferred to its own RFC/phase.
 | **5 — Cluster provider wiring** | `providers.embedding` resources; `graphs.<id>.embedding_provider`; `${NAME}` resolution at server boot | provider profile resolved from applied cluster state; legacy `omnigraph.yaml` untouched |
 | later | ingest-time `@embed` (Shape C) | separate RFC |
 
-**Status:** Phases 1–5 are implemented (`@embed("…", model="…")` is recorded in the schema IR and validated at
-query time with a typed same-space error; an unrecorded `@embed` keeps working with no check; cluster-served
-graphs can bind an applied `providers.embedding` profile). Ingest-time `@embed` remains.
+Phases 1–5 are implemented: `@embed("…", model="…")` is recorded in the schema
+IR and validated at query time with a typed same-space error; an unrecorded
+`@embed` keeps working with no check; and cluster-served graphs can bind an
+applied `providers.embedding` profile. Ingest-time `@embed` remains outside
+this RFC.
 
 ## Invariants & deny-list check
 

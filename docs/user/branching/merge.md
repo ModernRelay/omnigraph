@@ -1,92 +1,62 @@
 # Merging Branches
 
-Merging integrates the changes on one branch into another. OmniGraph merges are
-**three-way and entity-level**: it compares both branches against their common
-ancestor and merges each node or edge type entity by entity, then publishes the
-result as
-**one atomic commit** across the whole graph.
+A merge integrates one branch into another and publishes the target change
+atomically across the whole graph.
 
 ```bash
-omnigraph branch merge review/2026-04-25 --into main --store s3://bucket/graph.omni
+omnigraph branch merge review/2026-04-25 --into main \
+  --store s3://bucket/graph.omni
 ```
 
-`branch merge <source> [--into <target>]` merges `<source>` into `<target>`
-(default `main`).
-
-## Deleting the source branch
-
-A merge never touches the source branch — it stays in `branch list`, holds its
-per-dataset storage, and pins the main versions it inherited against
-[`cleanup`](../operations/maintenance.md) GC until someone deletes it. Since a
-successful merge guarantees the target no longer depends on the source's
-storage, the recommended lifecycle is to delete the source right after merging.
-
-`--delete-branch` does that in one step (over HTTP, set `delete_branch: true`
-on `POST /branches/merge`):
-
-```bash
-omnigraph branch merge review/2026-04-25 --into main --delete-branch --store s3://bucket/graph.omni
-```
-
-The deletion runs after the merge has landed, under its **own** `branch_delete`
-policy check — an actor allowed to merge but not to delete branches gets the
-merge without the deletion. Deletion runs on every successful outcome,
-including `already_up_to_date` (the "already merged, clean me up" case). A
-refusal or failure — policy denial, a dependent descendant branch, a branch
-another branch's datasets still fork from — never fails the request: the merge is
-durable by then, so the CLI exits 0 with a stderr warning, and the response
-reports `branch_deleted: false` plus `branch_delete_error` (on success,
-`branch_deleted: true`). Deleting a branch is irreversible: its own commit
-history is not retained (only the merge commit on the target records the merged
-state).
+The source is positional. `--into` defaults to `main`.
 
 ## Outcomes
 
-A merge resolves to one of three outcomes:
+- **Already up to date**: the target already contains the source changes.
+- **Fast-forward**: the target has not diverged and advances to the source state.
+- **Merged**: both branches changed, so OmniGraph performs a three-way,
+  entity-level merge and creates a commit with two parents.
 
-- **Already up to date** — the target already contains every change on the source;
-  nothing to do.
-- **Fast-forward** — the target has no changes the source lacks, so the target
-  simply advances to the source.
-- **Merged** — both sides diverged; a new merge commit is created with two parents.
+The source branch is unchanged by the merge. Use `--delete-branch` for the
+normal review-branch lifecycle:
 
-## Indexes after a merge
+```bash
+omnigraph branch merge review/2026-04-25 --into main --delete-branch \
+  --store s3://bucket/graph.omni
+```
 
-Merge publishes logical entities without building or rebuilding indexes inline,
-for both fast-forward and three-way (`Merged`) outcomes. Newly merged entities are
-covered the next time `ensure_indices` or `optimize` runs — indexes are derived
-state, so pending physical work never delays the graph commit.
+Deletion happens after a successful merge and has its own authorization check.
+If deletion is denied or the source still has descendants, the merge remains
+successful and durable; the CLI prints a warning and the HTTP response reports
+the deletion failure. You can delete the branch later.
 
-Vector search remains correct through brute-force search while a vector index
-is absent or only partially covered. Full-text search requires at least one
-inverted index on the searched property: before its first build, `search` / `bm25`
-return an index-required error; once the index exists, Lance scans uncovered
-fragments so freshly merged entities remain searchable while coverage catches up.
-
-Run `omnigraph optimize` after a large merge to restore full index coverage and
-normal indexed-query latency.
+Deleting a branch is irreversible and may make branch-only commits unavailable.
+It also releases old history for a later cleanup.
 
 ## Conflicts
 
-When both branches changed the same data incompatibly, the merge fails with a
-structured list of conflicts (the HTTP server returns `409` with a
-`merge_conflicts[]` array). No partial result is published — the merge is
-all-or-nothing. The conflict kinds are:
+When both sides changed the same logical data incompatibly, the merge returns a
+structured conflict list and publishes nothing.
 
 | Kind | Meaning |
 |---|---|
-| `DivergentInsert` | The same id was inserted on both branches. |
-| `DivergentUpdate` | The same entity was updated differently on both branches. |
-| `DeleteVsUpdate` | One side deleted an entity the other side updated. |
-| `OrphanEdge` | An edge references a node the other side deleted. |
-| `UniqueViolation` | The merged result would violate a unique constraint. |
-| `CardinalityViolation` | The merged result would violate an edge cardinality constraint. |
-| `ValueConstraintViolation` | The merged result would violate a value constraint (enum/range). |
+| `divergent_insert` | Both branches inserted the same id. |
+| `divergent_update` | Both branches updated the same entity differently. |
+| `delete_vs_update` | One branch deleted an entity the other updated. |
+| `orphan_edge` | The result would contain an edge whose endpoint was deleted. |
+| `unique_violation` | The result would violate uniqueness. |
+| `cardinality_violation` | The result would violate edge cardinality. |
+| `value_constraint_violation` | The result would violate an enum, range, or other value constraint. |
 
-Each conflict carries `entity_kind`, `type_name`, and `entity_id` (when
-applicable), plus the conflict kind and a message. Resolve conflicts by
-reconciling the two branches — typically by making
-the conflicting change on one side and re-merging.
+Each conflict identifies the affected type and, when applicable, entity id. The
+HTTP server returns conflicts with status `409`. Reconcile the data on one or
+both branches, then run the merge again.
 
-See [branches & commits](index.md) for the branch and commit-DAG model, and
-[changes](changes.md) for diffing two branches before you merge.
+## After a large merge
+
+Indexes do not define merge correctness. Newly merged entities remain queryable even
+when index coverage has not caught up, but some searches may scan them. Run
+`omnigraph optimize` after a large merge to restore efficient layout and index
+coverage.
+
+See [Branches, Commits, and History](index.md) for the complete branch workflow.

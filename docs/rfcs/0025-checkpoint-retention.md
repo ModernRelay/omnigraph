@@ -1,45 +1,51 @@
 ---
-type: spec
-title: "RFC-025 — Checkpoint-pinned retention"
-description: Makes named graph checkpoints authoritative retention roots, materializes them as Lance-native manifest and data-table tags, and defines crash-safe reconciliation and cleanup ordering on the RFC-022 unified write path.
-status: research-blocked
-tags: [eng, rfc, retention, checkpoint, cleanup, manifest, lance, omnigraph]
-timestamp: 2026-07-10
-owner: OmniGraph maintainers
+rfc: "0025"
+title: "Checkpoint-pinned retention"
+track: maintainer
+status: draft
+implementation: not-started
+authors:
+  - OmniGraph maintainers
+created: 2026-07-10
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on:
+  - History-flat checkpoint authority lookup
 ---
 
-# RFC-025 — Checkpoint-pinned retention
+# RFC 0025: Checkpoint-pinned retention
 
-**Status:** Research-blocked — Gate 0 rejected the current in-manifest BTREE
-access shape; no retention format is active
-**Date:** 2026-07-10
+> **Current disposition:** Gate 0 rejected the current in-manifest BTREE access
+> shape. The draft remains blocked and no retention format is active.
+
 **Gate 0 evaluated:** 2026-07-17
-**Author track:** Maintainer design series
 
-> **RFC-026 disposition:** RFC-026 was later rejected and removed. References
+> **RFC 0026 disposition:** RFC 0026 was later rejected and removed. References
 > below to quiescing MemWAL streams or to v7+ stream formats are historical
 > scenario analysis, not a retention prerequisite. See
-> [the removal decision](../dev/wal-removal.md).
+> the current [ingestion contract](../dev/ingestion.md).
 
-**Depends on:** [RFC-022](0022-unified-write-path.md)'s publisher and
+**Depends on:** [RFC 0022](0022-unified-write-path.md)'s publisher and
 recovery-sidecar protocol and
-[RFC-028](0028-stable-schema-identity.md)'s stable table identity/incarnation.
-It composes with [RFC-024](0024-durable-table-heads.md), but durable heads are
+[RFC 0028](0028-stable-schema-identity.md)'s stable table identity/incarnation.
+It composes with [RFC 0024](0024-durable-table-heads.md), but durable heads are
 not required for checkpoint authority.
 **Surveyed:** omnigraph 0.8.1; Lance 9.0.0-rc.1 at git rev
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance branch/tag,
 transaction, cleanup, and object-store specifications
 **Audience:** engine, storage, CLI, and operations maintainers
-**Open architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
-Findings marked **BLOCKER** must be dispositioned before acceptance.
+The former cross-RFC architecture review's owned blockers and evidence gates
+are incorporated below and remain prerequisites for acceptance.
 
 ---
 
 ## 0. Decision
 
 OmniGraph retains checkpoint-pinned retention as the target architecture, but
-activation is research-blocked on a history-flat current-authority access
-shape. A checkpoint is a durable, named graph snapshot: one reference set in
+the draft is blocked on a history-flat current-authority access shape. A
+checkpoint is a durable, named graph snapshot: one reference set in
 the reserved main-manifest registry containing every physical manifest/table
 lineage and version needed to reconstruct that graph state.
 
@@ -94,7 +100,7 @@ local matrix shows history-sensitive compacted scan bytes and an additional
 scan operation at depth 1,000. One required physical-I/O cell failing is
 sufficient to block activation; the unrun S3/RustFS cost cell is not needed to
 turn that result into a pass or a stronger claim. At evaluation time internal
-schema v6 remained authoritative. RFC-026 Phase A subsequently activated v7 and
+schema v6 remained authoritative. RFC 0026 Phase A subsequently activated v7 and
 private Phase B1 activated v8; neither adds checkpoint rows, tags, API, or
 cleanup integration. This
 result rejects the proposed access shape, not checkpoint
@@ -188,10 +194,10 @@ new version. A later format may instead use the strand rebuild and begin with
 no checkpoints, but it cannot silently merge, split, or revive V1
 reservations.
 
-Because RFC-024 heads are optional, RFC-025 owns this token contract for both
+Because RFC 0024 heads are optional, RFC 0025 owns this token contract for both
 the pinned manifest and every pinned table. The token identifies the immutable
 physical version object and its dataset/native-ref lineage for the exact
-`(path, branch, version)`; it is independent of RFC-028's logical incarnation.
+`(path, branch, version)`; it is independent of RFC 0028's logical incarnation.
 Use a strong object e_tag plus the Lance-native branch/dataset identifier when
 the backend exposes them, or another backend-specific token proven to change
 when a dataset/ref/version is deleted and recreated at the same coordinates.
@@ -199,15 +205,15 @@ Timestamp, path, branch name, and numeric Lance version alone are not proofs.
 A backend without a token that passes local and S3/RustFS ABA guards cannot
 activate the retention format.
 
-The name reservation, header, and every table row land in one RFC-022 publisher
+The name reservation, header, and every table row land in one RFC 0022 publisher
 CAS on main. First creation is insert-only; reuse requires the exact tombstoned
 reservation generation in the `ReadSet`. Two concurrent attempts for the same
 V1 canonical name therefore conflict even when they captured different source
 branches. A missing or duplicate table row is an invalid checkpoint, not a
 partial checkpoint.
 
-[RFC-028](0028-stable-schema-identity.md)'s stable table ID and incarnation are
-a ship gate; checkpoint rows cannot key retention to mutable names. RFC-024 may
+[RFC 0028](0028-stable-schema-identity.md)'s stable table ID and incarnation are
+a ship gate; checkpoint rows cannot key retention to mutable names. RFC 0024 may
 provide the same manifest's bounded head/index access machinery when it lands,
 but it does not own or supply checkpoint identity.
 
@@ -221,7 +227,7 @@ authority. Checkpoint IDs are never reused.
 
 Checkpoint create/delete are manifest metadata transactions. They do not create
 a graph-content commit or move `graph_head`: taking a checkpoint must not change
-the graph state it names. They still use RFC-022's read-set arbitration,
+the graph state it names. They still use RFC 0022's read-set arbitration,
 manifest CAS, actor, and audit contracts. Creation uses a recovery sidecar for
 its pre-CAS tag effects; deletion is authority-first and embeds its idempotent
 operation marker in the tombstone CAS instead of writing a generic sidecar.
@@ -319,9 +325,9 @@ or substrate lease design and is out of scope.
 
 ## 3. Checkpoint create protocol
 
-Checkpoint creation is a writer on the RFC-022 pipeline:
+Checkpoint creation is a writer on the RFC 0022 pipeline:
 
-1. Run and await RFC-022's synchronous recovery barrier.
+1. Run and await RFC 0022's synchronous recovery barrier.
 2. Authorize, capture one immutable source-branch manifest snapshot and graph
    commit, and prepare the complete header/table/tag set plus a `ReadSet` that
    includes source branch incarnation, source manifest version, format/schema
@@ -329,7 +335,7 @@ Checkpoint creation is a writer on the RFC-022 pipeline:
    GC boundaries, and the main-registry name reservation; a source at or behind
    a pruned-through boundary is refused even if its files happen to remain.
 3. Acquire the retention claim, checkpoint/cleanup process-local serialization,
-   source branch-control gate, and adapter-declared metadata gates in RFC-022's
+   source branch-control gate, and adapter-declared metadata gates in RFC 0022's
    canonical order. Ordinary data queues are not held merely because immutable
    versions are being tagged.
 4. Freshly revalidate the complete `ReadSet`. A changed branch incarnation,
@@ -373,7 +379,7 @@ A failed tag deletion only retains extra data. The checkpoint is already gone
 from the user-visible namespace. The reconciler and the next `cleanup` retry
 the physical reclaim.
 
-Delete is an RFC-022 authority-first metadata workflow: no independently durable
+Delete is an RFC 0022 authority-first metadata workflow: no independently durable
 effect precedes the atomic tombstone CAS, and later tag deletion is derived,
 over-retaining cleanup. It therefore needs no generic write sidecar. The
 `delete_operation_id` persisted by the tombstone CAS lets crash recovery
@@ -440,17 +446,17 @@ must be repaired before retention work.
 Read-only preview may run without a claim, but it is explicitly provisional.
 Confirmed execution uses this order:
 
-1. establish the operator write outage; when the graph format includes RFC-026
+1. establish the operator write outage; when the graph format includes RFC 0026
    and any target table is stream-enrolled, persistently seal/fold those streams
-   **before** taking the retention claim; then complete the RFC-022 recovery
+   **before** taking the retention claim; then complete the RFC 0022 recovery
    barrier;
 2. acquire the retention claim, then revalidate the fleet outage, absence of
    recovery sidecars, and—only when streaming is present—the exact `SEALED`
-   cuts; a retention-only graph has no stream gate or RFC-026 dependency;
+   cuts; a retention-only graph has no stream gate or RFC 0026 dependency;
 3. run pin reconciliation and recompute the exact root set and per-dataset
    cutoffs under the claim, including the oldest live lazy-branch inherited-main
    floor above;
-4. prepare and revalidate a complete RFC-022 `ReadSet` containing format/schema
+4. prepare and revalidate a complete RFC 0022 `ReadSet` containing format/schema
    identity, branch incarnations, current manifest table entries/heads, prior GC
    boundaries, and the root digest;
 5. publish mutable `gc_boundary:<dataset-lineage-hash>` rows containing cutoff,
@@ -461,15 +467,15 @@ Confirmed execution uses this order:
 7. record per-table removal statistics/failures and release the claim only when
    the operation is durably resumable or complete.
 
-Step 5 is an RFC-022 authority-first metadata transaction: it changes which
+Step 5 is an RFC 0022 authority-first metadata transaction: it changes which
 versions recovery may select, carries no graph-content lineage, and needs no
-sidecar because no physical effect precedes its CAS. Step 6 is RFC-022 §8
+sidecar because no physical effect precedes its CAS. Step 6 is RFC 0022 §8
 physical maintenance under the already-published boundary. The two are not one
 indistinguishable “cleanup commit.”
 
 The boundary advances before delete. Any later recovery, restore, or publisher path
 that could make an older physical version current must include the boundary in
-its RFC-022 `ReadSet` and revalidate it before the physical effect. A position
+its RFC 0022 `ReadSet` and revalidate it before the physical effect. A position
 at or behind the boundary is retried from current state or refused. Cleanup
 never starts with an armed recovery that may still need an older version.
 
@@ -531,11 +537,11 @@ the contingent format contract for a successor that first clears the same
 physical-I/O boundary; the Gate 0 result itself authorizes no implementation or
 format bump.
 
-This RFC owns its own internal-format activation. RFC-022 authorizes no format
-bump, and RFC-024 explicitly excludes checkpoint rows from its heads format.
+This RFC owns its own internal-format activation. RFC 0022 authorizes no format
+bump, and RFC 0024 explicitly excludes checkpoint rows from its heads format.
 Retention may therefore be the next independently accepted format capability
-after RFC-028 even when durable heads are absent. A heads-free target writes
-RFC-028 identity plus retention rows in its first valid state and resolves the
+after RFC 0028 even when durable heads are absent. A heads-free target writes
+RFC 0028 identity plus retention rows in its first valid state and resolves the
 bounded checkpoint registry through retention's own structured lookup; it does
 not rely on table-head rows. If heads already exist in the source format, a
 later retention target preserves that accepted capability and initializes the
@@ -595,7 +601,7 @@ before creating tags.
 
 That is a physical-I/O claim, not just a logical row-count claim. Registry
 lookup must use a structured Lance access path with a measured bound on
-uncovered fragments, reusing RFC-024's in-manifest scalar-index work when it is
+uncovered fragments, reusing RFC 0024's in-manifest scalar-index work when it is
 available or proving an equivalent access shape here. A filtered scan that
 still reads history-sized manifest fragments does not pass this RFC's cost gate;
 a separate checkpoint dataset is rejected because its authority rows could not
@@ -630,7 +636,7 @@ assertions; that means it reproduces the current blocker, not that Gate 0
 passes. The S3/RustFS matrix is checked in and bucket-gated but was not run for
 this decision, so this RFC makes no S3 cost claim.
 
-Separately, all 23 Lance surface guards pass on RC.1. The RFC-025 cells prove exact
+Separately, all 23 Lance surface guards pass on RC.1. The RFC 0025 cells prove exact
 main and named-branch tag targets, sparse cleanup pin/unpin behavior, and that
 a tag does not protect the named branch tree. These results validate the
 physical-pin architecture but cannot compensate for the failed registry-access
