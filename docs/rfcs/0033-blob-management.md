@@ -1,29 +1,32 @@
 ---
-type: spec
-title: "RFC-033 — Blob management"
-description: A safe, snapshot-aware, engine-owned blob surface for node and edge cells, with bounded streaming reads, raw-byte replacement and clear operations, explicit external-reference policy, and correctness gates for empty blobs and maintenance.
-status: draft
-tags: [eng, rfc, blob, storage, api, security, streaming, maintenance, omnigraph]
-timestamp: 2026-08-09
-owner: OmniGraph maintainers
+rfc: "0033"
+title: "Blob management"
+track: maintainer
+status: accepted
+implementation: partial
+authors:
+  - OmniGraph maintainers
+created: 2026-08-09
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-033: Blob management
+# RFC 0033: Blob management
 
-**Status:** Draft
-**Date:** 2026-08-09
-**Author track:** Maintainer design series
-**Depends on:** RFC-022 unified writes, RFC-023 exact `id` fencing,
-RFC-028 stable schema identity, internal manifest schema v6, and Lance 10.0.0
+**Depends on:** RFC 0022 unified writes, RFC 0023 exact `id` fencing,
+RFC 0028 stable schema identity, internal manifest schema v6, and Lance 10.0.0
 blob-v2 (`lance.blob.v2`) on file format V2_2.
-Phase 3 and the served-route lifecycle additionally depend on RFC-034 durable
-recovery authority, RFC-035 served-operation ownership, and RFC-036 atomic
+Phase 3 and the served-route lifecycle additionally depend on RFC 0034 durable
+recovery authority, RFC 0035 served-operation ownership, and RFC 0036 atomic
 runtime activation.
 **Surveyed:** OmniGraph `db23f58a5d97`; Lance 9.0.0 as the defect baseline;
 and Lance 10.0.0 as the required implementation substrate.
 **Audience:** engine, compiler, server, CLI, security, storage, maintenance,
 and documentation maintainers.
-**Implementation:** Phases 0, 1, 2A (HTTP read delivery), and 2B (CLI read
+**Current rollout:** Phases 0, 1, 2A (HTTP read delivery), and 2B (CLI read
 delivery) are implemented on the v0.10 development line. Phase 3 (mutation),
 Phase 4 (measured optimization), and the production delivery telemetry named
 in §11 remain open.
@@ -242,7 +245,7 @@ pub struct BlobCell {
 ```
 
 `type_name` and `property` are public graph vocabulary. They are resolved through
-the accepted catalog captured with the read view; under RFC-036 that catalog,
+the accepted catalog captured with the read view; under RFC 0036 that catalog,
 the schema token, Cedar policy, and external-Blob policy all come from the same
 immutable runtime generation. The engine then carries stable table identity,
 incarnation identity, and stable property identity internally.
@@ -333,7 +336,7 @@ the property and schema fences still apply.
 A returned reader keeps the snapshot/table handle needed to finish the read.
 Advancing a branch after the reader is opened does not switch the payload under
 that reader. Branch deletion and its physical tree reclamation are destructive
-boundaries, just like `cleanup` and RFC-034 exclusive compensation: Phase 1 adds
+boundaries, just like `cleanup` and RFC 0034 exclusive compensation: Phase 1 adds
 no durable reader lease or cross-process live-reader registry. Callers that
 require an opened reader to finish must quiesce it before deleting that branch,
 running version GC, or beginning offline compensation that can Restore or remove
@@ -581,13 +584,13 @@ Blob replacement and clear are not new writer kinds. The dedicated adapter uses
 Mutation's validation, exact per-table transaction, recovery-v9 sidecar, graph
 lineage, and one manifest CAS. The shared publish tail remains one call site.
 
-RFC-034 owns recovery classification and effects. A served Blob operation never
-heals inline: it forwards `RecoveryRequired`, RFC-035 emits one opaque wake, and
-RFC-036/034 own convergence. Runtime candidates use effect-free
+RFC 0034 owns recovery classification and effects. A served Blob operation never
+heals inline: it forwards `RecoveryRequired`, RFC 0035 emits one opaque wake, and
+RFC 0036 and RFC 0034 own convergence. Runtime candidates use effect-free
 `ReadWriteNoRecovery`; compensation remains offline and exclusive.
 
 The engine write itself uses one coherent accepted view from its handle. A
-served caller additionally binds that handle to one RFC-036 generation and
+served caller additionally binds that handle to one RFC 0036 generation and
 checks its schema token before entering the engine. The engine write:
 
 1. normalizes and rejects internal branch names;
@@ -626,14 +629,14 @@ Reads additionally accept `branch=<name>` or `snapshot=<commit>`, never both;
 the transport default is `branch=main`. Authorization uses the existing `read`
 action and the same snapshot-to-policy-branch resolution as `/read`.
 
-Under RFC-035/036 the route first captures one exact served generation and a
+Under RFC 0035 and RFC 0036 the route first captures one exact served generation and a
 `ReadObserver` permit before target observation. The generation supplies the
 engine, catalog, policy, external-Blob policy, and cache namespace. HEAD and an
 external redirect retain the capture through response completion; a managed GET
 retains it through body/scoped-producer EOF, error, or drop. Disconnect cancels
 the read normally and releases the permit only after producer settlement. A
-closed lane fails before target work with RFC-035's lifecycle 503; a fresh
-schema-token mismatch returns RFC-036's `GenerationStale` and wakes its
+closed lane fails before target work with RFC 0035's lifecycle 503; a fresh
+schema-token mismatch returns RFC 0036's `GenerationStale` and wakes its
 supervisor. Middleware never reloads the registry and silently switches
 generations.
 
@@ -698,7 +701,7 @@ raw `application/octet-stream`, not JSON or base64. Its route-specific body
 limit is 32 MiB inclusive. After effect-free authentication, bounded parsing,
 and preliminary authorization, the request prepares the bytes, selector,
 precondition, server-resolved actor, exact generation, and workload guard, then
-calls RFC-035's non-async `try_start_write`. That operation atomically acquires
+calls RFC 0035's non-async `try_start_write`. That operation atomically acquires
 the `Write` permit, registers, and spawns on the same generation with no
 I/O/await gap. Oversize input fails before handoff/effect; afterward a disconnect
 loses delivery only and never cancels or replays the write.
@@ -849,7 +852,7 @@ trust domain.
 
 The engine receives the policy with handle construction, so correctness and
 security do not depend on HTTP code. Embedded operations consume that
-handle/builder-bound policy. Under RFC-036, served operations instead consume it
+handle/builder-bound policy. Under RFC 0036, served operations instead consume it
 from the same immutable generation as the engine facade, catalog, schema token,
 and Cedar policy. Neither path rereads desired configuration or offers a
 per-request escape hatch. Cedar still decides who may change the graph;
@@ -863,7 +866,7 @@ cluster-served graph with configured bases; rebuild tooling with direct storage
 can import managed `base64:` values, while a rebuild containing external URIs
 must use that served route or an embedded handle with the graph policy installed.
 This is a deliberate trust-boundary choice, not a temporary per-request bypass.
-Future direct-store Blob writes are a separate writer process under RFC-034: an
+Future direct-store Blob writes are a separate writer process under RFC 0034: an
 operator must quiesce a serving writer or use the served CLI path instead.
 
 ### 7.2 Ingest behavior
@@ -1086,14 +1089,14 @@ Physical row addresses never become public stable identity.
 | External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
 | Engine read memory | `BlobReader::read_range` returns at most `BLOB_READ_RANGE_MAX_BYTES` (4 MiB); larger values require consecutive calls and there is no unbounded full-read method |
 | Delivery memory | Phase 2A adds a two-chunk queue, backpressure, and prompt cancellation without weakening the engine's 4 MiB per-call bound |
-| Runtime replacement | RFC-035 `ReadObserver` / `Write` permits bind the exact RFC-036 generation through read completion or owned-write terminal state; closed/stale admission fails before target work |
+| Runtime replacement | RFC 0035 `ReadObserver` / `Write` permits bind the exact RFC 0036 generation through read completion or owned-write terminal state; closed/stale admission fails before target work |
 | Range arithmetic | Half-open `start <= end <= length`; empty-at-end is valid; reversed/out-of-bounds ranges are typed and carry the logical length |
 | Stale overwrite | Optional strong `If-Match`, evaluated at each freshly pinned attempt |
 | Actor spoofing | Existing server-resolved actor and engine-wide Cedar enforcement |
 | Partial graph visibility | Existing Mutation sidecar and one manifest publication door |
 | External-object deletion | Never performed by OmniGraph |
 
-The RFC-035 lifecycle permit is mandatory and is not a workload-throttling
+The RFC 0035 lifecycle permit is mandatory and is not a workload-throttling
 control: GET/HEAD use `ReadObserver`, while PUT/DELETE use `Write`. The existing
 two-chunk semaphore bounds retained payload bytes independently. If measurements
 show that long-lived Blob streams can starve ordinary reads, a separate workload
@@ -1116,10 +1119,10 @@ depends on typed code and fields, not an opaque Lance string.
 | Managed HTTP range exceeds 4 MiB | consecutive bounded engine reads | 200/206; the 4 MiB ceiling bounds each payload read, not the requested representation |
 | Valid but unsatisfiable HTTP range | `BlobRangeNotSatisfiable { start, end, length }` details | 416 plus `Content-Range: bytes */N` and `blob_range` |
 | Blob write If-Match failed | `BlobWritePreconditionFailed { current_etag }` | 412 plus `blob_precondition_failure`; never graph `precondition_failure` |
-| Generation lane closed before operation | shared RFC-035 lifecycle detail | 503, not started |
-| Captured generation schema token is stale | RFC-036 `GenerationStale` | shared mapping and supervisor wake; no Blob-specific error |
+| Generation lane closed before operation | shared RFC 0035 lifecycle detail | 503, not started |
+| Captured generation schema token is stale | RFC 0036 `GenerationStale` | shared mapping and supervisor wake; no Blob-specific error |
 | Recovery intent armed but completion uncertain | `recovery_required` | existing mapping |
-| Owned write panics or has no knowable terminal outcome | shared RFC-035 unknown-outcome class | 500; never success or replay |
+| Owned write panics or has no knowable terminal outcome | shared RFC 0035 unknown-outcome class | 500; never success or replay |
 | Persisted table/Blob integrity contradiction | `BlobIntegrity { reason }` | exhaustive server mapping is 5xx |
 
 Phase 0 implements deterministic test probes for admitted external cells,
@@ -1128,7 +1131,7 @@ adds deterministic transport probes for zero-read HEAD, retained chunk/byte
 bounds, backpressure, and disconnect cancellation. These are structural
 acceptance evidence, not production telemetry.
 
-Production delivery telemetry remains required before RFC-033 is complete. It
+Production delivery telemetry remains required before RFC 0033 is complete. It
 must record operation, entity kind, managed/external/null classification,
 requested and served byte count, range/full mode, precondition result, and
 time-to-first-byte. It must never log payload bytes, bearer tokens, URI
@@ -1136,7 +1139,7 @@ credentials, or complete sensitive URIs. URI metrics use scheme plus a
 keyed/irreversible base identifier. Phase 2A deliberately does not add a new
 metrics backend merely to claim this box; the telemetry ships in a focused
 follow-up against the repository's eventual production observability owner.
-RFC-035/036 own generic lifecycle metrics. This RFC adds only Blob
+RFC 0035 and RFC 0036 own generic lifecycle metrics. This RFC adds only Blob
 classification, range, payload-byte, validator, and delivery timing dimensions.
 
 ## 12. Test and acceptance plan
@@ -1201,7 +1204,7 @@ The implementation extends existing owners before creating new fixtures, per
   movement, and then proves a canonical retained external reference does not
   poison the following keyed write.
 - Destructive-reclamation acceptance remains in `maintenance.rs`: readers never
-  retarget, operators quiesce them before cleanup, branch deletion, or RFC-034
+  retarget, operators quiesce them before cleanup, branch deletion, or RFC 0034
   exclusive compensation, and a reclamation race may only fail loudly.
 - Phase 3 extends the same `end_to_end.rs` fixture with update-only PUT, nullable
   clear, exact commit receipts, no-op clear `commit: null`, returned-ETag
@@ -1215,7 +1218,7 @@ The implementation extends existing owners before creating new fixtures, per
   and sidecar state unchanged.
 - Phase 3 extends the existing Mutation rendezvous owner: a competing write
   forces fresh If-Match evaluation, a post-publication write cannot alter the
-  first receipt/ETag, and branch ABA fails closed. RFC-036's generation owner
+  first receipt/ETag, and branch ABA fails closed. RFC 0036's generation owner
   adds a Blob representative for stale-schema refusal and wholly-G1 execution.
 - Later merge/mutation work in `branching.rs` retains merge preservation of
   empty bytes, operation-wide managed-plus-exact-range accounting, the 8,192
@@ -1229,7 +1232,7 @@ The implementation extends existing owners before creating new fixtures, per
   record with no unresolved sidecar. PUT proves exact bytes and an ETag equal to
   a fresh read. Clear proves null/NotFound with no ETag and proves the old ETag is
   stale; the injected call itself returns no successful write outcome. The test
-  proves the Mutation record; RFC-034/036 own later convergence.
+  proves the Mutation record; RFC 0034 and RFC 0036 own later convergence.
 - Phase 3 registers new writes under Mutation in `forbidden_apis.rs`; no new
   durable call site appears.
 
@@ -1260,13 +1263,13 @@ The implementation extends existing owners before creating new fixtures, per
 - Phase 2A extends `data_routes.rs` with GET/HEAD headers; empty 200; ranges and
   conditionals; external 302 with zero external I/O; branch/snapshot validation;
   node and edge selectors; and authorization. A payload-read probe remains at
-  zero for managed HEAD on both empty and near-limit values. RFC-035/036 extend
+  zero for managed HEAD on both empty and near-limit values. RFC 0035 and RFC 0036 extend
   the same route owner with exact-generation `ReadObserver` capture and shared
   lifecycle 503s. Phase 3 extends it with owned PUT/DELETE, exact receipts,
   no-op clear `commit: null`, distinct Blob 412 details, 413, and actor
   attribution.
 - `openapi.rs`: regenerate and compare each phase's binary request/response
-  surface. RFC-035/036 add GET/HEAD lifecycle responses; Phase 3 pins write
+  surface. RFC 0035 and RFC 0036 add GET/HEAD lifecycle responses; Phase 3 pins write
   lifecycle, the exact receipt, and the distinct Blob precondition without
   exposing storage identity.
 - Phase 2B's pure `crates/omnigraph-cli/src/blob_cli.rs` units own range
@@ -1303,7 +1306,7 @@ The implementation extends existing owners before creating new fixtures, per
   redirect paths also release exactly one `ReadObserver` permit.
   These deterministic counters, rather than a platform-noisy RSS number, are the
   acceptance gate.
-- Extend RFC-035's real HTTP cancellation owner with Blob PUT and DELETE after
+- Extend RFC 0035's real HTTP cancellation owner with Blob PUT and DELETE after
   Mutation arm: HTTP/1 disconnect, HTTP/2 reset, and request timeout may lose
   delivery but the owned task reaches one terminal result, never replays, and
   emits one opaque wake on `RecoveryRequired`.
@@ -1318,8 +1321,8 @@ The live raw PUT → ranged GET → stale If-Match exercise against the cluster
 server becomes an acceptance gate only when Phases 2 and 3 expose those
 transports.
 The object-store cost evidence is explicitly on-demand and is not implied by the
-canonical local test graph. Follow
-[`deployment.md` → Testing against S3 locally](../user/deployment.md#testing-against-s3-locally),
+canonical local test graph. Follow the current
+[deployment guide](../user/deployment.md),
 run `cargo test -p omnigraph-engine --test write_cost_s3` with the documented
 bucket, endpoint, and credential environment, and attach the untruncated test log
 plus the non-secret endpoint configuration to the implementation PR.
@@ -1415,14 +1418,14 @@ correctness gate.
 
 ### Phase 3 — mutation
 
-- **Served-read prerequisite:** when RFC-035/036 land, retrofit the already
+- **Served-read prerequisite:** when RFC 0035 and RFC 0036 land, retrofit the already
   shipped GET/HEAD routes with exact-generation `ReadObserver` lifetime before
   adding any Blob write route.
-- **3A — engine:** after RFC-034's canonical recovery interfaces stabilize, add
+- **3A — engine:** after RFC 0034's canonical recovery interfaces stabilize, add
   the dedicated exact-ID PUT/clear adapter through the shared Mutation
   staging/publication tail. Return the exact commit and same-publication Blob
   evidence; do not heal inline or synthesize `.gq`.
-- **3B — HTTP:** after RFC-035 ownership and RFC-036 generation capture land,
+- **3B — HTTP:** after RFC 0035 ownership and RFC 0036 generation capture land,
   add PUT/DELETE through owned execution and pin receipts, distinct Blob
   preconditions, lifecycle errors, OpenAPI, cancellation, and failpoint behavior.
 - **3C — CLI:** add put/clear with embedded/remote exact-receipt and
@@ -1456,7 +1459,7 @@ No architectural invariant is weakened.
   immutable-manifest identity, row, descriptor, and bytes from one `ReadTarget`
   within it.
 - **Ordinary writes are recoverable:** no Blob-specific direct commit or recovery
-  protocol is introduced; RFC-034 owns classification/effects and a Blob entry
+  protocol is introduced; RFC 0034 owns classification/effects and a Blob entry
   point never performs inline recovery.
 - **Strong consistency:** validators and preconditions are evaluated against the
   captured base; success is returned only after graph publication, with the

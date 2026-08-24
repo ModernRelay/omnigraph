@@ -1,9 +1,32 @@
-# RFC: Inline + Stored Queries, Request/Response Envelope, MCP
+---
+rfc: "0041"
+title: "Inline and stored queries"
+track: maintainer
+status: accepted
+implementation: partial
+authors:
+  - OmniGraph maintainers
+created: 2026-05-28
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
 
-**Status:** Proposed
-**Date:** 2026-05-28
-**Tickets:** MR-656 (inline `-e` + URL rename), MR-668 (multi-graph, shipped), MR-976 (Phase 1 envelope parent: MR-977 / MR-978 / MR-979 / MR-980), MR-969 (stored queries + MCP)
-**Target release:** v0.6.x patch series (MR-656 + Phase 1) → v0.7.0 (MR-969 PRs 1-3)
+# RFC 0041: Inline and stored queries
+**Tickets:** MR-656 (inline `-e` + URL rename), MR-668 (multi-graph, shipped),
+MR-976 (historical envelope proposal), and MR-969 (stored queries; MCP follow-up
+is now RFC 0003)
+**Historical target:** v0.6.x patch series (MR-656) through the stored-query
+work later shipped in the v0.10 line.
+
+> **Current boundary:** Inline `/query` and `/mutate`, boot-validated stored
+> queries, `GET /queries`, `POST /queries/{name}`, and the coarse
+> `invoke_query` Cedar gate ship. The richer request/response envelope below
+> remains design history, not a current contract. MCP transport is owned by the
+> still-draft [RFC 0003](0003-mcp-server-surface.md) and is intentionally absent
+> from this RFC.
 
 ## Summary
 
@@ -11,9 +34,15 @@ OmniGraph today exposes `POST /read` and `POST /change` with a weakly-contracted
 
 1. **MR-656**: rename `/read` → `/query` and `/change` → `/mutate`, add inline `-e` CLI flag, ship three-channel deprecation on the legacy URLs. **In flight, PR #110.**
 2. **Envelope hardening** (this RFC adds it as a Phase 1 before MR-969): make today's mutation surface agent-grade with idempotency keys, preconditions, deadlines, and a structured response envelope carrying `audit_id`, `commit_id`, `snapshot_id`, and cost stats.
-3. **MR-969**: add a stored-query registry, `POST /queries/{name}`, a new `InvokeQuery` Cedar action with per-query scope, inline pragmas in `.gq` (`@description`, `@returns`, `@mcp`), and MCP transport over the same routing primitive.
+3. **MR-969**: add a stored-query registry, `GET /queries`,
+   `POST /queries/{name}`, and an `InvokeQuery` Cedar action. The shipped gate
+   is graph-scoped; the invoked query still passes the ordinary `read` or
+   `change` gate for its body.
 
-The bet: inline and stored queries serve different stages of the same lifecycle, run through the same engine code, and are gated by different Cedar actions. HelixDB collapsed to stored-only. Postgres has neither stored-query Cedar nor MCP. The window for an OSS, declarative, agent-grade graph query surface is open.
+The bet: inline and stored queries serve different stages of the same lifecycle,
+run through the same engine code, and are gated by different Cedar actions.
+Inline remains the exploration surface; stored queries are the reviewed,
+boot-validated service surface.
 
 ## Motivation
 
@@ -30,9 +59,7 @@ The MR-656 rename solves the cosmetic asymmetry (`/read` was a poor pair for the
 - Compiled query bundles (HelixDB's `queries.json` shape). `.gq` files are already declarative; the file *is* the artifact.
 - Hot reload of the registry. Restart-only matches the multi-graph operational model from MR-668.
 - Per-query rate limits in v1. Existing `WorkloadController` covers the bulk of the risk. Punt to a future ticket.
-- Cross-graph tool listing in MCP. Agents loop over per-graph endpoints when they need multi-graph access. Avoid namespacing in the contract.
 - Web dashboard / control-plane management of the registry. Operators edit `.gq` + `policy.yaml` and restart.
-- Schema introspection through MCP. Schema is an operator concern; agents see types through declared return shapes on the queries they're allowed to invoke.
 - Per-environment override files. Environment-specific differences live in `policy.yaml`, which already has per-env variants.
 
 ## Background
@@ -52,8 +79,8 @@ MR-656 is currently in PR #110 (CONFLICTING / DIRTY against main; rebase planned
 | Source location | Request body | `queries/*.gq` on disk |
 | Parse + typecheck | Per request | Once at server boot |
 | Cedar action | `read` / `change` | `invoke_query` (per-name scope) |
-| MCP-exposed | No (not enumerable) | Yes (when `@mcp(expose=true)`) |
-| Output schema | Inferred | Declared via `@returns`, asserted at boot |
+| Catalogued | No (not enumerable) | Yes when the registry entry has `expose: true` |
+| Output schema | Inferred | Inferred and type-checked at boot |
 | Audit log shape | Records query hash | Records query name |
 | Failure visibility | Runtime 400 | Boot-time refusal |
 
@@ -63,8 +90,7 @@ Both paths converge in the engine:
 POST /query         ─parse→─┐
 POST /mutate        ─parse→─┤
                              ├─→ run_query / run_mutate(ast, params, branch) ─→ envelope
-POST /queries/{name} ───────┤
-POST /mcp/invoke ───────────┘   (MCP adapter on top of the same call)
+POST /queries/{name} ───────┘
 ```
 
 The MR-656 rebase widens `run_query` / `run_mutate` to accept a parsed AST or source string. Inline parses on each call. Stored looks up the pre-parsed AST in the registry. Same execution path beyond that point.
@@ -83,46 +109,50 @@ Inline and stored coexist safely because they're gated by different actions:
     actors: { group: agents }
     actions: [invoke_query]
     resource: Graph::"prod"
-    query_scope: { names: [find_user, list_orders, search_docs] }
 ```
 
-The agent's effective surface: three stored queries by name. Cannot compose inline. Cannot enumerate schema. Cannot read arbitrary entities. A developer in the same deployment with `dev-engineers` group membership might have `[read, change, invoke_query]` allowed — full access to both paths.
+The shipped `invoke_query` action grants access to the graph's stored-query
+surface as a whole. It does not yet scope the grant by query name. A stored
+read also passes the ordinary `read` gate; a stored mutation also passes the
+ordinary `change` gate. Callers without `invoke_query` receive the same 404 for
+a denied query and an unknown query, preventing registry-name probing.
 
 Same server, same data, two completely different API surfaces depending on token. This is the posture MR-969 calls "LLM-safe API surface."
 
-### `.gq` pragmas
+### Query metadata and registry exposure
 
-Stored queries self-describe at the top of the source file:
+Stored queries carry human-facing metadata in `.gq`:
 
 ```gq
-@description("Look up a user by ID. Returns name, email, last_login.")
-@returns({ name: String, email: String, last_login: DateTime? })
-@mcp(expose=true)
-
-query find_user($id: String) {
+query find_user($id: String)
+  @description("Look up a user by ID.")
+  @instruction("Use for exact ID lookups.") {
   match { $u: User { id: $id } }
   return { $u.name, $u.email, $u.last_login }
 }
 ```
 
-Three pragmas in v1:
+- `@description("...")` is concise catalog documentation.
+- `@instruction("...")` tells a caller when to use the query.
+- `expose` and the optional `tool_name` live on the applied cluster catalog
+  entry. They control `GET /queries` membership and naming, not authorization.
 
-- `@description("...")` — string surfaced in `omnigraph queries explain` and MCP tool descriptions.
-- `@returns({...})` — optional output type assertion. Compiler verifies the inferred type matches; mismatch fails server startup.
-- `@mcp(expose=true|false, tool_name="alt_name"?)` — controls MCP visibility. Default is `expose=false` (callable via HTTP, hidden from MCP). `tool_name` defaults to the query name.
+The server reads the applied cluster catalog, asserts that each registry key
+matches a query declaration, parses and type-checks every entry against the
+live graph schema, and quarantines a graph whose registry is invalid.
 
-Pragmas live in source, not in a separate YAML registry. Drop a file in `queries/`, restart, the registry picks it up. The full agent contract is reviewable in one diff.
+### Historical request-envelope proposal (not shipped)
 
-### Request envelope ("before")
+The remainder of this section records a rejected/deferred expansion. These
+headers and fields are not part of the current query contract.
 
-Today's request carries auth + body. Most envelope fields are optional. A
-graph-commit precondition instead selects the dedicated conditional
-stored-mutation route and is required on that route; the ordinary route
-rejects the header so older servers fail closed before executing a write:
+Today's request carries auth + body. The envelope adds five fields, all optional:
 
 ```http
 POST /graphs/prod/queries/find_user
 Authorization: Bearer <token>
+Idempotency-Key: 01HXYZ...              # mutations only
+If-Match: 01HABC...                     # optimistic concurrency
 X-Deadline: 2026-05-28T19:30:00Z        # or X-Timeout-Ms: 5000
 X-Trace-Id: 01HDEF...
 Content-Type: application/json
@@ -141,21 +171,19 @@ Field semantics:
 | Field | Applies to | Purpose |
 |---|---|---|
 | `Idempotency-Key` | Mutations | Server caches `(token, key)` → response for 10 minutes. Replays return cached response with `Idempotency-Replay: true` header. Prevents double-write on retry. |
-| `Omnigraph-If-Graph-Commit` | Dedicated conditional-mutation routes | Run only if branch HEAD matches the given raw commit ID. The separate route is a fail-closed rolling-version capability gate; ordinary routes reject the header. Inside the supported single-writer-process topology, mismatch is 412 Precondition Failed with no effect. An unsupported foreign post-effect race remains `recovery_required` (503) until distributed fencing exists. |
+| `If-Match` | Mutations | Run only if branch HEAD matches the given commit ID. 412 Precondition Failed otherwise. Enables read-then-write without races. |
 | `X-Deadline` / `X-Timeout-Ms` | All | Server respects; returns 504-typed error past the deadline. Bounds execution for context-budget-constrained callers. |
 | `X-Trace-Id` | All | Caller-supplied; server echoes back. Lets agents correlate multi-call sequences. |
 | `expect` | All | Caller asserts shape: `"read_only"`, `{"max_rows_scanned": 10000}`. Server validates against parsed AST or planner estimate; rejects before running. |
 | `dry_run` | Mutations | Returns what *would* happen without committing. Implemented via scratch branch + diff + discard. |
 | `fields` | Reads | Server returns only listed columns. Saves bandwidth + agent context window. |
 
-On ordinary routes, every additive envelope field remains optional, so today's
-call shape continues working. Supplying `Omnigraph-If-Graph-Commit` instead
-selects `/queries/{name}/if-graph-commit`, where that header is required and
-the stored declaration must be a mutation.
+All five fields are optional; today's call shape continues working.
 
-### Response envelope ("after")
+### Historical response-envelope proposal (not shipped)
 
-The response envelope replaces today's bare-result shape with a structured wrapper. Every endpoint (inline, stored, MCP) returns the same envelope:
+The proposal would have replaced the bare result shape with one wrapper for
+inline and stored endpoints:
 
 ```json
 {
@@ -194,43 +222,6 @@ Body envelope fields:
 
 The envelope is the API's *memory of what happened*. Without `audit_id` + `commit_id` + `snapshot_id`, agent reports are hearsay and reads are not reproducible. With them, provenance is a first-class property of every response.
 
-### MCP integration with multi-graph
-
-MCP routes are per-graph, matching the rest of MR-668's hierarchy:
-
-```
-GET  /graphs/{id}/mcp/tools     # tool list for this graph, this token
-POST /graphs/{id}/mcp/invoke    # invoke a tool on this graph
-```
-
-Single-mode collapses to `/mcp/tools` and `/mcp/invoke` at the root (same shape, no `/graphs/{id}` prefix). Both modes route through identical handler code.
-
-Tool list response:
-
-```json
-{
-  "tools": [
-    {
-      "name": "find_user",
-      "description": "Look up a user by ID.",
-      "inputSchema":  { "id": { "type": "string", "required": true } },
-      "outputSchema": { "name": "string", "email": "string", "last_login": "datetime?" },
-      "read_only": true
-    }
-  ],
-  "graph_id": "prod",
-  "snapshot_id": "01HJKL..."
-}
-```
-
-The tool list is the subset of registered queries where (a) `@mcp(expose=true)` in source and (b) Cedar permits `invoke_query` for this token on this name on this graph. Computed per request — cheap because it's just iterating the registry + one Cedar evaluation per name.
-
-**Token scoping.** Most tokens carry one graph claim. Cross-graph access requires multiple Cedar rules (one per graph) and is uncommon. Agents that genuinely operate across graphs loop over `/graphs/{id}/mcp/tools` themselves. The contract stays clean; graph renames don't break tool names.
-
-**Discovery.** Agents are told their MCP URL at provisioning: `https://omnigraph.example.com/graphs/prod/mcp`. Token authorizes; URL identifies. Same model as every OAuth-style API.
-
-**`/mcp/invoke` is a protocol adapter.** Unwrap MCP protocol envelope, call the same code path as `/queries/{name}`, wrap the response in MCP shape. No new execution semantics.
-
 ### CLI surface
 
 The CLI mirrors the HTTP routes. Post-MR-656 and post-MR-969:
@@ -240,17 +231,18 @@ The CLI mirrors the HTTP routes. Post-MR-656 and post-MR-969:
 omnigraph query  -e 'query test() { ... }'                    # /query
 omnigraph mutate -e 'query bump() { update ... }'             # /mutate
 
-# Stored (MR-969)
-omnigraph queries list                                        # GET /queries (future)
-omnigraph queries explain find_user                           # show params + return shape + source
-omnigraph queries invoke find_user --param id=u-42            # POST /queries/find_user
+# Stored (served graph; omit --query/-e)
+omnigraph query find_user --server prod --graph knowledge --params '{"id":"u-42"}'
+omnigraph mutate update_user --server prod --graph knowledge --params '{"id":"u-42"}'
 
-# Pragma + registry validation
-omnigraph lint queries/find_user.gq                           # parses + verifies pragmas
-omnigraph queries lint                                        # validates the whole registry
+# Registry validation
+omnigraph lint --query queries/find_user.gq
+omnigraph queries validate --cluster ./company-brain --graph knowledge
 ```
 
-`omnigraph queries invoke` reads bearer + URL from `omnigraph.yaml` like the other remote commands. Local invocations work the same way the existing `omnigraph query`/`mutate` do.
+Stored invocations resolve the server, credentials, and graph through the
+operator config/profile model from [RFC 0011](0011-cli-addressing-and-config.md).
+Ad-hoc file and inline invocations can also run directly against a store.
 
 ### Lifecycle
 
@@ -260,15 +252,15 @@ The promotion path from inline to stored is the load-bearing DX story:
 1. EXPLORE      omnigraph query -e 'query find_user($id: String) { ... }' --params '{"id": "u-42"}'
                   └─ POST /query, iterate freely
 
-2. STABILIZE    write queries/find_user.gq with @description, @returns, @mcp pragmas
+2. STABILIZE    write queries/find_user.gq with @description/@instruction metadata
                   └─ git diff shows the full agent contract in one file
 
 3. AUTHORIZE    add Cedar rule allowing invoke_query for the appropriate actor group
-                  └─ scope_names: [find_user]
+                  └─ graph-scoped invoke permission; read/change remains the inner gate
 
 4. DEPLOY       restart server
                   └─ /queries/find_user goes live
-                  └─ /mcp/tools auto-lists it for any token with invoke_query[find_user]
+                  └─ GET /queries lists exposed catalog entries
 
 5. RETIRE       deny: read change for the agent group
                   └─ inline access closed; stored remains
@@ -283,11 +275,12 @@ Existing callers see no breakage:
 
 - `POST /read` and `POST /change` keep working, now with `Deprecation: true` headers (MR-656).
 - `ChangeRequest` field names `query_source` / `query_name` accepted as serde aliases (MR-656).
-- `aliases:` block in `omnigraph.yaml` unchanged; both `read`/`change` and `query`/`mutate` accepted as `command:` values (MR-656).
 - New envelope fields are additive; old clients ignoring them keep working.
-- `Idempotency-Key` and `X-Deadline` are opt-in headers; absence is the current behavior. `Omnigraph-If-Graph-Commit` is required only on its dedicated conditional routes, so an older server fails with 404 before executing.
+- `Idempotency-Key`, `If-Match`, `X-Deadline` are opt-in headers; absence is the current behavior.
 
-Callers move at their own pace. The envelope upgrades + URL rename ship in v0.6.x (small PRs). Stored queries + MCP ship in v0.7.0.
+The URL rename and stored-query registry shipped. The historical envelope
+expansion did not; clients must use the current typed `ReadOutput` and
+`ChangeOutput` wire shapes.
 
 ## Sequencing
 
@@ -295,20 +288,20 @@ Callers move at their own pace. The envelope upgrades + URL rename ship in v0.6.
 
 1. Wrap responses in the structured envelope. Add `audit_id`, `snapshot_id`, `commit_id`, `stats`, `warnings`. Backward-compatible if we keep today's top-level fields and add new ones alongside; cleaner break if we move to nested `result.*`. Pick one and live with it.
 2. Honor `Idempotency-Key` on `/mutate` (and the deprecated `/change`). Server-side cache keyed by `(token, key)`.
-3. Honor `Omnigraph-If-Graph-Commit` on the dedicated
-   `/mutate/if-graph-commit` route. Carry it through the mutation authority
-   and recheck it under the pre-effect branch gate; the exact publisher remains
-   the final lost-update fence. Ordinary routes reject the header.
+3. Honor `If-Match` on `/mutate`. Wire through to the publisher CAS layer.
 4. Honor `X-Deadline` / `X-Timeout-Ms` on every endpoint. Return 504-typed error past deadline.
 
-**Phase 2: MR-969 PR 1 (registry).** The stored-query registry, `/queries/{name}` route, `InvokeQuery` Cedar action with per-name scope, `.gq` pragma parsing (`@description`, `@returns`, `@mcp`), read-vs-mutate classification at registry load. Inline keeps working unchanged.
+**Stored-query outcome:** The registry, `GET /queries`,
+`POST /queries/{name}`, graph-scoped `InvokeQuery` Cedar action,
+`@description`/`@instruction` metadata, and read-vs-mutate classification are
+shipped. Per-query-name authorization is not.
 
-**Phase 3: MR-969 PR 2 (MCP).** `/graphs/{id}/mcp/tools` and `/graphs/{id}/mcp/invoke`. Tool schemas projected from declared return types and parameter declarations. Single-graph-scoped tokens.
+**MCP follow-up:** extracted to [RFC 0003](0003-mcp-server-surface.md). No MCP
+transport route is accepted by this RFC.
 
 **Phase 4: MR-969 PR 3 (Cedar deny-on-ad-hoc sugar).** Small Cedar-language addition so operators can lock down `/read` / `/query` while keeping `/queries/*` open. Independent of PRs 1-2.
 
 **Phase 5: deferred.**
-- Cross-graph MCP namespacing (wait for usage signal).
 - Per-query rate limits (extend `WorkloadController`).
 - Schema introspection as a separate Cedar action (3-line PR).
 - CLI verb consolidation (`omnigraph call <name>`).
@@ -316,33 +309,29 @@ Callers move at their own pace. The envelope upgrades + URL rename ship in v0.6.
 
 ## Rejected Alternatives
 
-**Per-environment override files (`_overrides.yaml`).** Initial design had a sparse YAML file for per-env tweaks: MCP exposure, row caps, kill-switch, param locks. Rejected because every override candidate either belongs in source (`@mcp` flag), Cedar policy (per-actor visibility, per-env), or `omnigraph.yaml` (operator config). Splitting query metadata across files makes it harder to review what an agent can see. Keep source authoritative; let Cedar express the per-env differences.
+**Per-environment override files (`_overrides.yaml`).** Rejected. Query
+documentation belongs in `.gq`; catalog visibility and naming belong in the
+applied cluster declaration; authorization belongs in Cedar policy. A third
+override file would create drift.
 
 **Compiled query bundle (HelixDB's `queries.json`).** HelixDB compiles their Rust-DSL queries to JSON. Rejected because `.gq` files are already declarative. The file is the artifact. Reviewers diff source, not bytecode.
 
 **Stored-queries-only (HelixDB's posture).** Rejected because the personal-graph / dev-iteration use case dies without inline. Inline `-e` is the REPL for human exploration; stored is the contract for production agents. Both first-class.
 
-**Cross-graph tool-name prefixing (`prod.find_user`).** Rejected because graph renames would break agent contracts. Per-graph URLs let graph identity live in the URL, not in tool names.
-
-**Body-field graph dispatch (`{tool, graph, params}`).** Rejected because it doubles the contract surface (every tool is identified by two fields). Per-graph URLs are simpler.
-
 **Pragmas in YAML instead of source.** Rejected because two-file definitions (source + metadata YAML) make diffs harder to review and create drift opportunities. Source is the source of truth.
-
-**Pragmas as in-source comments (`#[mcp]` HelixDB-style).** Considered; chose `@mcp(...)` because comment-flavored pragmas conflate documentation and machine-readable metadata. The `@` prefix makes the pragma's role explicit.
 
 ## Open Questions
 
 1. **Envelope breakage vs additive.** Phase 1.1 wraps responses in a structured envelope. Do we keep today's top-level fields *and* add new ones (additive, ugly), or move result to `result.*` (clean break, requires SDK updates)? Lean toward additive — let the new envelope coexist with the old shape until v0.7.0, then collapse.
 
-2. **`@returns` strictness.** Should mismatched declared-vs-inferred return type be a boot-time error or a warning? Lean toward error — silent drift defeats the assertion's purpose. Operators who want flexibility omit `@returns`.
+2. **Stored mutation routing.** A `.gq` file that contains both reads and writes — does the registry reject it at load (parse-time D2 rule from MR-656), or accept and classify as "mixed"? Lean toward reject. Mixed queries are a footgun; force operators to split.
 
-3. **MCP protocol transport.** Streamable HTTP (the new MCP standard) vs stdio (Anthropic's original). Both have Rust crates. Lean toward streamable HTTP since we're already an HTTP server.
+3. **`expect` field strictness.** `expect: "read_only"` against a parsed mutating query is an obvious 400. But `expect: {max_rows_scanned: 10000}` requires planner estimates that don't exist today. Either ship `expect` with only the "read_only" assertion in v1 and grow it, or wait for the planner. Lean toward shipping the partial form.
 
-4. **Stored mutation routing.** A `.gq` file that contains both reads and writes — does the registry reject it at load (parse-time D2 rule from MR-656), or accept and classify as "mixed"? Lean toward reject. Mixed queries are a footgun; force operators to split.
-
-5. **`expect` field strictness.** `expect: "read_only"` against a parsed mutating query is an obvious 400. But `expect: {max_rows_scanned: 10000}` requires planner estimates that don't exist today. Either ship `expect` with only the "read_only" assertion in v1 and grow it, or wait for the planner. Lean toward shipping the partial form.
-
-6. **CLI `queries invoke` shape.** Today's `omnigraph query` takes a file or alias. `omnigraph queries invoke find_user` takes a stored query name. Should `omnigraph query --name find_user` also work (auto-detect)? Cleaner to keep them separate verbs — the stored vs inline distinction is part of the contract.
+4. **CLI invocation shape.** The shipped CLI selects a stored query by name
+through `omnigraph query <name>` or `omnigraph mutate <name>` and selects
+inline source with `--query`/`-e`; it does not add a parallel `queries invoke`
+verb.
 
 ## References
 
@@ -350,9 +339,7 @@ Callers move at their own pace. The envelope upgrades + URL rename ship in v0.6.
 - MR-668: [Multi-graph server mode](https://linear.app/modernrelay/issue/MR-668) (shipped, PR #119)
 - MR-969: [Stored queries with MCP exposure and per-query Cedar authorization](https://linear.app/modernrelay/issue/MR-969)
 - PR #110: [feat: inline query strings in CLI and HTTP server](https://github.com/ModernRelay/omnigraph/pull/110)
-- HelixDB docs: [docs.helix-db.com/llms-full.txt](https://docs.helix-db.com/llms-full.txt) — `#[mcp]` macro, scoped API keys, stored query model
 - RFC 9745 (`Deprecation` header)
 - RFC 8288 (`Link` relations, `successor-version`)
-- MCP spec: [modelcontextprotocol.io](https://modelcontextprotocol.io)
-- [invariants.md](./invariants.md) — substrate boundaries this work respects
+- [invariants.md](../dev/invariants.md) — substrate boundaries this work respects
 - [../user/server.md](../user/operations/server.md) — current HTTP surface (post-MR-656 picks up the `/query`+`/mutate` rename and deprecation)

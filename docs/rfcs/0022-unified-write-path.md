@@ -1,29 +1,32 @@
 ---
-type: spec
-title: "RFC-022 — Unified graph-write protocol"
-description: One correctness protocol for graph-visible writes, with synchronous recovery, complete read-set arbitration, writer-specific physical-effect adapters, and explicit control-plane exceptions.
-status: implemented
-tags: [eng, rfc, write-path, manifest, recovery, concurrency, lance, omnigraph]
-timestamp: 2026-07-13
-owner: OmniGraph maintainers
+rfc: "0022"
+title: "Unified graph-write protocol"
+track: maintainer
+status: accepted
+implementation: complete
+authors:
+  - OmniGraph maintainers
+created: 2026-07-12
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-022: Unified graph-write protocol
+# RFC 0022: Unified graph-write protocol
 
-**Status:** Implemented on 2026-07-13
-**Date:** 2026-07-12
-**Author track:** Maintainer design series
 **Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-rc.1, git rev `cec0b7df`
 **Audience:** engine and storage maintainers
-**Architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
-RFC-022's structural rollout and lifecycle findings are closed; the ledger
-remains active for RFC-023–027.
 
-> **RFC-026 disposition:** RFC-022's ordinary graph-write protocol remains
-> implemented, but RFC-026 was later rejected and removed. Every MemWAL,
+The architecture review's durable conclusions and evidence are incorporated
+in this RFC; the separate review ledger has been retired.
+
+> **RFC 0026 disposition:** RFC 0022's ordinary graph-write protocol remains
+> implemented, but RFC 0026 was later rejected and removed. Every MemWAL,
 > stream-quiescence, or fold-adapter passage below is historical only. Bounded
 > graph ingestion now reuses ordinary Load; see
-> [the removal decision](../dev/wal-removal.md).
+> [the current ingestion design](../dev/ingestion.md).
 
 **Implementation evidence:** [#343](https://github.com/ModernRelay/omnigraph/pull/343),
 [#344](https://github.com/ModernRelay/omnigraph/pull/344),
@@ -39,9 +42,9 @@ remains active for RFC-023–027.
 Implementation is complete for the documented single-writer-process support
 boundary. This status does not claim distributed destructive recovery. Exact
 Optimize provenance remains trigger-gated by §6.4, and MemWAL fold enrollment
-remains owned by RFC-026.
+remains owned by RFC 0026.
 
-**RFC-028 activation update (2026-07-15):** internal manifest schema v5 wraps
+**RFC 0028 activation update (2026-07-15):** internal manifest schema v5 wraps
 every active writer adapter in one identity-bearing recovery schema v9. The
 persisted payload field names (`protocol_v3`, `protocol_v4`, `protocol_v7`, and
 `protocol_v8`) retain the exact-effect shapes documented below, but their old
@@ -91,11 +94,11 @@ This RFC deliberately does not combine key fencing, durable table heads,
 checkpoint retention, MemWAL ingest, or lineage-based merge-delta discovery into
 one format and rollout. They are focused follow-ups:
 
-- [RFC-023 — Key-conflict fencing](0023-key-conflict-fencing.md)
-- [RFC-024 — Durable table heads](0024-durable-table-heads.md)
-- [RFC-025 — Checkpoint retention](0025-checkpoint-retention.md)
-- [RFC-026 — MemWAL streaming ingest](0026-memwal-streaming-ingest.md)
-- [RFC-027 — Lineage merge deltas](0027-lineage-merge-deltas.md)
+- [RFC 0023 — Key-conflict fencing](0023-key-conflict-fencing.md)
+- [RFC 0024 — Durable table heads](0024-durable-table-heads.md)
+- [RFC 0025 — Checkpoint retention](0025-checkpoint-retention.md)
+- [RFC 0026 — MemWAL streaming ingest](0026-memwal-streaming-ingest.md)
+- [RFC 0027 — Lineage merge deltas](0027-lineage-merge-deltas.md)
 
 ## 1. Scope and authority
 
@@ -418,7 +421,7 @@ The following cases are distinct:
   re-stage or point the manifest at whatever HEAD is now live.
 - **CAS success:** the graph commit is visible atomically.
 
-When durable table heads land under RFC-024, tombstoning a table must update its mutable
+When durable table heads land under RFC 0024, tombstoning a table must update its mutable
 head to an explicit deleted state in this same CAS. A stale live head plus an immutable
 tombstone history is not a valid O(tables) current-state representation.
 
@@ -451,7 +454,7 @@ to recover. The authority row itself is the durable recovery cursor. Checkpoint
 deletion, a GC-boundary publish, and `OPEN -> DRAINING` stream intent are candidate
 examples; each follow-up RFC must prove its post-CAS work is convergent and safe.
 
-A long control workflow is not one giant RFC-022 attempt. Each lifecycle transition,
+A long control workflow is not one giant RFC 0022 attempt. Each lifecycle transition,
 fold, schema/branch operation, and resume transition is a separate prepared write or
 native-ref control step with its own read set and visibility point. If a later phase
 needs a non-idempotent or independently visible effect not fully described by the
@@ -485,7 +488,7 @@ able to enumerate every adapter and every entry point that invokes it.
 - Put every uniqueness, RI, and cardinality probe in `ReadSet`.
 - Revalidate or restart when a probed-but-untouched table changes.
 - Preserve strict replacement semantics for overwrite/delete.
-- Treat key-conflict fencing and strict keyed Append semantics as RFC-023 concerns;
+- Treat key-conflict fencing and strict keyed Append semantics as RFC 0023 concerns;
   no fence is credited as protection until that RFC's rollout gates pass.
 
 ### 6.2 Branch merge
@@ -516,7 +519,7 @@ able to enumerate every adapter and every entry point that invokes it.
   it never turns that captured state into mutable-tip commit authority.
 - The adapter supports zero, one, or several physical commits per table and records
   exact confirmed post-state before manifest publish.
-- Lineage-based candidate discovery may replace the classifier only under RFC-027;
+- Lineage-based candidate discovery may replace the classifier only under RFC 0027;
   this protocol does not assume it is O(delta).
 
 ### 6.3 Schema apply and storage migration
@@ -566,7 +569,7 @@ able to enumerate every adapter and every entry point that invokes it.
   a long-lived reader in another process still needs the distributed
   schema-publication fence called out in the remaining concurrency limitations.
 - The parser retains historical schema-v5 bridge shapes for frozen fixtures, but
-  RFC-028 does not provide an in-place upgrade path for genuine pre-v9 artifacts:
+  RFC 0028 does not provide an in-place upgrade path for genuine pre-v9 artifacts:
   those files lack explicit table identity and are refused before classification.
   They are never reinterpreted as active `protocol_v7` ownership proof or admitted
   by matching aliases, paths, target hashes, or versions.
@@ -596,7 +599,7 @@ able to enumerate every adapter and every entry point that invokes it.
   authority token. Foreign movement is never adopted, and an owned effect buried
   by a same-table winner fails closed.
 - The parser retains schema-v6 EnsureIndices shapes as historical fixtures only.
-  A genuine identity-less v6 file is refused under RFC-028 and is never
+  A genuine identity-less v6 file is refused under RFC 0028 and is never
   reinterpreted as `protocol_v8` ownership proof or upgraded by alias inference.
 - Optimize uses one graph-wide schema-v9 identity envelope with a bounded
   maintenance payload. After its broad entry probe it acquires
@@ -622,7 +625,7 @@ able to enumerate every adapter and every entry point that invokes it.
 
 ### 6.5 MemWAL fold
 
-RFC-026 owns enrollment, acknowledgement, quiescence, fresh-read semantics, and the
+RFC 0026 owns enrollment, acknowledgement, quiescence, fresh-read semantics, and the
 public ingest surface. Any fold that becomes graph-visible is an adapter here:
 
 - fold-time validation contributes its complete read set;
@@ -660,8 +663,8 @@ ancestor clone-only dataset in place.
 Their control protocol is:
 
 1. run and await the recovery barrier;
-2. quiesce enrolled streams as required by RFC-026;
-3. acquire any active global claim, such as RFC-025's retention claim, and then
+2. quiesce enrolled streams as required by RFC 0026;
+3. acquire any active global claim, such as RFC 0025's retention claim, and then
    the schema, graph/branch-control, and accepted-catalog table gates in §4.3
    order, re-listing recovery intent under the complete gate set;
 4. open one operation-local control coordinator after those gates are held and
@@ -734,9 +737,9 @@ The native ref operation itself should enforce the freshly checked precondition 
 surface concurrent ref mutation as a conflict — but at the pinned Lance revision it
 does not: branch-ref creation is an existence check followed by an unconditional
 put, and delete is not compare-and-delete by `BranchIdentifier` (the same substrate
-gap for which RFC-025 §2.3 rejects a branch ref as a claim mechanism). Until Lance
+gap for which RFC 0025 §2.3 rejects a branch ref as a claim mechanism). Until Lance
 ships conditional/CAS ref mutation, graph-branch create/delete therefore inherit the
-documented single-writer-process support boundary — the same disposition RFC-023
+documented single-writer-process support boundary — the same disposition RFC 0023
 §10 applies to recovery ownership — and multi-process branch operations are not
 advertised. The upstream ask for a conditional ref primitive is filed alongside
 this RFC; a process-local branch gate remains a local optimization, not the missing
@@ -774,7 +777,7 @@ as elsewhere, those gates are an optimization rather than cross-process authorit
 
 Data-table compaction/index work that advances a version which graph reads must select
 through `__manifest` is not exempt; Section 6.4 applies. Checkpoint reachability and
-the mapping from graph checkpoint rows to Lance-native GC pins belong to RFC-025.
+the mapping from graph checkpoint rows to Lance-native GC pins belong to RFC 0025.
 
 ## 9. Concurrency and retry semantics
 
@@ -800,8 +803,8 @@ Retry rules are phase-specific:
 
 ## 10. Rollout and compatibility
 
-This RFC authorizes a protocol refactor, not a manifest v5 format moment. RFC-023
-through RFC-028 own their respective format and public-surface changes.
+This RFC authorizes a protocol refactor, not a manifest v5 format moment. RFC 0023
+through RFC 0028 own their respective format and public-surface changes.
 
 It also does not require a mutable-tip `GraphState` singleton. The follow-up
 access-shape work uses one process-wide Lance `ObjectStoreRegistry` as the
@@ -837,7 +840,7 @@ The implementation landed in this order:
    supported graph-content and schema apply advances `graph_head:<branch>` before
    schema promotion, the shared head row atomically arbitrates probed-but-untouched
    same-branch dependencies. The native branch identifier detects delete/recreate
-   ABA under the documented single-writer-process branch-control boundary. RFC-024
+   ABA under the documented single-writer-process branch-control boundary. RFC 0024
    later narrows false contention with table heads; it is not a correctness
    prerequisite for this coarse step. Existing live committed-state validation
    probes remain until the narrowed read set replaces them.
@@ -882,9 +885,9 @@ The implementation landed in this order:
    > physical effects, and one maintenance-class
    > monotonic batch publish. Exact provenance is deferred until Lance exposes a
    > stable public caller-controlled maintenance transaction API and OmniGraph has
-   > distributed recovery fencing; it is not an RFC-022 rollout gate. MemWAL is the
+   > distributed recovery fencing; it is not an RFC 0022 rollout gate. MemWAL is the
    > supported, strategic substrate selected by
-   > RFC-026; its separate fold enrollment remains owned by that RFC.
+   > RFC 0026; its separate fold enrollment remains owned by that RFC.
 
    > **Branch-control/cleanup slice (2026-07-11):** native graph-branch create
    > and delete now use the §7 authority classifier, including pre-clone name
@@ -898,7 +901,7 @@ The implementation landed in this order:
 3. Every current graph-visible effect writer was converted. This is structurally complete
    as of 2026-07-13: Mutation/Load, BranchMerge, SchemaApply, and EnsureIndices use
    exact adapters; Optimize uses the bounded schema-v9 adapter described in §6.4.
-   The deferred exact Optimize upgrade is not an RFC-022 rollout gate.
+   The deferred exact Optimize upgrade is not an RFC 0022 rollout gate.
 4. The supported writer set was closed. This is complete as of 2026-07-13:
    raw storage/coordinator/handle-cache modules are crate-private and public
    snapshots expose a read-only table/scan facade without Lance's raw scanner
@@ -1016,7 +1019,7 @@ writers.
   history-flat manifest cost remain pinned. Exact provenance is a deferred upgrade,
   triggered only by a stable public Lance maintenance-transaction API plus
   distributed OmniGraph recovery fencing.
-- MemWAL fold (supported strategic substrate; enrollment owned by RFC-026):
+- MemWAL fold (supported strategic substrate; enrollment owned by RFC 0026):
   merged-generation conflict and every fold crash boundary.
 - Native graph branch control: invalid name before clone; live path-prefix
   collision before clone; clone-only create recovery on main and a named source;
@@ -1059,7 +1062,7 @@ new writer may outrun.
 Invariant 15 already supplies the applicable rule: a view of immutable,
 version-pinned state may be cached, while an in-memory view of the mutable tip is only
 a hint. Every use of mutable-tip state as write input is re-arbitrated by the commit
-authority. Durable heads under RFC-024 are one possible authoritative representation;
+authority. Durable heads under RFC 0024 are one possible authoritative representation;
 this protocol does not require or bless a warm parallel truth path.
 
 ## 13. Drawbacks and rejected alternatives
@@ -1099,21 +1102,21 @@ substrate.
 The correctness contract is intentionally difficult to reverse: after writers rely on
 complete read-set arbitration and recovery-before-write, weakening either would
 reintroduce silent integrity or recovery races. Focused irreversible changes are
-reviewed in RFC-023 through RFC-028.
+reviewed in RFC 0023 through RFC 0028.
 
 ## 15. Follow-up RFC boundaries
 
-- **RFC-023** owns PK annotation, fenced merge routing, strict keyed Append behavior,
+- **RFC 0023** owns PK annotation, fenced merge routing, strict keyed Append behavior,
   mixed fenced/unfenced rollout, conflict mapping, and both commit-order tests.
-- **RFC-024** owns mutable table-head rows, explicit live/tombstoned head state,
+- **RFC 0024** owns mutable table-head rows, explicit live/tombstoned head state,
   current-state read shape, migration, and cost gates.
-- **RFC-025** owns checkpoint rows, Lance-native physical pins, cleanup reachability,
+- **RFC 0025** owns checkpoint rows, Lance-native physical pins, cleanup reachability,
   pruned-through semantics, and checkpoint/cleanup crash ordering.
-- **RFC-026** owns MemWAL enrollment, durable acknowledgements, fold/dead-letter
+- **RFC 0026** owns MemWAL enrollment, durable acknowledgements, fold/dead-letter
   behavior, stream quiescence, fresh reads, public surfaces, and upgrade fencing.
-- **RFC-027** owns candidate discovery from row lineage, deletion discovery, fallback
+- **RFC 0027** owns candidate discovery from row lineage, deletion discovery, fallback
   semantics, and evidence for any O(delta) merge claim.
-- **RFC-028** owns graph-scoped schema identity, rename/drop lifecycle,
+- **RFC 0028** owns graph-scoped schema identity, rename/drop lifecycle,
   allocation, SchemaApply integration, and the shared identity-format gate.
 
 Those RFCs call this protocol when they produce a graph-visible write. None may weaken

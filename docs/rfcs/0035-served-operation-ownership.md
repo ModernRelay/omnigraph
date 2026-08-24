@@ -1,18 +1,21 @@
 ---
-type: spec
-title: "RFC-035 — Served operation ownership"
-description: Generation-pinned read observation and server-owned write execution, with two one-way admission lanes, exact drain, and one extensible shutdown deadline.
+rfc: "0035"
+title: "Served operation ownership"
+track: maintainer
 status: draft
-tags: [eng, rfc, server, cancellation, shutdown, admission, lifecycle, omnigraph]
-timestamp: 2026-08-13
-owner: OmniGraph maintainers
+implementation: not-started
+authors:
+  - OmniGraph maintainers
+created: 2026-08-13
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-035: Served operation ownership
+# RFC 0035: Served operation ownership
 
-**Status:** Draft
-**Date:** 2026-08-13
-**Author track:** Maintainer design series
 **Depends on:** existing engine write and recovery contracts; no runtime-activation or recovery-supervision design.
 **Replaces:** [PR #490](https://github.com/ModernRelay/omnigraph/pull/490), retaining its cancellation evidence rather than its stacked implementation.
 **Audience:** server, engine, API, operations, and test maintainers.
@@ -233,7 +236,7 @@ or durable authority. Its consumer re-derives truth; the wake is only a hint.
 
 ## 7. Generation handoff and rolling behavior
 
-The separate transition owner supplies the mask: a safe transition may close `Write` only; a transition needing exclusive target quiescence closes `All`. RFC-035 provides this protocol without choosing why:
+The separate transition owner supplies the mask: a safe transition may close `Write` only; a transition needing exclusive target quiescence closes `All`. RFC 0035 provides this protocol without choosing why:
 
 1. `close(mask)` linearizes on the old cell.
 2. Existing selected permits remain pinned and participate in selected drain; unselected admission is unchanged.
@@ -323,8 +326,8 @@ Completed outputs/guards stay counted until drop or atomic registered-participan
 
 Initial participants are HTTP connections and served generations. Latch stop
 already closes cell `All`; the generation participant owns their exact drains and
-write abort handles. RFC-036's separate `RecoveryTaskSet` may implement the trait;
-RFC-035 knows no task type, recovery call/result, or ownership rule.
+write abort handles. RFC 0036's separate `RecoveryTaskSet` may implement the trait;
+RFC 0035 knows no task type, recovery call/result, or ownership rule.
 
 At signal receipt `ts`, the coordinator creates `ShutdownDeadline(ts + grace)` and
 arms its already-running watchdog before any wait. `latch.stop(deadline)` then
@@ -347,7 +350,7 @@ from signal receipt to process exit, not from one participant's close to a log.
 
 ## 9. Failure and observability contract
 
-RFC-035 owns lifecycle outcomes; RFC-038 classifies only engine/substrate
+RFC 0035 owns lifecycle outcomes; RFC 0038 classifies only engine/substrate
 failure conditions and supplies no replay decision. `ErrorOutput` gains an
 optional rolling-safe `lifecycle` detail whose `kind` and `outcome` are strings
 (unknown values must deserialize). The stable mapping is:
@@ -483,7 +486,7 @@ wall bound, asserting one shared deadline and retaining child logs on failure.
 
 No disk/manifest/Lance/query/success shape changes. Optional
 `ErrorOutput.lifecycle` is additive; closed `ErrorCode` stays unchanged, with
-OpenAPI/old-client tests. RFC-038 owns none of these meanings.
+OpenAPI/old-client tests. RFC 0038 owns none of these meanings.
 
 Observable changes are additive lifecycle failures and an admitted write may
 finish after disconnect/timeout. Docs state transport cancellation is not

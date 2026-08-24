@@ -1,13 +1,24 @@
+---
+rfc: "0039"
+title: "The end-to-end benchmark"
+track: public
+status: accepted
+implementation: in-progress
+authors:
+  - Azim Afroozeh (@azimafroozeh)
+created: 2026-08-19
+updated: 2026-08-23
+discussion: "https://github.com/ModernRelay/omnigraph/issues/539"
+supersedes: []
+superseded_by: []
+blocked_on:
+  - Target-path benchmark run records
+---
+
 # RFC 0039: The end-to-end benchmark
 
-| | |
-|---|---|
-| **Status** | Accepted |
-| **Date** | 2026-08-19 |
-| **Author track** | Public contribution |
-| **Author(s)** | Azim Afroozeh ([@azimafroozeh](https://github.com/azimafroozeh)) |
-| **Discussion** | [Issue #539](https://github.com/ModernRelay/omnigraph/issues/539) |
-| **Implementation** | [PR #537](https://github.com/ModernRelay/omnigraph/pull/537) (proposed; must follow RFC acceptance) |
+[PR #537](https://github.com/ModernRelay/omnigraph/pull/537) is the in-progress
+implementation of this accepted design.
 
 ## Evidence status of this document
 
@@ -66,7 +77,7 @@ end-to-end benchmark: one instrument, two profiles
 │   │                    · multi-hop completion
 │   │                    (recall/precision@k: future work)
 │   ├── cost ··········· $/query decomposed: requests · egress · compute · tokens
-│   ├── storage calls ·· counts per RFC-031 layer-specific action class
+│   ├── storage calls ·· counts per RFC 0031 layer-specific action class
 │   │                    (logical always · physical where exposed)
 │   ├── request timing · per-layer, per-action-class cumulative time
 │   │                    · matching calibration per layer-specific action class
@@ -120,7 +131,7 @@ end-to-end benchmark: one instrument, two profiles
     ├── 5 manual before automatic  a schedule is earned by understood variance,
     │                              never default
     ├── 6 this instrument ········ never gates, at any CI stage; gating stays
-    │                              with the counting instruments per RFC-031
+    │                              with the counting instruments per RFC 0031
     └── 7 effects clear the floor · a claimed effect exceeds the session's
                                    A/A noise floor by a declared, persisted
                                    margin, or reads "no detected effect"
@@ -129,7 +140,7 @@ end-to-end benchmark: one instrument, two profiles
 ## Motivation
 
 **Counting is specified and arriving; time, cost, and quality have nothing yet.** The repository's measurement foundation is storage-call counting:
-[RFC-031 §11](0031-comparative-cost-harness.md#11-amendment-2026-08-16-the-counting-side-as-built)
+[RFC 0031 §11](0031-comparative-cost-harness.md#11-amendment-2026-08-16-the-counting-side-as-built)
 records the DST counting golden, the calibrated real-backend ceilings first
 explored in PR #503, their implementation evidence, and their division of
 roles. Those instruments answer "how many calls"; this RFC builds the next
@@ -158,7 +169,7 @@ In dependency order; each entry depends only on plain English, terms the Summary
 - **Backend**: the storage world the engine runs against during measurement; always a storage layer (an object-store implementation, local or real), never a harness layer.
 - **Backend identity**: the naming a number's storage backend must carry: backend kind plus pinning (image digest for local object stores; region and storage class for real S3). Generic words ("local", "disk") are not a backend identity.
 - **Run spec**: a run's complete specification: its fixture, its workload, and its conditions (equivalently: one level assigned to every factor). The spec names the experiment: runs sharing a spec are repetitions of one measurement series, never overwrites of one another. Its serialized form is the ***point name***: a complete, canonical, injective serialization of every factor level, so two distinct specs can never share a name (omitted factors take defaults, the omission rules are versioned with the name format, and the format version is a persisted field of every record, since a name is decodable only with its format; short forms like `m3-t8-n100k-btree-d50` are prose abbreviations, never the name). Design of experiments calls the spec a treatment or design point.
-- **Scenario**: a named family of run specs sharing one workload shape; a scenario crossed with levels yields specs. (RFC-037 separately types Scenario inside the DST harness; that narrower sense is unchanged there.)
+- **Scenario**: a named family of run specs sharing one workload shape; a scenario crossed with levels yields specs. (RFC 0037 separately types Scenario inside the DST harness; that narrower sense is unchanged there.)
 - **Profile**: a canonical region of the instrument's space of run specs, given a name so it can be invoked without reciting factor levels, and decidable from a spec's levels alone. Two profiles are defined, in exact level names. The **micro profile** is the region where arrival is "unscheduled single-shot", Data provenance is "synthetic", and Protocol attribution is "per-phase on": it attributes cost to mechanisms. The **realistic profile** is the region where arrival is "scheduled steady" or "scheduled bursty" and attribution is "off": it measures what users feel. Both drive the public surface. Per-phase attribution in the micro profile is served through that same surface by the engine's phase-timing exposure; while that exposure is unshipped, the harness's in-process access is an implementation interim, not a different instrument. A new profile is a definition, not a new instrument.
 - **Run**: one execution of the end-to-end benchmark, under at most one profile. A spec falling in neither profile's region is a valid run, named by its full spec; profiles are named regions, not a partition.
 - **System under test (SUT)**: what the run measures: the engine's source commit, build profile, and engine configuration (feature flags and enabled techniques). Deliberately outside the run spec: the spec describes the experiment, the SUT is the subject. Equal specs with different SUTs compare systems (a fix verdict, a regression); equal SUTs across a sweep compare scaling.
@@ -187,27 +198,27 @@ The axes and sweep points live in the contract tree above (Summary); this sectio
 
 ### Backends
 
-- **MinIO**: the repeatable rig. Real S3 request semantics at local latency, cheap enough that comparisons and sweeps run in numbers. Never simulates faults; fault injection belongs to the DST harness (RFC-032, RFC-037).
+- **MinIO**: the repeatable rig. Real S3 request semantics at local latency, cheap enough that comparisons and sweeps run in numbers. Never simulates faults; fault injection belongs to the DST harness (RFC 0032, RFC 0037).
 - **Real S3**: the truth. Scheduled runs on a budget-capped scenario subset produce latency distributions and a regression trend over time, never single-run headline numbers, because a single real-network observation is weather, not climate.
 
 **Wall-clock is one measurement dimension; storage-call counts are the other,
-and every run records both.** The harness adopts both of RFC-031's action
+and every run records both.** The harness adopts both of RFC 0031's action
 vocabularies unchanged. Logical operations use `get`, `put`, `put_part`,
 `head`, `list`, `delete`, `copy`, `rename`, and logical multipart
 complete/abort. Physical attempts use HTTP `GET`, `HEAD`, `LIST`, `PUT`,
 `POST`, and `DELETE`, refined into multipart initiation, part upload,
-completion, abort, and copy where RFC-031 does so. Retries and multipart
+completion, abort, and copy where RFC 0031 does so. Retries and multipart
 fan-out make those layers and vocabularies differ; there is no implicit
 logical-to-physical class mapping. The logical layer is mandatory in every
 record; the physical layer is recorded where the backend seam exposes it, and
 a record states per layer whether it is present or absent, never silently
 conflating the two. Counts land in the same record beside the timings, as
-measurement columns, not gates: RFC-031's comparator remains the only pinned,
+measurement columns, not gates: RFC 0031's comparator remains the only pinned,
 gating count.
 
 The cross-check compares like with like, with every operand recorded. A
 ***latency calibration*** is a map keyed by `(measurement layer,
-layer-specific action class)`: logical keys come only from RFC-031's logical
+layer-specific action class)`: logical keys come only from RFC 0031's logical
 vocabulary, and physical keys come only from its physical request vocabulary.
 It is measured by the harness under the record's backend identity and
 conditions and persisted in the record. No calibration is translated or
@@ -237,9 +248,9 @@ time by up to the concurrency achieved, so only cumulative-versus-cumulative
 reconciles. A single operation is not automatically serial. A record without
 the physical layer carries no witness, so elapsed reconciliation is
 unavailable rather than assumed. This is the same-ruler pattern recorded in
-[RFC-031 §11](0031-comparative-cost-harness.md#11-amendment-2026-08-16-the-counting-side-as-built).
+[RFC 0031 §11](0031-comparative-cost-harness.md#11-amendment-2026-08-16-the-counting-side-as-built).
 
-**Cost is a decomposed, priced column.** The realistic profile's cost column decomposes into storage requests, egress, compute, and, for workloads whose answers involve a language model, token spend; each component is priced against a dated price table recorded with the run, so a cost number carries its own exchange rate the way RFC-031's pricing does.
+**Cost is a decomposed, priced column.** The realistic profile's cost column decomposes into storage requests, egress, compute, and, for workloads whose answers involve a language model, token spend; each component is priced against a dated price table recorded with the run, so a cost number carries its own exchange rate the way RFC 0031's pricing does.
 
 ### Answer quality: the initial step
 
@@ -258,23 +269,23 @@ unavailable rather than assumed. This is the same-ruler pattern recorded in
 Each rule states what it forbids; violating a measurement rule (1 to 4, 7) makes a number invalid, not merely unpolished, and violating a process rule (5, 6) makes the practice nonconforming, with the number-level consequence stated in the rule.
 
 1. **Open-loop driving with on-time validity.** Applies when the workload is scheduled (the realistic profile); a single-operation workload has no schedule to violate. Every scheduled-workload latency or throughput claim comes from an open-loop driver, and each workload declares its on-time validity rule. Numbers from an invalid run are unpublishable.
-2. **Release-build guard (wall-clock only).** A wall-clock number is recorded only from a release-profile build, and the harness makes recording from any other build profile impossible without deliberately bypassing a guard. Wall-clock numbers from different build profiles never compare. Storage-call counts are the exception by nature: counting is build-profile-independent (the same operations issue the same calls at any optimization level), so counts may be compared across build profiles; this is RFC-031's timing-versus-counting separation applied per dimension.
-3. **Repetitions, dispersion, controlled warmth.** Every wall-clock cell reports its repetition count and a dispersion measure (percentiles, or median with minimum and maximum); bare means are banned, per DBTest 2018's guidance that means reported without dispersion mislead. A cell declares its warmth level, and every repetition must actually execute under it: a cold first repetition folded into a warm cell invalidates the cell. A tail percentile requires a sample count that supports it: p95 at least 20 samples (RFC-031's rule), p99 at least 100; smaller-sample cells are directional evidence only, labeled so in the record.
+2. **Release-build guard (wall-clock only).** A wall-clock number is recorded only from a release-profile build, and the harness makes recording from any other build profile impossible without deliberately bypassing a guard. Wall-clock numbers from different build profiles never compare. Storage-call counts are the exception by nature: counting is build-profile-independent (the same operations issue the same calls at any optimization level), so counts may be compared across build profiles; this is RFC 0031's timing-versus-counting separation applied per dimension.
+3. **Repetitions, dispersion, controlled warmth.** Every wall-clock cell reports its repetition count and a dispersion measure (percentiles, or median with minimum and maximum); bare means are banned, per DBTest 2018's guidance that means reported without dispersion mislead. A cell declares its warmth level, and every repetition must actually execute under it: a cold first repetition folded into a warm cell invalidates the cell. A tail percentile requires a sample count that supports it: p95 at least 20 samples (RFC 0031's rule), p99 at least 100; smaller-sample cells are directional evidence only, labeled so in the record.
 4. **Identity on every number.** Every published number carries its backend identity and its machine specification; numbers from different backends or machine specifications never compare silently. Conclusions drawn only from a local backend are provisional and labeled so.
 5. **Manual before automatic.** The benchmark runs manually until its run-to-run variance is understood; only then may it earn a schedule, because automating un-understood variance automates the production of noise. Numbers produced by a schedule that was not earned this way are unpublishable. All scheduling (nightly MinIO runs, the real-S3 trend series, alerting) is a separate later change gated on that understanding.
-6. **This instrument never gates.** No measurement from this instrument gates anything, at any CI stage. Wall-clock never gates because timing variance on shared runners converts a gate into a lottery; this instrument's per-run counts never gate because they are unpinned measurement columns, and turning an unpinned measurement into a gate would recreate the counting golden without its review discipline. Count-based gating belongs to the counting instruments, at the stages RFC-031 §§6 and 11 assign them (RFC-031 states its harness is a release gate and an on-demand tool, not a per-PR performance gate, aside from one deliberately bounded structural guard it mandates; this RFC neither adds a gate nor moves one). The number-level consequence: a number produced by this instrument stays a valid measurement even when misused as a gate; the gate is what must be removed.
+6. **This instrument never gates.** No measurement from this instrument gates anything, at any CI stage. Wall-clock never gates because timing variance on shared runners converts a gate into a lottery; this instrument's per-run counts never gate because they are unpinned measurement columns, and turning an unpinned measurement into a gate would recreate the counting golden without its review discipline. Count-based gating belongs to the counting instruments, at the stages RFC 0031 §§6 and 11 assign them (RFC 0031 states its harness is a release gate and an on-demand tool, not a per-PR performance gate, aside from one deliberately bounded structural guard it mandates; this RFC neither adds a gate nor moves one). The number-level consequence: a number produced by this instrument stays a valid measurement even when misused as a gate; the gate is what must be removed.
 7. **Effects clear the floor.** Every comparison-bearing claim (a fix's effect, a regression, a difference between systems) must exceed the applicable per-metric noise floor by a declared margin, and the margin is itself persisted: a protocol-level default, or a per-claim declaration recorded beside the citation, never an after-the-fact choice. An effect below floor-plus-margin is reported as "no detected effect", never as a small effect. The floor is itself a recorded measurement, so every effect claim carries its own denominator.
 
 ## Relation to existing instruments
 
-**RFC-031 owns the counting instruments; this RFC adds only above them.** The repository has two other measurement tools: the logical-cost comparator and the real-backend qualifier (both call-counting, both owned by RFC-031 §§6 and 11, which this RFC adopts by name and re-specifies nothing of). Three tools produce three kinds of number, and this instrument's two profiles differ again, so measurement-bearing prose should name which tool (and, for this one, which profile) a number came from; "the benchmark" unqualified hides exactly the fact a reader needs. One term boundary is restated for visibility: RFC-037 separately uses "instrument" for one built capability inside the DST harness; that narrower, harness-internal sense is unchanged there, and this RFC's use is always the whole measurement tool. If review finds any sentence here in tension with RFC-031, RFC-031 wins and this RFC is the document to fix.
+**RFC 0031 owns the counting instruments; this RFC adds only above them.** The repository has two other measurement tools: the logical-cost comparator and the real-backend qualifier (both call-counting, both owned by RFC 0031 §§6 and 11, which this RFC adopts by name and re-specifies nothing of). Three tools produce three kinds of number, and this instrument's two profiles differ again, so measurement-bearing prose should name which tool (and, for this one, which profile) a number came from; "the benchmark" unqualified hides exactly the fact a reader needs. One term boundary is restated for visibility: RFC 0037 separately uses "instrument" for one built capability inside the DST harness; that narrower, harness-internal sense is unchanged there, and this RFC's use is always the whole measurement tool. If review finds any sentence here in tension with RFC 0031, RFC 0031 wins and this RFC is the document to fix.
 
 ## Non-goals
 
 - **Per-scenario detail of the micro profile.** Its scenario families and standard run sets live in the harness documentation; this RFC governs how any run is recorded and published, not which runs exist.
 - **Dataset choice.** LDBC-generated graph, agent-memory-shaped corpus, or both is a later decision; this RFC only requires that whatever is chosen comes through a dataset builder (generated or digest-pinned) and that its identity lands in the Data class.
 - **Quality metrics beyond the initial step.** The judge-free floor is specified above; everything past it (language-model judges and their controls, baseline batteries, task-type splits) is a discipline with its own credibility rules and gets its own document.
-- **Replacing existing tools.** `helpers::cost`, `benches/scenarios.rs`, and RFC-031's harness remain the right tools for their jobs.
+- **Replacing existing tools.** `helpers::cost`, `benches/scenarios.rs`, and RFC 0031's harness remain the right tools for their jobs.
 - **Automation machinery** (gated behind protocol rule 5).
 
 ## Invariants & deny-list check
@@ -285,7 +296,7 @@ Docs-only methodology RFC: no product behavior, storage format, wire protocol, o
 
 **Discipline overhead is the price; the alternatives cost more.** This RFC has two costs. First, bookkeeping: every run must carry its full spec, where naming a file by hand is easier. Second, and sharper: the validity rules will sometimes reject a run someone liked: a number that broke a rule may not be published, even when it looks good.
 
-Three alternatives were considered and rejected. **No rules:** Motivation documents where that ends. **One RFC for every measurement tool:** the counting tools already have their rules under RFC-031, and one tool should not have two rulebooks. **Micro and realistic as two separate instruments:** an earlier draft did exactly this; the five-class model then showed the two differ only in factor levels, so the single instrument with two profiles replaced it.
+Three alternatives were considered and rejected. **No rules:** Motivation documents where that ends. **One RFC for every measurement tool:** the counting tools already have their rules under RFC 0031, and one tool should not have two rulebooks. **Micro and realistic as two separate instruments:** an earlier draft did exactly this; the five-class model then showed the two differ only in factor levels, so the single instrument with two profiles replaced it.
 
 ## Reversibility
 

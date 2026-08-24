@@ -1,122 +1,66 @@
-# Operating an OmniGraph Cluster
+# Operating a cluster
 
-Clusters may use a local root, `s3://`, or an Azure Blob
-`az://<container>/<prefix>` root. Azure is a qualification preview, not a
-production-supported deployment: the safe live managed-identity smoke test has
-passed, while adversarial lease, concurrency, and termination qualification is
-still pending. The Azure reference deployment and its required single-process
-lease admission are documented in
-[Deployment](../deployment.md#azure-container-apps).
+An OmniGraph cluster is a declarative bundle of graphs, schemas, stored
+queries, and authorization policies. Operators edit the bundle, preview the
+change, apply it, and restart serving processes to activate the new revision.
 
-This is the operator's guide to the cluster control plane: how to go from an
-empty directory to a served deployment, and how to run it day to day —
-evolving schemas, rotating queries and policies, healing drift, approving
-destructive changes, and recovering from crashes.
+Use a cluster when you need a multi-graph server or a shared operational
+configuration. For one local graph, the [quickstart](../quickstart.md) is
+simpler.
 
-It is a **how-to**. The reference for every `cluster.yaml` key, command flag,
-state-file field, and diagnostic code is
-[config.md](config.md); the HTTP surface is
-[server.md](../operations/server.md).
+## Create a bundle
 
-## The model in one paragraph
-
-You declare the entire deployment — graphs, schemas, stored queries, Cedar
-policies — as files in one directory (`cluster.yaml` plus the `.pg`/`.gq`/
-`.yaml` files it references). `cluster apply` converges reality to that
-declaration and records what it did in a state ledger
-(`__cluster/state.json`); `cluster plan` previews exactly what apply would
-do, including real schema-migration steps. A server started with
-`omnigraph-server --cluster <dir>` serves what was applied — never what is
-merely written in config. Terraform users will recognize the shape: config
-is desired state, the ledger is recorded state, plan is the diff, apply is
-the only thing that changes the world, and irreversible changes require an
-explicitly recorded approval.
-
-## 1. Deploy a cluster from zero
-
-Lay out a config directory:
-
-```
+```text
 company-brain/
 ├── cluster.yaml
-├── people.pg            # schema for the "knowledge" graph
-├── queries/             # stored queries — the .gq files ARE the declaration
+├── knowledge.pg
+├── queries/
 │   └── people.gq
-└── base.policy.yaml     # a Cedar policy bundle
+└── graph.policy.yaml
 ```
 
 ```yaml
-# cluster.yaml
+# company-brain/cluster.yaml
 version: 1
-# storage: s3://omnigraph-local/clusters/company-brain   # optional: put the
-#   ledger, catalog, and graph data on object storage (default: this folder)
 metadata:
   name: company-brain
+
 graphs:
   knowledge:
-    schema: people.pg
-    queries: queries/            # every `query <name>` in queries/*.gq registers
+    schema: knowledge.pg
+    queries: queries/
+
 policies:
-  base:
-    file: base.policy.yaml
-    applies_to: [knowledge]      # graph-bound; use [cluster] for server-level
+  graph-access:
+    file: graph.policy.yaml
+    applies_to: [knowledge]
 ```
 
-Save the graph schema as `people.pg`:
+Paths are relative to the directory containing `cluster.yaml`. The
+[configuration reference](config.md) covers storage roots, embedding providers,
+external Blob policy, and every supported field.
 
-```pg
-node Person {
-  name: String
-}
-```
-
-Save the stored query as `queries/people.gq`:
-
-```gq
-query find_person($name: String) {
-  match { $p: Person { name: $name } }
-  return { $p.name }
-}
-```
-
-The bearer token below resolves to actor `act-reader`, so the graph policy must
-grant that actor both the outer stored-query gate and the query's inner read
-gate. Save this as `base.policy.yaml`:
-
-```yaml
-version: 1
-groups:
-  readers: [act-reader]
-rules:
-  - id: readers-can-invoke-stored-queries
-    allow:
-      actors: { group: readers }
-      actions: [invoke_query]
-  - id: readers-can-read
-    allow:
-      actors: { group: readers }
-      actions: [read]
-      branch_scope: any
-```
-
-Bring it to life:
+## Validate, plan, and apply
 
 ```bash
-omnigraph cluster validate --config company-brain   # parse + typecheck everything
-omnigraph cluster import   --config company-brain   # create the state ledger
-omnigraph cluster plan     --config company-brain   # preview: what would apply do?
-omnigraph cluster apply    --config company-brain   # converge
+omnigraph cluster validate --config ./company-brain
+omnigraph cluster plan --config ./company-brain
+omnigraph cluster apply --config ./company-brain --as act-alice
 ```
 
-That single `apply` **creates the graph** (at the derived root
-`company-brain/graphs/knowledge.omni`), applies its schema, and publishes
-the query and policy into the content-addressed catalog
-(`__cluster/resources/…`). The output lists every change with its
-disposition; `converged: true` means there is nothing left to do — re-running
-`apply` is always safe and idempotent.
+- `validate` parses and type-checks the complete bundle.
+- `plan` shows the difference between the desired and applied revisions.
+- `apply` creates graphs, applies supported schema changes, and publishes stored
+  queries and policies.
 
-Load data through the normal graph plane (the control plane manages
-*definitions*, not entities):
+Apply is idempotent: rerunning it after convergence is safe. It does not load
+graph data. Use `load` or `mutate` for data changes.
+
+Directory boot reads the current `cluster.yaml` to validate the bundle location
+and resolve `storage`; it then serves graph, query, and policy resources from
+the applied revision. An unapplied resource edit does not become active, but a
+malformed config or changed storage root can still affect startup. Restart the
+server after an apply:
 
 ```jsonl
 {"type":"Person","data":{"name":"Ada"}}
@@ -125,266 +69,94 @@ Load data through the normal graph plane (the control plane manages
 Save that record as `seed.jsonl`, then run:
 
 ```bash
-omnigraph load --data seed.jsonl --mode overwrite \
-  company-brain/graphs/knowledge.omni
+OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-reader":"secret"}' \
+  omnigraph-server --cluster ./company-brain --bind 0.0.0.0:8080
 ```
 
-Serve it:
+See [HTTP server](../operations/server.md) for authentication and routes.
+
+## Day-two workflow
+
+For schemas, queries, policies, and graph declarations, use the same loop:
 
 ```bash
-OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-reader":"s3cret"}' \
-  omnigraph-server --cluster company-brain --bind 0.0.0.0:8080
+$EDITOR company-brain/cluster.yaml
+omnigraph cluster validate --config ./company-brain
+omnigraph cluster plan --config ./company-brain
+omnigraph cluster apply --config ./company-brain --as act-alice
+# restart each server using this cluster
 ```
 
-`--cluster` accepts either a **config directory** (the storage root resolves
-through `cluster.yaml`'s `storage:` key) or a **storage-root URI directly**
-(`--cluster s3://bucket/prefix` or `--cluster az://container/prefix`) —
-config-free serving: a serving box needs
-only the URI and credentials, no checkout of the config repo. The ledger and
-catalog in object storage are the deployment artifact. An Azure-rooted,
-mutation-capable server must still enter through the admission wrapper; the URI
-alone is not writer authority.
-
-`--cluster` is an **exclusive boot source**: it cannot be combined with a
-graph URI or `--config`, and `omnigraph.yaml` is never read in
-this mode. Routing is always multi-graph:
+Schema drops applied through the cluster are soft. Destructive graph deletion
+is blocked until an actor approves the exact planned change:
 
 ```bash
-curl -H 'authorization: Bearer s3cret' \
-  -X POST http://localhost:8080/graphs/knowledge/queries/find_person \
-  -H 'content-type: application/json' -d '{"params":{"name":"Ada"}}'
+omnigraph cluster plan --config ./company-brain
+omnigraph cluster approve graph.scratch \
+  --config ./company-brain --as act-alice
+omnigraph cluster apply --config ./company-brain --as act-alice
 ```
 
-That request returns `200` with Ada in the result. A caller without `invoke_query`
-receives the same `404` as an unknown query name, intentionally preventing
-catalog probing. If this example returns `404`, confirm that the query was
-applied with `GET /graphs/knowledge/queries` and that the actor appears in the
-policy group above; see [stored-query authorization](../operations/server.md#stored-query-invocation-post-queriesname).
+If the declaration changes after approval, the approval no longer matches and
+the delete is blocked again.
 
-Bearer tokens and the bind address are deliberately *not* cluster facts —
-they are per-replica, set by flag or environment
-([server.md](../operations/server.md#auth-model-bearer--sha-256) for the token
-sources).
-
-## 2. The day-2 loop: edit → plan → apply → restart
-
-Every change follows the same loop, whatever its kind:
+## Inspect and recover control state
 
 ```bash
-$EDITOR company-brain/people.pg          # or any .gq / policy / cluster.yaml edit
-omnigraph cluster plan  --config company-brain
-omnigraph cluster apply --config company-brain --as andrew
-# restart cluster-booted servers to pick it up
+omnigraph cluster status  --config ./company-brain
+omnigraph cluster refresh --config ./company-brain
+omnigraph cluster import  --config ./company-brain
 ```
 
-`--as <actor>` attributes the run: it is recorded in recovery sidecars and
-audit entries and threaded into the engine's commit history. Set
-`operator: { actor: <you> }` in your `~/.omnigraph/config.yaml` to make it the
-default when `--as` is omitted (the flag always wins; `approve` requires one
-of the two).
+- `status` reads recorded state without changing resources.
+- `refresh` updates observations for an existing state record.
+- `import` initializes state from declared resources when adopting an existing
+  cluster.
 
-**`apply` runs out-of-band, with direct storage access — there are no server
-routes for it.** Like `init`/`load` and the maintenance verbs (§7),
-`cluster apply` reaches the object store directly: it reads and writes the
-cluster ledger under `__cluster/` *and* opens each graph's Lance datasets to
-create, migrate, or delete them. It never goes through a running
-`omnigraph-server`, so the host that runs it (an operator or CI) needs storage
-access — the `AWS_*` credential contract for an `s3://` cluster. This is by
-design, not a missing feature: the control plane is **declarative** (config →
-cluster), not a runtime mutation API on the serving process — intent lives in
-the config files, outside the running system (the reasoning is
-[cluster-axioms.md](../../dev/cluster-axioms.md) §3 and §4). The server only ever
-*reads* the converged ledger, which is why a held apply lock never blocks
-serving (see §5 below, in this guide).
-
-For an `az://` cluster, the same out-of-band operation uses the documented
-Azure account and managed-identity environment. In the reference preview
-topology, it must run through the same admission wrapper as the server; the
-cluster state lock is not a graph-writer fence.
-
-What each change kind does:
-
-| You edit | Plan shows | Apply does |
-|---|---|---|
-| a `.gq` file or `queries:` entry | `Update query.<g>.<n>` | publishes the new content-addressed blob, updates the ledger |
-| a policy file | `Update policy.<n>` | same — new blob, ledger update |
-| a policy's `applies_to` | `Update policy.<n> [bindings]` | records the new bindings (the file digest is unchanged; bindings are first-class changes) |
-| a `.pg` schema | `Update schema.<g>` **with the real migration steps embedded** | runs the engine's schema apply on the live graph — soft drops only, sidecar-fenced |
-| `graphs:` gains an entry | `Create graph.<g>` (+ schema, queries) | initializes the graph at its derived root; dependents apply in the same run |
-| `graphs:` loses an entry | `Delete graph.<g>` — **blocked, `approval_required`** | nothing, until approved (see §4) |
-
-Two properties worth internalizing:
-
-- **One apply, ordered correctly.** Creates run first, then schema
-  migrations, then catalog writes, then (approved) deletes — so a schema
-  change plus a query that uses the new field converge together in one run.
-- **Soft drops only.** A removed schema property disappears from the current
-  version while prior versions retain the data (reversible until `cleanup`).
-  Data-loss migrations are not reachable from cluster apply.
-
-Read the plan before applying when the change is non-trivial — for schema
-updates it embeds the engine's actual migration plan (`add_property`,
-`drop_property [soft]`, `unsupported: …`), so you see data impact before
-anything runs.
-
-## 3. Inspect: status, refresh, drift
+If an interrupted operator process leaves a lock, first prove that no plan,
+apply, refresh, or import is still running. Then copy the exact lock ID from the
+diagnostic:
 
 ```bash
-omnigraph cluster status  --config company-brain --json   # ledger only, read-only
-omnigraph cluster refresh --config company-brain          # re-observe live graphs
+omnigraph cluster force-unlock <LOCK_ID> --config ./company-brain
 ```
 
-`status` never touches the graphs; `refresh` opens them read-only and
-records what it finds — graph-manifest versions, live schema digests, catalog blob
-integrity. If someone changed a graph behind the control plane's back (a
-direct `omnigraph schema apply`, a tampered catalog file), refresh marks the
-resource **`drifted`**.
+Never guess a lock ID or force-unlock a live operation.
 
-**Drift is converged, not just reported.** After a refresh records drift,
-the next `plan` proposes migrating the live graph back to the declared
-schema — with the steps visible, including the soft drops of out-of-band
-fields — and `apply` executes it like any other change. If the out-of-band
-change is the one you want, change the *config* to match instead, and apply
-converges the ledger.
+## Object-storage clusters
 
-## 4. Destructive changes: the approval gate
+Set `storage` to keep applied state and graph data under one object-storage
+root:
 
-Removing a graph from `cluster.yaml` never executes silently:
+```yaml
+version: 1
+storage: s3://company-data/omnigraph/company-brain
+graphs:
+  knowledge:
+    schema: knowledge.pg
+```
+
+An object-storage deployment can boot from the root without the source bundle:
 
 ```bash
-omnigraph cluster apply --config company-brain
-#   Delete graph.scratch [Blocked: approval_required]
-
-omnigraph cluster approve graph.scratch --config company-brain --as andrew
-#   cluster approve: delete graph.scratch approved by andrew (approval 01KT…)
-
-omnigraph cluster apply --config company-brain --as andrew
-#   Delete graph.scratch [Applied]   ← root removed, subtree tombstoned
+omnigraph-server \
+  --cluster s3://company-data/omnigraph/company-brain \
+  --bind 0.0.0.0:8080
 ```
 
-The approval artifact (`__cluster/approvals/<id>.json`) is **digest-bound**:
-it authorizes exactly the change you saw when you approved it. Any config or
-state movement afterwards invalidates it automatically (`approval_stale`
-warning) — a stale approval can never authorize a different delete. One
-approval covers the graph's whole subtree (its schema and queries ride
-along). Consumed artifacts are kept (rewritten with `consumed_at`) and
-summarized in the ledger's `approval_records`, so the audit trail of *who
-approved what* survives the loss of either store.
+`az://container/prefix` roots are a qualification preview: implementation,
+Azurite testing, and a live managed-identity smoke deployment are complete,
+but the adversarial live-Azure matrix is still pending. Every mutation-capable
+Azure server, apply job, direct writer, and maintenance process must run through
+`omnigraph-azure-admission`. See
+[Deployment](../deployment.md#azure-blob-preview).
 
-## 5. When things go wrong
+## Operational boundaries
 
-**Crashes are designed for.** Every graph-moving operation (create, schema
-apply, delete) writes a recovery sidecar before acting. If an apply dies
-mid-run, the next state-mutating command sweeps the sidecars and reconciles
-— rolling the ledger forward when the operation completed on the graph,
-retiring stale intent when nothing moved, and flagging anything it cannot
-verify. You generally fix a crashed run by **running `cluster apply`
-again**.
-
-**A held lock** (a crashed process left `__cluster/lock.json`):
-
-```bash
-omnigraph cluster status --config company-brain      # shows the lock holder + id
-omnigraph cluster force-unlock <LOCK_ID> --config company-brain
-```
-
-Force-unlock requires the exact lock id (from status) — there is no blind
-unlock.
-
-**A lost or corrupted state ledger**: the cluster is self-describing.
-`cluster import` rebuilds `state.json` from the config plus read-only
-observation of the live graphs; the next `apply` re-converges onto the same
-content-addressed catalog.
-
-**A server that refuses to boot** with `--cluster` is telling you the
-applied revision is not safely servable. Each refusal names its remedy:
-
-| Boot error | Meaning | Remedy |
-|---|---|---|
-| `cluster_state_missing` | no ledger | `cluster import`, then `apply` |
-| `cluster_recovery_pending` | graph was quarantined because an interrupted operation awaits sweep | run `cluster apply` (or any state-mutating command), restart |
-| `cluster_no_healthy_graphs` | every applied graph is quarantined or failed startup | sweep/fix the graph-specific failures, then restart |
-| `catalog_payload_missing` / `…_digest_mismatch` | catalog blob lost or tampered | `cluster refresh`, then `apply`, restart |
-| `external_blob_policy_digest_mismatch` | graph metadata no longer matches its digest-bound applied record | restore the cluster state ledger from a trusted copy, then retry; do not edit metadata or digests |
-| `policy_bindings_missing` | ledger predates binding metadata | re-run `cluster apply` (backfills), restart |
-| `cluster_empty` | applied revision has no graphs | apply a cluster with ≥1 graph |
-| multiple bundles bind one scope | legacy/tampered state violates the one-bundle-per-scope contract now enforced before apply | merge the rules into one bundle and re-run `cluster apply` |
-
-A held *state lock* is deliberately **not** a boot error — the server reads
-the atomically-replaced ledger without locking, so serving never contends
-with an in-flight apply.
-
-When at least one graph is healthy, graph-attributed recovery sidecars and
-graph-local startup failures do not block the whole server. The affected
-graph is skipped, its graph-only policy bindings and queries are omitted,
-and `/graphs` lists only the ready graphs. Pass
-`omnigraph-server --require-all-graphs` or set
-`OMNIGRAPH_REQUIRE_ALL_GRAPHS=1` to make any such quarantine fail startup.
-
-## 6. Deployment patterns
-
-- **Replicas**: do not infer safe multi-replica mutation serving from the
-  read-only boot sequence. Once started, a normal server can accept graph
-  writes, and current recovery ownership is not a distributed writer fence.
-  Keep one externally admitted writer process; a structurally read-only server
-  role and read-replica topology require separate design and evidence. The
-  Azure preview enforces the stronger rule of one lease-admitted writer for the
-  whole cluster.
-- **The directory is the deployable unit**: config, catalog, ledger,
-  approvals, and graph data all live under it. Back it up as a whole;
-  version the *config files* (not `__cluster/` or `graphs/`) in git.
-- **CI-driven convergence**: `validate` and `plan --json` are read-only and
-  safe in pipelines; gate `apply --as ci` on plan review. Approvals are the
-  human step by design — keep `cluster approve` out of automation.
-- **`~/.omnigraph/config.yaml` is the per-operator config**: your
-  `operator.actor` default for `--as`, named servers/clusters, credentials,
-  profiles, and data-plane ergonomics (address a cluster graph by its derived
-  root like `company-brain/graphs/knowledge.omni` with `--store` for loads). The
-  cluster directory's `cluster.yaml` is the **sole deployment declaration** — the
-  server boots from the cluster only.
-
-## 7. Maintaining a cluster graph
-
-Storage maintenance (`optimize` / `repair` / `cleanup`) is **not** a control-plane
-operation — it runs out-of-band, with direct storage access, against the graph's
-roots. Address a cluster graph by name instead of hand-typing its storage path:
-
-```bash
-omnigraph optimize --cluster ./company-brain --graph knowledge
-omnigraph cleanup  --cluster ./company-brain --graph knowledge --keep 10 --confirm
-# --cluster also takes the storage-root URI directly (config-free), and a
-# `clusters:` name from ~/.omnigraph/config.yaml:
-omnigraph optimize --cluster s3://bucket/clusters/company-brain --graph knowledge
-```
-
-The graph's storage URI is resolved from the **served cluster state** (the same
-truth a `--cluster` server boots from); a graph that hasn't been applied yet is
-not resolvable. Run these from a host with storage access — there are no server
-routes for them. Conversely, **`init` refuses** a cluster-managed path: graphs in
-a cluster are created by `cluster apply`, not by hand.
-
-If the cluster has exactly **one** applied graph you can omit `--graph` — it is
-used automatically. With **several**, omitting `--graph` errors and lists the
-candidates; it never picks one for you.
-
-Against an **`s3://`- or `az://`-backed cluster** the resolved graph storage is
-non-local, so a destructive `cleanup` additionally requires **`--yes`** (an
-interactive prompt otherwise, refusal without a TTY) on top of `--confirm` —
-see [cli-reference.md](../cli/reference.md)'s *Write diagnostics & destructive
-confirmation*. Every maintenance run also echoes its resolved target to stderr
-(suppress with `--quiet`). Azure maintenance must also run under the cluster's
-admission wrapper, never concurrently with the mutation-capable server.
-
-## What the control plane does not do (yet)
-
-- **No hot reload** — applied changes serve on the next restart.
-- **No data operations** — entities move through `omnigraph load / ingest /
-  mutate` against the graph roots, with branches and merges as usual.
-- **Stored-query exposure is all-or-nothing per cluster** — every applied
-  query is listed and invokable (subject to Cedar `invoke_query`); per-query
-  exposure policy is a planned phase.
-- **Pipelines (ETL)** are a separate project; the `pipelines:` key is
-  reserved and rejected loudly.
-
-For the full reference — every key, flag, status, disposition, and
-diagnostic — see [cluster-config.md](config.md).
+- Servers activate applied changes on restart; there is no hot reload.
+- HTTP does not add or remove graphs. Change `cluster.yaml`, apply, and restart.
+- Run only one mutation-capable writer process for a cluster unless your
+  deployment provides an external writer fence. The Azure reference topology
+  uses the admission wrapper for that purpose.
+- Run maintenance out of band with `--cluster <root> --graph <id>`; see
+  [Maintenance](../operations/maintenance.md).

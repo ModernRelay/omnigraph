@@ -1,160 +1,85 @@
 # Install
 
-## Quick Install
-
-macOS / Linux:
+## macOS and Linux
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
 ```
 
-Windows PowerShell:
+The installer downloads a release archive, verifies its SHA-256 checksum, and
+installs the binaries in `~/.local/bin`.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.ps1 | iex"
-```
+Prebuilt archives support Linux x86_64 and arm64, macOS arm64, and Windows
+x86_64. Build from source on other platforms, including Intel macOS.
 
-By default the installer places:
-
-- `omnigraph`
-- `omnigraph-server`
-- `omnigraph-azure-admission`
-
-in `~/.local/bin` on macOS / Linux, or:
-
-- `omnigraph.exe`
-- `omnigraph-server.exe`
-- `omnigraph-azure-admission.exe`
-
-in `%USERPROFILE%\.local\bin` on Windows.
-
-Starting with v0.10.0, the admission binary is shipped beside the two core
-binaries. Its `run` child-supervision mode is supported only on the Unix
-deployment images used by the Azure reference topology. The Windows executable
-can run `inspect`/`break` and display help; it is not a Windows process
-supervisor.
-
-The default installer is binary-only. It downloads a published release asset,
-verifies the SHA256 checksum, and unpacks it. It does not build from source.
-If no stable tag is published yet, the installer automatically falls back to
-the rolling `edge` release.
-
-## Homebrew
+Homebrew is also supported:
 
 ```bash
 brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
-## Channels
+## Windows
 
-Stable binaries:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.ps1 | iex"
 ```
 
-Rolling edge binaries from `main`:
+Binaries are installed in `%USERPROFILE%\.local\bin`.
+
+## Release channels
+
+The default is the latest stable release; if none exists, the installer falls
+back to `edge`. To request the rolling build explicitly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | RELEASE_CHANNEL=edge bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh \
+  | RELEASE_CHANNEL=edge bash
 ```
-
-Windows rolling edge binaries:
 
 ```powershell
 iwr -UseBasicParsing https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.ps1 -OutFile install.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ReleaseChannel edge
 ```
 
-Install from source (requires the Rust stable toolchain and `protoc` — install
-the Protocol Buffers compiler first with `brew install protobuf` or
-`apt-get install -y protobuf-compiler libprotobuf-dev`):
+Install a specific tag with `VERSION=v0.10.0` on macOS/Linux or
+`-Version v0.10.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
+different destination.
+
+Documentation on `main` may describe behavior newer than the latest stable
+binary. Check `omnigraph version` and the [release notes](../releases/).
+
+## Build from source
+
+Install the Rust stable toolchain and the Protocol Buffers compiler (`protoc`),
+then:
+
+```bash
+cargo build --release --locked \
+  -p omnigraph-cli \
+  -p omnigraph-server \
+  -p omnigraph-azure-admission
+```
+
+Or use the source installer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install-source.sh | bash
 ```
 
-## Useful Overrides
+## Installed programs
 
-Install to a different directory:
+Release archives contain:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | INSTALL_DIR="$HOME/bin" bash
-```
+- `omnigraph` — CLI;
+- `omnigraph-server` — HTTP server;
+- `omnigraph-azure-admission` — Azure writer-admission utility.
 
-Windows:
+The admission utility's `inspect`, `break`, and help commands are available on
+Windows. Its child-supervision `run` mode is supported only by the Unix
+deployment images used for the Azure reference topology.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -InstallDir "$env:USERPROFILE\bin"
-```
-
-Install a specific tag:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | VERSION=v0.9.0 bash
-```
-
-Windows:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.9.0
-```
-
-Build from a specific git ref:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install-source.sh | SOURCE_REF=main bash
-```
-
-## Manual Source Build
-
-Requires the Rust stable toolchain and `protoc` (`brew install protobuf` /
-`apt-get install -y protobuf-compiler libprotobuf-dev`).
-
-macOS / Linux:
-
-```bash
-cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission
-install -m 0755 target/release/omnigraph ~/.local/bin/omnigraph
-install -m 0755 target/release/omnigraph-server ~/.local/bin/omnigraph-server
-install -m 0755 target/release/omnigraph-azure-admission ~/.local/bin/omnigraph-azure-admission
-```
-
-Windows:
-
-```powershell
-cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin" | Out-Null
-Copy-Item target\release\omnigraph.exe "$env:USERPROFILE\.local\bin\omnigraph.exe"
-Copy-Item target\release\omnigraph-server.exe "$env:USERPROFILE\.local\bin\omnigraph-server.exe"
-Copy-Item target\release\omnigraph-azure-admission.exe "$env:USERPROFILE\.local\bin\omnigraph-azure-admission.exe"
-```
-
-## Release Assets
-
-Tagged releases are expected to publish:
-
-- `omnigraph-linux-x86_64.tar.gz`
-- `omnigraph-linux-arm64.tar.gz`
-- `omnigraph-macos-arm64.tar.gz`
-- `omnigraph-windows-x86_64.zip`
-
-Starting with v0.10.0, the macOS / Linux archives contain:
-
-- `omnigraph`
-- `omnigraph-server`
-- `omnigraph-azure-admission`
-
-Starting with v0.10.0, the Windows archive contains:
-
-- `omnigraph.exe`
-- `omnigraph-server.exe`
-- `omnigraph-azure-admission.exe`
-
-## Verify The Install
-
-macOS / Linux:
+## Verify
 
 ```bash
 omnigraph version
@@ -162,10 +87,4 @@ omnigraph-server --help
 omnigraph-azure-admission --help
 ```
 
-Windows:
-
-```powershell
-omnigraph.exe version
-omnigraph-server.exe --help
-omnigraph-azure-admission.exe --help
-```
+Continue with the [quickstart](quickstart.md).

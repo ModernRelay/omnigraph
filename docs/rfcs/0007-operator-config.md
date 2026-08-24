@@ -1,19 +1,37 @@
-# RFC: Per-Operator Config — the Operator Slice of RFC-002
+---
+rfc: "0007"
+title: "Per-operator configuration"
+track: maintainer
+status: accepted
+implementation: complete
+authors:
+  - OmniGraph maintainers
+created: 2026-06-11
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
 
-**Status:** Proposed
-**Date:** 2026-06-11
-**Builds on:** [rfc-002-config-cli-architecture.md](rfc-002-config-cli-architecture.md) (Proposed; implementation parked — PRs #139/#162 closed over review findings), [rfc-005-server-cluster-boot.md](rfc-005-server-cluster-boot.md) (Landed), RFC-006 storage roots (#186/#190/#194, landed). The #139 review record is a normative input: every design rule in §D6 traces to a confirmed finding.
-**Paired with:** [rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md) — together they define the two-surface architecture this RFC's operator half belongs to.
+# RFC 0007: Per-operator configuration
+**Builds on:** [RFC 0002](0002-config-cli-architecture.md) (superseded umbrella;
+PRs #139/#162 closed over review findings),
+[RFC 0005](0005-server-cluster-boot.md), and
+[RFC 0006](0006-object-storage-cluster-roots.md). The #139 review record is a
+normative input: every design rule in §D6 traces to a confirmed finding.
+**Paired with:** [RFC 0008](0008-retire-omnigraph-yaml.md) — together they define
+the two-surface architecture this RFC's operator half belongs to.
 **Target release:** unversioned (staged; see Sequencing).
 
 ## Summary
 
 Give OmniGraph the operator half of the **two-surface config architecture**
-(RFC-008): **cluster config** (team-owned, in a repo — what the system *is*)
+(RFC 0008): **cluster config** (team-owned, in a repo — what the system *is*)
 and **operator config** (person-owned, in `$HOME` — who *I* am). This is
 Terraform's split: `~/.terraformrc` for the operator, the checkout for the
 declaration. OmniGraph today has neither half cleanly — `omnigraph.yaml`
-mixes both concerns (RFC-008 retires it), and there is no home-level config
+mixes both concerns (RFC 0008 retires it), and there is no home-level config
 at all: identity and credentials get re-declared per working directory, in
 files that sit next to repo-committed config.
 
@@ -26,12 +44,12 @@ and a **keyed credentials chain**, scoped deliberately small:
 3. **Named servers** — operator-owned endpoint definitions; nothing a
    checkout supplies can redefine them.
 
-It is explicitly a **subset of RFC-002**, sequenced to land. RFC-002 settled
+It is explicitly a **subset of RFC 0002**, sequenced to land. RFC 0002 settled
 the right long-term decisions (one `~/.omnigraph/` dir, credentials keyed by
 server name, `OMNIGRAPH_CONFIG`/`OMNIGRAPH_HOME` env precedence) but its
 implementation arrived as one 4,800-line PR mixing a crate extraction with
 behavior changes, and died over ten confirmed findings. This RFC adopts
-RFC-002's settled decisions verbatim where they apply, defers everything
+RFC 0002's settled decisions verbatim where they apply, defers everything
 else (`GraphLocator`, multi-homing, `omnigraph use`, the State layer), and
 encodes the #139 findings as design rules so the same failures cannot recur.
 
@@ -49,7 +67,7 @@ Three concrete pains, all hit in real operation this cycle:
   steps per server (invent a var name, reference it in config, set it in
   the secret store). The peer group — AWS profiles, `gh hosts`, kubeconfig
   users — keys secrets by the server's *name*.
-- **Cluster-era working shape.** With clusters on object storage (RFC-006),
+- **Cluster-era working shape.** With clusters on object storage (RFC 0006),
   the project directory is a *declaration checkout* — operators run
   `cluster apply --config ./checkout` from anywhere. The things that are
   about the *operator* (who am I, which servers do I know, how do I like
@@ -57,7 +75,7 @@ Three concrete pains, all hit in real operation this cycle:
 
 ## Non-Goals
 
-- **`GraphLocator` / multi-homed graph resolution** (RFC-002 §1) — the
+- **`GraphLocator` / multi-homed graph resolution** (RFC 0002 §1) — the
   biggest and riskiest part of config-v2; untouched here.
 - **`omnigraph use` / the State layer** (`~/.omnigraph/state/`) — deferred
   with it (finding #2 showed its precedence interacts badly with scaffolds;
@@ -69,8 +87,8 @@ Three concrete pains, all hit in real operation this cycle:
   explicit, deterministic story for cluster checkouts. Rejected, not
   deferred: walk-up makes "which config am I using" a function of cwd
   depth, the class of surprise this RFC exists to remove.
-- **Retiring `omnigraph.yaml`** — that is RFC-008's job, with its own
-  staging. This RFC builds the destination; during RFC-008's deprecation
+- **Retiring `omnigraph.yaml`** — that is RFC 0008's job, with its own
+  staging. This RFC builds the destination; during RFC 0008's deprecation
   window the legacy file keeps loading exactly as today.
 - **Renaming or removing anything.** No flag renames, no key renames, no
   schema-version bumps (findings #1, #3, #10).
@@ -89,7 +107,7 @@ Three concrete pains, all hit in real operation this cycle:
   project config's actor — currently the end of the chain.
 - **Existing credential mechanism**: `TargetConfig.bearer_token_env` names
   an env var; `auth.env_file` points at a git-ignored dotenv. Both keep
-  working indefinitely (RFC-002 already committed to this; finding #3
+  working indefinitely (RFC 0002 already committed to this; finding #3
   showed what happens otherwise).
 - **`OMNIGRAPH_CONFIG`** exists today only as the *container entrypoint's*
   translation to the server's `--config`. The CLI does not read it.
@@ -101,8 +119,8 @@ Three concrete pains, all hit in real operation this cycle:
 ```
 ~/.omnigraph/config.yaml      # the operator surface (this RFC)
 ~/.omnigraph/credentials      # keyed secrets, 0600, git-irrelevant (§D4)
-./cluster.yaml + checkout     # the team surface (unchanged; RFC-004..006)
-./omnigraph.yaml              # legacy, loads as today through RFC-008's window
+./cluster.yaml + checkout     # the team surface (unchanged; RFC 0004..006)
+./omnigraph.yaml              # legacy, loads as today through RFC 0008's window
 ```
 
 Discovery order for the operator file: `$OMNIGRAPH_HOME/config.yaml` if
@@ -115,9 +133,9 @@ argument in the CLI (highest precedence below the flag itself), aligning the
 CLI with the container contract that already uses this variable for the
 server. One name, one meaning, both binaries — it points at whatever the
 command's `--config` would (a cluster checkout for cluster commands; the
-legacy file during RFC-008's window).
+legacy file during RFC 0008's window).
 
-Per RFC-002 §4 (adopted verbatim): `~/.omnigraph/` is the one canonical
+Per RFC 0002 §4 (adopted verbatim): `~/.omnigraph/` is the one canonical
 dir — cache/state subdirectories arrive with their own slices; XDG roots are
 not part of the mental model (`$XDG_CONFIG_HOME` may be honored as a
 fallback read location if set, but is never written to).
@@ -162,7 +180,7 @@ Three things must not be conflated:
   team-owned name* — reviewed, digest-pinned, invocable by name over HTTP.
 - **Legacy `omnigraph.yaml` aliases** conflate a personal name with a
   pointer to query *content in a local file* — which is why they break
-  across directories and can drift from the catalog. RFC-008 retires them.
+  across directories and can drift from the catalog. RFC 0008 retires them.
 - **Operator aliases** are pure **bindings, zero content**: a personal name
   → (server, graph, stored-query *name*, arg mapping, defaults). An alias
   that carries content competes with the catalog; an alias that references
@@ -182,7 +200,7 @@ The three senses of "global", resolved by this split:
 3. **Across machines** — dotfile the one operator file; bindings carry no
    local-file dependencies.
 
-Collision rule during the RFC-008 window: a legacy file-alias with the
+Collision rule during the RFC 0008 window: a legacy file-alias with the
 same name **wins**, with a warning naming both definitions — consistent
 with §D3's legacy-outranks-operator ordering.
 
@@ -196,7 +214,7 @@ no output preferences. Identity can never come from a checkout:
 flag  >  env  >  operator config  >  built-in
 ```
 
-During RFC-008's deprecation window, a legacy `omnigraph.yaml` slots in
+During RFC 0008's deprecation window, a legacy `omnigraph.yaml` slots in
 between env and operator config (its keys win over operator defaults,
 preserving today's behavior for unmigrated setups) — with the §D5
 credential inversion: **credentials and endpoint definitions never come
@@ -217,7 +235,7 @@ Concretely for the two flows this slice touches:
 
 ### D4. Credentials: keyed by server name, by-reference always
 
-Adopted from RFC-002 §5 unchanged, minus the keychain (a later source in
+Adopted from RFC 0002 §5 unchanged, minus the keychain (a later source in
 the same chain). For a server named `<name>`, the resolution chain is:
 
 1. `OMNIGRAPH_TOKEN_<NAME>` (uppercased, `-`→`_`) — explicit env, wins.
@@ -237,7 +255,7 @@ Findings #4, #5, #6 share one root cause: a file that arrives with a
 *repo checkout* could redirect where requests go and what secrets they
 carry. In the end state this is closed by construction — cluster config has
 no server/credential keys at all, and the operator surface never comes from
-a checkout. The rules below therefore govern the **RFC-008 window** (while
+a checkout. The rules below therefore govern the **RFC 0008 window** (while
 legacy `omnigraph.yaml` still loads) and stand as the permanent law for any
 future checkout-supplied surface:
 
@@ -289,11 +307,11 @@ Three PRs, each independently useful, each landable without the next:
 3. **PR 3 — operator targeting** *(landed)*. `--server <name>` on remote-capable
    commands and `aliases:` in the operator layer (server + graph + query +
    default params), resolving through operator-defined servers. This is
-   the *bridge* toward RFC-002's locator — multi-server addressing in a
+   the *bridge* toward RFC 0002's locator — multi-server addressing in a
    safe, minimal form without the `GraphLocator` rework — and the
-   replacement RFC-008 needs before legacy aliases can migrate.
+   replacement RFC 0008 needs before legacy aliases can migrate.
 
-RFC-008's deprecation stages begin only after PRs 1–2 are on main: the
+RFC 0008's deprecation stages begin only after PRs 1–2 are on main: the
 operator surface must exist before `config migrate` has somewhere to move
 keys to.
 
@@ -305,29 +323,29 @@ keys to.
 - Does `defaults.output` belong in slice 1, or is identity-only an even
   cleaner first PR? (Cost of including it is one cascade hop; value is
   immediate.)
-- `omnigraph config view --resolved` (RFC-002 had it; #139 shipped a
+- `omnigraph config view --resolved` (RFC 0002 had it; #139 shipped a
   version) — slice 1 or slice 2? It materially helps debugging precedence,
   which argues early.
 
-## Relationship to RFC-002 and RFC-008
+## Relationship to RFC 0002 and RFC 0008
 
-**RFC-008 is the other half of this design**: this RFC builds the operator
-surface; RFC-008 retires the mixed-ownership file
-([rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md)),
+**RFC 0008 is the other half of this design**: this RFC builds the operator
+surface; RFC 0008 retires the mixed-ownership file
+([RFC 0008](0008-retire-omnigraph-yaml.md)),
 leaving exactly two config surfaces — cluster (team) and operator (person).
 Every mention of `omnigraph.yaml` in this RFC describes the deprecation
-window only. Sequencing couples them: RFC-007 PRs 1–2 land first, then
-RFC-008's migration stages run against them.
+window only. Sequencing couples them: RFC 0007 PRs 1–2 land first, then
+RFC 0008's migration stages run against them.
 
-[rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md) consumes
+[RFC 0009](0009-unified-access-paths.md) consumes
 this RFC's surfaces: the actor chain and keyed-credential chain become
 constructor-time inputs of its `RemoteClient`/`EmbeddedClient`, and
 `--server`/operator aliases resolve to the same (base URL, credential)
 pair before its `GraphClient` trait is touched.
 
-RFC-002 remains the umbrella architecture. This RFC implements its §2
+RFC 0002 remains the umbrella architecture. This RFC implements its §2
 (layered config, global-first), §4 (file naming / one dir), and §5
 (credentials) in their minimal load-bearing form, and explicitly defers §1
 (`GraphLocator`/targets), §3 (roles), and the State layer. If/when the
 locator work resumes, it builds on these layers rather than re-landing
-them. RFC-002's header should gain a pointer here once this merges.
+them. RFC 0002's header should gain a pointer here once this merges.

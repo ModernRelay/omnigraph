@@ -1,12 +1,27 @@
+---
+rfc: "0037"
+title: "Deterministic simulation harness"
+track: public
+status: draft
+implementation: in-progress
+authors:
+  - Azim Afroozeh
+created: 2026-08-18
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on:
+  - Upstream Lance entropy and mock-time seams
+  - Pool-thread identity propagation
+  - Per-instance failpoint registries
+---
+
 # RFC 0037: Deterministic simulation harness
 
-| | |
-|---|---|
-| **Status** | Proposed |
-| **Author track** | Public contribution |
-| **Author(s)** | Azim Afroozeh |
-| **Discussion** | <link when opened> |
-| **Implementation** | `crates/omnigraph-dst` (harness PR, link when opened) |
+The proposed design is backed by the measured prototype and findings described
+below. Integration of the complete `crates/omnigraph-dst` harness and its
+remaining determinism seams is still in progress.
 
 ## Summary
 
@@ -41,14 +56,14 @@ answer file that any diff fails against).
 
 Omnigraph's worst bugs are crash and concurrency interleavings on the
 object-storage path. They fire under timing nobody can recreate, and a
-bug that cannot be re-run is nearly worthless. RFC-016 named the goal
-(deterministic simulation testing) and RFC-032 shipped the current
+bug that cannot be re-run is nearly worthless. RFC 0016 named the goal
+(deterministic simulation testing) and RFC 0032 shipped the current
 official position (an adversarial harness with normalized replay). Both
 stopped short of the same thing: executions that replay exactly.
 
 The long-run liability of NOT having this is measured, not
 hypothetical. Before the harness: every correctness bug so far was
-found by incident or by hand (RFC-032's own motivation), and a
+found by incident or by hand (RFC 0032's own motivation), and a
 55-extra-requests-per-op cost regression shipped unnoticed because
 wall-clock benchmarks hide storage costs in variance. With the harness,
 in its first week: 12 findings, each replayable from its
@@ -194,7 +209,7 @@ operation that caused it. Awareness enables three mechanisms:
   crash-window coverage moved from 35/66 to 50/66, at most three seeded
   universes per newly crossed window.
 - Cost attribution labels every storage call with the op kind that made
-  it, which is what turns the harness into a benchmark (RFC-031's
+  it, which is what turns the harness into a benchmark (RFC 0031's
   counting side).
 
 **3. Forward-compatible.** New operations join without invalidating
@@ -562,7 +577,7 @@ and its order, the final store state, and the verdicts; that whole
 trace is a function of (scenario, seed). The contract is verified per
 run, not assumed: the replay meta-test reruns the pair and
 byte-compares the reports before the golden or any oracle claim is
-trusted. Relative to RFC-032's 3.3: identifiers and timestamps are
+trusted. Relative to RFC 0032's 3.3: identifiers and timestamps are
 inside the compared trace here (seed-determined), where 3.3 normalizes
 them away; 3.3 remains the right contract for instruments running on
 the real substrate.
@@ -657,23 +672,23 @@ No invariant is weakened; several are the harness's test subjects.
 
 ## Drawbacks & alternatives
 
-- RFC-016 surveyed the tooling and concluded the practical choice was
+- RFC 0016 surveyed the tooling and concluded the practical choice was
   between in-process simulators (rejected: Lance cannot be shimmed
   without a fork) and the Antithesis hypervisor (deferred: cost). Its
   table has no row for the option this RFC implements: a custom-seam
   harness on stock tokio that quiesces Lance by configuration and
   measures the residue instead of forking or buying. The measured
   envelope is the evidence that the missing row was viable.
-- RFC-032 chose normalized replay (its 3.3): alpha-normalize fresh IDs
+- RFC 0032 chose normalized replay (its 3.3): alpha-normalize fresh IDs
   and timestamps, then compare. This RFC's contract is stronger where
   it matters: IDs and timestamps are seed-determined, so they stay
   comparable instead of being normalized away. 3.3 is engaged as what
   it is, a boundary choice on one axis, not a competing technique.
-- RFC-032's rejection of the libc route priced it as an
+- RFC 0032's rejection of the libc route priced it as an
   Antithesis-scale purchase; measured, it is a ~60-line crate-level
   interposition pattern (the entropy shim already in the harness).
 - PR #503 (the node-versus-edge logical-cost comparator) is an
-  independent, concurrent implementation of RFC-031's counting idea on
+  independent, concurrent implementation of RFC 0031's counting idea on
   real backends. Its relationship to this harness, element by element:
 
   | #503 element | What it does | Disposition here |
@@ -708,7 +723,7 @@ storage), which are additive.
 
 ## Unresolved questions
 
-1. Does this RFC amend RFC-032 in place or stand beside it as the
+1. Does this RFC amend RFC 0032 in place or stand beside it as the
    execution layer its instruments run on?
 2. How much of the findings ledger belongs in the RFC body vs linked
    issues? (Unfiled findings stay count-only regardless.)

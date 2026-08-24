@@ -1,31 +1,25 @@
 ---
-type: spec
-title: "RFC-0001 — Branch merge by fragment adoption"
-description: Adopt source-branch Lance fragments by reference, then re-home them before the source branch can be deleted.
+rfc: "0001"
+title: "Branch merge by fragment adoption"
+track: maintainer
 status: draft
-tags: [eng, rfc, branch, merge, lance, fragments]
-timestamp: 2026-06-30
-owner: Ragnor Comerford
+implementation: not-started
+authors:
+  - Ragnor Comerford
+created: 2026-06-30
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-0001: Branch merge by fragment adoption
-
-| | |
-|---|---|
-| **Status** | Draft |
-| **Author(s)** | Ragnor Comerford |
-| **Owner** | Ragnor Comerford |
-| **Author track** | Maintainer design series |
-| **Date** | 2026-06-30 |
-| **Discussion** | — |
-| **Implementation** | — |
+# RFC 0001: Branch merge by fragment adoption
 
 > This working specification was merged with
 > [PR #314](https://github.com/ModernRelay/omnigraph/pull/314) as part of a
-> maintainer-internal change, not as public RFC acceptance. It was reclassified
-> under the maintainer design-series lifecycle on 2026-07-13. Its explicit
-> author track and `Draft` status mean that merge does not imply acceptance in
-> this track.
+> maintainer-internal change. Its draft lifecycle means the merge published the
+> design record but did not accept it.
 
 ## Summary
 

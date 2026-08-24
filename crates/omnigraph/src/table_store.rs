@@ -3560,7 +3560,7 @@ impl TableStore {
         // when WriteParams omits it (pinned by
         // `stage_overwrite_preserves_stable_row_ids` in table_store/staged_tests.rs),
         // but setting it explicitly keeps the invariant documented at every Overwrite site
-        // (see docs/storage.md "Stable row IDs"). Setting it on an existing
+        // (see docs/dev/lance.md "Stable row IDs"). Setting it on an existing
         // dataset that was created without stable row IDs is a no-op per
         // Lance's row-id-lineage spec, so this stays correct for legacy
         // datasets.

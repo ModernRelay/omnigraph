@@ -1,13 +1,26 @@
-# RFC: Deprecate `omnigraph.yaml` — One Concern per Config Surface
+---
+rfc: "0008"
+title: "Retire `omnigraph.yaml`"
+track: maintainer
+status: accepted
+implementation: complete
+authors:
+  - OmniGraph maintainers
+created: 2026-06-11
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
 
-**Status:** Proposed
-**Date:** 2026-06-11
-**Builds on:** [rfc-007-operator-config.md](rfc-007-operator-config.md) (the
+# RFC 0008: Retire `omnigraph.yaml`
+**Builds on:** [RFC 0007](0007-operator-config.md) (the
 operator layer that absorbs the identity/credential keys),
-[rfc-005-server-cluster-boot.md](rfc-005-server-cluster-boot.md) (Landed —
-cluster-booted serving), RFC-006 storage roots (landed: #186/#190/#194).
-**Supersedes in part:** RFC-007's "project layer" framing (§Relationship
-below) and [rfc-002-config-cli-architecture.md](rfc-002-config-cli-architecture.md)'s
+[RFC 0005](0005-server-cluster-boot.md) (landed —
+cluster-booted serving), RFC 0006 storage roots (landed: #186/#190/#194).
+**Supersedes in part:** RFC 0007's "project layer" framing (§Relationship
+below) and [RFC 0002](0002-config-cli-architecture.md)'s
 assumption that `omnigraph.yaml` remains the project manifest.
 **Target release:** staged; final removal at the next major (see Sequencing).
 
@@ -46,7 +59,7 @@ deprecation cycle first.
   this cycle tripped on it: per-operator copies in `~/exp/intel`,
   graph-scoped alias URIs that only make sense per-person, the #139
   findings where a checkout-supplied file could redirect tokens.
-- **The cluster made it redundant.** Since RFC-005/006, a cluster
+- **The cluster made it redundant.** Since RFC 0005 and RFC 0006, a cluster
   deployment serves from the applied catalog — `--cluster` mode does not
   read `omnigraph.yaml` *at all*. Stored queries, policies, bindings, and
   graph addressing all have authoritative homes. What remains in
@@ -80,15 +93,15 @@ The full `OmnigraphConfig` surface (verified against
 | `omnigraph.yaml` key | Concern | New home |
 |---|---|---|
 | `graphs.<name>.uri` | what exists / where | `cluster.yaml` `graphs:` (storage-root-derived) — or a flag/env for the zero-config tier |
-| `graphs.<name>.queries`, top-level `queries:` | what exists | cluster catalog (`.gq` discovery, RFC-004/#183) |
+| `graphs.<name>.queries`, top-level `queries:` | what exists | cluster catalog (`.gq` discovery, RFC 0004/#183) |
 | `graphs.<name>.policy.file`, top-level `policy.file`, `server.policy.file` | what's enforced | `cluster.yaml` `policies:` + `applies_to` bindings |
 | `server.bind` | deployment runtime | `--bind` / env (already authoritative; the key is a default) |
 | `server.graph` | deployment runtime | `--target`-style flag / env in the zero-config tier; meaningless under cluster boot |
-| `graphs.<name>.bearer_token_env`, `auth.env_file` | credentials | operator credentials chain (RFC-007 §D4) |
-| `cli.actor` | identity | `operator.actor` (RFC-007 §D3) |
-| `cli.output_format`, `cli.table_*` | personal ergonomics | `defaults:` in operator config (RFC-007 §D2) |
-| `cli.graph`, `cli.branch` | personal targeting | operator config: named servers + a per-operator default target (RFC-007 PR 3) |
-| `aliases.<name>` | a personal name conflated with a content pointer | **splits in two** (RFC-007 §D2 "bindings, not content"): the referenced `.gq` file's *content* becomes a catalog stored query (team-reviewed); the *binding* becomes an operator alias referencing that name. `config migrate` proposes both halves but cannot publish catalog content itself — that is a `cluster apply` |
+| `graphs.<name>.bearer_token_env`, `auth.env_file` | credentials | operator credentials chain (RFC 0007 §D4) |
+| `cli.actor` | identity | `operator.actor` (RFC 0007 §D3) |
+| `cli.output_format`, `cli.table_*` | personal ergonomics | `defaults:` in operator config (RFC 0007 §D2) |
+| `cli.graph`, `cli.branch` | personal targeting | operator config: named servers + a per-operator default target (RFC 0007 PR 3) |
+| `aliases.<name>` | a personal name conflated with a content pointer | **splits in two** (RFC 0007 §D2 "bindings, not content"): the referenced `.gq` file's *content* becomes a catalog stored query (team-reviewed); the *binding* becomes an operator alias referencing that name. `config migrate` proposes both halves but cannot publish catalog content itself — that is a `cluster apply` |
 | `query.roots` | discovery convenience | obsolete — cluster query discovery (#183) replaced it |
 | `project.name` | label | dropped (the cluster's `metadata.name` is the deployment label) |
 
@@ -134,12 +147,12 @@ contract), retirement is staged, loud, and tooled:
    `cluster.yaml` from `config migrate`.
 4. **Opt-in strict** *(landed — the release gap to stages 1–3 collapsed: no version boundary was crossed between them, so all four ship in the same release)*. `OMNIGRAPH_NO_LEGACY_CONFIG=1` turns the warning into
    an error — for teams that finished migrating and want regressions caught.
-5. **Remove at the next major** *(eased by [rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md) Phases 4–5: declared plane capabilities and route alignment shrink the yaml-boot removal diff)*. Loading the file becomes an error pointing
+5. **Remove at the next major** *(eased by [RFC 0009](0009-unified-access-paths.md) Phases 4–5: declared plane capabilities and route alignment shrink the yaml-boot removal diff)*. Loading the file becomes an error pointing
    at `config migrate`. The `OmnigraphConfig` code path, the dual
    query-registry loaders, and the yaml-mode server boot source are deleted
    — the payoff that makes the whole exercise worth it.
 
-Stages 1–3 can land in one release once RFC-007 PRs 1–2 exist (the operator
+Stages 1–3 can land in one release once RFC 0007 PRs 1–2 exist (the operator
 layer must exist before anything can migrate *to* it). Stage 4 the release
 after. Stage 5 at the major, with the removal listed in release notes from
 stage 1 onward.
@@ -156,14 +169,14 @@ stage 1 onward.
 - An entire class of documentation ("which file does X go in?") and the
   #139 security surface (a checkout cannot hijack what no longer loads).
 
-## Relationship to RFC-007 and RFC-002
+## Relationship to RFC 0007 and RFC 0002
 
-RFC-007 ships the operator layer this RFC migrates *to*; its "project
+RFC 0007 ships the operator layer this RFC migrates *to*; its "project
 layer" language should be read as transitional — after this RFC, the
-project layer **is** the cluster checkout, and RFC-007's PR 3 (project
+project layer **is** the cluster checkout, and RFC 0007's PR 3 (project
 `server:` references) applies to `cluster.yaml`-adjacent operator targeting
-rather than to `omnigraph.yaml`. RFC-002's locator/state-layer work, if
-resumed, targets the two-surface world directly. RFC-002's file-naming
+rather than to `omnigraph.yaml`. RFC 0002's locator/state-layer work, if
+resumed, targets the two-surface world directly. RFC 0002's file-naming
 decisions (`~/.omnigraph/` as the one dir) are unaffected.
 
 ## Open questions
@@ -174,5 +187,5 @@ decisions (`~/.omnigraph/` as the one dir) are unaffected.
 - **`omnigraph login` vs `config migrate` ordering** — both write
   `~/.omnigraph/`; whichever lands first establishes the file-locking and
   atomic-write helpers the other reuses.
-- **Does the MCP server config** (RFC-003) reference `omnigraph.yaml`
+- **Does the MCP server config** (RFC 0003) reference `omnigraph.yaml`
   anywhere that needs the same treatment? To be audited in stage 1.

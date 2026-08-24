@@ -1,7 +1,30 @@
-# RFC: Config & CLI Architecture — Layered Config, Client Targeting, File Naming
+---
+rfc: "0002"
+title: "Config and CLI architecture"
+track: maintainer
+status: superseded
+implementation: partial
+authors:
+  - OmniGraph maintainers
+created: 2026-05-30
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: ["0007", "0008", "0009", "0011"]
+blocked_on: []
+---
 
-**Status:** Proposed (umbrella; implementation parked — PRs #139/#162). Its pieces have since landed or been superseded piecemeal: layered config/file-naming/credentials → [rfc-007-operator-config.md](rfc-007-operator-config.md) (landed); the project-manifest role of `omnigraph.yaml` → deprecated by [rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md) (stages 1–4 landed); the `omnigraph-api-types` extraction and client unification → [rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md) (proposed; salvages #139's clean extraction). Still exclusively here: `GraphLocator`/multi-homing (§1), roles (§3), the State layer / `omnigraph use`. Do not implement from this document without checking those successors first.
-**Date:** 2026-05-30
+# RFC 0002: Config and CLI architecture
+
+> **Disposition:** This umbrella was implemented or superseded piecemeal:
+> layered config, file naming, and credentials moved to
+> [RFC 0007](0007-operator-config.md); the project-manifest role of
+> `omnigraph.yaml` was retired by [RFC 0008](0008-retire-omnigraph-yaml.md);
+> API-type extraction and client unification moved to
+> [RFC 0009](0009-unified-access-paths.md); and the final addressing model lives
+> in [RFC 0011](0011-cli-addressing-and-config.md). The `GraphLocator`, roles,
+> and state-layer discussion below is historical and must not be implemented as
+> an active plan.
 **Tickets:** MR-668 (multi-graph server, shipped — the dependency this builds on), MR-969 (stored queries + MCP — supplies the in-repo agent tool surface), MR-973 (quickstart / onboarding), MR-974 (agent setup surface), MR-981 (agent-friendly CLI hardening)
 **Target release:** v0.8.x (tentative; phased — see Rollout)
 

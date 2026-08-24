@@ -112,6 +112,9 @@ jobs:
       - name: Verify AGENTS.md ↔ docs/ cross-links
         run: bash scripts/check-agents-md.sh
 
+      - name: Verify documentation structure and RFC registry
+        run: python3 scripts/check-docs.py
+
   workflow_action_pins:
     name: Check Workflow Action Pins
     runs-on: ubuntu-latest

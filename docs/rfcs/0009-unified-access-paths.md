@@ -1,16 +1,29 @@
-# RFC: Unify the CLI's Embedded and Remote Access Paths
+---
+rfc: "0009"
+title: "Unified embedded and remote access paths"
+track: maintainer
+status: accepted
+implementation: complete
+authors:
+  - OmniGraph maintainers
+created: 2026-06-12
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
 
-**Status:** Proposed
-**Date:** 2026-06-12
+# RFC 0009: Unified embedded and remote access paths
 **Audience:** engine/CLI/server maintainers
-**Builds on:** [rfc-007-operator-config.md](rfc-007-operator-config.md)
+**Builds on:** [RFC 0007](0007-operator-config.md)
 (landed — `--server` targeting and operator aliases are remote-addressing
 surfaces the unified client must treat as first-class),
-[rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md)
+[RFC 0008](0008-retire-omnigraph-yaml.md)
 (stages 1–4 landed — the config-authority demotion this RFC's earlier
 drafts promised as a "companion" already happened; the remaining sliver,
-removing the yaml-mode server boot source, is RFC-008 stage 5 and is
-*eased* by Phases 4–5 here), [rfc-002-config-cli-architecture.md](rfc-002-config-cli-architecture.md)
+removing the yaml-mode server boot source, is RFC 0008 stage 5 and is
+*eased* by Phases 4–5 here), [RFC 0002](0002-config-cli-architecture.md)
 (umbrella; see Prior Art for what is salvageable from its parked
 implementation).
 **Sequencing:** post-v0.7.0 (the release cut comes first).
@@ -34,7 +47,7 @@ functions the CLI's embedded arm calls), and Cedar enforcement lives inside
 those writers. What *can* drift is everything around them:
 
 1. **15 `is_remote` forks** in `crates/omnigraph-cli/src/main.rs`, each
-   duplicating request shaping and output mapping per command. (RFC-007 PR 3
+   duplicating request shaping and output mapping per command. (RFC 0007 PR 3
    threaded `apply_server_flag` through exactly these sites — the duplication
    is measured, not estimated.)
 2. **Triple DTO construction.** "The result of a load" is built in three
@@ -111,7 +124,7 @@ type sharing is available.
 **Prior art to salvage:** PR #139's review explicitly found the
 `omnigraph-api-types` extraction *clean* ("the crate extraction itself is
 clean and the openapi.json byte-identical claim holds" —
-[pr-139 findings](rfc-002-config-cli-architecture.md)); it was the behavior
+[PR #139 findings](0002-config-cli-architecture.md)); it was the behavior
 changes bundled alongside that killed the PR. Seed this phase from the
 extraction commits on `ragnorc/scrutinize-rfc-002` rather than rebuilding —
 cherry-picked narrowly, never relanded wholesale.
@@ -135,16 +148,16 @@ CLI output type, not a wire DTO, so it stayed CLI-side — both its mappings
 
 ```text
 trait GraphClient        // verb-level: load, mutate, query, branch_*, schema_*, export, commit_*
- ├── EmbeddedClient      // wraps Omnigraph + the shared mapping; actor: explicit (--as cascade, RFC-007)
+ ├── EmbeddedClient      // wraps Omnigraph + the shared mapping; actor: explicit (--as cascade, RFC 0007)
  └── RemoteClient        // reqwest + bearer; actor: resolved server-side from the token
 ```
 
 Each CLI command body is written once against the trait; the 15 forks become
 2 impls × 1 contract. Actor resolution is a constructor-time difference of the
 impls, never a per-verb branch — the trust model (storage credentials =
-self-declared actor via the RFC-007 actor chain; server = token-resolved
-actor via the RFC-007 keyed-credential chain) is a feature, not drift.
-`RemoteClient` construction is where RFC-007's addressing lands once:
+self-declared actor via the RFC 0007 actor chain; server = token-resolved
+actor via the RFC 0007 keyed-credential chain) is a feature, not drift.
+`RemoteClient` construction is where RFC 0007's addressing lands once:
 positional URI, `--target`, `--server <name>`, and operator aliases all
 resolve to the same (base URL, credential) pair before the trait is touched.
 The Phase 1 matrix becomes the trait's conformance suite, run against both
@@ -158,7 +171,7 @@ resolved target against the declaration and fails with one deliberate message
 server target") instead of today's incidental errors. The declaration table is
 also documentation: it makes the control-plane/data-plane split (maintenance
 and cluster commands must work with the server down) explicit in code.
-"Server" targets include operator-config named servers (RFC-007), not only
+"Server" targets include operator-config named servers (RFC 0007), not only
 literal `http(s)://` URIs.
 
 ### Phase 5 — Route alignment (landed)
@@ -185,7 +198,7 @@ registration — the migration is a worthwhile but orthogonal cleanup, deferred.
 - **No spec-codegen for the Rust client** (see Phase 2).
 - **No change to plane-restricted command availability** — maintenance stays
   storage-direct by design; Phase 4 only makes the restriction explicit.
-- **No config-authority work** — that was RFC-008, already landed through
+- **No config-authority work** — that was RFC 0008, already landed through
   stage 4; this RFC neither accelerates nor blocks stage 5, though Phases 4–5
   make the eventual yaml-boot removal a smaller diff.
 
@@ -220,7 +233,7 @@ registration — the migration is a worthwhile but orthogonal cleanup, deferred.
 3. ~~Whether `graphs list` belongs on the trait.~~ **Answered by the
    two-surface architecture**: the embedded impl enumerates the **cluster
    catalog** (`read_serving_snapshot` exists for exactly this), never
-   `omnigraph.yaml` (deprecated, RFC-008). `graphs list` becomes
+   `omnigraph.yaml` (deprecated, RFC 0008). `graphs list` becomes
    `Both`-capability: remote = `GET /graphs` (policy-gated), embedded =
    catalog enumeration from a cluster storage root.
 
@@ -229,8 +242,8 @@ registration — the migration is a worthwhile but orthogonal cleanup, deferred.
 The third application of the same principle in this lineage: storage adapters
 (collapsed to one implementation + an executable contract — and its CAS/flush
 bugs were exactly the no-referee class), recovery liveness, and now access
-paths. RFC-007 supplied the addressing and credential surfaces `RemoteClient`
-consumes; RFC-008 removed the competing config authority; RFC-002 remains the
+paths. RFC 0007 supplied the addressing and credential surfaces `RemoteClient`
+consumes; RFC 0008 removed the competing config authority; RFC 0002 remains the
 umbrella whose remaining unimplemented pieces (`GraphLocator`, the State
 layer) would build on the trait introduced here rather than on per-command
 forks.

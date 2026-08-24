@@ -1,450 +1,144 @@
 # Testing
 
-This file is the always-on map of the test surface. **Consult it before every task** so you know what tests already cover the area you're about to change, what helpers to reuse, and where a new test belongs. The architectural invariant for boundary-matched tests lives in [docs/dev/invariants.md](invariants.md).
+This is the ownership map for OmniGraph's tests. Read it before changing code: find the existing owner, run it as a clean baseline, and extend it instead of creating a parallel fixture.
 
-## Where tests live, per crate
+## Rules
 
-| Crate | Path | Style |
+1. Test at the boundary that owns the promise. Compiler behavior belongs in compiler tests; engine guarantees belong at the public engine API; HTTP and CLI behavior belongs at those transports.
+2. Prefer one new assertion, fixture row, or parameter over another `init_and_load` test.
+3. Test logical results and durable state. Inspect Lance internals only for a compatibility fence, recovery fault, or physical-cost contract.
+4. Every failure path must prove what did *not* move: manifest head, table head, lineage, sidecar, or external I/O as appropriate.
+5. Time and RSS measurements are decision instruments, not ordinary correctness gates. Deterministic operation counts may be CI contracts.
+
+The invariants behind these rules are in [invariants.md](invariants.md). Lance-dependent changes also require the upstream review and guards described in [lance.md](lance.md).
+
+## Test layout
+
+| Package | Primary owners | Shared support |
 |---|---|---|
-| `omnigraph` (engine) | `crates/omnigraph/tests/` | Integration tests (one file per behavior area — see the table below), fixture-driven, share `tests/helpers/mod.rs` |
-| `omnigraph-cli` | `crates/omnigraph-cli/tests/` | Per-area suites: cluster lifecycle, data/load/read/change/branch/commit/export/snapshot/policy/embed/maintenance, schema/config, stored queries, embedded-vs-remote parity, local/remote system journeys, and genuine released-format upgrade fences. Shared support keeps `OMNIGRAPH_HOME` hermetic by default. `cli_data.rs::query_lint_json_with_schema_reports_warnings` owns the exact serialized query-operation descriptor in lint JSON, including structured result fields and deterministic graph facts. RFC-033 Phase 2B adds graph-level `blob get/stat`: `cli_data.rs` owns raw/file delivery and failures, while `parity_matrix.rs` owns byte and stat parity between embedded and remote reads, validating each store-local resolved-view witness separately; its change rows drive `commit changes` (incremental page-token walking), filtered diffs, beginning-replay polls, and the baseline handshake through both arms, which must agree exactly on the twin fixture — cursors included. `output.rs` unit cells pin that incremental JSON rendering preserves the aggregate commit/feed shapes and stitches only the currently open split block without retaining completed pages. |
-| `omnigraph-cluster` | mostly in-source `#[cfg(test)] mod tests`; `tests/failpoints.rs`; `tests/s3_cluster.rs` | Cluster config plus strict policy YAML, semantic policy rules, graph/server binding-kind separation, and one-bundle-per-scope validation; state CAS and locking; validate/plan/status/refresh/import; idempotent apply; graph create/schema/delete; policy binding; serving snapshots; crash windows; and object-storage lifecycle. RFC-033 cells pin normalized per-graph external-Blob policies in desired/applied digests, historical omission for default deny, tamper refusal, embedded-only filtering at the serving boundary, and list-item duplicate-key scoping. |
-| `omnigraph-server` | `crates/omnigraph-server/tests/` | Auth/policy, data and schema routes, bounded streaming export/cut ownership and backpressure, stored queries, multi-graph cluster boot, boot settings, S3, and OpenAPI drift. The change surfaces add commit-diff/feed/baseline route coverage in `data_routes.rs` (ordered pages with cause once, image shapes per op, strict repeatable filters, limit and token refusals, typed 409 refusals, cursor-advance and cut-pinning polls, the baseline terminal-record stream, and fixed graph-vocabulary 404s for missing branches) plus the wire vocabulary gate rejecting physical storage keys, the auth/policy split (`read` for diffs and the feed, `export` for baselines) in `auth_policy.rs` — including `padded_branch_spelling_cannot_bypass_change_route_policy`, which pins that the feed/baseline/export handlers normalize the caller's branch before Cedar sees it (a padded ' main ' is judged as protected main, not an unprotected named branch), and spec-side path/param/schema gates in `openapi.rs` — including `openapi_change_operations_reach_only_graph_vocabulary_schemas`, which walks every schema transitively referenced by the change operations (error envelopes included), requires storage properties absent and the generic `ErrorOutput` unreachable (the routes reference the `ChangeErrorOutput` projection), and pins the baseline NDJSON response's terminal-record schema plus actual 500/503 change responses. The in-source change-error matrix is an allowlist: physical paths/table keys, Blob integrity strings, and unknown resource names collapse to one fixed 500 while recovery retains only its safe operation id. Shared support lives in `tests/support/mod.rs`. RFC-033 in-source cells pin server-safe policy projection (`file://` is never admitted), startup refusal of forged scope data, and the 400 policy / 424 dependency error split. The 424 cell pins rolling-safe `external_blob_source.{uri,reason}` details with no closed-enum extension, and `openapi.rs` pins 424 on every write route that can admit or carry an external Blob. Phase 2A extends `data_routes.rs` with graph-level node/edge Blob GET/HEAD, null versus valid empty, exact snapshot headers, one-range and strong-If-Match-before-weak-If-None-Match conditional semantics, external 302 with an unavailable target, and bounded 4-MiB payload chunks; `auth_policy.rs` pins 401/403 plus snapshot-to-policy-branch resolution. The transport's in-source owner deterministically pins zero HEAD payload reads, two-chunk/8-MiB retention, backpressure, and disconnect cancellation. `openapi.rs` also pins GET/HEAD binary, redirect, conditional, range/error headers, rolling-safe `blob_range.{start,end,length}`, security, and checked-in spec drift. |
-| `omnigraph-compiler` | mostly in-source `#[cfg(test)] mod tests` | Parser, type-checker, IR lowering, lint. `query/lint_tests.rs` owns the compiler's shared operation descriptor: structured scalar/list/vector result fields, stable serialization, deterministic read/write facts, nested-negation reads, mutation target reads, inserted-edge endpoint reads, node-delete incident-edge cascades, and omission after type-check failure. `query/typecheck_tests.rs` owns exact node-versus-edge mutation-target resolution when the namespaces share a name. Schema parser and SchemaIR validation tests both reject the five exact Lance virtual system-column property names while preserving near-miss identifiers |
+| `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests | Module-local fixtures |
+| `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
+| `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
+| `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
+| `omnigraph-cluster` | In-source lifecycle tests; `tests/failpoints.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
+| `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
+| `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 
-The engine's `tests/` is the principal coverage surface; most graph-shaped behavior is exercised there.
+Do not copy server or CLI process setup into a new suite. Their support modules own hermetic configuration, binary startup, temporary roots, and common assertions.
 
-## CLI Blob tests
+## Engine ownership
 
-| File | Covers |
+The engine integration suite is grouped by behavior, not implementation module:
+
+| Concern | Existing owners |
 |---|---|
-| `src/planes.rs` (in-source) | Blob commands are classified as Data/Any. The shared flag matrix admits `--server`, `--graph`, `--store`, and profile scope while rejecting `--cluster` and the unconsumed `--as`; the nested Blob parser owns four required logical-cell positionals and has no positional graph-URI slot. |
-| `src/blob_cli.rs` (in-source) | Pure CLI shaping owns range validation/clamping, whole-object external URI admission versus ranged-descriptor fail-closed behavior, and embedded/remote target-change diagnostic parity. |
-| `cli_data.rs` | RFC-033 Phase 2B graph-level `blob get/stat`: node and edge selectors; black-box refusal of a fifth positional graph URI, `--cluster`, and `--as` addressing; branch/snapshot targeting; raw binary stdout and `--out`; complete, offset-plus-length, offset-to-end, and length-from-zero reads; valid empty versus null; zero-length/overflow pre-resolution failures, EOF clamping, and unsatisfiable-start pre-transfer refusal; a pre-transfer failure preserving an existing `--out` destination; managed and whole-object external stat shapes; and whole-object external GET refusal with URI disclosure, a stat suggestion, and no redirect following. The user docs separately record the ordinary stream contract: an environmental failure after transfer starts exits nonzero, while stdout or `--out` may retain the delivered prefix. |
-| `parity_matrix.rs` | RFC-033 Phase 2B uses an immutable hard-linked twin so embedded and served arms share one physical native manifest, stable identities, and payload bytes. It requires byte-identical managed full, range, and snapshot output; exact structured stat equality, including the strong ETag and resolved-view witness in this identical-physical-tree fixture; and exact shared failure diagnostics. The opaque witness is not promised equal across independent graph copies. Whole-object external descriptor/no-follow outcomes match and `KNOWN_DIVERGENCES` remains empty. |
+| Initialization and representative journeys | `lifecycle.rs`, `end_to_end.rs`, `composite_flow.rs`, `consistency.rs` |
+| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs` |
+| Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs` |
+| Writes, validation, schema, and policy | `writes.rs`, `validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
+| Branches, snapshots, diffs, and merges | `branching.rs`, `point_in_time.rs`, `changes.rs`, `merge_truth_table.rs`, `merge_fast_forward.rs` |
+| Recovery and crash windows | `recovery.rs`, `failpoints.rs`, `failpoint_names_guard.rs`, in-source manifest/recovery tests |
+| Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
+| Export and lineage | `export.rs`, `lineage_projection.rs` |
+| Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, and `benchmark_scenario_contract.rs` |
 
-## CI control-plane tests
+Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`.
 
-The workflow has one conservative text-only classifier: only known top-level
-documentation files and documentation formats below `docs/` may skip the
-post-merge heavy jobs. A Markdown/text fixture under `crates/` is source, not
-documentation. There is no feature-specific dependency-key rebuild harness.
-Code pull requests run a reporting-only
-`cargo check --workspace --locked` with default features; the heavy test graphs
-remain post-merge, tag-, or dispatch-time owners.
+`changes_cost.rs` owns the change-feed cost boundary: transaction-footprint
+candidate scans, bounded page work, and caught-up versus backlog polling curves.
 
-The always-reporting `Graph Vocabulary Guard` is the CI owner for the reviewed
-three-surface vocabulary inventory, including on documentation-only pull
-requests. It scans route-reachable OpenAPI, parses the closed set of
-user-visible Rust string sinks, and derives externally reachable signatures
-from the default and all-features rustdoc graphs for the seven public library
-crates. Documentation prose is intentionally outside this exact-occurrence
-gate. Its package tests own deterministic collection, reference cycles and
-compositions, Rust sink selection, public-signature
-normalization, inventory validation, and negative base/current comparison
-cases. The CI check compares every selected observation with
-`tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv` in the current
-and exact base trees. It fetches full history and fails if the base asset is
-absent or stale. It does not regenerate the specification or replace
-`crates/omnigraph-server/tests/openapi.rs`, which remains the byte-for-byte
-OpenAPI drift owner.
+### Recovery and failpoints
 
-`legacy_graph_misuse` is monotonic at a fingerprint-independent semantic
-boundary: editing the text cannot silently relabel a surviving misuse. The
-comparison first reserves every exact observation whose non-legacy
-classification is unchanged, so that row cannot be mistaken for a rewritten
-legacy neighbour that happens to share the coarse boundary. Every remaining
-observation is still an anti-laundering candidate: a text/fingerprint rewrite
-cannot escape review, and a marker placed on an exact unchanged non-legacy row
-cannot authorize another row's rewrite. When a reviewed presentation rewrite
-intentionally retains the noun only in a valid new role (for example, quoted
-compatibility prose), its non-legacy row uses the exact
-`compatibility_treatment` marker `reviewed_semantic_reclassification` and
-`rollout_phase=presentation`. The guard rejects a newly introduced, moved, or
-rewritten marker when no surviving base misuse needs it. An exact marker
-accepted in an earlier generation may persist (or be retired), so unrelated
-later pull requests do not inherit a cleanup obligation. This remains a visible
-migration exception rather than a general classification bypass.
+Recovery tests must cover the protocol layer, the writer, and the user-visible reopening behavior:
 
-`compatibility_alias` is closed after the v0.10 breaking contract cleanup. The
-base comparison permits exact reviewed aliases to disappear and rejects a new,
-moved, or reintroduced alias; the current-tree check then requires the set to
-be empty. Removing one alias therefore cannot license adding another at a
-different boundary or leave a partial migration green.
+- in-source tests own sidecar encoding, validation, classification, and exact publication rules;
+- `tests/recovery.rs` owns deterministic completed, partial, ambiguous, and foreign-effect outcomes;
+- `tests/failpoints.rs` owns crash windows around durable effects;
+- the writer's normal integration owner proves pre-arm failures leave no residue.
 
-The public-Rust pass pins `cargo-public-api` 0.52.0 and
-`nightly-2026-08-01`; the repository's
-stable toolchain remains the owner of the workspace build. CI caches the
-pinned extractor, nightly toolchain, and dedicated target. Its rows use the
-owning package manifest as the stable source and the complete normalized
-exported signature as the boundary because `cargo-public-api` does not expose
-one unambiguous declaration/re-export source span; the guard does not guess at
-aliases or macro-generated items. Public-Rust extraction always scans
-the current and base trees. A path-only shortcut cannot prove that a change is
-irrelevant because Cargo `include!`, build scripts, generated sources, and
-configuration can make any tracked input affect rustdoc. An unreviewed
-workspace library is an error, so adding a crate requires an explicit
-public/internal reachability decision. All three surfaces execute on every run.
+When adding a new writer or sidecar field, update all three layers. See [recovery.md](recovery.md).
 
-Run the focused evidence with a base that already contains the reviewed
-inventory:
+### Blob behavior
+
+Blob coverage is deliberately split:
+
+- engine `end_to_end.rs`, `branching.rs`, and in-source Blob tests own logical cell selection, snapshots, integrity, ranges, external classification, and write admission;
+- cluster tests own persisted external-source policy and serving projections;
+- server `data_routes.rs`, `auth_policy.rs`, and `openapi.rs` own GET/HEAD, auth, conditions, ranges, redirects, backpressure, and schema drift;
+- CLI `cli_data.rs` owns `blob get/stat`; `parity_matrix.rs` compares embedded and remote results.
+
+Do not exercise a server promise solely through the engine facade. The complete contract is summarized in [blob.md](blob.md).
+
+### Lance compatibility
+
+Run this first for every Lance change:
 
 ```bash
-cargo test -p omnigraph-vocabulary-guard --locked
-git fetch origin main
-BASE_SHA=$(git rev-parse origin/main)
-for surface in openapi rust-string; do
-  cargo run -p omnigraph-vocabulary-guard --locked -- \
-    check --surface "$surface" --base "$BASE_SHA" \
-    --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
-    --openapi openapi.json
-done
-
-rustup toolchain install nightly-2026-08-01 --profile minimal
-CARGO_INSTALL_ROOT="$PWD/target/vocabulary-public-api/tool" \
-  cargo install cargo-public-api --version 0.52.0 --locked
-cargo run -p omnigraph-vocabulary-guard --locked -- \
-  check --surface public-rust --base "$BASE_SHA" \
-  --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
-  --cargo-public-api target/vocabulary-public-api/tool/bin/cargo-public-api \
-  --public-api-target-dir target/vocabulary-public-api
+cargo test -p omnigraph-engine --test lance_surface_guards
 ```
 
-When changing `.github/workflows/ci.yml`, validate its syntax and the remaining
-shell owners:
+The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, index coverage, stable row IDs, vector ordering fences, and Blob reads through compaction. If an upstream limitation disappears, remove the workaround and its guard together.
+
+## Server and CLI ownership
+
+Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
+
+CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
+
+The system tests start workspace binaries on ephemeral localhost ports. Set `OMNIGRAPH_SKIP_SYSTEM_E2E=1` only in constrained local sandboxes; CI's configured owners must not skip.
+
+## Commands
+
+Focused iteration:
 
 ```bash
-shellcheck scripts/*.sh
-actionlint .github/workflows/*.yml
-python3 scripts/check-workflow-action-pins.py
+cargo test -p omnigraph-engine --test traversal
+cargo test -p omnigraph-engine --test writes concurrent
+cargo test -p omnigraph-server --test data_routes
+cargo test -p omnigraph-cli --test cli_data
+cargo test -p omnigraph-cluster --test failpoints --features failpoints
 ```
 
-Also inspect the `Classify Changes` case table whenever a new fixture format or
-source subtree is added. Hosted-runner latency is measured workflow evidence;
-it is not inferred from a local syntax check. See [ci.md](ci.md).
+Canonical workspace graph:
 
-## Engine integration tests (`crates/omnigraph/tests/`)
+```bash
+cargo test --workspace --locked \
+  --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+```
 
-| File | Covers |
-|---|---|
-| `src/branch_control.rs` | Native Lance branch-ref control truth cells, including absent-ref/tree-present delete, same-identifier refusal, recreated-identifier conflict, the physical list→delete→read enumeration race, and exact three-attempt exhaustion. `forbidden_apis.rs::lance_branch_enumeration_stays_behind_retry_boundary` proves raw `Dataset::list_branches` remains owned by the bounded retry helper rather than a production forwarding path. |
-| `end_to_end.rs` | Full init → load → query/mutate flow. RFC-033 Phase 1 extends the existing Blob fixture for node/edge `read_blob_at`, null/valid-empty/non-empty states, exact-ID metacharacters, current-handle freshness, full/sub/empty ranges, typed bounds and exact-resource failures, published-dataset-version-granular ETags, and descriptor-only external classification after its target disappears. `blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots` pins the compatibility transition: schema-preserving Append retains an upgraded dataset's unmarked schema and makes its prior entry ineligible, then full-dataset Overwrite adopts the 0.10 catalog marker on the replacement fields. `blob_load_external_file_uri` still proves an allowed Overwrite persists the exact normalized reference proven by preflight—including a `file://` symlink later retargeted outside the base—while normalized keyed copies deduplicate metadata and payload reads; `update_with_blob_mid_schema_does_not_panic` still carries valid empty through scalar rewrite. Blob-valued `.gq` reads remain compiler `T24`. |
-| `src/blob.rs` | Engine-owned external-policy and persisted Blob-v2 descriptor unit owner. Phase 1 additionally pins the literal ETag golden over five ordered big-endian `u64`s, one big-endian byte length, and the exact non-empty UTF-8 bytes of the opened immutable Lance manifest's `transaction_file` identity; missing/empty identity and the malformed-descriptor matrix are typed `BlobIntegrity`; `BlobReader` is `Send + Sync`. |
-| `branching.rs` | Branch create/list/delete and lazy fork; native-control hardening includes main and named-source clone-only create recovery, invalid-name-before-clone, live path-prefix namespace rejection, legacy prefix-collision leaf-first delete, and delete/recreate first-write safety. The control path captures one operation-local accepted catalog plus fresh graph-manifest/namespace view after the complete gate envelope rather than refreshing the handle-local coordinator around dataset-gate acquisition; `forbidden_apis.rs::native_branch_controls_use_post_gate_captures_not_handle_refreshes` structurally pins that shape and post-success cache invalidation. RFC-023 pins exact-`id` PK metadata both on an inherited feature snapshot and after the first write materializes its lazy `Person` fork. RFC-033 Phase 1 pins explicit named-branch and snapshot Blob reads plus an already-returned reader remaining on its captured bytes after branch advance and logical entity deletion. Branch deletion/tree reclamation is explicitly not a reader-survival promise. The Blob fixtures admit a warm-bound fresh child through its inherited effective head. `blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_reads` bypasses a stale local dataset-handle cache after same-path/same-version branch recreation and refuses an older branch-owned snapshot without a persisted native-incarnation witness. `blob_snapshot_inherited_from_main_refuses_named_branch_recreation_aba` separately proves genuine inherited-main history survives ordinary branch advance but an explicit snapshot cannot reopen a recreated named graph manifest at the same version. `branch_merge_detects_nested_list_value_change` proves the three-way classifier routes through the shared typed comparator: a `[String]` change from `["a, b"]` to `["a","b"]` (which `array_value_to_string` rendered identically) is merged rather than dropped as a no-op. `branch_merge_with_blob_columns_preserves_blob_data` carries valid-empty and non-empty managed values through divergent scalar rewrites and one graph merge. `branch_merge_with_external_blob_uri_materializes_payload` creates retained external descriptors with allowed Overwrites, proves default-deny HEAD-advancing merge refusal is pre-arm and effect-free, then proves an entity-writing merge admits only the three normalized-equivalent cells actually selected across two datasets—excluding a Blob-bearing entity changed identically on source and target—with one HEAD, one payload GET per bounded dataset chunk, and managed readable outputs. `branch_merge_pointer_only_external_blob_needs_no_source_io` removes the external target, returns to default-deny, and proves exact graph-manifest-pointer adoption without source I/O. The three `branch_merge_rejects_*` tests prove one oversized source, cross-column/cross-dataset exact external ranges, and separately committed managed values all share the one 32 MiB carried-payload ceiling before payload read or graph movement; they also assemble 8,193 selected persisted external cells through two individually legal Overwrites and require typed refusal before external HEAD/payload I/O or graph effect. Crate-private accounting cells route exact/+1 8,192 external-reference-cell and 32 MiB retained-URI-metadata bounds through the actual descriptor-selection batch path, plus pin range rather than whole-object charging. The lower classifier truth cells (absent-ref/tree-present delete, same-identifier native refusal, recreated-identifier typed conflict with JSON details) live in `src/branch_control.rs` unit tests |
-| `merge_truth_table.rs` | Merge-pair truth table (MR-786): all 10×10 `(left_op, right_op)` cells from `{noop, addNode, removeNode, addEdge, removeEdge, setProperty, netZeroEdge, dropProperty, addLabel, removeLabel}`. Adding a new op to `OpVariant` forces a compile error in `build_case` until the new row + column are dispositioned. 49 executable cells run through real `branch_merge` with a structured oracle (`MergeOutcome` / `MergeConflictKind` + graph-state assert); 51 cells involving `dropProperty`/`addLabel`/`removeLabel` are recorded as `Unsupported` until the mutation grammar grows. |
-| `merge_net_zero.rs` | #473 net-zero merge owner: lineage-only and mixed real-plus-net-zero deltas into main and named targets, with exact graph-manifest movement, dataset-pointer suppression, content, and idempotence assertions. Adopt equality regressions pin null versus empty, U+001F framing, legal `_row_id`, and managed Blob file qualification. |
-| `merge_fast_forward.rs` | Branch-adopt cost + correctness under RFC-023. The one-batch and 8,193-entity fixtures prove that a complete v1 insertion-absence history chain publishes one/two bounded exact-`id` filtered `Update` transactions with zero target strict-insert preflights, target MergeInsert joins, committed Appends, ordered-cursor scans, or whole-delta staged combines. `pure_insert_fast_forward_retains_value_constraint_validation` proves the certificate skips only redundant key work, not logical entity constraints; its all-new Upsert source is certified from completed effect statistics. `proven_fast_forward_certificate_composes_across_merge_generation` proves the publisher re-mints v1 and a second merge consumes that output as the next proof-chain link. `fast_forward_merge_streams_blob_columns` pins the same zero-preflight/zero-ordered-scan proven route for a Blob-bearing source interval while checking exact payload survival. A missing intermediate transaction proves cleaned history is an optimization miss: the merge enters the general ordered diff, preserves the exact entities, and leaves no recovery residue. `changed_only_adopt_uses_known_present_update` proves a general fast-forward's already-present scalar entity uses the update-only adapter rather than insertion-capable Upsert; `blob_changed_only_adopt_uses_known_present_update` composes that route with one retained external descriptor, merge-owned bytes, and unchanged valid-empty/null siblings. `lazy_target_ref_only_fast_forward_uses_pin_after_main_advances` distinguishes a valid old lazy graph pin from drift when the inherited main ref advances. A nested `main → feature → experiment` cell prevents a deeper valid `BranchIdentifier` from becoming a false read-set conflict. Every general-route base/source/target `OrderedTableCursor` scan applies both Lance `batch_size(8,192)` and `batch_size_bytes(32 MiB)`. Validation streams projected `id`/`src`/`dst`/scalar batches, charges exact Arrow memory before retention, and shares one 32 MiB operation-wide budget across candidate datasets; `branch_merge_validation_delta_is_aggregate_bounded_pre_arm` crosses it with two individually valid ~18 MiB deltas while proving zero HEAD/graph-manifest/lineage/sidecar movement. Deletes use exact escaped-filter chunks with the same row/byte and retained-plan bounds. `fast_forward_merge_defers_vector_index_to_reconciler` and `merged_outcome_defers_vector_index_to_reconciler` prove neither adopt nor true three-way publication stages vector-index artifacts inline. Production-helper unit cells pin chain/delete/recovery limits. The subprocess scenario owns the final production latency/RSS evidence; these integration tests own route semantics, not timings |
-| `writes.rs` | Direct-publish writes: cancellation, RFC-022 non-strict full-attempt reprepare from fresh branch authority, strict stale-write conflicts, multi-statement atomicity, and graph-head caller CAS (`mutate_expected_head_precondition_issue_365` plus the two-handle warm-read-token round trip); MR-794 staged-write rewire (D₂ rejection, insert+update coalesce, multi-append coalesce, partial-failure recovery, load RI/cardinality recovery); RFC-023 pins the inclusive 8,192-row keyed input ceiling, the same exact/+1 boundary on streamed mutation-update matches, no-effect state for both refusals, and an explicitly allowed oversized stored external Blob rejected from metadata before payload read. `blob_table_insert_then_non_blob_update_preserves_full_schema` also proves mutation last-write-wins occurs before URI admission: a superseded disallowed source causes no policy check or I/O, while only the surviving allowed source is copied. Crate-internal pending-scan cells pin inclusive/+1 32 MiB accounting plus pending-key shadow-before-charge. The lance#7444 row-id-overlap regression (`filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent` — merge-load → same-key merge-load → delete → keyed point lookup, green on the pinned upstream Lance release — plus its append-only control) |
-| `src/table_store/staged_tests.rs` | Crate-internal staged primitives. RFC-023 pins one exact target preflight for general StrictInsert, durable v1 mint/commit/reopen/history persistence, exact-`id` filter emission, typed `KeyConflict`, and missing/wrong PK refusal. `all_new_upsert_certifies_insert_absence_and_persists_it_in_history` proves an all-new completed Upsert receives the optional certificate, a mixed/update Upsert does not, unrelated transaction properties survive, and UUID rebinding does not erase it. Proven-insert cells show the opaque path performs zero strict preflights; stages with `InsertBuilder` but commits the full pure-insert `Update` shape (exact parent and `id` filter, `RewriteRows`, no updates/removals, full nested schema preorder, physical rows); persists/re-admits its own output for proof composition; leaves new fragments outside old index coverage; and fails same-key races loudly in proven/proven and proven/general orders. The in-source `exec/merge.rs` certificate unit table rejects missing/unknown properties, wrong parent/filter/full-preorder/mode/offsets, rewrite/removal shapes, missing `physical_rows`, and Append. Source-interval cells pin exact selection, lazy retained-parent splitting, coalescing, and pinned Lance's approximate raw-emission boundary while every normalized/writer chunk remains hard-capped. Generic `stage_append`/`stage_merge_insert` remain primitive tests only. The file also owns index staging and `commit_staged{,_exact}` |
-| `forbidden_apis.rs` | Defense-in-depth source guard for the sealed storage boundary: raw Lance and coordinator surfaces stay crate-private, public snapshots expose safe scanners, graph writers use approved staged adapters, and retired WAL/stream symbols and durable call sites remain absent. RFC-033 Phase 1 removes the public `read_blob -> BlobFile` escape and classifies `read_blob_at` as read-only with no new durable call site. |
-| `lance_surface_guards.rs` | Compile/runtime pins for the Lance APIs OmniGraph depends on: shared object-store registries with isolated metadata caches, uncommitted index shapes, branch reclaim, exact transaction/head witnesses, PK conflict filters, cleanup refs, virtual system-column reservations, the exact-end handle requirement for historical delta row images, and stable row/version columns on OmniGraph-created graph datasets. Its Blob owner pins stable-row-ID `take_blobs` / `read_blobs` / `read_blob_ranges` cardinality and null-vs-valid-empty semantics, then exact neighbouring bytes and validity across 3→1 fragment compaction. Vector cells pin stable-ID/delete/IVF optimize alignment (#7704) and Lance 10's remaining late-payload KNN ordering-metadata gap plus the one-output-partition compatibility fence (#7868). Run first on every Lance bump. |
-| `durable_head_lookup_cost.rs` | RFC-024 Gate A decision instrument, isolated from the production manifest schema/publisher. At fixed catalog width 10 it runs the full absent/reconciled/one-uncovered/eight-uncovered/reconciled-after-tail matrix over compacted and uncompacted histories, with cold-open and warm-repeat measurements on local FS and bucket-gated S3/RustFS. Default depths are 20/80; the ignored decision-scale cell runs 10/100/1,000. Correct exact heads, flat indexed `rows_scanned`/range work, an index-absent growing negative control, and observable bounded tails all pass; after the eight-fragment tail, `optimize_indices` returns coverage to zero uncovered and representative `rows_scanned`/range work from 27→10 / 17→10. The test deliberately pins the no-go: uncompacted RustFS cold object reads/bytes and compacted byte terms grow, while RC.1 also crosses a bounded one-operation boundary by 1,000 commits, so RFC-024 remains research-blocked. `rows_scanned` is an RC.1 debug proxy, not a universal decoded-row counter. Object-store wrapper bytes and Lance execution-summary bytes are separate fixture-owned metrics and are not additive |
-| `checkpoint_retention_cost.rs` | RFC-025 Gate 0 decision instrument, isolated from the production manifest schema. It models three live checkpoints at catalog width 10 and measures complete list, exact show, and cleanup-root authority reads across absent/reconciled/eight-uncovered index states, compacted/uncompacted layouts, and cold/warm access. It also owns the reference V1 name-normalization matrix. Default local depths 20/80 pass the checked-in **no-go-preservation** assertions; the RC.1 ignored 10/100/1,000 run shows reconciled uncompacted work and the bounded tail flat, but rejects the candidate shape after compaction: list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; show grows 29,348→53,064 and 24,672→30,128; scan operations add one at 1,000. The S3/RustFS cell is bucket-gated and was not run for this decision. The result keeps RFC-025 research-blocked; current v6 adds no checkpoint state |
-| `warm_read_cost.rs` | Cost-budget tests for the warm read/control path (query-latency work), measured at the object-store boundary with Lance `IOTracker` (the LanceDB IO-counted pattern): a warm same-branch read does 0 graph-manifest opens and 1 graph-manifest version probe, validates the schema once (Fix 1 / finding A / Fix 2 at commit-history depth); a warm named-branch read additionally reads exactly its one `BranchContents` lifetime witness and no graph-manifest-version body, because version/e-tag/time can repeat across delete/recreate; a cold other-branch resolution derives snapshot state and lineage from one coherent graph-manifest open/scan; native branch create and create-from each use one post-gate open/scan, while delete uses one target capture plus one native-ref opener and only one graph-manifest row scan; stale same-branch reads perform exactly 2 probes and keep the state-only refresh when an exact graph-head row exists, while an absent row refreshes the inherited lineage atomically; recreated non-main branches with the same native dataset version refresh by incarnation and pair replacement graph-manifest rows with the replacement inherited head; recreated branch-owned dataset handles are distinguished by dataset e_tag or refresh-time cache clearing; recreated traversal topology is protected by per-edge-dataset e_tag in the graph-index cache key or refresh-time cache clearing; a warm *repeat* read does 0 dataset opens via the held-handle cache and a write re-opens only the changed dataset at its new published version/e_tag (Fix 3/6A). Also the CSR topology-build cost guards: `fresh_branch_traversal_reuses_main_graph_index` (A1 — a lazy-fork branch reuses main's cached CSR index, 0 rebuilds via `graph_build_count`) and `single_edge_query_builds_only_referenced_edge` (A2 — a one-edge query builds only that edge via `graph_edges_built`); both force CSR via the scoped `with_traversal_mode` seam, so they need no `#[serial]`. See "Cost-budget tests" below. |
-| `write_cost.rs` | Cost-budget tests for the WRITE path (RFC-013), the latency twin of `warm_read_cost.rs` on the **shared `helpers::cost` harness** (`measure`/`IoCounts`/`assert_flat`/`local_graph`). Runs on **local FS**; gates the **internal-dataset** term (`__manifest` scans flat in commit-history depth, lineage rows included — `internal_table_scans_are_flat_in_history`, now **green every-PR** since RFC-013 step 2 brought the internal datasets into `optimize`; the test compacts at each depth before measuring), graph-visible maintenance arbitration (`ensure_indices_manifest_reads_are_flat_in_history` and `optimize_manifest_reads_are_flat_in_history`), plus green every-PR guards (single-insert `data_writes` bounded, a per-write read-op ceiling that fails the moment a round-trip is added, and a `measure_with_staged` fitness assert that a keyed insert routes through the exact-`id` fenced adapter once with no bare `stage_append`/vector-index build). Also gates the batched committed `@unique` probe: `unique_probe_io_is_flat_in_delta_rows` sweeps DELTA size (4 vs 64 entities) at fixed shallow history and asserts `data_open_count`/`data_scan_reads` flat — red when the cross-version probe regresses to per-entity scans/opens. The **data-dataset opener** term is S3-only — see `write_cost_s3.rs` and the backend-split note in "Cost-budget tests" below. RFC-023's representative entity-count and peak-RSS decision measurements use the scenario harness, not this every-PR I/O budget |
-| `write_cost_s3.rs` | Bucket-gated (skips without `OMNIGRAPH_S3_TEST_BUCKET`) twin of `write_cost.rs` on the same `helpers::cost` harness: gates the **data-dataset opener** term (per-write latest-version resolution flat across commit depth on a real object store — per-version GETs are invisible on local FS). RFC-033's external-source cell sends 64 normalized-equivalent references through one keyed load and pins 64 admitted inputs, one actual metadata request, and one payload GET. These are cost gates, not correctness tests — run on demand, not in the every-merge `rustfs_integration` job (see the backend-split note in "Cost-budget tests" below) |
-| `helpers/cost.rs` | The shared cost-budget harness (not a test): `IoCounts`/`StagedCounts` (counts by dataset class), `measure`/`measure_with_staged` (the one place the `with_query_io_probes` + `MergeWriteProbes` task-local + `IOTracker` wiring lives; reads per-op deltas via lance's `incremental_stats()`, the upstream per-request idiom from `rust/lance/src/dataset/tests/dataset_io.rs`), `cost_harness`/`GraphIoMeter` (installs ONE `__manifest` `IOTracker` for a whole test body so the graph opens **under** it and `manifest_reads` is **ground truth** — every read regardless of handle age, the warm-coordinator freshness probe included — closing the blind spot where a per-op tracker installed at measure time cannot see a long-lived handle's reads; outside `cost_harness`, `measure` falls back to fresh per-op tracking, so `write_cost_s3.rs` is unaffected), `open_tracked_lance_dataset` (attaches a caller-owned `IOTracker` before `DatasetBuilder::load`, so a cold-open fixture includes latest Lance dataset-manifest resolution), `last_manifest_reads()` (the graph-manifest read log for `assert_io_eq!`-style failure diagnostics), `assert_flat(curve, select, slack, what)`, and store-agnostic `local_graph`/`s3_graph` fixtures. The general `IoCounts` vocabulary remains operation counts; RFC-024's decision fixture owns its object/plan byte metrics. `warm_read_cost.rs`, `write_cost.rs`, `write_cost_s3.rs`, and the RFC-024 instrument consume the relevant seams |
-| `benchmark_scenario_contract.rs` | Source/protocol contract for the non-CI scenario harness. RFC-023 pins the production route's explicit `strict_insert_preflight_calls == 0` assertion and emitted `probe_strict_insert_preflight_calls` field, alongside route labels, clean-tree/binary identity, child-protocol refusal, and exact-content verification fields. A benchmark record therefore cannot silently claim the proven path after paying a target preflight |
-| `lifecycle.rs` | Graph lifecycle and schema state, including the v6 creation invariant that every fresh node/edge dataset declares exactly physical non-null `id` as Lance's unenforced primary key. The same fresh-dataset matrix proves every graph user field carries its catalog `omnigraph.stable_property_id`, while `id`/`src`/`dst` carry none. `open_accepts_historical_body_unique_blob_but_init_rejects_it` constructs a coherent old accepted contract and pins the narrow compatibility boundary: the root opens, while new admission rejects the same source. |
-| `point_in_time.rs` | Snapshots and time travel (`snapshot_at_graph_manifest_version`, `entity_at`) |
-| `changes.rs` | `diff_between` / `diff_commits`, including immutable-identity dataset pairing: pure renames stay empty while drop/re-add under one alias remains two dataset lifetimes. The write-receipt cell proves an effectful mutation and Load return the exact durable commit from publication, while a zero-entity mutation returns no commit and leaves branch lineage unchanged. Also the owner of the change surfaces: per-commit entity pages (id-ordered nodes-before-edges emission, exact update before/after images including null-vs-empty and per-image edge endpoints, commit-era schema decoding with rename-stable opaque type ids, unchanged-Blob suppression and empty physical-only blocks, typed parentless/schema-boundary/page-token refusals, reclaim → typed feed gap) and the durable feed (block-boundary-only cursors with pinned cuts, start modes with named-branch inheritance, first-parent merge blocks carrying the merged parent, cursor scope/witness/genesis rejections incl. warm named-branch delete/recreate ABA, commit-ceiling-bounded sparse polls, stateless cross-handle resume, and the gap → baseline-reset handshake with its failing-writer no-cursor guarantee). Long shared-prefix IDs pin exact-or-prefix/digest continuation positions, arbitrarily long branch names pin fixed-size branch scopes, and both resume commit/feed pages without duplicates; a positive remainder at a commit boundary pins the page-wide solo-change exception. `commit_changes_detects_same_length_blob_update_after_overwrite` and its feed twin pin the data-file-path Blob identity: a same-length managed-Blob update through a full-dataset Overwrite (which resets fragment ids) is detected, where the retired fragment-id qualifier aliased it as unchanged. `change_feed_poll_follows_commits_from_another_handle` pins that a warm handle's live-read refresh re-reads lineage when the durable head is a commit its projection lacks (a state-only refresh permanently broke later polls with a missing-commit error), and `change_feed_byte_budget_admits_one_solo_oversized_change_per_page` pins that an exhausted byte budget stops at the block boundary instead of force-emitting one oversized change per remaining commit. |
-| `changes_cost.rs` | Cost budgets for the change surfaces on `helpers::cost`: per-page dataset opens bounded at two per changed interval and Blob payload work tracking emitted changes (flat). The adjacent proven path scans transaction-touched fragments without a secondary-index dependency: absent-index and stale/partial-index extent curves keep data reads flat, `candidate_transaction_reads` is exactly one, and `candidate_fragment_metadata_steps` permits only logarithmic manifest lookup plus touched fragments; the conservative exact ordered-merge fallback remains a GROWING extent tripwire. `changes_page_size_one_bounds_large_candidate_delta` resumes a 2,048-row Blob delta across two stateless `max_changes=1` pages and on each pins two candidates examined (one emission + sentinel), row target 2, the caller's byte target, and exactly one materialized image (the sentinel performs no JSON/Blob work); `changes_page_size_one_skips_transaction_history_for_multi_version_intervals` adopts two raw logical updates in one forced-repair graph commit, resumes it across two stateless size-one pages, and pins zero candidate transaction reads on both. Caught-up feed polls stay data-flat and manifest-read-flat over history depth; backlog cells pin `feed_commits_visited` to backlog for an unbounded poll and exactly two commits (one emitted + sentinel) for `max_commits=1`, with graph-manifest reads and dataset opens flat across backlog depths. |
-| `src/db/graph_coordinator.rs` | Crate-internal coordinator classification, including RFC-030's direct/reversed/arbitrary/merge range matrix: only the child's persisted first-parent pointer creates a `FirstParentEdge`; a merged parent remains provenance and classifies as an arbitrary endpoint range. |
-| `src/table_store.rs` | The ordered-scan unit owner forces a global `id` sort through a 2 MiB pool, proves nonzero spill count/bytes/rows and stable ordering, then proves a one-byte scratch quota emits no row and survives the Lance stream boundary as a typed resource error. The same cell pins fail-closed behavior when spilling is disabled. |
-| `consistency.rs` | Cross-dataset snapshot isolation and atomic publish; RFC-023 cells prove `LoadMode::Append` is strict (existing `id` rejected without update/version movement), pin the inclusive 8,192-entity keyed-load ceiling with a one-over pre-effect refusal, prove that refusal does not poison a following strict Overwrite above the keyed ceiling, reject an input above 32 MiB through the shared Mutation/Load staging seam with raw dataset HEAD/graph-manifest/sidecar unchanged, and pin the external-source failure ladder on a lazy branch: default deny returns typed policy failure without a probe, an allowed missing object returns typed source failure, an allowed oversized object is rejected from metadata before payload access/ref creation/sidecar arm, and two individually valid half-limit sources selected for different datasets share one operation-wide 32 MiB copy budget and are both refused before either payload read. The same owner distinguishes the generic external-ingress bound from the keyed entity cap: Overwrite accepts exactly 8,192 external URI cells with one normalized HEAD and no payload GET, while 8,193 cells split across two individually legal datasets return typed `resource_limit` before preflight, lazy-ref creation, dataset/graph-manifest movement, or recovery arm. A barrier-synchronized stress cell over 16 pre-opened handles proves one same-key winner, 15 typed `KeyConflict` losers, exactly one stored entity carrying the winner's value, and survival of disjoint IDs. |
-| `lineage_projection.rs` | RFC-013 Phase 7 acceptance gate: graph lineage lives ONLY in `__manifest` — over a realistic history (main commits, a branch, a merge, actors), the production coordinator reconstructs graph-manifest snapshot state and the full DAG projection from one coherent graph-manifest scan (commit set, parents, merge parents + merge actor, per-branch heads, inline actors), and the `_graph_commits.lance` / `_graph_commit_actors.lance` dataset directories are never created at all |
-| `schema_apply.rs` | Migration plan + apply, schema-apply lock; schema-contract publication is pinned by `read_only_open_holds_schema_gate_through_catalog_capture` and `refresh_holds_schema_gate_through_catalog_publication` (source, accepted IR/state, and compiled catalog are captured under one root schema gate). `apply_schema_drops_a_nullable_property_softly_preserves_prior_version` admits one whole-object external descriptor under an embedded policy, reopens under default deny, removes its target, then proves the unrelated rewrite carries that descriptor without re-authorization or I/O while valid-empty and neighboring managed values remain exact; it also soft-drops and same-name re-adds that Blob property and requires the retired snapshot to fail `BadRequest` as a different stable-property lifetime. `schema_apply_rejects_ranged_external_blob_before_arm_or_effects` forges a valid persisted external range and proves typed refusal leaves recovery sidecars, dataset HEAD, graph manifest, and graph lineage unchanged, while the in-source helper matrix pins every ranged shape. RFC-033 Phase 1 extends the pure-rename cell with a current `Human.portrait` read and a typed `BadRequest` for the same current selector at the pre-property-rename snapshot; historical property-field crossing stays deferred. `long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token` covers mutation/load plus a post-apply new node type merged through the pre-apply handle, and proves the rebuilt `Person` plus newly created `Project` fields carry the exact catalog property markers while physical identity fields remain unmarked. `stale_handle_branch_delete_gates_tables_added_by_schema_apply` parks delete over that new type while a legacy index reconciler waits, proving merge planning and native-control dataset envelopes use an operation-local accepted catalog rather than stale ArcSwap state. Index materialization is deferred to the reconciler (iss-848): `apply_schema_defers_vector_index_on_empty_table` (an empty-dataset Vector `@index` never aborts the apply) and `index_only_constraint_apply_touches_no_table_data` (adding an `@index` is metadata-only — no published-dataset-version bump); enum widening (iss-enum-widening-migration): `enum_widening_apply_is_metadata_only_and_accepts_new_variant` (no published-dataset-version bump; new variant accepted, out-of-set still rejected) + `enum_narrowing_apply_is_refused` (OG-MF-106 with the graph left writable). The planner's widening/narrowing matrix lives in `schema_plan.rs`'s in-source tests. RFC-023 assertions prove exact-`id` PK metadata survives rewrites, applies to added types, remains on retained types across drop/re-add, and is present after reopen |
-| `search.rs` | FTS / vector / hybrid (`bm25`, `nearest`, `rrf`), including a >8,192-result multi-fragment nearest query that proves late payload hydration preserves global rank through the Lance 10 compatibility fence |
-| `scalar_indexes.rs` | Per-property index dispatch of `build_indices_on_dataset_for_catalog`: enums + orderable scalars get a BTREE (so `=`/range/IN/IS NULL are index-accelerated), free-text Strings keep FTS — observed through the read-only `SnapshotDataset::index_coverage`, backed by the same helper the traversal chooser uses |
-| `traversal.rs` | `Expand`, variable-length hops, anti-join, undirected traversal (`$a <edge> $b`, `Direction::Both` — out ∪ in with set-semantics dedup, both-direction anti-join) (CSR path — `OMNIGRAPH_TRAVERSAL_MODE` unset) |
-| `traversal_indexed.rs` | BTREE-indexed Expand (`execute_expand_indexed`) forced via the scoped `with_traversal_mode` seam (not the env var), asserted semantically equal to the CSR path. No `#[serial]` needed — the seam is scope-bound and process-safe. (The CSR topology-build cost guards — `fresh_branch_traversal_reuses_main_graph_index` (A1, `graph_build_count`) and `single_edge_query_builds_only_referenced_edge` (A2, `graph_edges_built`) — live in `warm_read_cost.rs`.) |
-| `proptest_equivalence.rs` | Property-based query-correctness invariants over generated graphs (shared key alphabet forces cross-type id collisions, cycles, self-loops) — pins Expand-mode result-multiset equivalence, no-phantom rows, and anti-join partition laws so a future fork divergence fails loudly instead of silently. It uses the scoped `with_traversal_mode` seam; no `#[serial]` is needed |
-| `ordering.rs` | ORDER BY contract: descending, multi-key precedence, deterministic key-column tie-break (total order, so `ORDER … LIMIT` is deterministic), NULL placement (`nulls_first = !descending`) |
-| `literal_filters.rs` | Execution goldens for non-string/non-integer scalar literal filters (F64/F32/Bool/Date/DateTime) across both the in-memory comparison arm and the Lance-pushdown arm |
-| `aggregation.rs` | `count`, `sum`, `avg`, `min`, `max` |
-| `export.rs` | NDJSON streaming export filters; its Blob fixture explicitly authorizes URI admission, then pins exact null, valid-empty-leading-fragment, non-empty neighbour, and the persisted normalized external reference while the target is unavailable. RFC-033 Phase 1 migrates its post-import assertions to `read_blob_at` without changing export's batched implementation or dereferencing the unavailable external target merely to classify it. Rebuild restores the source and supplies an explicit target policy before importing the URI, then proves fidelity and performs a later `LoadMode::Append` strict insert into the populated current-format dataset (preserving the v6 PK contract) with exact bytes and exact-`id` PK metadata afterward. `export_jsonl_round_trips_branch_snapshot` separately exports `main` and a named feature branch, rebuilds each into a main-only graph, and proves independent identity domains plus disjoint, self-contained histories |
-| `s3_storage.rs` | S3-backed graph (skipped unless `OMNIGRAPH_S3_TEST_BUCKET` is set). `s3_public_load_uses_hidden_run_and_publishes` also applies a server-safe external-Blob base, loads two normalized-equivalent S3 references with exactly two admitted cells/one HEAD/one payload GET, deletes the source object, and proves both managed copies survive. Includes `s3_fresh_branch_traversal_reuses_main_graph_index_with_etags` — the CSR topology cache-key test on a **real** per-dataset e_tag (`None` on local FS, so `warm_read_cost.rs` can't reach this path); forces CSR via the scoped `with_traversal_mode` seam |
-| `lance_version_columns.rs` | Per-row `_row_last_updated_at_version` behavior |
-| `validators.rs` | Schema constraint enforcement (enum, range, unique, cardinality) across JSONL load, mutation insert/update. ALL THREE write surfaces — mutation, bulk load, AND merge — route through the unified `crate::validate` evaluator (Δ-scoped, index-backed, reusing these leaf checks). Cross-version-uniqueness closure: `cross_version_unique_rejected_on_mutation_insert` + `reinsert_existing_key_is_upsert_not_unique_violation` (mutation path); `cross_version_unique_rejected_on_append_load` + `merge_load_reupsert_existing_key_is_not_unique_violation` (load path). Per-dataset `Overwrite`: `overwrite_load_validates_ri_against_new_image` (an edges-only overwrite still resolves RI against retained committed nodes) + `append_load_rejects_orphan_edge`. The evaluator's own unit tests live in `src/validate.rs` (`#[cfg(test)]`), including the correction identity for a fresh-source minimum-cardinality violation; its merge-conflict equivalence is pinned by `merge_truth_table.rs` (OrphanEdge) + `branching.rs` (Unique/Cardinality merge tests). Intra-batch duplicate-`@key` rejection on every load mode is pinned by `consistency.rs::loader_rejects_intra_batch_duplicate_keys`; the mutation-coalesce counterpart (insert+update / chained updates of one id are NOT a self-collision) by `writes.rs`. Non-String `@unique` columns probe committed state with a TYPED literal (not a stringified key): `cross_version_unique_rejected_on_date_column` + `noncolliding_write_to_date_unique_column_succeeds` (a `Date @unique` collision is a proper `@unique` violation, and a distinct value does not raise a Date32-vs-Utf8 coercion error). Cardinality is keyed by edge id, last-wins (matching commit's `dedupe_merge_batches_by_id`): `merge_load_edge_src_move_rechecks_vacated_src_cardinality` (a Merge-load moving an edge recounts the vacated src for `@card` min) + `merge_load_duplicate_edge_id_counts_once_per_card` (a dup edge id under two srcs in one batch counts once, no spurious max violation). Direct deletes capture the ids they remove (from the delete op's own scan) into the change-set's `deleted_ids`, so a delete emptying a src is validated: `mutation_delete_edge_below_card_min_rejected` (a `delete Edge` dropping a src below `@card` min is rejected, not silently committed). |
-| `merge_cost.rs` | Cost budgets for branch MERGE on the shared `helpers::cost` harness: `merge_validation_is_delta_scoped` keeps validation tied to the delta and caps the common one-row fast-forward route at 3 internal opens / 3 coherent manifest scans. `merge_manifest_cost_grows_with_history` caps the diverged route at 4 opens and 4 scans across the checked depths while preserving the growing object-read tripwire. Retained source/target manifest `Dataset` probe handles and combined manifest+lineage decoding reduce the pre-slice measured depth-5/depth-80 baseline from 59/651 manifest reads to 40/410, but the surviving journal fold and fresh publisher authority scan remain history-sensitive on an uncompacted graph; this is reduced amplification, not a history-flat claim |
-| `branch_control_cost.rs` | Cost-budget tests for native branch CONTROL ops on the shared `helpers::cost` harness: `branch_delete_manifest_reads_bounded_per_surviving_branch` gates the SLOPE of `branch_delete`'s `__manifest` reads per surviving branch — the delete dependency check reads one manifest-only snapshot per foreign branch, never a full cold resolve (state + lineage scans + schema-contract re-read) per branch |
-| `policy_engine_chassis.rs` | Engine-layer Cedar enforcement (MR-722): allow + deny through every `_as` writer via the SDK directly — no HTTP — proving embedded and CLI callers hit the same gate as the server, with action × scope shapes matching `authorize_request` |
-| `maintenance.rs` | `ensure_indices`, `optimize` (compaction), `repair` (explicit uncovered-drift publish), and `cleanup` (version GC): empty/idempotent/no-op edges, policy validation, head preservation. EnsureIndices refuses uncovered drift before arming its identity-bearing v9 envelope and keeps untrainable Vector work pending. Cleanup pins exact keep-count behavior, lazy-branch retention, graph-wide fail-closed ordering, and refusal of uncovered main HEAD drift before GC. Optimize's bounded payload inside the v9 envelope publishes multiple productive backing datasets through one graph commit, emits no lineage/sidecar at steady state, skips uncovered drift, refuses pending recovery, and compacts Blob-v2 datasets. Its Blob cell preserves non-empty/null/valid-empty/neighbour values and fragment reduction through one graph-manifest publication. Repair previews/heals verified maintenance drift and requires `--force` for semantic drift |
-| `failpoints.rs` | Feature-gated crash-window coverage for ordinary recovery-v9 writers: Mutation/Load, BranchMerge, SchemaApply, EnsureIndices, Optimize, native branch controls, first-touch refs, graph-manifest publication, recovery discovery, cleanup, and S3 twins. Effects remain invisible until the one graph-manifest publication and ambiguous outcomes remain recovery-owned. The net-zero merge cell proves a pre-confirmation crash compensates the real sibling delta, preserves source and target entities, leaves the suppressed dataset untouched, and remains exactly retryable. Conditional mutation cells park effectful update/delete and zero-match attempts before their authoritative gate, advance the branch, and require terminal `PreconditionFailed` before loser effects; a live-read refresh cell injects failure between replacement state and inherited-lineage decoding and proves the next read retries a coherent branch-incarnation view. RFC-033 additionally parks a live named-branch Blob read after graph capture, replaces that branch at the same physical path/version, and proves the reader fails the cold incarnation proof instead of returning replacement bytes. RFC-030's `CHANGE_FEED_POST_CAPTURE` cell is the change-feed twin for the first ABA window: it parks a poll after cut capture, delete/recreates the polled branch at the same version, and proves `commit_snapshot`'s incarnation re-prove fails closed rather than emitting the replacement branch's entities under the old commit's label. `change_feed_poll_refuses_delete_recreate_aba_before_table_open` (`CHANGE_FEED_PRE_TABLE_OPEN`) is the second-window twin: it isolates a single commit, parks between the head proof and the per-dataset open, delete/recreates the branch at the same path/version, and proves `open_at_entry_verified`'s e_tag incarnation check fails closed instead of reading the replacement branch's entities. `change_feed_poll_refuses_table_open_aba_without_etag_witness` combines that park with the `CHANGE_FEED_SKIP_ETAG_WITNESS` behavior seam (simulating an e_tag-less store) and proves the LOGICAL post-open witness — `reprove_named_branch_heads`'s fresh graph-manifest reopen comparing `graph_head` at the pinned version — refuses the replacement alone; the e_tag comparison is defense-in-depth, not the load-bearing witness. |
-| `failpoint_names_guard.rs` | Source-walk guard (same defense-in-depth shape as `forbidden_apis.rs`): every failpoint call site across engine + cluster (`maybe_fail`, `ScopedFailPoint::new`/`with_callback`, `Rendezvous::park_first`) must reference a compile-checked `failpoints::names` const, never a bare string literal — a typo'd literal compiles but silently never fires |
-| `recovery.rs` | In-source recovery tests for ordinary identity-bearing sidecar schema v9: grammar validation, exact effect ownership, fixed lineage, roll-forward/compensation, audit, read-only refusal, stale-sidecar cleanup, and refusal of future sidecar versions. |
-| `composite_flow.rs` | Compositional/narrative end-to-end stories — multi-step flows that compose mechanics covered by other test files. Catches integration regressions where individual operations all pass their unit tests but their composition breaks (sequential merges, post-merge main writes, time-travel through merge DAG, reopen consistency over multi-merge histories, post-optimize and post-cleanup strict writes). |
+The feature-superset command is the canonical graph because it compiles the current tree once with failpoint hooks present but inert unless a test enables one. Also run formatting and both Clippy graphs before pushing; [ci.md](ci.md) lists the exact gates.
 
-## Fixtures
+AWS server support has a separate feature owner:
 
-`crates/omnigraph/tests/fixtures/` holds the canonical schema (`.pg`), seed data (`.jsonl`), and queries (`.gq`) shared across tests. Reuse these before inventing new ones — the helpers harness already knows how to load them.
+```bash
+cargo test -p omnigraph-server --features aws
+```
 
-## Test helpers
+S3-backed tests skip unless `OMNIGRAPH_S3_TEST_BUCKET` and the corresponding AWS endpoint/credential variables are set. Azure-backed tests skip unless `OMNIGRAPH_AZURE_TEST_CONTAINER` and the documented Azure/Azurite variables are set. A configured CI backend treats a skip as failure.
 
-- **Engine** — `crates/omnigraph/tests/helpers/mod.rs`: `init_and_load()` (bootstrap a temp graph + load standard fixture), `snapshot_main()`, `snapshot_branch()`, query/mutation runners, row collection and counting. Use these instead of hand-rolling.
-- **CLI** — `crates/omnigraph-cli/tests/support/mod.rs`: `Command`-style wrapper for invoking `omnigraph`, server-process spawning, fixture resolution, output assertion helpers.
-- **Server** — no shared helpers; server tests call the `Omnigraph` engine API directly and exercise endpoints over the wire.
+### OpenAPI
 
-> Note: the shared storage adapter has an in-memory backend (`ObjectStorageAdapter::in_memory()`, full contract including true conditional updates) used by the adapter contract tests in `crates/omnigraph-storage/src/lib.rs`. Those tests also pin the optional single-GET text-read contract: present objects return `Some`, typed `NotFound` returns `None`, and non-absence failures remain loud. The engine's `crates/omnigraph/src/storage.rs` is a compatibility facade over that implementation. This covers only the text-object layer (sidecars, schema staging, cluster state) — **Lance datasets bypass the adapter**, so engine integration tests still use `tempfile::tempdir()`. An in-memory Lance substrate remains an architectural ask — keep it explicit in [docs/dev/invariants.md](invariants.md) under known gaps.
+`crates/omnigraph-server/tests/openapi.rs` regenerates the specification in memory and compares it with `openapi.json`. For an intentional API change:
 
-## Failpoints (fault injection)
+```bash
+OMNIGRAPH_UPDATE_OPENAPI=1 \
+  cargo test -p omnigraph-server --test openapi openapi_spec_is_up_to_date
+```
 
-The feature-gated engine and cluster failpoint suites own crash windows around
-ordinary recovery-v9 sidecar creation, each dataset effect, confirmation,
-graph-manifest publication, audit, cleanup, first-touch branch refs, and cluster-state
-CAS. Extend those existing owners when changing a writer; do not create a
-parallel recovery suite for a transport facade over Load.
+Commit the generated file with the API change. CI checks drift; it never updates the file.
 
-## RustFS / S3 integration
+## Cost tests and benchmarks
 
-CI runs these S3-backed **correctness** tests against a containerized RustFS
-server (`.github/workflows/ci.yml` → `rustfs_integration` job) in two
-feature-graph shards. The default shard selects its five test binaries in one
-Cargo invocation so dependency features and large test links compile once,
-then runs the outer libtest harness with `--test-threads=1` and checks the
-captured log for every required S3 cell and explicit skip. This serializes only
-the top-level scenarios sharing one RustFS container; each scenario keeps its
-ordinary internal Tokio concurrency. RustFS readiness and bucket creation are
-hard gates. A failed shard records container state, stdout/stderr, and the
-service files under `/logs`. The failpoints shard runs the `s3_`-prefixed
-feature-gated cells in one invocation. These remain the focused local
-equivalents:
+Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the scenario harness under `crates/omnigraph/benches/`, whose JSONL output is evidence rather than a pass/fail assertion.
 
-- `cargo test -p omnigraph-engine --test s3_storage` (lifecycle/branching, allowed external-S3 copy with 2 inputs/1 HEAD/1 GET and post-source-deletion ownership, plus the e_tag-present CSR topology cache-key reuse test — the path local FS can't reach since its e_tag is `None`)
-- `cargo test -p omnigraph-engine --test lance_surface_guards public_physical_ref_token_rejects_s3_same_version_aba -- --exact` (RFC-024's public current-HEAD witness across unchanged reopen plus main/named same-version ABA; the workflow additionally rejects a zero-test/vacuous match)
-- `cargo test -p omnigraph-server --test s3` (single-graph serving + config-free `--cluster s3://` boot + applied server-safe Blob copy and structured missing-source 424)
-- `cargo test -p omnigraph-cluster --test s3_cluster` (full control-plane lifecycle on the bucket)
-- `cargo test -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow`
-- `cargo test -p omnigraph-engine --features failpoints --test failpoints s3_` (recovery-sidecar lifecycle on a real bucket)
+Keep measurement fixtures separate from production schemas and recovery state. A no-go result belongs in the RFC or issue that consumed the experiment, not as a permanent narrative in this map.
 
-Locally, set `OMNIGRAPH_S3_TEST_BUCKET` (and the usual `AWS_*` vars including `AWS_ENDPOINT_URL_S3` for non-AWS) before running. Without those, S3 tests skip gracefully.
+## Before every task
 
-RFC-024's S3 **cost** matrix is deliberately not in this correctness job. Run
-it on demand with
-`OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test durable_head_lookup_cost s3_durable_head_lookup_matrix_is_correct_and_observable -- --exact --nocapture`.
-
-RFC-025's S3 **cost** matrix is likewise on demand and was not run for the
-2026-07-17 local no-go decision:
-`OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test checkpoint_retention_cost s3_checkpoint_retention_matrix_is_exact_and_records_the_current_no_go -- --exact --nocapture`.
-
-## Cross-version upgrade (genuine binary format fences)
-
-`crates/omnigraph-cli/tests/crossversion_upgrade.rs` owns both the released v4
-to current-v6 boundary and the adjacent development v5-to-v6 format fence. In
-the released cell, the genuine v0.8.1 binary creates/exports v4; the current
-binary refuses direct open, rebuilds a fresh v6 graph through init/load, and
-proves logical entity/vector/blob fidelity plus exact-`id` PK metadata. The old
-binary must refuse the v6 root.
-
-V5 was the unreleased immediate predecessor to current v6. CI builds the exact
-final-v5 commit `46b6d9084fb629b88d4ac9e8c546e0a30d213d19`, exports it through
-`OMNIGRAPH_V5_BIN`, and runs only
-`current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6`. The cell proves
-both format refusals and the documented export/init/load rebuild; it is not a
-same-format compatibility test.
-
-V7-v19 were abandoned unreleased RFC-026 formats. Default CI does not rebuild
-their historical binaries or promise export fidelity. One future-stamp guard
-proves the v6 binary refuses before recovery/dataset decoding. Local unit tests
-pin the exact refusal grammar; they supplement rather than replace the genuine
-released v4↔v6 boundary.
-
-## System e2e requirements and suppression
-
-The CLI system tests (`system_local.rs`) spawn the workspace-built `omnigraph` and `omnigraph-server` binaries (cargo provides paths via `CARGO_BIN_EXE_*`), bind ephemeral localhost ports, and use local-FS temp dirs — no external services, no env vars required; they run in the default `cargo test --workspace`. The comprehensive cluster lifecycle e2es (multi-server-restart flows) honor an opt-out for constrained sandboxes: set `OMNIGRAPH_SKIP_SYSTEM_E2E=1` to skip them with a logged message (the same graceful-skip pattern as the S3 gate). Cargo-native filtering also works: `cargo test --test system_local -- --skip local_cluster`.
-
-## OpenAPI drift
-
-`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json` and diffs against the checked-in copy. CI always runs the drift check strictly and does not auto-commit generated output. For server/API changes, regenerate locally with `OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi` and commit the result, or the PR's `test_aws_feature` job fails on drift. See [ci.md](ci.md).
-
-## Examples & benches
-
-- `crates/omnigraph/examples/bench_expand.rs` — runnable example (not part of CI).
-- `crates/omnigraph/benches/scenarios.rs` — the **scenario benchmark harness**: a
-  decision instrument, never a CI gate. Each scenario is ONE cold, stateful
-  macro-run (a branch merge, a filtered vector search) executed in a fresh
-  subprocess and instrumented for wall-clock + peak RSS (`libc::wait4` /
-  `ru_maxrss` — kernel-exact, no sampling) + scenario metrics, emitted as JSON
-  lines. Scenario-local structural assertions keep a run on its claimed route;
-  timing/RSS thresholds are evaluated from the records, not asserted in the
-  executable. It is not part of `cargo test --workspace`. Criterion is
-  deliberately not used (statistics over warm in-process iterations is the wrong
-  model for multi-second stateful scenarios; no memory measurement; no crash
-  isolation — an OOM under `--memory-cap-mb` is a *data point*). Run:
-  `cargo bench -p omnigraph-engine --bench scenarios -- --scenario
-  merge-all-changed --rows 20000 --dims 256` (also `nearest-prefilter`;
-  existing scenarios use `--baseline` to omit or replace the measured op,
-  while RFC-023 records the exact comparator boundary in `metrics.routing` and
-  `metrics.measurement_boundary`; `--memory-cap-mb` applies and verifies
-  `RLIMIT_AS` on Linux. A requested cap on an unsupported platform, or one that
-  cannot be verified, is recorded before allocation and the child refuses the
-  scenario with exit status 78). Every run appends its record (with `ts` +
-  `git_sha`, full `git_tree_sha`, `git_worktree_dirty`, and an exact SHA-256
-  digest of the benchmark binary) to a results log — `--out <path>`, else `OMNIGRAPH_BENCH_RESULTS`,
-  else `crates/omnigraph/benches/results.jsonl` (gitignored; host-specific) —
-  so baselines survive across sessions and substrate bumps. Add new scenarios
-  here rather than new bench targets; keep the JSON-lines/no-assertions
-  contract.
-- `crates/omnigraph/benches/scenarios.rs` with
-  `benches/scenarios/rfc023.rs` — RFC-023's decision instrument. It measures a
-  fixed 32-row mixed upsert against 10K/100K/1M-row
-  indexed targets (forced v2 filter route versus default index-enabled route),
-  one exact filtered 8,192-row transaction mirroring the Mutation/Load
-  single-transaction ceiling, and an embedding-bearing all-new branch adopt.
-  Every adopt trial is explicitly three-phase over one persisted fresh root.
-  An uncapped setup child initializes the same real graph, loads main, creates
-  the source branch, loads its all-new rows, validates main=N/source=2N, and
-  records both observed published dataset versions in its fingerprint. A fresh measured
-  child alone receives `--memory-cap-mb`, identically `Omnigraph::open`s the
-  root for either arm, records pre-operation HWM, and executes production
-  `Omnigraph::branch_merge` or the labeled non-production comparator.
-  Production includes the full coordinator lifecycle. For this proven all-new
-  fixture that means complete v1 history-chain admission, bounded source-
-  interval scans, final source/target native-incarnation checks, sidecar and
-  recovery-chain work, dataset commits, and graph-manifest publication. The admitted
-  opaque chunks stage immutable fragments with `InsertBuilder`, replace its
-  temporary uncommitted Append operation with the exact-`id` filter-bearing
-  `Update`, and re-mint v1. `MergeWriteProbes` assert the observed transaction
-  count exactly equals the row/byte plan, all rows were fenced, and target
-  MergeInsert calls, strict-insert target preflights, committed/bare Append,
-  whole-delta combines, and ordered-cursor scans all stayed at zero. Raw Lance
-  interval-emission count/maximum bytes are recorded separately from the hard
-  normalized chunk boundaries. The comparator
-  streams only `adopt-new-*` rows through `InsertBuilder::execute_stream` in
-  Lance Append mode and never collects the whole delta. Because it cannot
-  access OmniGraph's private Session, the lower-level comparator opens one raw
-  Lance Session and explicitly shares it between physical main/source handles.
-  Both arms capture operation wall time and immediate post-operation HWM, then
-  perform no final row scan. A third uncapped fresh child uses bounded
-  `id`/`slug`/`embedding` projections plus an exact-domain bitset and
-  deterministic vector checks to prove physical and graph-visible content, not
-  merely row counts.
-  The parent exposes setup/controller/operation/verify peaks separately, while
-  top-level `peak_rss_bytes` is exactly the measured-operation child's
-  whole-process `wait4` peak. Unsupported requested caps still fail closed
-  before the operation child opens the fixture. A failed/refused child still
-  produces its one aggregate JSON record, and the parent exits nonzero after
-  finishing the requested runs; malformed, missing, duplicate, or non-object
-  child protocol records are harness failures. Final evidence is exactly five
-  matched pairs / ten trials per size over separate fresh roots, with A =
-  production, B = comparator, the same seed within a pair, and order AB, BA,
-  AB, BA, AB. Every exit and phase must be successful, exact route/content
-  checks green, the worktree clean, and `git_tree_sha` plus benchmark-binary
-  SHA-256 identical across all ten records. The exact gates are
-  `median(A metrics.operation_wall_ms) / median(B metrics.operation_wall_ms) <= 5.0` and
-  `max_i(A_i operation-child peak - B_i operation-child peak) <= 67,108,864`
-  bytes, using signed pair differences. All raw records/pairs are reported;
-  there is no exclusion or replacement. When immediate post-operation HWM is
-  not above pre-operation HWM, the recorded increment is transparently
-  censored rather than replaced with zero; the RSS gate still uses whole-child
-  `wait4` peaks.
-
-  The predeclared replacement series completed on clean Git tree
-  `22b31354b237b981683fa1bc5b01275a6c8b8750` with benchmark digest
-  `17b4eb12083afd3eb8c26b23ef01dbd90b6ac9b2ab4160352b6617887f403edb`.
-  The 10K file
-  `/Users/andrew/.local/state/omnigraph/benchmarks/rfc023-no-preflight-acceptance-10k.jsonl`
-  used seeds `2404001..2404005`: production operation times
-  `[31, 30, 30, 31, 31]` ms versus comparator `[8, 8, 8, 9, 8]` ms give
-  medians 31/8 and **3.875×**; maximum signed paired RSS overhead was
-  **24,297,472 bytes**. The 100K file
-  `/Users/andrew/.local/state/omnigraph/benchmarks/rfc023-no-preflight-acceptance-100k.jsonl`
-  used seeds `2414001..2414005`: production
-  `[136, 136, 137, 134, 134]` ms versus comparator
-  `[40, 36, 34, 35, 35]` ms give medians 136/35 and **~3.886×**; maximum
-  signed paired RSS overhead was **32,604,160 bytes**. Both sizes pass both
-  fixed gates. All twenty records completed every phase and exact-content
-  check; every production record reports zero target strict-insert preflights,
-  zero MergeInsert calls, and zero ordered-diff scans.
-
-  Historical direct-substrate bulk rows remain narrower substrate evidence,
-  not production acceptance. The earlier full-lifecycle 10K series failed at
-  30.0× and 108,625,920 bytes and is preserved; that failure motivated the
-  complete-certificate/InsertBuilder path. The historical 1M small-upsert and
-  8,192 × 256 one-ceiling substrate cells remain valid for their own gates.
-  Those macOS measurements predate fail-closed cap handling: the RFC records
-  observed `ru_maxrss` and does not claim the requested 256 MiB cap was
-  enforced. The current harness refuses a requested capped scenario on macOS.
-- `crates/omnigraph/benches/scenarios.rs` with
-  `benches/scenarios/rfc023.rs` — the `general-merge-updates` scenario, the
-  counterpart to `fenced-adopt-all-new`. That scenario measures the proven
-  insert-only shortcut against an untouched target; this one always advances
-  `main` on a disjoint key range so the merge is genuinely diverged. The update
-  arm (`--source-mode update`) rewrites committed rows, carries no
-  insert-absence certificate, and pins the general ordered-diff route. The
-  insert arm (`--source-mode insert`) writes all-new rows within the pure-insert
-  history-proof limit and records whether the shortcut survives target
-  movement. Both arms assert `MergeOutcome::Merged`; the update arm
-  additionally asserts ordered cursor scans and zero strict-insert preflights.
-  Fresh verification checks the exact
-  row count plus deterministic payloads from both the source delta and target
-  divergence. `--delta-rows` sets the branch delta independently of `--rows`,
-  which is the whole point — the scenario separates delta cost from target
-  cost for [#384](https://github.com/ModernRelay/omnigraph/issues/384). Its
-  fixture sizes `load()` chunks from the loader's real keyed accounting (a
-  JSON array is charged `(dims + 1) * 4` offset bytes **plus** `dims * 4`
-  value bytes, roughly `dims * 8`), not from `derive_chunk_plan`'s `dims * 4`
-  value-buffer model; the two agree at dims=256 only because the 8,192-row cap
-  binds first.
-  A decision instrument, not a CI gate: it asserts route where the shape fixes
-  it, records the insert-arm discovery, and never asserts a performance
-  threshold.
-- Add `benches/` per crate when you ship a perf-driven change, and include the motivating workload with the optimization.
-
-## Coverage tooling — what's missing
-
-There is **no** coverage tooling in the repository today: no `tarpaulin.toml`, no `codecov.yml`, no coverage CI step. If you want to know whether your change is covered, the answer comes from reading and running the relevant integration tests, not from a tool.
-
-If introducing coverage tooling is in scope for your task, the natural first step is `cargo-llvm-cov` wired into a separate CI job, and a per-crate threshold rather than a global one.
-
-## First principle: check what already covers it
-
-**Before writing any new test, check whether an existing test already covers the case.** The cost of duplicating coverage is high: more code to read, more places to keep in sync when behavior changes, and more drift when one copy lags. The cost of *extending* an existing test is usually one extra assertion or one extra fixture row.
-
-How to check:
-
-1. **Map the change to an area** — use the engine integration-test table above (`branching.rs`, `writes.rs`, `search.rs`, etc.). The filename usually names the area.
-2. **Open the file and skim every test fn name.** Test fn names are the index — read them all, not just the first few.
-3. **Grep for the symbol or path you're changing.** `rg <FunctionName>` or `rg <enum_variant>` across all `tests/` directories surfaces existing coverage you might miss.
-4. **Decide one of three outcomes**, in this order of preference:
-   - *Existing test already asserts the new behavior* → no new test needed; this PR is a refactor or no-op behaviorally. Confirm by running the existing test against the change.
-   - *Existing test covers the area but not your case* → **add an assertion or a fixture row to the existing test**, don't write a new function with `init_and_load()` again.
-   - *No existing coverage in any test file* → only then write a new test; put it in the file that owns the area, or open a new file only if the area itself is new.
-
-Three duplicated `init_and_load() → run_query → assert_eq` blocks where one parameterized test would do is the most common form of test rot in this repository. Don't add to it.
-
-## Before-every-task checklist
-
-When you pick up any change, walk through this:
-
-1. **Find existing coverage** (per the principle above). Don't just look at the first test file by name — grep for the symbol you're touching across every crate's `tests/`.
-2. **Run those tests locally before editing.** `cargo test --workspace --locked` for the broad pass; `-p <crate> --test <file>` for a focused loop. Confirm a clean baseline.
-3. **Decide extend-vs-new** explicitly. If you can extend an existing test (assertion, fixture row, parameterization), do that. Only add a new test fn or new file if no existing one owns the area.
-4. **Reuse the helpers.** `init_and_load()`, fixture files, the CLI `support` harness — re-use them. Don't bootstrap a fresh graph by hand if a helper exists.
-5. **Mind the boundary.** Per [docs/dev/invariants.md](invariants.md), test at the layer the change lives at — planner-level changes deserve planner-level tests, not just end-to-end.
-6. **For substrate-touching changes** (Lance behavior), reach for `failpoints` or fixture-driven scenarios, not stubbed-out mocks.
-7. **For server / API changes**, confirm the OpenAPI regeneration happens in `openapi.rs` and that the diff lands in `openapi.json`.
-8. **Verify your change makes an existing test fail before it makes the new one pass.** If you can break the code without breaking a test, your coverage gap is the problem to fix first.
-9. **Bound hot-path cost at history depth.** If the change touches a read, **write**, or open path, add or extend a test that asserts a *bounded* cost (e.g. a warm same-branch read performs zero `Dataset::open`, or a per-write read-op count flat across commit depth) against a fixture with realistic *commit-history depth*, not just realistic row counts. Reuse the shared `helpers::cost` harness (`measure`/`IoCounts`/`assert_flat`) — don't hand-roll `IOTracker` wiring. Cost that scales with history is invisible on a shallow fixture and only bites in production. See "Cost-budget tests" below.
-
-## Cost-budget tests: bound hot-path cost at history depth
-
-Correctness bugs fail loudly in tests; cost-scaling bugs pass every test and degrade silently in production. The engine read path historically had no cost assertion, and fixtures carry shallow commit history, so an O(commits)-per-query cost stayed green in CI and only surfaced on a long-lived graph (read snapshot resolution re-scanned the internal manifest and commit-graph tables on every query, and those tables were never compacted). Guard against the class:
-
-- **Assert a cost budget, not just a result.** For a read/open path, assert the number of `Dataset::open` calls (or object-store ops) a warm query performs, and that it does not grow with commit count. The reference is LanceDB's IO-counted tests, which assert a cached read costs 0-1 IO and carry a named regression test against "a list call on every subsequent query."
-- **Test at history depth.** Build a fixture with many *commits* (not many rows) and assert warm-read cost is flat across depths. A shallow fixture cannot catch an O(commits) cost.
-- **Use the shared harness, and gate each term on the backend where it manifests.** `helpers::cost` (`measure`/`IoCounts`/`assert_flat`/`local_graph`/`s3_graph`) is the one place the `IOTracker`/task-local plumbing lives — consume it, don't duplicate it. The write path has *two distinct* depth terms that split cleanly across backends, and conflating them is a real trap (the local data-dataset *scan* term used to grow with depth for a different reason — the merge-insert/RI scan re-reading O(depth) *fragments* — until the dataset-opener unification attached the shared per-graph `Session` to write-side opens; immutable fragment/Lance dataset-manifest metadata now comes from the session cache, and `write_cost.rs::data_table_reads_split_into_flat_opener_and_scan_flat_with_session` pins that flatness — a red there means a write-side open dropped the session): (1) the **internal-dataset** scan term (`__manifest` fragment scans, lineage rows included) reproduces on **any** backend including local FS, so `write_cost.rs` gates it on local every-PR; (2) the **data-dataset opener** term (latest-version resolution) is a per-object-store-RPC phenomenon — local-FS resolves latest with one cheap `read_dir` regardless of the opener used, so the namespace-vs-direct difference is **invisible on local** and only shows on a real object store (per-version GETs), gated by the bucket-gated `write_cost_s3.rs`. Same harness, different fixture; each term asserted where it actually appears. **`write_cost_s3` is a cost (IO-count) gate, not a correctness test, so it was pulled out of the every-merge `rustfs_integration` CI job — run it on demand (`OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test write_cost_s3`) pending a dedicated cost/perf harness. The local `write_cost.rs` opener/scan-split guard still runs every-PR, so the split itself stays covered; only the S3 acceptance of the opener term is off the correctness path.**
-- **Separate access-shape wins from history-slope claims.** A shared
-  `ObjectStoreRegistry`, a graph-handle-scoped cached data session, a zero-cache
-  control session, or one manifest+lineage scan per coordinator open can remove
-  duplicate client construction and scans without making the surviving
-  append-only journal fold O(1). Merge instrumentation therefore reports both
-  open/scan counts and underlying reads; until a checked-in gate passes at
-  realistic history depth, describe the result as reduced amplification, not
-  history-flat authority lookup.
-- **Keep decision instruments honest when the answer is no.** RFC-024's `durable_head_lookup_cost.rs` attaches tracking before the cold dataset load through `open_tracked_lance_dataset`, then reports object-store wrapper I/O separately from Lance execution-summary I/O. Its reconciled BTREE row/range curve is flat, but its required RustFS cold-open and compacted-byte curves grow; those red design facts are asserted as the current result rather than erased because some counters pass. Run the default local 20/80 matrix with `cargo test -p omnigraph-engine --test durable_head_lookup_cost local_durable_head_lookup_matrix_is_correct_and_observable -- --exact --nocapture`; run the ignored 10/100/1,000 local matrix with `cargo test -p omnigraph-engine --test durable_head_lookup_cost local_durable_head_lookup_matrix_at_one_thousand_commits -- --ignored --exact --nocapture`. The bucket-gated S3 command is in the RustFS section above and remains on demand.
-- **Apply the same rule to RFC-025.** `checkpoint_retention_cost.rs` keeps live checkpoint count and catalog width fixed while unrelated journal history grows, and counts complete list/show/cleanup-root authority reads. The uncompacted reconciled counters and bounded tail are flat; compacted scan bytes and the 1,000-commit operation boundary are not, so the assertions preserve a no-go. Run the default local matrix with `cargo test -p omnigraph-engine --test checkpoint_retention_cost local_checkpoint_retention_matrix_is_exact_and_records_the_current_no_go -- --exact --nocapture`; run the ignored decision scale with `cargo test -p omnigraph-engine --test checkpoint_retention_cost local_checkpoint_retention_matrix_at_one_thousand_commits -- --ignored --exact --nocapture`. A green test means the known result was reproduced, not that RFC-025 passed Gate 0.
-- **Count on the handle that does the reads, not just the one a measured op opens.** Lance's IO-counted tests attach the `IOTracker` to the (warm, cached) dataset and read `incremental_stats()` per request — the tracker MUST be on the handle performing the reads, or warm-handle reads escape. A per-op tracker installed at measure time cannot see reads on a long-lived handle opened earlier (the warm coordinator's `__manifest` handle, reused across writes), so such reads were silently undercounted. Wrap a depth-swept body in `cost_harness` so the manifest tracker is installed before the graph opens and `manifest_reads` is **ground truth** (handle-age-irrelevant). The `version_probes` counter is the freshness-probe *call* count; ground truth additionally reveals that a write's probe does ~3 object-store RPCs (a read's probe is a 0-IO cache hit). `manifest_reads_capture_warm_probe` is the guard that this stays true.
-- This is the testing companion to invariant 15 in [docs/dev/invariants.md](invariants.md) (hot-path cost is bounded by work, not history).
-
-When in doubt, re-read [docs/dev/invariants.md](invariants.md) — quality gates apply to every change.
+1. Read [invariants.md](invariants.md).
+2. Use [lance.md](lance.md) to identify and read every relevant full upstream page.
+3. Search existing tests by public API, error variant, route, and durable object name.
+4. Run the narrowest existing owner as a clean baseline.
+5. Extend that owner unless the behavior crosses a genuinely new public boundary.
+6. Run the focused owner again, then the canonical workspace graph in proportion to risk.
+7. For docs, workflow, or API changes, also run the repository link/pin/OpenAPI checks that own those generated contracts.

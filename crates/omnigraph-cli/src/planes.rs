@@ -1,13 +1,13 @@
-//! Declared CLI "planes" (RFC-010 Slice 1).
+//! Declared CLI "planes" (RFC 0010 Slice 1).
 //!
 //! Every subcommand belongs to exactly one plane. This classification is the
 //! single source of truth the wrong-plane guard consumes — and that later
-//! RFC-010 slices (the capability surface, plane-grouped help) will consume
+//! RFC 0010 slices (the capability surface, plane-grouped help) will consume
 //! too. The `command_plane` match is **exhaustive on purpose**: adding a
 //! `Command` variant is a compile error until its plane is declared, so the
 //! surface cannot silently drift from the command set.
 //!
-//! See [docs/dev/rfc-010-cli-planes-restructure.md].
+//! See [docs/rfcs/0010-cli-planes.md].
 
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -43,7 +43,7 @@ impl std::fmt::Display for Plane {
     }
 }
 
-/// What a command *needs*, in the user-facing vocabulary (RFC-011). This is the
+/// What a command *needs*, in the user-facing vocabulary (RFC 0011). This is the
 /// language CLI errors and `--help` speak; `Plane` stays the internal classifier
 /// (`Capability` is derived from it, so the two cannot drift).
 ///
@@ -258,7 +258,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         } => Plane::Storage,
         // `queries` and `policy` tooling now source their inputs from a
         // cluster's applied state (`--cluster`), so they live on the control
-        // plane (RFC-011 — omnigraph.yaml excised from the CLI).
+        // plane (RFC 0011 — omnigraph.yaml excised from the CLI).
         Command::Queries { .. } => Plane::Control,
         Command::Policy { .. } => Plane::Control,
         Command::Init { .. }
@@ -338,10 +338,10 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
             | Command::Repair { .. }
             | Command::Cleanup { .. }
             // `lint` can type-check a `.gq` against a cluster graph's schema
-            // (RFC-011): `--cluster <dir> --graph <id>`.
+            // (RFC 0011): `--cluster <dir> --graph <id>`.
             | Command::Lint { .. }
             // The policy/queries tooling addresses a cluster's applied state
-            // (RFC-011): `--cluster <dir>` selects the cluster, `--graph <id>`
+            // (RFC 0011): `--cluster <dir>` selects the cluster, `--graph <id>`
             // picks a graph's bundle/registry within it.
             | Command::Policy { .. }
             | Command::Queries { .. }
@@ -364,7 +364,7 @@ fn accepts_graph_selector(cmd: &Command) -> bool {
 /// - `--cluster` → cluster-scoped direct/control verbs;
 /// - `--graph` → any multi-graph scope: a served scope *or* a cluster one.
 ///
-/// RFC-010 Slice 1, generalized for RFC-011 cluster addressing.
+/// RFC 0010 Slice 1, generalized for RFC 0011 cluster addressing.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     if let Command::Alias { .. } = &cli.command {
         // The binding owns all addressing. The listing keeps its historical
