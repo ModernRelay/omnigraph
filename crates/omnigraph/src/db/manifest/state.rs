@@ -199,16 +199,16 @@ fn manifest_state_from_scan(version: u64, scan: ManifestScan) -> Result<Manifest
 /// reductions `assemble_manifest_state` applies — both paths run through this
 /// type, so the incremental and full projections CANNOT diverge in
 /// dedup/filter/sort semantics. Sizes: `registrations`/`latest_versions`/
-/// `tombstone_map` are O(tables), `graph_heads` O(branches); only
-/// `lineage_rows` grows with commit history (it is the projection being
-/// preserved).
+/// `tombstone_map` are O(tables), and `graph_heads` is O(branches). Lineage is
+/// deliberately not retained here: `GraphCoordinator` already owns that
+/// projection, and duplicating it made an otherwise small exception-safety
+/// clone O(commit history).
 #[derive(Debug, Clone)]
 pub(super) struct ProjectionAccumulator {
     registrations: HashMap<TableIdentity, TableRegistration>,
     latest_versions: HashMap<TableIdentity, DatasetEntry>,
     tombstone_map: HashMap<TableIdentity, u64>,
     graph_heads: HashMap<String, String>,
-    lineage_rows: Vec<GraphLineageRow>,
 }
 
 impl ProjectionAccumulator {
@@ -218,7 +218,6 @@ impl ProjectionAccumulator {
             latest_versions: HashMap::new(),
             tombstone_map: HashMap::new(),
             graph_heads: HashMap::new(),
-            lineage_rows: Vec::new(),
         }
     }
 
@@ -232,7 +231,6 @@ impl ProjectionAccumulator {
         version_entries: Vec<DatasetEntry>,
         tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
         graph_heads: HashMap<String, String>,
-        lineage_rows: Vec<GraphLineageRow>,
     ) -> Result<()> {
         for (identity, registration) in registrations {
             if let Some(existing) = self.registrations.insert(identity, registration.clone()) {
@@ -261,11 +259,31 @@ impl ProjectionAccumulator {
             }
         }
         self.graph_heads.extend(graph_heads);
-        self.lineage_rows.extend(lineage_rows);
         Ok(())
     }
 
     fn fold_scan(&mut self, scan: ManifestScan) -> Result<()> {
+        // A delta tombstone may refer to a registration in an older fragment,
+        // so validate against the union of incoming and retained authority.
+        // Do this before mutating the accumulator to preserve exception safety.
+        for tombstone in &scan.tombstones {
+            let registration = scan
+                .table_registrations
+                .get(&tombstone.identity)
+                .or_else(|| self.registrations.get(&tombstone.identity))
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "manifest tombstone for identity {} has no table registration",
+                        tombstone.identity
+                    ))
+                })?;
+            if registration.table_key != tombstone.table_key {
+                return Err(OmniError::manifest_internal(format!(
+                    "manifest tombstone identity {} has diagnostic alias '{}', current binding is '{}'",
+                    tombstone.identity, tombstone.table_key, registration.table_key
+                )));
+            }
+        }
         self.fold_parts(
             scan.table_registrations,
             scan.version_entries,
@@ -273,7 +291,6 @@ impl ProjectionAccumulator {
                 .into_iter()
                 .map(|t| (t.identity, t.tombstone_version)),
             scan.graph_heads,
-            scan.lineage_rows,
         )
     }
 
@@ -282,10 +299,6 @@ impl ProjectionAccumulator {
     /// when one exists, arrives via the delta fragments' live rows).
     pub(super) fn remove_head(&mut self, branch_key: &str) {
         self.graph_heads.remove(branch_key);
-    }
-
-    pub(super) fn lineage_rows(&self) -> &[GraphLineageRow] {
-        &self.lineage_rows
     }
 
     /// Reduce to the visible state at `version`. Pure and repeatable.
@@ -300,18 +313,19 @@ impl ProjectionAccumulator {
     }
 }
 
-/// One coherent scan producing both the finished state and the retained fold
-/// accumulators (with lineage). The projection-retaining open/refresh paths
-/// use this; the plain read paths keep `read_manifest_state`.
+/// One coherent scan producing the finished state, compact retained fold
+/// accumulators, and lineage rows handed off to `CommitGraph`. The plain read
+/// paths keep `read_manifest_state`.
 pub(super) async fn read_manifest_projection(
     dataset: &Dataset,
-) -> Result<(ManifestState, ProjectionAccumulator)> {
+) -> Result<(ManifestState, ProjectionAccumulator, Vec<GraphLineageRow>)> {
     let version = dataset.version().version;
-    let scan = read_manifest_scan_fragments(dataset, true, None).await?;
+    let mut scan = read_manifest_scan_fragments(dataset, true, None).await?;
+    let lineage_rows = std::mem::take(&mut scan.lineage_rows);
     let mut accumulator = ProjectionAccumulator::empty();
     accumulator.fold_scan(scan)?;
     let state = accumulator.finish(version)?;
-    Ok((state, accumulator))
+    Ok((state, accumulator, lineage_rows))
 }
 
 /// Fold ONLY the live rows of `fragments` of `dataset` into `accumulator`
@@ -321,11 +335,12 @@ pub(super) async fn fold_projection_delta(
     dataset: &Dataset,
     fragments: Vec<lance_table::format::Fragment>,
     accumulator: &mut ProjectionAccumulator,
-) -> Result<ManifestState> {
+) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
     let version = dataset.version().version;
-    let scan = read_manifest_scan_fragments(dataset, true, Some(fragments)).await?;
+    let mut scan = read_manifest_scan_fragments(dataset, true, Some(fragments)).await?;
+    let lineage_rows = std::mem::take(&mut scan.lineage_rows);
     accumulator.fold_scan(scan)?;
-    accumulator.finish(version)
+    Ok((accumulator.finish(version)?, lineage_rows))
 }
 
 /// `(object_type, object_id)` of the rows at `offsets` inside one fragment,
@@ -337,44 +352,61 @@ pub(super) async fn read_object_identities_at_offsets(
     fragment: lance_table::format::Fragment,
     offsets: &std::collections::HashSet<u32>,
 ) -> Result<Vec<(String, String)>> {
-    let mut scanner = dataset.scan();
-    scanner
-        .project(&["object_id", "object_type"])
-        .map_err(OmniError::storage)?;
-    scanner.with_fragments(vec![fragment]);
-    scanner.with_row_address();
-    let batches: Vec<RecordBatch> = scanner
-        .try_into_stream()
-        .await
-        .map_err(OmniError::storage)?
-        .try_collect()
-        .await
-        .map_err(OmniError::storage)?;
-    let mut identities = Vec::new();
-    for batch in &batches {
-        let object_ids = string_column(batch, "object_id")?;
-        let object_types = string_column(batch, "object_type")?;
-        let addresses = batch
-            .column_by_name(lance_core::ROW_ADDR)
-            .ok_or_else(|| {
-                OmniError::manifest_internal("projection delta scan missing row addresses")
-            })?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                OmniError::manifest_internal("projection delta row address column is not u64")
-            })?;
-        for row in 0..batch.num_rows() {
-            let address =
-                lance_core::utils::address::RowAddress::new_from_u64(addresses.value(row));
-            if offsets.contains(&address.row_offset()) {
-                identities.push((
-                    object_types.value(row).to_string(),
-                    object_ids.value(row).to_string(),
-                ));
-            }
-        }
+    if offsets.is_empty() {
+        return Ok(Vec::new());
     }
+
+    let fragment_id = u32::try_from(fragment.id).map_err(|_| {
+        OmniError::manifest_internal(format!(
+            "manifest fragment id {} cannot be represented as a Lance row address",
+            fragment.id
+        ))
+    })?;
+    let mut addresses = offsets
+        .iter()
+        .copied()
+        .map(|offset| {
+            u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+                fragment_id,
+                offset,
+            ))
+        })
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+
+    // A fragment restriction limits which files a scanner visits; it is not a
+    // row-level take. Use the physical addresses already supplied by the
+    // deletion-vector delta so a compacted, history-sized fragment still reads
+    // only the newly deleted head rows from the exact pinned old dataset.
+    let dataset = Arc::new(dataset.clone());
+    let projection_schema = dataset
+        .schema()
+        .project_preserve_system_columns(&["object_id", "object_type"])
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let projection = lance::dataset::ProjectionRequest::from_schema(projection_schema)
+        .into_projection_plan(Arc::clone(&dataset))
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let batch = lance::dataset::TakeBuilder::try_new_from_addresses(
+        dataset,
+        addresses,
+        Arc::new(projection),
+    )
+    .map_err(|e| OmniError::Lance(e.to_string()))?
+    .execute()
+    .await
+    .map_err(|e| OmniError::Lance(e.to_string()))?;
+    crate::instrumentation::record_projection_identity_rows(batch.num_rows());
+
+    let object_ids = string_column(&batch, "object_id")?;
+    let object_types = string_column(&batch, "object_type")?;
+    let identities = (0..batch.num_rows())
+        .map(|row| {
+            (
+                object_types.value(row).to_string(),
+                object_ids.value(row).to_string(),
+            )
+        })
+        .collect();
     Ok(identities)
 }
 
@@ -395,13 +427,7 @@ pub(super) fn assemble_manifest_state(
     graph_heads: HashMap<String, String>,
 ) -> Result<ManifestState> {
     let mut accumulator = ProjectionAccumulator::empty();
-    accumulator.fold_parts(
-        registrations,
-        version_entries,
-        tombstones,
-        graph_heads,
-        Vec::new(),
-    )?;
+    accumulator.fold_parts(registrations, version_entries, tombstones, graph_heads)?;
     accumulator.finish(version)
 }
 

@@ -238,6 +238,10 @@ pub struct IoCounts {
     /// `__manifest` registry scans (publish state; includes the graph-lineage rows
     /// folded into `__manifest` by RFC-013 Phase 7).
     pub manifest_reads: u64,
+    /// Bytes returned by those real object-store reads. This distinguishes a
+    /// physical-address take from scanning a compacted history-sized fragment
+    /// even when both use a similar number of requests.
+    pub manifest_read_bytes: u64,
     /// Version-probe invocations (the cheap freshness check).
     pub version_probes: u64,
     /// DATA-table open CALL count through the two instrumented chokepoints — an
@@ -265,6 +269,11 @@ pub struct IoCounts {
     pub candidate_scan_target_rows_peak: u64,
     pub candidate_scan_target_bytes_peak: u64,
     pub change_images_materialized: u64,
+    /// Incremental vs full merge-authority projection refreshes and the exact
+    /// number of physical manifest rows hydrated to classify DV additions.
+    pub projection_incremental_refreshes: u64,
+    pub projection_full_refreshes: u64,
+    pub projection_identity_rows: u64,
 }
 
 impl IoCounts {
@@ -518,6 +527,9 @@ struct OpProbes {
     candidate_scan_target_rows_peak: Arc<AtomicU64>,
     candidate_scan_target_bytes_peak: Arc<AtomicU64>,
     change_images_materialized: Arc<AtomicU64>,
+    projection_incremental_refreshes: Arc<AtomicU64>,
+    projection_full_refreshes: Arc<AtomicU64>,
+    projection_identity_rows: Arc<AtomicU64>,
 }
 
 impl OpProbes {
@@ -544,6 +556,9 @@ impl OpProbes {
             candidate_scan_target_rows_peak: Arc::new(AtomicU64::new(0)),
             candidate_scan_target_bytes_peak: Arc::new(AtomicU64::new(0)),
             change_images_materialized: Arc::new(AtomicU64::new(0)),
+            projection_incremental_refreshes: Arc::new(AtomicU64::new(0)),
+            projection_full_refreshes: Arc::new(AtomicU64::new(0)),
+            projection_identity_rows: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
@@ -559,6 +574,9 @@ impl OpProbes {
             candidate_scan_target_rows_peak: Arc::clone(&h.candidate_scan_target_rows_peak),
             candidate_scan_target_bytes_peak: Arc::clone(&h.candidate_scan_target_bytes_peak),
             change_images_materialized: Arc::clone(&h.change_images_materialized),
+            projection_incremental_refreshes: Arc::clone(&h.projection_incremental_refreshes),
+            projection_full_refreshes: Arc::clone(&h.projection_full_refreshes),
+            projection_identity_rows: Arc::clone(&h.projection_identity_rows),
             // graph_build_count / graph_edges_built unused by this harness.
             ..Default::default()
         };
@@ -586,6 +604,7 @@ impl OpProbes {
             data_opener_reads: t.opener_reads,
             data_scan_reads: t.scan_reads,
             manifest_reads: manifest.read_iops,
+            manifest_read_bytes: manifest.read_bytes,
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
             internal_open_count: self.internal_open_count.load(Ordering::Relaxed),
@@ -603,6 +622,11 @@ impl OpProbes {
                 .candidate_scan_target_bytes_peak
                 .load(Ordering::Relaxed),
             change_images_materialized: self.change_images_materialized.load(Ordering::Relaxed),
+            projection_incremental_refreshes: self
+                .projection_incremental_refreshes
+                .load(Ordering::Relaxed),
+            projection_full_refreshes: self.projection_full_refreshes.load(Ordering::Relaxed),
+            projection_identity_rows: self.projection_identity_rows.load(Ordering::Relaxed),
         }
     }
 }
