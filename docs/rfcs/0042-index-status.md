@@ -16,10 +16,6 @@ blocked_on: []
 
 # RFC 0042: Read-only index status
 
-> Number provisional: 0042 is the next available per this README at
-> base `bb0e3dc8` (0040 is reserved by PR #546); re-verify at PR-open
-> time and renumber if raced. Remove this note before merge.
-
 > A term set in ***bold italics*** is being defined at that exact spot;
 > it is used in plain text everywhere after.
 
@@ -264,8 +260,11 @@ coordinated by `__manifest`. Per report:
    system indexes (Lance-internal bookkeeping indexes, the
    `is_system_index` set) are omitted (rule 8); a
    present-but-undeclared index reports `declared: false`, state
-   from coverage alone. The reconciler still maintains undeclared
-   indexes; reporting them keeps that drift visible.
+   from coverage alone. The reconciler's top-up pass still maintains
+   undeclared indexes, because its trigger and Lance's
+   `optimize_indices` filter only system indexes, never declaration;
+   creation and retrain remain declared-only. Reporting undeclared
+   indexes keeps that drift visible.
 4. Counts: fragments from bitmap containment; rows by summing
    logical fragment row counts, the `index_statistics` arithmetic. No column
    data, one bounded exception: `unbuildable` classification reuses the
@@ -402,3 +401,7 @@ None.
 
 - 2026-08-25: drafted from the #550 request (read-only index readiness
   status plus a blocking wait command) and the #486 monitoring gap.
+- 2026-08-25: PR review: clarified undeclared-index maintenance (the
+  top-up pass is declaration-blind, filtering only system indexes;
+  creation and retrain are declared-only) and removed the provisional
+  numbering note after the registry allocated 0042.
