@@ -112,6 +112,9 @@ jobs:
       - name: Reject mutable external action refs
         run: python3 scripts/check-workflow-action-pins.py
 
+      - name: Enforce release vocabulary gates
+        run: python3 scripts/check-release-vocabulary-gates.py
+
   azure_contract_guards:
     name: Azure Contract Guards
     runs-on: ubuntu-latest
@@ -247,6 +250,61 @@ jobs:
             --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
             --cargo-public-api "$tool" \
             --public-api-target-dir target/vocabulary-public-api
+
+  release_edge_after_vocabulary:
+    name: Release edge after vocabulary audit
+    needs: [classify_changes, graph_vocabulary_guard]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify_changes.outputs.run_full_ci == 'true'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/release-edge.yml
+    with:
+      source_ref: ${{ github.sha }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+
+  release_tag_after_vocabulary:
+    name: Release tag after vocabulary audit
+    needs: graph_vocabulary_guard
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ github.ref_name }}
+      source_ref: ${{ github.ref }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+    secrets: inherit
+
+  publish_tag_image_after_vocabulary:
+    name: Publish tag image after vocabulary audit
+    needs: graph_vocabulary_guard
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      tag: ${{ github.ref_name }}
+      source_ref: ${{ github.ref }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+    secrets: inherit
+
+  publish_tag_crates_after_vocabulary:
+    name: Publish tag crates after vocabulary audit
+    needs: graph_vocabulary_guard
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/publish-crates.yml
+    with:
+      tag: ${{ github.ref_name }}
+      source_ref: ${{ github.ref }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+    secrets: inherit
 
   entrypoint_test:
     name: Container Entrypoint

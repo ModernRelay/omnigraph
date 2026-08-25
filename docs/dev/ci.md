@@ -29,6 +29,22 @@ audit and is owned by `scripts/check-docs.py`. The AWS job reports a successful
 skip for a documentation-only change; formatting and Clippy are also skipped by
 the classifier without leaving required contexts pending.
 
+Automatic edge and versioned publication are jobs in the same CI run and cannot
+start until that run's vocabulary audit succeeds. Each publishing workflow then
+re-verifies the authorizing CI run, resolves its source once to an immutable
+commit, and builds only that commit. Version tags are checked again immediately
+before publication; a stale main audit cannot move the rolling `edge` tag
+backward. A manual backfill must already have a successful non-PR vocabulary
+audit for the exact commit. The current manual workflows therefore fail closed
+for historical pre-guard tags rather than offering a force bypass.
+
+GitHub evaluates a tag-push workflow from the commit selected by that tag. A
+new `v*` tag must not be created against a commit that predates these gates,
+because no later workflow edit can retroactively replace that commit's old
+publisher definitions. Enforcing that administrative boundary against tag
+creators requires repository tag policy in addition to the checked-in workflow
+gate.
+
 Formatting and Clippy use the repository's pinned toolchain. Lints remain warnings in the workspace; CI applies `-D warnings`. Clippy runs both the default and failpoint-superset graphs.
 
 Repository metadata gates also check:
@@ -90,6 +106,7 @@ For repository metadata and workflow changes:
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
+python3 scripts/check-release-vocabulary-gates.py
 python3 scripts/check-container-binary-contract.py
 python3 scripts/check-azure-admission-boundary.py
 actionlint .github/workflows/*.yml
@@ -102,10 +119,10 @@ shellcheck scripts/*.sh
 
 | Workflow | Trigger and output |
 |---|---|
-| `release-edge.yml` | Push to `main` or manual dispatch; updates the rolling `edge` release and platform archives. |
-| `release.yml` | `v*` tag or explicit manual release; builds platform archives, publishes the GitHub release, updates Homebrew when credentials are available, and smoke-tests the Windows installer. |
-| `publish-crates.yml` | `v*` tag or manual dispatch; publishes workspace crates in dependency order when the registry token and substrate state permit it. |
-| `publish-image.yml` | `v*` tag or explicit tag backfill; builds the bookworm-compatible public server image for GHCR and, when configured, Docker Hub. Backfills do not move `latest`. |
+| `release-edge.yml` | Called by a non-documentation `main` CI run after its vocabulary audit, or manually for an already-audited current `main`; updates the rolling `edge` release and platform archives. |
+| `release.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds platform archives, publishes the GitHub release, updates Homebrew when credentials are available, and smoke-tests the Windows installer. |
+| `publish-crates.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; publication remains paused until the registry-ownership policy changes. |
+| `publish-image.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds the bookworm-compatible public server image for GHCR and, when configured, Docker Hub. Manual backfills do not move `latest`. |
 | `package.yml` / `omnigraph-package.yml` | Manual AWS CodeBuild packaging for default and AWS-feature artifacts, with checksums, digests, and attestations. |
 | `refresh-docs-site.yml` | Documentation changes on `main` or manual dispatch; requests a docs-site redeploy. |
 
@@ -117,4 +134,7 @@ Release archives and containers include the CLI, server, and Azure admission wra
 2. Keep external Actions and reusable workflows pinned to full commit SHAs.
 3. Update the documentation classifier when adding a new documentation format; never classify by extension outside the approved docs paths.
 4. Keep configured object-store jobs fail-closed on accidental skips.
-5. Update [branch-protection.md](branch-protection.md) only when the declared required contexts or policy actually change.
+5. Keep every automatic artifact publisher transitively behind a successful
+   exact-SHA vocabulary audit; a skipped pull-request context never authorizes
+   publication.
+6. Update [branch-protection.md](branch-protection.md) only when the declared required contexts or policy actually change.

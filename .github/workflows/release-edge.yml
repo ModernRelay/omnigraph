@@ -1,37 +1,77 @@
 name: Release Edge
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - "**/*.md"
-      - "**/*.mdx"
-      - "**/*.txt"
-      - "**/*.rst"
-      - "**/*.adoc"
+  workflow_call:
+    inputs:
+      source_ref:
+        required: true
+        type: string
+      ci_run_id:
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Current main ref or commit to release. Defaults to the selected workflow ref.
+        required: false
+        type: string
+      ci_run_id:
+        description: Optional CI run that contains the successful exact-SHA vocabulary audit.
+        required: false
+        type: string
 
 jobs:
+  vocabulary_gate:
+    name: Require audited edge source
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-vocabulary-gate.yml
+    with:
+      source_ref: ${{ inputs.source_ref || github.sha }}
+      ci_run_id: ${{ inputs.ci_run_id || '' }}
+
   prepare_edge_release:
     name: Prepare edge release
+    needs: vocabulary_gate
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      publish: ${{ steps.freshness.outputs.publish }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
+          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
           fetch-depth: 0
 
-      - name: Force-update edge tag
+      - name: Reject a stale edge source
+        id: freshness
+        env:
+          SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
         run: |
-          git tag -f edge "$GITHUB_SHA"
+          set -euo pipefail
+          current_main="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+          if [[ "$current_main" != "$SOURCE_SHA" ]]; then
+            echo "::notice::main advanced to ${current_main}; skipping stale edge source ${SOURCE_SHA}"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Force-update edge tag
+        if: steps.freshness.outputs.publish == 'true'
+        env:
+          SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
+        run: |
+          git tag -f edge "$SOURCE_SHA"
           git push origin refs/tags/edge --force
 
   build_release:
     name: Build edge ${{ matrix.asset_name }}
-    needs: prepare_edge_release
+    needs: [vocabulary_gate, prepare_edge_release]
+    if: needs.prepare_edge_release.outputs.publish == 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -56,6 +96,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -121,19 +163,21 @@ jobs:
           prerelease: true
           make_latest: false
           body: |
-            Rolling prerelease from `${{ github.sha }}`.
+            Rolling prerelease from `${{ needs.vocabulary_gate.outputs.source_sha }}`.
           files: |
             ${{ matrix.asset_name }}.*
 
   smoke_windows_installer:
     name: Smoke Windows installer
-    needs: build_release
+    needs: [vocabulary_gate, build_release]
     runs-on: windows-latest
     permissions:
       contents: read
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
 
       - name: Install from edge release
         run: ./scripts/install.ps1 -ReleaseChannel edge -InstallDir "$env:RUNNER_TEMP/omnigraph-bin"
