@@ -1,0 +1,28 @@
+[package]
+name = "omnigraph-bench"
+version = "0.10.0"
+edition = "2024"
+description = "Declarative benchmark planning for OmniGraph."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+publish = false
+
+[[bin]]
+name = "omnigraph-bench"
+path = "src/bin/omnigraph-bench.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
