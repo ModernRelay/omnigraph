@@ -1,4 +1,4 @@
-//! Read-path cost instrumentation (test seam).
+//! Read/write cost instrumentation (test and benchmark seam).
 //!
 //! Two boundary instruments let cost-budget tests assert that a warm read does
 //! no redundant IO, the way LanceDB's IO-counted tests do (see
@@ -10,6 +10,8 @@
 //!   so the open helpers attach nothing (one unset-`Option` check per open).
 //! - **omnigraph `StorageAdapter`** — [`CountingStorageAdapter`], a decorator that
 //!   counts per-method calls (the schema-contract reads on the query path).
+//! - **branch merge** — [`MergeWriteProbes`] reports structural route counters
+//!   and completed timing intervals without reading the clock when unset.
 //!
 //! The probes themselves only observe, and the decorator delegates every call.
 //! The shared dataset opener also supplies the process control session when a
@@ -21,7 +23,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use lance::Dataset;
@@ -271,17 +273,16 @@ pub(crate) fn record_change_image_materialized() {
     let _ = current(|p| p.change_images_materialized.fetch_add(1, Ordering::Relaxed));
 }
 
-/// Per-operation staged-write counts, installed for a task via
-/// [`with_merge_write_probes`]. Lets a cost-budget test assert WHICH staged-write
-/// primitive an operation invokes — e.g. that an append-only fast-forward merge
-/// routes new rows through the exact-id fenced merge adapter and does **zero**
-/// bare appends. Counts the publish-path primitives only; merge-staging temp
-/// tables use `append_or_create_batch`, not these.
+/// One internal branch-merge timing bucket.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MergeTimingPhase {
     OuterPrepare,
     ProvenInsertHistory,
     ProvenInsertPlanScan,
+    /// One general three-way ordered table walk plus staging its merged rows.
+    /// Scalar and Blob tables each record one interval; proven-insert routes
+    /// bypass this phase entirely.
+    TableWalk,
     CandidateValidation,
     FinalRevalidation,
     RecoveryArm,
@@ -295,13 +296,80 @@ pub(crate) enum MergeTimingPhase {
 }
 
 impl MergeTimingPhase {
-    const COUNT: usize = 13;
+    const COUNT: usize = 14;
 
     const fn index(self) -> usize {
         self as usize
     }
+
+    const ALL: [Self; Self::COUNT] = [
+        Self::OuterPrepare,
+        Self::ProvenInsertHistory,
+        Self::ProvenInsertPlanScan,
+        Self::TableWalk,
+        Self::CandidateValidation,
+        Self::FinalRevalidation,
+        Self::RecoveryArm,
+        Self::PhysicalPublish,
+        Self::KeyedStage,
+        Self::KeyedCommit,
+        Self::RecoveryConfirm,
+        Self::ManifestPublish,
+        Self::RecoveryCleanup,
+        Self::OuterRestoreRefresh,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::OuterPrepare => "OuterPrepare",
+            Self::ProvenInsertHistory => "ProvenInsertHistory",
+            Self::ProvenInsertPlanScan => "ProvenInsertPlanScan",
+            Self::TableWalk => "TableWalk",
+            Self::CandidateValidation => "CandidateValidation",
+            Self::FinalRevalidation => "FinalRevalidation",
+            Self::RecoveryArm => "RecoveryArm",
+            Self::PhysicalPublish => "PhysicalPublish",
+            Self::KeyedStage => "KeyedStage",
+            Self::KeyedCommit => "KeyedCommit",
+            Self::RecoveryConfirm => "RecoveryConfirm",
+            Self::ManifestPublish => "ManifestPublish",
+            Self::RecoveryCleanup => "RecoveryCleanup",
+            Self::OuterRestoreRefresh => "OuterRestoreRefresh",
+        }
+    }
 }
 
+/// One diagnostic merge phase returned by
+/// [`MergeWriteProbes::merge_timing_snapshot`]. Times are accumulated in
+/// microseconds; `interval_count` remains exact even when a duration rounds
+/// down to zero microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergeTimingReading {
+    /// Stable, additive diagnostic identifier. Existing identifiers are never
+    /// renamed or repurposed; callers must tolerate new identifiers.
+    pub phase: &'static str,
+    /// Sum of every explicitly completed interval, rounded down to microseconds.
+    pub total_us: u64,
+    /// Largest explicitly completed interval, rounded down to microseconds.
+    pub max_us: u64,
+    /// Exact number of explicitly completed intervals. Failed and cancelled
+    /// phases drop their unfinished span and do not increment this count.
+    pub interval_count: u64,
+}
+
+#[derive(Default)]
+struct MergeTimingCounters {
+    total_ns: [AtomicU64; MergeTimingPhase::COUNT],
+    max_ns: [AtomicU64; MergeTimingPhase::COUNT],
+    interval_count: [AtomicU64; MergeTimingPhase::COUNT],
+}
+
+/// Per-operation branch-merge route and timing counters.
+///
+/// Install a fresh instance with [`with_merge_write_probes`] for each measured
+/// repetition. Counters accumulate for the lifetime of this value; read a
+/// timing snapshot after the scoped future completes.
 #[derive(Clone, Default)]
 pub struct MergeWriteProbes {
     pub stage_append_calls: Arc<AtomicU64>,
@@ -361,8 +429,7 @@ pub struct MergeWriteProbes {
     /// Diagnostic-only elapsed-time buckets. They are non-overlapping at the
     /// top level; `KeyedStage` and `KeyedCommit` are intentional sub-buckets of
     /// `PhysicalPublish`. Production pays only the unset task-local probe.
-    merge_timing_total_ns: Arc<[AtomicU64; MergeTimingPhase::COUNT]>,
-    merge_timing_max_ns: Arc<[AtomicU64; MergeTimingPhase::COUNT]>,
+    merge_timing: Arc<MergeTimingCounters>,
 }
 
 impl MergeWriteProbes {
@@ -436,10 +503,13 @@ impl MergeWriteProbes {
             .load(Ordering::Relaxed)
     }
     fn merge_timing_total_us(&self, phase: MergeTimingPhase) -> u64 {
-        self.merge_timing_total_ns[phase.index()].load(Ordering::Relaxed) / 1_000
+        self.merge_timing.total_ns[phase.index()].load(Ordering::Relaxed) / 1_000
     }
     fn merge_timing_max_us(&self, phase: MergeTimingPhase) -> u64 {
-        self.merge_timing_max_ns[phase.index()].load(Ordering::Relaxed) / 1_000
+        self.merge_timing.max_ns[phase.index()].load(Ordering::Relaxed) / 1_000
+    }
+    fn merge_timing_interval_count(&self, phase: MergeTimingPhase) -> u64 {
+        self.merge_timing.interval_count[phase.index()].load(Ordering::Relaxed)
     }
     pub fn outer_prepare_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::OuterPrepare)
@@ -449,6 +519,15 @@ impl MergeWriteProbes {
     }
     pub fn proven_insert_plan_scan_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::ProvenInsertPlanScan)
+    }
+    pub fn table_walk_total_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::TableWalk)
+    }
+    pub fn table_walk_max_us(&self) -> u64 {
+        self.merge_timing_max_us(MergeTimingPhase::TableWalk)
+    }
+    pub fn table_walk_interval_count(&self) -> u64 {
+        self.merge_timing_interval_count(MergeTimingPhase::TableWalk)
     }
     pub fn candidate_validation_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::CandidateValidation)
@@ -486,14 +565,34 @@ impl MergeWriteProbes {
     pub fn outer_restore_refresh_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::OuterRestoreRefresh)
     }
+
+    /// Snapshot all completed merge timing intervals in deterministic order.
+    ///
+    /// Take the snapshot after the [`with_merge_write_probes`] future completes.
+    /// `phase` is the stable identifier: callers must match by name rather than
+    /// position and tolerate additive phases. This observational read uses the
+    /// same relaxed counters as the individual accessors.
+    pub fn merge_timing_snapshot(&self) -> Vec<MergeTimingReading> {
+        MergeTimingPhase::ALL
+            .into_iter()
+            .map(|phase| MergeTimingReading {
+                phase: phase.name(),
+                total_us: self.merge_timing_total_us(phase),
+                max_us: self.merge_timing_max_us(phase),
+                interval_count: self.merge_timing_interval_count(phase),
+            })
+            .collect()
+    }
 }
 
 tokio::task_local! {
     static MERGE_WRITE_PROBES: MergeWriteProbes;
 }
 
-/// Run `fut` with staged-write probes installed. Test-only entry point; nothing
-/// in production sets the probes, so `record_stage_*` below are no-ops.
+/// Run `fut` with branch-merge test/benchmark probes installed.
+///
+/// Production leaves this scope unset. Use a fresh [`MergeWriteProbes`] per
+/// measured repetition and inspect it only after this future completes.
 pub async fn with_merge_write_probes<F>(probes: MergeWriteProbes, fut: F) -> F::Output
 where
     F: std::future::Future,
@@ -627,14 +726,49 @@ pub(crate) fn record_proven_insert_raw_batch(bytes: u64) {
     });
 }
 
-/// Add one elapsed interval to a diagnostic merge phase. No-op when no test or
-/// benchmark probe is installed.
-pub(crate) fn record_merge_timing(phase: MergeTimingPhase, elapsed: Duration) {
-    let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-    let _ = MERGE_WRITE_PROBES.try_with(|p| {
-        p.merge_timing_total_ns[phase.index()].fetch_add(nanos, Ordering::Relaxed);
-        p.merge_timing_max_ns[phase.index()].fetch_max(nanos, Ordering::Relaxed);
-    });
+/// An explicitly completed diagnostic timing interval. The disabled variant
+/// carries no timestamp, so production performs only the task-local probe.
+#[must_use = "call finish after the timed phase succeeds"]
+pub(crate) struct MergeTimingSpan {
+    active: Option<ActiveMergeTimingSpan>,
+}
+
+struct ActiveMergeTimingSpan {
+    phase: MergeTimingPhase,
+    started: Instant,
+    counters: Arc<MergeTimingCounters>,
+}
+
+impl MergeTimingSpan {
+    /// Record this interval. Dropping a span without finishing preserves the
+    /// existing success-only behavior for failed or cancelled phases.
+    pub(crate) fn finish(self) {
+        let Some(ActiveMergeTimingSpan {
+            phase,
+            started,
+            counters,
+        }) = self.active
+        else {
+            return;
+        };
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        counters.total_ns[phase.index()].fetch_add(nanos, Ordering::Relaxed);
+        counters.max_ns[phase.index()].fetch_max(nanos, Ordering::Relaxed);
+        counters.interval_count[phase.index()].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Start one diagnostic merge phase. No clock is read unless a test or
+/// benchmark installed merge probes for this task.
+pub(crate) fn start_merge_timing(phase: MergeTimingPhase) -> MergeTimingSpan {
+    let active = MERGE_WRITE_PROBES
+        .try_with(|probes| ActiveMergeTimingSpan {
+            phase,
+            counters: Arc::clone(&probes.merge_timing),
+            started: Instant::now(),
+        })
+        .ok();
+    MergeTimingSpan { active }
 }
 
 /// Which version [`open_dataset`] resolves.
@@ -874,5 +1008,42 @@ impl StorageAdapter for CountingStorageAdapter {
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
         self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.delete_prefix(prefix_uri).await
+    }
+}
+
+#[cfg(test)]
+mod merge_timing_phase_tests {
+    use super::*;
+
+    #[test]
+    fn all_lists_every_phase_in_counter_order() {
+        for (index, phase) in MergeTimingPhase::ALL.into_iter().enumerate() {
+            assert_eq!(phase.index(), index);
+        }
+    }
+
+    #[tokio::test]
+    async fn timing_spans_record_only_when_explicitly_finished() {
+        assert!(
+            start_merge_timing(MergeTimingPhase::TableWalk)
+                .active
+                .is_none()
+        );
+
+        let probes = MergeWriteProbes::default();
+        with_merge_write_probes(probes.clone(), async {
+            start_merge_timing(MergeTimingPhase::TableWalk).finish();
+            drop(start_merge_timing(MergeTimingPhase::TableWalk));
+        })
+        .await;
+
+        assert_eq!(probes.table_walk_interval_count(), 1);
+        let readings = probes.merge_timing_snapshot();
+        assert_eq!(readings.len(), MergeTimingPhase::COUNT);
+        let table_walk = readings
+            .iter()
+            .find(|reading| reading.phase == "TableWalk")
+            .expect("TableWalk timing reading");
+        assert_eq!(table_walk.interval_count, 1);
     }
 }

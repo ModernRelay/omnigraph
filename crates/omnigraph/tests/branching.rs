@@ -580,8 +580,16 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     drop(child_reader);
     main.branch_delete("experiment").await.unwrap();
 
-    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
     assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(
+        probes.table_walk_interval_count(),
+        1,
+        "one diverged Blob table must emit one post-preflight staging walk"
+    );
 
     let merged_snapshot = main.resolve_snapshot("main").await.unwrap();
     main.branch_delete("feature").await.unwrap();

@@ -116,15 +116,22 @@ the operational remedy.
 ## Diagnosing a slow merge
 
 `MergeWriteProbes` is a task-local test and benchmark seam; production leaves
-it unset. Its non-overlapping timing phases are:
+it unset, so timing does not read the clock. Its top-level timing flow is:
 
-`OuterPrepare` -> `ProvenInsertHistory` -> `ProvenInsertPlanScan` ->
-`CandidateValidation` -> `FinalRevalidation` -> `RecoveryArm` ->
-`PhysicalPublish` -> `RecoveryConfirm` -> `ManifestPublish` ->
-`RecoveryCleanup` -> `OuterRestoreRefresh`.
+`OuterPrepare` -> ((`ProvenInsertHistory` -> `ProvenInsertPlanScan`) | `TableWalk`)
+-> `CandidateValidation` -> `FinalRevalidation` -> `RecoveryArm` ->
+`PhysicalPublish` -> `RecoveryConfirm` -> `ManifestPublish` -> `RecoveryCleanup`
+-> `OuterRestoreRefresh`.
 
-`KeyedStage` and `KeyedCommit` are sub-buckets of `PhysicalPublish`. Structural
-probes identify the chosen data path. The columns below correspond to
+The parenthesized classification routes are chosen per table, so a mixed-table
+operation can record both route families. `TableWalk` covers one general
+three-way ordered walk and merged-row staging; for Blob tables it begins after
+the operation-wide descriptor preflight. `KeyedStage` and `KeyedCommit` are
+sub-buckets of `PhysicalPublish`.
+`merge_timing_snapshot` reports total, maximum, and exact interval count for
+every phase; the count remains meaningful when a short duration rounds down to
+zero microseconds. Structural probes identify the chosen data path. The columns
+below correspond to
 `ordered_cursor_scan_calls`, `stage_fenced_insert_calls`,
 `stage_known_present_update_calls`, `stage_merge_insert_calls`, and
 `strict_insert_preflight_calls`:
