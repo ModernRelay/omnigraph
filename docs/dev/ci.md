@@ -20,11 +20,14 @@ The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC
 location and metadata, and registry agreement.
 
-The vocabulary guard checks OpenAPI, Rust presentation strings, and public Rust
-against the reviewed terminology inventory. User documentation is intentionally
-outside this exact-occurrence gate and is owned by `scripts/check-docs.py`. The AWS job reports
-a successful skip for a documentation-only change; formatting and Clippy are
-also skipped by the classifier without leaving required contexts pending.
+`Graph Vocabulary Guard` remains a required reporting context, but its
+substrate-sized audit is disabled on pull requests. It reports a successful
+skip there and checks OpenAPI, Rust presentation strings, and public Rust
+against the reviewed terminology inventory after merge, on tags, and by manual
+dispatch. User documentation is intentionally outside this exact-occurrence
+audit and is owned by `scripts/check-docs.py`. The AWS job reports a successful
+skip for a documentation-only change; formatting and Clippy are also skipped by
+the classifier without leaving required contexts pending.
 
 Formatting and Clippy use the repository's pinned toolchain. Lints remain warnings in the workspace; CI applies `-D warnings`. Clippy runs both the default and failpoint-superset graphs.
 
@@ -49,9 +52,15 @@ This is deliberate latency policy, not a lesser standard. Run the canonical suit
 
 Independent post-merge/tag/manual jobs own contracts that need special infrastructure:
 
+- **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
+  public Rust against the reviewed terminology inventory.
 - **V5 ↔ V6 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild.
 - **RustFS S3 integration** runs configured engine, server, cluster, CLI, recovery, and deterministic operation-count owners. A configured test that skips is a failure.
-- **Azurite Azure integration** runs configured storage, admission-lease, recovery, cluster, server, and CLI owners against a digest-pinned Azurite image. It also verifies control objects, Lance data, and the admission object use the declared container.
+- **Azurite Azure integration** runs only after merge, on tags, or by manual
+  dispatch. It exercises configured storage, admission-lease, recovery,
+  cluster, server, and CLI owners against a digest-pinned Azurite image, then
+  verifies that control objects, Lance data, and the admission object use the
+  declared container.
 - **AWS feature** builds and tests `omnigraph-server` with `--features aws`.
 
 Azure remains a qualification preview. Emulator coverage and the completed
