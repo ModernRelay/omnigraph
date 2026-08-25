@@ -62,6 +62,12 @@ async fn append_only_fast_forward_merge_uses_fenced_insert() {
     assert_eq!(outcome, MergeOutcome::FastForward);
 
     assert_eq!(
+        probes.table_walk_interval_count(),
+        0,
+        "proven insert replay must bypass the general three-way table walk"
+    );
+
+    assert_eq!(
         probes.stage_fenced_insert_calls(),
         1,
         "one-chunk fast-forward merge must stage one exact-id fenced insert; did {}",
@@ -950,6 +956,11 @@ async fn merged_outcome_defers_vector_index_to_reconciler() {
         .unwrap();
     assert_eq!(outcome, MergeOutcome::Merged);
     assert_eq!(
+        probes.table_walk_interval_count(),
+        1,
+        "one diverged scalar table must emit one general table-walk interval"
+    );
+    assert_eq!(
         probes.stage_vector_index_calls(),
         0,
         "three-way merge must not stage derived vector-index work inline"
@@ -1007,6 +1018,11 @@ async fn fast_forward_merge_streams_blob_columns() {
         .await
         .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(
+        probes.table_walk_interval_count(),
+        0,
+        "proven Blob insert replay must bypass the general table walk"
+    );
     assert_eq!(probes.stage_fenced_insert_calls(), 1);
     assert_eq!(probes.stage_fenced_insert_rows(), 1);
     assert_eq!(probes.stage_merge_insert_calls(), 0);

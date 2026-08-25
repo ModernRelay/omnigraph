@@ -802,7 +802,9 @@ async fn try_proven_pure_insert_history(
         return Ok(None);
     }
 
-    let history_start = std::time::Instant::now();
+    let history_timing = crate::instrumentation::start_merge_timing(
+        crate::instrumentation::MergeTimingPhase::ProvenInsertHistory,
+    );
     let base = base_snapshot.open_lance_dataset(table_key).await?;
     let source = source_snapshot.open_lance_dataset(table_key).await?;
     if source.version().version != source_entry.published_dataset_version
@@ -919,10 +921,7 @@ async fn try_proven_pure_insert_history(
     if proven_inserted_rows != inserted_rows {
         return Ok(None);
     }
-    crate::instrumentation::record_merge_timing(
-        crate::instrumentation::MergeTimingPhase::ProvenInsertHistory,
-        history_start.elapsed(),
-    );
+    history_timing.finish();
 
     Ok(Some(ProvenPureInsertAdopt {
         source,
@@ -1127,7 +1126,9 @@ async fn plan_proven_pure_insert_chunks(
     expected_rows: u64,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
 ) -> Result<Option<Vec<usize>>> {
-    let scan_start = std::time::Instant::now();
+    let scan_timing = crate::instrumentation::start_merge_timing(
+        crate::instrumentation::MergeTimingPhase::ProvenInsertPlanScan,
+    );
     let source = SnapshotHandle::new(source.clone());
     let mut stream = db
         .storage()
@@ -1159,10 +1160,7 @@ async fn plan_proven_pure_insert_chunks(
             return Ok(None);
         }
     }
-    crate::instrumentation::record_merge_timing(
-        crate::instrumentation::MergeTimingPhase::ProvenInsertPlanScan,
-        scan_start.elapsed(),
-    );
+    scan_timing.finish();
     if observed_rows != expected_rows || chunk_rows.is_empty() {
         return Err(OmniError::manifest_internal(format!(
             "branch merge pure-insert plan for '{table_key}' observed {observed_rows} rows in {} chunks against a provenance proof for {expected_rows}",
@@ -3167,7 +3165,9 @@ async fn commit_keyed_stream_chunks(
         observed_rows = observed_rows
             .checked_add(batch.num_rows() as u64)
             .ok_or_else(|| OmniError::manifest_internal("branch merge row count overflow"))?;
-        let stage_start = std::time::Instant::now();
+        let stage_timing = crate::instrumentation::start_merge_timing(
+            crate::instrumentation::MergeTimingPhase::KeyedStage,
+        );
         let staged = match stage_kind {
             KeyedChunkStage::General(semantics) => {
                 target_db
@@ -3188,10 +3188,7 @@ async fn commit_keyed_stream_chunks(
                     .await?
             }
         };
-        crate::instrumentation::record_merge_timing(
-            crate::instrumentation::MergeTimingPhase::KeyedStage,
-            stage_start.elapsed(),
-        );
+        stage_timing.finish();
         let planned = planned_transactions.get(*planned_index).ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "branch merge table '{table_key}' has no transaction planned for keyed chunk {}",
@@ -3199,12 +3196,11 @@ async fn commit_keyed_stream_chunks(
             ))
         })?;
         *planned_index += 1;
-        let commit_start = std::time::Instant::now();
-        current = commit_exact_merge_stage(target_db, current, staged, planned).await?;
-        crate::instrumentation::record_merge_timing(
+        let commit_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::KeyedCommit,
-            commit_start.elapsed(),
         );
+        current = commit_exact_merge_stage(target_db, current, staged, planned).await?;
+        commit_timing.finish();
         if chunk_index + 1 < chunk_rows.len()
             && let Some(failpoint) = between_chunk_failpoint
         {
@@ -3250,7 +3246,9 @@ async fn publish_proven_pure_insert_adopt(
     prepared_target: PreparedExistingMergeTarget,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
 ) -> Result<crate::db::DatasetUpdate> {
-    let publish_start = std::time::Instant::now();
+    let publish_timing = crate::instrumentation::start_merge_timing(
+        crate::instrumentation::MergeTimingPhase::PhysicalPublish,
+    );
     let (current, full_path, table_branch) = prepared_target.into_parts();
     let source = SnapshotHandle::new(proven.source.clone());
     let stream = target_db
@@ -3288,10 +3286,7 @@ async fn publish_proven_pure_insert_adopt(
         .storage()
         .table_state(&full_path, &committed)
         .await?;
-    crate::instrumentation::record_merge_timing(
-        crate::instrumentation::MergeTimingPhase::PhysicalPublish,
-        publish_start.elapsed(),
-    );
+    publish_timing.finish();
 
     Ok(crate::db::DatasetUpdate {
         identity,
@@ -3534,7 +3529,9 @@ impl Omnigraph {
         target: &str,
         actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
-        let outer_prepare_start = std::time::Instant::now();
+        let outer_prepare_timing = crate::instrumentation::start_merge_timing(
+            crate::instrumentation::MergeTimingPhase::OuterPrepare,
+        );
         if is_internal_system_branch(source) || is_internal_system_branch(target) {
             return Err(OmniError::manifest(format!(
                 "branch_merge does not allow internal system refs ('{}' -> '{}')",
@@ -3644,10 +3641,7 @@ impl Omnigraph {
             // stale instance after the merge.
             (!target_was_active).then_some(previous)
         };
-        crate::instrumentation::record_merge_timing(
-            crate::instrumentation::MergeTimingPhase::OuterPrepare,
-            outer_prepare_start.elapsed(),
-        );
+        outer_prepare_timing.finish();
         // Keep the deliberately large merge planner/publisher state out of the
         // operation shell's generated future. The inner operation composes
         // ordered typed comparison, Blob materialization, validation, recovery,
@@ -3668,7 +3662,9 @@ impl Omnigraph {
             actor_id,
         ))
         .await;
-        let outer_restore_start = std::time::Instant::now();
+        let outer_restore_timing = crate::instrumentation::start_merge_timing(
+            crate::instrumentation::MergeTimingPhase::OuterRestoreRefresh,
+        );
         if let Some(previous) = previous {
             self.restore_coordinator(previous).await;
         }
@@ -3689,10 +3685,7 @@ impl Omnigraph {
             }
         }
 
-        crate::instrumentation::record_merge_timing(
-            crate::instrumentation::MergeTimingPhase::OuterRestoreRefresh,
-            outer_restore_start.elapsed(),
-        );
+        outer_restore_timing.finish();
 
         merge_result
     }
@@ -3773,22 +3766,28 @@ impl Omnigraph {
                     {
                         candidates.insert(table_key.clone(), candidate);
                     }
-                } else if let Some(staged) = stage_streaming_table_merge(
-                    self,
-                    table_key,
-                    catalog,
-                    base_snapshot,
-                    source_snapshot,
-                    target_snapshot,
-                    &mut conflicts,
-                    &empty_external_preflight,
-                )
-                .await?
-                {
-                    candidates.insert(
-                        table_key.clone(),
-                        CandidateTableState::RewriteMerged(staged),
+                } else {
+                    let table_walk_timing = crate::instrumentation::start_merge_timing(
+                        crate::instrumentation::MergeTimingPhase::TableWalk,
                     );
+                    let staged = stage_streaming_table_merge(
+                        self,
+                        table_key,
+                        catalog,
+                        base_snapshot,
+                        source_snapshot,
+                        target_snapshot,
+                        &mut conflicts,
+                        &empty_external_preflight,
+                    )
+                    .await?;
+                    table_walk_timing.finish();
+                    if let Some(staged) = staged {
+                        candidates.insert(
+                            table_key.clone(),
+                            CandidateTableState::RewriteMerged(staged),
+                        );
+                    }
                 }
                 continue;
             }
@@ -3972,7 +3971,10 @@ impl Omnigraph {
                 continue;
             }
 
-            if let Some(staged) = stage_streaming_table_merge(
+            let table_walk_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::TableWalk,
+            );
+            let staged = stage_streaming_table_merge(
                 self,
                 table_key,
                 catalog,
@@ -3982,8 +3984,9 @@ impl Omnigraph {
                 &mut conflicts,
                 &external_preflight,
             )
-            .await?
-            {
+            .await?;
+            table_walk_timing.finish();
+            if let Some(staged) = staged {
                 candidates.insert(
                     table_key.clone(),
                     CandidateTableState::RewriteMerged(staged),
@@ -4002,13 +4005,12 @@ impl Omnigraph {
         let validation_is_redundant =
             is_fast_forward && proven_fast_forward_needs_no_validation(catalog, &candidates);
         if !validation_is_redundant {
-            let validation_start = std::time::Instant::now();
+            let validation_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::CandidateValidation,
+            );
             let changeset = build_merge_changeset(self, catalog, &candidates).await?;
             validate_merge_candidates(catalog, target_snapshot, &changeset).await?;
-            crate::instrumentation::record_merge_timing(
-                crate::instrumentation::MergeTimingPhase::CandidateValidation,
-                validation_start.elapsed(),
-            );
+            validation_timing.finish();
         }
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_MERGE_POST_CANDIDATE_VALIDATION,
@@ -4029,7 +4031,9 @@ impl Omnigraph {
         // re-run the sidecar barrier and re-read both manifest branches before
         // Phase A. Planning remains outside table queues, but no plan derived
         // from a stale source/target snapshot can cross into physical effects.
-        let final_revalidation_start = std::time::Instant::now();
+        let final_revalidation_timing = crate::instrumentation::start_merge_timing(
+            crate::instrumentation::MergeTimingPhase::FinalRevalidation,
+        );
         let active_branch_for_keys = target_branch.map(str::to_string);
         let merge_branches = [
             source_branch.map(str::to_string),
@@ -4337,10 +4341,7 @@ impl Omnigraph {
                 continue;
             }
         }
-        crate::instrumentation::record_merge_timing(
-            crate::instrumentation::MergeTimingPhase::FinalRevalidation,
-            final_revalidation_start.elapsed(),
-        );
+        final_revalidation_timing.finish();
 
         // Keep the sidecar alongside its handle: after the whole physical
         // effect set completes, confirmation binds every output slot and every
@@ -4379,17 +4380,16 @@ impl Omnigraph {
                     tombstones: Vec::new(),
                 },
             )?;
-            let recovery_arm_start = std::time::Instant::now();
+            let recovery_arm_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::RecoveryArm,
+            );
             let handle = crate::db::manifest::write_sidecar(
                 self.root_uri(),
                 self.storage_adapter(),
                 &sidecar,
             )
             .await?;
-            crate::instrumentation::record_merge_timing(
-                crate::instrumentation::MergeTimingPhase::RecoveryArm,
-                recovery_arm_start.elapsed(),
-            );
+            recovery_arm_timing.finish();
             Some((sidecar, handle))
         };
 
@@ -4544,7 +4544,9 @@ impl Omnigraph {
                 crate::failpoints::names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM,
             )?;
             if let Some((sidecar, _)) = recovery.as_mut() {
-                let recovery_confirm_start = std::time::Instant::now();
+                let recovery_confirm_timing = crate::instrumentation::start_merge_timing(
+                    crate::instrumentation::MergeTimingPhase::RecoveryConfirm,
+                );
                 crate::db::manifest::confirm_branch_merge_sidecar_v9(
                     self.root_uri(),
                     self.storage_adapter(),
@@ -4553,10 +4555,7 @@ impl Omnigraph {
                     &confirmed_ref_identifiers,
                 )
                 .await?;
-                crate::instrumentation::record_merge_timing(
-                    crate::instrumentation::MergeTimingPhase::RecoveryConfirm,
-                    recovery_confirm_start.elapsed(),
-                );
+                recovery_confirm_timing.finish();
             }
 
             crate::failpoints::maybe_fail(
@@ -4569,7 +4568,9 @@ impl Omnigraph {
                 target_txn.effective_graph_head.as_deref(),
                 Some(target_head_commit_id)
             );
-            let manifest_publish_start = std::time::Instant::now();
+            let manifest_publish_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::ManifestPublish,
+            );
             // The manifest publisher reaches Lance MergeInsert and DataFusion's
             // physical planner. Erase that substrate-heavy future at the graph
             // publication boundary instead of making this recovery envelope's
@@ -4583,10 +4584,7 @@ impl Omnigraph {
                 merge_lineage,
             ))
             .await?;
-            crate::instrumentation::record_merge_timing(
-                crate::instrumentation::MergeTimingPhase::ManifestPublish,
-                manifest_publish_start.elapsed(),
-            );
+            manifest_publish_timing.finish();
 
             Ok::<_, OmniError>((updates, changed_edge_tables))
         })
@@ -4608,7 +4606,9 @@ impl Omnigraph {
         // Best-effort cleanup; the merge already landed durably so failing the
         // user here is undesirable.
         if let Some((_, handle)) = recovery {
-            let recovery_cleanup_start = std::time::Instant::now();
+            let recovery_cleanup_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::RecoveryCleanup,
+            );
             if let Err(err) =
                 crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
             {
@@ -4618,10 +4618,7 @@ impl Omnigraph {
                     "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
                 );
             }
-            crate::instrumentation::record_merge_timing(
-                crate::instrumentation::MergeTimingPhase::RecoveryCleanup,
-                recovery_cleanup_start.elapsed(),
-            );
+            recovery_cleanup_timing.finish();
         }
 
         if changed_edge_tables {
