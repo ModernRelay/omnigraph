@@ -17,9 +17,10 @@ protection.
 - `Lint (clippy)`
 
 Checks are strict, so a PR must be current with `main`. `Graph Vocabulary
-Guard` always reports and protects the reviewed vocabulary inventory across
-OpenAPI, Rust presentation strings, and public Rust surfaces. User documentation
-is intentionally outside this exact-occurrence gate and is validated by the
+Guard` remains as an always-reporting context but reports a successful skip on
+pull requests; the full OpenAPI, Rust presentation-string, and public-Rust
+audit runs after merge, on tags, and by manual dispatch. User documentation is
+intentionally outside this exact-occurrence audit and is validated by the
 documentation structure check.
 Documentation-only PRs still receive every required context; work-heavy steps
 may report as skipped.

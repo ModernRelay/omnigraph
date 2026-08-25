@@ -1,0 +1,106 @@
+name: Release vocabulary gate
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Git ref or commit to resolve once as the release source.
+        required: true
+        type: string
+      ci_run_id:
+        description: Exact CI run that authorized an automatic release.
+        required: false
+        default: ""
+        type: string
+    outputs:
+      source_sha:
+        description: Immutable audited commit used by every release checkout.
+        value: ${{ jobs.verify.outputs.source_sha }}
+
+jobs:
+  verify:
+    name: Verify exact-SHA vocabulary audit
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Resolve release source once
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record immutable source commit
+        id: source
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse 'HEAD^{commit}')"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Require successful vocabulary audit
+        env:
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          audit_succeeded_in_run() {
+            local run_id="$1"
+            local jobs
+            jobs="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?filter=latest&per_page=100")"
+            jq -e --arg sha "$SOURCE_SHA" '
+              .jobs
+              | any(
+                  .name == "Graph Vocabulary Guard"
+                  and .head_sha == $sha
+                  and .status == "completed"
+                  and .conclusion == "success"
+                )
+            ' <<<"$jobs" >/dev/null
+          }
+
+          if [[ -n "$CI_RUN_ID" ]]; then
+            run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}")"
+            jq -e --arg sha "$SOURCE_SHA" '
+              .path == ".github/workflows/ci.yml"
+              and .head_sha == $sha
+              and (.event == "push" or .event == "workflow_dispatch")
+            ' <<<"$run" >/dev/null || {
+              echo "::error::CI run ${CI_RUN_ID} does not authorize source ${SOURCE_SHA}"
+              exit 1
+            }
+            # `needs` guarantees the audit job completed, but allow the Jobs
+            # REST view a short consistency window before failing closed.
+            for _ in $(seq 1 12); do
+              if audit_succeeded_in_run "$CI_RUN_ID"; then
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "::error::CI run ${CI_RUN_ID} has no successful exact-SHA Graph Vocabulary Guard"
+            exit 1
+          fi
+
+          # Manual backfills may reuse an earlier audit of the exact commit,
+          # but a skipped pull-request context never qualifies.
+          mapfile -t run_ids < <(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SOURCE_SHA}&per_page=100" \
+              --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | .id'
+          )
+          for run_id in "${run_ids[@]}"; do
+            if audit_succeeded_in_run "$run_id"; then
+              exit 0
+            fi
+          done
+
+          echo "::error::source ${SOURCE_SHA} has no successful non-PR Graph Vocabulary Guard"
+          echo "Audit the exact ref first, then retry the manual release. Historical pre-guard tags require an explicit policy decision."
+          exit 1

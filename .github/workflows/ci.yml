@@ -23,7 +23,6 @@ jobs:
       contents: read
     outputs:
       run_full_ci: ${{ steps.filter.outputs.run_full_ci }}
-      run_azure_ci: ${{ steps.filter.outputs.run_azure_ci }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -43,7 +42,6 @@ jobs:
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
-            echo "run_azure_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -60,7 +58,6 @@ jobs:
 
           if [[ -z "${base:-}" ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
-            echo "run_azure_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -69,12 +66,10 @@ jobs:
           mapfile -t changed < <(git diff --name-only --no-renames "$base" "$head")
           if [[ "${#changed[@]}" -eq 0 ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
-            echo "run_azure_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           run_full_ci=false
-          run_azure_ci=false
           for path in "${changed[@]}"; do
             case "$path" in
               docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc) ;;
@@ -84,21 +79,11 @@ jobs:
                 run_full_ci=true
                 ;;
             esac
-            case "$path" in
-              Cargo.toml|Cargo.lock|Dockerfile|.dockerignore|docker/*|deploy/azure/*) run_azure_ci=true ;;
-              .github/workflows/ci.yml|.github/workflows/package.yml|.github/workflows/publish-image.yml) run_azure_ci=true ;;
-              .github/workflows/release.yml|.github/workflows/release-edge.yml|.github/workflows/omnigraph-package.yml) run_azure_ci=true ;;
-              scripts/install.sh|scripts/install.ps1|scripts/install-source.sh|scripts/update-homebrew-formula.sh) run_azure_ci=true ;;
-              scripts/check-azure-admission-boundary.py|scripts/check-container-binary-contract.py) run_azure_ci=true ;;
-              crates/omnigraph-storage/*|crates/omnigraph-azure-admission/*|crates/omnigraph/*) run_azure_ci=true ;;
-              crates/omnigraph-cluster/*|crates/omnigraph-server/*|crates/omnigraph-cli/*) run_azure_ci=true ;;
-            esac
           done
 
           printf 'Changed files:\n'
           printf '  %s\n' "${changed[@]}"
           echo "run_full_ci=$run_full_ci" >> "$GITHUB_OUTPUT"
-          echo "run_azure_ci=$run_azure_ci" >> "$GITHUB_OUTPUT"
 
   check_agents_md:
     name: Check AGENTS.md Links
@@ -127,6 +112,9 @@ jobs:
       - name: Reject mutable external action refs
         run: python3 scripts/check-workflow-action-pins.py
 
+      - name: Enforce release vocabulary gates
+        run: python3 scripts/check-release-vocabulary-gates.py
+
   azure_contract_guards:
     name: Azure Contract Guards
     runs-on: ubuntu-latest
@@ -144,9 +132,10 @@ jobs:
 
   graph_vocabulary_guard:
     name: Graph Vocabulary Guard
-    # Required PR context: keep this job independent of the documentation-only
-    # classifier so it always reports. The review-owned inventory protects the
-    # OpenAPI, Rust presentation-string, and public-Rust surfaces.
+    # Keep this exact reporting context while it remains required by branch
+    # protection, but do not run the substrate-sized audit on pull requests.
+    # The full audit still runs after merge, on tags, and by manual dispatch.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # A cold default + relevant all-features rustdoc pass over all seven public
     # library crates is substrate-sized. The first hosted run completed the
@@ -261,6 +250,61 @@ jobs:
             --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
             --cargo-public-api "$tool" \
             --public-api-target-dir target/vocabulary-public-api
+
+  release_edge_after_vocabulary:
+    name: Release edge after vocabulary audit
+    needs: [classify_changes, graph_vocabulary_guard]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify_changes.outputs.run_full_ci == 'true'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/release-edge.yml
+    with:
+      source_ref: ${{ github.sha }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+
+  release_tag_after_vocabulary:
+    name: Release tag after vocabulary audit
+    needs: graph_vocabulary_guard
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ github.ref_name }}
+      source_ref: ${{ github.ref }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+    secrets: inherit
+
+  publish_tag_image_after_vocabulary:
+    name: Publish tag image after vocabulary audit
+    needs: graph_vocabulary_guard
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      tag: ${{ github.ref_name }}
+      source_ref: ${{ github.ref }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+    secrets: inherit
+
+  publish_tag_crates_after_vocabulary:
+    name: Publish tag crates after vocabulary audit
+    needs: graph_vocabulary_guard
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/publish-crates.yml
+    with:
+      tag: ${{ github.ref_name }}
+      source_ref: ${{ github.ref }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+    secrets: inherit
 
   entrypoint_test:
     name: Container Entrypoint
@@ -791,12 +835,11 @@ jobs:
 
   azurite_integration:
     name: Azurite Azure Integration
-    # Azure-touching PRs gate on the configured backend contract; main, tag,
-    # and manual full-CI runs retain the same post-merge coverage. Keep this
-    # independent of `test` so cold backend graphs start together and a
-    # failure reports at its real boundary.
+    # This configured backend contract runs after merge, on tags, and by
+    # manual dispatch. Keep it independent of `test` so cold backend graphs
+    # start together and a failure reports at its real boundary.
     needs: classify_changes
-    if: needs.classify_changes.outputs.run_full_ci == 'true' && (github.event_name != 'pull_request' || needs.classify_changes.outputs.run_azure_ci == 'true')
+    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # Cold failpoint and default-feature Lance graphs compile sequentially on
     # the first cache miss; keep the timeout above the RustFS shard envelope.
