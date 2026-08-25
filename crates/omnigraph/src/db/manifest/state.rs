@@ -382,19 +382,19 @@ pub(super) async fn read_object_identities_at_offsets(
     let projection_schema = dataset
         .schema()
         .project_preserve_system_columns(&["object_id", "object_type"])
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     let projection = lance::dataset::ProjectionRequest::from_schema(projection_schema)
         .into_projection_plan(Arc::clone(&dataset))
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     let batch = lance::dataset::TakeBuilder::try_new_from_addresses(
         dataset,
         addresses,
         Arc::new(projection),
     )
-    .map_err(|e| OmniError::Lance(e.to_string()))?
+    .map_err(OmniError::storage)?
     .execute()
     .await
-    .map_err(|e| OmniError::Lance(e.to_string()))?;
+    .map_err(OmniError::storage)?;
     crate::instrumentation::record_projection_identity_rows(batch.num_rows());
 
     let object_ids = string_column(&batch, "object_id")?;
