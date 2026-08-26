@@ -33,6 +33,20 @@ use lance::io::WrappingObjectStore;
 use crate::error::{OmniError, Result};
 use crate::storage::{ListDirBounds, StorageAdapter};
 
+/// Cargo features compiled into this exact `omnigraph-engine` artifact.
+///
+/// This read-only build seam lets benchmark and diagnostic binaries report
+/// dependency features from the crate that owns them. A dependent crate's
+/// `cfg(feature = ...)` namespace cannot observe features enabled directly on
+/// `omnigraph-engine` by Cargo's workspace feature graph.
+#[doc(hidden)]
+pub const fn enabled_engine_cargo_features() -> &'static [&'static str] {
+    &[
+        #[cfg(feature = "failpoints")]
+        "failpoints",
+    ]
+}
+
 /// Per-query IO probes, installed for a query's task via [`with_query_io_probes`].
 ///
 /// Each wrapper is attached (when present) to the datasets that category opens,
