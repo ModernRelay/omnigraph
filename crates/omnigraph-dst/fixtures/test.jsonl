@@ -1,0 +1,11 @@
+{"type": "Person", "data": {"name": "Alice", "age": 30}}
+{"type": "Person", "data": {"name": "Bob", "age": 25}}
+{"type": "Person", "data": {"name": "Charlie", "age": 35}}
+{"type": "Person", "data": {"name": "Diana", "age": 28}}
+{"type": "Company", "data": {"name": "Acme"}}
+{"type": "Company", "data": {"name": "Globex"}}
+{"edge": "Knows", "from": "Alice", "to": "Bob"}
+{"edge": "Knows", "from": "Alice", "to": "Charlie"}
+{"edge": "Knows", "from": "Bob", "to": "Diana"}
+{"edge": "WorksAt", "from": "Alice", "to": "Acme"}
+{"edge": "WorksAt", "from": "Bob", "to": "Globex"}

@@ -1,0 +1,15 @@
+node Person {
+    name: String @key
+    age: I32?
+    ver: I64?
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+
+edge WorksAt: Person -> Company

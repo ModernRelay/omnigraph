@@ -2,13 +2,13 @@
 rfc: "0037"
 title: "Deterministic simulation harness"
 track: public
-status: draft
+status: accepted
 implementation: in-progress
 authors:
   - Azim Afroozeh
 created: 2026-08-18
-updated: 2026-08-23
-discussion: null
+updated: 2026-08-26
+discussion: "https://github.com/ModernRelay/omnigraph/pull/507"
 supersedes: []
 superseded_by: []
 blocked_on:
@@ -35,7 +35,11 @@ today or in a year and it regenerates the identical universe (one
 complete simulated lifetime): the same operation stream, the same
 generated IDs and timestamps, the same storage calls in the same
 order, the same final store state, the same ***verdicts*** (the pass
-or fail judgments on the run). That is what determinism buys,
+or fail judgments on the run). The CHECKED form of this identity
+compares the full report projection — logical rows, commit IDs, a raw
+query rendering, and every counter — not yet the byte-level call
+trace; the full-trace comparison is Deferred to v2 (see that section).
+That is what determinism buys,
 repeatability, and repeatability pays twice. In testing, a failing
 universe replays from its (scenario, seed) pair, so the rarest crash
 or race becomes
@@ -102,7 +106,8 @@ sections that follow.
   from running more seeds.
 - **Crash window**: the gap between two consecutive durable writes of
   one operation, where dying leaves a distinct partial state that
-  recovery must handle. The engine catalogs 66 of them.
+  recovery must handle. The engine catalogs 71 of them
+  (`catalog::CRASH_WINDOWS`).
 - **Multiverse**: Antithesis's term for a fork-tree of one execution;
   this harness approximates its payoff without forking (see "Reaching
   rare states" below).
@@ -180,8 +185,10 @@ judgment). Three properties define it.
 
 **1. One seed suffices.** The seed fans out through a ***seed tree***
 (a deterministic derivation of child seeds; SplitMix64): one child for
-the workload stream, the ID stream, the logical clock, the scheduler,
-and, in concurrent universes, one per writer. Every random-shaped
+the workload stream, the ID stream, the scheduler, and the entropy
+shim, and, in concurrent universes, one triple per writer (the logical
+clock needs no child: it counts from a fixed epoch, so its stamps
+derive from the op stream). Every random-shaped
 decision in the universe traces to the one root number. Operations are
 therefore never stored: a workload is always re-derived from
 (scenario, seed), so a bug report is a scenario plus one number,
@@ -268,7 +275,7 @@ exactly:
 | # | Name | Imitated reality | Who sees the fault | What must survive | Positions indexed by | Mechanism |
 |---|---|---|---|---|---|---|
 | 1 | injected storage faults | the store misbehaves on a call | the operation (an error or wrong bytes) | its retry and error paths | the call | call-level |
-| 2 | crash windows | the process dies at a phase boundary | nobody; the process is gone | recovery, from a marked place | code location (the 66 cataloged windows) | line-level |
+| 2 | crash windows | the process dies at a phase boundary | nobody; the process is gone | recovery, from a marked place | code location (the 71 cataloged windows) | line-level |
 | 3 | crash-state enumeration | the process dies between durable writes | nobody; the process is gone | recovery, from every write cut | write ordinal (W writes = W states) | call-level (a write counter) |
 
 Per model, what is built and measured:
@@ -295,6 +302,22 @@ Per model, what is built and measured:
 
 The counts differ because mechanisms name entry points and models name
 imitated realities, mapped many-to-one (the table's last column).
+
+Crash coverage runs in two delivery lanes for the death itself. Lane A
+is ***modeled death***: the storage wrapper stops forwarding at the
+scheduled moment and the process survives to judge itself, so a
+modeled kill exercises exactly the writes-stopped-here state, not the
+teardown of a real process. Lane B is ***real death***: a parent
+process spawns the workload child, waits on a durably flushed barrier
+line at a chosen completion ordinal (a count of successful durable
+completions, defined under Crash machinery), and SIGKILLs it, so the
+operating system tears the process down mid-flight; a fresh process
+then recovers and judges from the child's log-ahead operation log.
+Lane A is complete over its cuts, fast, and replays exactly; lane B is
+the ground truth that lane A models. In this version lane B ships as a
+labeled preview: the instruments and the judge are in-tree with six
+judge red-proofs (each proves the judge can go red on a planted
+defect); full qualification is deferred, see Deferred to v2.
 
 **Why these three suffice.** The claim is completeness over disaster
 entry points, not over bugs (logic bugs on healthy paths are the
@@ -396,13 +419,15 @@ biggest night.
 
 #### Coverage, stated honestly
 
-Coverage is a ledger, not a scoreboard: 50 of 66 crash windows crossed
-with verdicts; the 16 dark windows are each named with an unlock
-condition, in three classes: quarantined on a known bug (#494 blocks
-schema ops in the sampler until its fix), owned by a filed future
-workload (blob-bearing paths), and recipe debt (recovery internals
-whose preconditions have no recipe yet). 50 crossed plus 16 named is 66
-accounted for.
+Coverage is a ledger, not a scoreboard. At the recorded coverage run's
+66-window catalog: 50 crash windows crossed with verdicts; the 16 dark
+windows each named with an unlock condition, in three classes:
+quarantined on a known bug (#494 blocks schema ops in the sampler until
+its fix), owned by a filed future workload (blob-bearing paths), and
+recipe debt (recovery internals whose preconditions have no recipe
+yet). 50 crossed plus 16 named is 66 accounted for; the catalog has
+since grown to 71, and the five newer windows enter the ledger as
+never-reached until their workloads exist.
 
 #### Provenance
 
@@ -447,16 +472,20 @@ seized it:
   them seed-determined; this is what makes the contract ID-inclusive,
   so they stay comparable instead of being normalized away.
 - **OS randomness**: libc symbol interposition answers the entropy
-  calls from a seeded stream; this also covers hash-map hash seeds, so
-  hash-based collections stop varying per process.
+  calls from a seeded stream. Hash-map hash seeds are covered only by
+  the shim's pre-start env arming (`DST_ENTROPY_SEED`): std's hasher
+  seeds once per process and cannot be re-armed, so in the suite's
+  standard configuration hash-based collections still seed from the
+  OS — which is why iteration order gets its own treatment next.
 - **Iteration order**: roughly thirty data-structure walks
-  canonicalized, so no visit order is left to the hasher, under a
-  standing rule: an iterated map uses insertion order (`IndexMap`)
-  when its order needs only stability, canonical key order
-  (`BTreeMap`) when the order carries meaning; lookup-only hash maps
-  are harmless and stay (iteration is the leak, not storage). The rule
-  is enforced by lint, not memory: `clippy::iter_over_hash_type` fires
-  on any new walk of a hash-ordered structure. This mirrors the
+  canonicalized — each walk collects and sorts (or re-keys into a
+  `BTreeMap`) before iterating, so no visit order is left to the
+  hasher; lookup-only hash maps are harmless and stay (iteration is
+  the leak, not storage). The rule is enforced by the strict-replay
+  meta-test — a new order-observable walk diverges same-seed reports
+  and reds the replay cell; promoting it to a compiler gate
+  (`clippy::iter_over_hash_type`, with per-site allows for the nine
+  existing order-unobservable walks) is v2 work. This mirrors the
   repository's own deny-list bar on hash-map iteration order reaching
   observable output.
 - **Storage**: the in-memory object store; beyond removing real IO, it
@@ -487,7 +516,11 @@ carry no stable identity: at the quiesced shape their unattributed
 traffic is zero, while unquiesced hunts measure thousands of
 unattributed calls per universe. The standing doctrine follows the
 measurement: hunt unquiesced (racier finds more), replay quiesced
-(deterministic).
+(deterministic). The same honesty binds the failure models: the `wild`
+concurrent arms (real pool threads, timing not seed-derived) and lane
+B's real kills deliberately trade exact replay for real timing; their
+failures ship as evidence (the seed row, the operation log, the
+judge's dump), not as transcripts.
 
 **What remains, each with an owner:**
 
@@ -531,7 +564,8 @@ crate; conceptually two inputs, structurally one recipe value):
   long, keyword-like, whitespace) instead of the clean set.
 - `faults` (a `FaultPlan`): which storage faults may strike, and how
   often.
-- `crash_at`: schedule a crash at a fixed operation index.
+- `crash_at`: schedule a crash — the named failpoint to arm plus the
+  fixed operation index to arm it at.
 - `crash_on_match`: schedule it on the N-th operation whose kind can
   reach the targeted crash window.
 - `probe_only`: with `crash_on_match` set, install a record-only probe
@@ -561,13 +595,17 @@ interposes both without modifying either side:
   object-store provider registry under the engine's shared-memory
   scheme, decorating every call Lance issues. Zero Lance code changes;
   the registry is a public extension surface.
-- **Entropy**: a libc symbol-interposition module (~60 lines,
-  env-gated, inert by default) answering the OS entropy calls from a
-  seeded stream. It is the only seam that is process-global by nature,
-  so it is re-seeded per universe as a mandatory setup step.
-- **Clock and IDs**: builder-injected seams making timestamps and
-  identifiers seed-derived; these are the additive production-API
-  touch points (injection parameters with real defaults).
+- **Entropy**: a libc symbol-interposition module (env-gated or
+  programmatically armed, inert by default) answering the OS entropy
+  calls from a seeded stream. It is the only seam that is
+  process-global by nature, so it is re-seeded per universe as a
+  mandatory setup step.
+- **Clock and IDs**: feature-gated thread-local install seams making
+  timestamps and identifiers seed-derived (compiled to direct
+  real-clock/real-ID calls without the `dst` feature); promoting them
+  to instance-owned builder injection is the P1-5 v2 row in Deferred
+  to v2. Storage is the one seam already builder-injected
+  (`init_with_storage`).
 
 ### The determinism contract, precisely
 
@@ -601,28 +639,55 @@ state).
 ### Crash machinery
 
 The window catalog names the failpoints compiled at the engine's
-write-path phase boundaries (66 at the surveyed version), kept honest
-by a names-guard test that fails when catalog and engine drift. A
+write-path phase boundaries (71 at the pinned engine version), kept
+honest by a names-guard test that fails on any catalog entry the
+engine does not define (a typo'd or renamed-away window cannot
+silently never fire). A
 scheduled crash is scoped to exactly one operation and disarms on
 guard drop, so a panicking test cannot leak a live trap; per-window
-census states are scheduled, hit, never reached, and unschedulable,
+census states are scheduled, hit (with crossed-but-absorbed
+distinguished in the sweep report), never reached, and unschedulable,
 so dark windows carry reasons. Kill-at-kth-write maintains one durable
-write counter across both realms; death is followed by post-mortem
-refusal (a dead process performs nothing) until the explicit revival
-that models restart, and `recovery_crash` schedules a second death
-inside recovery itself, the double fault.
+write counter across both realms; in lane A the death is modeled:
+post-mortem refusal (a dead process performs nothing) holds until the
+explicit revival that stands in for restart, in the same process, and
+`recovery_crash` schedules a second modeled death inside recovery
+itself, the double fault.
+
+Completion-cut coverage carries three typed exclusions, enumerated in
+`write_census::CUT_COVERAGE_EXCLUSIONS` and printed by the census gate
+on every run: multipart writes (tripwired, first use fails the gate),
+the adapter's internal rename stages, and per-key deletes inside one
+`delete_prefix` call. A coverage claim in this document always means
+coverage minus these three arms.
+
+Lane B's coordinates are ***completion ordinals***: the child counts
+only successful durable completions (an adapter or proxy write whose
+inner call returned success), and killing at completion #c means the
+child freezes after the c-th such completion, appends a durably
+flushed barrier line carrying c and the in-flight gauge (asserted to
+be exactly one), and parks until the parent SIGKILLs it. Ordinal
+c = 0 parks before the first forwarded call. The judge recovers in a
+fresh process and compares three channels per branch: the operation
+log (what was acknowledged), the query surface, and the physical
+listing; acknowledged-and-absent is a finding, visible-but-unclaimed
+is legal (the err-after-commit class: the write committed, the
+acknowledgement did not arrive).
 
 ### Fault plans
 
-The `FaultPlan` carries per-class probabilities and latency, plus:
-read-path corruption (value-aware bit rot, truncated reads, and
-persistent per-object latent sector errors), write-side weather
-(corrupted, lost, and misdirected writes), ack-loss (the effect
-durable, the confirmation replaced by an error, across the write
-classes including conditional writes), and bounded staleness (per-key
+The `FaultPlan` carries per-class probabilities and latency (write and
+read classes separately), plus: read-path corruption (value-aware bit
+rot, truncated reads, and persistent per-object latent sector errors),
+write-side weather (corrupted, lost, and misdirected writes), ack-loss
+(the effect durable, the confirmation replaced by an error, across the
+write classes including conditional writes), bounded staleness (per-key
 version history with as-of reads and listings, conditional writes
-strict at head). Injected damage is judged detected-or-harmless by
-attribution: a damage ledger records what was injected, so
+strict at head), a Lance-realm opt-in (the same weather reaching the
+interposed provider), and a client-retry mode (after an ack-lost op the
+harness plays the real client's one retry and holds its error surface
+to the legal catalog). Injected damage is judged detected-or-harmless
+by attribution: a damage ledger records what was injected, so
 engine-born detection errors are legalized by overlap instead of
 guessed at.
 
@@ -667,8 +732,11 @@ No invariant is weakened; several are the harness's test subjects.
   make observable behavior explicitly contractual. Nothing on
   the deny-list is brushed: the harness is dev-only, every instrument
   is slot-armed and off by default (zero draws, zero behavior change
-  unarmed), and the only production-code touch points are additive
-  builder injection parameters with real defaults.
+  unarmed), and the production-code touch points are the feature-gated
+  seams (direct calls when off), the storage builder injection, the
+  canonicalized iteration walks (order made deterministic, semantics
+  keyed), and the write queue's release-epoch bookkeeping (the one
+  default-build residual, tracked in Deferred to v2).
 
 ## Drawbacks & alternatives
 
@@ -717,9 +785,34 @@ No invariant is weakened; several are the harness's test subjects.
 ## Reversibility
 
 Dev-only crate plus feature-gated seams; no on-disk, wire, or format
-impact. Removing it deletes tests, not behavior. The one production
-surface touched is builder injection points (clock, entropy, IDs,
-storage), which are additive.
+impact. Removing it deletes tests plus the seam passthroughs; the
+canonicalized iteration walks and the write queue's release-epoch
+bookkeeping would remain as (harmless, order-stabilizing) production
+code until separately reverted.
+
+## Deferred to v2 (#527 review)
+
+The #527 review (2026-08-21) raised nine P1 points. This version
+addresses every point: some are fixed outright, the rest are rescoped
+honestly and fenced by an in-repo mechanism that fails or reports
+when the deferral's premise breaks. The RFC never carries a deferral
+alone; the mechanism fires regardless of what this table says. Two
+points (P1-2, process-environment mutation; P1-8, the merge-gate
+wording) were fixed outright and carry no residual gap; the table
+lists the seven with one.
+
+| Gap | Review point | v1 mechanism | v2 solves | Issue |
+|---|---|---|---|---|
+| Modeled death is not process death | P1-1 | vocabulary rescope (the two delivery lanes above); lane B preview in-tree with six judge red-proofs | lane B qualification: PRE_ACK/ACK cells, no-kill baselines, sensitivity fixture, second backend, lane A agreement check | #TBD-1 |
+| Multipart writes bypass completion hooks | P1-3 | tripwire: census gate reds on first multipart use; typed exclusion row | harness-owned MultipartUpload wrapper, part-level cuts | #TBD-2 |
+| Adapter collapses rename/delete_prefix stages | P1-4 | typed exclusion rows + census never-fired report | shared DurableEventSequencer below both realms | #TBD-3 |
+| DST seams reachable via feature flag only | P1-5 | non-default `dst` cargo feature; passthroughs compile to direct calls when off | instance-owned builder injection, no feature flag | #TBD-4 |
+| Nightly seed identity derived, not declared | P1-6 | evidence note in the nightly workflow; failures carry the literal seed row | versioned RunPlan/RunResult manifest artifact | #TBD-5 |
+| Scheduler escapes tolerated outside strict cells | P1-7 | replay-honesty labels: wild arms declared non-replayable | logical turns for finish/timeouts; readers gated | #TBD-6 |
+| Strict replay compares a report projection | P1-9 | claim rescoped to report-projection replay; ambient ID/clock sites routed through seams | full-trace and object-inventory comparison; ambient-source guard | #TBD-7 |
+
+Issue numbers are filled when the tracking issues are filed; each code
+site carries `TODO(#527)` until then and is renumbered with the issue.
 
 ## Unresolved questions
 
@@ -727,14 +820,13 @@ storage), which are additive.
    execution layer its instruments run on?
 2. How much of the findings ledger belongs in the RFC body vs linked
    issues? (Unfiled findings stay count-only regardless.)
-3. Number: 0037 assumed; re-check for in-flight collisions at PR time
-   (the number is reserved by the merge, per the lifecycle doc).
-4. This harness's whole-universe cost profile and #503's fresh-store
+3. This harness's whole-universe cost profile and #503's fresh-store
    marginal costs show very different numbers; the divergence
    decomposes across four named axes (marginal versus summed
    denominator, counting boundary, store age, backend). A first
-   same-ruler measurement now exists (bench run-002: a fresh-store
-   single-op scenario, counted on the Lance realm only, the two
+   same-ruler measurement now exists (the `#[ignore]`d floor-cell
+   instrument in the scenario suite: a fresh-store single-op scenario,
+   counted on the Lance realm only, the two
    rulers' overlap): write counts match #503's RustFS column exactly,
    7 puts on both insert kinds; edge-insert reads land within three
    calls (53 versus 50); node-insert reads are the one open residual

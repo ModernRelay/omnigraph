@@ -307,6 +307,12 @@ impl From<std::io::Error> for StorageError {
 const FILE_SCHEME_PREFIX: &str = "file://";
 const S3_SCHEME_PREFIX: &str = "s3://";
 const AZURE_SCHEME_PREFIX: &str = "az://";
+/// The DST harness's opaque in-memory scheme (Lance's shared-memory
+/// provider). Named beside its siblings; every user (the classification
+/// arm, the URI normalizer, the Memory-codec strip) is `dst`-gated, so
+/// the const is too.
+#[cfg(feature = "dst")]
+const SHARED_MEMORY_SCHEME_PREFIX: &str = "shared-memory://";
 const DEFAULT_AZURITE_BLOB_STORAGE_URL: &str = "http://127.0.0.1:10000";
 // Keep the Azure GET -> multipart PUT rename envelope bounded. Five MiB is
 // accepted as a non-final multipart part by every object_store backend and
@@ -1378,12 +1384,24 @@ impl ObjectStorageAdapter {
                     )
                 })
             }
-            UriCodec::Memory => ObjectPath::parse(uri.trim_start_matches('/')).map_err(|err| {
-                StorageError::backend(
-                    StorageFailureKind::Configuration,
-                    format!("invalid memory object path for '{}': {}", uri, err),
-                )
-            }),
+            UriCodec::Memory => {
+                // DST: accept the harness's scheme-carrying roots
+                // (shared-memory://name/key) — that scheme is namespacing
+                // only; the authority+path becomes the opaque key. Only
+                // this one scheme, and only under `dst`: default builds
+                // keep the base behavior (scheme-carrying keys error in
+                // ObjectPath::parse).
+                #[cfg(feature = "dst")]
+                let key = uri.strip_prefix(SHARED_MEMORY_SCHEME_PREFIX).unwrap_or(uri);
+                #[cfg(not(feature = "dst"))]
+                let key = uri;
+                ObjectPath::parse(key.trim_start_matches('/')).map_err(|err| {
+                    StorageError::backend(
+                        StorageFailureKind::Configuration,
+                        format!("invalid memory object path for '{}': {}", uri, err),
+                    )
+                })
+            }
         }
     }
 
@@ -1476,6 +1494,35 @@ impl ObjectStorageAdapter {
             return StorageError::io_context(link_error, message);
         }
         storage_backend_error("write_if_absent", uri, err)
+    }
+
+    /// DST-only bottom-count listing: every key currently held by the
+    /// backing store, flat, no prefix filter. This reads BELOW every
+    /// harness wrapper (the store itself is the one surface a bypass
+    /// writer cannot avoid), so the DST write census can reconcile
+    /// wrapper-recorded writes against ground truth. Hidden like the
+    /// engine's dst seams; not part of the storage contract.
+    ///
+    /// UNBOUNDED and unscoped by design (census roots are universe-sized;
+    /// a partial listing would hide exactly the bypass writes it exists
+    /// to find) — census use on universe-scoped roots only; on a
+    /// local-filesystem adapter it walks the store's whole root.
+    ///
+    /// # Errors
+    /// When the backing store's listing fails.
+    #[doc(hidden)]
+    #[cfg(feature = "dst")]
+    pub async fn dst_list_all_keys(&self) -> Result<Vec<String>> {
+        let listing: Vec<object_store::ObjectMeta> = self
+            .store
+            .list(None)
+            .try_collect()
+            .await
+            .map_err(|err| storage_backend_error("dst_list_all_keys", "<all>", err))?;
+        Ok(listing
+            .into_iter()
+            .map(|meta| meta.location.to_string())
+            .collect())
     }
 }
 
@@ -2032,6 +2079,15 @@ impl StorageAdapter for ObjectStorageAdapter {
 }
 
 pub fn storage_kind_for_uri(uri: &str) -> Result<StorageKind> {
+    // `shared-memory://` is the DST harness's in-memory scheme (Lance's
+    // shared-memory provider). Classified Local: universes need Local
+    // layout/probe semantics while all IO is served by the injected
+    // adapter. Gated on `dst`, so production builds refuse the scheme
+    // like any unknown one.
+    #[cfg(feature = "dst")]
+    if uri.starts_with(SHARED_MEMORY_SCHEME_PREFIX) {
+        return Ok(StorageKind::Local);
+    }
     if uri.starts_with(S3_SCHEME_PREFIX) {
         Ok(StorageKind::S3)
     } else if uri.starts_with(AZURE_SCHEME_PREFIX) {
@@ -2074,6 +2130,14 @@ pub fn storage_handle_for_uri(uri: &str) -> Result<StorageHandle> {
 }
 
 pub fn normalize_root_uri(uri: &str) -> Result<String> {
+    // DST: Lance's `shared-memory://` scheme is opaque —
+    // normalized like other object-store URIs, never as a local path.
+    // Gated like the classification arm below, so production builds
+    // refuse the scheme at every step.
+    #[cfg(feature = "dst")]
+    if uri.starts_with(SHARED_MEMORY_SCHEME_PREFIX) {
+        return Ok(trim_trailing_slashes(uri));
+    }
     match storage_kind_for_uri(uri)? {
         StorageKind::Local => {
             let path = local_path_from_uri(uri)?;

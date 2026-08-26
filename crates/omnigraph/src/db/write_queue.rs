@@ -48,6 +48,92 @@ use tokio::sync::{
     RwLock as AsyncRwLock,
 };
 
+/// DST seam: one write-queue slot — the lock plus its RELEASE EPOCH.
+/// The epoch closes an arrival-order leak: without it the mutex RELEASE
+/// is an ungated event, so a contender's retry races the holder's guard
+/// drop and same-seed runs diverge. With the epoch, releases are
+/// TURN-ORDERED (see `QueueGuard`) and a contender re-attempts only
+/// after observing a release — ordered strictly after the unlock, never
+/// racing it.
+pub(crate) struct QueueSlot {
+    lock: Arc<AsyncMutex<()>>,
+    releases: std::sync::atomic::AtomicU64,
+}
+
+impl QueueSlot {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            lock: Arc::new(AsyncMutex::new(())),
+            releases: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+/// A held write-queue lock whose RELEASE is visible to the harness arbiter:
+/// dropping it takes a turn (when the gate hook is installed), unlocks
+/// INSIDE that turn, and bumps the slot's release epoch — so an unlock is a
+/// scheduled event with a deterministic position in the grant sequence,
+/// exactly like the acquisition attempts. Uninstalled: a plain unlock.
+pub(crate) struct QueueGuard {
+    inner: Option<OwnedMutexGuard<()>>,
+    slot: Arc<QueueSlot>,
+}
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        // Turn first (None when uninstalled/unarmed — plain path), unlock
+        // under it, bump the epoch last: a waiter that observes the bump
+        // sees a lock that is genuinely free.
+        let _turn = crate::dst_gate::turn();
+        drop(self.inner.take());
+        self.slot
+            .releases
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Scheduled lock acquisition. Uninstalled (or hook declining): plain
+/// blocking `lock_owned`. Installed: the contender STAYS IN THE TURN LOOP
+/// the whole time — always visible and drawable at the arbiter (a
+/// turn-free wait was measured to reproduce the invisibility disease as
+/// systematic escapes) — but a granted turn ATTEMPTS the lock only when
+/// the slot's release epoch has advanced past the last failed attempt
+/// (epoch read UNDER the turn, so it is turn-ordered); otherwise the turn
+/// is a deterministic no-op. Attempts therefore never race the unlock
+/// (releases bump the epoch inside their own turns, see `QueueGuard`),
+/// and every event — attempt, no-op, release — has a seeded position in
+/// the grant sequence.
+async fn scheduled_lock(slot: Arc<QueueSlot>) -> QueueGuard {
+    let mut wait_epoch: Option<u64> = None;
+    loop {
+        match crate::dst_gate::turn() {
+            None => {
+                let guard = Arc::clone(&slot.lock).lock_owned().await;
+                return QueueGuard {
+                    inner: Some(guard),
+                    slot,
+                };
+            }
+            Some(_turn) => {
+                let epoch_now = slot.releases.load(std::sync::atomic::Ordering::SeqCst);
+                if wait_epoch.is_none_or(|e| epoch_now != e) {
+                    match Arc::clone(&slot.lock).try_lock_owned() {
+                        Ok(guard) => {
+                            return QueueGuard {
+                                inner: Some(guard),
+                                slot: Arc::clone(&slot),
+                            };
+                        }
+                        Err(_) => wait_epoch = Some(epoch_now),
+                    }
+                }
+                // else: no release since the failed attempt — a no-op turn.
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Queue key: `(table_key, branch_ref)`. `branch_ref = None` means main.
 ///
 /// Branch is part of the key because the same Lance dataset can be
@@ -88,7 +174,7 @@ pub(crate) struct ExportDestructivePermit {
 pub(crate) struct WriteQueueManager {
     /// Held only briefly per `acquire` call: clone out the per-key Arc,
     /// release the std mutex, then await the per-key tokio Mutex.
-    queues: Mutex<HashMap<TableQueueKey, Arc<AsyncMutex<()>>>>,
+    queues: Mutex<HashMap<TableQueueKey, Arc<QueueSlot>>>,
     /// Coarse per-branch effect gate used by sidecar-backed RFC-022 writers.
     ///
     /// This is deliberately separate from `queues`: a branch is authority,
@@ -96,7 +182,7 @@ pub(crate) struct WriteQueueManager {
     /// acquire this gate before any table queue and hold it through manifest
     /// publication; explicit authority/physical exceptions follow their own
     /// registered ordering contracts.
-    branch_queues: Mutex<HashMap<Option<String>, Arc<AsyncMutex<()>>>>,
+    branch_queues: Mutex<HashMap<Option<String>, Arc<QueueSlot>>>,
     /// One immutable export owns the write side through output. Cooperative
     /// destructive controls share the read side, so they remain mutually
     /// concurrent but cannot remove a path/version beneath a live cut.
@@ -127,17 +213,17 @@ impl WriteQueueManager {
     }
 
     /// Get-or-create the per-key queue and clone its Arc.
-    fn slot(&self, key: &TableQueueKey) -> Arc<AsyncMutex<()>> {
+    fn slot(&self, key: &TableQueueKey) -> Arc<QueueSlot> {
         let mut map = self.queues.lock().expect("write queue map poisoned");
         if let Some(existing) = map.get(key) {
             return Arc::clone(existing);
         }
-        let fresh = Arc::new(AsyncMutex::new(()));
+        let fresh = QueueSlot::new();
         map.insert(key.clone(), Arc::clone(&fresh));
         fresh
     }
 
-    fn branch_slot(&self, branch: &Option<String>) -> Arc<AsyncMutex<()>> {
+    fn branch_slot(&self, branch: &Option<String>) -> Arc<QueueSlot> {
         let mut map = self
             .branch_queues
             .lock()
@@ -145,7 +231,7 @@ impl WriteQueueManager {
         if let Some(existing) = map.get(branch) {
             return Arc::clone(existing);
         }
-        let fresh = Arc::new(AsyncMutex::new(()));
+        let fresh = QueueSlot::new();
         map.insert(branch.clone(), Arc::clone(&fresh));
         fresh
     }
@@ -155,9 +241,9 @@ impl WriteQueueManager {
     /// RFC-022-enrolled callers MUST acquire this before any per-table queue.
     /// It is an in-process contention optimization only; publisher OCC and
     /// recovery remain the correctness authorities.
-    pub(crate) async fn acquire_branch(&self, branch: Option<&str>) -> OwnedMutexGuard<()> {
+    pub(crate) async fn acquire_branch(&self, branch: Option<&str>) -> QueueGuard {
         let key = branch.map(str::to_string);
-        self.branch_slot(&key).lock_owned().await
+        scheduled_lock(self.branch_slot(&key)).await
     }
 
     /// Reserve the sole immutable export cut without waiting.
@@ -189,10 +275,7 @@ impl WriteQueueManager {
     /// both incarnations must remain stable across its fresh revalidation and
     /// visibility point. Sorting/deduping gives branch control the same
     /// deadlock-free acquisition rule as [`Self::acquire_many`] gives tables.
-    pub(crate) async fn acquire_branches(
-        &self,
-        branches: &[Option<String>],
-    ) -> Vec<OwnedMutexGuard<()>> {
+    pub(crate) async fn acquire_branches(&self, branches: &[Option<String>]) -> Vec<QueueGuard> {
         if branches.is_empty() {
             return Vec::new();
         }
@@ -201,7 +284,7 @@ impl WriteQueueManager {
         sorted.dedup();
         let mut guards = Vec::with_capacity(sorted.len());
         for branch in sorted {
-            guards.push(self.branch_slot(&branch).lock_owned().await);
+            guards.push(scheduled_lock(self.branch_slot(&branch)).await);
         }
         guards
     }
@@ -210,8 +293,8 @@ impl WriteQueueManager {
     ///
     /// Blocks until the lock is available. Drop the returned guard to
     /// release; the lock outlives the `WriteQueueManager` borrow.
-    pub(crate) async fn acquire(&self, key: &TableQueueKey) -> OwnedMutexGuard<()> {
-        self.slot(key).lock_owned().await
+    pub(crate) async fn acquire(&self, key: &TableQueueKey) -> QueueGuard {
+        scheduled_lock(self.slot(key)).await
     }
 
     /// Acquire exclusive access to many `(table_key, branch)` keys
@@ -222,7 +305,7 @@ impl WriteQueueManager {
     /// Empty input returns an empty Vec without touching the map.
     /// Duplicates in `keys` are deduped before acquisition (the same
     /// key acquired twice would deadlock against itself).
-    pub(crate) async fn acquire_many(&self, keys: &[TableQueueKey]) -> Vec<OwnedMutexGuard<()>> {
+    pub(crate) async fn acquire_many(&self, keys: &[TableQueueKey]) -> Vec<QueueGuard> {
         if keys.is_empty() {
             return Vec::new();
         }
