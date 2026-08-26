@@ -308,8 +308,10 @@ const FILE_SCHEME_PREFIX: &str = "file://";
 const S3_SCHEME_PREFIX: &str = "s3://";
 const AZURE_SCHEME_PREFIX: &str = "az://";
 /// The DST harness's opaque in-memory scheme (Lance's shared-memory
-/// provider). Named beside its siblings; the `dst`-gated classification
-/// arm and the URI normalizer both match on it.
+/// provider). Named beside its siblings; every user (the classification
+/// arm, the URI normalizer, the Memory-codec strip) is `dst`-gated, so
+/// the const is too.
+#[cfg(feature = "dst")]
 const SHARED_MEMORY_SCHEME_PREFIX: &str = "shared-memory://";
 const DEFAULT_AZURITE_BLOB_STORAGE_URL: &str = "http://127.0.0.1:10000";
 // Keep the Azure GET -> multipart PUT rename envelope bounded. Five MiB is
