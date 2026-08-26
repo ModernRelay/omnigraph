@@ -58,12 +58,9 @@ jobs:
           workspaces: |
             . -> target
           key: dst
-          # TEMPORARY while #527 iterates: PR runs may seed the cache so
-          # each push does not repeat the ~30 min cold build. Restore
-          # `save-if: ${{ github.event_name == 'push' }}` before merge —
-          # push-only saving protects the long-lived main cache from PR
-          # eviction churn.
-          save-if: true
+          # Push-only saving protects the long-lived main cache from PR
+          # eviction churn; PR runs still restore from it.
+          save-if: ${{ github.event_name == 'push' }}
 
       # The whole active suite: lib proofs (arbiter, judges, classifiers,
       # census guards) + scenario pins + the torn-init pin. Instruments
