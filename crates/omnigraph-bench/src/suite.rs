@@ -154,27 +154,24 @@ pub fn validate_suite(suite: SuiteV1) -> ValidationOutcome<SuiteV1> {
     }
 }
 
-/// Load a suite and all referenced case files relative to the suite location.
+/// Load a suite and all referenced case files from one benchmark catalog.
 ///
-/// Canonical paths, human case ids, and full point ids must each be unique.
+/// The suite must be directly inside `<catalog>/suites`. Case references remain
+/// relative to the suite file, but their canonical targets must stay inside
+/// `<catalog>/cases`. Canonical paths, human case ids, and full point ids must
+/// each be unique.
 pub fn load_suite(path: &Path) -> ValidationOutcome<ResolvedSuite> {
-    let source = match read_yaml_file(path, "suite") {
+    let (suite_path, cases_root) = match resolve_catalog_paths(path) {
+        Ok(paths) => paths,
+        Err(diagnostic) => return ValidationOutcome::failure(vec![diagnostic]),
+    };
+    let source = match read_yaml_file(&suite_path, "suite") {
         Ok(source) => source,
         Err(diagnostic) => return ValidationOutcome::failure(vec![diagnostic]),
     };
     let definition = match parse_suite(&source).into_result() {
         Ok(suite) => suite,
         Err(diagnostics) => return ValidationOutcome::failure(diagnostics),
-    };
-    let suite_path = match fs::canonicalize(path) {
-        Ok(path) => path,
-        Err(error) => {
-            return ValidationOutcome::failure(vec![Diagnostic::error(
-                "suite_path_error",
-                path.display().to_string(),
-                format!("could not resolve suite path: {error}"),
-            )]);
-        }
     };
     let suite_dir = suite_path
         .parent()
@@ -197,6 +194,18 @@ pub fn load_suite(path: &Path) -> ValidationOutcome<ResolvedSuite> {
                 continue;
             }
         };
+        if !case_path.starts_with(&cases_root) {
+            diagnostics.push(Diagnostic::error(
+                "case_outside_catalog",
+                format!("runs[{index}].case"),
+                format!(
+                    "case resolves outside the catalog cases directory '{}': {}",
+                    cases_root.display(),
+                    case_path.display()
+                ),
+            ));
+            continue;
+        }
         if let Some(first) = canonical_paths.insert(case_path.clone(), index) {
             diagnostics.push(Diagnostic::error(
                 "duplicate_case_path",
@@ -234,6 +243,78 @@ pub fn load_suite(path: &Path) -> ValidationOutcome<ResolvedSuite> {
         definition,
         suite_path,
         runs,
+    })
+}
+
+fn resolve_catalog_paths(path: &Path) -> Result<(PathBuf, PathBuf), Diagnostic> {
+    let declared_suites_root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if declared_suites_root
+        .file_name()
+        .is_none_or(|name| name != "suites")
+    {
+        return Err(Diagnostic::error(
+            "suite_catalog_layout_error",
+            path.display().to_string(),
+            "suite file must be directly inside a benchmark catalog's 'suites' directory",
+        ));
+    }
+    let declared_catalog_root = declared_suites_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let catalog_root = canonicalize_catalog_path(declared_catalog_root, "catalog root")?;
+    let suites_root = canonicalize_catalog_path(
+        &declared_catalog_root.join("suites"),
+        "catalog suites directory",
+    )?;
+    let cases_root = canonicalize_catalog_path(
+        &declared_catalog_root.join("cases"),
+        "catalog cases directory",
+    )?;
+
+    if suites_root.parent() != Some(catalog_root.as_path())
+        || cases_root.parent() != Some(catalog_root.as_path())
+        || suites_root == cases_root
+    {
+        return Err(Diagnostic::error(
+            "catalog_directory_escape",
+            catalog_root.display().to_string(),
+            "the catalog's 'suites' and 'cases' directories must resolve to distinct direct children of its root",
+        ));
+    }
+
+    let suite_path = fs::canonicalize(path).map_err(|error| {
+        Diagnostic::error(
+            "suite_path_error",
+            path.display().to_string(),
+            format!("could not resolve suite path: {error}"),
+        )
+    })?;
+    if suite_path.parent() != Some(suites_root.as_path()) {
+        return Err(Diagnostic::error(
+            "suite_outside_catalog",
+            path.display().to_string(),
+            format!(
+                "suite resolves outside the catalog suites directory '{}': {}",
+                suites_root.display(),
+                suite_path.display()
+            ),
+        ));
+    }
+
+    Ok((suite_path, cases_root))
+}
+
+fn canonicalize_catalog_path(path: &Path, label: &str) -> Result<PathBuf, Diagnostic> {
+    fs::canonicalize(path).map_err(|error| {
+        Diagnostic::error(
+            "catalog_path_error",
+            path.display().to_string(),
+            format!("could not resolve {label}: {error}"),
+        )
     })
 }
 
@@ -281,7 +362,7 @@ scenario: branch-merge-v1
 fixture:
   builder: { kind: synthetic-branch-merge, version: 1, seed: 0 }
   data: { provenance: synthetic, tables: 8, rows_per_table: 1000, payload_bytes: 64, column_shape: scalars, topology_skew: uniform }
-  state: { aging: bulk-loaded, indexes: [], deletion_history: none, compaction_recency: optimized, history_depth: 1 }
+  state: { aging: bulk-loaded, indexes: [], deletion_history: none, compaction_recency: not-optimized, history_depth: 1 }
 workload: { delta_rows_per_side: 50, diverged_tables: 4, arrival: unscheduled-single-shot, clients: 1, read_write_mix: write-heavy, contention: distinct-key }
 environment:
   backend: { kind: local-fs, filesystem: apfs, storage_class: nvme-ssd }
@@ -297,13 +378,18 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
         )
     }
 
+    fn catalog(root: &Path) -> (PathBuf, PathBuf) {
+        let cases = root.join("cases");
+        let suites = root.join("suites");
+        fs::create_dir_all(&cases).unwrap();
+        fs::create_dir_all(&suites).unwrap();
+        (cases, suites)
+    }
+
     #[test]
     fn resolves_relative_cases_and_keeps_quantity_outside_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let cases = dir.path().join("cases");
-        let suites = dir.path().join("suites");
-        fs::create_dir_all(&cases).unwrap();
-        fs::create_dir_all(&suites).unwrap();
+        let (cases, suites) = catalog(dir.path());
         fs::write(cases.join("base.yaml"), CASE).unwrap();
         let suite_path = suites.join("smoke.yaml");
         fs::write(&suite_path, suite("../cases/base.yaml", 5)).unwrap();
@@ -318,11 +404,12 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
     #[test]
     fn rejects_duplicate_paths_after_resolution() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("case.yaml"), CASE).unwrap();
-        let suite_path = dir.path().join("suite.yaml");
+        let (cases, suites) = catalog(dir.path());
+        fs::write(cases.join("case.yaml"), CASE).unwrap();
+        let suite_path = suites.join("suite.yaml");
         fs::write(
             &suite_path,
-            "version: 1\nname: duplicates\nruns:\n  - { case: case.yaml, repetitions: 5 }\n  - { case: ./case.yaml, repetitions: 5 }\n",
+            "version: 1\nname: duplicates\nruns:\n  - { case: ../cases/case.yaml, repetitions: 5 }\n  - { case: ../cases/./case.yaml, repetitions: 5 }\n",
         )
         .unwrap();
         let outcome = load_suite(&suite_path);
@@ -337,21 +424,22 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
     #[test]
     fn rejects_duplicate_case_and_point_ids_independently() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.yaml"), CASE).unwrap();
+        let (cases, suites) = catalog(dir.path());
+        fs::write(cases.join("a.yaml"), CASE).unwrap();
         fs::write(
-            dir.path().join("same-id.yaml"),
+            cases.join("same-id.yaml"),
             CASE.replace("delta_rows_per_side: 50", "delta_rows_per_side: 51"),
         )
         .unwrap();
         fs::write(
-            dir.path().join("same-point.yaml"),
+            cases.join("same-point.yaml"),
             CASE.replace("id: base-case", "id: another-case"),
         )
         .unwrap();
-        let suite_path = dir.path().join("suite.yaml");
+        let suite_path = suites.join("suite.yaml");
         fs::write(
             &suite_path,
-            "version: 1\nname: duplicates\nruns:\n  - { case: a.yaml, repetitions: 5 }\n  - { case: same-id.yaml, repetitions: 5 }\n  - { case: same-point.yaml, repetitions: 5 }\n",
+            "version: 1\nname: duplicates\nruns:\n  - { case: ../cases/a.yaml, repetitions: 5 }\n  - { case: ../cases/same-id.yaml, repetitions: 5 }\n  - { case: ../cases/same-point.yaml, repetitions: 5 }\n",
         )
         .unwrap();
         let codes: Vec<_> = load_suite(&suite_path)
@@ -361,6 +449,89 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
             .collect();
         assert!(codes.contains(&"duplicate_case_id".to_string()));
         assert!(codes.contains(&"duplicate_point_id".to_string()));
+    }
+
+    #[test]
+    fn rejects_parent_traversal_outside_the_case_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog_root = dir.path().join("catalog");
+        let (_cases, suites) = catalog(&catalog_root);
+        fs::write(dir.path().join("outside.yaml"), "not: [valid").unwrap();
+        let suite_path = suites.join("escape.yaml");
+        fs::write(&suite_path, suite("../../outside.yaml", 5)).unwrap();
+
+        let outcome = load_suite(&suite_path);
+
+        assert_eq!(outcome.diagnostics[0].code, "case_outside_catalog");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_case_symlinks_that_escape_the_catalog() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog_root = dir.path().join("catalog");
+        let (cases, suites) = catalog(&catalog_root);
+        let outside = dir.path().join("outside.yaml");
+        fs::write(&outside, "not: [valid").unwrap();
+        symlink(&outside, cases.join("escape.yaml")).unwrap();
+        let suite_path = suites.join("escape.yaml");
+        fs::write(&suite_path, suite("../cases/escape.yaml", 5)).unwrap();
+
+        let outcome = load_suite(&suite_path);
+
+        assert_eq!(outcome.diagnostics[0].code, "case_outside_catalog");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_cases_directory_symlinks_that_escape_the_catalog() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog_root = dir.path().join("catalog");
+        let suites = catalog_root.join("suites");
+        let outside_cases = dir.path().join("outside-cases");
+        fs::create_dir_all(&suites).unwrap();
+        fs::create_dir_all(&outside_cases).unwrap();
+        fs::write(outside_cases.join("base.yaml"), CASE).unwrap();
+        symlink(&outside_cases, catalog_root.join("cases")).unwrap();
+        let suite_path = suites.join("escape.yaml");
+        fs::write(&suite_path, suite("../cases/base.yaml", 5)).unwrap();
+
+        let outcome = load_suite(&suite_path);
+
+        assert_eq!(outcome.diagnostics[0].code, "catalog_directory_escape");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_suite_symlinks_that_escape_the_catalog() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog_root = dir.path().join("catalog");
+        let (_cases, suites) = catalog(&catalog_root);
+        let outside = dir.path().join("outside-suite.yaml");
+        fs::write(&outside, "not: [valid").unwrap();
+        let suite_path = suites.join("escape.yaml");
+        symlink(&outside, &suite_path).unwrap();
+
+        let outcome = load_suite(&suite_path);
+
+        assert_eq!(outcome.diagnostics[0].code, "suite_outside_catalog");
+    }
+
+    #[test]
+    fn rejects_suites_without_a_catalog_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let suite_path = dir.path().join("suite.yaml");
+        fs::write(&suite_path, suite("case.yaml", 5)).unwrap();
+
+        let outcome = load_suite(&suite_path);
+
+        assert_eq!(outcome.diagnostics[0].code, "suite_catalog_layout_error");
     }
 
     #[test]

@@ -9,8 +9,11 @@ records, fixtures, or result storage.
 
 - `cases/*.case-v1.yaml` assigns the fixture, workload, environment, and
   protocol for one point.
-- `suites/*.suite-v1.yaml` lists cases to run. A `case` path is resolved
-  relative to the suite file that contains it.
+- `suites/*.suite-v1.yaml` lists cases to run. Suite files live directly in
+  `suites/`, whose parent is the authoritative catalog root. A `case` path is
+  resolved relative to the suite file that contains it, and its canonical
+  target must remain under the same catalog's `cases/` directory. Suite and
+  referenced-case symlinks cannot escape the catalog.
 
 The `version` field selects the document schema. Keep identifiers and enum
 values in kebab-case. The scenario and fixture-builder versions identify the
@@ -18,7 +21,15 @@ code contracts that interpret the remaining typed fields.
 
 Index state is an inventory rather than a global label. Use `indexes: []` for
 an unindexed fixture; each indexed entry names its `table`, `column`, `kind`,
-and `freshness`.
+and `freshness`. Synthetic branch-merge builder v1 supports only
+`compaction_recency: not-optimized`, because OmniGraph optimization
+materializes physical indexes outside this builder's exact inventory contract.
+
+`protocol.deadline_seconds` is required. Set it to an integer from 1 through
+3600, or to YAML `null` when the measured operation has no deadline; the
+executor must still enforce a separate bounded safety watchdog. Leading and
+trailing whitespace in S3 identity fields and index table/column names is
+normalized before validation and hashing.
 
 Case definitions deliberately contain no source branch, system-under-test
 build, machine identity, AWS account, bucket URI, result location, or

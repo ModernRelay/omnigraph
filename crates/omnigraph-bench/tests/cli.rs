@@ -93,11 +93,12 @@ fn suite_plan_resolves_relative_cases_and_supports_selection() {
     assert_eq!(plan["runs"].as_array().expect("runs").len(), 1);
     assert_eq!(plan["runs"][0]["case_id"], "branch-merge-d50-warm");
     assert_eq!(plan["runs"][0]["repetitions"], 5);
-    // This is the persisted V1 natural key. A deliberate canonicalization
-    // change must bump POINT_IDENTITY_VERSION and update this fixture together.
+    // This is the persisted V1 natural key for the checked-in point. An
+    // identity-serialization change must bump POINT_IDENTITY_VERSION; a
+    // deliberate factor change must update this fixture.
     assert_eq!(
         plan["runs"][0]["point_id"],
-        "e650c176e94d26a73ae88cd1f66a23a9409fd8dc65bb20195af7031a45eff40c"
+        "a23df610a3cdb76315b55753c935d6d2c129122175f4e4f288552211ec205e30"
     );
 }
 

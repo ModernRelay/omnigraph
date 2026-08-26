@@ -359,11 +359,22 @@ pub enum WarmthProgram {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Protocol {
-    pub deadline_seconds: u64,
+    /// Measured-operation deadline. An explicit YAML `null` means no
+    /// measurement deadline; the runner's independent supervisor watchdog
+    /// remains bounded either way.
+    #[serde(deserialize_with = "deserialize_required_optional_deadline")]
+    pub deadline_seconds: Option<u64>,
     pub attribution: Attribution,
     pub schedule: Schedule,
     pub reset: ResetMode,
     pub timer: Timer,
+}
+
+fn deserialize_required_optional_deadline<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -466,6 +477,7 @@ pub fn load_case(path: &Path) -> ValidationOutcome<ValidatedCase> {
 
 /// Check cross-field invariants and derive stable identities.
 pub fn validate_case(mut definition: CaseV1) -> ValidationOutcome<ValidatedCase> {
+    normalize_identity_strings(&mut definition);
     let mut diagnostics = Vec::new();
     if definition.version != CASE_FORMAT_VERSION {
         diagnostics.push(Diagnostic::error(
@@ -507,6 +519,7 @@ pub fn validate_case(mut definition: CaseV1) -> ValidationOutcome<ValidatedCase>
         &definition.fixture.state.indexes,
         &mut diagnostics,
     );
+    validate_fixture_state(&definition.fixture, &mut diagnostics);
     validate_workload(&definition, &mut diagnostics);
     validate_warmth(&definition.environment.warmth, &mut diagnostics);
     validate_backend_protocol(&definition, &mut diagnostics);
@@ -543,6 +556,24 @@ pub fn validate_case(mut definition: CaseV1) -> ValidationOutcome<ValidatedCase>
         case_digest,
         point_name,
     })
+}
+
+fn normalize_identity_strings(case: &mut CaseV1) {
+    for index in &mut case.fixture.state.indexes {
+        index.table = index.table.trim().to_owned();
+        index.column = index.column.trim().to_owned();
+    }
+    if let Backend::S3 {
+        implementation_version,
+        region,
+        storage_class,
+        ..
+    } = &mut case.environment.backend
+    {
+        *implementation_version = implementation_version.trim().to_owned();
+        *region = region.trim().to_owned();
+        *storage_class = storage_class.trim().to_owned();
+    }
 }
 
 impl WarmthRegime {
@@ -692,6 +723,19 @@ fn validate_fixture_scale(fixture: &Fixture, diagnostics: &mut Vec<Diagnostic>) 
     }
 }
 
+fn validate_fixture_state(fixture: &Fixture, diagnostics: &mut Vec<Diagnostic>) {
+    if fixture.builder.kind == FixtureBuilderKind::SyntheticBranchMerge
+        && fixture.builder.version == 1
+        && fixture.state.compaction_recency == CompactionRecency::Optimized
+    {
+        diagnostics.push(Diagnostic::error(
+            "impossible_optimized_index_state",
+            "fixture.state.compaction_recency",
+            "synthetic-branch-merge builder v1 cannot truthfully declare optimized state because OmniGraph optimization materializes indexes outside this builder's exact inventory contract; use not-optimized",
+        ));
+    }
+}
+
 fn validate_indexes(
     column_shape: ColumnShape,
     indexes: &[IndexSpec],
@@ -776,12 +820,14 @@ fn valid_sha256_image_digest(value: &str) -> bool {
 fn validate_backend_protocol(case: &CaseV1, diagnostics: &mut Vec<Diagnostic>) {
     let environment = &case.environment;
     let protocol = &case.protocol;
-    if !(1..=MAX_DEADLINE_SECONDS).contains(&protocol.deadline_seconds) {
-        diagnostics.push(Diagnostic::error(
-            "invalid_deadline",
-            "protocol.deadline_seconds",
-            format!("deadline_seconds must be in 1..={MAX_DEADLINE_SECONDS}"),
-        ));
+    if let Some(deadline_seconds) = protocol.deadline_seconds {
+        if !(1..=MAX_DEADLINE_SECONDS).contains(&deadline_seconds) {
+            diagnostics.push(Diagnostic::error(
+                "invalid_deadline",
+                "protocol.deadline_seconds",
+                format!("deadline_seconds must be null or in 1..={MAX_DEADLINE_SECONDS}"),
+            ));
+        }
     }
     if protocol.schedule != Schedule::Manual {
         diagnostics.push(Diagnostic::error(
@@ -926,7 +972,7 @@ fixture:
     aging: bulk-loaded
     indexes: []
     deletion_history: none
-    compaction_recency: optimized
+    compaction_recency: not-optimized
     history_depth: 1
 workload:
   delta_rows_per_side: 50
@@ -1098,7 +1144,7 @@ protocol:
     }
 
     #[test]
-    fn index_inventory_order_is_not_identity_but_duplicate_keys_are_invalid() {
+    fn index_inventory_is_normalized_before_identity_and_duplicate_checks() {
         let first_yaml = VALID.replace(
             "indexes: []",
             "indexes:\n      - { table: n0, column: id, kind: btree, freshness: optimized }\n      - { table: n1, column: name, kind: fts, freshness: rows-stale }",
@@ -1112,12 +1158,30 @@ protocol:
         assert_eq!(first.point_id, second.point_id);
         assert_eq!(first.case_digest, second.case_digest);
 
+        let padded_yaml = first_yaml
+            .replace("table: n0", "table: ' n0 '")
+            .replace("column: id", "column: ' id '");
+        let padded = parse_case(&padded_yaml).into_result().unwrap();
+        assert_eq!(first.point_id, padded.point_id);
+        assert_eq!(first.case_digest, padded.case_digest);
+
         let duplicate = first_yaml.replace(
             "      - { table: n1, column: name, kind: fts, freshness: rows-stale }",
             "      - { table: n0, column: id, kind: btree, freshness: rows-stale }",
         );
         assert!(
             parse_case(&duplicate)
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "duplicate_index")
+        );
+
+        let padded_duplicate = first_yaml.replace(
+            "      - { table: n1, column: name, kind: fts, freshness: rows-stale }",
+            "      - { table: ' n0 ', column: ' id ', kind: btree, freshness: rows-stale }",
+        );
+        assert!(
+            parse_case(&padded_duplicate)
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "duplicate_index")
@@ -1133,6 +1197,27 @@ protocol:
                 .iter()
                 .any(|diagnostic| diagnostic.code == "impossible_index_inventory")
         );
+    }
+
+    #[test]
+    fn builder_v1_rejects_optimized_fixture_state_for_any_index_inventory() {
+        let optimized = VALID.replace(
+            "compaction_recency: not-optimized",
+            "compaction_recency: optimized",
+        );
+        let partial_inventory = optimized.replace(
+            "indexes: []",
+            "indexes:\n      - { table: n0, column: id, kind: btree, freshness: optimized }",
+        );
+        for yaml in [optimized, partial_inventory] {
+            let outcome = parse_case(&yaml);
+            assert!(!outcome.ok);
+            assert!(outcome.value.is_none());
+            assert!(outcome.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "impossible_optimized_index_state"
+                    && diagnostic.path == "fixture.state.compaction_recency"
+            }));
+        }
     }
 
     #[test]
@@ -1236,7 +1321,23 @@ protocol:
     }
 
     #[test]
-    fn deadline_is_bounded() {
+    fn deadline_is_explicit_bounded_or_none_and_remains_identity() {
+        let bounded = valid();
+        let none = parse_case(&VALID.replace("deadline_seconds: 60", "deadline_seconds: null"))
+            .into_result()
+            .unwrap();
+        assert_eq!(none.definition.protocol.deadline_seconds, None);
+        assert_eq!(
+            serde_json::to_value(&none.identity).unwrap()["protocol"]["deadline_seconds"],
+            serde_json::Value::Null
+        );
+        assert_ne!(bounded.point_id, none.point_id);
+
+        let thirty = parse_case(&VALID.replace("deadline_seconds: 60", "deadline_seconds: 30"))
+            .into_result()
+            .unwrap();
+        assert_ne!(bounded.point_id, thirty.point_id);
+
         for seconds in [0, MAX_DEADLINE_SECONDS + 1] {
             assert!(
                 parse_case(&VALID.replace(
@@ -1248,6 +1349,12 @@ protocol:
                 .any(|diagnostic| diagnostic.code == "invalid_deadline")
             );
         }
+
+        let missing = VALID.replace("  deadline_seconds: 60\n", "");
+        assert_eq!(
+            parse_case(&missing).diagnostics[0].code,
+            "invalid_case_yaml"
+        );
     }
 
     #[test]
@@ -1266,6 +1373,33 @@ protocol:
             "network_position: same-host",
         );
         assert!(parse_case(&same_host_minio).ok);
+    }
+
+    #[test]
+    fn s3_identity_strings_are_normalized_before_validation_and_hashing() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let canonical = parse_case(&s3_case("minio", "release-1", "enabled", Some(&digest)))
+            .into_result()
+            .unwrap();
+        let padded_yaml = s3_case("minio", "' release-1 '", "enabled", Some(&digest))
+            .replace("region: us-east-1", "region: ' us-east-1 '")
+            .replace("storage_class: standard", "storage_class: ' standard '");
+        let padded = parse_case(&padded_yaml).into_result().unwrap();
+
+        assert_eq!(canonical.point_id, padded.point_id);
+        assert_eq!(canonical.case_digest, padded.case_digest);
+        let Backend::S3 {
+            implementation_version,
+            region,
+            storage_class,
+            ..
+        } = padded.definition.environment.backend
+        else {
+            panic!("expected S3 backend");
+        };
+        assert_eq!(implementation_version, "release-1");
+        assert_eq!(region, "us-east-1");
+        assert_eq!(storage_class, "standard");
     }
 
     #[test]

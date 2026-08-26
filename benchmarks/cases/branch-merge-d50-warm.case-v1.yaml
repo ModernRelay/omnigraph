@@ -18,7 +18,7 @@ fixture:
     aging: bulk-loaded
     indexes: []
     deletion_history: none
-    compaction_recency: optimized
+    compaction_recency: not-optimized
     history_depth: 1
 
 workload:
