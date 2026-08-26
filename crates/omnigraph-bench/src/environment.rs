@@ -204,11 +204,10 @@ fn storage_name(storage: LocalStorageClass) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn parses_diskutil_fields_without_accepting_prefixes() {
         let output = "   Type (Bundle): apfs\n   Protocol: Apple Fabric\n";
@@ -217,7 +216,6 @@ mod tests {
         assert!(probe_value(output, "Type").is_err());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn parses_df_capacity_and_mounts_with_spaces() {
         let output = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk1 1000 250 750 25% /Volumes/Fast Disk\n";
@@ -226,7 +224,6 @@ mod tests {
         assert_eq!(mount.available_bytes, 750 * 1024);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn classifies_only_proved_internal_ssd_protocols() {
         assert_eq!(
