@@ -15,7 +15,9 @@ pub(crate) fn maybe_fail(_name: &str) -> Result<(), Diagnostic> {
     #[cfg(feature = "failpoints")]
     {
         let name = _name;
-        fail::fail_point!(name, |_| {
+        // The cluster consults the ENGINE's shared registry, so one
+        // `ScopedFailPoint` configures both crates' points.
+        fail_parallel::fail_point!(omnigraph::failpoints::registry(), name, |_| {
             Err(Diagnostic::error(
                 "injected_failpoint",
                 name,

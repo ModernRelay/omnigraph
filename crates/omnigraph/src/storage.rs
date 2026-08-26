@@ -114,6 +114,17 @@ impl ObjectStorageAdapter {
         }
     }
 
+    /// DST-only bottom-count listing passthrough; the contract and the
+    /// why live on `omnigraph_storage::ObjectStorageAdapter::dst_list_all_keys`.
+    ///
+    /// # Errors
+    /// When the backing store's listing fails.
+    #[doc(hidden)]
+    #[cfg(feature = "dst")]
+    pub async fn dst_list_all_keys(&self) -> Result<Vec<String>> {
+        Ok(self.inner.dst_list_all_keys().await?)
+    }
+
     /// S3 backend scoped to the bucket named in `root_uri`. Credentials and
     /// endpoint come from the standard `AWS_*` environment variables (the
     /// same ones Lance reads for its dataset stores).

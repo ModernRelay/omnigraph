@@ -43,7 +43,7 @@ fn pre_minted_schema_transaction(
 ) -> crate::table_store::StagedTransactionIdentity {
     crate::table_store::StagedTransactionIdentity {
         read_version,
-        uuid: format!("omnigraph-schema-{}", ulid::Ulid::new()),
+        uuid: format!("omnigraph-schema-{}", crate::dst_ids::new_ulid()),
     }
 }
 
@@ -1220,7 +1220,6 @@ where
 /// no current version was written, its pre-drop version). A future
 /// orphan-cleanup pass should remove the directory entirely.
 async fn cleanup_dataset_old_versions(db: &Omnigraph, full_uri: &str) -> Result<()> {
-    use chrono::Utc;
     use lance::dataset::cleanup::CleanupPolicy;
     let ds = crate::instrumentation::open_dataset(
         full_uri,
@@ -1230,7 +1229,7 @@ async fn cleanup_dataset_old_versions(db: &Omnigraph, full_uri: &str) -> Result<
     )
     .await?;
     let policy = CleanupPolicy {
-        before_timestamp: Some(Utc::now()),
+        before_timestamp: Some(crate::dst_clock::now_utc()),
         before_version: None,
         delete_unverified: false,
         error_if_tagged_old_versions: false,

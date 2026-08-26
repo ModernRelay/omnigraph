@@ -21,7 +21,6 @@ use omnigraph_compiler::{
     SchemaShape, SchemaTypeKind, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
     plan_schema_migration,
 };
-use ulid::Ulid;
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, ResolvedCommitRange};
 use crate::error::{OmniError, Result, dataset_subject};
@@ -353,10 +352,22 @@ impl Omnigraph {
         schema_source: &str,
         options: InitOptions,
     ) -> Result<Self> {
-        Self::init_with_storage(uri, schema_source, storage_for_uri(uri)?, options).await
+        Self::init_with_storage_impl(uri, schema_source, storage_for_uri(uri)?, options).await
     }
 
-    pub(crate) async fn init_with_storage(
+    // Injected-storage constructor: test-only authority, exists only
+    // under the `dst` feature (see the feature doc in Cargo.toml).
+    #[cfg(feature = "dst")]
+    pub async fn init_with_storage(
+        uri: &str,
+        schema_source: &str,
+        storage: Arc<dyn StorageAdapter>,
+        options: InitOptions,
+    ) -> Result<Self> {
+        Self::init_with_storage_impl(uri, schema_source, storage, options).await
+    }
+
+    async fn init_with_storage_impl(
         uri: &str,
         schema_source: &str,
         storage: Arc<dyn StorageAdapter>,
@@ -591,6 +602,17 @@ impl Omnigraph {
     /// decorator for IO-budget tests). Defaults to `OpenMode::ReadWrite`.
     pub async fn open_with_storage(uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
         Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
+    }
+
+    // Read-only injected-storage twin, so a harness can audit the same
+    // universe through the read-only open path. Test-only authority,
+    // exists only under the `dst` feature (see the Cargo.toml feature doc).
+    #[cfg(feature = "dst")]
+    pub async fn open_read_only_with_storage(
+        uri: &str,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<Self> {
+        Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadOnly).await
     }
 
     pub(crate) async fn open_with_storage_and_mode(
@@ -3476,7 +3498,10 @@ fn blob_properties_for_table_key<'a>(
 /// table entry and refuse every older snapshot rather than inferring identity
 /// from Lance field IDs or positions, even when no rename occurred.
 fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
-    let node_names = catalog.node_types.keys().cloned().collect::<Vec<_>>();
+    // Canonically ordered walk (DST determinism: hash order must not leak
+    // into schema fixups).
+    let mut node_names = catalog.node_types.keys().cloned().collect::<Vec<_>>();
+    node_names.sort();
     for name in node_names {
         let stable_property_ids = catalog.node_types[&name]
             .properties
@@ -3503,7 +3528,8 @@ fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
             &format!("node:{name}"),
         )?;
     }
-    let edge_names = catalog.edge_types.keys().cloned().collect::<Vec<_>>();
+    let mut edge_names = catalog.edge_types.keys().cloned().collect::<Vec<_>>();
+    edge_names.sort();
     for name in edge_names {
         let stable_property_ids = catalog.edge_types[&name]
             .properties
@@ -3648,7 +3674,7 @@ async fn acquire_init_claim(root: &str, storage: &dyn StorageAdapter) -> Result<
     let uri = init_claim_uri(root);
     let payload = serde_json::json!({
         "version": INIT_CLAIM_PAYLOAD_VERSION,
-        "attempt_id": Ulid::new().to_string(),
+        "attempt_id": crate::dst_ids::new_ulid().to_string(),
     })
     .to_string();
     if !storage.write_text_if_absent(&uri, &payload).await? {
@@ -3721,7 +3747,10 @@ async fn verify_local_create_if_absent(root: &str, storage: &dyn StorageAdapter)
     }
     crate::failpoints::maybe_fail(crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE)?;
     for _ in 0..CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS {
-        let probe_name = format!("{CREATE_IF_ABSENT_PROBE_FILENAME_PREFIX}_{}", Ulid::new());
+        let probe_name = format!(
+            "{CREATE_IF_ABSENT_PROBE_FILENAME_PREFIX}_{}",
+            crate::dst_ids::new_ulid()
+        );
         let probe_uri = join_uri(root, &probe_name);
         if !storage.write_text_if_absent(&probe_uri, "").await? {
             // A prior or foreign writer owns this candidate. It proves
@@ -4405,10 +4434,18 @@ edge WorksAt: Person -> Company
         let root = normalize_root_uri(&uri).unwrap();
         let (left_storage, right_storage, schema_deletes) = init_race_adapters(&root);
 
-        let left =
-            Omnigraph::init_with_storage(&uri, TEST_SCHEMA, left_storage, InitOptions::default());
-        let right =
-            Omnigraph::init_with_storage(&uri, TEST_SCHEMA, right_storage, InitOptions::default());
+        let left = Omnigraph::init_with_storage_impl(
+            &uri,
+            TEST_SCHEMA,
+            left_storage,
+            InitOptions::default(),
+        );
+        let right = Omnigraph::init_with_storage_impl(
+            &uri,
+            TEST_SCHEMA,
+            right_storage,
+            InitOptions::default(),
+        );
         let (left, right) = tokio::join!(left, right);
         let ok_count = usize::from(left.is_ok()) + usize::from(right.is_ok());
         assert_eq!(ok_count, 1, "exactly one concurrent init should win");
@@ -4452,9 +4489,10 @@ edge WorksAt: Person -> Company
         let root = normalize_root_uri(uri).unwrap();
         let (left_storage, right_storage, schema_deletes) = init_race_adapters(&root);
 
-        let left = Omnigraph::init_with_storage(uri, LEFT_RACE_SCHEMA, left_storage, left_options);
+        let left =
+            Omnigraph::init_with_storage_impl(uri, LEFT_RACE_SCHEMA, left_storage, left_options);
         let right =
-            Omnigraph::init_with_storage(uri, RIGHT_RACE_SCHEMA, right_storage, right_options);
+            Omnigraph::init_with_storage_impl(uri, RIGHT_RACE_SCHEMA, right_storage, right_options);
         let (left, right) = tokio::join!(left, right);
 
         let winning_schema = match (left, right) {
@@ -4541,7 +4579,7 @@ edge WorksAt: Person -> Company
             .await
             .unwrap();
 
-        let err = match Omnigraph::init_with_storage(
+        let err = match Omnigraph::init_with_storage_impl(
             uri,
             TEST_SCHEMA,
             Arc::new(ObjectStorageAdapter::local()),
@@ -4596,9 +4634,14 @@ edge WorksAt: Person -> Company
         let uri = dir.path().to_str().unwrap();
         let adapter = Arc::new(RecordingStorageAdapter::default());
 
-        Omnigraph::init_with_storage(uri, TEST_SCHEMA, adapter.clone(), InitOptions::default())
-            .await
-            .unwrap();
+        Omnigraph::init_with_storage_impl(
+            uri,
+            TEST_SCHEMA,
+            adapter.clone(),
+            InitOptions::default(),
+        )
+        .await
+        .unwrap();
         assert!(adapter.writes().contains(&join_uri(uri, "_schema.pg")));
         assert!(adapter.writes().contains(&join_uri(uri, "_schema.ir.json")));
         assert!(

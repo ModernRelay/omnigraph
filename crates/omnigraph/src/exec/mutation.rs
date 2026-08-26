@@ -1194,7 +1194,7 @@ impl Omnigraph {
                     OmniError::manifest(format!("insert {key_description} cannot contain null"))
                 })?
             } else {
-                ulid::Ulid::new().to_string()
+                crate::dst_ids::new_ulid().to_string()
             };
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
@@ -1232,7 +1232,7 @@ impl Omnigraph {
             let edge_type = &catalog.edge_types[type_name];
             let schema = edge_type.arrow_schema.clone();
             let blob_props = edge_type.blob_properties.clone();
-            let id = ulid::Ulid::new().to_string();
+            let id = crate::dst_ids::new_ulid().to_string();
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             // Validation (edge-RI, enum, unique, @card against the live
@@ -1666,7 +1666,7 @@ fn concat_match_batches_to_schema(
 fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
     let mut resolved = params.clone();
     if !resolved.contains_key(NOW_PARAM_NAME) {
-        let now = OffsetDateTime::now_utc()
+        let now = OffsetDateTime::from(crate::dst_clock::system_time_now())
             .format(&Rfc3339)
             .map_err(|e| OmniError::manifest(format!("failed to format now(): {}", e)))?;
         resolved.insert(NOW_PARAM_NAME.to_string(), Literal::DateTime(now));

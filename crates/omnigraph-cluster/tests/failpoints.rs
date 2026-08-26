@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use fail::FailScenario;
 use omnigraph::db::Omnigraph;
 use omnigraph::error::OmniError;
+use omnigraph::failpoints::FailScenario;
 // One ScopedFailPoint for both engine- and cluster-scoped failpoint names:
 // it is registry-only (error-type agnostic) and lives in the lowest crate.
 use omnigraph::failpoints::ScopedFailPoint;

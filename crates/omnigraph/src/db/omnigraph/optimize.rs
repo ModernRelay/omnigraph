@@ -28,7 +28,6 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
 use futures::stream::StreamExt;
 use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
 use lance::dataset::optimize::{
@@ -1174,7 +1173,7 @@ pub async fn cleanup_all_datasets(
         }
     }
 
-    let before_timestamp = options.older_than.map(|d| Utc::now() - d);
+    let before_timestamp = options.older_than.map(|d| crate::dst_clock::now_utc() - d);
     let keep_versions = options.keep_versions;
     let table_tasks = table_tasks
         .into_iter()
@@ -1559,7 +1558,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_caches_live_branch_snapshot_resolution_failure() {
-        let _scenario = fail::FailScenario::setup();
+        let _scenario = crate::failpoints::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let schema = "node Person { name: String @key }\nnode Company { name: String @key }\n";

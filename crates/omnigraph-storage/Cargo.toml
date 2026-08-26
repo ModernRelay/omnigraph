@@ -22,3 +22,7 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+# See the engine crate's `dst` feature doc (PR #527 review P1-5).
+dst = []

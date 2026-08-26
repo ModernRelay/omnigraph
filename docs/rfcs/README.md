@@ -163,7 +163,7 @@ This table is the human index for the canonical RFC corpus.
 | [0034](0034-durable-recovery-authority.md) | Durable recovery authority and outcomes | maintainer | draft | not-started |
 | [0035](0035-served-operation-ownership.md) | Served operation ownership | maintainer | draft | not-started |
 | [0036](0036-atomic-runtime-activation.md) | Atomic runtime activation and graph availability supervision | maintainer | draft | not-started |
-| [0037](0037-deterministic-simulation-harness.md) | Deterministic simulation harness | public | draft | in-progress |
+| [0037](0037-deterministic-simulation-harness.md) | Deterministic simulation harness | public | accepted | in-progress |
 | [0038](0038-typed-storage-failures.md) | Typed storage failures | public | accepted | complete |
 | [0039](0039-end-to-end-benchmark.md) | The end-to-end benchmark | public | accepted | in-progress |
 | [0041](0041-inline-stored-queries.md) | Inline and stored queries | maintainer | accepted | partial |

@@ -86,6 +86,23 @@ admission-wrapper boundary.
 
 CI checks OpenAPI drift but never rewrites `openapi.json`. Regenerate an intentional API change locally as described in [testing.md](testing.md).
 
+## DST tiers
+
+Two workflows own deterministic simulation testing; both set
+`RUSTFLAGS: --cfg tokio_unstable` themselves (the `omnigraph-dst` crate
+compiles empty without it, so the default jobs are unaffected):
+
+- **`dst.yml`** (per PR and on `main` pushes): the pinned deterministic
+  suite — every failure line carries the universe seed, so a red run is
+  reproducible locally from the log alone. The job also lints the shipped
+  engine shape (`-p`, no `dst` feature), which workspace feature
+  unification hides from the default Clippy job. Whether the suite blocks
+  a merge is the branch-protection required-contexts list.
+- **`dst-nightly.yml`** (cron 03:00 UTC + manual dispatch): matrix-sharded
+  deterministic and concurrent fleets over date-derived, mutually disjoint
+  seed intervals. Failures are logs with seed rows, not required contexts;
+  the concurrent fleet's `wild` mode makes no replay claim.
+
 ## Local pre-push checks
 
 For Rust changes:

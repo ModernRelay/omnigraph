@@ -129,7 +129,9 @@ impl GraphIndex {
         // Phase 1: Scan all edges, build TypeIndices and collect edge pairs
         let mut edge_pairs: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
 
-        for (edge_name, (from_type, to_type)) in edge_types {
+        let mut __dst_e1: Vec<_> = edge_types.iter().collect();
+        __dst_e1.sort_by(|a, b| a.0.cmp(b.0));
+        for (edge_name, (from_type, to_type)) in __dst_e1 {
             let table_key = format!("edge:{}", edge_name);
             if snapshot.dataset(&table_key).is_none() {
                 continue;
@@ -176,7 +178,9 @@ impl GraphIndex {
         }
 
         // Phase 2: Build CSR/CSC using final TypeIndex sizes
-        for (edge_name, (from_type, to_type)) in edge_types {
+        let mut __dst_e2: Vec<_> = edge_types.iter().collect();
+        __dst_e2.sort_by(|a, b| a.0.cmp(b.0));
+        for (edge_name, (from_type, to_type)) in __dst_e2 {
             let Some(edges) = edge_pairs.get(edge_name) else {
                 continue;
             };
