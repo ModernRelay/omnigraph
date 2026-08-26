@@ -1,14 +1,15 @@
 # OmniGraph benchmark harness
 
-`omnigraph-bench` owns benchmark definitions, planning, and the first narrow
-execution path. It parses strict, versioned YAML case and suite documents,
-validates their semantics, computes stable experiment identities, emits plans,
-and can execute supported local `branch-merge-v1` points. Run wall-clock
-measurements from a release build only:
+`omnigraph-bench` owns benchmark definitions, planning, execution, durable run
+records, and the rebuildable result projection. It parses strict, versioned
+YAML case and suite documents, validates their semantics, computes stable
+experiment identities, and can execute supported local `branch-merge-v1`
+points. Run wall-clock measurements from a clean release build only:
 
 ```bash
 cargo run --release --locked -p omnigraph-bench -- \
-  suite run benchmarks/suites/local-smoke.suite-v1.yaml
+  suite run benchmarks/suites/local-smoke.suite-v1.yaml \
+  --archive .bench/archive
 ```
 
 The checked-in catalog and command examples are in
@@ -42,11 +43,18 @@ measurement protocol and identity vocabulary.
   branch, manifest, or deletion history. Reset and pre-timer proof traverse
   metadata but never read file contents or fall back to a byte copy.
 - Every repetition runs in a fresh worker process whose executable SHA-256,
-  release-profile facts, source commit/dirty evidence, and effective
-  `LANCE_MEM_POOL_SIZE` must match the parent attestation. Its complete cache
-  condition is part of point identity. When declared, its read-only warm-up
-  program runs before measured counters and the monotonic merge timer begin. A
-  storage firewall permits only the engine's one balanced,
+  source commit/dirty state, Cargo's
+  release/opt-level observations, compiler-effective debug assertions, the
+  checked-in release-profile declaration, build-script-visible flag/override
+  state, Cargo features reported by `omnigraph-engine` itself, and a versioned
+  allowlist of effective engine environment. Unknown `LANCE_*` or
+  engine-facing `OMNIGRAPH_*` overrides are refused without serializing their
+  values. Cargo does not expose the final target rustc invocation to
+  `build.rs`, so effective LTO/codegen-unit/strip settings remain explicitly
+  unproved until a later controlled digest-bound build receipt supplies them.
+  Its complete cache condition is part of point identity. When declared, its
+  read-only warm-up program runs before measured counters and the monotonic
+  merge timer begin. A storage firewall permits only the engine's one balanced,
   empty create-if-absent capability probe during each read-write open; every
   other pre-measurement write is rejected. The worker also proves the restored
   tree's complete metadata shape before it declares itself ready. Each timed
@@ -83,6 +91,108 @@ measurement protocol and identity vocabulary.
 - Store counts are **logical store calls** made by the engine. They do not
   observe retries, pagination, multipart fan-out, or other physical attempts,
   and therefore are not network-request or cloud-cost measurements.
+- Fixture validation covers the exact schema, empty index inventory, and every
+  row on `main`, `bench-source`, and `bench-target`. Its logical-content digest
+  is stable across rebuilt Lance ids, timestamps, and encodings; a separate
+  physical tree digest pins the exact bytes restored for every repetition.
+
+## Durable records and archive
+
+Passing `--archive <DIR>` changes successful `suite run` finalization from a
+diagnostic-only run into durable telemetry publication. The harness mints one
+session ULID for the command and one invocation ULID per suite entry. Each
+record contains the complete typed run spec, exact point identity, clean source
+commit and declared release-build evidence, executable digest, process-effective machine and
+backend evidence,
+stamped fixture manifest, raw repetition rows, dispersion, logical calls, and
+explicit presence or absence statements for physical attempts, request timing,
+calibration, and concurrency witnesses.
+
+A dirty or unproved source tree cannot publish a record because the source
+commit would not honestly describe its provenance. The exact executable is
+identified by its digest and normalized compiler/build/engine facts. Build
+after committing the intended source, then verify the resulting archive:
+
+```bash
+target/release/omnigraph-bench suite run \
+  benchmarks/suites/local-smoke.suite-v1.yaml \
+  --archive .bench/archive
+
+target/release/omnigraph-bench archive verify .bench/archive
+```
+
+If publication reports `possibly_published`, reconcile that exact candidate
+before minting a replacement invocation:
+
+```bash
+target/release/omnigraph-bench archive reconcile .bench/archive \
+  --invocation-id <INVOCATION_ULID> \
+  --record-sha256 <RECORD_SHA256> --json
+```
+
+Reconciliation holds the publication lock, validates the exact immutable
+pointer and canonical record, and retries the required file/directory syncs.
+It returns `durable`, `absent`, or `conflict`; only `durable` exits successfully.
+
+Canonical compact JSON objects live below `objects/sha256/`. Publication makes
+the object durable first, then atomically installs an immutable invocation
+pointer below `invocations/`. Only reachable, fully validated pointers are
+records; a crash can leave an unreferenced content object but cannot expose a
+partial record. Reusing an invocation for unequal bytes fails closed, and
+publishing identical bytes is idempotent. The JSON archive is the only result
+authority. `archive verify` streams a fixed invocation inventory and returns a
+compact count and inventory digest; it does not retain or print the complete
+record set.
+
+Machine evidence records OS/kernel/CPU/memory facts, the worker-inherited nice
+level and scheduler policy/priority, and a versioned digest of a fixed common
+set of soft/hard process resource limits. The hostname-derived label omits the
+raw hostname but is only a non-secret, non-stable correlation hint: it is not
+anonymization, a privacy boundary, or proof of machine identity. On Linux the
+record also includes process CPU affinity and the effective cgroup-v2
+CPU/memory limits plus a bounded fingerprint of every stable controller
+setting across the inherited hierarchy; cgroup-v1, hybrid control, and
+scheduler policies whose canonical parameters are not fully represented are
+refused rather than published with incomplete identity.
+Every repetition worker captures this identity immediately before `Ready`;
+the parent refuses a run if any repetition differs, and record finalization
+uses that worker-attested identity rather than a long-lived CLI snapshot.
+
+## Rebuildable query projection
+
+The team-facing query database is an OmniGraph read model generated from the
+complete archive. It is never written in a measured window and has no
+incremental mutation API:
+
+```bash
+target/release/omnigraph-bench projection rebuild \
+  --archive .bench/archive \
+  --root .bench/projection
+
+target/release/omnigraph-bench projection list-points \
+  --root .bench/projection --limit 100
+
+target/release/omnigraph-bench projection list-runs \
+  --root .bench/projection \
+  --point-id <FULL_SHA256_POINT_ID> --limit 100
+```
+
+Rebuild validates every archive record, collision-checks point and invocation
+identity, loads a fresh bounded generation through the public engine surface,
+verifies its complete inventory and a canonical digest over every projected
+point and run field. Only then does it atomically replace `CURRENT`. Public and
+internal queries are bounded and use exclusive cursors pinned to one immutable
+generation. Pass the JSON `next_cursor` from one page back through `--cursor`
+to continue. A generation id is derived from the projection schema,
+source-to-row transform contract, sorted archive inventory, and complete
+projected-row digest, so neither stale formulas nor bad field mappings can be
+reused silently. Rebuilds serialize across processes with a bounded lock wait,
+clean abandoned staging directories, and retain at most eight published
+generations; reaching that ceiling requires deleting the disposable projection
+root and rebuilding it.
+Query callers choose fixed, parameterized names; arbitrary GQ text is not
+accepted. The projection may be deleted at any time and rebuilt without losing
+evidence.
 
 ## Runner-v1 support envelope
 
@@ -112,16 +222,22 @@ entries. It also requires free scratch capacity for a 16x byte-amplification
 allowance plus 1 GiB before writing the fixture. These are runner safety limits,
 not case-schema or engine limits.
 
-`suite run --json` emits a versioned diagnostic execution projection with
-`durable_record: false`. It is useful for inspecting samples, phase timings,
-per-repetition worker peak RSS, logical calls, the exact worker executable
-SHA-256 plus release profile/optimization/debug-assertion attestation, source
-commit/dirty evidence, effective `LANCE_MEM_POOL_SIZE`, fixture identity, and
-verification, but it is not a benchmark record and must not be
-archived as one. Immutable JSON records, their
-rebuildable database projection, fixture caching, and AWS orchestration belong
-to later, separately reviewed slices.
+Without `--archive`, `suite run --json` still emits a versioned diagnostic
+execution projection whose runs have `durable_record: false`; it must not be
+copied into the archive. With `--archive`, each complete run is canonically
+encoded, published, and then dropped from CLI memory. The success output omits
+the raw `runs` array and carries only `completed_run_count` plus authoritative
+content addresses and invocation pointers. Archive-mode failures likewise
+report the completed count and known receipts without duplicating previously
+published raw samples. A completed run whose record could not be published is
+retained once as state-neutral `completed_run` recovery evidence, because an
+indeterminate pointer sync may already be authoritative. That sync also carries
+`possibly_published` for candidate-specific reconciliation. Human-mode failures
+print the same complete recovery JSON envelope, not only a timing summary.
+Fixture caching and AWS orchestration belong to later, separately reviewed
+slices.
 
-Machine-readable failures keep the suite/case/point identity and all completed
-runs or repetitions. A worker killed at its hard deadline contributes
-structured process-containment evidence, but never a partial sample.
+Machine-readable diagnostic-mode failures keep the suite/case/point identity
+and all completed runs or repetitions. A worker killed at its hard deadline
+contributes structured process-containment evidence, but never a partial
+sample.

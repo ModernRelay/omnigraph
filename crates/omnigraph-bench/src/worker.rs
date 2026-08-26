@@ -118,6 +118,7 @@ async fn execute_request(
     signals: &mut ProtocolSignals,
 ) -> RunnerResult<crate::runner::RepObservation> {
     crate::runner::enforce_release_build()?;
+    crate::runner::refuse_unmodeled_runtime_overrides()?;
     let validated = validate_worker_case(request)?;
     let plan = BranchMergePlan::try_from(&validated)
         .map_err(|error| RunnerError::new("unsupported_runner_axis", error.to_string()))?;
@@ -192,6 +193,15 @@ struct ProtocolSignals {
 
 impl MeasurementSignals for ProtocolSignals {
     fn ready(&mut self) -> RunnerResult<()> {
+        // Observe the child rather than the CLI/supervisor process. This probe
+        // runs after fixture preparation but before Ready releases the parent
+        // to start the measured clock.
+        let machine = crate::machine::capture_machine_identity().map_err(|error| {
+            RunnerError::new(
+                "machine_identity_capture_failed",
+                format!("could not capture repetition-worker machine identity: {error}"),
+            )
+        })?;
         write_frame(
             &mut self.output,
             &ChildFrameV1::Ready {
@@ -200,6 +210,7 @@ impl MeasurementSignals for ProtocolSignals {
                 point_id: self.request.expected_point_id.clone(),
                 case_digest: self.request.expected_case_digest.clone(),
                 worker_build: self.worker_build.clone(),
+                machine,
                 physical_digest: self.request.expected_physical_digest.clone(),
                 metadata_digest: self.request.expected_metadata_digest.clone(),
             },
@@ -298,6 +309,7 @@ fn stage_for_error(error: &RunnerError) -> WorkerStageV1 {
         | "cache_preparation_failed"
         | "protected_head_capture_failed"
         | "unsupported_cache_condition"
+        | "machine_identity_capture_failed"
         | "engine_open_failed"
         | "storage_open_failed"
         | "non_utf8_path" => WorkerStageV1::Prepare,

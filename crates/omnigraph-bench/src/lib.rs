@@ -2,17 +2,22 @@
 //!
 //! A case describes exactly one experiment. A suite only selects checked-in
 //! cases and says how many samples to collect; it cannot override experiment
-//! identity. The local runner consumes those resolved plans; durable record
-//! persistence and cloud orchestration live in later harness slices.
+//! identity. The local runner consumes those resolved plans, canonical JSON is
+//! the durable telemetry authority, and OmniGraph provides a disposable query
+//! projection over that archive. Cloud orchestration is a later harness slice.
 
+pub mod archive;
 pub mod branch_merge;
 pub mod case;
 pub mod counting;
 pub mod environment;
 #[doc(hidden)]
 pub mod fixture_worker;
+pub mod machine;
 pub mod model;
 mod preparation;
+pub mod projection;
+pub mod record;
 pub mod reset;
 pub mod runner;
 pub mod suite;

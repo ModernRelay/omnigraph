@@ -77,10 +77,12 @@ neither supported nor representable because controlling the OS page cache says
 nothing about device, object-store, or remote-service caches.
 Case definitions deliberately contain no source branch, system-under-test
 build, machine identity, AWS account, bucket URI, result location, or
-credentials. Runner-v1 binds the supported local host facts at execution; the
-durable telemetry slice will bind the complete invocation identity to its run
-record. Repetition count is run quantity, so it belongs to the suite rather
-than the case's experiment identity.
+credentials. Record finalization binds the clean source/build, backend,
+complete typed process observations, session, and invocation to each completed
+run. Its hostname-derived label is only a non-secret, non-stable correlation
+hint—not a privacy boundary or proof of machine identity.
+Repetition count is run quantity, so it belongs to the suite rather than the
+case's experiment identity.
 
 `fixture.state.history_depth` is the exact number of reachable OmniGraph graph
 commits on **each already-diverged frozen branch**, including the history
@@ -131,13 +133,20 @@ Wall-clock execution is available only from a release-profile binary:
 
 ```bash
 cargo run --release --locked -p omnigraph-bench -- \
-  suite run benchmarks/suites/local-smoke.suite-v1.yaml
+  suite run benchmarks/suites/local-smoke.suite-v1.yaml \
+  --archive .bench/archive
 ```
 
 Use `--case <ID>` to select one suite entry, `--scratch-root <EXISTING-DIR>` to
-place disposable fixture trees on a particular volume, and `--json` for
-machine-readable diagnostic output. The host probe examines the created
-scratch tree, not merely the path supplied on the command line.
+place disposable fixture trees on a particular volume, `--archive <DIR>` to
+publish immutable canonical records, and `--json` for machine-readable output.
+The host probe examines the created scratch tree, not merely the path supplied
+on the command line. Durable publication requires a release binary built from
+a clean committed tree so the record has honest source provenance. The exact
+system under test is bound separately by the executable SHA-256, Cargo/compiler
+observations, checked-in release-profile declarations, and engine feature
+inventory. Effective LTO/codegen/strip settings remain explicitly unproved
+until the AWS build slice supplies a controlled digest-bound receipt.
 
 Runner-v1 constructs and verifies one fixture whose `bench-source` and
 `bench-target` branches are already diverged, closes it, and freezes the
@@ -156,20 +165,20 @@ prove identity.
 
 Every repetition uses a fresh worker process and starts from the same frozen
 state. The parent pins and records the worker executable SHA-256 and requires
-matching release profile, optimization level, and debug-assertion attestation
-in the private handshake, together with the full source commit and worktree
-dirty status (each explicitly unknown when its bounded probe cannot prove an
-answer) and effective `LANCE_MEM_POOL_SIZE`. The supervisor
-also records the repetition worker's peak RSS. The complete cache condition is
-part of point identity. A declared
-read-only warm-up program runs inside each repetition before measurement. A
-storage firewall allows only each read-write open's one balanced, empty
+matching source commit/dirty state, release-profile, target/compiler,
+engine-feature, and effective engine-environment evidence in the private
+handshake. Unknown `LANCE_*` or engine-facing `OMNIGRAPH_*` overrides fail
+closed without recording their values; credential values never enter a
+record. The supervisor also records the repetition worker's peak RSS. The
+complete cache condition is part of point identity. A declared read-only
+warm-up program runs inside each repetition before measurement. A storage
+firewall allows only each read-write open's one balanced, empty
 create-if-absent capability probe and rejects any other preparation write; a
 complete metadata-shape witness independently catches path, kind, or length
-drift. Measured counters are then cleared and exactly one branch merge is timed.
-The repetition's writes disappear when `active` is removed rather than aging
-the next sample, and the never-opened template is checked after every worker
-exits.
+drift. Measured counters are then cleared and exactly one branch merge is
+timed. The repetition's writes disappear when `active` is removed rather than
+aging the next sample, and the never-opened template is checked after every
+worker exits.
 
 Before it initializes a fixture, the runner derives the exact builder-v2
 publication count, rejects a mismatched history declaration, applies explicit
@@ -217,19 +226,43 @@ OS cache limitation explicitly. A true page-cache-cold point remains refused
 until a named platform/backend eviction control has a post-control witness;
 storage-cold is also unsupported and unrepresentable.
 
-## Delivery boundary
+## Telemetry and delivery boundary
 
-The configuration, planning, and identical-state local runner slices now sit
-behind one typed plan contract. Runner-v1 deliberately stops at versioned
-diagnostic output with `durable_record: false`; even its JSON output is not an
-immutable benchmark record.
+The archive stores canonical run-record-v1 JSON by content digest and publishes
+it through one immutable pointer per invocation. Check it independently with:
 
-The next telemetry slice writes immutable JSON records to a content-addressed
-archive and builds a query database as a disposable projection. A later AWS
-adapter binds declared S3 and machine facts, applies budget and lifecycle
-controls, executes the same plans, and uploads that same record format. S3
-reset, fixture caching, server-mode execution, and proved operating-system
-page-cache eviction remain outside the current local runner.
+```bash
+target/release/omnigraph-bench archive verify .bench/archive
+```
+
+The JSON archive is authority. Its team-facing OmniGraph database is a
+disposable, inventory-verified projection:
+
+```bash
+target/release/omnigraph-bench projection rebuild \
+  --archive .bench/archive --root .bench/projection
+target/release/omnigraph-bench projection list-points \
+  --root .bench/projection --limit 100
+```
+
+Projection responses are bounded pages. When `next_cursor` is present, pass
+that JSON value to the next command with `--cursor`; the cursor remains pinned
+to the immutable generation from which the first page was read. The archive
+verifier likewise captures one publication-coherent invocation inventory,
+streams its immutable records, and emits only a count plus an inventory digest.
+
+Without `--archive`, runner-v1 retains its versioned diagnostic output with
+`durable_record: false`; copying that output into the archive is invalid. With
+`--archive`, the CLI publishes and releases each complete raw run in turn; its
+bounded summary contains the completed count and immutable record receipts,
+not a duplicate raw `runs` array. A failed publication retains only its current
+completed execution as state-neutral `completed_run` recovery evidence. Resolve any `possibly_published`
+identity with `archive reconcile` before minting a replacement invocation. A
+later AWS adapter binds declared S3 facts, applies budget and lifecycle
+controls, executes the same typed plans, and uploads the same record format.
+S3 reset, fixture caching, server-mode execution, comparison/noise-floor
+reports, and proved operating-system page-cache eviction remain outside this
+slice.
 
 ## Add a case
 

@@ -8,11 +8,22 @@ const GIT_PROBE_DEADLINE: Duration = Duration::from_secs(3);
 const GIT_REAP_DEADLINE: Duration = Duration::from_secs(1);
 const MAX_GIT_POINTER_BYTES: u64 = 4 * 1024;
 const MAX_PACKED_REFS_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RUSTC_VERSION_BYTES: u64 = 64 * 1024;
+const MAX_WORKSPACE_MANIFEST_BYTES: u64 = 1024 * 1024;
+const RELEASE_PROFILE_OVERRIDE_PREFIX: &str = "CARGO_PROFILE_RELEASE_";
 const UNKNOWN: &str = "unknown";
+
+#[derive(Debug)]
+struct ReleaseProfile {
+    lto: String,
+    codegen_units: u32,
+    strip: bool,
+}
 
 fn main() {
     let profile = std::env::var("PROFILE").expect("Cargo sets PROFILE for build scripts");
     let opt_level = std::env::var("OPT_LEVEL").expect("Cargo sets OPT_LEVEL for build scripts");
+    let target = std::env::var("TARGET").expect("Cargo sets TARGET for build scripts");
     println!("cargo:rustc-env=OMNIGRAPH_BENCH_BUILD_PROFILE={profile}");
     println!("cargo:rustc-env=OMNIGRAPH_BENCH_BUILD_OPT_LEVEL={opt_level}");
 
@@ -47,6 +58,45 @@ fn main() {
         .unwrap_or_else(|| UNKNOWN.to_string());
     println!("cargo:rustc-env=OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT={source_git_commit}");
     println!("cargo:rustc-env=OMNIGRAPH_BENCH_SOURCE_WORKTREE_DIRTY={source_worktree_dirty}");
+
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let rustc_version = run_command_output_bounded(Path::new(&rustc), &["--version"])
+        .unwrap_or_else(|| UNKNOWN.to_string());
+    let release_profile =
+        repository.and_then(|root| read_release_profile(&root.join("Cargo.toml")));
+    let declared_release_lto = release_profile
+        .as_ref()
+        .map_or(UNKNOWN, |profile| profile.lto.as_str());
+    let declared_release_codegen_units = release_profile
+        .as_ref()
+        .map(|profile| profile.codegen_units.to_string())
+        .unwrap_or_else(|| UNKNOWN.to_string());
+    let declared_release_strip = release_profile
+        .as_ref()
+        .map(|profile| profile.strip.to_string())
+        .unwrap_or_else(|| UNKNOWN.to_string());
+    let encoded_rustflags_present =
+        std::env::var_os("CARGO_ENCODED_RUSTFLAGS").is_some_and(|value| !value.is_empty());
+    let release_overrides = if release_profile_overrides_supported() {
+        "supported"
+    } else {
+        "unsupported"
+    };
+
+    println!("cargo:rustc-env=OMNIGRAPH_BENCH_TARGET_TRIPLE={target}");
+    println!("cargo:rustc-env=OMNIGRAPH_BENCH_RUSTC_VERSION={rustc_version}");
+    println!("cargo:rustc-env=OMNIGRAPH_BENCH_DECLARED_RELEASE_LTO={declared_release_lto}");
+    println!(
+        "cargo:rustc-env=OMNIGRAPH_BENCH_DECLARED_RELEASE_CODEGEN_UNITS={declared_release_codegen_units}"
+    );
+    println!("cargo:rustc-env=OMNIGRAPH_BENCH_DECLARED_RELEASE_STRIP={declared_release_strip}");
+    println!(
+        "cargo:rustc-env=OMNIGRAPH_BENCH_CARGO_ENCODED_RUSTFLAGS_PRESENT={encoded_rustflags_present}"
+    );
+    println!(
+        "cargo:rustc-env=OMNIGRAPH_BENCH_RELEASE_PROFILE_ENVIRONMENT_OVERRIDES={release_overrides}"
+    );
+    println!("cargo:rustc-env=OMNIGRAPH_BENCH_EFFECTIVE_CODEGEN_OPTIONS_PROVED=false");
 }
 
 fn probe_git_commit(repository: &Path) -> Option<String> {
@@ -169,6 +219,82 @@ fn run_git_status_bounded(repository: &Path, arguments: &[&str]) -> Option<ExitS
             }
         }
     }
+}
+
+fn run_command_output_bounded(executable: &Path, arguments: &[&str]) -> Option<String> {
+    let mut command = Command::new(executable);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    configure_git_process_group(&mut command);
+    let mut child = command.spawn().ok()?;
+    let process_group = i32::try_from(child.id()).ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_RUSTC_VERSION_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()
+            .map(|_| bytes)
+    });
+    let deadline = Instant::now() + GIT_PROBE_DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => {
+                if !kill_git_process_group(process_group) {
+                    let _ = child.kill();
+                }
+                break None;
+            }
+        }
+    };
+    let reap_deadline = Instant::now() + GIT_REAP_DEADLINE;
+    while Instant::now() < reap_deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    let group_gone = wait_for_git_process_group_gone(process_group, GIT_REAP_DEADLINE);
+    let bytes = reader.join().ok()??;
+    let status = status?;
+    if !status.success()
+        || !group_gone
+        || u64::try_from(bytes.len()).ok()? > MAX_RUSTC_VERSION_BYTES
+    {
+        return None;
+    }
+    let value = String::from_utf8(bytes).ok()?;
+    let value = value.trim();
+    (!value.is_empty() && !value.chars().any(char::is_control)).then(|| value.to_string())
+}
+
+fn read_release_profile(path: &Path) -> Option<ReleaseProfile> {
+    let bytes = read_bounded_file(path, MAX_WORKSPACE_MANIFEST_BYTES)?;
+    let source = std::str::from_utf8(&bytes).ok()?;
+    let document = source.parse::<toml::Value>().ok()?;
+    let release = document.get("profile")?.get("release")?;
+    let lto = release.get("lto")?.as_str()?.to_string();
+    let codegen_units = u32::try_from(release.get("codegen-units")?.as_integer()?).ok()?;
+    let strip = release.get("strip")?.as_bool()?;
+    Some(ReleaseProfile {
+        lto,
+        codegen_units,
+        strip,
+    })
+}
+
+fn release_profile_overrides_supported() -> bool {
+    !std::env::vars_os().any(|(name, _)| {
+        name.to_str()
+            .is_some_and(|name| name.starts_with(RELEASE_PROFILE_OVERRIDE_PREFIX))
+    })
 }
 
 #[cfg(unix)]

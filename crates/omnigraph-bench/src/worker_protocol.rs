@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::case::CaseV1;
+use crate::machine::MachineIdentityV1;
 use crate::reset::{MetadataDigest, PhysicalDigest};
 use crate::runner::{EffectiveEnvironmentValue, RepObservation};
 
 /// The only worker protocol understood by this build.
-pub const WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const WORKER_PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum compact JSON payload bytes in one frame, excluding its newline.
 ///
@@ -35,13 +36,37 @@ const EXECUTABLE_DIGEST_BUFFER_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerBuildV1 {
-    pub cargo_profile: Box<str>,
-    pub opt_level: Box<str>,
+    pub source_commit: String,
+    /// `None` is an explicit failed build-time probe and is never admissible
+    /// for a measured worker. Keeping the absence typed lets the parent fail
+    /// closed instead of accepting a fabricated clean/dirty value.
+    pub source_tree_dirty: Option<bool>,
+    pub cargo_profile: String,
+    /// Cargo's profile-level observation, not proof against direct target
+    /// rustc arguments.
+    pub cargo_opt_level: String,
     pub debug_assertions: bool,
-    pub source_git_commit_sha: Option<Box<str>>,
-    pub source_worktree_dirty: Option<bool>,
+    /// Effective Lance memory-pool setting inherited by the measured worker.
+    /// This is retained until the complete typed engine-environment registry
+    /// below replaces the one-setting representation.
     pub effective_lance_mem_pool_size: Box<EffectiveEnvironmentValue>,
-    pub executable_sha256: Box<str>,
+    pub target_triple: String,
+    pub rustc_version: String,
+    pub declared_release_lto: String,
+    pub declared_release_codegen_units: Option<u32>,
+    pub declared_release_strip: Option<bool>,
+    pub cargo_encoded_rustflags_present: Option<bool>,
+    pub release_profile_environment_overrides_supported: Option<bool>,
+    /// False until a controlled build wrapper supplies the final target rustc
+    /// command line in a digest-bound external receipt.
+    pub effective_codegen_options_proved: bool,
+    /// Canonical Cargo feature names reported by the linked
+    /// `omnigraph-engine` artifact itself, not inferred from this CLI crate.
+    pub engine_feature_flags: Vec<String>,
+    /// Canonical non-Cargo engine techniques enabled for this execution.
+    /// Runner-v1 has no such controls and therefore admits only an empty set.
+    pub enabled_techniques: Vec<String>,
+    pub executable_sha256: String,
 }
 
 /// Complete, immutable input for one worker process.
@@ -105,6 +130,10 @@ pub enum WorkerStageV1 {
 /// Frames sent by one repetition worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "frame", rename_all = "kebab-case", deny_unknown_fields)]
+// Ready is handled once per process and the complete enum is bounded by the
+// framing limit; an extra allocation here would not reduce retained protocol
+// state or improve the supervisor's memory bound.
+#[allow(clippy::large_enum_variant)]
 pub enum ChildFrameV1 {
     /// Open, cache preparation, identity, and pre-measurement checks completed.
     Ready {
@@ -113,6 +142,9 @@ pub enum ChildFrameV1 {
         point_id: String,
         case_digest: String,
         worker_build: WorkerBuildV1,
+        /// Process-effective identity captured by this child immediately
+        /// before it declared itself ready for measurement.
+        machine: MachineIdentityV1,
         physical_digest: PhysicalDigest,
         metadata_digest: MetadataDigest,
     },
@@ -439,6 +471,32 @@ protocol:
         }
     }
 
+    fn machine_identity() -> MachineIdentityV1 {
+        MachineIdentityV1 {
+            format_version: crate::machine::MACHINE_IDENTITY_FORMAT_VERSION,
+            os_name: "macos".to_string(),
+            os_version: "15.6".to_string(),
+            kernel_version: "24.6.0".to_string(),
+            architecture: "aarch64".to_string(),
+            cpu_model: "Apple M4".to_string(),
+            logical_cores: 10,
+            physical_cores: 10,
+            total_memory_bytes: 32 * 1024 * 1024 * 1024,
+            resource_control: crate::machine::ResourceControlV1::MacosNative,
+            scheduling: crate::machine::SchedulingIdentityV1 {
+                nice_level: 0,
+                policy: crate::machine::SchedulerPolicyV1::Other,
+                priority: 0,
+                reset_on_fork: false,
+            },
+            resource_limits: crate::machine::ResourceLimitIdentityV1 {
+                scope_version: crate::machine::RESOURCE_LIMIT_SCOPE_VERSION,
+                values_sha256: "9".repeat(64),
+            },
+            machine_label: format!("hostname-sha256:{}", "8".repeat(64)),
+        }
+    }
+
     fn sample() -> RepObservation {
         RepObservation {
             repetition: 3,
@@ -562,16 +620,27 @@ protocol:
                 point_id: "d".repeat(64),
                 case_digest: "e".repeat(64),
                 worker_build: WorkerBuildV1 {
-                    cargo_profile: "release".into(),
-                    opt_level: "2".into(),
+                    source_commit: "0".repeat(40),
+                    source_tree_dirty: Some(false),
+                    cargo_profile: "release".to_string(),
+                    cargo_opt_level: "2".to_string(),
                     debug_assertions: false,
-                    source_git_commit_sha: Some("1".repeat(40).into_boxed_str()),
-                    source_worktree_dirty: Some(false),
                     effective_lance_mem_pool_size: Box::new(EffectiveEnvironmentValue::Utf8 {
                         value: "1GiB".to_string(),
                     }),
-                    executable_sha256: "f".repeat(64).into_boxed_str(),
+                    target_triple: "aarch64-apple-darwin".to_string(),
+                    rustc_version: "rustc 1.97.1".to_string(),
+                    declared_release_lto: "thin".to_string(),
+                    declared_release_codegen_units: Some(16),
+                    declared_release_strip: Some(true),
+                    cargo_encoded_rustflags_present: Some(false),
+                    release_profile_environment_overrides_supported: Some(true),
+                    effective_codegen_options_proved: false,
+                    engine_feature_flags: Vec::new(),
+                    enabled_techniques: Vec::new(),
+                    executable_sha256: "f".repeat(64),
                 },
+                machine: machine_identity(),
                 physical_digest: physical_digest(),
                 metadata_digest: metadata_digest(),
             },
