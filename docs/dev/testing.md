@@ -99,7 +99,7 @@ cargo test -p omnigraph-engine --test writes concurrent
 cargo test -p omnigraph-server --test data_routes
 cargo test -p omnigraph-cli --test cli_data
 cargo test -p omnigraph-cluster --test failpoints --features failpoints
-cargo test -p omnigraph-bench
+cargo test -p omnigraph-bench --locked
 ```
 
 Canonical workspace graph:
@@ -132,7 +132,22 @@ Commit the generated file with the API change. CI checks drift; it never updates
 
 ## Cost tests and benchmarks
 
-Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness, whose records are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; the engine's deterministic benchmark contracts remain in `crates/omnigraph/tests/`.
+Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; the engine's deterministic benchmark contracts remain in `crates/omnigraph/tests/`.
+
+The current runner executes the narrow, fail-closed local envelope documented
+in `crates/omnigraph-bench/README.md`. It requires a release binary, restores
+every repetition from a never-opened APFS clonefile template at the fixture's
+stable path, contains each measured merge in a fresh SHA-attested,
+hard-deadline worker process, verifies exact target/source/main state, and emits
+diagnostic output rather than a durable benchmark record:
+
+```bash
+cargo run --release --locked -p omnigraph-bench -- \
+  suite run benchmarks/suites/local-smoke.suite-v1.yaml
+```
+
+Do not archive that diagnostic JSON as telemetry. Immutable records and their
+query projection are owned by the next harness slice.
 
 Keep measurement fixtures separate from production schemas and recovery state. A no-go result belongs in the RFC or issue that consumed the experiment, not as a permanent narrative in this map.
 

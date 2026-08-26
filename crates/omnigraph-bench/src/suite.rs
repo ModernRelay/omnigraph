@@ -10,9 +10,9 @@ use crate::model::{
     Diagnostic, ValidationOutcome, declared_version, read_yaml_file, strict_yaml, valid_kebab_id,
 };
 
-const MAX_SUITE_RUNS: usize = 10_000;
-const MAX_REPETITIONS_PER_CASE: u32 = 10_000;
-const MAX_TOTAL_REPETITIONS: u64 = 100_000;
+pub(crate) const MAX_SUITE_RUNS: usize = 10_000;
+pub(crate) const MAX_REPETITIONS_PER_CASE: u32 = 10_000;
+pub(crate) const MAX_TOTAL_REPETITIONS: u64 = 100_000;
 
 /// A V1 suite groups immutable case definitions and owns sample quantity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

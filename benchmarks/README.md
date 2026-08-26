@@ -70,25 +70,35 @@ nothing about device, object-store, or remote-service caches.
 
 Case definitions deliberately contain no source branch, system-under-test
 build, machine identity, AWS account, bucket URI, result location, or
-credentials. A runner binds those invocation facts and records them with the
-result. Repetition count is run quantity, so it belongs to the suite rather
+credentials. Runner-v1 binds the supported local host facts at execution; the
+durable telemetry slice will bind the complete invocation identity to its run
+record. Repetition count is run quantity, so it belongs to the suite rather
 than the case's experiment identity.
+
+`fixture.state.history_depth` is the exact number of reachable OmniGraph graph
+commits on **each already-diverged frozen branch**, including the history
+shared before the branch was created. It is not merely the number of commits
+made after branching. Builder v1 measures both frozen branches and refuses a
+case whose declaration does not match; it does not silently pad or squash
+history. For the checked case, the reachable depth is 214: one genesis commit,
+200 base-load publications (25 chunks for each of eight tables), one optimize
+publication, and 12 branch-local divergence publications.
 
 ## Validate and inspect
 
 From the repository root:
 
 ```bash
-cargo run -p omnigraph-bench -- \
+cargo run --locked -p omnigraph-bench -- \
   case validate benchmarks/cases/branch-merge-d50-warm.case-v1.yaml
 
-cargo run -p omnigraph-bench -- \
+cargo run --locked -p omnigraph-bench -- \
   case list benchmarks/cases
 
-cargo run -p omnigraph-bench -- \
+cargo run --locked -p omnigraph-bench -- \
   suite validate benchmarks/suites/local-smoke.suite-v1.yaml
 
-cargo run -p omnigraph-bench -- \
+cargo run --locked -p omnigraph-bench -- \
   suite plan benchmarks/suites/local-smoke.suite-v1.yaml
 ```
 
@@ -101,33 +111,102 @@ reset/backend compatibility. Planning expands the suite into ordered run
 entries; it does not execute a benchmark.
 
 The checked-in smoke point declares APFS on local NVMe storage. Validation is
-host-independent, but the future runner must verify those declared environment
-facts and refuse to measure on a mismatched host. S3-compatible cases likewise
-carry region, storage class, implementation/version, bucket-versioning state,
-and a digest pin for MinIO or RustFS images in their point identity.
+host-independent; runner-v1 probes the actual scratch volume on macOS and
+refuses to measure when its APFS and internal-storage evidence does not match
+the declaration. S3-compatible cases likewise carry region, storage class,
+implementation/version, bucket-versioning state, and a digest pin for MinIO or
+RustFS images in their point identity, but they are not executable by this
+runner slice.
+
+## Run locally
+
+Wall-clock execution is available only from a release-profile binary:
+
+```bash
+cargo run --release --locked -p omnigraph-bench -- \
+  suite run benchmarks/suites/local-smoke.suite-v1.yaml
+```
+
+Use `--case <ID>` to select one suite entry, `--scratch-root <EXISTING-DIR>` to
+place disposable fixture trees on a particular volume, and `--json` for
+machine-readable diagnostic output. The host probe examines the created
+scratch tree, not merely the path supplied on the command line.
+
+Runner-v1 constructs and verifies one fixture whose `bench-source` and
+`bench-target` branches are already diverged, closes it, and freezes the
+complete directory by physical SHA-256. The fixture is built at a stable
+`active` path because Lance shallow-branch manifests can retain absolute base
+paths. The runner makes a never-opened APFS clonefile template, removes
+`active`, and clone-restores every repetition to that exact path. Forced
+clonefile reset has no byte-copy fallback. Reset and the pre-timer witness walk
+metadata but do not read file contents, so they do not prewarm the fixture's
+data pages merely to prove identity.
+
+Every repetition uses a fresh worker process and starts from the same frozen
+state. The parent pins and records the worker executable SHA-256 and requires
+matching release-profile attestation in the private handshake. The declared
+read-only warmth program runs before measurement. A storage firewall allows
+only each read-write open's one balanced, empty create-if-absent capability
+probe and rejects any other preparation write; a complete metadata-shape
+witness independently catches path, kind, or length drift. Measured counters
+are then cleared and exactly one branch merge is timed. The repetition's writes
+disappear when `active` is removed rather than aging the next sample, and the
+never-opened template is checked after every worker exits.
+
+Before it initializes a fixture, the runner derives the exact builder-v1
+publication count, rejects a mismatched history declaration, applies explicit
+local row/byte/entry/history limits, and proves that the scratch volume has its
+conservative frozen-copy capacity allowance. The concrete runner limits are
+listed in `crates/omnigraph-bench/README.md`; they are deliberately narrower
+than the host-independent case schema.
+
+The supervisor starts the declared hard deadline immediately before releasing
+the prepared worker with `Begin`. The worker must send `Settled` after its merge
+future returns. On timeout the supervisor kills the worker's complete process
+group without a grace period, waits for and reaps it, and proves the group is
+gone before cleanup. No killed or partial operation becomes a sample.
+Preparation and exact verification have separate bounded watchdogs with a
+300-second minimum allowance. Successful finalization additionally requires
+clean, bounded EOF on both captured pipes and no frame after `Complete`; an
+unproved containment state quarantines the disposable workspace.
+
+After timing and call counters stop, the runner verifies exact IDs, values,
+cohorts, payloads, insertions, and deletions across every target table,
+including the tables that should remain untouched. Source and main must retain
+their exact frozen content and unchanged branch heads. The runner also requires
+the general three-way route and exactly one `TableWalk` interval per diverged
+table. The reported storage counts are logical engine calls, not physical
+requests or cloud-cost estimates.
+
+The warm program `branch-merge-read-set-v1` reads the reachable commit list and
+a coherent snapshot for `main`, `bench-source`, and `bench-target`, then fully
+consumes the projected benchmark columns of every diverged table. A
+post-invalidation point runs that same program and reopens the engine handle
+before measurement. Cold points remain refused because a fresh worker process
+does not by itself prove that operating-system page caches were evicted.
 
 ## Delivery boundary
 
-This first slice stops at a validated, versioned execution plan. The remaining
-pieces land behind that contract in this order:
+The configuration, planning, and identical-state local runner slices now sit
+behind one typed plan contract. Runner-v1 deliberately stops at versioned
+diagnostic output with `durable_record: false`; even its JSON output is not an
+immutable benchmark record.
 
-1. A runner builds and freezes fixtures, performs one operation per repetition,
-   restores the declared reset state, and verifies non-vacuous results.
-2. Telemetry writes immutable JSON run records to a content-addressed archive.
-   A query database is a rebuildable projection, never the source of truth.
-3. An AWS adapter binds declared S3 and machine facts, applies budget and
-   lifecycle controls, runs the same plans, and uploads the same record format.
-
-Keeping execution, persistence, and cloud orchestration out of this slice lets
-reviewers stabilize experiment identity before any point ids or result records
-escape into infrastructure.
+The next telemetry slice writes immutable JSON records to a content-addressed
+archive and builds a query database as a disposable projection. A later AWS
+adapter binds declared S3 and machine facts, applies budget and lifecycle
+controls, executes the same plans, and uploads that same record format. S3
+reset, fixture caching, server-mode execution, and proved operating-system
+page-cache eviction remain outside the current local runner.
 
 ## Add a case
 
 1. Add a versioned case file with explicit levels for every typed factor.
 2. Reference it from a suite with a path relative to that suite.
 3. Run both `case validate` and `suite validate`.
-4. Inspect `suite plan` before handing the plan to a runner.
+4. Inspect `suite plan` before executing the suite.
+5. Run from a release build on a host that can prove every declared environment
+   fact; an unsupported factor is a refusal, not permission to approximate it.
 
 Do not encode a profile such as `micro` or `realistic` in a case. Profiles are
 derived from the declared factor levels. Benchmark timing is evidence and does

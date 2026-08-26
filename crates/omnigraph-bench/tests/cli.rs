@@ -122,7 +122,7 @@ fn suite_plan_resolves_relative_cases_and_supports_selection() {
     // deliberate factor change must update this fixture.
     assert_eq!(
         plan["runs"][0]["point_id"],
-        "ac0f9c1885b31ea11943bb4baa37060d283af31271a45722373d073b3c90609c"
+        "eee6d8e8dd097564e791b8359c913a3e2a5821eef3506c33b1f521e26e5765d5"
     );
 }
 
@@ -163,6 +163,54 @@ fn missing_case_selector_fails_instead_of_running_the_full_suite() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("does-not-exist"));
+}
+
+#[test]
+fn suite_run_refuses_debug_wall_clock_measurement_before_fixture_setup() {
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "suite",
+            "run",
+            benchmark_path("suites/local-smoke.suite-v1.yaml")
+                .to_str()
+                .expect("UTF-8 path"),
+            "--case",
+            "branch-merge-d50-warm",
+            "--json",
+        ])
+        .output()
+        .expect("run suite");
+    assert!(!output.status.success(), "{output:?}");
+    let failure: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("runner failure JSON");
+    assert_eq!(failure["runner_output_version"], 1);
+    assert_eq!(failure["suite"], "local-smoke");
+    assert_eq!(failure["completed_runs"].as_array().unwrap().len(), 0);
+    assert_eq!(failure["error"]["code"], "release_build_required");
+    assert_eq!(failure["error"]["case_id"], "branch-merge-d50-warm");
+    assert_eq!(
+        failure["error"]["point_id"],
+        "eee6d8e8dd097564e791b8359c913a3e2a5821eef3506c33b1f521e26e5765d5"
+    );
+}
+
+#[test]
+fn suite_run_checks_selection_before_execution_guards() {
+    Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "suite",
+            "run",
+            benchmark_path("suites/local-smoke.suite-v1.yaml")
+                .to_str()
+                .expect("UTF-8 path"),
+            "--case",
+            "does-not-exist",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown_case_selector"));
 }
 
 #[test]

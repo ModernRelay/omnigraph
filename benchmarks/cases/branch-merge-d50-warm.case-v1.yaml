@@ -19,7 +19,7 @@ fixture:
     indexes: []
     deletion_history: none
     compaction_recency: not-optimized
-    history_depth: 1
+    history_depth: 213
 
 workload:
   delta_rows_per_side: 50
@@ -47,5 +47,5 @@ protocol:
   deadline_seconds: 60
   attribution: per-phase
   schedule: manual
-  reset: plain-copy
+  reset: local-clonefile
   timer: monotonic
