@@ -33,7 +33,11 @@ jobs:
   dst-suite:
     name: DST pinned suite
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Cold budget: the uncached build of the full dependency graph plus
+    # the shipped-shape clippy pass measured ~30 min on the standard
+    # runner; warm runs are minutes. 60 keeps the timeout a hang guard,
+    # not a cold-build ceiling.
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -54,7 +58,12 @@ jobs:
           workspaces: |
             . -> target
           key: dst
-          save-if: ${{ github.event_name == 'push' }}
+          # TEMPORARY while #527 iterates: PR runs may seed the cache so
+          # each push does not repeat the ~30 min cold build. Restore
+          # `save-if: ${{ github.event_name == 'push' }}` before merge —
+          # push-only saving protects the long-lived main cache from PR
+          # eviction churn.
+          save-if: true
 
       # The whole active suite: lib proofs (arbiter, judges, classifiers,
       # census guards) + scenario pins + the torn-init pin. Instruments
