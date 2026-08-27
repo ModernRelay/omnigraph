@@ -19,8 +19,9 @@ use crate::branch_merge::{BranchMergePlan, TARGET_BRANCH};
 use crate::machine::MachineIdentityV1;
 use crate::reset::{MetadataDigest, PhysicalDigest};
 use crate::runner::{
-    ChildProcessEvidence, RepObservation, RunnerError, RunnerResult,
-    configure_benchmark_worker_environment, validate_worker_build_attestation,
+    ChildProcessEvidence, MergePhaseEvidenceForm, RepObservation, RunnerError, RunnerResult,
+    configure_benchmark_worker_environment, validate_successful_merge_phase_topology,
+    validate_worker_build_attestation,
 };
 use crate::worker_protocol::{
     ChildFrameV1, MAX_WORKER_FRAME_BYTES, ParentFrameV1, WORKER_PROTOCOL_VERSION, WorkerBuildV1,
@@ -1211,17 +1212,13 @@ fn validate_sample_admission(
     let expected_rows = plan
         .expected_merged_rows()
         .map_err(|error| format!("parent could not derive expected merged rows: {error}"))?;
-    let table_walk_phases = sample
-        .phases
-        .iter()
-        .filter(|phase| phase.phase == "TableWalk")
-        .collect::<Vec<_>>();
-
-    let table_walk_interval_counts = table_walk_phases
-        .iter()
-        .map(|phase| phase.interval_count)
-        .collect::<Vec<_>>();
-    let expected_table_walk_interval_counts = vec![expected_intervals];
+    validate_successful_merge_phase_topology(
+        &sample.phases,
+        &sample.route,
+        expected_intervals,
+        MergePhaseEvidenceForm::StoredSample,
+    )
+    .map_err(|error| format!("worker sample phase topology invalid: {error}"))?;
     let expected_outcome = "merged".to_string();
     let expected_branch = TARGET_BRANCH.to_string();
     let mut mismatches = Vec::new();
@@ -1254,18 +1251,6 @@ fn validate_sample_admission(
         "outcome",
         &expected_outcome,
         &sample.outcome,
-    );
-    record_admission_mismatch(
-        &mut mismatches,
-        "route.table_walk_intervals",
-        &expected_intervals,
-        &sample.route.table_walk_intervals,
-    );
-    record_admission_mismatch(
-        &mut mismatches,
-        "table_walk_phase_interval_counts",
-        &expected_table_walk_interval_counts,
-        &table_walk_interval_counts,
     );
     record_admission_mismatch(
         &mut mismatches,
@@ -1383,8 +1368,8 @@ fn remaining(total: Duration, elapsed: Duration) -> Duration {
 mod tests {
     use crate::counting::LogicalCallCounts;
     use crate::runner::{
-        ControlCallObservation, LogicalStoreCallObservation, MergeRouteObservation,
-        PhaseObservation, VerificationObservation,
+        ControlCallObservation, LogicalStoreCallObservation, VerificationObservation,
+        test_general_merge_route, test_general_merge_stored_phases,
     };
     use crate::worker_protocol::ChildFrameV1;
     use crate::{ValidatedCase, parse_case};
@@ -1548,22 +1533,8 @@ mod tests {
             elapsed_us: TEST_ELAPSED_US,
             peak_rss_bytes: None,
             outcome: "merged".to_string(),
-            phases: vec![PhaseObservation {
-                phase: "TableWalk".to_string(),
-                total_us: 700,
-                max_us: 250,
-                interval_count: intervals,
-            }],
-            route: MergeRouteObservation {
-                table_walk_intervals: intervals,
-                stage_merge_insert_calls: 0,
-                stage_merge_insert_rows: 0,
-                stage_known_present_update_calls: 0,
-                stage_known_present_update_rows: 0,
-                stage_fenced_insert_calls: 0,
-                stage_fenced_insert_rows: 0,
-                strict_insert_preflight_calls: 0,
-            },
+            phases: test_general_merge_stored_phases(intervals, intervals),
+            route: test_general_merge_route(intervals, intervals),
             logical_store_calls: LogicalStoreCallObservation {
                 manifest: LogicalCallCounts::default(),
                 table: LogicalCallCounts::default(),
@@ -2012,8 +1983,13 @@ mod tests {
             ("route.table_walk_intervals", |sample| {
                 sample.route.table_walk_intervals += 1;
             }),
-            ("table_walk_phase_interval_counts", |sample| {
-                sample.phases[0].interval_count += 1;
+            ("TableWalk", |sample| {
+                sample
+                    .phases
+                    .iter_mut()
+                    .find(|phase| phase.phase == "TableWalk")
+                    .unwrap()
+                    .interval_count += 1;
             }),
             ("verification.branch", |sample| {
                 sample.verification.branch = "source".to_string();
@@ -2050,6 +2026,45 @@ mod tests {
             assert!(message.contains("expected="), "field={field}: {message}");
             assert!(message.contains("observed="), "field={field}: {message}");
         }
+    }
+
+    #[test]
+    fn parent_admission_enforces_successful_merge_phase_topology() {
+        let (_workspace, input) = supervision_input(PathBuf::from("/unused"));
+        validate_sample_admission(&valid_sample(&input), &input, TEST_ELAPSED_US).unwrap();
+
+        let mut empty = valid_sample(&input);
+        empty.phases.clear();
+        assert!(
+            validate_sample_admission(&empty, &input, TEST_ELAPSED_US)
+                .unwrap_err()
+                .contains("missing mandatory phase `OuterPrepare`")
+        );
+
+        let mut missing_publish = valid_sample(&input);
+        missing_publish
+            .phases
+            .retain(|phase| phase.phase != "PhysicalPublish");
+        assert!(
+            validate_sample_admission(&missing_publish, &input, TEST_ELAPSED_US)
+                .unwrap_err()
+                .contains("missing mandatory phase `PhysicalPublish`")
+        );
+
+        let mut bad_enclosure = valid_sample(&input);
+        for phase in bad_enclosure
+            .phases
+            .iter_mut()
+            .filter(|phase| matches!(phase.phase.as_str(), "KeyedStage" | "KeyedCommit"))
+        {
+            phase.total_us = 60;
+            phase.max_us = 20;
+        }
+        assert!(
+            validate_sample_admission(&bad_enclosure, &input, TEST_ELAPSED_US)
+                .unwrap_err()
+                .contains("does not enclose")
+        );
     }
 
     #[test]

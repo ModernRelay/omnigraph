@@ -10,6 +10,7 @@
 //! layer; fixture caching, cold page-cache control, S3 reset, and AWS
 //! orchestration remain separate slices.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
@@ -24,7 +25,7 @@ use futures::FutureExt;
 use lance::io::WrappingObjectStore;
 use omnigraph::db::{MergeOutcome, Omnigraph};
 use omnigraph::instrumentation::{
-    CountingStorageAdapter, MergeWriteProbes, QueryIoProbes, StorageReadCounts,
+    CountingStorageAdapter, MergeTimingReading, MergeWriteProbes, QueryIoProbes, StorageReadCounts,
     with_merge_write_probes, with_query_io_probes,
 };
 use serde::{Deserialize, Serialize};
@@ -410,6 +411,388 @@ pub struct MergeRouteObservation {
     pub stage_fenced_insert_calls: u64,
     pub stage_fenced_insert_rows: u64,
     pub strict_insert_preflight_calls: u64,
+}
+
+impl MergeRouteObservation {
+    pub(crate) fn from_probes(probes: &MergeWriteProbes) -> Self {
+        Self {
+            table_walk_intervals: probes.table_walk_interval_count(),
+            stage_merge_insert_calls: probes.stage_merge_insert_calls(),
+            stage_merge_insert_rows: probes.stage_merge_insert_rows(),
+            stage_known_present_update_calls: probes.stage_known_present_update_calls(),
+            stage_known_present_update_rows: probes.stage_known_present_update_rows(),
+            stage_fenced_insert_calls: probes.stage_fenced_insert_calls(),
+            stage_fenced_insert_rows: probes.stage_fenced_insert_rows(),
+            strict_insert_preflight_calls: probes.strict_insert_preflight_calls(),
+        }
+    }
+}
+
+const CURRENT_STABLE_MERGE_PHASES: [&str; 14] = [
+    "OuterPrepare",
+    "ProvenInsertHistory",
+    "ProvenInsertPlanScan",
+    "TableWalk",
+    "CandidateValidation",
+    "FinalRevalidation",
+    "RecoveryArm",
+    "PhysicalPublish",
+    "KeyedStage",
+    "KeyedCommit",
+    "RecoveryConfirm",
+    "ManifestPublish",
+    "RecoveryCleanup",
+    "OuterRestoreRefresh",
+];
+const REQUIRED_GENERAL_TOP_LEVEL_PHASES: [&str; 9] = [
+    "OuterPrepare",
+    "CandidateValidation",
+    "FinalRevalidation",
+    "RecoveryArm",
+    "PhysicalPublish",
+    "RecoveryConfirm",
+    "ManifestPublish",
+    "RecoveryCleanup",
+    "OuterRestoreRefresh",
+];
+const GENERAL_ROUTE_UNENTERED_PHASES: [&str; 2] = ["ProvenInsertHistory", "ProvenInsertPlanScan"];
+
+#[cfg(test)]
+pub(crate) fn test_general_merge_route(
+    table_walk_intervals: u64,
+    merge_insert_calls: u64,
+) -> MergeRouteObservation {
+    MergeRouteObservation {
+        table_walk_intervals,
+        stage_merge_insert_calls: merge_insert_calls,
+        stage_merge_insert_rows: merge_insert_calls,
+        stage_known_present_update_calls: 0,
+        stage_known_present_update_rows: 0,
+        stage_fenced_insert_calls: 0,
+        stage_fenced_insert_rows: 0,
+        strict_insert_preflight_calls: 0,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_general_merge_stored_phases(
+    table_walk_intervals: u64,
+    merge_insert_calls: u64,
+) -> Vec<PhaseObservation> {
+    let phase = |name: &str, total_us, max_us, interval_count| PhaseObservation {
+        phase: name.to_string(),
+        total_us,
+        max_us,
+        interval_count,
+    };
+    vec![
+        phase("OuterPrepare", 5, 5, 1),
+        phase("TableWalk", 20, 10, table_walk_intervals),
+        phase("CandidateValidation", 4, 4, 1),
+        phase("FinalRevalidation", 5, 5, 1),
+        phase("RecoveryArm", 2, 2, 1),
+        phase("PhysicalPublish", 100, 100, 1),
+        phase("KeyedStage", 20, 10, merge_insert_calls),
+        phase("KeyedCommit", 30, 15, merge_insert_calls),
+        phase("RecoveryConfirm", 2, 2, 1),
+        phase("ManifestPublish", 6, 6, 1),
+        phase("RecoveryCleanup", 1, 1, 1),
+        phase("OuterRestoreRefresh", 2, 2, 1),
+    ]
+}
+
+/// Whether phase evidence is the engine's complete raw snapshot or the
+/// compact, durable evidence stored on an admitted sample.
+///
+/// The raw snapshot enumerates stable optional phases that were not entered as
+/// zero-count readings. Those entries are deliberately removed only after the
+/// required successful-merge topology has been checked. Durable evidence, by
+/// contrast, may contain only phases that were actually observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergePhaseEvidenceForm {
+    RawSnapshot,
+    StoredSample,
+}
+
+/// A fail-closed violation of the successful branch-merge phase topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergePhaseTopologyError {
+    code: &'static str,
+    message: String,
+}
+
+impl MergePhaseTopologyError {
+    fn new(code: &'static str, message: String) -> Self {
+        Self { code, message }
+    }
+
+    pub(crate) const fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+impl Display for MergePhaseTopologyError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// Validate the one successful-merge phase contract used by worker execution,
+/// parent admission, and durable-record loading.
+///
+/// Runner-v1 admits only its declared non-fast-forward general three-way
+/// route. `KeyedStage` and `KeyedCommit` are sub-buckets of
+/// `PhysicalPublish`; their expected interval count is the route's admitted
+/// merge-insert call count. Additive unknown phases remain valid only when
+/// observed; a new zero-count phase must be classified here before the compact
+/// stored representation may omit it.
+pub(crate) fn validate_successful_merge_phase_topology(
+    phases: &[PhaseObservation],
+    route: &MergeRouteObservation,
+    expected_table_walks: u64,
+    form: MergePhaseEvidenceForm,
+) -> Result<(), MergePhaseTopologyError> {
+    if route.table_walk_intervals != expected_table_walks {
+        return Err(MergePhaseTopologyError::new(
+            "phase_topology_mismatch",
+            format!(
+                "route.table_walk_intervals mismatch: expected={expected_table_walks}, observed={}",
+                route.table_walk_intervals
+            ),
+        ));
+    }
+    if route.stage_merge_insert_calls < expected_table_walks {
+        return Err(MergePhaseTopologyError::new(
+            "phase_topology_mismatch",
+            format!(
+                "route.stage_merge_insert_calls must be at least the diverged-table count: minimum={expected_table_walks}, observed={}",
+                route.stage_merge_insert_calls
+            ),
+        ));
+    }
+    if route.stage_merge_insert_rows < route.stage_merge_insert_calls {
+        return Err(MergePhaseTopologyError::new(
+            "phase_topology_mismatch",
+            format!(
+                "route.stage_merge_insert_rows must be at least the merge-insert call count: minimum={}, observed={}",
+                route.stage_merge_insert_calls, route.stage_merge_insert_rows
+            ),
+        ));
+    }
+    for (field, observed) in [
+        (
+            "route.stage_known_present_update_calls",
+            route.stage_known_present_update_calls,
+        ),
+        (
+            "route.stage_known_present_update_rows",
+            route.stage_known_present_update_rows,
+        ),
+        (
+            "route.stage_fenced_insert_calls",
+            route.stage_fenced_insert_calls,
+        ),
+        (
+            "route.stage_fenced_insert_rows",
+            route.stage_fenced_insert_rows,
+        ),
+        (
+            "route.strict_insert_preflight_calls",
+            route.strict_insert_preflight_calls,
+        ),
+    ] {
+        if observed != 0 {
+            return Err(MergePhaseTopologyError::new(
+                "phase_topology_mismatch",
+                format!(
+                    "{field} is not part of the general three-way route: expected=0, observed={observed}"
+                ),
+            ));
+        }
+    }
+
+    let mut by_name = BTreeMap::new();
+    for phase in phases {
+        if phase.phase.is_empty() {
+            return Err(MergePhaseTopologyError::new(
+                "invalid_phase_measurement",
+                "phase names must not be empty".to_string(),
+            ));
+        }
+        if by_name.insert(phase.phase.as_str(), phase).is_some() {
+            return Err(MergePhaseTopologyError::new(
+                "duplicate_phase",
+                format!("phase `{}` occurs more than once", phase.phase),
+            ));
+        }
+        if phase.max_us > phase.total_us {
+            return Err(MergePhaseTopologyError::new(
+                "invalid_phase_measurement",
+                format!(
+                    "phase `{}` has max_us={} greater than total_us={}",
+                    phase.phase, phase.max_us, phase.total_us
+                ),
+            ));
+        }
+        match (form, phase.interval_count) {
+            (MergePhaseEvidenceForm::RawSnapshot, 0) => {
+                if !GENERAL_ROUTE_UNENTERED_PHASES.contains(&phase.phase.as_str()) {
+                    return Err(MergePhaseTopologyError::new(
+                        "phase_topology_mismatch",
+                        format!(
+                            "raw phase `{}` has zero intervals but is not a declared unentered phase of the general three-way route",
+                            phase.phase
+                        ),
+                    ));
+                }
+                if phase.total_us != 0 || phase.max_us != 0 {
+                    return Err(MergePhaseTopologyError::new(
+                        "invalid_phase_measurement",
+                        format!(
+                            "unentered raw phase `{}` must have zero total_us and max_us",
+                            phase.phase
+                        ),
+                    ));
+                }
+            }
+            (MergePhaseEvidenceForm::StoredSample, 0) => {
+                return Err(MergePhaseTopologyError::new(
+                    "invalid_phase_measurement",
+                    format!(
+                        "stored phase `{}` must contain at least one completed interval",
+                        phase.phase
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if form == MergePhaseEvidenceForm::RawSnapshot {
+        for name in CURRENT_STABLE_MERGE_PHASES {
+            if !by_name.contains_key(name) {
+                return Err(MergePhaseTopologyError::new(
+                    "missing_phase_evidence",
+                    format!("raw merge timing snapshot is missing stable phase `{name}`"),
+                ));
+            }
+        }
+    }
+
+    for name in REQUIRED_GENERAL_TOP_LEVEL_PHASES {
+        let phase = by_name.get(name).ok_or_else(|| {
+            MergePhaseTopologyError::new(
+                "missing_phase_evidence",
+                format!("successful general merge is missing mandatory phase `{name}`"),
+            )
+        })?;
+        if phase.interval_count != 1 {
+            return Err(MergePhaseTopologyError::new(
+                "phase_topology_mismatch",
+                format!(
+                    "{name} interval_count mismatch: expected=1, observed={}",
+                    phase.interval_count
+                ),
+            ));
+        }
+    }
+
+    let table_walk = by_name.get("TableWalk").ok_or_else(|| {
+        MergePhaseTopologyError::new(
+            "missing_phase_evidence",
+            "successful general merge is missing required phase `TableWalk`".to_string(),
+        )
+    })?;
+    if table_walk.interval_count != expected_table_walks {
+        return Err(MergePhaseTopologyError::new(
+            "phase_topology_mismatch",
+            format!(
+                "TableWalk interval_count mismatch: expected={expected_table_walks}, observed={}",
+                table_walk.interval_count
+            ),
+        ));
+    }
+
+    for name in GENERAL_ROUTE_UNENTERED_PHASES {
+        match (form, by_name.get(name)) {
+            (MergePhaseEvidenceForm::RawSnapshot, Some(phase)) if phase.interval_count == 0 => {}
+            (MergePhaseEvidenceForm::RawSnapshot, Some(phase)) => {
+                return Err(MergePhaseTopologyError::new(
+                    "phase_topology_mismatch",
+                    format!(
+                        "general three-way route must not enter {name}: expected=0, observed={}",
+                        phase.interval_count
+                    ),
+                ));
+            }
+            (MergePhaseEvidenceForm::StoredSample, None) => {}
+            (MergePhaseEvidenceForm::StoredSample, Some(_)) => {
+                return Err(MergePhaseTopologyError::new(
+                    "phase_topology_mismatch",
+                    format!("stored general-route evidence must omit unentered phase `{name}`"),
+                ));
+            }
+            // Raw stable-name validation above owns this refusal, but retain a
+            // total match so this route rule stays independently fail closed.
+            (MergePhaseEvidenceForm::RawSnapshot, None) => {
+                return Err(MergePhaseTopologyError::new(
+                    "missing_phase_evidence",
+                    format!("raw merge timing snapshot is missing stable phase `{name}`"),
+                ));
+            }
+        }
+    }
+
+    let keyed_stage = by_name.get("KeyedStage").copied();
+    let keyed_commit = by_name.get("KeyedCommit").copied();
+    for (name, phase) in [("KeyedStage", keyed_stage), ("KeyedCommit", keyed_commit)] {
+        match phase {
+            Some(phase) if phase.interval_count != route.stage_merge_insert_calls => {
+                return Err(MergePhaseTopologyError::new(
+                    "phase_topology_mismatch",
+                    format!(
+                        "{name} interval_count mismatch: expected={}, observed={}",
+                        route.stage_merge_insert_calls, phase.interval_count
+                    ),
+                ));
+            }
+            None => {
+                return Err(MergePhaseTopologyError::new(
+                    "missing_phase_evidence",
+                    format!(
+                        "successful general merge has {} merge-insert calls but is missing required phase `{name}`",
+                        route.stage_merge_insert_calls
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let physical_publish = by_name
+        .get("PhysicalPublish")
+        .expect("mandatory phase was checked above");
+    let keyed_stage_total = keyed_stage.map_or(0, |phase| phase.total_us);
+    let keyed_commit_total = keyed_commit.map_or(0, |phase| phase.total_us);
+    let keyed_total = keyed_stage_total
+        .checked_add(keyed_commit_total)
+        .ok_or_else(|| {
+            MergePhaseTopologyError::new(
+                "phase_topology_overflow",
+                "KeyedStage plus KeyedCommit total_us does not fit u64".to_string(),
+            )
+        })?;
+    if physical_publish.total_us < keyed_total {
+        return Err(MergePhaseTopologyError::new(
+            "phase_topology_mismatch",
+            format!(
+                "PhysicalPublish total_us={} does not enclose KeyedStage + KeyedCommit total_us={keyed_total}",
+                physical_publish.total_us
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2138,6 +2521,28 @@ fn local_environment(
         .map_err(|message| RunnerError::new("environment_mismatch", message))
 }
 
+pub(crate) fn phase_observations(readings: Vec<MergeTimingReading>) -> Vec<PhaseObservation> {
+    readings
+        .into_iter()
+        .map(|reading| PhaseObservation {
+            phase: reading.phase.to_string(),
+            total_us: reading.total_us,
+            max_us: reading.max_us,
+            interval_count: reading.interval_count,
+        })
+        .collect()
+}
+
+/// A sample carries measurements, not the engine's complete stable-phase
+/// enumeration. This filter is valid only after the raw snapshot passes
+/// [`validate_successful_merge_phase_topology`].
+fn observed_phase_evidence(phases: Vec<PhaseObservation>) -> Vec<PhaseObservation> {
+    phases
+        .into_iter()
+        .filter(|phase| phase.interval_count > 0)
+        .collect()
+}
+
 async fn execute_rep(
     repetition: u32,
     root: &Path,
@@ -2367,28 +2772,36 @@ async fn execute_rep_body<S: MeasurementSignals>(
         ));
     }
 
-    let phase_readings = merge_probes.merge_timing_snapshot();
-    let table_walk = phase_readings
-        .iter()
-        .find(|reading| reading.phase == "TableWalk")
-        .ok_or_else(|| {
-            RunnerError::new(
-                "missing_table_walk_phase",
-                "merge timing snapshot did not contain the stable TableWalk phase",
-            )
-        })?;
     let expected_intervals = u64::try_from(plan.diverged_tables).map_err(|_| {
         RunnerError::new("interval_overflow", "diverged table count does not fit u64")
     })?;
-    if table_walk.interval_count != expected_intervals {
-        return Err(RunnerError::new(
-            "vacuous_merge",
-            format!(
-                "repetition {repetition} completed {} TableWalk intervals; expected exactly {expected_intervals}",
-                table_walk.interval_count
-            ),
-        ));
-    }
+    let route = MergeRouteObservation::from_probes(&merge_probes);
+    let raw_phases = phase_observations(merge_probes.merge_timing_snapshot());
+    validate_successful_merge_phase_topology(
+        &raw_phases,
+        &route,
+        expected_intervals,
+        MergePhaseEvidenceForm::RawSnapshot,
+    )
+    .map_err(|error| {
+        RunnerError::new(
+            error.code(),
+            format!("repetition {repetition} phase evidence is invalid: {error}"),
+        )
+    })?;
+    let phases = observed_phase_evidence(raw_phases);
+    validate_successful_merge_phase_topology(
+        &phases,
+        &route,
+        expected_intervals,
+        MergePhaseEvidenceForm::StoredSample,
+    )
+    .map_err(|error| {
+        RunnerError::new(
+            error.code(),
+            format!("repetition {repetition} stored phase evidence is invalid: {error}"),
+        )
+    })?;
 
     // Verification runs only after all measured clocks and counters are read.
     let verification = verify_merged_graph(&db, plan, &protected_heads)
@@ -2402,25 +2815,8 @@ async fn execute_rep_body<S: MeasurementSignals>(
         elapsed_us,
         peak_rss_bytes: None,
         outcome: "merged".to_string(),
-        phases: phase_readings
-            .into_iter()
-            .map(|reading| PhaseObservation {
-                phase: reading.phase.to_string(),
-                total_us: reading.total_us,
-                max_us: reading.max_us,
-                interval_count: reading.interval_count,
-            })
-            .collect(),
-        route: MergeRouteObservation {
-            table_walk_intervals: merge_probes.table_walk_interval_count(),
-            stage_merge_insert_calls: merge_probes.stage_merge_insert_calls(),
-            stage_merge_insert_rows: merge_probes.stage_merge_insert_rows(),
-            stage_known_present_update_calls: merge_probes.stage_known_present_update_calls(),
-            stage_known_present_update_rows: merge_probes.stage_known_present_update_rows(),
-            stage_fenced_insert_calls: merge_probes.stage_fenced_insert_calls(),
-            stage_fenced_insert_rows: merge_probes.stage_fenced_insert_rows(),
-            strict_insert_preflight_calls: merge_probes.strict_insert_preflight_calls(),
-        },
+        phases,
+        route,
         logical_store_calls: LogicalStoreCallObservation {
             manifest: manifest_calls,
             table: table_calls,
@@ -2583,6 +2979,257 @@ mod tests {
 
     use super::*;
     use crate::parse_case;
+
+    fn general_route(merge_insert_calls: u64) -> MergeRouteObservation {
+        test_general_merge_route(2, merge_insert_calls)
+    }
+
+    fn phase(name: &str, total_us: u64, max_us: u64, interval_count: u64) -> PhaseObservation {
+        PhaseObservation {
+            phase: name.to_string(),
+            total_us,
+            max_us,
+            interval_count,
+        }
+    }
+
+    fn valid_stored_phases() -> Vec<PhaseObservation> {
+        test_general_merge_stored_phases(2, 2)
+    }
+
+    fn valid_raw_phases() -> Vec<PhaseObservation> {
+        let mut phases = valid_stored_phases();
+        phases.push(phase("ProvenInsertHistory", 0, 0, 0));
+        phases.push(phase("ProvenInsertPlanScan", 0, 0, 0));
+        phases
+    }
+
+    #[test]
+    fn raw_phase_topology_is_validated_before_unobserved_phases_are_filtered() {
+        // A fresh probe snapshot is the engine's complete stable-phase
+        // enumeration with no completed intervals. It must not turn into an
+        // apparently valid empty sample merely because zero-count phases are
+        // omitted from durable evidence.
+        let raw = phase_observations(MergeWriteProbes::default().merge_timing_snapshot());
+        assert!(raw.len() > 1);
+        assert!(raw.iter().all(|reading| reading.interval_count == 0));
+        let error = validate_successful_merge_phase_topology(
+            &raw,
+            &general_route(2),
+            2,
+            MergePhaseEvidenceForm::RawSnapshot,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "phase_topology_mismatch");
+        assert!(observed_phase_evidence(raw).is_empty());
+    }
+
+    #[test]
+    fn successful_merge_phase_topology_requires_publish_and_enclosure() {
+        let route = general_route(2);
+        let phases = valid_stored_phases();
+        validate_successful_merge_phase_topology(
+            &phases,
+            &route,
+            2,
+            MergePhaseEvidenceForm::StoredSample,
+        )
+        .unwrap();
+
+        let mut missing_publish = phases.clone();
+        missing_publish.retain(|phase| phase.phase != "PhysicalPublish");
+        let error = validate_successful_merge_phase_topology(
+            &missing_publish,
+            &route,
+            2,
+            MergePhaseEvidenceForm::StoredSample,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "missing_phase_evidence");
+
+        let mut missing_mandatory = phases.clone();
+        missing_mandatory.retain(|phase| phase.phase != "CandidateValidation");
+        let error = validate_successful_merge_phase_topology(
+            &missing_mandatory,
+            &route,
+            2,
+            MergePhaseEvidenceForm::StoredSample,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "missing_phase_evidence");
+        assert!(error.to_string().contains("CandidateValidation"));
+
+        let mut bad_enclosure = phases;
+        let physical_publish = bad_enclosure
+            .iter_mut()
+            .find(|phase| phase.phase == "PhysicalPublish")
+            .unwrap();
+        physical_publish.total_us = 24;
+        physical_publish.max_us = 24;
+        let error = validate_successful_merge_phase_topology(
+            &bad_enclosure,
+            &route,
+            2,
+            MergePhaseEvidenceForm::StoredSample,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "phase_topology_mismatch");
+        assert!(error.to_string().contains("does not enclose"));
+
+        let mut wrong_publish_count = valid_stored_phases();
+        wrong_publish_count
+            .iter_mut()
+            .find(|phase| phase.phase == "PhysicalPublish")
+            .unwrap()
+            .interval_count = 2;
+        assert_eq!(
+            validate_successful_merge_phase_topology(
+                &wrong_publish_count,
+                &route,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap_err()
+            .code(),
+            "phase_topology_mismatch"
+        );
+
+        let mut wrong_keyed_count = valid_stored_phases();
+        wrong_keyed_count
+            .iter_mut()
+            .find(|phase| phase.phase == "KeyedStage")
+            .unwrap()
+            .interval_count = 3;
+        assert_eq!(
+            validate_successful_merge_phase_topology(
+                &wrong_keyed_count,
+                &route,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap_err()
+            .code(),
+            "phase_topology_mismatch"
+        );
+
+        let mut duplicate = valid_stored_phases();
+        let duplicate_phase = duplicate[0].clone();
+        duplicate.push(duplicate_phase);
+        assert_eq!(
+            validate_successful_merge_phase_topology(
+                &duplicate,
+                &route,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap_err()
+            .code(),
+            "duplicate_phase"
+        );
+
+        let mut zero_count = valid_stored_phases();
+        zero_count.push(PhaseObservation {
+            phase: "OptionalFuturePhase".to_string(),
+            total_us: 0,
+            max_us: 0,
+            interval_count: 0,
+        });
+        assert_eq!(
+            validate_successful_merge_phase_topology(
+                &zero_count,
+                &route,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap_err()
+            .code(),
+            "invalid_phase_measurement"
+        );
+    }
+
+    #[test]
+    fn general_route_rejects_false_zero_wrong_route_and_incomplete_raw_evidence() {
+        let phases = valid_stored_phases();
+        validate_successful_merge_phase_topology(
+            &valid_raw_phases(),
+            &general_route(2),
+            2,
+            MergePhaseEvidenceForm::RawSnapshot,
+        )
+        .unwrap();
+
+        let mut false_zero = general_route(2);
+        false_zero.stage_merge_insert_calls = 0;
+        false_zero.stage_merge_insert_rows = 0;
+        let error = validate_successful_merge_phase_topology(
+            &phases,
+            &false_zero,
+            2,
+            MergePhaseEvidenceForm::StoredSample,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stage_merge_insert_calls"));
+
+        let mut wrong_route = general_route(2);
+        wrong_route.stage_known_present_update_calls = 1;
+        wrong_route.stage_known_present_update_rows = 1;
+        let error = validate_successful_merge_phase_topology(
+            &phases,
+            &wrong_route,
+            2,
+            MergePhaseEvidenceForm::StoredSample,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stage_known_present_update_calls")
+        );
+
+        let mut zero_rows = general_route(2);
+        zero_rows.stage_merge_insert_rows = 0;
+        let error = validate_successful_merge_phase_topology(
+            &phases,
+            &zero_rows,
+            2,
+            MergePhaseEvidenceForm::StoredSample,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stage_merge_insert_rows"));
+
+        let mut incomplete_raw = valid_raw_phases();
+        incomplete_raw.retain(|phase| phase.phase != "ProvenInsertHistory");
+        let error = validate_successful_merge_phase_topology(
+            &incomplete_raw,
+            &general_route(2),
+            2,
+            MergePhaseEvidenceForm::RawSnapshot,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "missing_phase_evidence");
+        assert!(error.to_string().contains("ProvenInsertHistory"));
+
+        let mut entered_proven = valid_raw_phases();
+        let proven = entered_proven
+            .iter_mut()
+            .find(|phase| phase.phase == "ProvenInsertHistory")
+            .unwrap();
+        proven.total_us = 1;
+        proven.max_us = 1;
+        proven.interval_count = 1;
+        let error = validate_successful_merge_phase_topology(
+            &entered_proven,
+            &general_route(2),
+            2,
+            MergePhaseEvidenceForm::RawSnapshot,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must not enter ProvenInsertHistory")
+        );
+    }
 
     fn assert_json_object_keys(value: &serde_json::Value, expected: &[&str]) {
         let actual = value
@@ -3273,6 +3920,23 @@ protocol:
                             for sample in execution.samples {
                                 assert_eq!(sample.outcome, "merged");
                                 assert_eq!(sample.route.table_walk_intervals, 1);
+                                validate_successful_merge_phase_topology(
+                                    &sample.phases,
+                                    &sample.route,
+                                    1,
+                                    MergePhaseEvidenceForm::StoredSample,
+                                )
+                                .unwrap();
+                                assert!(sample.phases.iter().all(|phase| phase.interval_count > 0));
+                                assert_eq!(
+                                    sample
+                                        .phases
+                                        .iter()
+                                        .find(|phase| phase.phase == "PhysicalPublish")
+                                        .unwrap()
+                                        .interval_count,
+                                    1
+                                );
                                 assert!(sample.verification.exact_content);
                                 assert!(sample.verification.source_exact_content);
                                 assert!(sample.verification.main_exact_content);

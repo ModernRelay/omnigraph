@@ -2523,6 +2523,11 @@ mod tests {
         use omnigraph::db::MergeOutcome;
         use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 
+        use crate::runner::{
+            MergePhaseEvidenceForm, MergeRouteObservation, phase_observations,
+            validate_successful_merge_phase_topology,
+        };
+
         let mut plan = plan(16, 2, 6);
         plan.compaction_recency = CompactionRecency::NotOptimized;
         plan.requested_history_depth = 11;
@@ -2544,6 +2549,25 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, MergeOutcome::Merged);
         assert_eq!(probes.table_walk_interval_count(), 2);
+        let route = MergeRouteObservation::from_probes(&probes);
+        assert!(route.stage_merge_insert_calls >= 2);
+        let phases = phase_observations(probes.merge_timing_snapshot());
+        validate_successful_merge_phase_topology(
+            &phases,
+            &route,
+            2,
+            MergePhaseEvidenceForm::RawSnapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            phases
+                .iter()
+                .find(|phase| phase.phase == "PhysicalPublish")
+                .unwrap()
+                .interval_count,
+            1,
+            "one merge operation with two changed tables publishes physically once"
+        );
 
         let verified = verify_merged_graph(&db, &plan, &protected).await.unwrap();
         assert_eq!(verified.target.tables, 4);
