@@ -247,7 +247,24 @@ pub fn load_suite(path: &Path) -> ValidationOutcome<ResolvedSuite> {
 }
 
 fn resolve_catalog_paths(path: &Path) -> Result<(PathBuf, PathBuf), Diagnostic> {
-    let declared_suites_root = path
+    // Preserve the caller's lexical catalog boundary while making a bare
+    // filename relative to the actual working directory. Canonicalizing the
+    // suite file first would let a symlink redefine which catalog is
+    // authoritative.
+    let declared_suite_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                Diagnostic::error(
+                    "suite_path_error",
+                    path.display().to_string(),
+                    format!("could not resolve the current directory: {error}"),
+                )
+            })?
+            .join(path)
+    };
+    let declared_suites_root = declared_suite_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
@@ -286,7 +303,7 @@ fn resolve_catalog_paths(path: &Path) -> Result<(PathBuf, PathBuf), Diagnostic> 
         ));
     }
 
-    let suite_path = fs::canonicalize(path).map_err(|error| {
+    let suite_path = fs::canonicalize(&declared_suite_path).map_err(|error| {
         Diagnostic::error(
             "suite_path_error",
             path.display().to_string(),

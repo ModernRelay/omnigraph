@@ -42,6 +42,20 @@ fn checked_in_case_and_suite_validate() {
 }
 
 #[test]
+fn suite_commands_accept_a_bare_filename_from_the_suites_directory() {
+    let suites = benchmark_path("suites");
+    for command in ["validate", "plan"] {
+        Command::cargo_bin("omnigraph-bench")
+            .expect("benchmark binary")
+            .current_dir(&suites)
+            .args(["suite", command, "local-smoke.suite-v1.yaml"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("local-smoke"));
+    }
+}
+
+#[test]
 fn case_list_is_machine_readable_and_deterministic() {
     let cases = benchmark_path("cases");
     let output = Command::cargo_bin("omnigraph-bench")
