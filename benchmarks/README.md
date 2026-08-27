@@ -31,6 +31,43 @@ executor must still enforce a separate bounded safety watchdog. Leading and
 trailing whitespace in S3 identity fields and index table/column names is
 normalized before validation and hashing.
 
+`environment.cache_condition` is structured, not a single cold/warm label.
+Every current point uses `process: fresh-per-repetition`. Select one of these
+exact engine/page-cache/program combinations:
+
+```yaml
+# Process-cold: fresh worker, no declared warm-up, OS page cache uncontrolled.
+cache_condition:
+  process: fresh-per-repetition
+  engine: preparation-only
+  page_cache: uncontrolled
+  program: none
+  iterations: 0
+
+# Warm: named program, then measurement on the same handle.
+cache_condition:
+  process: fresh-per-repetition
+  engine: warmed-by-program
+  page_cache: program-conditioned
+  program: branch-merge-read-set-v1
+  iterations: 1
+
+# Post-reopen: named program, then a new engine handle; no invalidation claim.
+cache_condition:
+  process: fresh-per-repetition
+  engine: reopened-after-program
+  page_cache: program-conditioned
+  program: branch-merge-read-set-v1
+  iterations: 1
+```
+
+All five fields enter point identity. `program-conditioned` says the named
+reads ran immediately before measurement; it is not a page-residency proof.
+Page-cache-cold is deliberately absent: it requires both a named
+platform/backend eviction control and a post-control witness. Storage-cold is
+neither supported nor representable because controlling the OS page cache says
+nothing about device, object-store, or remote-service caches.
+
 Case definitions deliberately contain no source branch, system-under-test
 build, machine identity, AWS account, bucket URI, result location, or
 credentials. A runner binds those invocation facts and records them with the
@@ -59,9 +96,9 @@ Each command accepts `--json` for machine-readable output. `suite plan` also
 accepts `--case <ID>` to select one case from a suite.
 
 Validation loads every referenced case and checks cross-field rules, including
-checked scale budgets, table bounds, warmth declarations, and reset/backend
-compatibility. Planning expands the suite into ordered run entries; it does
-not execute a benchmark.
+checked scale budgets, table bounds, cache-condition declarations, and
+reset/backend compatibility. Planning expands the suite into ordered run
+entries; it does not execute a benchmark.
 
 The checked-in smoke point declares APFS on local NVMe storage. Validation is
 host-independent, but the future runner must verify those declared environment

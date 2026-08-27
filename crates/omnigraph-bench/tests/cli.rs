@@ -93,12 +93,22 @@ fn suite_plan_resolves_relative_cases_and_supports_selection() {
     assert_eq!(plan["runs"].as_array().expect("runs").len(), 1);
     assert_eq!(plan["runs"][0]["case_id"], "branch-merge-d50-warm");
     assert_eq!(plan["runs"][0]["repetitions"], 5);
+    assert_eq!(
+        plan["runs"][0]["identity"]["environment"]["cache_condition"],
+        serde_json::json!({
+            "process": "fresh-per-repetition",
+            "engine": "warmed-by-program",
+            "page_cache": "program-conditioned",
+            "program": "branch-merge-read-set-v1",
+            "iterations": 1
+        })
+    );
     // This is the persisted V1 natural key for the checked-in point. An
     // identity-serialization change must bump POINT_IDENTITY_VERSION; a
     // deliberate factor change must update this fixture.
     assert_eq!(
         plan["runs"][0]["point_id"],
-        "a23df610a3cdb76315b55753c935d6d2c129122175f4e4f288552211ec205e30"
+        "ac0f9c1885b31ea11943bb4baa37060d283af31271a45722373d073b3c90609c"
     );
 }
 

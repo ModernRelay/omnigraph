@@ -368,7 +368,7 @@ environment:
   backend: { kind: local-fs, filesystem: apfs, storage_class: nvme-ssd }
   network_position: same-host
   execution: embedded
-  warmth: { regime: warm, program: branch-merge-read-set-v1, iterations: 1 }
+  cache_condition: { process: fresh-per-repetition, engine: warmed-by-program, page_cache: program-conditioned, program: branch-merge-read-set-v1, iterations: 1 }
 protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, reset: plain-copy, timer: monotonic }
 "#;
 

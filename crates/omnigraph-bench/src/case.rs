@@ -189,7 +189,7 @@ pub struct Environment {
     pub backend: Backend,
     pub network_position: NetworkPosition,
     pub execution: Execution,
-    pub warmth: Warmth,
+    pub cache_condition: CacheCondition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -335,23 +335,38 @@ pub enum Execution {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Warmth {
-    pub regime: WarmthRegime,
-    pub program: WarmthProgram,
+pub struct CacheCondition {
+    pub process: ProcessLifecycle,
+    pub engine: EnginePreparation,
+    pub page_cache: PageCacheCondition,
+    pub program: WarmupProgram,
     pub iterations: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum WarmthRegime {
-    Cold,
-    Warm,
-    PostInvalidation,
+pub enum ProcessLifecycle {
+    FreshPerRepetition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum WarmthProgram {
+pub enum EnginePreparation {
+    PreparationOnly,
+    WarmedByProgram,
+    ReopenedAfterProgram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PageCacheCondition {
+    Uncontrolled,
+    ProgramConditioned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WarmupProgram {
     None,
     BranchMergeReadSetV1,
 }
@@ -521,7 +536,7 @@ pub fn validate_case(mut definition: CaseV1) -> ValidationOutcome<ValidatedCase>
     );
     validate_fixture_state(&definition.fixture, &mut diagnostics);
     validate_workload(&definition, &mut diagnostics);
-    validate_warmth(&definition.environment.warmth, &mut diagnostics);
+    validate_cache_condition(&definition.environment.cache_condition, &mut diagnostics);
     validate_backend_protocol(&definition, &mut diagnostics);
 
     if !diagnostics.is_empty() {
@@ -547,7 +562,7 @@ pub fn validate_case(mut definition: CaseV1) -> ValidationOutcome<ValidatedCase>
         definition.fixture.data.tables,
         definition.fixture.data.rows_per_table,
         definition.workload.delta_rows_per_side,
-        definition.environment.warmth.regime.as_str(),
+        definition.environment.cache_condition.display_label(),
     );
     ValidationOutcome::success(ValidatedCase {
         definition,
@@ -576,12 +591,12 @@ fn normalize_identity_strings(case: &mut CaseV1) {
     }
 }
 
-impl WarmthRegime {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Cold => "cold",
-            Self::Warm => "warm",
-            Self::PostInvalidation => "post-invalidation",
+impl CacheCondition {
+    fn display_label(&self) -> &'static str {
+        match self.engine {
+            EnginePreparation::PreparationOnly => "process-cold",
+            EnginePreparation::WarmedByProgram => "warm",
+            EnginePreparation::ReopenedAfterProgram => "post-reopen",
         }
     }
 }
@@ -777,30 +792,37 @@ fn validate_indexes(
     }
 }
 
-fn validate_warmth(warmth: &Warmth, diagnostics: &mut Vec<Diagnostic>) {
-    if warmth.iterations > MAX_WARMUP_ITERATIONS {
+fn validate_cache_condition(condition: &CacheCondition, diagnostics: &mut Vec<Diagnostic>) {
+    let ProcessLifecycle::FreshPerRepetition = condition.process;
+    if condition.iterations > MAX_WARMUP_ITERATIONS {
         diagnostics.push(Diagnostic::error(
             "warmup_iteration_budget_exceeded",
-            "environment.warmth.iterations",
+            "environment.cache_condition.iterations",
             format!("warm-up iterations must be <= {MAX_WARMUP_ITERATIONS}"),
         ));
     }
-    match warmth.regime {
-        WarmthRegime::Cold => {
-            if warmth.program != WarmthProgram::None || warmth.iterations != 0 {
+    match condition.engine {
+        EnginePreparation::PreparationOnly => {
+            if condition.page_cache != PageCacheCondition::Uncontrolled
+                || condition.program != WarmupProgram::None
+                || condition.iterations != 0
+            {
                 diagnostics.push(Diagnostic::error(
-                    "invalid_cold_warmth",
-                    "environment.warmth",
-                    "cold warmth requires program: none and iterations: 0",
+                    "invalid_preparation_only_cache_condition",
+                    "environment.cache_condition",
+                    "preparation-only requires page_cache: uncontrolled, program: none, and iterations: 0",
                 ));
             }
         }
-        WarmthRegime::Warm | WarmthRegime::PostInvalidation => {
-            if warmth.program != WarmthProgram::BranchMergeReadSetV1 || warmth.iterations == 0 {
+        EnginePreparation::WarmedByProgram | EnginePreparation::ReopenedAfterProgram => {
+            if condition.page_cache != PageCacheCondition::ProgramConditioned
+                || condition.program != WarmupProgram::BranchMergeReadSetV1
+                || condition.iterations == 0
+            {
                 diagnostics.push(Diagnostic::error(
-                    "invalid_warmth_program",
-                    "environment.warmth",
-                    "warm and post-invalidation regimes require a named program and iterations >= 1",
+                    "invalid_programmed_cache_condition",
+                    "environment.cache_condition",
+                    "warmed-by-program and reopened-after-program require page_cache: program-conditioned, a named program, and iterations >= 1",
                 ));
             }
         }
@@ -988,8 +1010,10 @@ environment:
     storage_class: nvme-ssd
   network_position: same-host
   execution: embedded
-  warmth:
-    regime: warm
+  cache_condition:
+    process: fresh-per-repetition
+    engine: warmed-by-program
+    page_cache: program-conditioned
     program: branch-merge-read-set-v1
     iterations: 1
 protocol:
@@ -1266,17 +1290,52 @@ protocol:
     }
 
     #[test]
-    fn warmth_is_a_typed_program_with_cross_validation() {
-        let cold = VALID
-            .replace("regime: warm", "regime: cold")
+    fn cache_condition_is_typed_cross_validated_and_identity_bearing() {
+        let process_cold = VALID
+            .replace("engine: warmed-by-program", "engine: preparation-only")
+            .replace(
+                "page_cache: program-conditioned",
+                "page_cache: uncontrolled",
+            )
             .replace("program: branch-merge-read-set-v1", "program: none")
             .replace("iterations: 1", "iterations: 0");
-        assert!(parse_case(&cold).ok);
+        let process_cold = parse_case(&process_cold).into_result().unwrap();
+        assert!(process_cold.point_name.contains("process-cold"));
+        assert_ne!(valid().point_id, process_cold.point_id);
 
-        let invalid = VALID.replace("regime: warm", "regime: cold");
+        let post_reopen = VALID.replace(
+            "engine: warmed-by-program",
+            "engine: reopened-after-program",
+        );
+        let post_reopen = parse_case(&post_reopen).into_result().unwrap();
+        assert!(post_reopen.point_name.contains("post-reopen"));
+        assert_ne!(valid().point_id, post_reopen.point_id);
+
+        let two_iterations = parse_case(&VALID.replace("iterations: 1", "iterations: 2"))
+            .into_result()
+            .unwrap();
+        assert_ne!(valid().point_id, two_iterations.point_id);
+
+        let invalid = VALID.replace("engine: warmed-by-program", "engine: preparation-only");
         assert_eq!(
             parse_case(&invalid).diagnostics[0].code,
-            "invalid_cold_warmth"
+            "invalid_preparation_only_cache_condition"
+        );
+        let invalid_warm_page_cache = VALID.replace(
+            "page_cache: program-conditioned",
+            "page_cache: uncontrolled",
+        );
+        assert_eq!(
+            parse_case(&invalid_warm_page_cache).diagnostics[0].code,
+            "invalid_programmed_cache_condition"
+        );
+        let false_page_cache_claim = VALID.replace(
+            "page_cache: program-conditioned",
+            "page_cache: witnessed-evicted",
+        );
+        assert_eq!(
+            parse_case(&false_page_cache_claim).diagnostics[0].code,
+            "invalid_case_yaml"
         );
         let unsupported = VALID.replace(
             "program: branch-merge-read-set-v1",

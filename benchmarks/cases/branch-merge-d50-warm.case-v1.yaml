@@ -36,8 +36,10 @@ environment:
     storage_class: nvme-ssd
   network_position: same-host
   execution: embedded
-  warmth:
-    regime: warm
+  cache_condition:
+    process: fresh-per-repetition
+    engine: warmed-by-program
+    page_cache: program-conditioned
     program: branch-merge-read-set-v1
     iterations: 1
 
