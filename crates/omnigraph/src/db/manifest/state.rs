@@ -340,16 +340,16 @@ pub(super) async fn read_object_identities_at_offsets(
     let mut scanner = dataset.scan();
     scanner
         .project(&["object_id", "object_type"])
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     scanner.with_fragments(vec![fragment]);
     scanner.with_row_address();
     let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .map_err(OmniError::storage)?
         .try_collect()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     let mut identities = Vec::new();
     for batch in &batches {
         let object_ids = string_column(batch, "object_id")?;

@@ -754,7 +754,7 @@ async fn fragment_deletion_offsets(
     Ok(fragment
         .get_deletion_vector()
         .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
+        .map_err(OmniError::storage)?
         .map(|dv| dv.as_ref().iter().collect())
         .unwrap_or_default())
 }
