@@ -24,7 +24,7 @@ use futures::FutureExt;
 use lance::io::WrappingObjectStore;
 use omnigraph::db::{MergeOutcome, Omnigraph};
 use omnigraph::instrumentation::{
-    CountingStorageAdapter, MergeWriteProbes, QueryIoProbes, StorageReadCounts,
+    CountingStorageAdapter, MergeTimingReading, MergeWriteProbes, QueryIoProbes, StorageReadCounts,
     with_merge_write_probes, with_query_io_probes,
 };
 use serde::{Deserialize, Serialize};
@@ -2138,6 +2138,22 @@ fn local_environment(
         .map_err(|message| RunnerError::new("environment_mismatch", message))
 }
 
+/// The engine timing snapshot enumerates every stable phase, including phases
+/// the measured route never entered. A sample carries measurements, not the
+/// enumeration: keep only phases with at least one completed interval.
+fn observed_phase_evidence(readings: Vec<MergeTimingReading>) -> Vec<PhaseObservation> {
+    readings
+        .into_iter()
+        .filter(|reading| reading.interval_count > 0)
+        .map(|reading| PhaseObservation {
+            phase: reading.phase.to_string(),
+            total_us: reading.total_us,
+            max_us: reading.max_us,
+            interval_count: reading.interval_count,
+        })
+        .collect()
+}
+
 async fn execute_rep(
     repetition: u32,
     root: &Path,
@@ -2402,15 +2418,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
         elapsed_us,
         peak_rss_bytes: None,
         outcome: "merged".to_string(),
-        phases: phase_readings
-            .into_iter()
-            .map(|reading| PhaseObservation {
-                phase: reading.phase.to_string(),
-                total_us: reading.total_us,
-                max_us: reading.max_us,
-                interval_count: reading.interval_count,
-            })
-            .collect(),
+        phases: observed_phase_evidence(phase_readings),
         route: MergeRouteObservation {
             table_walk_intervals: merge_probes.table_walk_interval_count(),
             stage_merge_insert_calls: merge_probes.stage_merge_insert_calls(),
@@ -2583,6 +2591,16 @@ mod tests {
 
     use super::*;
     use crate::parse_case;
+
+    #[test]
+    fn phase_evidence_excludes_unobserved_phases() {
+        // A fresh probe snapshot is the engine's complete stable-phase
+        // enumeration with no completed intervals; none of it is evidence.
+        let snapshot = MergeWriteProbes::default().merge_timing_snapshot();
+        assert!(snapshot.len() > 1);
+        assert!(snapshot.iter().all(|reading| reading.interval_count == 0));
+        assert!(observed_phase_evidence(snapshot).is_empty());
+    }
 
     fn assert_json_object_keys(value: &serde_json::Value, expected: &[&str]) {
         let actual = value
