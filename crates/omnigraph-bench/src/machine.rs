@@ -1178,13 +1178,17 @@ fn linux_resource_control(
         }
         let cpu = controls.get("cpu.max");
         let memory = controls.get("memory.max");
-        if let Some(candidate) = cpu.as_deref().map(parse_cpu_max).transpose()?.flatten()
+        if let Some(candidate) = cpu
+            .map(|value| value.as_str())
+            .map(parse_cpu_max)
+            .transpose()?
+            .flatten()
             && effective_cpu.is_none_or(|current| cpu_quota_is_stricter(candidate, current))
         {
             effective_cpu = Some(candidate);
         }
         if let Some(candidate) = memory
-            .as_deref()
+            .map(|value| value.as_str())
             .map(parse_memory_max)
             .transpose()?
             .flatten()
@@ -1227,7 +1231,7 @@ fn cgroup_v2_hierarchy(
             candidates.push((mount.root.components().count(), mount.mount_point, leaf));
         }
     }
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     let Some((specificity, root, leaf)) = candidates.first().cloned() else {
         return Err(MachineIdentityError::probe(
             "resource_control",

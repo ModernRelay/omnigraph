@@ -26,8 +26,9 @@ use crate::counting::LogicalCallCounts;
 use crate::machine::MachineIdentityV1;
 use crate::model::typed_sha256;
 use crate::runner::{
-    ControlCallObservation, MergeRouteObservation, PHYSICAL_TREE_DIGEST_ALGORITHM,
-    PhaseObservation, RepObservation, RunExecution, VerificationObservation,
+    ControlCallObservation, EffectiveEnvironmentValue, MergeRouteObservation,
+    PHYSICAL_TREE_DIGEST_ALGORITHM, PhaseObservation, RepObservation, RunExecution,
+    VerificationObservation,
 };
 use crate::suite::MAX_REPETITIONS_PER_CASE;
 use crate::{CASE_FORMAT_VERSION, POINT_IDENTITY_VERSION, ResolvedRun, validate_case};
@@ -46,6 +47,7 @@ pub const DEFAULT_FLOOR_MULTIPLIER_MILLIS: u32 = 2_000;
 /// Maximum canonical bytes accepted for one run-record-v1 authority object.
 pub const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 1_024;
+const MAX_ACQUISITION_ERROR_CODE_BYTES: usize = 128;
 // The projection stores the complete SUT JSON as one escaped field beside
 // selected normalized SUT fields in a 64 KiB RunRow. Keeping the canonical SUT
 // identity at or below 8 KiB leaves bounded headroom for that second escaping,
@@ -66,6 +68,16 @@ pub struct RunRecordV1 {
     pub fixture: StampedFixtureManifestV1,
     pub acquisition: AcquisitionV1,
     pub measurements: MeasurementsV1,
+}
+
+impl RunRecordV1 {
+    /// A performance claim requires both a complete acquisition and proof of
+    /// the effective build settings that produced the measured executable.
+    /// Current local records deliberately lack the latter proof and therefore
+    /// remain useful evidence without becoming claim-authorizing evidence.
+    pub const fn claim_eligible(&self) -> bool {
+        self.acquisition.is_complete() && self.sut.build.effective_codegen_options_proved
+    }
 }
 
 /// Globally unique invocation identity and its containing machine session.
@@ -134,6 +146,7 @@ pub struct BuildIdentityV1 {
 pub struct EngineConfigurationV1 {
     pub feature_flags: Vec<String>,
     pub enabled_techniques: Vec<String>,
+    pub lance_mem_pool_size: EffectiveEnvironmentValue,
 }
 
 /// Backend facts observed by a trusted probe, separate from the declaration
@@ -158,11 +171,126 @@ pub enum ObservedBackendV1 {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcquisitionV1 {
+    pub status: AcquisitionStatusV1,
     pub requested_repetitions: u32,
     pub observed_repetitions: u32,
+    pub terminal: Option<AcquisitionTerminalV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AcquisitionStatusV1 {
+    Complete,
+    Censored,
+}
+
+/// Stable terminal evidence for an acquisition that stopped after a verified
+/// prefix. Prose and stderr are intentionally excluded from durable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcquisitionTerminalV1 {
+    /// Zero-based index of the first repetition that did not become a verified
+    /// sample. It therefore equals `observed_repetitions` for a censored run.
+    pub failed_repetition: u32,
+    pub stage: AcquisitionTerminalStageV1,
+    /// Stable lowercase identifier: underscore-delimited segments beginning
+    /// with an ASCII letter, with a total encoded length of at most 128 bytes.
+    pub code: String,
+}
+
+/// Closed acquisition-stage vocabulary persisted by run-record-v1.
+///
+/// Worker stages name structured worker failures. The remaining stages are
+/// exact supervisor boundaries that can stop an acquisition after an earlier
+/// repetition has been fully verified. `Runner` covers failures outside a
+/// live child-process boundary, such as reset or fixture-integrity checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AcquisitionTerminalStageV1 {
+    Runner,
+    SupervisorPanic,
+    Bootstrap,
+    Prepare,
+    Measure,
+    Verify,
+    Finalize,
+    Protocol,
+    PipeSetup,
+    WriterSetup,
+    ReaderSetup,
+    RequestWrite,
+    PrepareTimeout,
+    PrepareProtocol,
+    BeginWrite,
+    MeasureTimeout,
+    MeasureProtocol,
+    VerifyTimeout,
+    VerifyProtocol,
+    FinalizeProtocol,
+    ExitTimeout,
+    GroupProof,
+    FinalizeExit,
+    StructuredFailureReap,
+}
+
+impl AcquisitionTerminalStageV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Runner => "runner",
+            Self::SupervisorPanic => "supervisor-panic",
+            Self::Bootstrap => "bootstrap",
+            Self::Prepare => "prepare",
+            Self::Measure => "measure",
+            Self::Verify => "verify",
+            Self::Finalize => "finalize",
+            Self::Protocol => "protocol",
+            Self::PipeSetup => "pipe-setup",
+            Self::WriterSetup => "writer-setup",
+            Self::ReaderSetup => "reader-setup",
+            Self::RequestWrite => "request-write",
+            Self::PrepareTimeout => "prepare-timeout",
+            Self::PrepareProtocol => "prepare-protocol",
+            Self::BeginWrite => "begin-write",
+            Self::MeasureTimeout => "measure-timeout",
+            Self::MeasureProtocol => "measure-protocol",
+            Self::VerifyTimeout => "verify-timeout",
+            Self::VerifyProtocol => "verify-protocol",
+            Self::FinalizeProtocol => "finalize-protocol",
+            Self::ExitTimeout => "exit-timeout",
+            Self::GroupProof => "group-proof",
+            Self::FinalizeExit => "finalize-exit",
+            Self::StructuredFailureReap => "structured-failure-reap",
+        }
+    }
+}
+
+impl AcquisitionTerminalV1 {
+    /// Construct terminal evidence while enforcing the record's stable code
+    /// grammar before any archive publication is attempted.
+    pub fn new(
+        failed_repetition: u32,
+        stage: AcquisitionTerminalStageV1,
+        code: impl Into<String>,
+    ) -> RecordResult<Self> {
+        let terminal = Self {
+            failed_repetition,
+            stage,
+            code: code.into(),
+        };
+        validate_acquisition_error_code(&terminal.code, "acquisition.terminal.code")?;
+        Ok(terminal)
+    }
+}
+
+impl AcquisitionV1 {
+    /// Whether acquisition itself reached its requested verified sample count.
+    /// Record-level claim eligibility has additional SUT/build gates.
+    pub const fn is_complete(&self) -> bool {
+        matches!(self.status, AcquisitionStatusV1::Complete)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +328,7 @@ pub struct RawSampleV1 {
     pub repetition: u32,
     pub input_physical_digest_sha256: String,
     pub elapsed_us: u64,
+    pub peak_rss_bytes: u64,
     pub outcome: String,
     pub phases: Vec<PhaseObservation>,
     pub route: MergeRouteObservation,
@@ -335,6 +464,7 @@ pub fn sut_identity_for_execution(execution: &RunExecution) -> RecordResult<SutI
         engine: EngineConfigurationV1 {
             feature_flags: execution.build.engine_feature_flags.clone(),
             enabled_techniques: execution.build.enabled_techniques.clone(),
+            lance_mem_pool_size: execution.build.effective_lance_mem_pool_size.clone(),
         },
     };
     validate_sut(&sut)?;
@@ -370,6 +500,34 @@ pub fn build_run_record(
     execution: &RunExecution,
     input: RecordInputV1,
 ) -> RecordResult<RunRecordV1> {
+    build_run_record_with_acquisition(run, execution, input, AcquisitionStatusV1::Complete, None)
+}
+
+/// Construct a durable, permanently claim-ineligible record from the verified
+/// prefix of an acquisition that failed before its requested repetitions were
+/// complete.
+pub fn build_censored_run_record(
+    run: &ResolvedRun,
+    execution: &RunExecution,
+    input: RecordInputV1,
+    terminal: AcquisitionTerminalV1,
+) -> RecordResult<RunRecordV1> {
+    build_run_record_with_acquisition(
+        run,
+        execution,
+        input,
+        AcquisitionStatusV1::Censored,
+        Some(terminal),
+    )
+}
+
+fn build_run_record_with_acquisition(
+    run: &ResolvedRun,
+    execution: &RunExecution,
+    input: RecordInputV1,
+    status: AcquisitionStatusV1,
+    terminal: Option<AcquisitionTerminalV1>,
+) -> RecordResult<RunRecordV1> {
     validate_resolved_run(run)?;
     validate_execution_binding(run, execution)?;
 
@@ -400,7 +558,7 @@ pub fn build_run_record(
                 "record-v1 has no physical-attempt measurement schema; refusing to discard observed data",
             ));
         }
-        raw_samples.push(RawSampleV1::from(sample));
+        raw_samples.push(RawSampleV1::try_from(sample)?);
     }
 
     let observed_repetitions = u32::try_from(raw_samples.len()).map_err(|_| {
@@ -426,8 +584,10 @@ pub fn build_run_record(
         backend: input.backend,
         fixture: input.fixture,
         acquisition: AcquisitionV1 {
+            status,
             requested_repetitions: run.repetitions,
             observed_repetitions,
+            terminal,
         },
         measurements: MeasurementsV1 {
             wall_clock: WallClockSummaryV1 {
@@ -449,12 +609,22 @@ pub fn build_run_record(
     Ok(record)
 }
 
-impl From<&RepObservation> for RawSampleV1 {
-    fn from(sample: &RepObservation) -> Self {
-        Self {
+impl TryFrom<&RepObservation> for RawSampleV1 {
+    type Error = RecordError;
+
+    fn try_from(sample: &RepObservation) -> Result<Self, Self::Error> {
+        let peak_rss_bytes = sample.peak_rss_bytes.ok_or_else(|| {
+            RecordError::new(
+                "missing_peak_rss",
+                format!("execution.samples[{}].peak_rss_bytes", sample.repetition),
+                "durable samples require the supervisor-observed peak resident set size",
+            )
+        })?;
+        Ok(Self {
             repetition: sample.repetition,
             input_physical_digest_sha256: sample.input_physical_digest_sha256.clone(),
             elapsed_us: sample.elapsed_us,
+            peak_rss_bytes,
             outcome: sample.outcome.clone(),
             phases: sample.phases.clone(),
             route: sample.route.clone(),
@@ -464,7 +634,7 @@ impl From<&RepObservation> for RawSampleV1 {
             },
             control_store_calls: sample.control_store_calls,
             verification: sample.verification.clone(),
-        }
+        })
     }
 }
 
@@ -837,6 +1007,10 @@ fn validate_sut(sut: &SutIdentityV1) -> RecordResult<()> {
         &sut.engine.enabled_techniques,
         "sut.engine.enabled_techniques",
     )?;
+    validate_effective_environment_value(
+        &sut.engine.lance_mem_pool_size,
+        "sut.engine.lance_mem_pool_size",
+    )?;
     let canonical = serde_json::to_vec(sut).map_err(|error| {
         RecordError::new(
             "sut_identity_serialization_failed",
@@ -855,6 +1029,15 @@ fn validate_sut(sut: &SutIdentityV1) -> RecordResult<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_effective_environment_value(
+    value: &EffectiveEnvironmentValue,
+    _path: &str,
+) -> RecordResult<()> {
+    match value {
+        EffectiveEnvironmentValue::Unset | EffectiveEnvironmentValue::Bytes { .. } => Ok(()),
+    }
 }
 
 fn validate_backend(declared: &Backend, observed: &ObservedBackendV1) -> RecordResult<()> {
@@ -1026,12 +1209,34 @@ fn validate_measurements(
             "sample count does not fit u32",
         )
     })?;
-    if observed != sample_count || observed != requested {
+    if observed != sample_count {
         return Err(RecordError::new(
             "repetition_count_mismatch",
             "acquisition",
-            "a finalized successful record requires requested, observed, and raw sample counts to match",
+            "observed repetitions must exactly match the raw sample count",
         ));
+    }
+    match (&record.acquisition.status, &record.acquisition.terminal) {
+        (AcquisitionStatusV1::Complete, None) if observed == requested => {}
+        (AcquisitionStatusV1::Censored, Some(terminal))
+            if observed >= 1 && observed < requested && terminal.failed_repetition == observed =>
+        {
+            validate_acquisition_error_code(&terminal.code, "acquisition.terminal.code")?;
+        }
+        (AcquisitionStatusV1::Complete, _) => {
+            return Err(RecordError::new(
+                "invalid_complete_acquisition",
+                "acquisition",
+                "a complete acquisition requires requested=observed=samples and no terminal failure",
+            ));
+        }
+        (AcquisitionStatusV1::Censored, _) => {
+            return Err(RecordError::new(
+                "invalid_censored_acquisition",
+                "acquisition",
+                "a censored acquisition requires 1 <= observed < requested, a terminal failure, and failed_repetition=observed",
+            ));
+        }
     }
     let expected_presence = v1_layer_presence();
     if record.measurements.layer_presence != expected_presence {
@@ -1093,11 +1298,11 @@ fn validate_measurements(
                 "sample did not start from the stamped physical fixture",
             ));
         }
-        if sample.elapsed_us == 0 || sample.outcome != "merged" {
+        if sample.elapsed_us == 0 || sample.peak_rss_bytes == 0 || sample.outcome != "merged" {
             return Err(RecordError::new(
                 "invalid_sample_outcome",
                 format!("measurements.raw_samples[{index}]"),
-                "a durable branch-merge sample must have nonzero elapsed time and outcome `merged`",
+                "a durable branch-merge sample must have nonzero elapsed time, nonzero peak RSS, and outcome `merged`",
             ));
         }
         validate_projected_call_totals(index, sample)?;
@@ -1388,6 +1593,48 @@ fn validate_text(value: &str, path: &str) -> RecordResult<()> {
     Ok(())
 }
 
+fn validate_acquisition_error_code(value: &str, path: &str) -> RecordResult<()> {
+    if value.is_empty() || value.len() > MAX_ACQUISITION_ERROR_CODE_BYTES || !value.is_ascii() {
+        return Err(RecordError::new(
+            "invalid_acquisition_error_code",
+            path,
+            format!(
+                "error code must be a non-empty canonical ASCII token of at most {MAX_ACQUISITION_ERROR_CODE_BYTES} bytes"
+            ),
+        ));
+    }
+
+    let mut segment_start = true;
+    for byte in value.bytes() {
+        if segment_start {
+            if !byte.is_ascii_lowercase() {
+                return Err(RecordError::new(
+                    "invalid_acquisition_error_code",
+                    path,
+                    "error-code segments must start with a lowercase ASCII letter",
+                ));
+            }
+            segment_start = false;
+        } else if byte == b'_' {
+            segment_start = true;
+        } else if !byte.is_ascii_lowercase() && !byte.is_ascii_digit() {
+            return Err(RecordError::new(
+                "invalid_acquisition_error_code",
+                path,
+                "error codes may contain only lowercase ASCII letters, digits, and single underscores between segments",
+            ));
+        }
+    }
+    if segment_start {
+        return Err(RecordError::new(
+            "invalid_acquisition_error_code",
+            path,
+            "error codes must not end with an underscore or contain empty segments",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_sha256(value: &str, path: &str) -> RecordResult<()> {
     if !valid_lower_hex(value, &[64]) {
         return Err(RecordError::new(
@@ -1489,7 +1736,7 @@ version: 1
 id: durable-record
 scenario: branch-merge-v1
 fixture:
-  builder: { kind: synthetic-branch-merge, version: 1, seed: 0 }
+  builder: { kind: synthetic-branch-merge, version: 2, seed: 0 }
   data: { provenance: synthetic, tables: 8, rows_per_table: 1000, payload_bytes: 64, column_shape: scalars, topology_skew: uniform }
   state: { aging: bulk-loaded, indexes: [], deletion_history: none, compaction_recency: not-optimized, history_depth: 21 }
 workload: { delta_rows_per_side: 50, diverged_tables: 4, arrival: unscheduled-single-shot, clients: 1, read_write_mix: write-heavy, contention: distinct-key }
@@ -1497,7 +1744,7 @@ environment:
   backend: { kind: local-fs, filesystem: apfs, storage_class: nvme-ssd }
   network_position: same-host
   execution: embedded
-  warmth: { regime: warm, program: branch-merge-read-set-v1, iterations: 1 }
+  cache_condition: { process: fresh-per-repetition, engine: warmed-by-program, page_cache: program-conditioned, program: branch-merge-read-set-v1, iterations: 1 }
 protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, reset: local-clonefile, timer: monotonic }
 "#;
 
@@ -1517,6 +1764,7 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
             repetition,
             input_physical_digest_sha256: PHYSICAL_SHA.to_string(),
             elapsed_us,
+            peak_rss_bytes: Some(32 * 1024 * 1024),
             outcome: "merged".to_string(),
             phases: vec![PhaseObservation {
                 phase: "TableWalk".to_string(),
@@ -1575,6 +1823,7 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
             case_path: run.case_path.clone(),
             point_id: run.case.point_id.clone(),
             point_name: run.case.point_name.clone(),
+            cache_condition: run.case.definition.environment.cache_condition.clone(),
             requested_repetitions: run.repetitions,
             build: BuildEvidence {
                 source_commit: "a".repeat(40),
@@ -1582,6 +1831,7 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
                 cargo_profile: "release".to_string(),
                 cargo_opt_level: "2".to_string(),
                 debug_assertions: false,
+                effective_lance_mem_pool_size: EffectiveEnvironmentValue::Unset,
                 target_triple: "aarch64-apple-darwin".to_string(),
                 rustc_version: "rustc 1.97.1".to_string(),
                 declared_release_lto: "thin".to_string(),
@@ -1655,6 +1905,7 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
             engine: EngineConfigurationV1 {
                 feature_flags: Vec::new(),
                 enabled_techniques: Vec::new(),
+                lance_mem_pool_size: EffectiveEnvironmentValue::Unset,
             },
         }
     }
@@ -1752,6 +2003,11 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
         assert_eq!(record.format_version, RUN_RECORD_FORMAT_VERSION);
         assert_eq!(record.acquisition.requested_repetitions, 2);
         assert_eq!(record.acquisition.observed_repetitions, 2);
+        assert!(record.acquisition.is_complete());
+        assert!(
+            !record.claim_eligible(),
+            "complete local records still lack effective-codegen proof"
+        );
         assert_eq!(record.measurements.raw_samples.len(), 2);
         assert_eq!(
             record.measurements.layer_presence.logical.counts,
@@ -1780,6 +2036,108 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
     }
 
     #[test]
+    fn censored_record_preserves_only_a_verified_prefix_and_is_never_claimable() {
+        let run = resolved_run();
+        let mut execution = execution(&run);
+        execution.samples.truncate(1);
+        execution.wall_clock = WallClockSummary {
+            observed_repetitions: 1,
+            min_us: 10,
+            p50_us: 10,
+            max_us: 10,
+            p95_us: None,
+            p95_supported: false,
+        };
+        let record = build_censored_run_record(
+            &run,
+            &execution,
+            input(&run, &execution),
+            AcquisitionTerminalV1::new(1, AcquisitionTerminalStageV1::Measure, "worker_timeout")
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(record.acquisition.status, AcquisitionStatusV1::Censored);
+        assert!(!record.claim_eligible());
+        assert_eq!(record.acquisition.observed_repetitions, 1);
+        assert_eq!(record.measurements.raw_samples.len(), 1);
+        validate_run_record(&record).unwrap();
+
+        let mut invalid = record;
+        invalid
+            .acquisition
+            .terminal
+            .as_mut()
+            .unwrap()
+            .failed_repetition = 0;
+        assert_eq!(
+            validate_run_record(&invalid).unwrap_err().code,
+            "invalid_censored_acquisition"
+        );
+    }
+
+    #[test]
+    fn censored_terminal_code_is_a_bounded_canonical_token() {
+        for valid in ["worker_timeout", "worker_v2_timeout", "a", "a1"] {
+            AcquisitionTerminalV1::new(1, AcquisitionTerminalStageV1::Runner, valid).unwrap();
+        }
+
+        for invalid in [
+            "",
+            "Worker_timeout",
+            "worker-timeout",
+            "worker__timeout",
+            "worker_timeout_",
+            "worker timeout",
+            "worker_2timeout",
+            "wörker_timeout",
+        ] {
+            assert_eq!(
+                AcquisitionTerminalV1::new(1, AcquisitionTerminalStageV1::Runner, invalid,)
+                    .unwrap_err()
+                    .code,
+                "invalid_acquisition_error_code",
+                "invalid token {invalid:?} must fail closed",
+            );
+        }
+
+        assert_eq!(
+            AcquisitionTerminalV1::new(
+                1,
+                AcquisitionTerminalStageV1::Runner,
+                "a".repeat(MAX_ACQUISITION_ERROR_CODE_BYTES + 1),
+            )
+            .unwrap_err()
+            .code,
+            "invalid_acquisition_error_code",
+        );
+    }
+
+    #[test]
+    fn acquisition_terminal_stage_serialization_is_closed_and_canonical() {
+        assert_eq!(
+            serde_json::to_string(&AcquisitionTerminalStageV1::StructuredFailureReap).unwrap(),
+            r#""structured-failure-reap""#,
+        );
+        assert!(
+            serde_json::from_str::<AcquisitionTerminalStageV1>(r#""arbitrary prose""#).is_err()
+        );
+    }
+
+    #[test]
+    fn durable_samples_require_supervisor_peak_rss() {
+        let run = resolved_run();
+        let mut execution = execution(&run);
+        execution.samples[0].peak_rss_bytes = None;
+        assert_eq!(
+            build_run_record(&run, &execution, input(&run, &execution))
+                .unwrap_err()
+                .code,
+            "missing_peak_rss"
+        );
+    }
+
+    #[test]
     fn construction_uses_the_worker_build_not_caller_compile_constants() {
         let run = resolved_run();
         let execution = execution(&run);
@@ -1805,6 +2163,23 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
                 .code,
             "sut_identity_mismatch"
         );
+    }
+
+    #[test]
+    fn admitted_lance_memory_setting_is_part_of_sut_identity() {
+        let run = resolved_run();
+        let baseline_execution = execution(&run);
+        let baseline = sut_identity_for_execution(&baseline_execution).unwrap();
+        let mut configured_execution = baseline_execution;
+        configured_execution.build.effective_lance_mem_pool_size =
+            EffectiveEnvironmentValue::Bytes { bytes: 805_306_368 };
+        let configured = sut_identity_for_execution(&configured_execution).unwrap();
+        assert_ne!(baseline, configured);
+
+        let mut supplied = input(&run, &configured_execution);
+        supplied.sut = configured.clone();
+        let record = build_run_record(&run, &configured_execution, supplied).unwrap();
+        assert_eq!(record.sut, configured);
     }
 
     #[test]

@@ -7,8 +7,8 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs::File;
-use std::io::{self, BufRead, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -21,7 +21,7 @@ use crate::reset::{MetadataDigest, PhysicalDigest};
 use crate::runner::{EffectiveEnvironmentValue, RepObservation};
 
 /// The only worker protocol understood by this build.
-pub const WORKER_PROTOCOL_VERSION: u32 = 2;
+pub const WORKER_PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum compact JSON payload bytes in one frame, excluding its newline.
 ///
@@ -82,6 +82,10 @@ pub struct WorkerRequestV1 {
     pub expected_point_id: String,
     pub expected_case_digest: String,
     pub repetition_root: PathBuf,
+    /// Harness-owned empty sibling directory on the verified scratch backend.
+    /// Both generic process-temporary spill and OmniGraph merge staging must
+    /// resolve through this exact protocol field.
+    pub worker_scratch_root: PathBuf,
     pub expected_physical_digest: PhysicalDigest,
     pub expected_metadata_digest: MetadataDigest,
 }
@@ -181,7 +185,26 @@ pub enum ChildFrameV1 {
 
 /// SHA-256 one bounded regular worker executable.
 pub fn digest_worker_executable(path: &Path) -> io::Result<String> {
-    let metadata = std::fs::metadata(path)?;
+    open_and_digest_worker_executable(path).map(|(_file, _bytes, digest)| digest)
+}
+
+/// Open and SHA-256 one bounded regular worker executable through the same
+/// file descriptor. Callers that must survive a later path replacement can
+/// retain the returned descriptor and stage those exact bytes elsewhere.
+pub(crate) fn open_and_digest_worker_executable(path: &Path) -> io::Result<(File, u64, String)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // The configured path is external input. Open it in a mode that cannot
+        // block on a FIFO/device and cannot follow a symlink, then attest only
+        // the object named by this exact descriptor.
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -200,7 +223,7 @@ pub fn digest_worker_executable(path: &Path) -> io::Result<String> {
             ),
         ));
     }
-    let mut file = File::open(path)?;
+    file.rewind()?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; EXECUTABLE_DIGEST_BUFFER_BYTES];
     let mut observed = 0_u64;
@@ -239,7 +262,8 @@ pub fn digest_worker_executable(path: &Path) -> io::Result<String> {
             ),
         ));
     }
-    Ok(format!("{:x}", digest.finalize()))
+    file.rewind()?;
+    Ok((file, observed, format!("{:x}", digest.finalize())))
 }
 
 impl ChildFrameV1 {
@@ -383,7 +407,7 @@ where
     }
 }
 
-/// Reject a frame from any worker protocol version other than V1.
+/// Reject a frame from any worker protocol version other than this build's.
 pub fn validate_protocol_version(observed: u32) -> Result<(), WorkerProtocolError> {
     if observed == WORKER_PROTOCOL_VERSION {
         Ok(())
@@ -566,6 +590,99 @@ protocol:
         decoded
     }
 
+    #[cfg(unix)]
+    fn run_fifo_operation_with_deadline<T, F>(fifo: &Path, operation: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(PathBuf) -> T + Send + 'static,
+    {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let fifo_for_thread = fifo.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let result = operation(fifo_for_thread);
+            let _ = sender.send(result);
+        });
+        match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => {
+                handle.join().expect("FIFO executable reader panicked");
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                use std::os::unix::fs::OpenOptionsExt;
+
+                let mut options = std::fs::OpenOptions::new();
+                options
+                    .read(true)
+                    .write(true)
+                    .custom_flags(nix::libc::O_NONBLOCK);
+                let unblocker = options.open(fifo).expect("could not unblock test FIFO");
+                drop(unblocker);
+                if receiver
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .is_ok()
+                {
+                    handle
+                        .join()
+                        .expect("blocked FIFO executable reader panicked after release");
+                } else {
+                    std::mem::forget(handle);
+                }
+                panic!("worker executable reader blocked while opening a FIFO");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                handle.join().expect("FIFO executable reader panicked");
+                panic!("worker executable reader exited without reporting a result");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_executable_reader_rejects_fifo_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("worker.fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+
+        let error = run_fifo_operation_with_deadline(&fifo, |path| {
+            open_and_digest_worker_executable(&path)
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("regular file"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_executable_reader_rejects_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("worker");
+        let link = directory.path().join("worker-link");
+        std::fs::write(&target, b"worker-bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        open_and_digest_worker_executable(&link).unwrap_err();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_executable_reader_rejects_character_device() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let null = Path::new("/dev/null");
+        assert!(
+            std::fs::symlink_metadata(null)
+                .unwrap()
+                .file_type()
+                .is_char_device()
+        );
+
+        let error = open_and_digest_worker_executable(null).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("regular file"), "{error}");
+    }
+
     #[derive(Default)]
     struct FlushWitness {
         bytes: Vec<u8>,
@@ -596,6 +713,7 @@ protocol:
                 expected_point_id: validated.point_id,
                 expected_case_digest: validated.case_digest,
                 repetition_root: PathBuf::from("/tmp/worker-repetition"),
+                worker_scratch_root: PathBuf::from("/tmp/worker-scratch-00000003"),
                 expected_physical_digest: physical_digest(),
                 expected_metadata_digest: metadata_digest(),
             }),
@@ -625,8 +743,8 @@ protocol:
                     cargo_profile: "release".to_string(),
                     cargo_opt_level: "2".to_string(),
                     debug_assertions: false,
-                    effective_lance_mem_pool_size: Box::new(EffectiveEnvironmentValue::Utf8 {
-                        value: "1GiB".to_string(),
+                    effective_lance_mem_pool_size: Box::new(EffectiveEnvironmentValue::Bytes {
+                        bytes: 1_073_741_824,
                     }),
                     target_triple: "aarch64-apple-darwin".to_string(),
                     rustc_version: "rustc 1.97.1".to_string(),
@@ -776,8 +894,8 @@ protocol:
             validate_protocol_version(WORKER_PROTOCOL_VERSION + 1).unwrap_err(),
             WorkerProtocolError::UnsupportedVersion {
                 expected: WORKER_PROTOCOL_VERSION,
-                observed: 2
-            }
+                observed
+            } if observed == WORKER_PROTOCOL_VERSION + 1
         ));
     }
 }

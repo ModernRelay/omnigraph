@@ -5,7 +5,7 @@
 //! engine or filesystem operation can be killed and reaped without stranding
 //! an in-process task that still owns the disposable store.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -21,11 +21,14 @@ use crate::branch_merge::{BranchMergePlan, FixtureBuildSummary, initialize_local
 use crate::case::CaseV1;
 use crate::reset::{MetadataDigest, PhysicalDigest, TraversalLimits, freeze_clonefile_template};
 #[cfg(unix)]
-use crate::runner::ChildProcessEvidence;
+use crate::runner::{
+    ChildProcessEvidence, configure_fixture_child_environment,
+    validate_fixture_child_runtime_overrides,
+};
 use crate::runner::{RunnerError, RunnerResult};
 use crate::{ValidatedCase, validate_case};
 
-const FIXTURE_PROTOCOL_VERSION: u32 = 1;
+const FIXTURE_PROTOCOL_VERSION: u32 = 2;
 const MAX_FIXTURE_PROTOCOL_BYTES: u64 = 1024 * 1024;
 const PROCESS_POLL: Duration = Duration::from_millis(10);
 const REAP_DEADLINE: Duration = Duration::from_secs(10);
@@ -39,6 +42,7 @@ struct FixtureRequestV1 {
     expected_case_digest: String,
     active_root: PathBuf,
     template_root: PathBuf,
+    fixture_scratch_root: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +102,16 @@ async fn run_fixture_worker(request_path: &Path) -> FixtureResultV1 {
         }
         Err(error) => return failure("fixture_protocol_error", error),
     };
+    if let Err(error) = validate_fixture_paths(&request) {
+        return failure("fixture_protocol_error", error);
+    }
+    if let Err(error) = validate_fixture_child_runtime_overrides(&request.fixture_scratch_root) {
+        return failure(error.code, error.message);
+    }
+    execute_fixture_request(request).await
+}
+
+async fn execute_fixture_request(request: FixtureRequestV1) -> FixtureResultV1 {
     let case = match validate_case(request.case).into_result() {
         Ok(case) => case,
         Err(diagnostics) => {
@@ -155,6 +169,65 @@ async fn run_fixture_worker(request_path: &Path) -> FixtureResultV1 {
     }
 }
 
+fn validate_fixture_paths(request: &FixtureRequestV1) -> Result<(), String> {
+    if !request.active_root.is_absolute()
+        || !request.template_root.is_absolute()
+        || !request.fixture_scratch_root.is_absolute()
+    {
+        return Err("fixture protocol paths must be absolute".to_string());
+    }
+    if request
+        .fixture_scratch_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("fixture-scratch-v1")
+    {
+        return Err("fixture scratch root has an invalid protocol name".to_string());
+    }
+    let active_metadata = std::fs::symlink_metadata(&request.active_root)
+        .map_err(|error| format!("could not inspect fixture active root: {error}"))?;
+    let scratch_metadata = std::fs::symlink_metadata(&request.fixture_scratch_root)
+        .map_err(|error| format!("could not inspect fixture scratch root: {error}"))?;
+    if active_metadata.file_type().is_symlink() || !active_metadata.is_dir() {
+        return Err("fixture active root must be a real directory".to_string());
+    }
+    if scratch_metadata.file_type().is_symlink() || !scratch_metadata.is_dir() {
+        return Err("fixture scratch root must be a real directory".to_string());
+    }
+    match std::fs::symlink_metadata(&request.template_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err("fixture template root must not exist before construction".to_string()),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect fixture template destination: {error}"
+            ));
+        }
+    }
+    let active = std::fs::canonicalize(&request.active_root)
+        .map_err(|error| format!("could not resolve fixture active root: {error}"))?;
+    let scratch = std::fs::canonicalize(&request.fixture_scratch_root)
+        .map_err(|error| format!("could not resolve fixture scratch root: {error}"))?;
+    if active.parent() != scratch.parent()
+        || request.template_root.parent() != request.fixture_scratch_root.parent()
+    {
+        return Err(
+            "fixture active, template, and scratch roots must be siblings on the verified backend"
+                .to_string(),
+        );
+    }
+    let mut entries = std::fs::read_dir(&scratch)
+        .map_err(|error| format!("could not inspect fixture scratch contents: {error}"))?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|error| format!("could not inspect fixture scratch entry: {error}"))?
+        .is_some()
+    {
+        return Err("fixture scratch root must be empty before construction".to_string());
+    }
+    Ok(())
+}
+
 fn failure(code: impl Into<String>, message: impl Into<String>) -> FixtureResultV1 {
     FixtureResultV1::Failed {
         protocol_version: FIXTURE_PROTOCOL_VERSION,
@@ -200,6 +273,16 @@ where
 {
     let request_path = workspace_root.join("fixture-request-v1.json");
     let result_path = workspace_root.join("fixture-result-v1.json");
+    let fixture_scratch_root = workspace_root.join("fixture-scratch-v1");
+    std::fs::create_dir(&fixture_scratch_root).map_err(|error| {
+        RunnerError::new(
+            "fixture_scratch_directory_error",
+            format!(
+                "could not create harness-owned fixture scratch directory {}: {error}",
+                fixture_scratch_root.display()
+            ),
+        )
+    })?;
     let request = FixtureRequestV1 {
         protocol_version: FIXTURE_PROTOCOL_VERSION,
         case: case.definition.clone(),
@@ -207,11 +290,13 @@ where
         expected_case_digest: case.case_digest.clone(),
         active_root: active_root.to_path_buf(),
         template_root: template_root.to_path_buf(),
+        fixture_scratch_root: fixture_scratch_root.clone(),
     };
     write_new_json(&request_path, &request)
         .map_err(|error| RunnerError::new("fixture_protocol_error", error))?;
 
     let mut command = Command::new(executable);
+    configure_fixture_child_environment(&mut command, &fixture_scratch_root);
     command
         .arg("__fixture-worker-v1")
         .arg(&request_path)
@@ -349,8 +434,12 @@ where
             && case_digest == case.case_digest =>
         {
             validate_handoff_summary(case, &handoff.summary)
-                .map(|()| handoff)
-                .map_err(|error| error.with_child_process(evidence()))
+                .map_err(|error| error.with_child_process(evidence()))?;
+            remove_owned_tree(&fixture_scratch_root, "fixture scratch").map_err(|message| {
+                RunnerError::new("fixture_scratch_cleanup_failed", message)
+                    .with_child_process(evidence())
+            })?;
+            Ok(handoff)
         }
         FixtureResultV1::Failed {
             protocol_version,
@@ -407,17 +496,21 @@ fn validate_handoff_summary(
                 "parent-derived optimized table count overflowed usize",
             )
         })?;
-    let expected = FixtureBuildSummary {
-        base_load_commits: expected_base_load_commits,
-        optimized_user_tables: expected_optimized_user_tables,
-        source_history_depth: expected_history_depth,
-        target_history_depth: expected_history_depth,
-    };
-    if *observed != expected {
+    let valid_logical_digest = observed.logical_content_sha256.len() == 64
+        && observed
+            .logical_content_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+    if observed.base_load_commits != expected_base_load_commits
+        || observed.optimized_user_tables != expected_optimized_user_tables
+        || observed.source_history_depth != expected_history_depth
+        || observed.target_history_depth != expected_history_depth
+        || !valid_logical_digest
+    {
         return Err(RunnerError::new(
             "fixture_protocol_error",
             format!(
-                "fixture worker summary disagrees with the parent-derived recipe: expected={expected:?}, observed={observed:?}"
+                "fixture worker summary disagrees with the parent-derived recipe or carries an invalid logical digest: observed={observed:?}"
             ),
         ));
     }
@@ -425,24 +518,24 @@ fn validate_handoff_summary(
 }
 
 fn remove_active_tree(active_root: &Path) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(active_root).map_err(|error| {
+    remove_owned_tree(active_root, "active fixture")
+}
+
+fn remove_owned_tree(root: &Path, label: &str) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(root).map_err(|error| {
         format!(
-            "could not inspect active fixture {} before removal: {error}",
-            active_root.display()
+            "could not inspect {label} {} before removal: {error}",
+            root.display()
         )
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(format!(
-            "active fixture path is not a real directory: {}",
-            active_root.display()
+            "{label} path is not a real directory: {}",
+            root.display()
         ));
     }
-    std::fs::remove_dir_all(active_root).map_err(|error| {
-        format!(
-            "could not remove active fixture {}: {error}",
-            active_root.display()
-        )
-    })
+    std::fs::remove_dir_all(root)
+        .map_err(|error| format!("could not remove {label} {}: {error}", root.display()))
 }
 
 fn write_new_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -464,12 +557,31 @@ fn write_new_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
 }
 
 fn read_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
-    let file =
-        File::open(path).map_err(|error| format!("could not open {}: {error}", path.display()))?;
-    let length = file
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // A protocol path is untrusted process-boundary input. O_NONBLOCK
+        // prevents a FIFO or device from pinning the child or parent before
+        // its watchdog can act, and O_NOFOLLOW prevents a symlink swap from
+        // redirecting the read after the path was selected.
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let metadata = file
         .metadata()
-        .map_err(|error| format!("could not stat {}: {error}", path.display()))?
-        .len();
+        .map_err(|error| format!("could not stat {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "fixture protocol path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let length = metadata.len();
     if length > MAX_FIXTURE_PROTOCOL_BYTES {
         return Err(format!(
             "fixture protocol file {} has {length} bytes; limit is {MAX_FIXTURE_PROTOCOL_BYTES}",
@@ -658,6 +770,94 @@ mod tests {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
 
+    fn run_fifo_operation_with_deadline<T, F>(fifo: &Path, operation: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(PathBuf) -> T + Send + 'static,
+    {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let fifo_for_thread = fifo.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let result = operation(fifo_for_thread);
+            let _ = sender.send(result);
+        });
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => {
+                handle.join().expect("FIFO protocol reader panicked");
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                use std::os::unix::fs::OpenOptionsExt;
+
+                // A read/write nonblocking endpoint releases a buggy blocking
+                // read-open without introducing another unbounded test wait.
+                let mut options = std::fs::OpenOptions::new();
+                options
+                    .read(true)
+                    .write(true)
+                    .custom_flags(nix::libc::O_NONBLOCK);
+                let unblocker = options.open(fifo).expect("could not unblock test FIFO");
+                drop(unblocker);
+                if receiver.recv_timeout(Duration::from_secs(1)).is_ok() {
+                    handle
+                        .join()
+                        .expect("blocked FIFO protocol reader panicked after release");
+                } else {
+                    std::mem::forget(handle);
+                }
+                panic!("fixture protocol reader blocked while opening a FIFO");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                handle.join().expect("FIFO protocol reader panicked");
+                panic!("fixture protocol reader exited without reporting a result");
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_protocol_reader_rejects_fifo_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("request.fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+
+        let error = run_fifo_operation_with_deadline(&fifo, |path| {
+            read_bounded_json::<serde_json::Value>(&path)
+        })
+        .unwrap_err();
+
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn fixture_protocol_reader_rejects_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("request.json");
+        let link = directory.path().join("request-link.json");
+        std::fs::write(&target, br#"{"ok":true}"#).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = read_bounded_json::<serde_json::Value>(&link).unwrap_err();
+
+        assert!(error.contains("could not open"), "{error}");
+    }
+
+    #[test]
+    fn fixture_protocol_reader_rejects_character_device() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let null = Path::new("/dev/null");
+        assert!(
+            std::fs::symlink_metadata(null)
+                .unwrap()
+                .file_type()
+                .is_char_device()
+        );
+
+        let error = read_bounded_json::<serde_json::Value>(null).unwrap_err();
+
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
     #[test]
     fn hanging_fixture_worker_is_killed_and_reaped() {
         let (_script_directory, executable) = script("sleep 300\n");
@@ -767,6 +967,7 @@ mod tests {
                     optimized_user_tables: 0,
                     source_history_depth: 0,
                     target_history_depth: 0,
+                    logical_content_sha256: "0".repeat(64),
                 },
                 physical: PhysicalDigest {
                     files: 0,
@@ -808,31 +1009,28 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn fixture_endpoint_revalidates_builds_and_returns_checked_identity() {
+    async fn fixture_request_revalidates_builds_and_returns_checked_identity() {
         let workspace = tempfile::tempdir().unwrap();
         let active = workspace.path().join("active");
         let template = workspace.path().join("template");
+        let fixture_scratch_root = workspace.path().join("fixture-scratch-v1");
         std::fs::create_dir(&active).unwrap();
+        std::fs::create_dir(&fixture_scratch_root).unwrap();
         let case = tiny_case();
-        let request_path = workspace.path().join("request.json");
         let result_path = workspace.path().join("result.json");
-        write_new_json(
-            &request_path,
-            &FixtureRequestV1 {
-                protocol_version: FIXTURE_PROTOCOL_VERSION,
-                case: case.definition.clone(),
-                expected_point_id: case.point_id.clone(),
-                expected_case_digest: case.case_digest.clone(),
-                active_root: active.clone(),
-                template_root: template.clone(),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            run_fixture_worker_files_v1(&request_path, &result_path).await,
-            ExitCode::SUCCESS
-        );
+        let request = FixtureRequestV1 {
+            protocol_version: FIXTURE_PROTOCOL_VERSION,
+            case: case.definition.clone(),
+            expected_point_id: case.point_id.clone(),
+            expected_case_digest: case.case_digest.clone(),
+            active_root: active.clone(),
+            template_root: template.clone(),
+            fixture_scratch_root,
+        };
+        validate_fixture_paths(&request).unwrap();
+        let result = execute_fixture_request(request).await;
+        assert!(matches!(result, FixtureResultV1::Complete { .. }));
+        write_new_json(&result_path, &result).unwrap();
         match read_bounded_json::<FixtureResultV1>(&result_path).unwrap() {
             FixtureResultV1::Complete {
                 point_id,

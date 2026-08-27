@@ -47,11 +47,24 @@ measurement protocol and identity vocabulary.
   release/opt-level observations, compiler-effective debug assertions, the
   checked-in release-profile declaration, build-script-visible flag/override
   state, Cargo features reported by `omnigraph-engine` itself, and a versioned
-  allowlist of effective engine environment. Unknown `LANCE_*` or
+  allowlist of effective engine environment. Fixture and repetition children
+  start from a cleared environment with fixed locale. The fixture child gets a
+  protocol-owned empty `fixture-scratch-v1` directory as `TMPDIR`; each measured
+  worker gets its own empty `worker-scratch-N` directory as both `TMPDIR` and
+  `OMNIGRAPH_MERGE_STAGING_DIR`. The child validates that these absolute paths
+  are real siblings of the active store on the verified backend. They are
+  removed only after process containment is proved; an uncontained failure
+  quarantines the whole workspace. The only inherited engine setting is
+  `LANCE_MEM_POOL_SIZE`, admitted only when it is the canonical decimal `u64`
+  byte count Lance actually parses; that applied byte count becomes typed SUT
+  identity. Non-UTF-8, unit-suffixed, noncanonical, and overflowing values are
+  refused before execution. Parent-side
+  `TOKIO_WORKER_THREADS`/`RAYON_NUM_THREADS` and unknown `LANCE_*` or
   engine-facing `OMNIGRAPH_*` overrides are refused without serializing their
   values. Cargo does not expose the final target rustc invocation to
   `build.rs`, so effective LTO/codegen-unit/strip settings remain explicitly
-  unproved until a later controlled digest-bound build receipt supplies them.
+  unproved until later controlled infrastructure supplies a digest-bound build
+  receipt.
   Its complete cache condition is part of point identity. When declared, its
   read-only warm-up program runs before measured counters and the monotonic
   merge timer begin. A storage firewall permits only the engine's one balanced,
@@ -109,9 +122,18 @@ explicit presence or absence statements for physical attempts, request timing,
 calibration, and concurrency witnesses.
 
 A dirty or unproved source tree cannot publish a record because the source
-commit would not honestly describe its provenance. The exact executable is
-identified by its digest and normalized compiler/build/engine facts. Build
-after committing the intended source, then verify the resulting archive:
+commit would not honestly describe its provenance. The local CLI rechecks that
+its build checkout still names that exact commit and has neither tracked nor
+untracked changes before archive preflight and again at every publication
+boundary. That proof uses a pinned system Git, binds the exact git directory
+and worktree, disables replacement objects and hostile stat-cache settings,
+compares tracked source as raw bytes without clean filters, and refuses
+assume-unchanged or skip-worktree entries. Ignored files in workspace
+source/config roots are still source and therefore make the build dirty. The
+measured worker must independently attest the same clean commit.
+The exact executable is identified by its digest and normalized
+compiler/build/engine facts. Build after committing the intended source, then
+verify the resulting archive:
 
 ```bash
 target/release/omnigraph-bench suite run \
@@ -143,6 +165,32 @@ publishing identical bytes is idempotent. The JSON archive is the only result
 authority. `archive verify` streams a fixed invocation inventory and returns a
 compact count and inventory digest; it does not retain or print the complete
 record set.
+
+A run that verifies every requested repetition publishes a `complete` record.
+If a later repetition fails after at least one earlier repetition was fully
+measured and verified, archive mode publishes exactly that verified prefix as
+a `censored` record, persists the failed repetition index plus a closed stable
+stage and canonical error-code token,
+and still exits nonzero. A repetition that merely reached `Settled` is never
+included. A failure before the first verified sample publishes no record.
+Censored records are permanently ineligible for performance claims. A complete
+acquisition is necessary but not sufficient: `claim_eligible` also requires
+every record-level proof gate, including effective-codegen proof. The current
+local publisher deliberately lacks that proof, so its complete records remain
+useful evidence with `claim_eligible: false`. The projection exposes the
+status, eligibility, and nullable terminal fields.
+Every durable raw sample includes supervisor-observed peak RSS.
+
+The current archive durability contract is local Unix filesystem durability.
+The content object and immutable pointer are synced through descriptor-rooted
+directory chains from their containing shards back through the captured
+archive root, with path/inode revalidation after each directory fsync. Only
+`EINTR` is retried, on the same already-open descriptor. Inventory readers fix
+the pointer inventory under the shared publication lock, then durability-close
+each visible immutable record exactly once before yielding it; they reject the
+stream if that proof still fails. Any publication failure after pointer visibility is reported as
+`possibly_published` and the publisher must reconcile that exact identity
+before retrying; an orphaned content object is not inventory.
 
 Machine evidence records OS/kernel/CPU/memory facts, the worker-inherited nice
 level and scheduler policy/priority, and a versioned digest of a fixed common
@@ -219,22 +267,28 @@ and refuses an emergent history depth. Its local construction envelope is at
 most 256 tables, 10 million base rows, 4 GiB of conservatively estimated
 generated bytes, 100,000 commits per branch, and 750,000 estimated fixture
 entries. It also requires free scratch capacity for a 16x byte-amplification
-allowance plus 1 GiB before writing the fixture. These are runner safety limits,
-not case-schema or engine limits.
+allowance plus 1 GiB and the exact staged worker executable before writing the
+fixture. These are runner safety limits, not case-schema or engine limits.
 
 Without `--archive`, `suite run --json` still emits a versioned diagnostic
 execution projection whose runs have `durable_record: false`; it must not be
 copied into the archive. With `--archive`, each complete run is canonically
-encoded, published, and then dropped from CLI memory. The success output omits
+encoded, published, and then dropped from CLI memory. A failed run may publish
+one censored verified prefix under the rules above, while the command remains a
+failure. The success output omits
 the raw `runs` array and carries only `completed_run_count` plus authoritative
 content addresses and invocation pointers. Archive-mode failures likewise
 report the completed count and known receipts without duplicating previously
-published raw samples. A completed run whose record could not be published is
-retained once as state-neutral `completed_run` recovery evidence, because an
-indeterminate pointer sync may already be authoritative. That sync also carries
+published raw samples. A complete execution or censored verified prefix whose
+record could not be published is retained once as state-neutral
+`unpublished_run` recovery evidence, because an indeterminate pointer sync may
+already be authoritative. That sync also carries
 `possibly_published` for candidate-specific reconciliation. Human-mode failures
-print the same complete recovery JSON envelope, not only a timing summary.
-Fixture caching and AWS orchestration belong to later, separately reviewed
+print the same complete recovery JSON envelope, not only a timing summary. If
+acquisition fails and publishing its censored prefix also fails, that envelope
+retains the recording error and the complete structured acquisition error as
+separate fields.
+Fixture caching and controlled cloud orchestration belong to later, separately reviewed
 slices.
 
 Machine-readable diagnostic-mode failures keep the suite/case/point identity

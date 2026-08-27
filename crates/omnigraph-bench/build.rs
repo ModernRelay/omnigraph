@@ -1,17 +1,39 @@
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const GIT_PROBE_DEADLINE: Duration = Duration::from_secs(3);
-const GIT_REAP_DEADLINE: Duration = Duration::from_secs(1);
+const PROBE_DEADLINE: Duration = Duration::from_secs(3);
+const PROBE_REAP_DEADLINE: Duration = Duration::from_secs(1);
 const MAX_GIT_POINTER_BYTES: u64 = 4 * 1024;
 const MAX_PACKED_REFS_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_GIT_STATUS_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUSTC_VERSION_BYTES: u64 = 64 * 1024;
 const MAX_WORKSPACE_MANIFEST_BYTES: u64 = 1024 * 1024;
+const RAW_HASH_CHUNK_PATHS: usize = 128;
 const RELEASE_PROFILE_OVERRIDE_PREFIX: &str = "CARGO_PROFILE_RELEASE_";
+const RELEASE_PROFILE_OVERRIDE_NAMES: &[&str] = &[
+    "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+    "CARGO_PROFILE_RELEASE_DEBUG",
+    "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS",
+    "CARGO_PROFILE_RELEASE_INCREMENTAL",
+    "CARGO_PROFILE_RELEASE_LTO",
+    "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+    "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS",
+    "CARGO_PROFILE_RELEASE_PANIC",
+    "CARGO_PROFILE_RELEASE_RPATH",
+    "CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO",
+    "CARGO_PROFILE_RELEASE_STRIP",
+];
 const UNKNOWN: &str = "unknown";
+
+#[cfg(unix)]
+const GIT_EXECUTABLE: &str = "/usr/bin/git";
+#[cfg(not(unix))]
+const GIT_EXECUTABLE: &str = "git";
 
 #[derive(Debug)]
 struct ReleaseProfile {
@@ -44,6 +66,8 @@ fn main() {
             repository.join("Cargo.lock"),
             repository.join("rust-toolchain.toml"),
             repository.join(".cargo"),
+            repository.join(".gitattributes"),
+            repository.join(".gitignore"),
         ] {
             println!("cargo:rerun-if-changed={}", input.display());
         }
@@ -58,6 +82,11 @@ fn main() {
         .unwrap_or_else(|| UNKNOWN.to_string());
     println!("cargo:rustc-env=OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT={source_git_commit}");
     println!("cargo:rustc-env=OMNIGRAPH_BENCH_SOURCE_WORKTREE_DIRTY={source_worktree_dirty}");
+    let declared_engine_features = repository
+        .and_then(read_declared_engine_features)
+        .map(|features| features.join(","))
+        .unwrap_or_else(|| UNKNOWN.to_string());
+    println!("cargo:rustc-env=OMNIGRAPH_BENCH_DECLARED_ENGINE_FEATURES={declared_engine_features}");
 
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let rustc_version = run_command_output_bounded(Path::new(&rustc), &["--version"])
@@ -97,6 +126,26 @@ fn main() {
         "cargo:rustc-env=OMNIGRAPH_BENCH_RELEASE_PROFILE_ENVIRONMENT_OVERRIDES={release_overrides}"
     );
     println!("cargo:rustc-env=OMNIGRAPH_BENCH_EFFECTIVE_CODEGEN_OPTIONS_PROVED=false");
+
+    // Build-script output is cached independently from the final target
+    // compilation. Keep every inherited input to these facts explicit so a
+    // later build cannot reuse stale provenance.
+    println!("cargo:rerun-if-env-changed=RUSTC");
+    println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    for name in RELEASE_PROFILE_OVERRIDE_NAMES {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    // Cargo supports package-specific and future profile keys too. Existing
+    // unknown release overrides fail closed below; watching each one present
+    // in this invocation ensures changing its value reruns the probe.
+    for (name, _) in std::env::vars_os() {
+        if let Some(name) = name.to_str()
+            && name.starts_with(RELEASE_PROFILE_OVERRIDE_PREFIX)
+            && !RELEASE_PROFILE_OVERRIDE_NAMES.contains(&name)
+        {
+            println!("cargo:rerun-if-env-changed={name}");
+        }
+    }
 }
 
 fn probe_git_commit(repository: &Path) -> Option<String> {
@@ -130,6 +179,17 @@ fn probe_git_commit(repository: &Path) -> Option<String> {
 }
 
 fn probe_git_dirty(repository: &Path) -> Option<bool> {
+    let index = run_git_output_bounded(
+        repository,
+        &["ls-files", "-v", "-z", "--"],
+        MAX_GIT_STATUS_BYTES,
+    )?;
+    if !canonical_index_inventory(&index) {
+        return Some(true);
+    }
+    if !raw_source_matches_index(repository)? {
+        return Some(true);
+    }
     let tracked = run_git_status_bounded(
         repository,
         &[
@@ -150,63 +210,204 @@ fn probe_git_dirty(repository: &Path) -> Option<bool> {
     if tracked_dirty {
         return Some(true);
     }
-    let untracked = run_git_status_bounded(
+    let untracked_source = run_git_output_bounded(
         repository,
         &[
             "ls-files",
             "--others",
-            "--exclude-standard",
-            "--error-unmatch",
-            "*",
+            "-z",
+            "--",
+            "crates",
+            "benchmarks",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo",
+            ".gitattributes",
+            ".gitignore",
         ],
+        MAX_GIT_STATUS_BYTES,
     )?;
-    let untracked_dirty = match untracked.code() {
-        Some(0) => true,
-        Some(1) => false,
-        _ => return None,
-    };
-    Some(untracked_dirty)
+    if !untracked_source.is_empty() {
+        return Some(true);
+    }
+    let untracked = run_git_output_bounded(
+        repository,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        MAX_GIT_STATUS_BYTES,
+    )?;
+    Some(!untracked.is_empty())
+}
+
+fn canonical_index_inventory(encoded: &[u8]) -> bool {
+    (encoded.is_empty() || encoded.last() == Some(&0))
+        && encoded
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .all(|entry| entry.len() >= 3 && entry[0] == b'H' && entry[1] == b' ')
+}
+
+#[derive(Debug)]
+struct SourceIndexEntry {
+    object_id: String,
+    path: PathBuf,
+    executable: bool,
+}
+
+fn raw_source_matches_index(repository: &Path) -> Option<bool> {
+    let encoded = run_git_output_bounded(
+        repository,
+        &[
+            "ls-files",
+            "--stage",
+            "-z",
+            "--",
+            "crates",
+            "benchmarks",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo",
+            ".gitattributes",
+            ".gitignore",
+        ],
+        MAX_GIT_STATUS_BYTES,
+    )?;
+    let entries = parse_source_index_entries(&encoded)?;
+    if entries.is_empty() {
+        return None;
+    }
+    for entry in &entries {
+        let metadata = match std::fs::symlink_metadata(repository.join(&entry.path)) {
+            Ok(metadata) => metadata,
+            Err(_) => return Some(false),
+        };
+        if !metadata.is_file() {
+            return Some(false);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if (metadata.permissions().mode() & 0o111 != 0) != entry.executable {
+                return Some(false);
+            }
+        }
+        #[cfg(not(unix))]
+        return None;
+    }
+    for entries in entries.chunks(RAW_HASH_CHUNK_PATHS) {
+        let mut command = sanitized_git_command(repository)?;
+        command.args(["hash-object", "--no-filters", "--"]);
+        for entry in entries {
+            command.arg(&entry.path);
+        }
+        let (status, output) = run_child_output_bounded(&mut command, MAX_GIT_STATUS_BYTES)?;
+        if !status.success() {
+            return None;
+        }
+        let hashes = std::str::from_utf8(&output)
+            .ok()?
+            .lines()
+            .collect::<Vec<_>>();
+        if hashes.len() != entries.len() {
+            return None;
+        }
+        if entries
+            .iter()
+            .zip(hashes)
+            .any(|(entry, observed)| observed != entry.object_id)
+        {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn parse_source_index_entries(encoded: &[u8]) -> Option<Vec<SourceIndexEntry>> {
+    if !encoded.is_empty() && encoded.last() != Some(&0) {
+        return None;
+    }
+    encoded
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let tab = entry.iter().position(|byte| *byte == b'\t')?;
+            let metadata = std::str::from_utf8(&entry[..tab]).ok()?;
+            let mut fields = metadata.split(' ');
+            let mode = fields.next()?;
+            let object_id = fields.next()?;
+            let stage = fields.next()?;
+            if fields.next().is_some()
+                || !matches!(mode, "100644" | "100755")
+                || stage != "0"
+                || normalize_commit(object_id).is_none()
+            {
+                return None;
+            }
+            let path = path_from_git_bytes(&entry[tab + 1..])?;
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return None;
+            }
+            Some(SourceIndexEntry {
+                object_id: object_id.to_string(),
+                path,
+                executable: mode == "100755",
+            })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(path: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(path: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(path).ok().map(PathBuf::from)
 }
 
 /// Run one non-interactive, status-only Git metadata probe. Standard streams
 /// are null, so timeout handling never blocks on a pipe-reader join.
 fn run_git_status_bounded(repository: &Path, arguments: &[&str]) -> Option<ExitStatus> {
-    let mut command = Command::new("git");
+    let mut command = sanitized_git_command(repository)?;
     command
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(repository)
         .args(arguments)
-        .env("LC_ALL", "C")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    configure_git_process_group(&mut command);
+    configure_probe_process_group(&mut command);
     let mut child = command.spawn().ok()?;
-    let process_group = i32::try_from(child.id()).ok()?;
-    let deadline = Instant::now() + GIT_PROBE_DEADLINE;
+    let process_group = match i32::try_from(child.id()) {
+        Ok(process_group) => process_group,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let deadline = Instant::now() + PROBE_DEADLINE;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                if wait_for_git_process_group_gone(process_group, GIT_REAP_DEADLINE) {
+                if wait_for_probe_process_group_gone(process_group, PROBE_REAP_DEADLINE) {
                     return Some(status);
                 }
-                let _ = kill_git_process_group(process_group);
-                let _ = wait_for_git_process_group_gone(process_group, GIT_REAP_DEADLINE);
+                let _ = kill_probe_process_group(process_group);
+                let _ = wait_for_probe_process_group_gone(process_group, PROBE_REAP_DEADLINE);
                 return None;
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) | Err(_) => {
-                if !kill_git_process_group(process_group) {
+                if !kill_probe_process_group(process_group) {
                     let _ = child.kill();
                 }
-                let reap_deadline = Instant::now() + GIT_REAP_DEADLINE;
+                let reap_deadline = Instant::now() + PROBE_REAP_DEADLINE;
                 while Instant::now() < reap_deadline {
                     match child.try_wait() {
                         Ok(Some(_)) => break,
@@ -214,60 +415,25 @@ fn run_git_status_bounded(repository: &Path, arguments: &[&str]) -> Option<ExitS
                         Err(_) => break,
                     }
                 }
-                let _ = wait_for_git_process_group_gone(process_group, GIT_REAP_DEADLINE);
+                let _ = wait_for_probe_process_group_gone(process_group, PROBE_REAP_DEADLINE);
                 return None;
             }
         }
     }
 }
 
+fn run_git_output_bounded(repository: &Path, arguments: &[&str], limit: u64) -> Option<Vec<u8>> {
+    let mut command = sanitized_git_command(repository)?;
+    command.args(arguments);
+    let (status, output) = run_child_output_bounded(&mut command, limit)?;
+    status.success().then_some(output)
+}
+
 fn run_command_output_bounded(executable: &Path, arguments: &[&str]) -> Option<String> {
     let mut command = Command::new(executable);
-    command
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    configure_git_process_group(&mut command);
-    let mut child = command.spawn().ok()?;
-    let process_group = i32::try_from(child.id()).ok()?;
-    let stdout = child.stdout.take()?;
-    let reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(MAX_RUSTC_VERSION_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .ok()
-            .map(|_| bytes)
-    });
-    let deadline = Instant::now() + GIT_PROBE_DEADLINE;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) | Err(_) => {
-                if !kill_git_process_group(process_group) {
-                    let _ = child.kill();
-                }
-                break None;
-            }
-        }
-    };
-    let reap_deadline = Instant::now() + GIT_REAP_DEADLINE;
-    while Instant::now() < reap_deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(_) => break,
-        }
-    }
-    let group_gone = wait_for_git_process_group_gone(process_group, GIT_REAP_DEADLINE);
-    let bytes = reader.join().ok()??;
-    let status = status?;
-    if !status.success()
-        || !group_gone
-        || u64::try_from(bytes.len()).ok()? > MAX_RUSTC_VERSION_BYTES
-    {
+    command.args(arguments).env("LC_ALL", "C");
+    let (status, bytes) = run_child_output_bounded(&mut command, MAX_RUSTC_VERSION_BYTES)?;
+    if !status.success() {
         return None;
     }
     let value = String::from_utf8(bytes).ok()?;
@@ -275,10 +441,206 @@ fn run_command_output_bounded(executable: &Path, arguments: &[&str]) -> Option<S
     (!value.is_empty() && !value.chars().any(char::is_control)).then(|| value.to_string())
 }
 
+/// Capture bounded stdout from a non-interactive child without trusting the
+/// child or its descendants to close the pipe. In particular, a compiler
+/// wrapper can exit after spawning a descendant that retains stdout. The
+/// process group is killed before we wait for pipe completion, and the reader
+/// is observed through a bounded channel wait rather than an unbounded join.
+fn run_child_output_bounded(command: &mut Command, limit: u64) -> Option<(ExitStatus, Vec<u8>)> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    configure_probe_process_group(command);
+    let mut child = command.spawn().ok()?;
+    let process_group = match i32::try_from(child.id()) {
+        Ok(process_group) => process_group,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = kill_probe_process_group(process_group);
+            let _ = child.kill();
+            reap_child_bounded(&mut child);
+            return None;
+        }
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let _reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .ok()
+            .map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    let deadline = Instant::now() + PROBE_DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => {
+                if !kill_probe_process_group(process_group) {
+                    let _ = child.kill();
+                }
+                reap_child_bounded(&mut child);
+                let _ = wait_for_probe_process_group_gone(process_group, PROBE_REAP_DEADLINE);
+                return None;
+            }
+        }
+    };
+
+    if !wait_for_probe_process_group_gone(process_group, PROBE_REAP_DEADLINE) {
+        let _ = kill_probe_process_group(process_group);
+        let _ = wait_for_probe_process_group_gone(process_group, PROBE_REAP_DEADLINE);
+        // A probe whose root exited while descendants remained is not trusted,
+        // even if killing those descendants eventually closed the pipe.
+        return None;
+    }
+    let bytes = receiver.recv_timeout(PROBE_REAP_DEADLINE).ok()??;
+    (u64::try_from(bytes.len()).ok()? <= limit).then_some((status, bytes))
+}
+
+fn reap_child_bounded(child: &mut std::process::Child) {
+    let deadline = Instant::now() + PROBE_REAP_DEADLINE;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => return,
+        }
+    }
+}
+
+/// Git's repository-selection and configuration environment takes precedence
+/// over `-C`. Remove all inherited `GIT_*` variables so dirty-state evidence
+/// cannot be redirected to another worktree, index, namespace, or config.
+fn sanitized_git_command(repository: &Path) -> Option<Command> {
+    let repository = repository.canonicalize().ok()?;
+    let git_dir = discover_git_dir(&repository)?.canonicalize().ok()?;
+    let mut command = Command::new(GIT_EXECUTABLE);
+    #[cfg(not(unix))]
+    let path = std::env::var_os("PATH");
+    command.env_clear();
+    #[cfg(not(unix))]
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    command
+        .env("LC_ALL", "C")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("--no-optional-locks")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .arg("--work-tree")
+        .arg(&repository)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.ignoreCase=false",
+            "-c",
+            "core.fileMode=true",
+            "-c",
+            "core.symlinks=true",
+            "-c",
+            "core.precomposeUnicode=false",
+            "-c",
+            "core.trustctime=true",
+            "-c",
+            "core.checkStat=default",
+            "-c",
+            "core.ignoreStat=false",
+        ])
+        .current_dir(&repository);
+    Some(command)
+}
+
+fn read_declared_engine_features(repository: &Path) -> Option<Vec<String>> {
+    let manifest = read_bounded_file(
+        &repository.join("crates/omnigraph/Cargo.toml"),
+        MAX_WORKSPACE_MANIFEST_BYTES,
+    )?;
+    let source = std::str::from_utf8(&manifest).ok()?;
+    let document = toml::from_str::<toml::Value>(source).ok()?;
+    let table = document.get("features")?.as_table()?;
+    let mut features = table.keys().cloned().collect::<Vec<_>>();
+    if features.iter().any(|feature| {
+        feature.is_empty()
+            || feature.len() > 128
+            || feature.contains(',')
+            || feature.chars().any(char::is_control)
+    }) {
+        return None;
+    }
+    let suppressed_optional_dependencies = table
+        .values()
+        .filter_map(toml::Value::as_array)
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .filter_map(|feature| feature.strip_prefix("dep:"))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if optional_dependency_names(&document)
+        .difference(&suppressed_optional_dependencies)
+        .next()
+        .is_some()
+    {
+        return None;
+    }
+    features.sort_unstable();
+    Some(features)
+}
+
+fn optional_dependency_names(document: &toml::Value) -> BTreeSet<String> {
+    fn extend_from_table(value: Option<&toml::Value>, names: &mut BTreeSet<String>) {
+        let Some(table) = value.and_then(toml::Value::as_table) else {
+            return;
+        };
+        names.extend(
+            table
+                .iter()
+                .filter(|(_name, specification)| {
+                    specification
+                        .as_table()
+                        .and_then(|fields| fields.get("optional"))
+                        .and_then(toml::Value::as_bool)
+                        .is_some_and(|optional| optional)
+                })
+                .map(|(name, _specification)| name.clone()),
+        );
+    }
+
+    let mut names = BTreeSet::new();
+    for table in ["dependencies", "build-dependencies"] {
+        extend_from_table(document.get(table), &mut names);
+    }
+    if let Some(targets) = document.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            for table in ["dependencies", "build-dependencies"] {
+                extend_from_table(target.get(table), &mut names);
+            }
+        }
+    }
+    names
+}
+
 fn read_release_profile(path: &Path) -> Option<ReleaseProfile> {
     let bytes = read_bounded_file(path, MAX_WORKSPACE_MANIFEST_BYTES)?;
     let source = std::str::from_utf8(&bytes).ok()?;
-    let document = source.parse::<toml::Value>().ok()?;
+    let document = toml::from_str::<toml::Value>(source).ok()?;
     let release = document.get("profile")?.get("release")?;
     let lto = release.get("lto")?.as_str()?.to_string();
     let codegen_units = u32::try_from(release.get("codegen-units")?.as_integer()?).ok()?;
@@ -292,20 +654,20 @@ fn read_release_profile(path: &Path) -> Option<ReleaseProfile> {
 
 fn release_profile_overrides_supported() -> bool {
     !std::env::vars_os().any(|(name, _)| {
-        name.to_str()
-            .is_some_and(|name| name.starts_with(RELEASE_PROFILE_OVERRIDE_PREFIX))
+        name.to_string_lossy()
+            .starts_with(RELEASE_PROFILE_OVERRIDE_PREFIX)
     })
 }
 
 #[cfg(unix)]
-fn configure_git_process_group(command: &mut Command) {
+fn configure_probe_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn configure_git_process_group(_command: &mut Command) {}
+fn configure_probe_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -314,7 +676,7 @@ unsafe extern "C" {
 }
 
 #[cfg(unix)]
-fn kill_git_process_group(process_group: i32) -> bool {
+fn kill_probe_process_group(process_group: i32) -> bool {
     // SAFETY: `send_signal` has the POSIX `kill(2)` signature. The negative
     // pid selects the fresh process group created immediately before spawn.
     let result = unsafe { send_signal(-process_group, 9) };
@@ -322,12 +684,12 @@ fn kill_git_process_group(process_group: i32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn kill_git_process_group(_process_group: i32) -> bool {
+fn kill_probe_process_group(_process_group: i32) -> bool {
     false
 }
 
 #[cfg(unix)]
-fn git_process_group_is_gone(process_group: i32) -> bool {
+fn probe_process_group_is_gone(process_group: i32) -> bool {
     // SAFETY: signal zero performs existence/permission checking only; the
     // negative pid addresses the dedicated process group.
     let result = unsafe { send_signal(-process_group, 0) };
@@ -341,14 +703,14 @@ fn no_such_process(error: std::io::Error) -> bool {
 }
 
 #[cfg(not(unix))]
-fn git_process_group_is_gone(_process_group: i32) -> bool {
+fn probe_process_group_is_gone(_process_group: i32) -> bool {
     true
 }
 
-fn wait_for_git_process_group_gone(process_group: i32, timeout: Duration) -> bool {
+fn wait_for_probe_process_group_gone(process_group: i32, timeout: Duration) -> bool {
     let started = Instant::now();
     loop {
-        if git_process_group_is_gone(process_group) {
+        if probe_process_group_is_gone(process_group) {
             return true;
         }
         if started.elapsed() >= timeout {
@@ -417,18 +779,45 @@ fn emit_git_rerun_paths(repository: &Path) {
         git_dir.join("HEAD"),
         git_dir.join("index"),
         common_dir.join("packed-refs"),
-        common_dir.join("index"),
     ] {
-        println!("cargo:rerun-if-changed={}", path.display());
+        emit_existing_rerun_path(&path);
     }
     if let Some(reference) = read_bounded_file(&git_dir.join("HEAD"), MAX_GIT_POINTER_BYTES)
         .and_then(|head| String::from_utf8(head).ok())
         .and_then(|head| head.trim().strip_prefix("ref: ").map(str::to_string))
         .filter(|reference| safe_git_reference(reference).is_some())
     {
-        println!(
-            "cargo:rerun-if-changed={}",
-            common_dir.join(reference).display()
-        );
+        let private_reference = git_dir.join(&reference);
+        emit_reference_rerun_path(&private_reference, &git_dir);
+        if common_dir != git_dir {
+            emit_reference_rerun_path(&common_dir.join(reference), &common_dir);
+        }
+    }
+}
+
+fn emit_existing_rerun_path(path: &Path) {
+    if path.is_file() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+fn emit_reference_rerun_path(reference: &Path, git_dir: &Path) {
+    if reference.is_file() {
+        println!("cargo:rerun-if-changed={}", reference.display());
+        return;
+    }
+    // A packed ref has no loose file yet. Watch its nearest existing refs
+    // directory so creating the loose ref reruns the probe, but never broaden
+    // that fallback to the whole `.git` directory.
+    let mut ancestor = reference.parent();
+    while let Some(path) = ancestor {
+        if path == git_dir {
+            return;
+        }
+        if path.is_dir() {
+            println!("cargo:rerun-if-changed={}", path.display());
+            return;
+        }
+        ancestor = path.parent();
     }
 }

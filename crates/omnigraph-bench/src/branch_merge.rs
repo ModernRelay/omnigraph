@@ -12,7 +12,7 @@ use std::fmt::{Display, Formatter, Write as _};
 use arrow_array::{Array, Int32Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryStreamExt;
-use omnigraph::db::{GraphCommit, Omnigraph, ReadTarget, SnapshotId};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
@@ -784,9 +784,10 @@ pub struct FixtureBuildSummary {
     pub optimized_user_tables: usize,
     pub source_history_depth: u64,
     pub target_history_depth: u64,
-    /// Digest of the exactly verified user-visible schema, empty index
-    /// inventory, and rows on every frozen branch. Unlike the physical tree
-    /// digest, this remains stable across Lance ids, timestamps, and encoding.
+    /// Digest of the exactly verified user-visible schema, physically proven
+    /// empty index inventory, and rows on every frozen branch. Unlike the
+    /// physical tree digest, this remains stable across Lance ids, timestamps,
+    /// compaction layout, and encoding.
     pub logical_content_sha256: String,
 }
 
@@ -873,6 +874,11 @@ pub async fn initialize_local_fixture(
         b"schema-shape",
         schema_shape.as_bytes(),
     );
+    // Builder v2 declares no secondary indexes. The per-branch verification
+    // below proves that every node and edge manifest has an empty physical
+    // index inventory before this declared empty inventory is certified in the
+    // logical digest. Compaction layout and encoding remain derived state.
+    hash_logical_field(&mut logical_digest, b"logical-index-inventory", b"[]");
     verify_branch(
         &db,
         MAIN_BRANCH,
@@ -944,12 +950,12 @@ fn verified_schema_shape_json(db: &Omnigraph, plan: &BranchMergePlan) -> BranchM
     })?;
     let expected_source = schema_source(plan.tables);
     let expected_ast = parse_schema(&expected_source)
-        .map_err(|error| verification_error(format!("parse builder-v1 schema: {error}")))?;
+        .map_err(|error| verification_error(format!("parse builder-v2 schema: {error}")))?;
     let expected = compile_schema_shape(&expected_ast)
-        .map_err(|error| verification_error(format!("compile builder-v1 schema shape: {error}")))?;
+        .map_err(|error| verification_error(format!("compile builder-v2 schema shape: {error}")))?;
     if observed != expected {
         return Err(verification_error(
-            "accepted fixture schema differs from the complete canonical builder-v1 schema shape",
+            "accepted fixture schema differs from the complete canonical builder-v2 schema shape",
         ));
     }
     schema_shape_json(&observed)
@@ -965,7 +971,7 @@ fn logical_node_row_sha256(
     payload: &str,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"node-row\\0");
+    digest.update(b"node-row\0");
     for (label, bytes) in [
         (b"type".as_slice(), ty.as_bytes()),
         (b"id".as_slice(), id.as_bytes()),
@@ -989,7 +995,7 @@ fn logical_edge_row_sha256(
     payload: &str,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"edge-row\\0");
+    digest.update(b"edge-row\0");
     for (label, bytes) in [
         (b"type".as_slice(), ty.as_bytes()),
         (b"id".as_slice(), id.as_bytes()),
@@ -1629,14 +1635,11 @@ async fn verify_branch(
         }
         if dataset.has_raw_index_section() {
             return Err(verification_error(format!(
-                "table {table} on {branch} carries a raw Lance index-metadata section, but builder-v1 requires proof of an empty physical index inventory"
+                "node table {table} on {branch} carries a raw Lance index-metadata section, but builder v2 declares indexes: []"
             )));
         }
         if let Some(digest) = logical_digest.as_deref_mut() {
             hash_logical_field(digest, b"type", ty.as_bytes());
-            // This exact empty set is derived from the dataset metadata just
-            // inspected, not from the builder's declaration.
-            hash_logical_field(digest, b"physical-index-inventory", b"[]");
         }
         let mut scanner = dataset.scan();
         scanner.project(&["id", "name", "cohort", "val", "payload"])?;
@@ -1688,12 +1691,11 @@ async fn verify_branch(
         }
         if dataset.has_raw_index_section() {
             return Err(verification_error(format!(
-                "edge table {table} on {branch} carries a raw Lance index-metadata section, but builder-v2 declares an empty physical index inventory"
+                "edge table {table} on {branch} carries a raw Lance index-metadata section, but builder v2 declares indexes: []"
             )));
         }
         if let Some(digest) = logical_digest.as_deref_mut() {
             hash_logical_field(digest, b"type", ty.as_bytes());
-            hash_logical_field(digest, b"physical-index-inventory", b"[]");
         }
         let mut scanner = dataset.scan();
         scanner.project(&["id", "src", "dst", "cohort", "val", "payload"])?;
@@ -2166,18 +2168,6 @@ impl SeenBits {
 mod tests {
     use super::*;
 
-    fn graph_commit(id: &str, parent: Option<&str>) -> GraphCommit {
-        GraphCommit {
-            graph_commit_id: id.to_string(),
-            graph_branch: None,
-            graph_manifest_version: 1,
-            parent_commit_id: parent.map(str::to_string),
-            merged_parent_commit_id: None,
-            actor_id: None,
-            created_at: 0,
-        }
-    }
-
     fn plan(rows: usize, diverged_tables: usize, delta: usize) -> BranchMergePlan {
         let split = split_delta(delta).unwrap();
         let table_deltas = (0..diverged_tables)
@@ -2200,7 +2190,7 @@ mod tests {
             diverged_tables,
             delta_rows_per_side: delta,
             requested_history_depth: 1,
-            compaction_recency: CompactionRecency::NotOptimized,
+            compaction_recency: CompactionRecency::Optimized,
             table_deltas,
             source_update_cohort: format!("d{delta}_src_upd"),
             source_delete_cohort: format!("d{delta}_src_del"),
@@ -2241,13 +2231,13 @@ mod tests {
     fn preflight_derives_checked_case_history_and_bounded_scratch_before_io() {
         let mut plan = plan(100_000, 4, 50);
         plan.tables = 8;
-        plan.requested_history_depth = 213;
+        plan.requested_history_depth = 214;
         let preflight = plan.preflight().unwrap();
         assert_eq!(preflight.base_rows, 800_000);
         assert_eq!(preflight.base_load_commits, 200);
-        assert_eq!(preflight.optimize_commits, 0);
+        assert_eq!(preflight.optimize_commits, 1);
         assert_eq!(preflight.divergence_commits_per_branch, 12);
-        assert_eq!(preflight.expected_history_depth, 213);
+        assert_eq!(preflight.expected_history_depth, 214);
         assert!(preflight.required_scratch_bytes > preflight.estimated_generated_bytes);
         assert!(preflight.estimated_max_entries <= MAX_RUNNER_ESTIMATED_ENTRIES);
     }
@@ -2262,7 +2252,7 @@ mod tests {
                 .preflight()
                 .unwrap_err()
                 .to_string()
-                .contains("requires exactly 213 reachable commits")
+                .contains("requires exactly 214 reachable commits")
         );
 
         let mut too_many_tables = plan(1, 1, 1);
@@ -2277,23 +2267,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixture_initialization_proves_the_complete_declared_lineage_recipe() {
-        // Delta three yields one update, delete, and insert publication on each
-        // named branch, so the test also proves the complete three-commit
-        // authored suffix rather than only the branch head label.
+    async fn fixture_initialization_proves_logical_rebuild_stability_and_history_depth() {
+        // Two user tables require two base publications. Delta three yields one
+        // update, delete, and insert publication on each named branch.
         let mut plan = plan(32, 1, 3);
         plan.compaction_recency = CompactionRecency::NotOptimized;
-        plan.requested_history_depth = 7;
-        assert_eq!(plan.preflight().unwrap().expected_history_depth, 7);
+        plan.requested_history_depth = 6;
+        assert_eq!(plan.preflight().unwrap().expected_history_depth, 6);
 
         let directory = tempfile::tempdir().unwrap();
         let summary = initialize_local_fixture(directory.path().to_str().unwrap(), &plan)
             .await
             .unwrap();
-        assert_eq!(summary.base_load_commits, 3);
+        assert_eq!(summary.base_load_commits, 2);
         assert_eq!(summary.optimized_user_tables, 0);
-        assert_eq!(summary.source_history_depth, 7);
-        assert_eq!(summary.target_history_depth, 7);
+        assert_eq!(summary.source_history_depth, 6);
+        assert_eq!(summary.target_history_depth, 6);
         assert_eq!(summary.logical_content_sha256.len(), 64);
 
         let rebuilt_directory = tempfile::tempdir().unwrap();
@@ -2306,52 +2295,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fork_proof_rejects_disjoint_history_without_hashing_physical_commit_ids() {
-        let first = vec![
-            graph_commit("source-a", Some("main-a")),
-            graph_commit("main-a", None),
-        ];
-        let second = vec![
-            graph_commit("source-b", Some("main-b")),
-            graph_commit("main-b", None),
-        ];
-        let mut first_digest = Sha256::new();
-        verify_shared_main_fork("bench-source", &first, 1, "main-a", &mut first_digest).unwrap();
-        let mut second_digest = Sha256::new();
-        verify_shared_main_fork("bench-source", &second, 1, "main-b", &mut second_digest).unwrap();
-        assert_eq!(
-            first_digest.finalize(),
-            second_digest.finalize(),
-            "rebuild-specific commit ids must not enter logical fixture identity"
-        );
-
-        let mut rejected_digest = Sha256::new();
-        let error = verify_shared_main_fork(
-            "bench-source",
-            &first,
-            1,
-            "different-main-head",
-            &mut rejected_digest,
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("does not share main's actual head"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn optimized_empty_index_fixture_is_refused_before_io() {
+    #[tokio::test]
+    async fn optimized_direct_plan_cannot_certify_declared_empty_index_state() {
         let mut plan = plan(4_097, 1, 1);
         plan.compaction_recency = CompactionRecency::Optimized;
-        let error = plan.preflight().unwrap_err();
+        plan.requested_history_depth = 7;
+        let preflight = plan.preflight().unwrap();
+        assert_eq!(preflight.optimize_commits, 1);
+
+        let directory = tempfile::tempdir().unwrap();
+        let error = initialize_local_fixture(directory.path().to_str().unwrap(), &plan)
+            .await
+            .expect_err("optimized manifests cannot certify builder v2's indexes: [] state");
+        let fixture_error = error
+            .downcast_ref::<BranchMergeError>()
+            .expect("fixture certification must return a classified scenario error");
+        assert_eq!(fixture_error.kind(), BranchMergeErrorKind::Verification);
         assert!(
             error
                 .to_string()
-                .contains("Optimize automatically creates physical indexes"),
+                .contains("raw Lance index-metadata section, but builder v2 declares indexes: []"),
             "unexpected error: {error}"
         );
     }
@@ -2455,22 +2418,74 @@ mod tests {
     }
 
     #[test]
-    fn actual_logical_row_digest_is_stable_and_content_sensitive() {
-        let first = logical_row_sha256("T000", "row", "row", "keep", 7, "payload");
+    fn logical_node_and_edge_digests_are_stable_and_content_sensitive() {
+        let node = logical_node_row_sha256(
+            "BenchN000",
+            "n000_r0000007",
+            "n000_r0000007",
+            "keep",
+            7,
+            "payload",
+        );
         assert_eq!(
-            first,
-            logical_row_sha256("T000", "row", "row", "keep", 7, "payload")
+            node,
+            logical_node_row_sha256(
+                "BenchN000",
+                "n000_r0000007",
+                "n000_r0000007",
+                "keep",
+                7,
+                "payload",
+            )
         );
         assert_ne!(
-            first,
-            logical_row_sha256("T000", "row", "row", "keep", 7, "payload-2"),
-            "a logical payload change must change the fixture identity"
+            node,
+            logical_node_row_sha256(
+                "BenchN000",
+                "n000_r0000007",
+                "renamed",
+                "keep",
+                7,
+                "payload",
+            ),
+            "a logical node property change must change the row digest"
+        );
+
+        let edge = logical_edge_row_sha256(
+            "BenchE000",
+            "e000_r0000007",
+            "n000_r0000007",
+            "n001_r0000007",
+            "keep",
+            7,
+            "payload",
+        );
+        assert_eq!(
+            edge,
+            logical_edge_row_sha256(
+                "BenchE000",
+                "e000_r0000007",
+                "n000_r0000007",
+                "n001_r0000007",
+                "keep",
+                7,
+                "payload",
+            )
         );
         assert_ne!(
-            first,
-            logical_row_sha256("T000", "row", "row", "keep", 8, "payload"),
-            "a logical value change must change the fixture identity"
+            edge,
+            logical_edge_row_sha256(
+                "BenchE000",
+                "e000_r0000007",
+                "n000_r0000007",
+                "n000_r0000008",
+                "keep",
+                7,
+                "payload",
+            ),
+            "a logical edge endpoint change must change the row digest"
         );
+        assert_ne!(node, edge, "node and edge rows use separate digest domains");
     }
 
     #[test]

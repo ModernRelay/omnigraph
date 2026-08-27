@@ -20,6 +20,8 @@ pub mod projection;
 pub mod record;
 pub mod reset;
 pub mod runner;
+#[doc(hidden)]
+pub mod source_provenance;
 pub mod suite;
 mod supervisor;
 #[doc(hidden)]

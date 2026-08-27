@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use omnigraph_bench::RUNNER_OUTPUT_VERSION;
 use predicates::prelude::*;
 
 fn repository_root() -> PathBuf {
@@ -185,7 +186,7 @@ fn suite_run_refuses_debug_wall_clock_measurement_before_fixture_setup() {
     assert!(!output.status.success(), "{output:?}");
     let failure: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("runner failure JSON");
-    assert_eq!(failure["runner_output_version"], 1);
+    assert_eq!(failure["runner_output_version"], RUNNER_OUTPUT_VERSION);
     assert_eq!(failure["suite"], "local-smoke");
     assert_eq!(failure["completed_runs"].as_array().unwrap().len(), 0);
     assert_eq!(failure["error"]["code"], "release_build_required");

@@ -20,7 +20,7 @@ use crate::machine::MachineIdentityV1;
 use crate::reset::{MetadataDigest, PhysicalDigest};
 use crate::runner::{
     ChildProcessEvidence, RepObservation, RunnerError, RunnerResult,
-    validate_worker_build_attestation,
+    configure_benchmark_worker_environment, validate_worker_build_attestation,
 };
 use crate::worker_protocol::{
     ChildFrameV1, MAX_WORKER_FRAME_BYTES, ParentFrameV1, WORKER_PROTOCOL_VERSION, WorkerBuildV1,
@@ -52,6 +52,7 @@ pub(crate) struct SupervisionInput {
     pub repetition: u32,
     pub case: ValidatedCase,
     pub repetition_root: PathBuf,
+    pub worker_scratch_root: PathBuf,
     pub physical_digest: PhysicalDigest,
     pub metadata_digest: MetadataDigest,
     pub deadline: Option<Duration>,
@@ -78,6 +79,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
     }
     let measurement_watchdog = measurement_watchdog(&input);
     let mut command = Command::new(&input.worker_executable);
+    configure_benchmark_worker_environment(&mut command, &input.worker_scratch_root);
     command
         .arg("__worker-v1")
         .stdin(Stdio::piped())
@@ -195,6 +197,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
             expected_point_id: input.case.point_id.clone(),
             expected_case_digest: input.case.case_digest.clone(),
             repetition_root: input.repetition_root.clone(),
+            worker_scratch_root: input.worker_scratch_root.clone(),
             expected_physical_digest: input.physical_digest.clone(),
             expected_metadata_digest: input.metadata_digest.clone(),
         }),
@@ -1478,25 +1481,32 @@ mod tests {
         }
     }
 
-    fn supervision_input(worker_executable: PathBuf) -> SupervisionInput {
-        SupervisionInput {
+    fn supervision_input(worker_executable: PathBuf) -> (tempfile::TempDir, SupervisionInput) {
+        let workspace = tempfile::tempdir().unwrap();
+        let repetition_root = workspace.path().join("supervisor-test-fixture");
+        let worker_scratch_root = workspace.path().join("worker-scratch-00000007");
+        std::fs::create_dir(&repetition_root).unwrap();
+        std::fs::create_dir(&worker_scratch_root).unwrap();
+        let input = SupervisionInput {
             worker_executable,
             expected_worker_executable_sha256: worker_build().executable_sha256,
             expected_machine: None,
             fixture_manifest_sha256: "e".repeat(64),
             repetition: TEST_REPETITION,
             case: test_case(),
-            repetition_root: PathBuf::from("/unused/supervisor-test-fixture"),
+            repetition_root,
+            worker_scratch_root,
             physical_digest: physical_digest(),
             metadata_digest: metadata_digest(),
             deadline: Some(GENEROUS_DEADLINE),
             auxiliary_deadline_override: Some(GENEROUS_AUXILIARY_DEADLINE),
-        }
+        };
+        (workspace, input)
     }
 
     #[test]
     fn undeclared_operation_deadline_keeps_an_independent_safety_watchdog() {
-        let mut input = supervision_input(PathBuf::from("/unused"));
+        let (_workspace, mut input) = supervision_input(PathBuf::from("/unused"));
         input.deadline = None;
 
         assert_eq!(
@@ -1643,7 +1653,7 @@ mod tests {
     #[test]
     fn valid_worker_completes_ready_begin_settled_complete_protocol() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let expected = valid_sample(&input);
         let body = normal_exchange(&input, complete_frame(&input, expected.clone()));
         let (_guard, _directory, worker) = worker_script(&body);
@@ -1661,7 +1671,7 @@ mod tests {
     #[test]
     fn worker_cannot_report_more_elapsed_time_than_the_parent_observed() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let forged = ChildFrameV1::Settled {
             protocol_version: WORKER_PROTOCOL_VERSION,
             repetition: input.repetition,
@@ -1689,7 +1699,7 @@ mod tests {
     #[test]
     fn supervised_repetitions_use_distinct_worker_processes() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         input.auxiliary_deadline_override = Some(Duration::from_secs(5));
         let expected = valid_sample(&input);
         let body = format!(
@@ -1703,10 +1713,11 @@ mod tests {
         let first_thread = std::thread::spawn(move || supervise_repetition(input));
         let second_thread = std::thread::spawn(move || supervise_repetition(second));
         for result in [first_thread.join().unwrap(), second_thread.join().unwrap()] {
-            let mut observed = result.unwrap();
-            assert!(observed.peak_rss_bytes.is_some(), "{observed:?}");
-            observed.peak_rss_bytes = None;
-            assert_eq!(observed, expected);
+            let observed = result.unwrap();
+            assert!(observed.sample.peak_rss_bytes.is_some(), "{observed:?}");
+            let mut sample = observed.sample;
+            sample.peak_rss_bytes = None;
+            assert_eq!(sample, expected);
         }
 
         let pid_log = PathBuf::from(format!("{}.pids", worker.display()));
@@ -1724,7 +1735,7 @@ mod tests {
     #[test]
     fn worker_that_never_reads_stdin_is_bounded_by_prepare_deadline() {
         let (_guard, _directory, worker) = worker_script("sleep 300\n");
-        let mut input = supervision_input(worker);
+        let (_workspace, mut input) = supervision_input(worker);
         input.auxiliary_deadline_override = Some(QUICK_DEADLINE);
         let started = Instant::now();
 
@@ -1748,7 +1759,7 @@ mod tests {
     #[test]
     fn worker_measurement_hang_is_killed_at_the_declared_deadline() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         input.deadline = Some(QUICK_DEADLINE);
         let body = format!(
             "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\nsleep 300\n",
@@ -1778,7 +1789,7 @@ mod tests {
     #[test]
     fn worker_verification_hang_after_settled_is_bounded() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         input.auxiliary_deadline_override = Some(BOUNDED_AUXILIARY_DEADLINE);
         let body = format!(
             "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n{}sleep 300\n",
@@ -1800,7 +1811,7 @@ mod tests {
     #[test]
     fn worker_that_reports_complete_but_does_not_exit_is_killed() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         input.auxiliary_deadline_override = Some(BOUNDED_AUXILIARY_DEADLINE);
         let sample = valid_sample(&input);
         let mut body = normal_exchange(&input, complete_frame(&input, sample));
@@ -1820,7 +1831,7 @@ mod tests {
     #[test]
     fn valid_trailing_frame_after_complete_is_rejected() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let sample = valid_sample(&input);
         let mut body = normal_exchange(&input, complete_frame(&input, sample));
         body.push_str(&emit(&ready_frame(&input)));
@@ -1845,7 +1856,7 @@ mod tests {
     #[test]
     fn malformed_trailing_output_after_complete_is_rejected() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let sample = valid_sample(&input);
         let mut body = normal_exchange(&input, complete_frame(&input, sample));
         body.push_str("printf '%s\\n' '{not-json'\n");
@@ -1863,7 +1874,7 @@ mod tests {
     #[test]
     fn forged_ready_identity_is_rejected() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let mut forged = ready_frame(&input);
         if let ChildFrameV1::Ready { point_id, .. } = &mut forged {
             *point_id = "0".repeat(64);
@@ -1885,7 +1896,7 @@ mod tests {
     #[test]
     fn incomplete_worker_build_attestation_is_rejected_before_measurement() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let mut forged = ready_frame(&input);
         if let ChildFrameV1::Ready { worker_build, .. } = &mut forged {
             worker_build.rustc_version = "unknown".to_string();
@@ -1907,7 +1918,7 @@ mod tests {
     #[test]
     fn invalid_worker_machine_identity_is_rejected_before_measurement() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let mut forged = ready_frame(&input);
         if let ChildFrameV1::Ready { machine, .. } = &mut forged {
             machine.logical_cores = 0;
@@ -1929,7 +1940,7 @@ mod tests {
     #[test]
     fn changed_worker_machine_identity_is_rejected_before_begin() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let mut expected = machine_identity();
         expected.machine_label = format!("hostname-sha256:{}", "7".repeat(64));
         expected.validate().unwrap();
@@ -1951,7 +1962,7 @@ mod tests {
     #[test]
     fn out_of_order_failed_frame_cannot_smuggle_settled_evidence_before_ready() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let forged = ChildFrameV1::Failed {
             protocol_version: WORKER_PROTOCOL_VERSION,
             stage: WorkerStageV1::Verify,
@@ -1973,7 +1984,7 @@ mod tests {
     #[test]
     fn forged_complete_sample_is_rejected_by_parent_admission() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let mut sample = valid_sample(&input);
         sample.verification.rows += 1;
         let body = normal_exchange(&input, complete_frame(&input, sample));
@@ -2029,7 +2040,7 @@ mod tests {
                 sample.logical_store_calls.physical_attempts_observed = true
             }),
         ];
-        let input = supervision_input(PathBuf::from("/unused"));
+        let (_workspace, input) = supervision_input(PathBuf::from("/unused"));
 
         for (field, mutate) in cases {
             let mut sample = valid_sample(&input);
@@ -2044,7 +2055,7 @@ mod tests {
     #[test]
     fn descendant_holding_inherited_pipes_prevents_false_clean_completion() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         input.auxiliary_deadline_override = Some(GENEROUS_AUXILIARY_DEADLINE);
         let sample = valid_sample(&input);
         let mut body = normal_exchange(&input, complete_frame(&input, sample));

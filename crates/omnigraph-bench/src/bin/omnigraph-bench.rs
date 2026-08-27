@@ -14,8 +14,8 @@ use omnigraph_bench::projection::{
     list_points_page, list_runs_for_point_page, rebuild_projection,
 };
 use omnigraph_bench::record::{
-    InvocationIdentityV1, ObservedBackendV1, RecordInputV1, build_run_record,
-    sut_identity_for_execution,
+    AcquisitionTerminalStageV1, AcquisitionTerminalV1, InvocationIdentityV1, ObservedBackendV1,
+    RecordInputV1, build_censored_run_record, build_run_record, sut_identity_for_execution,
 };
 use omnigraph_bench::{
     Diagnostic, PLAN_FORMAT_VERSION, RUNNER_OUTPUT_VERSION, ResolvedRun, ResolvedSuite,
@@ -793,6 +793,66 @@ fn select_runs<'a>(
     Ok(selected)
 }
 
+fn classify_censored_prefix<T>(
+    partial: Option<T>,
+    observed_repetitions: impl FnOnce(&T) -> usize,
+    failure_stage: Option<&str>,
+    failure_code: &str,
+) -> Result<Option<(T, AcquisitionTerminalV1)>, RecordingError> {
+    let Some(partial) = partial else {
+        return Ok(None);
+    };
+    let observed = observed_repetitions(&partial);
+    if observed == 0 {
+        return Ok(None);
+    }
+    let observed = u32::try_from(observed).expect("runner repetition bounds fit u32");
+    let stage = acquisition_terminal_stage(failure_stage)?;
+    let terminal = AcquisitionTerminalV1::new(observed, stage, failure_code)
+        .map_err(RecordingError::from_record)?;
+    Ok(Some((partial, terminal)))
+}
+
+fn acquisition_terminal_stage(
+    runner_stage: Option<&str>,
+) -> Result<AcquisitionTerminalStageV1, RecordingError> {
+    use AcquisitionTerminalStageV1 as Stage;
+
+    let stage = match runner_stage {
+        None => Stage::Runner,
+        Some("supervisor-panic") => Stage::SupervisorPanic,
+        Some("Bootstrap") => Stage::Bootstrap,
+        Some("Prepare") => Stage::Prepare,
+        Some("Measure") => Stage::Measure,
+        Some("Verify") => Stage::Verify,
+        Some("Finalize") => Stage::Finalize,
+        Some("Protocol") => Stage::Protocol,
+        Some("pipe-setup") => Stage::PipeSetup,
+        Some("writer-setup") => Stage::WriterSetup,
+        Some("reader-setup") => Stage::ReaderSetup,
+        Some("request-write") => Stage::RequestWrite,
+        Some("prepare-timeout") => Stage::PrepareTimeout,
+        Some("prepare-protocol") => Stage::PrepareProtocol,
+        Some("begin-write") => Stage::BeginWrite,
+        Some("measure-timeout") => Stage::MeasureTimeout,
+        Some("measure-protocol") => Stage::MeasureProtocol,
+        Some("verify-timeout") => Stage::VerifyTimeout,
+        Some("verify-protocol") => Stage::VerifyProtocol,
+        Some("finalize-protocol") => Stage::FinalizeProtocol,
+        Some("exit-timeout") => Stage::ExitTimeout,
+        Some("group-proof") => Stage::GroupProof,
+        Some("finalize-exit") => Stage::FinalizeExit,
+        Some("structured-failure-reap") => Stage::StructuredFailureReap,
+        Some(_) => {
+            return Err(RecordingError::new(
+                "invalid_acquisition_terminal_stage",
+                "runner failure carried a child-process stage outside the closed run-record-v1 terminal-stage registry",
+            ));
+        }
+    };
+    Ok(stage)
+}
+
 async fn run_suite_execution(
     path: &Path,
     selector: Option<&str>,
@@ -838,7 +898,59 @@ async fn run_suite_execution(
         let invocation = recording.as_ref().map(RecordingContext::begin_invocation);
         let execution = match execute_run(run, &options).await {
             Ok(execution) => execution,
-            Err(error) => {
+            Err(mut error) => {
+                let partial_run = error.context.partial_run.as_deref().cloned();
+                let censored = if let Some(recording) = recording.as_ref() {
+                    match classify_censored_prefix(
+                        partial_run.clone(),
+                        |partial| partial.samples.len(),
+                        error
+                            .context
+                            .child_process
+                            .as_ref()
+                            .map(|evidence| evidence.stage.as_str()),
+                        &error.code,
+                    ) {
+                        Ok(censored) => censored,
+                        Err(recording_error) => {
+                            return print_recording_failure(
+                                &suite,
+                                completed_run_count,
+                                partial_run.as_ref(),
+                                &receipts,
+                                Some(recording),
+                                Some(&recording.archive_root),
+                                &recording_error.with_acquisition_failure(&error),
+                                json,
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let (Some(recording), Some(invocation), Some((partial, terminal))) =
+                    (recording.as_ref(), invocation, censored)
+                {
+                    match recording.publish_censored(run, &partial, invocation, terminal) {
+                        Ok(receipt) => {
+                            receipts.push(receipt);
+                            error.context.completed_samples.clear();
+                            error.context.settled_sample = None;
+                        }
+                        Err(recording_error) => {
+                            return print_recording_failure(
+                                &suite,
+                                completed_run_count,
+                                Some(&partial),
+                                &receipts,
+                                Some(recording),
+                                Some(&recording.archive_root),
+                                &recording_error.with_acquisition_failure(&error),
+                                json,
+                            );
+                        }
+                    }
+                }
                 return print_runner_failure(
                     &suite,
                     completed_run_count,
@@ -1058,19 +1170,21 @@ struct RecordingContext {
     archive_root: PathBuf,
     session_id: Ulid,
     session_id_string: String,
+    source_commit: String,
 }
 
 impl RecordingContext {
     fn new(archive_root: PathBuf) -> Result<Self, RecordingError> {
-        preflight_archive_publication(&archive_root).map_err(RecordingError::from_archive)?;
-        let source_commit = env!("OMNIGRAPH_BENCH_SOURCE_COMMIT").to_string();
+        omnigraph_bench::runner::validate_durable_recording_process()
+            .map_err(RecordingError::from_runner)?;
+        let source_commit = env!("OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT").to_string();
         if !valid_source_commit(&source_commit) {
             return Err(RecordingError::new(
                 "recording_source_commit_unavailable",
                 "this benchmark build does not carry a complete lowercase source commit",
             ));
         }
-        match env!("OMNIGRAPH_BENCH_SOURCE_DIRTY") {
+        match env!("OMNIGRAPH_BENCH_SOURCE_WORKTREE_DIRTY") {
             "false" => {}
             "true" => {
                 return Err(RecordingError::new(
@@ -1085,12 +1199,20 @@ impl RecordingContext {
                 ));
             }
         }
+        omnigraph_bench::source_provenance::verify_compiled_source_checkout(&source_commit)
+            .map_err(|message| {
+                RecordingError::new("recording_source_revalidation_failed", message)
+            })?;
+        // Eligibility and source provenance are pure checks. Only after both
+        // succeed may archive preflight create or synchronize directories.
+        preflight_archive_publication(&archive_root).map_err(RecordingError::from_archive)?;
         let session_id = Ulid::new();
         let session_id_string = session_id.to_string();
         Ok(Self {
             archive_root,
             session_id,
             session_id_string,
+            source_commit,
         })
     }
 
@@ -1117,6 +1239,7 @@ impl RecordingContext {
         execution: &RunExecution,
         invocation: InvocationIdentityV1,
     ) -> Result<ArchiveReceiptV1, RecordingError> {
+        self.validate_worker_source(execution)?;
         let fixture = execution.fixture.stamp.clone();
         let backend = match &run.case.definition.environment.backend {
             Backend::LocalFs {
@@ -1148,6 +1271,82 @@ impl RecordingContext {
         .map_err(RecordingError::from_record)?;
         publish_record(&self.archive_root, &record).map_err(RecordingError::from_archive)
     }
+
+    fn publish_censored(
+        &self,
+        run: &ResolvedRun,
+        execution: &RunExecution,
+        invocation: InvocationIdentityV1,
+        terminal: AcquisitionTerminalV1,
+    ) -> Result<ArchiveReceiptV1, RecordingError> {
+        self.validate_worker_source(execution)?;
+        let fixture = execution.fixture.stamp.clone();
+        let backend = self.observed_backend(run, execution)?;
+        let record = build_censored_run_record(
+            run,
+            execution,
+            RecordInputV1 {
+                invocation,
+                sut: sut_identity_for_execution(execution).map_err(RecordingError::from_record)?,
+                backend,
+                fixture,
+            },
+            terminal,
+        )
+        .map_err(RecordingError::from_record)?;
+        publish_record(&self.archive_root, &record).map_err(RecordingError::from_archive)
+    }
+
+    fn observed_backend(
+        &self,
+        run: &ResolvedRun,
+        execution: &RunExecution,
+    ) -> Result<ObservedBackendV1, RecordingError> {
+        match &run.case.definition.environment.backend {
+            Backend::LocalFs {
+                filesystem,
+                storage_class,
+            } => Ok(ObservedBackendV1::LocalFs {
+                filesystem: *filesystem,
+                storage_class: *storage_class,
+                storage_protocol: execution.environment.storage_protocol.clone(),
+                probe: execution.environment.probe.to_string(),
+            }),
+            Backend::S3 { .. } => Err(RecordingError::new(
+                "recording_backend_unsupported",
+                "the local runner cannot produce observed S3 backend identity",
+            )),
+        }
+    }
+
+    fn validate_worker_source(&self, execution: &RunExecution) -> Result<(), RecordingError> {
+        // A long-running suite can outlive a checkout change. Revalidate at
+        // the publication boundary, then tie that checked checkout explicitly
+        // to the separately attested measured worker.
+        omnigraph_bench::source_provenance::verify_compiled_source_checkout(&self.source_commit)
+            .map_err(|message| {
+                RecordingError::new("recording_source_revalidation_failed", message)
+            })?;
+        validate_recording_worker_source(
+            &self.source_commit,
+            &execution.build.source_commit,
+            execution.build.source_tree_dirty,
+        )
+    }
+}
+
+fn validate_recording_worker_source(
+    revalidated_source_commit: &str,
+    worker_source_commit: &str,
+    worker_source_tree_dirty: bool,
+) -> Result<(), RecordingError> {
+    if worker_source_tree_dirty || worker_source_commit != revalidated_source_commit {
+        return Err(RecordingError::new(
+            "recording_worker_source_mismatch",
+            "measured worker source provenance does not match the clean checkout revalidated by the recording process",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -1156,6 +1355,10 @@ struct RecordingError {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     possibly_published: Option<Box<ArchivePublicationUnknownV1>>,
+    /// Structured acquisition failure retained when publishing its verified
+    /// censored prefix fails as a second, independent operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acquisition_failure: Option<Box<RunnerError>>,
 }
 
 impl RecordingError {
@@ -1164,6 +1367,7 @@ impl RecordingError {
             code: code.into(),
             message: message.into(),
             possibly_published: None,
+            acquisition_failure: None,
         }
     }
 
@@ -1171,12 +1375,34 @@ impl RecordingError {
         Self::new(error.code, error.to_string())
     }
 
+    fn from_runner(error: RunnerError) -> Self {
+        Self::new(error.code, error.message)
+    }
+
     fn from_archive(error: ArchiveError) -> Self {
         Self {
             code: error.code.to_string(),
             message: error.to_string(),
             possibly_published: error.possibly_published,
+            acquisition_failure: None,
         }
+    }
+
+    fn with_acquisition_failure(mut self, acquisition: &RunnerError) -> Self {
+        self.message = format!(
+            "benchmark acquisition failed with {}; its verified prefix could not be archived: {}",
+            acquisition.code, self.message
+        );
+        let mut diagnostic = acquisition.clone();
+        // `unpublished_run` is the sole recovery copy of the verified prefix.
+        // Keep the failed repetition and containment diagnostics here, but do
+        // not duplicate raw completed samples or suite runs in the nested
+        // acquisition error.
+        diagnostic.context.completed_runs.clear();
+        diagnostic.context.completed_samples.clear();
+        diagnostic.context.partial_run = None;
+        self.acquisition_failure = Some(Box::new(diagnostic));
+        self
     }
 }
 
@@ -1189,7 +1415,7 @@ struct RecordingFailure<'a> {
     suite_path: &'a Path,
     completed_run_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    completed_run: Option<&'a RunExecution>,
+    unpublished_run: Option<&'a RunExecution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     archive_session_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1202,7 +1428,7 @@ struct RecordingFailure<'a> {
 fn print_recording_failure(
     suite: &ResolvedSuite,
     completed_run_count: usize,
-    completed_run: Option<&RunExecution>,
+    unpublished_run: Option<&RunExecution>,
     published_records: &[ArchiveReceiptV1],
     recording: Option<&RecordingContext>,
     archive_root: Option<&Path>,
@@ -1215,7 +1441,7 @@ fn print_recording_failure(
         suite: &suite.definition.name,
         suite_path: &suite.suite_path,
         completed_run_count,
-        completed_run,
+        unpublished_run,
         archive_session_id: recording.map(|context| context.session_id_string.as_str()),
         archive_root: archive_root.map(|root| root.to_string_lossy().into_owned()),
         published_records,
@@ -1306,7 +1532,30 @@ fn print_diagnostics(diagnostics: &[Diagnostic]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+
+    fn assert_json_object_keys(value: &serde_json::Value, expected: &[&str]) {
+        let actual = value
+            .as_object()
+            .expect("JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn refused_recording_does_not_create_the_archive_root() {
+        let holder = tempfile::tempdir().unwrap();
+        let archive = holder.path().join("not-created");
+        let error = RecordingContext::new(archive.clone()).unwrap_err();
+        assert_eq!(error.code, "release_build_required");
+        assert!(!archive.exists());
+    }
 
     #[test]
     fn recording_error_preserves_unknown_publication_identity() {
@@ -1333,6 +1582,25 @@ mod tests {
     }
 
     #[test]
+    fn durable_recording_requires_worker_source_to_match_revalidated_checkout() {
+        let commit = "a".repeat(40);
+        validate_recording_worker_source(&commit, &commit, false).unwrap();
+
+        assert_eq!(
+            validate_recording_worker_source(&commit, &"b".repeat(40), false)
+                .unwrap_err()
+                .code,
+            "recording_worker_source_mismatch"
+        );
+        assert_eq!(
+            validate_recording_worker_source(&commit, &commit, true)
+                .unwrap_err()
+                .code,
+            "recording_worker_source_mismatch"
+        );
+    }
+
+    #[test]
     fn human_recovery_envelope_can_carry_reconciliation_identity() {
         let unknown = ArchivePublicationUnknownV1 {
             archive_format_version: 1,
@@ -1345,6 +1613,7 @@ mod tests {
             code: "archive_pointer_publication_unknown".to_string(),
             message: "directory durability could not be proved".to_string(),
             possibly_published: Some(Box::new(unknown)),
+            acquisition_failure: None,
         };
         let failure = RecordingFailure {
             ok: false,
@@ -1352,7 +1621,7 @@ mod tests {
             suite: "suite",
             suite_path: Path::new("suite.yaml"),
             completed_run_count: 1,
-            completed_run: None,
+            unpublished_run: None,
             archive_session_id: Some("01K00000000000000000000001"),
             archive_root: Some("archive".to_string()),
             published_records: &[],
@@ -1365,6 +1634,127 @@ mod tests {
             "01K00000000000000000000000"
         );
         assert_eq!(encoded["archive_root"], "archive");
+    }
+
+    #[test]
+    fn double_failure_preserves_recording_and_acquisition_errors_structurally() {
+        use omnigraph_bench::counting::LogicalCallCounts;
+        use omnigraph_bench::runner::{
+            ControlCallObservation, LogicalStoreCallObservation, MergeRouteObservation,
+            RepObservation, VerificationObservation,
+        };
+
+        let unknown = ArchivePublicationUnknownV1 {
+            archive_format_version: 1,
+            invocation_id: "01K00000000000000000000000".to_string(),
+            record_sha256: "a".repeat(64),
+            object_relative_path: format!("objects/sha256/{}.json", "a".repeat(64)),
+            pointer_relative_path: "invocations/01K00000000000000000000000.json".to_string(),
+        };
+        let mut acquisition = RunnerError {
+            code: "verification_failed".to_string(),
+            message: "rep 1 verification failed".to_string(),
+            context: Box::default(),
+        };
+        acquisition.context.repetition = Some(1);
+        acquisition.context.completed_samples.push(RepObservation {
+            repetition: 0,
+            input_physical_digest_sha256: "d".repeat(64),
+            elapsed_us: 1,
+            peak_rss_bytes: Some(1),
+            outcome: "merged".to_string(),
+            phases: Vec::new(),
+            route: MergeRouteObservation {
+                table_walk_intervals: 1,
+                stage_merge_insert_calls: 0,
+                stage_merge_insert_rows: 0,
+                stage_known_present_update_calls: 0,
+                stage_known_present_update_rows: 0,
+                stage_fenced_insert_calls: 0,
+                stage_fenced_insert_rows: 0,
+                strict_insert_preflight_calls: 0,
+            },
+            logical_store_calls: LogicalStoreCallObservation {
+                manifest: LogicalCallCounts::default(),
+                table: LogicalCallCounts::default(),
+                physical_attempts_observed: false,
+            },
+            control_store_calls: ControlCallObservation {
+                read_text: 0,
+                read_text_if_exists: 0,
+                read_text_versioned: 0,
+                exists: 0,
+                list_dir: 0,
+                mutation_calls: 0,
+                write_text: 0,
+                delete: 0,
+            },
+            verification: VerificationObservation {
+                branch: "main".to_string(),
+                tables: 2,
+                rows: 1,
+                exact_content: true,
+                source_exact_content: true,
+                main_exact_content: true,
+                protected_heads_unchanged: true,
+            },
+        });
+        acquisition.context.child_process = Some(omnigraph_bench::runner::ChildProcessEvidence {
+            stage: "verify".to_string(),
+            stderr_tail: "bounded worker detail".to_string(),
+            direct_child_reaped: true,
+            process_group_gone: true,
+            stdio_closed_cleanly: true,
+            ..Default::default()
+        });
+        let recording = RecordingError::from_archive(ArchiveError {
+            code: "archive_pointer_publication_unknown",
+            path: Some(PathBuf::from("archive/invocations/candidate.json")),
+            message: "could not prove censored-prefix publication".to_string(),
+            possibly_published: Some(Box::new(unknown)),
+        })
+        .with_acquisition_failure(&acquisition);
+        let failure = RecordingFailure {
+            ok: false,
+            runner_output_version: RUNNER_OUTPUT_VERSION,
+            suite: "suite",
+            suite_path: Path::new("suite.yaml"),
+            completed_run_count: 0,
+            unpublished_run: None,
+            archive_session_id: Some("01K00000000000000000000000"),
+            archive_root: Some("archive".to_string()),
+            published_records: &[],
+            error: &recording,
+        };
+
+        let encoded = serde_json::to_value(failure).expect("double-failure recovery JSON");
+        assert_eq!(
+            encoded["error"]["code"],
+            "archive_pointer_publication_unknown"
+        );
+        assert_eq!(
+            encoded["error"]["possibly_published"]["invocation_id"],
+            "01K00000000000000000000000"
+        );
+        assert_eq!(
+            encoded["error"]["acquisition_failure"]["code"],
+            "verification_failed"
+        );
+        assert_eq!(encoded["error"]["acquisition_failure"]["repetition"], 1);
+        assert_eq!(
+            encoded["error"]["acquisition_failure"]["child_process"]["stage"],
+            "verify"
+        );
+        assert_eq!(
+            encoded["error"]["acquisition_failure"]["child_process"]["stderr_tail"],
+            "bounded worker detail"
+        );
+        assert!(
+            encoded["error"]["acquisition_failure"]
+                .get("completed_samples")
+                .is_none(),
+            "the unpublished prefix must not be duplicated in the nested diagnostic"
+        );
     }
 
     #[test]
@@ -1392,6 +1782,26 @@ mod tests {
         };
 
         let encoded = serde_json::to_value(output).expect("suite output JSON");
+        assert_eq!(encoded["runner_output_version"], RUNNER_OUTPUT_VERSION);
+        assert_json_object_keys(
+            &encoded,
+            &[
+                "completed_run_count",
+                "durable_archive",
+                "runner_output_version",
+                "suite",
+                "suite_path",
+            ],
+        );
+        assert_json_object_keys(
+            &encoded["durable_archive"],
+            &[
+                "archive_format_version",
+                "archive_root",
+                "records",
+                "session_id",
+            ],
+        );
         assert_eq!(encoded["completed_run_count"], 1);
         assert!(encoded.get("runs").is_none());
         assert_eq!(
@@ -1401,5 +1811,146 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn runner_failure_shape_is_bound_to_output_version() {
+        let error = RunnerError {
+            code: "worker_failed".to_string(),
+            message: "worker failed".to_string(),
+            context: Box::default(),
+        };
+        let records = [ArchiveReceiptV1 {
+            archive_format_version: 1,
+            invocation_id: "01K00000000000000000000001".to_string(),
+            record_sha256: "b".repeat(64),
+            object_relative_path: format!("objects/sha256/{}.json", "b".repeat(64)),
+            pointer_relative_path: "invocations/01K00000000000000000000001.json".to_string(),
+            newly_published: true,
+        }];
+        let failure = RunnerFailure {
+            ok: false,
+            runner_output_version: RUNNER_OUTPUT_VERSION,
+            suite: "suite",
+            suite_path: Path::new("suite.yaml"),
+            completed_run_count: 1,
+            completed_runs: Some(&[]),
+            archive_session_id: Some("01K00000000000000000000000"),
+            archive_root: Some("archive".to_string()),
+            published_records: &records,
+            error: &error,
+        };
+
+        let encoded = serde_json::to_value(failure).expect("runner failure JSON");
+        assert_eq!(encoded["runner_output_version"], RUNNER_OUTPUT_VERSION);
+        assert_json_object_keys(
+            &encoded,
+            &[
+                "archive_root",
+                "archive_session_id",
+                "completed_run_count",
+                "completed_runs",
+                "error",
+                "ok",
+                "published_records",
+                "runner_output_version",
+                "suite",
+                "suite_path",
+            ],
+        );
+        assert_json_object_keys(&encoded["error"], &["code", "message"]);
+    }
+
+    #[test]
+    fn censored_prefix_uses_only_completed_repetitions_and_omits_rep_zero() {
+        let settled_but_unverified = "settled-rep-1".to_string();
+        let completed = vec!["verified-rep-0".to_string()];
+        let (prefix, terminal) = classify_censored_prefix(
+            Some(completed.clone()),
+            Vec::len,
+            Some("Verify"),
+            "verification_failed",
+        )
+        .unwrap()
+        .expect("one verified repetition is a censored prefix");
+
+        assert_eq!(prefix, completed);
+        assert!(!prefix.contains(&settled_but_unverified));
+        assert_eq!(terminal.failed_repetition, 1);
+        assert_eq!(terminal.stage, AcquisitionTerminalStageV1::Verify);
+        assert_eq!(terminal.code, "verification_failed");
+        assert!(
+            classify_censored_prefix(
+                Some(Vec::<String>::new()),
+                Vec::len,
+                Some("Measure"),
+                "merge_failed",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            classify_censored_prefix::<Vec<String>>(None, Vec::len, None, "worker_failed",)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn censored_terminal_conversion_accepts_only_emitted_runner_stages() {
+        use AcquisitionTerminalStageV1 as Stage;
+
+        let emitted = [
+            (None, Stage::Runner),
+            (Some("supervisor-panic"), Stage::SupervisorPanic),
+            (Some("Bootstrap"), Stage::Bootstrap),
+            (Some("Prepare"), Stage::Prepare),
+            (Some("Measure"), Stage::Measure),
+            (Some("Verify"), Stage::Verify),
+            (Some("Finalize"), Stage::Finalize),
+            (Some("Protocol"), Stage::Protocol),
+            (Some("pipe-setup"), Stage::PipeSetup),
+            (Some("writer-setup"), Stage::WriterSetup),
+            (Some("reader-setup"), Stage::ReaderSetup),
+            (Some("request-write"), Stage::RequestWrite),
+            (Some("prepare-timeout"), Stage::PrepareTimeout),
+            (Some("prepare-protocol"), Stage::PrepareProtocol),
+            (Some("begin-write"), Stage::BeginWrite),
+            (Some("measure-timeout"), Stage::MeasureTimeout),
+            (Some("measure-protocol"), Stage::MeasureProtocol),
+            (Some("verify-timeout"), Stage::VerifyTimeout),
+            (Some("verify-protocol"), Stage::VerifyProtocol),
+            (Some("finalize-protocol"), Stage::FinalizeProtocol),
+            (Some("exit-timeout"), Stage::ExitTimeout),
+            (Some("group-proof"), Stage::GroupProof),
+            (Some("finalize-exit"), Stage::FinalizeExit),
+            (
+                Some("structured-failure-reap"),
+                Stage::StructuredFailureReap,
+            ),
+        ];
+        for (runner_stage, expected) in emitted {
+            assert_eq!(acquisition_terminal_stage(runner_stage).unwrap(), expected);
+        }
+
+        for invalid in [Some(""), Some("verification"), Some("arbitrary prose")] {
+            assert_eq!(
+                acquisition_terminal_stage(invalid).unwrap_err().code,
+                "invalid_acquisition_terminal_stage",
+            );
+        }
+    }
+
+    #[test]
+    fn censored_terminal_conversion_rejects_noncanonical_error_codes() {
+        let error = classify_censored_prefix(
+            Some(vec!["verified-rep-0".to_string()]),
+            Vec::len,
+            Some("Verify"),
+            "Verification failed",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "invalid_acquisition_error_code");
     }
 }

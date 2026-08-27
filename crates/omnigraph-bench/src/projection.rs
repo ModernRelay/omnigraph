@@ -8,7 +8,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -53,7 +55,7 @@ const GRAPH_DIRECTORY: &str = "graph";
 const MANIFEST_FILE: &str = "manifest-v1.json";
 const MAX_POINTER_BYTES: u64 = 16 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
-const PROJECTION_TRANSFORM_VERSION: u32 = 3;
+const PROJECTION_TRANSFORM_VERSION: u32 = 4;
 const MAX_PROJECTED_RECORDS: usize = 100_000;
 const MAX_BATCH_ROWS: usize = 2_048;
 const MAX_BATCH_BYTES: usize = 24 * 1024 * 1024;
@@ -91,6 +93,7 @@ static CURRENT_STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 const PROJECTION_TRANSFORM_CONTRACT: &str = concat!(
     "point=canonical-json(PointRow),ordered-by=point_id;",
     "run=canonical-json(RunRow),ordered-by=invocation_id;",
+    "acquisition=status,claim-eligible=complete-and-effective-codegen-proved,nullable-terminal;",
     "edges=inventory(invocation_id,record_sha256,point_id);",
     "logical-calls=min,p50-nearest-rank,max-per-plane;",
     "canonical-json=serde-struct-declaration-order-v1;",
@@ -153,6 +156,11 @@ node BenchmarkRun {
     fixture_manifest_sha256: String
     fixture_logical_sha256: String
     fixture_physical_sha256: String
+    acquisition_status: String
+    claim_eligible: Bool
+    terminal_failed_repetition: U32?
+    terminal_stage: String?
+    terminal_code: String?
     requested_repetitions: U32
     observed_repetitions: U32
     min_us: U64
@@ -245,6 +253,11 @@ query list_runs_for_point_page($point_id: String, $after_key: String) {
         $run.fixture_manifest_sha256 as fixture_manifest_sha256
         $run.fixture_logical_sha256 as fixture_logical_sha256
         $run.fixture_physical_sha256 as fixture_physical_sha256
+        $run.acquisition_status as acquisition_status
+        $run.claim_eligible as claim_eligible
+        $run.terminal_failed_repetition as terminal_failed_repetition
+        $run.terminal_stage as terminal_stage
+        $run.terminal_code as terminal_code
         $run.requested_repetitions as requested_repetitions
         $run.observed_repetitions as observed_repetitions
         $run.min_us as min_us
@@ -349,6 +362,11 @@ query projection_run_rows_page($after_key: String) {
         $run.fixture_manifest_sha256 as fixture_manifest_sha256
         $run.fixture_logical_sha256 as fixture_logical_sha256
         $run.fixture_physical_sha256 as fixture_physical_sha256
+        $run.acquisition_status as acquisition_status
+        $run.claim_eligible as claim_eligible
+        $run.terminal_failed_repetition as terminal_failed_repetition
+        $run.terminal_stage as terminal_stage
+        $run.terminal_code as terminal_code
         $run.requested_repetitions as requested_repetitions
         $run.observed_repetitions as observed_repetitions
         $run.min_us as min_us
@@ -602,6 +620,11 @@ struct RunRow {
     fixture_manifest_sha256: String,
     fixture_logical_sha256: String,
     fixture_physical_sha256: String,
+    acquisition_status: String,
+    claim_eligible: bool,
+    terminal_failed_repetition: Option<u32>,
+    terminal_stage: Option<String>,
+    terminal_code: Option<String>,
     requested_repetitions: u32,
     observed_repetitions: u32,
     min_us: u64,
@@ -1055,7 +1078,7 @@ pub async fn rebuild_projection(
         &projection_root,
     )?;
 
-    if final_generation.exists() {
+    if retained_generations.contains(&inventory.generation_id) {
         let manifest = verify_generation(
             &final_generation,
             Some(&inventory.entries),
@@ -1119,18 +1142,10 @@ pub async fn rebuild_projection(
     sync_directory(staging.path())?;
 
     rebuild_lock.validate()?;
-    let reused = match fs::rename(staging.path(), &final_generation) {
+    let (installed, reused) = match fs::rename(staging.path(), &final_generation) {
         Ok(()) => {
             sync_directory(&generations_root)?;
-            false
-        }
-        Err(_) if final_generation.exists() => {
-            // A concurrent rebuild may have installed the same deterministic
-            // logical generation with a different internal graph commit id.
-            // Its independently verified complete row digest, edge inventory,
-            // and counts prove equivalence without relying on byte equality
-            // with our disposable build.
-            verify_generation(
+            let installed = verify_generation(
                 &final_generation,
                 Some(&inventory.entries),
                 Some(record_count),
@@ -1138,25 +1153,38 @@ pub async fn rebuild_projection(
                 Some(&inventory.projected_rows_sha256),
             )
             .await?;
-            true
+            (installed, false)
         }
         Err(error) => {
-            return Err(ProjectionError::io(
-                "projection_generation_publish_failed",
+            if symlink_metadata_if_present(
                 &final_generation,
-                error,
-            ));
+                "projection_generation_inspection_failed",
+            )?
+            .is_none()
+            {
+                return Err(ProjectionError::io(
+                    "projection_generation_publish_failed",
+                    &final_generation,
+                    error,
+                ));
+            }
+
+            // A concurrent rebuild or a prior crash may have installed the
+            // same deterministic logical generation even though this rename
+            // did not report success. Verify that installed generation once
+            // and retain the exact manifest that passed verification for
+            // CURRENT publication below.
+            let installed = verify_generation(
+                &final_generation,
+                Some(&inventory.entries),
+                Some(record_count),
+                Some(point_count),
+                Some(&inventory.projected_rows_sha256),
+            )
+            .await?;
+            (installed, true)
         }
     };
-
-    let installed = verify_generation(
-        &final_generation,
-        Some(&inventory.entries),
-        Some(record_count),
-        Some(point_count),
-        Some(&inventory.projected_rows_sha256),
-    )
-    .await?;
     if reused {
         sync_directory(&generations_root)?;
     }
@@ -1669,6 +1697,23 @@ fn run_row(
             .logical_content_sha256
             .clone(),
         fixture_physical_sha256: record.fixture.manifest.physical.tree_sha256.clone(),
+        acquisition_status: json_string(&record.acquisition.status, "acquisition status")?,
+        claim_eligible: record.claim_eligible(),
+        terminal_failed_repetition: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.failed_repetition),
+        terminal_stage: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.stage.as_str().to_string()),
+        terminal_code: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.code.clone()),
         requested_repetitions: record.acquisition.requested_repetitions,
         observed_repetitions: record.acquisition.observed_repetitions,
         min_us: wall.min_us,
@@ -2595,6 +2640,8 @@ fn publish_current_with_observers(
     after_manifest_read: impl FnOnce() -> Result<(), ProjectionError>,
     before_publish: impl FnOnce() -> Result<(), ProjectionError>,
 ) -> Result<(), ProjectionError> {
+    #[cfg(not(unix))]
+    let _ = rebuild_lock;
     #[cfg(unix)]
     rebuild_lock.validate()?;
     after_initial_validation()?;
@@ -3662,7 +3709,7 @@ fn resolve_prospective_path(path: &Path) -> Result<PathBuf, ProjectionError> {
     let mut cursor = absolute.as_path();
     let mut suffix = Vec::<OsString>::new();
     loop {
-        if cursor.exists() {
+        if symlink_metadata_if_present(cursor, "projection_root_resolution_failed")?.is_some() {
             let mut resolved = fs::canonicalize(cursor).map_err(|error| {
                 ProjectionError::io("projection_root_resolution_failed", cursor, error)
             })?;
@@ -3686,6 +3733,21 @@ fn resolve_prospective_path(path: &Path) -> Result<PathBuf, ProjectionError> {
                 "could not find an existing ancestor",
             )
         })?;
+    }
+}
+
+/// Read path-entry metadata without following the final symlink while keeping
+/// every failure except a genuine missing entry observable. `Path::exists`
+/// cannot be used at publication or path-resolution boundaries because it
+/// collapses permission, I/O, and symlink-loop errors into `false`.
+fn symlink_metadata_if_present(
+    path: &Path,
+    code: &'static str,
+) -> Result<Option<fs::Metadata>, ProjectionError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ProjectionError::io(code, path, error)),
     }
 }
 
@@ -3763,6 +3825,52 @@ mod tests {
         assert_eq!(decoded["path"], path.to_string_lossy().as_ref());
     }
 
+    #[test]
+    fn path_presence_only_classifies_not_found_as_absent() {
+        let holder = tempfile::tempdir().unwrap();
+        let missing = holder.path().join("missing");
+        assert!(
+            symlink_metadata_if_present(&missing, "projection_test_inspection_failed")
+                .unwrap()
+                .is_none()
+        );
+
+        let nondirectory = holder.path().join("not-a-directory");
+        fs::write(&nondirectory, b"file").unwrap();
+        let blocked_child = nondirectory.join("child");
+        let error =
+            symlink_metadata_if_present(&blocked_child, "projection_test_inspection_failed")
+                .unwrap_err();
+        assert_eq!(error.code, "projection_test_inspection_failed");
+        assert_eq!(error.path.as_deref(), Some(blocked_child.as_path()));
+
+        let error = resolve_prospective_path(&blocked_child).unwrap_err();
+        assert_eq!(error.code, "projection_root_resolution_failed");
+        assert_eq!(error.path.as_deref(), Some(blocked_child.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_presence_propagates_symlink_loop_failures() {
+        use std::os::unix::fs::symlink;
+
+        let holder = tempfile::tempdir().unwrap();
+        let left = holder.path().join("left");
+        let right = holder.path().join("right");
+        symlink("right", &left).unwrap();
+        symlink("left", &right).unwrap();
+        let through_loop = left.join("child");
+
+        let error = symlink_metadata_if_present(&through_loop, "projection_test_inspection_failed")
+            .unwrap_err();
+        assert_eq!(error.code, "projection_test_inspection_failed");
+        assert_eq!(error.path.as_deref(), Some(through_loop.as_path()));
+
+        let error = resolve_prospective_path(&through_loop).unwrap_err();
+        assert_eq!(error.code, "projection_root_resolution_failed");
+        assert_eq!(error.path.as_deref(), Some(through_loop.as_path()));
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_reads_reject_special_files_and_symlinked_ancestors_without_blocking() {
@@ -3837,6 +3945,12 @@ mod tests {
         };
         let point = point_row(&record).unwrap();
         let run = run_row(&record, &receipt).unwrap();
+        assert_eq!(run.acquisition_status, "complete");
+        assert!(
+            !run.claim_eligible,
+            "complete acquisition is not enough without effective-codegen proof"
+        );
+        assert_eq!(run.terminal_failed_repetition, None);
 
         let digest_for = |point: &PointRow, run: &RunRow| {
             let mut point_digest = projected_table_digest("BenchmarkPoint");
@@ -3876,6 +3990,42 @@ mod tests {
             ),
             "transform contract changes must create a different generation"
         );
+    }
+
+    #[test]
+    fn censored_acquisition_projects_terminal_state_and_denies_claims() {
+        let mut record = crate::record::tests::valid_record_fixture();
+        record.acquisition.status = crate::record::AcquisitionStatusV1::Censored;
+        record.acquisition.observed_repetitions = 1;
+        record.acquisition.terminal = Some(
+            crate::record::AcquisitionTerminalV1::new(
+                1,
+                crate::record::AcquisitionTerminalStageV1::Measure,
+                "worker_timeout",
+            )
+            .unwrap(),
+        );
+        record.measurements.raw_samples.truncate(1);
+        let elapsed = record.measurements.raw_samples[0].elapsed_us;
+        record.measurements.wall_clock.min_us = elapsed;
+        record.measurements.wall_clock.p50_us = elapsed;
+        record.measurements.wall_clock.max_us = elapsed;
+        crate::record::validate_run_record(&record).unwrap();
+
+        let receipt = crate::archive::ArchiveReceiptV1 {
+            archive_format_version: ARCHIVE_FORMAT_VERSION,
+            invocation_id: record.invocation.invocation_id.clone(),
+            record_sha256: "a".repeat(64),
+            object_relative_path: "objects/sha256/aa/record.json".to_string(),
+            pointer_relative_path: "invocations/01/pointer.json".to_string(),
+            newly_published: true,
+        };
+        let row = run_row(&record, &receipt).unwrap();
+        assert_eq!(row.acquisition_status, "censored");
+        assert!(!row.claim_eligible);
+        assert_eq!(row.terminal_failed_repetition, Some(1));
+        assert_eq!(row.terminal_stage.as_deref(), Some("measure"));
+        assert_eq!(row.terminal_code.as_deref(), Some("worker_timeout"));
     }
 
     #[test]
@@ -4197,6 +4347,14 @@ mod tests {
         assert_eq!(first.point_count, 0);
         assert_eq!(list_points(&projection).await.unwrap().num_rows(), 0);
 
+        let generations = projection.join(GENERATIONS_DIRECTORY);
+        let reconciled = reconcile_generation_directory_blocking(&generations).unwrap();
+        assert_eq!(
+            reconciled,
+            BTreeSet::from([first.generation_id.clone()]),
+            "the first reuse decision must come from the reconciled generation inventory"
+        );
+
         let second = rebuild_projection(&archive, &projection).await.unwrap();
         assert!(second.reused);
         assert_eq!(second.generation_id, first.generation_id);
@@ -4413,6 +4571,11 @@ mod tests {
             fixture_manifest_sha256: "3".repeat(64),
             fixture_logical_sha256: "4".repeat(64),
             fixture_physical_sha256: "5".repeat(64),
+            acquisition_status: "complete".to_string(),
+            claim_eligible: false,
+            terminal_failed_repetition: None,
+            terminal_stage: None,
+            terminal_code: None,
             requested_repetitions: 1,
             observed_repetitions: 1,
             min_us: 10,

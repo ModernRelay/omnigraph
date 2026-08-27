@@ -11,7 +11,11 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(any(unix, test))]
+use std::io::Read;
+use std::io::Write;
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -25,6 +29,7 @@ use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, mkdirat};
 #[cfg(unix)]
 use nix::unistd::{UnlinkatFlags, linkat, unlinkat};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::fd::{IntoRawFd, OwnedFd};
 #[cfg(unix)]
@@ -32,9 +37,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Instant;
 
-use crate::record::{
-    RunRecordV1, canonical_record_bytes, parse_canonical_record, record_content_sha256,
-};
+use crate::record::{RunRecordV1, canonical_record_bytes, parse_canonical_record};
 
 /// Version of the archive pointer and receipt contract.
 pub const ARCHIVE_FORMAT_VERSION: u32 = 1;
@@ -70,14 +73,54 @@ type PublicationRootSwapHooks = (
     Option<PublicationRootSwapHook>,
     Option<PublicationRootSwapHook>,
 );
+#[cfg(test)]
+type PointerPostSyncHook = Box<dyn FnOnce()>;
+#[cfg(test)]
+type PointerAncestorChainPostSyncHook = Box<dyn FnOnce()>;
+#[cfg(test)]
+type ImmutableParentPostEnsureHook = Box<dyn FnOnce()>;
 
 #[cfg(test)]
 std::thread_local! {
-    static INJECT_POINTER_DIRECTORY_SYNC_FAILURES: std::cell::Cell<usize> = const {
-        std::cell::Cell::new(0)
-    };
+    static INJECT_POINTER_DIRECTORY_SYNC_FAILURES:
+        std::cell::RefCell<std::collections::VecDeque<i32>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static INJECT_PUBLICATION_ROOT_SWAP_HOOKS: std::cell::RefCell<Option<PublicationRootSwapHooks>> =
         const { std::cell::RefCell::new(None) };
+    static INJECT_POINTER_POST_SYNC_HOOK: std::cell::RefCell<Option<PointerPostSyncHook>> =
+        const { std::cell::RefCell::new(None) };
+    static INJECT_POINTER_ANCESTOR_CHAIN_POST_SYNC_HOOK:
+        std::cell::RefCell<Option<PointerAncestorChainPostSyncHook>> =
+        const { std::cell::RefCell::new(None) };
+    static INJECT_IMMUTABLE_PARENT_POST_ENSURE_HOOK:
+        std::cell::RefCell<Option<ImmutableParentPostEnsureHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn injected_pointer_directory_sync_failure(path: &Path) -> Option<std::io::Error> {
+    #[cfg(test)]
+    {
+        if is_invocation_pointer_path(path) {
+            return INJECT_POINTER_DIRECTORY_SYNC_FAILURES.with(|failures| {
+                failures
+                    .borrow_mut()
+                    .pop_front()
+                    .map(std::io::Error::from_raw_os_error)
+            });
+        }
+    }
+    #[cfg(not(test))]
+    let _ = path;
+    None
+}
+
+fn is_invocation_pointer_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == std::ffi::OsStr::new(INVOCATION_DIRECTORY))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(POINTER_SUFFIX))
 }
 
 /// Stable reference returned only after an invocation pointer is durable.
@@ -164,6 +207,13 @@ struct AnchoredArchiveRoot {
     identity: ArchiveRootIdentity,
     #[cfg(unix)]
     directory: Arc<File>,
+}
+
+#[cfg(unix)]
+struct CapturedArchiveDirectory {
+    descriptor: File,
+    display_path: PathBuf,
+    name_from_parent: Option<String>,
 }
 
 impl ArchiveLock {
@@ -699,17 +749,30 @@ impl AnchoredArchiveRoot {
         }
         let parent_relative = components.join("/");
         self.ensure_relative_directory(&parent_relative)?;
+        run_immutable_parent_post_ensure_hook();
         let parent = self
             .open_relative_directory_optional(&parent_relative)?
-            .expect("ensured descriptor-relative archive parent must exist");
+            .ok_or_else(|| {
+                ArchiveError::new(
+                    "archive_directory_replaced",
+                    Some(&self.display_path(&parent_relative)),
+                    "immutable-entry parent disappeared after descriptor-relative creation",
+                )
+            })?;
         let display = self.display_path(relative);
 
         match fstatat(&parent, name.as_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(_) => {
-                self.require_identical_relative_file(relative, bytes, limit)?;
-                self.sync_relative_regular_file(relative)?;
-                self.sync_visible_relative_entry_directory(relative)?;
-                return Ok(false);
+                return self
+                    .require_identical_relative_file(relative, bytes, limit)
+                    .and_then(|()| self.sync_relative_regular_file(relative))
+                    .and_then(|()| {
+                        self.sync_visible_relative_entry_directory_on(
+                            relative, &parent, bytes, limit,
+                        )
+                    })
+                    .map(|()| false)
+                    .map_err(|error| link_visible_failure(&display, error));
             }
             Err(Errno::ENOENT) => {}
             Err(error) => {
@@ -735,14 +798,19 @@ impl AnchoredArchiveRoot {
             Ok(()) => self
                 .require_identical_relative_file(relative, bytes, limit)
                 .and_then(|()| self.sync_relative_regular_file(relative))
-                .and_then(|()| self.sync_visible_relative_entry_directory(relative))
+                .and_then(|()| {
+                    self.sync_visible_relative_entry_directory_on(relative, &parent, bytes, limit)
+                })
                 .map(|()| true)
                 .map_err(|error| link_visible_failure(&display, error)),
             Err(Errno::EEXIST) => self
                 .require_identical_relative_file(relative, bytes, limit)
                 .and_then(|()| self.sync_relative_regular_file(relative))
-                .and_then(|()| self.sync_visible_relative_entry_directory(relative))
-                .map(|()| false),
+                .and_then(|()| {
+                    self.sync_visible_relative_entry_directory_on(relative, &parent, bytes, limit)
+                })
+                .map(|()| false)
+                .map_err(|error| link_visible_failure(&display, error)),
             Err(error) => Err(anchored_errno(
                 "archive_publish_failed",
                 &display,
@@ -794,75 +862,435 @@ impl AnchoredArchiveRoot {
         validate_anchored_regular_file(&parent, &name, &display, &file)
     }
 
-    #[cfg(not(unix))]
-    fn sync_relative_regular_file(&self, _relative: &str) -> Result<(), ArchiveError> {
-        Err(ArchiveError::new(
-            "archive_lock_unsupported",
-            Some(&self.display_path),
-            "descriptor-rooted archive synchronization requires Unix openat semantics",
-        ))
+    #[cfg(unix)]
+    fn sync_relative_file_and_ancestor_chain(
+        &self,
+        relative: &str,
+        expected: &[u8],
+        limit: u64,
+    ) -> Result<(), ArchiveError> {
+        let mut components = self.relative_components(relative)?;
+        let name = components
+            .pop()
+            .expect("relative component validation requires one component")
+            .to_string();
+        if components.is_empty() {
+            return Err(ArchiveError::new(
+                "archive_path_invalid",
+                Some(&self.display_path(relative)),
+                "durable archive entries require a parent below the archive root",
+            ));
+        }
+
+        let mut directories = Vec::with_capacity(components.len().saturating_add(1));
+        directories.push(CapturedArchiveDirectory {
+            descriptor: self.root_descriptor()?,
+            display_path: self.display_path.clone(),
+            name_from_parent: None,
+        });
+        let mut display = self.display_path.clone();
+        for component in components {
+            display.push(component);
+            let descriptor = openat_directory(
+                &directories
+                    .last()
+                    .expect("captured directory chain starts at the archive root")
+                    .descriptor,
+                component,
+                &display,
+            )?;
+            directories.push(CapturedArchiveDirectory {
+                descriptor,
+                display_path: display.clone(),
+                name_from_parent: Some(component.to_string()),
+            });
+        }
+
+        let entry_display = self.display_path(relative);
+        let leaf = directories
+            .last()
+            .expect("captured directory chain includes the archive root");
+        let mut file = self.open_expected_relative_entry_on(
+            &leaf.descriptor,
+            &name,
+            &entry_display,
+            expected,
+            limit,
+        )?;
+        file.sync_all()
+            .map_err(|error| ArchiveError::io("archive_file_sync_failed", &entry_display, error))?;
+        self.require_expected_open_entry(
+            &mut file,
+            &leaf.descriptor,
+            &name,
+            &entry_display,
+            expected,
+            limit,
+        )?;
+
+        // Sync from the file's containing directory back through the captured
+        // archive root. Every step is re-opened through its held parent and
+        // compared by device/inode after fsync, so syncing a detached or
+        // replaced shard can never be mistaken for durable authority.
+        for index in (0..directories.len()).rev() {
+            let directory = &directories[index];
+            let injected_pointer_path = (index + 1 == directories.len()
+                && is_invocation_pointer_path(&entry_display))
+            .then_some(entry_display.as_path());
+            self.sync_captured_directory(
+                &directory.descriptor,
+                &directory.display_path,
+                injected_pointer_path,
+            )?;
+            self.validate_captured_directory_chain(&directories)?;
+            self.require_expected_open_entry(
+                &mut file,
+                &leaf.descriptor,
+                &name,
+                &entry_display,
+                expected,
+                limit,
+            )?;
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
-    fn sync_relative_parent_directory(&self, relative: &str) -> Result<(), ArchiveError> {
-        let (parent, _name, display) = self.open_relative_parent(relative)?;
-        parent.sync_all().map_err(|error| {
-            ArchiveError::io(
-                "archive_directory_sync_failed",
-                display.parent().unwrap_or(&self.display_path),
-                error,
-            )
-        })
-    }
-
-    #[cfg(not(unix))]
-    fn sync_relative_parent_directory(&self, _relative: &str) -> Result<(), ArchiveError> {
-        Err(ArchiveError::new(
-            "archive_lock_unsupported",
-            Some(&self.display_path),
-            "descriptor-rooted archive synchronization requires Unix openat semantics",
-        ))
-    }
-
-    #[cfg(unix)]
-    fn sync_visible_relative_entry_directory(&self, relative: &str) -> Result<(), ArchiveError> {
-        let display = self.display_path(relative);
-        let mut last_message = String::new();
-        for _attempt in 1..=POST_LINK_DIRECTORY_SYNC_ATTEMPTS {
-            #[cfg(test)]
-            if display
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(POINTER_SUFFIX))
-                && INJECT_POINTER_DIRECTORY_SYNC_FAILURES.with(|remaining| {
-                    let count = remaining.get();
-                    if count == 0 {
-                        false
-                    } else {
-                        remaining.set(count - 1);
-                        true
+    fn sync_captured_directory(
+        &self,
+        directory: &File,
+        display: &Path,
+        injected_pointer_path: Option<&Path>,
+    ) -> Result<(), ArchiveError> {
+        for attempt in 1..=POST_LINK_DIRECTORY_SYNC_ATTEMPTS {
+            let result = injected_pointer_path
+                .and_then(injected_pointer_directory_sync_failure)
+                .map_or_else(|| directory.sync_all(), Err);
+            match result {
+                Ok(()) => {
+                    if injected_pointer_path.is_some() {
+                        run_pointer_ancestor_chain_post_sync_hook();
                     }
-                })
-            {
-                last_message = "injected invocation-pointer directory fsync failure".to_string();
-                continue;
-            }
-            match self.sync_relative_parent_directory(relative) {
-                Ok(()) => return Ok(()),
-                Err(error) => last_message = error.message,
+                    return Ok(());
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::Interrupted
+                        && attempt < POST_LINK_DIRECTORY_SYNC_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(ArchiveError::new(
+                        "archive_directory_sync_failed",
+                        Some(display),
+                        format!(
+                            "could not durably sync captured archive directory on attempt {attempt}: {error}"
+                        ),
+                    ));
+                }
             }
         }
-        Err(ArchiveError::new(
-            LINK_VISIBLE_SYNC_FAILURE_CODE,
-            Some(&display),
-            format!(
-                "linked entry remained visible, but syncing its parent directory failed after {POST_LINK_DIRECTORY_SYNC_ATTEMPTS} attempts; crash durability is unknown: {last_message}"
-            ),
-        ))
+        unreachable!("the bounded directory-sync loop always returns")
+    }
+
+    #[cfg(unix)]
+    fn validate_captured_directory_chain(
+        &self,
+        directories: &[CapturedArchiveDirectory],
+    ) -> Result<(), ArchiveError> {
+        let root = directories.first().ok_or_else(|| {
+            ArchiveError::new(
+                "archive_directory_replaced",
+                Some(&self.display_path),
+                "captured archive directory chain is empty",
+            )
+        })?;
+        let root_metadata = fstat(&root.descriptor).map_err(|error| {
+            anchored_errno(
+                "archive_directory_inspection_failed",
+                &root.display_path,
+                error,
+                "could not inspect the captured archive root",
+            )
+        })?;
+        if SFlag::from_bits_truncate(root_metadata.st_mode) != SFlag::S_IFDIR
+            || root_metadata.st_dev as u64 != self.identity.device
+            || root_metadata.st_ino as u64 != self.identity.inode
+        {
+            return Err(ArchiveError::new(
+                "archive_root_replaced",
+                Some(&self.display_path),
+                "captured durability chain no longer starts at the coordinated archive root inode",
+            ));
+        }
+        validate_archive_root_identity(&self.display_path, self.identity)?;
+
+        for pair in directories.windows(2) {
+            let parent = &pair[0];
+            let child = &pair[1];
+            let name = child.name_from_parent.as_deref().ok_or_else(|| {
+                ArchiveError::new(
+                    "archive_directory_replaced",
+                    Some(&child.display_path),
+                    "captured non-root archive directory has no parent-relative name",
+                )
+            })?;
+            let reachable = openat_directory_optional(
+                &parent.descriptor,
+                name,
+                &child.display_path,
+            )?
+            .ok_or_else(|| {
+                ArchiveError::new(
+                    "archive_directory_replaced",
+                    Some(&child.display_path),
+                    "captured archive directory is no longer reachable through its held parent",
+                )
+            })?;
+            let captured_metadata = fstat(&child.descriptor).map_err(|error| {
+                anchored_errno(
+                    "archive_directory_inspection_failed",
+                    &child.display_path,
+                    error,
+                    "could not inspect captured archive directory",
+                )
+            })?;
+            let reachable_metadata = fstat(&reachable).map_err(|error| {
+                anchored_errno(
+                    "archive_directory_inspection_failed",
+                    &child.display_path,
+                    error,
+                    "could not inspect reachable archive directory",
+                )
+            })?;
+            if SFlag::from_bits_truncate(captured_metadata.st_mode) != SFlag::S_IFDIR
+                || SFlag::from_bits_truncate(reachable_metadata.st_mode) != SFlag::S_IFDIR
+                || captured_metadata.st_dev != reachable_metadata.st_dev
+                || captured_metadata.st_ino != reachable_metadata.st_ino
+            {
+                return Err(ArchiveError::new(
+                    "archive_directory_replaced",
+                    Some(&child.display_path),
+                    "captured archive directory was replaced at its canonical descriptor-relative path",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn sync_visible_relative_entry_directory_on(
+        &self,
+        relative: &str,
+        parent: &File,
+        expected: &[u8],
+        limit: u64,
+    ) -> Result<(), ArchiveError> {
+        let mut components = self.relative_components(relative)?;
+        let name = components
+            .pop()
+            .expect("relative component validation requires one component");
+        let parent_relative = components.join("/");
+        let display = self.display_path(relative);
+        let parent_display = display.parent().unwrap_or(&self.display_path);
+        let mut linked_file = self
+            .open_expected_relative_entry_on(parent, name, &display, expected, limit)
+            .map_err(|error| link_visible_validation_failure(&display, error))?;
+        // `parent` is the descriptor used by `linkat`. Keep that exact inode
+        // across the durability loop: reopening by path could sync a replaced
+        // directory. Only EINTR is retryable; any other result leaves a
+        // visible link whose crash durability is unknown.
+        for attempt in 1..=POST_LINK_DIRECTORY_SYNC_ATTEMPTS {
+            let result = injected_pointer_directory_sync_failure(&display)
+                .map_or_else(|| parent.sync_all(), Err);
+            match result {
+                Ok(()) => {
+                    run_pointer_post_sync_hook(&display);
+                    self.validate_relative_parent_descriptor(
+                        &parent_relative,
+                        parent,
+                        parent_display,
+                    )
+                    .and_then(|()| {
+                        self.require_expected_open_entry(
+                            &mut linked_file,
+                            parent,
+                            name,
+                            &display,
+                            expected,
+                            limit,
+                        )
+                    })
+                    .and_then(|()| {
+                        self.validate_relative_parent_descriptor(
+                            &parent_relative,
+                            parent,
+                            parent_display,
+                        )
+                    })
+                    .map_err(|error| link_visible_validation_failure(&display, error))?;
+                    return Ok(());
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::Interrupted
+                        && attempt < POST_LINK_DIRECTORY_SYNC_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(ArchiveError::new(
+                        LINK_VISIBLE_SYNC_FAILURE_CODE,
+                        Some(&display),
+                        format!(
+                            "linked entry remained visible, but syncing its already-open parent directory failed on attempt {attempt}; crash durability is unknown: {error} (parent: {})",
+                            parent_display.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        unreachable!("the bounded directory-sync loop always returns")
+    }
+
+    #[cfg(unix)]
+    fn open_expected_relative_entry_on(
+        &self,
+        parent: &File,
+        name: &str,
+        display: &Path,
+        expected: &[u8],
+        limit: u64,
+    ) -> Result<File, ArchiveError> {
+        let descriptor =
+            openat(parent, name, regular_file_open_flags(), Mode::empty()).map_err(|error| {
+                match error {
+                    Errno::ELOOP => ArchiveError::new(
+                        "archive_file_invalid",
+                        Some(display),
+                        "archive file must be a regular file, not a symlink or special file",
+                    ),
+                    _ => anchored_errno(
+                        "archive_file_open_failed",
+                        display,
+                        error,
+                        "could not reopen linked immutable entry",
+                    ),
+                }
+            })?;
+        let mut file = File::from(descriptor);
+        self.require_expected_open_entry(&mut file, parent, name, display, expected, limit)?;
+        Ok(file)
+    }
+
+    #[cfg(unix)]
+    fn require_expected_open_entry(
+        &self,
+        file: &mut File,
+        parent: &File,
+        name: &str,
+        display: &Path,
+        expected: &[u8],
+        limit: u64,
+    ) -> Result<(), ArchiveError> {
+        let expected_len = u64::try_from(expected.len()).map_err(|_| {
+            ArchiveError::new(
+                "archive_file_too_large",
+                Some(display),
+                "expected immutable content length does not fit u64",
+            )
+        })?;
+        if expected_len > limit {
+            return Err(ArchiveError::new(
+                "archive_file_too_large",
+                Some(display),
+                format!("expected immutable content exceeds the {limit}-byte read bound"),
+            ));
+        }
+        let metadata = fstat(&*file).map_err(|error| {
+            anchored_errno(
+                "archive_file_inspection_failed",
+                display,
+                error,
+                "could not inspect linked immutable entry",
+            )
+        })?;
+        if metadata.st_size < 0 || u64::try_from(metadata.st_size).ok() != Some(expected_len) {
+            return Err(ArchiveError::new(
+                "archive_immutable_conflict",
+                Some(display),
+                "linked immutable entry length changed before durable acknowledgement",
+            ));
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| ArchiveError::io("archive_file_read_failed", display, error))?;
+        let mut observed = Vec::with_capacity(expected.len());
+        Read::by_ref(file)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut observed)
+            .map_err(|error| ArchiveError::io("archive_file_read_failed", display, error))?;
+        if observed != expected {
+            return Err(ArchiveError::new(
+                "archive_immutable_conflict",
+                Some(display),
+                "linked immutable entry content changed before durable acknowledgement",
+            ));
+        }
+        validate_anchored_regular_file(parent, name, display, file)
+    }
+
+    #[cfg(unix)]
+    fn validate_relative_parent_descriptor(
+        &self,
+        parent_relative: &str,
+        linked_parent: &File,
+        display: &Path,
+    ) -> Result<(), ArchiveError> {
+        let reachable_parent = self
+            .open_relative_directory_optional(parent_relative)?
+            .ok_or_else(|| {
+                ArchiveError::new(
+                    "archive_directory_replaced",
+                    Some(display),
+                    "linked entry parent is no longer reachable below the captured archive root",
+                )
+            })?;
+        let linked = fstat(linked_parent).map_err(|error| {
+            anchored_errno(
+                "archive_directory_inspection_failed",
+                display,
+                error,
+                "could not inspect the parent directory used by linkat",
+            )
+        })?;
+        let reachable = fstat(&reachable_parent).map_err(|error| {
+            anchored_errno(
+                "archive_directory_inspection_failed",
+                display,
+                error,
+                "could not inspect the canonical linked-entry parent",
+            )
+        })?;
+        if SFlag::from_bits_truncate(linked.st_mode) != SFlag::S_IFDIR
+            || SFlag::from_bits_truncate(reachable.st_mode) != SFlag::S_IFDIR
+            || linked.st_dev != reachable.st_dev
+            || linked.st_ino != reachable.st_ino
+        {
+            return Err(ArchiveError::new(
+                "archive_directory_replaced",
+                Some(display),
+                "the parent directory synced after linkat is no longer reachable at its canonical archive-relative path",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(not(unix))]
-    fn sync_visible_relative_entry_directory(&self, _relative: &str) -> Result<(), ArchiveError> {
+    fn sync_relative_file_and_ancestor_chain(
+        &self,
+        _relative: &str,
+        _expected: &[u8],
+        _limit: u64,
+    ) -> Result<(), ArchiveError> {
         Err(ArchiveError::new(
             "archive_lock_unsupported",
             Some(&self.display_path),
@@ -1189,13 +1617,7 @@ pub fn publish_record(
             format!("record is {byte_len} bytes; maximum is {MAX_ARCHIVE_RECORD_BYTES}"),
         ));
     }
-    let record_sha256 = record_content_sha256(record).map_err(|error| {
-        ArchiveError::new(
-            "archive_record_invalid",
-            None,
-            format!("record digest could not be derived: {error}"),
-        )
-    })?;
+    let record_sha256 = sha256_bytes(&bytes);
     require_sha256(&record_sha256, "record digest")?;
     let invocation_id = &record.invocation.invocation_id;
     let object_relative_path = object_relative_path(&record_sha256);
@@ -1223,6 +1645,11 @@ pub fn publish_record(
     #[cfg(test)]
     run_publication_root_swap_hook(false);
     let _object_new = object_result?;
+    anchored_root.sync_relative_file_and_ancestor_chain(
+        &object_relative_path,
+        &bytes,
+        MAX_ARCHIVE_RECORD_BYTES,
+    )?;
     publication_lock.validate_root(&archive_root)?;
 
     let pointer = InvocationPointerV1 {
@@ -1264,6 +1691,19 @@ pub fn publish_record(
             return Err(error);
         }
     };
+    if let Err(error) = anchored_root.sync_relative_file_and_ancestor_chain(
+        &pointer_relative_path,
+        &pointer_bytes,
+        MAX_POINTER_BYTES,
+    ) {
+        let candidate =
+            ArchivePublicationUnknownV1::new(invocation_id.clone(), record_sha256.clone())?;
+        return Err(ArchiveError::pointer_publication_unknown(
+            &pointer_path,
+            candidate,
+            error,
+        ));
+    }
     if let Err(error) = publication_lock.validate_root(&archive_root) {
         let candidate =
             ArchivePublicationUnknownV1::new(invocation_id.clone(), record_sha256.clone())?;
@@ -1322,7 +1762,7 @@ pub fn reconcile_archive_publication(
         ));
     }
     let (archived, _serialized_bytes) = loaded?;
-    let durability = make_receipt_durable(&anchored_root, &archived.receipt);
+    let durability = make_archived_record_durable(&anchored_root, &archived);
     if let Err(error) = publication_lock.validate_root(&archive_root) {
         let observed = ArchivePublicationUnknownV1::new(
             archived.receipt.invocation_id.clone(),
@@ -1384,30 +1824,61 @@ fn validate_reconciliation_candidate(
     InvocationId::parse(&candidate.invocation_id)
 }
 
-fn make_receipt_durable(
+fn make_archived_record_durable(
     archive_root: &AnchoredArchiveRoot,
-    receipt: &ArchiveReceiptV1,
+    archived: &ArchivedRecord,
 ) -> Result<(), ArchiveError> {
-    archive_root.sync_relative_regular_file(&receipt.object_relative_path)?;
-    archive_root.sync_relative_parent_directory(&receipt.object_relative_path)?;
-
-    let pointer_path = archive_root.display_path(&receipt.pointer_relative_path);
-    archive_root.sync_relative_regular_file(&receipt.pointer_relative_path)?;
-    match archive_root.sync_visible_relative_entry_directory(&receipt.pointer_relative_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.code == LINK_VISIBLE_SYNC_FAILURE_CODE => {
-            let observed = ArchivePublicationUnknownV1::new(
-                receipt.invocation_id.clone(),
-                receipt.record_sha256.clone(),
-            )?;
-            Err(ArchiveError::pointer_publication_unknown(
-                &pointer_path,
-                observed,
-                error,
-            ))
-        }
-        Err(error) => Err(error),
+    let receipt = &archived.receipt;
+    let record_bytes = canonical_record_bytes(&archived.record).map_err(|error| {
+        ArchiveError::new(
+            "archive_record_invalid",
+            Some(&archive_root.display_path(&receipt.object_relative_path)),
+            format!("validated record could not be canonicalized for durability closure: {error}"),
+        )
+    })?;
+    let observed_record_sha256 = sha256_bytes(&record_bytes);
+    if observed_record_sha256 != receipt.record_sha256 {
+        return Err(ArchiveError::new(
+            "archive_record_digest_mismatch",
+            Some(&archive_root.display_path(&receipt.object_relative_path)),
+            format!(
+                "receipt expects {}, canonical record hashes to {observed_record_sha256}",
+                receipt.record_sha256
+            ),
+        ));
     }
+    let pointer_bytes = serde_json::to_vec(&InvocationPointerV1 {
+        archive_format_version: ARCHIVE_FORMAT_VERSION,
+        invocation_id: receipt.invocation_id.clone(),
+        record_sha256: receipt.record_sha256.clone(),
+        object_relative_path: receipt.object_relative_path.clone(),
+    })
+    .map_err(|error| {
+        ArchiveError::new(
+            "archive_pointer_serialization_failed",
+            None,
+            error.to_string(),
+        )
+    })?;
+    let pointer_path = archive_root.display_path(&receipt.pointer_relative_path);
+    let observed = ArchivePublicationUnknownV1::new(
+        receipt.invocation_id.clone(),
+        receipt.record_sha256.clone(),
+    )?;
+    let durability = (|| {
+        archive_root.sync_relative_file_and_ancestor_chain(
+            &receipt.object_relative_path,
+            &record_bytes,
+            MAX_ARCHIVE_RECORD_BYTES,
+        )?;
+        archive_root.sync_relative_file_and_ancestor_chain(
+            &receipt.pointer_relative_path,
+            &pointer_bytes,
+            MAX_POINTER_BYTES,
+        )
+    })();
+    durability
+        .map_err(|error| ArchiveError::pointer_publication_unknown(&pointer_path, observed, error))
 }
 
 /// Open the archive's invocation inventory without materializing its records.
@@ -1423,8 +1894,8 @@ impl ArchiveRecordIter {
     pub fn open(archive_root: &Path) -> Result<Self, ArchiveError> {
         let archive_root = canonical_archive_root(archive_root)?;
         // Only pointer discovery needs the lock. Once captured, every pointer
-        // and its already-durable content object is immutable, so record
-        // validation can stream without holding up future publishers.
+        // is immutable, so each record can be loaded and durability-closed
+        // exactly once on yield without holding up future publishers.
         let inventory_lock =
             acquire_archive_lock(&archive_root, ArchiveLockMode::Shared, ARCHIVE_LOCK_TIMEOUT)?;
         inventory_lock.validate_root(&archive_root)?;
@@ -1455,7 +1926,11 @@ impl ArchiveRecordIter {
         let invocation_id = self.invocation_ids[self.next_index];
         self.next_index += 1;
         let loaded = validate_archive_root_identity(&self.archive_root, self.archive_root_identity)
-            .and_then(|()| load_invocation(&self.anchored_root, invocation_id));
+            .and_then(|()| load_invocation(&self.anchored_root, invocation_id))
+            .and_then(|(archived, serialized_bytes)| {
+                make_archived_record_durable(&self.anchored_root, &archived)
+                    .map(|()| (archived, serialized_bytes))
+            });
         let loaded =
             match validate_archive_root_identity(&self.archive_root, self.archive_root_identity) {
                 Err(root_error) => Err(root_error),
@@ -1499,31 +1974,31 @@ pub fn load_archive(archive_root: &Path) -> Result<Vec<ArchivedRecord>, ArchiveE
     Ok(records)
 }
 
+#[cfg(not(unix))]
 fn invocation_inventory(
     archive_root: &AnchoredArchiveRoot,
 ) -> Result<Vec<InvocationId>, ArchiveError> {
-    #[cfg(not(unix))]
-    {
-        let _ = archive_root;
-        return Err(ArchiveError::new(
-            "archive_lock_unsupported",
-            None,
-            "descriptor-rooted archive inventory requires Unix openat semantics",
-        ));
-    }
+    let _ = archive_root;
+    Err(ArchiveError::new(
+        "archive_lock_unsupported",
+        None,
+        "descriptor-rooted archive inventory requires Unix openat semantics",
+    ))
+}
 
-    #[cfg(unix)]
+#[cfg(unix)]
+fn invocation_inventory(
+    archive_root: &AnchoredArchiveRoot,
+) -> Result<Vec<InvocationId>, ArchiveError> {
     let Some(invocation_root) =
         archive_root.open_relative_directory_optional(INVOCATION_DIRECTORY)?
     else {
         return Ok(Vec::new());
     };
-    #[cfg(unix)]
     let invocation_root_path = archive_root.display_path(INVOCATION_DIRECTORY);
     let mut entries_seen = 0usize;
     let mut shard_count = 0usize;
     let mut invocation_ids = Vec::new();
-    #[cfg(unix)]
     for shard_name in anchored_directory_stream(&invocation_root, &invocation_root_path)? {
         let shard_name = shard_name?;
         if matches!(shard_name.as_str(), "." | "..") {
@@ -1655,13 +2130,9 @@ fn load_invocation(
             error.to_string(),
         )
     })?;
-    let observed_sha256 = record_content_sha256(&record).map_err(|error| {
-        ArchiveError::new(
-            "archive_record_invalid",
-            Some(&object_path),
-            error.to_string(),
-        )
-    })?;
+    // `parse_canonical_record` accepted this exact byte slice. Hash it
+    // directly instead of serializing the typed record a second time.
+    let observed_sha256 = sha256_bytes(&record_bytes);
     if observed_sha256 != pointer.record_sha256 {
         return Err(ArchiveError::new(
             "archive_record_digest_mismatch",
@@ -1808,13 +2279,14 @@ fn install_immutable(
     validate_archive_directory_chain(archive_root, parent)?;
     match fs::symlink_metadata(path) {
         Ok(_) => {
-            require_identical_file(archive_root, path, bytes, limit)?;
             // Another publisher may have linked this entry but not yet synced
             // the directory. Idempotent acknowledgement must close that crash
             // window itself rather than depend on the winning process.
-            sync_regular_file(archive_root, path)?;
-            sync_visible_entry_directory(archive_root, path, parent)?;
-            return Ok(false);
+            return require_identical_file(archive_root, path, bytes, limit)
+                .and_then(|()| sync_regular_file(archive_root, path))
+                .and_then(|()| sync_visible_entry_directory(archive_root, path, parent))
+                .map(|()| false)
+                .map_err(|error| link_visible_failure(path, error));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -1840,6 +2312,7 @@ fn install_immutable(
                 .and_then(|()| sync_regular_file(archive_root, path))
                 .and_then(|()| sync_visible_entry_directory(archive_root, path, parent))
                 .map(|()| false)
+                .map_err(|error| link_visible_failure(path, error))
         }
         Err(error) => Err(ArchiveError::io("archive_publish_failed", path, error)),
     };
@@ -1850,7 +2323,10 @@ fn install_immutable(
 }
 
 fn link_visible_failure(path: &Path, cause: ArchiveError) -> ArchiveError {
-    if cause.code == LINK_VISIBLE_SYNC_FAILURE_CODE {
+    if matches!(
+        cause.code,
+        LINK_VISIBLE_SYNC_FAILURE_CODE | "archive_immutable_conflict"
+    ) {
         cause
     } else {
         ArchiveError::new(
@@ -1863,64 +2339,127 @@ fn link_visible_failure(path: &Path, cause: ArchiveError) -> ArchiveError {
     }
 }
 
+fn link_visible_validation_failure(path: &Path, cause: ArchiveError) -> ArchiveError {
+    if cause.code == LINK_VISIBLE_SYNC_FAILURE_CODE {
+        cause
+    } else {
+        ArchiveError::new(
+            LINK_VISIBLE_SYNC_FAILURE_CODE,
+            Some(path),
+            format!(
+                "linked entry became visible, but its post-sync identity could not be revalidated: {cause}"
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 fn sync_visible_entry_directory(
     archive_root: &Path,
     path: &Path,
     parent: &Path,
 ) -> Result<(), ArchiveError> {
-    let mut last_message = String::new();
-    for _attempt in 1..=POST_LINK_DIRECTORY_SYNC_ATTEMPTS {
-        match sync_visible_entry_directory_once(archive_root, path, parent) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_message = error.message,
+    validate_archive_directory_chain(archive_root, parent)?;
+    let directory = open_directory_no_follow(parent)?;
+    for attempt in 1..=POST_LINK_DIRECTORY_SYNC_ATTEMPTS {
+        match directory.sync_all() {
+            Ok(()) => {
+                return validate_open_directory_target(parent, &directory)
+                    .and_then(|()| validate_archive_directory_chain(archive_root, parent))
+                    .map_err(|error| link_visible_failure(path, error));
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    && attempt < POST_LINK_DIRECTORY_SYNC_ATTEMPTS =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(ArchiveError::new(
+                    LINK_VISIBLE_SYNC_FAILURE_CODE,
+                    Some(path),
+                    format!(
+                        "linked entry remained visible, but syncing its already-open parent directory failed on attempt {attempt}; crash durability is unknown: {error} (parent: {})",
+                        parent.display()
+                    ),
+                ));
+            }
         }
     }
-    Err(ArchiveError::new(
-        LINK_VISIBLE_SYNC_FAILURE_CODE,
-        Some(path),
-        format!(
-            "linked entry remained visible, but syncing its parent directory failed after {POST_LINK_DIRECTORY_SYNC_ATTEMPTS} attempts; crash durability is unknown: {last_message}"
-        ),
-    ))
+    unreachable!("the bounded directory-sync loop always returns")
 }
 
 #[cfg(test)]
-fn sync_visible_entry_directory_once(
-    archive_root: &Path,
-    path: &Path,
-    parent: &Path,
-) -> Result<(), ArchiveError> {
+fn inject_pointer_directory_sync_failures(failures: impl IntoIterator<Item = i32>) {
+    INJECT_POINTER_DIRECTORY_SYNC_FAILURES.with(|injected| {
+        *injected.borrow_mut() = failures.into_iter().collect();
+    });
+}
+
+#[cfg(test)]
+fn inject_pointer_post_sync_hook(hook: impl FnOnce() + 'static) {
+    INJECT_POINTER_POST_SYNC_HOOK.with(|injected| {
+        *injected.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn inject_pointer_ancestor_chain_post_sync_hook(hook: impl FnOnce() + 'static) {
+    INJECT_POINTER_ANCESTOR_CHAIN_POST_SYNC_HOOK.with(|injected| {
+        *injected.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn inject_immutable_parent_post_ensure_hook(hook: impl FnOnce() + 'static) {
+    INJECT_IMMUTABLE_PARENT_POST_ENSURE_HOOK.with(|injected| {
+        *injected.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+fn run_immutable_parent_post_ensure_hook() {
+    #[cfg(test)]
+    INJECT_IMMUTABLE_PARENT_POST_ENSURE_HOOK.with(|injected| {
+        if let Some(hook) = injected.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+fn run_pointer_post_sync_hook(path: &Path) {
+    #[cfg(test)]
+    {
+        if path
+            .components()
+            .any(|component| component.as_os_str() == std::ffi::OsStr::new(INVOCATION_DIRECTORY))
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(POINTER_SUFFIX))
+        {
+            INJECT_POINTER_POST_SYNC_HOOK.with(|injected| {
+                if let Some(hook) = injected.borrow_mut().take() {
+                    hook();
+                }
+            });
+        }
+    }
     #[cfg(not(test))]
     let _ = path;
-    #[cfg(test)]
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(POINTER_SUFFIX))
-        && INJECT_POINTER_DIRECTORY_SYNC_FAILURES.with(|remaining| {
-            let count = remaining.get();
-            if count == 0 {
-                false
-            } else {
-                remaining.set(count - 1);
-                true
-            }
-        })
-    {
-        return Err(ArchiveError::new(
-            "archive_directory_sync_failed",
-            Some(parent),
-            "injected invocation-pointer directory fsync failure",
-        ));
-    }
+}
 
-    sync_archive_directory(archive_root, parent)
+fn run_pointer_ancestor_chain_post_sync_hook() {
+    #[cfg(test)]
+    INJECT_POINTER_ANCESTOR_CHAIN_POST_SYNC_HOOK.with(|injected| {
+        if let Some(hook) = injected.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 #[cfg(test)]
-fn inject_pointer_directory_sync_failures(count: usize) {
-    INJECT_POINTER_DIRECTORY_SYNC_FAILURES.with(|remaining| remaining.set(count));
+fn remaining_pointer_directory_sync_failures() -> usize {
+    INJECT_POINTER_DIRECTORY_SYNC_FAILURES.with(|injected| injected.borrow().len())
 }
 
 #[cfg(test)]
@@ -2027,6 +2566,9 @@ fn make_probe_writable(archive_root: &Path, path: &Path) -> Result<(), ArchiveEr
 }
 
 #[cfg(not(unix))]
+// The portable standard-library permission type exposes only the Windows-style
+// read-only bit here; clearing it does not broaden executable or ACL rights.
+#[allow(clippy::permissions_set_readonly_false)]
 fn make_probe_writable(archive_root: &Path, path: &Path) -> Result<(), ArchiveError> {
     let file = open_regular_file_no_follow(archive_root, path)?;
     let mut permissions = file
@@ -2751,6 +3293,12 @@ fn require_sha256(value: &str, label: &str) -> Result<(), ArchiveError> {
     Ok(())
 }
 
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
+}
+
 fn join_relative(root: &Path, relative: &str) -> PathBuf {
     relative
         .split('/')
@@ -2772,6 +3320,7 @@ mod tests {
 
         let first = publish_record(archive.path(), &record).unwrap();
         assert!(first.newly_published);
+        assert_eq!(first.record_sha256, sha256_bytes(&canonical));
         assert!(archive.path().join(&first.pointer_relative_path).is_file());
         let object_path = archive.path().join(&first.object_relative_path);
         assert_eq!(fs::read(&object_path).unwrap(), canonical);
@@ -2893,6 +3442,127 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn immutable_parent_disappearance_is_a_typed_failure() {
+        let archive = tempfile::tempdir().unwrap();
+        let record = crate::record::tests::valid_record_fixture();
+        let bytes = canonical_record_bytes(&record).unwrap();
+        let digest = sha256_bytes(&bytes);
+        let object_relative = object_relative_path(&digest);
+        let object_parent = archive
+            .path()
+            .join(&object_relative)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let lock = acquire_archive_lock(
+            archive.path(),
+            ArchiveLockMode::Exclusive,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let anchored = lock.anchored_root(archive.path()).unwrap();
+        anchored.ensure_archive_layout().unwrap();
+        inject_immutable_parent_post_ensure_hook(move || {
+            fs::remove_dir(&object_parent).unwrap();
+        });
+
+        let error = anchored
+            .install_immutable(&object_relative, &bytes, MAX_ARCHIVE_RECORD_BYTES)
+            .unwrap_err();
+
+        assert_eq!(error.code, "archive_directory_replaced");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_content_is_not_inventory_and_retry_reuses_it_before_publishing_pointer() {
+        use std::os::unix::fs::MetadataExt;
+
+        let archive = tempfile::tempdir().unwrap();
+        let record = crate::record::tests::valid_record_fixture();
+        let bytes = canonical_record_bytes(&record).unwrap();
+        let digest = sha256_bytes(&bytes);
+        let object_relative = object_relative_path(&digest);
+        let pointer_relative = pointer_relative_path(&record.invocation.invocation_id).unwrap();
+
+        let original_inode = {
+            let lock = acquire_archive_lock(
+                archive.path(),
+                ArchiveLockMode::Exclusive,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            let anchored = lock.anchored_root(archive.path()).unwrap();
+            anchored.ensure_archive_layout().unwrap();
+            assert!(
+                anchored
+                    .install_immutable(&object_relative, &bytes, MAX_ARCHIVE_RECORD_BYTES)
+                    .unwrap(),
+                "the crash boundary begins after installing the content object"
+            );
+            fs::metadata(archive.path().join(&object_relative))
+                .unwrap()
+                .ino()
+        };
+
+        assert!(!archive.path().join(&pointer_relative).exists());
+        assert_eq!(iter_archive(archive.path()).unwrap().remaining(), 0);
+
+        let receipt = publish_record(archive.path(), &record).unwrap();
+
+        assert!(receipt.newly_published);
+        assert_eq!(receipt.object_relative_path, object_relative);
+        assert_eq!(receipt.pointer_relative_path, pointer_relative);
+        assert_eq!(
+            fs::metadata(archive.path().join(&receipt.object_relative_path))
+                .unwrap()
+                .ino(),
+            original_inode,
+            "retry must reuse the immutable content object rather than replace it"
+        );
+        assert_eq!(
+            fs::read_dir(
+                archive
+                    .path()
+                    .join(&receipt.object_relative_path)
+                    .parent()
+                    .unwrap()
+            )
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(RECORD_SUFFIX))
+            })
+            .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(
+                archive
+                    .path()
+                    .join(&receipt.pointer_relative_path)
+                    .parent()
+                    .unwrap()
+            )
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(POINTER_SUFFIX))
+            })
+            .count(),
+            1
+        );
+        assert_eq!(load_archive(archive.path()).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn archive_lock_wait_is_bounded_and_fail_closed() {
         let archive = tempfile::tempdir().unwrap();
         let held = acquire_archive_lock(
@@ -2914,24 +3584,180 @@ mod tests {
         drop(held);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn transient_pointer_directory_sync_failure_is_recovered_before_acknowledgement() {
+    fn interrupted_pointer_directory_sync_is_retried_before_acknowledgement() {
         let archive = tempfile::tempdir().unwrap();
         let record = crate::record::tests::valid_record_fixture();
-        inject_pointer_directory_sync_failures(1);
+        assert_eq!(
+            std::io::Error::from_raw_os_error(nix::libc::EINTR).kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        inject_pointer_directory_sync_failures([nix::libc::EINTR]);
 
         let receipt = publish_record(archive.path(), &record).unwrap();
 
         assert!(receipt.newly_published);
+        assert_eq!(remaining_pointer_directory_sync_failures(), 0);
         assert_eq!(load_archive(archive.path()).unwrap()[0].record, record);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn visible_pointer_with_exhausted_directory_sync_is_reported_as_possibly_published() {
+    fn eio_after_pointer_visibility_is_not_retried_or_acknowledged() {
         let archive = tempfile::tempdir().unwrap();
         let record = crate::record::tests::valid_record_fixture();
-        let expected_digest = record_content_sha256(&record).unwrap();
-        inject_pointer_directory_sync_failures(POST_LINK_DIRECTORY_SYNC_ATTEMPTS);
+        assert_ne!(
+            std::io::Error::from_raw_os_error(nix::libc::EIO).kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        inject_pointer_directory_sync_failures([nix::libc::EIO, nix::libc::EINTR]);
+
+        let error = publish_record(archive.path(), &record).unwrap_err();
+
+        assert_eq!(error.code, "archive_pointer_publication_unknown");
+        assert!(error.possibly_published.is_some());
+        assert_eq!(
+            remaining_pointer_directory_sync_failures(),
+            1,
+            "a substantive EIO must stop immediately instead of consuming a retry"
+        );
+
+        inject_pointer_directory_sync_failures([]);
+        let candidate = error.possibly_published.as_deref().unwrap();
+        assert!(matches!(
+            reconcile_archive_publication(archive.path(), candidate).unwrap(),
+            ArchiveReconciliationV1::Durable { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_pointer_parent_after_sync_is_possibly_published_even_with_same_entry() {
+        use std::os::unix::fs::MetadataExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let archive = holder.path().join("archive");
+        fs::create_dir(&archive).unwrap();
+        let record = crate::record::tests::valid_record_fixture();
+        let pointer_relative = pointer_relative_path(&record.invocation.invocation_id).unwrap();
+        let pointer_path = archive.join(&pointer_relative);
+        let pointer_parent = pointer_path.parent().unwrap().to_path_buf();
+        let pointer_name = pointer_path.file_name().unwrap().to_owned();
+        let displaced_parent = holder.path().join("displaced-pointer-parent");
+        let hook_parent = pointer_parent.clone();
+        let hook_displaced = displaced_parent.clone();
+        inject_pointer_post_sync_hook(move || {
+            fs::rename(&hook_parent, &hook_displaced).unwrap();
+            fs::create_dir(&hook_parent).unwrap();
+            fs::hard_link(
+                hook_displaced.join(&pointer_name),
+                hook_parent.join(&pointer_name),
+            )
+            .unwrap();
+        });
+
+        let error = publish_record(&archive, &record).unwrap_err();
+
+        assert_eq!(error.code, "archive_pointer_publication_unknown");
+        assert!(error.possibly_published.is_some());
+        let canonical = fs::metadata(&pointer_path).unwrap();
+        let displaced =
+            fs::metadata(displaced_parent.join(pointer_path.file_name().unwrap())).unwrap();
+        assert_eq!(
+            (canonical.dev(), canonical.ino()),
+            (displaced.dev(), displaced.ino())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_pointer_ancestor_is_detected_before_durable_acknowledgement() {
+        use std::os::unix::fs::MetadataExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let archive = holder.path().join("archive");
+        fs::create_dir(&archive).unwrap();
+        let record = crate::record::tests::valid_record_fixture();
+        let pointer_relative = pointer_relative_path(&record.invocation.invocation_id).unwrap();
+        let pointer_path = archive.join(&pointer_relative);
+        let shard_path = pointer_path.parent().unwrap().to_path_buf();
+        let shard_name = shard_path.file_name().unwrap().to_owned();
+        let invocation_root = shard_path.parent().unwrap().to_path_buf();
+        let displaced_invocation_root = holder.path().join("displaced-invocations");
+        let hook_invocation_root = invocation_root.clone();
+        let hook_displaced_root = displaced_invocation_root.clone();
+        inject_pointer_ancestor_chain_post_sync_hook(move || {
+            fs::rename(&hook_invocation_root, &hook_displaced_root).unwrap();
+            fs::create_dir(&hook_invocation_root).unwrap();
+            fs::rename(
+                hook_displaced_root.join(&shard_name),
+                hook_invocation_root.join(&shard_name),
+            )
+            .unwrap();
+        });
+
+        let error = publish_record(&archive, &record).unwrap_err();
+
+        assert_eq!(error.code, "archive_pointer_publication_unknown");
+        assert!(error.possibly_published.is_some());
+        assert!(pointer_path.is_file());
+        assert_ne!(
+            fs::metadata(&invocation_root).unwrap().ino(),
+            fs::metadata(&displaced_invocation_root).unwrap().ino(),
+            "the pointer shard must remain reachable through a newly installed ancestor"
+        );
+        assert_eq!(load_archive(&archive).unwrap()[0].record, record);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_pointer_entry_after_sync_is_possibly_published_even_with_same_bytes() {
+        use std::os::unix::fs::MetadataExt;
+
+        let archive = tempfile::tempdir().unwrap();
+        let record = crate::record::tests::valid_record_fixture();
+        let record_sha256 = sha256_bytes(&canonical_record_bytes(&record).unwrap());
+        let pointer_relative = pointer_relative_path(&record.invocation.invocation_id).unwrap();
+        let pointer_path = archive.path().join(&pointer_relative);
+        let displaced_pointer = archive.path().join("displaced-pointer");
+        let expected_pointer = serde_json::to_vec(&InvocationPointerV1 {
+            archive_format_version: ARCHIVE_FORMAT_VERSION,
+            invocation_id: record.invocation.invocation_id.clone(),
+            record_sha256: record_sha256.clone(),
+            object_relative_path: object_relative_path(&record_sha256),
+        })
+        .unwrap();
+        let hook_pointer = pointer_path.clone();
+        let hook_displaced = displaced_pointer.clone();
+        let replacement_bytes = expected_pointer.clone();
+        inject_pointer_post_sync_hook(move || {
+            fs::rename(&hook_pointer, &hook_displaced).unwrap();
+            fs::write(&hook_pointer, replacement_bytes).unwrap();
+        });
+
+        let error = publish_record(archive.path(), &record).unwrap_err();
+
+        assert_eq!(error.code, "archive_pointer_publication_unknown");
+        assert!(error.possibly_published.is_some());
+        assert_eq!(fs::read(&pointer_path).unwrap(), expected_pointer);
+        assert_ne!(
+            fs::metadata(&pointer_path).unwrap().ino(),
+            fs::metadata(&displaced_pointer).unwrap().ino(),
+            "byte-identical replacement must still be detected by inode identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_rejects_ambiguous_pointer_until_durability_closure_succeeds() {
+        let archive = tempfile::tempdir().unwrap();
+        let record = crate::record::tests::valid_record_fixture();
+        let expected_digest = sha256_bytes(&canonical_record_bytes(&record).unwrap());
+        inject_pointer_directory_sync_failures(std::iter::repeat_n(
+            nix::libc::EINTR,
+            POST_LINK_DIRECTORY_SYNC_ATTEMPTS * 2,
+        ));
 
         let error = publish_record(archive.path(), &record).unwrap_err();
 
@@ -2960,9 +3786,27 @@ mod tests {
             serialized["possibly_published"]["invocation_id"],
             record.invocation.invocation_id
         );
+        assert_eq!(
+            remaining_pointer_directory_sync_failures(),
+            POST_LINK_DIRECTORY_SYNC_ATTEMPTS,
+            "publication must leave the separately injected reader-healing failure queued"
+        );
+        let reader_error = load_archive(archive.path()).unwrap_err();
+        assert_eq!(reader_error.code, "archive_pointer_publication_unknown");
+        assert_eq!(
+            reader_error
+                .possibly_published
+                .as_deref()
+                .expect("reader retains the exact ambiguous publication identity"),
+            possible.as_ref()
+        );
+        assert_eq!(remaining_pointer_directory_sync_failures(), 0);
         assert_eq!(load_archive(archive.path()).unwrap()[0].record, record);
 
-        inject_pointer_directory_sync_failures(POST_LINK_DIRECTORY_SYNC_ATTEMPTS);
+        inject_pointer_directory_sync_failures(std::iter::repeat_n(
+            nix::libc::EINTR,
+            POST_LINK_DIRECTORY_SYNC_ATTEMPTS,
+        ));
         let still_unknown = reconcile_archive_publication(archive.path(), possible).unwrap_err();
         assert_eq!(still_unknown.code, "archive_pointer_publication_unknown");
         assert_eq!(
@@ -3219,7 +4063,7 @@ mod tests {
         let mut second = first.clone();
         second.invocation.invocation_id.replace_range(25..26, "B");
         let bytes = canonical_record_bytes(&second).unwrap();
-        let digest = record_content_sha256(&second).unwrap();
+        let digest = sha256_bytes(&bytes);
         let object_relative_path = object_relative_path(&digest);
         install_immutable(
             archive.path(),

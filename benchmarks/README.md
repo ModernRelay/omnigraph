@@ -145,8 +145,10 @@ on the command line. Durable publication requires a release binary built from
 a clean committed tree so the record has honest source provenance. The exact
 system under test is bound separately by the executable SHA-256, Cargo/compiler
 observations, checked-in release-profile declarations, and engine feature
-inventory. Effective LTO/codegen/strip settings remain explicitly unproved
-until the AWS build slice supplies a controlled digest-bound receipt.
+inventory. The inventory includes Cargo's `default` feature and execution
+refuses manifest/registry drift or an unsuppressed implicit optional-dependency
+feature. Effective LTO/codegen/strip settings remain explicitly unproved
+until controlled benchmark infrastructure supplies a digest-bound receipt.
 
 Runner-v1 constructs and verifies one fixture whose `bench-source` and
 `bench-target` branches are already diverged, closes it, and freezes the
@@ -167,9 +169,19 @@ Every repetition uses a fresh worker process and starts from the same frozen
 state. The parent pins and records the worker executable SHA-256 and requires
 matching source commit/dirty state, release-profile, target/compiler,
 engine-feature, and effective engine-environment evidence in the private
-handshake. Unknown `LANCE_*` or engine-facing `OMNIGRAPH_*` overrides fail
-closed without recording their values; credential values never enter a
-record. The supervisor also records the repetition worker's peak RSS. The
+handshake. Fixture and repetition children clear inherited environment. The
+fixture child receives an empty protocol-owned scratch sibling as `TMPDIR`; a
+measured worker receives a fresh per-repetition scratch sibling as both
+`TMPDIR` and `OMNIGRAPH_MERGE_STAGING_DIR`. Each child validates the exact real,
+absolute path and uses it as its current directory before work, so relative
+dependency spill cannot escape the verified disposable workspace. Cleanup
+occurs only after containment is proved.
+`LANCE_MEM_POOL_SIZE` is admitted only as the canonical decimal `u64` byte
+count Lance actually applies and is recorded as typed SUT identity. Unknown
+`LANCE_*`, engine-facing `OMNIGRAPH_*`, or process-runtime thread-count
+overrides fail closed without recording their values. Credentials and unrelated
+host knobs never reach the child or enter a record. The supervisor also records
+the repetition worker's peak RSS. The
 complete cache condition is part of point identity. A declared read-only
 warm-up program runs inside each repetition before measurement. A storage
 firewall allows only each read-write open's one balanced, empty
@@ -183,9 +195,10 @@ worker exits.
 Before it initializes a fixture, the runner derives the exact builder-v2
 publication count, rejects a mismatched history declaration, applies explicit
 local row/byte/entry/history limits, and proves that the scratch volume has its
-conservative frozen-copy capacity allowance. The concrete runner limits are
-listed in `crates/omnigraph-bench/README.md`; they are deliberately narrower
-than the host-independent case schema.
+conservative frozen-copy capacity allowance plus space for the staged,
+descriptor-bound worker executable. The concrete runner limits are listed in
+`crates/omnigraph-bench/README.md`; they are deliberately narrower than the
+host-independent case schema.
 
 The supervisor starts the declared hard deadline immediately before releasing
 the prepared worker with `Begin`. The worker must send `Settled` after its merge
@@ -249,16 +262,24 @@ Projection responses are bounded pages. When `next_cursor` is present, pass
 that JSON value to the next command with `--cursor`; the cursor remains pinned
 to the immutable generation from which the first page was read. The archive
 verifier likewise captures one publication-coherent invocation inventory,
-streams its immutable records, and emits only a count plus an inventory digest.
+durability-closes every visible record through the captured archive-root
+directory chain, streams the immutable records, and emits only a count plus an
+inventory digest. A reader refuses an inventory whose durability proof still
+fails; the publisher must still use candidate-specific `archive reconcile`
+before retrying an invocation reported as `possibly_published`.
 
 Without `--archive`, runner-v1 retains its versioned diagnostic output with
 `durable_record: false`; copying that output into the archive is invalid. With
 `--archive`, the CLI publishes and releases each complete raw run in turn; its
 bounded summary contains the completed count and immutable record receipts,
-not a duplicate raw `runs` array. A failed publication retains only its current
-completed execution as state-neutral `completed_run` recovery evidence. Resolve any `possibly_published`
+not a duplicate raw `runs` array. If a later repetition fails, one or more
+already verified repetitions publish as a permanently claim-ineligible
+`censored` record and the command still fails; rep-zero failures publish
+nothing, and `Settled` evidence is never promoted to a sample. A failed
+publication retains only its current complete execution or censored verified
+prefix as state-neutral `unpublished_run` recovery evidence. Resolve any `possibly_published`
 identity with `archive reconcile` before minting a replacement invocation. A
-later AWS adapter binds declared S3 facts, applies budget and lifecycle
+later controlled-cloud adapter binds declared S3 facts, applies budget and lifecycle
 controls, executes the same typed plans, and uploads the same record format.
 S3 reset, fixture caching, server-mode execution, comparison/noise-floor
 reports, and proved operating-system page-cache eviction remain outside this
