@@ -1534,7 +1534,11 @@ mod tests {
         assert!(error.to_string().contains("symlinks"));
 
         fs::remove_file(fixture.path().join("link")).unwrap();
-        let socket = classify_unix_mode(u32::from(nix::libc::S_IFSOCK | 0o600));
+        #[cfg(target_os = "macos")]
+        let socket_mode = u32::from(nix::libc::S_IFSOCK | 0o600);
+        #[cfg(not(target_os = "macos"))]
+        let socket_mode = nix::libc::S_IFSOCK | 0o600;
+        let socket = classify_unix_mode(socket_mode);
         assert_eq!(socket, EntryType::Special);
         let error = supported_inventory_kind(socket, Path::new("socket")).unwrap_err();
         assert!(error.to_string().contains("special files"));

@@ -632,6 +632,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(target_os = "macos")]
     fn tiny_case() -> ValidatedCase {
         let mut definition = test_case().definition;
         definition.id = "fixture-worker-tiny".to_string();
