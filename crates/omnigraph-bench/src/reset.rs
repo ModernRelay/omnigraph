@@ -219,7 +219,7 @@ pub(crate) fn accept_clonefile_template_handoff(
     require_clonefile_platform()?;
     let active_root = stable_absolute_path("active fixture root", active_root)?;
     let template_root = stable_absolute_path("clonefile template root", template_root)?;
-    refuse_destination_below_source(&active_root, &template_root)?;
+    refuse_destination_below_retired_source(&active_root, &template_root)?;
     match fs::symlink_metadata(&active_root) {
         Ok(_) => {
             return Err(invalid_data(format!(
@@ -1149,6 +1149,43 @@ fn refuse_destination_below_source(source: &Path, destination: &Path) -> io::Res
             format!("canonicalizing fixture root {}", source.display()),
         )
     })?;
+    refuse_resolved_destination_below(&canonical_source, destination)
+}
+
+/// Containment for the contained-fixture handoff, where the worker has
+/// already retired the active path: resolve the absent fixture root through
+/// its canonical parent, then refuse a template that equals or lies below it.
+fn refuse_destination_below_retired_source(source: &Path, destination: &Path) -> io::Result<()> {
+    let parent = source
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            invalid_input(format!(
+                "fixture root has no parent directory: {}",
+                source.display()
+            ))
+        })?;
+    let name = source.file_name().ok_or_else(|| {
+        invalid_input(format!(
+            "fixture root has no final component: {}",
+            source.display()
+        ))
+    })?;
+    let canonical_source = fs::canonicalize(parent)
+        .map_err(|error| {
+            contextual(
+                error,
+                format!("canonicalizing fixture-root parent {}", parent.display()),
+            )
+        })?
+        .join(name);
+    refuse_resolved_destination_below(&canonical_source, destination)
+}
+
+fn refuse_resolved_destination_below(
+    canonical_source: &Path,
+    destination: &Path,
+) -> io::Result<()> {
     let canonical_destination = match fs::symlink_metadata(destination) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -1192,7 +1229,7 @@ fn refuse_destination_below_source(source: &Path, destination: &Path) -> io::Res
         }
     };
 
-    if canonical_destination.starts_with(&canonical_source) {
+    if canonical_destination.starts_with(canonical_source) {
         return Err(invalid_input(format!(
             "fixture-copy destination must not equal or lie below the fixture root: {}",
             destination.display()
@@ -1606,6 +1643,52 @@ mod tests {
         let error = frozen.restore_active().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!active.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contained_handoff_accepts_only_a_retired_active_path() {
+        let Some(workspace) = apfs_tempdir() else {
+            return;
+        };
+        let active = workspace.path().join("active");
+        let template = workspace.path().join("template");
+        fs::create_dir(&active).unwrap();
+        fixture_tree(&active);
+        let limits = TraversalLimits::default();
+        let frozen = freeze_clonefile_template(&active, &template, limits).unwrap();
+        let physical = frozen.physical_digest().clone();
+        let metadata = digest_metadata_tree(&template, limits).unwrap();
+
+        let left_behind = accept_clonefile_template_handoff(
+            &active,
+            &template,
+            physical.clone(),
+            metadata.clone(),
+            limits,
+        )
+        .unwrap_err();
+        assert!(
+            left_behind
+                .to_string()
+                .contains("left the active path behind"),
+            "{left_behind}"
+        );
+
+        // The contained worker retires the active tree before handing off;
+        // the parent must accept exactly that state.
+        fs::remove_dir_all(&active).unwrap();
+        let accepted =
+            accept_clonefile_template_handoff(&active, &template, physical, metadata, limits)
+                .unwrap();
+        assert_eq!(accepted.active_root(), active);
+        assert_eq!(accepted.template_root(), template);
+        let prepared = accepted.restore_active().unwrap();
+        assert_eq!(
+            digest_physical_tree(&active, limits).unwrap(),
+            *accepted.physical_digest()
+        );
+        prepared.verify_unchanged().unwrap();
     }
 
     #[cfg(target_os = "macos")]
