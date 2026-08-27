@@ -67,7 +67,6 @@ Page-cache-cold is deliberately absent: it requires both a named
 platform/backend eviction control and a post-control witness. Storage-cold is
 neither supported nor representable because controlling the OS page cache says
 nothing about device, object-store, or remote-service caches.
-
 Case definitions deliberately contain no source branch, system-under-test
 build, machine identity, AWS account, bucket URI, result location, or
 credentials. Runner-v1 binds the supported local host facts at execution; the
@@ -144,8 +143,9 @@ data pages merely to prove identity.
 
 Every repetition uses a fresh worker process and starts from the same frozen
 state. The parent pins and records the worker executable SHA-256 and requires
-matching release-profile attestation in the private handshake. The declared
-read-only warmth program runs before measurement. A storage firewall allows
+matching release-profile attestation in the private handshake. The complete
+cache condition is point identity. A declared read-only warm-up program runs
+inside each repetition before measurement. A storage firewall allows
 only each read-write open's one balanced, empty create-if-absent capability
 probe and rejects any other preparation write; a complete metadata-shape
 witness independently catches path, kind, or length drift. Measured counters
@@ -178,12 +178,16 @@ the general three-way route and exactly one `TableWalk` interval per diverged
 table. The reported storage counts are logical engine calls, not physical
 requests or cloud-cost estimates.
 
-The warm program `branch-merge-read-set-v1` reads the reachable commit list and
+The warm-up program `branch-merge-read-set-v1` reads the reachable commit list and
 a coherent snapshot for `main`, `bench-source`, and `bench-target`, then fully
 consumes the projected benchmark columns of every diverged table. A
-post-invalidation point runs that same program and reopens the engine handle
-before measurement. Cold points remain refused because a fresh worker process
-does not by itself prove that operating-system page caches were evicted.
+`reopened-after-program` point runs that same program and reopens the engine
+handle before measurement; it does not claim invalidation. A process-cold point
+uses `preparation-only`, `program: none`, and `iterations: 0`: the worker is
+fresh and no workload-shaped warm-up runs, but ordinary open and harness
+preparation reads still occur and `page_cache: uncontrolled` states the OS
+cache limitation explicitly. A true page-cache-cold point remains refused
+until a named platform/backend eviction control has an observed witness.
 
 ## Delivery boundary
 

@@ -3,7 +3,7 @@
 //! A local read-write bind deliberately creates and deletes one empty
 //! `__create_if_absent_probe_*` object to prove the mount's atomic primitive.
 //! Clean fixture recovery must perform no other write. This adapter permits
-//! exactly that balanced capability probe while the runner prepares warmth,
+//! exactly that balanced capability probe while the runner prepares caches,
 //! then opens the full mutation surface only at the measurement gate.
 
 use std::fmt;

@@ -36,16 +36,19 @@ measurement protocol and identity vocabulary.
   branch, manifest, or deletion history. Reset and pre-timer proof traverse
   metadata but never read file contents or fall back to a byte copy.
 - Every repetition runs in a fresh worker process whose executable SHA-256 and
-  release-profile facts must match the parent attestation. Its declared
-  read-only warmth program runs before measured counters and the monotonic
-  merge timer begin. A storage firewall permits only the engine's one balanced,
+  release-profile facts must match the parent attestation. Its complete cache
+  condition is part of point identity. When declared, its read-only warm-up
+  program runs before measured counters and the monotonic merge timer begin. A
+  storage firewall permits only the engine's one balanced,
   empty create-if-absent capability probe during each read-write open; every
   other pre-measurement write is rejected. The worker also proves the restored
   tree's complete metadata shape before it declares itself ready. Each timed
-  repetition performs exactly one branch merge. Post-invalidation additionally
-  drops and reopens the engine handle after the warmth program while the
-  firewall remains closed. Cold execution is still refused: a fresh process
-  does not prove that operating-system page caches are cold.
+  repetition performs exactly one branch merge. `reopened-after-program`
+  additionally drops and reopens the engine handle after the warm-up while the
+  firewall remains closed; it makes no cache-invalidation claim.
+  `preparation-only` is executable as process-cold: it has no declared warm-up,
+  while ordinary engine open and harness verification-preparation reads still
+  occur and the OS page cache remains explicitly uncontrolled.
 - After the measured window closes, verification checks the exact expected
   rows and values across every target table, including untouched tables. It
   separately proves that source and main still have their exact frozen content
@@ -70,14 +73,16 @@ Execution currently supports only synthetic builder v1 with seed `0`, scalar
 uniform bulk-loaded data, no indexes or pre-existing deletion history, local
 filesystem storage, same-host embedded execution, one client, distinct-key
 write-heavy divergence, manual scheduling, local-clonefile reset, per-phase
-attribution, and a monotonic timer. Warm and post-invalidation regimes are
-supported.
+attribution, and a monotonic timer. Process-cold, warmed-by-program, and
+reopened-after-program engine preparation are supported with their exact
+cross-validated cache declarations.
 
 The host probe currently proves APFS on an internal macOS NVMe or SATA SSD. A
-debug build, cold regime, S3 or Azure backend, server execution, plain-copy
-reset, unproved host declaration, unsupported scenario axis, deadline breach,
-reset witness mismatch, non-general merge route, or content mismatch is
-refused instead of being approximated.
+debug build, S3 or Azure backend, server execution, plain-copy reset, unproved
+host declaration, unsupported scenario axis, deadline breach, reset witness
+mismatch, non-general merge route, or content mismatch is refused instead of
+being approximated. A true OS-page-cache-cold claim is not representable yet;
+it requires a named platform/backend control and an observed eviction witness.
 
 Before initialization, runner-v1 derives the exact builder publication recipe
 and refuses an emergent history depth. Its local construction envelope is at

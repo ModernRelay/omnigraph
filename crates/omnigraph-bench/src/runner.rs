@@ -4,7 +4,7 @@
 //! APFS storage, an already-diverged branch-merge fixture frozen once as a
 //! clonefile template, and one fresh attested worker process per repetition.
 //! Every worker restores the same stable path, performs the declared read-only
-//! warm or post-invalidation program behind a preparation-write firewall, and
+//! cache-preparation program behind a preparation-write firewall, and
 //! executes exactly one bounded merge followed by exact verification. Durable
 //! run records, fixture caching, cold page-cache control, S3 reset, and AWS
 //! orchestration are separate slices.
@@ -28,7 +28,7 @@ use crate::branch_merge::{
     BranchMergePlan, FixturePreflight, SOURCE_BRANCH, TARGET_BRANCH,
     capture_protected_branch_heads, initialize_local_fixture, verify_merged_graph, warm_read_set,
 };
-use crate::case::{Attribution, Backend, ResetMode, WarmthRegime};
+use crate::case::{Attribution, Backend, CacheCondition, EnginePreparation, ResetMode};
 use crate::counting::{LogicalCallCounter, LogicalCallCounts};
 use crate::environment::{LocalEnvironmentEvidence, verify_local_environment};
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
@@ -415,15 +415,6 @@ async fn execute_run_inner(
             "unsupported_runner_axis",
             "runner-v1 executes the micro profile and requires protocol.attribution: per-phase",
         ));
-    }
-    match run.case.definition.environment.warmth.regime {
-        WarmthRegime::Warm | WarmthRegime::PostInvalidation => {}
-        WarmthRegime::Cold => {
-            return Err(RunnerError::new(
-                "unsupported_runner_axis",
-                "cold requires control of the operating-system page cache in addition to a fresh process; runner-v1 refuses to approximate it",
-            ));
-        }
     }
     if run.case.definition.protocol.reset != ResetMode::LocalClonefile && !guards.allow_plain_copy {
         return Err(RunnerError::new(
@@ -894,6 +885,9 @@ async fn run_in_process_repetitions(
     run: &ResolvedRun,
     plan: &BranchMergePlan,
 ) -> RunnerResult<Vec<RepObservation>> {
+    // This path exists only for owning-layer tests. Public execution always
+    // takes the supervised path above, which creates the fresh-per-repetition
+    // process declared by every current cache condition.
     let mut samples = Vec::with_capacity(run.repetitions as usize);
     for repetition in 0..run.repetitions {
         template.verify_unchanged()?;
@@ -904,8 +898,7 @@ async fn run_in_process_repetitions(
             template.physical_digest(),
             &metadata,
             plan,
-            run.case.definition.environment.warmth.regime,
-            run.case.definition.environment.warmth.iterations,
+            &run.case.definition.environment.cache_condition,
             run.case
                 .definition
                 .protocol
@@ -999,8 +992,7 @@ async fn execute_rep(
     input_digest: &PhysicalDigest,
     input_metadata: &MetadataDigest,
     plan: &BranchMergePlan,
-    warmth: WarmthRegime,
-    warmth_iterations: u32,
+    cache_condition: &CacheCondition,
     deadline: Option<Duration>,
 ) -> RunnerResult<RepObservation> {
     let mut signals = ImmediateMeasurementSignals;
@@ -1010,8 +1002,7 @@ async fn execute_rep(
         input_digest,
         input_metadata,
         plan,
-        warmth,
-        warmth_iterations,
+        cache_condition,
         deadline,
         &mut signals,
     )
@@ -1042,8 +1033,7 @@ pub(crate) async fn execute_rep_signaled<S: MeasurementSignals>(
     input_digest: &PhysicalDigest,
     input_metadata: &MetadataDigest,
     plan: &BranchMergePlan,
-    warmth: WarmthRegime,
-    warmth_iterations: u32,
+    cache_condition: &CacheCondition,
     deadline: Option<Duration>,
     signals: &mut S,
 ) -> RunnerResult<RepObservation> {
@@ -1062,8 +1052,7 @@ pub(crate) async fn execute_rep_signaled<S: MeasurementSignals>(
             input_digest,
             input_metadata,
             plan,
-            warmth,
-            warmth_iterations,
+            cache_condition,
             deadline,
             manifest_counter,
             table_counter,
@@ -1081,8 +1070,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
     input_digest: &PhysicalDigest,
     input_metadata: &MetadataDigest,
     plan: &BranchMergePlan,
-    warmth: WarmthRegime,
-    warmth_iterations: u32,
+    cache_condition: &CacheCondition,
     deadline: Option<Duration>,
     manifest_counter: LogicalCallCounter,
     table_counter: LogicalCallCounter,
@@ -1090,13 +1078,18 @@ async fn execute_rep_body<S: MeasurementSignals>(
 ) -> RunnerResult<RepObservation> {
     let root_uri = utf8_path(root, "repetition store")?;
     let (mut db, mut control_counts, mut preparation_gate) = open_counting(root_uri).await?;
-    warm_read_set(&db, plan, warmth_iterations)
-        .await
-        .map_err(|error| RunnerError::new("warmth_failed", error.to_string()))?;
+    match cache_condition.engine {
+        EnginePreparation::PreparationOnly => {}
+        EnginePreparation::WarmedByProgram | EnginePreparation::ReopenedAfterProgram => {
+            warm_read_set(&db, plan, cache_condition.iterations)
+                .await
+                .map_err(|error| RunnerError::new("cache_preparation_failed", error.to_string()))?;
+        }
+    }
     let protected_heads = capture_protected_branch_heads(&db)
         .await
         .map_err(|error| RunnerError::new("verification_failed", error.to_string()))?;
-    if warmth == WarmthRegime::PostInvalidation {
+    if cache_condition.engine == EnginePreparation::ReopenedAfterProgram {
         preparation_gate
             .validate_preparation()
             .map_err(|message| RunnerError::new("pre_measurement_write_detected", message))?;
@@ -1105,14 +1098,14 @@ async fn execute_rep_body<S: MeasurementSignals>(
     }
 
     // The engine handle must be read-write for the measured mutation. Prove
-    // that open and the declared warmth program issued no write through either
+    // that open and the declared cache-preparation program issued no write through either
     // storage seam, then compare the complete metadata state without reading
     // file contents. The clonefile syscall already proved byte identity.
     verify_metadata_shape(root, input_metadata, TraversalLimits::default()).map_err(|error| {
         RunnerError::new(
             "pre_measurement_state_mismatch",
             format!(
-                "repetition {repetition} did not retain the clonefile metadata state through open and warmth: {error}"
+                "repetition {repetition} did not retain the clonefile metadata state through open and cache preparation: {error}"
             ),
         )
     })?;
@@ -1127,7 +1120,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
         return Err(RunnerError::new(
             "pre_measurement_write_detected",
             format!(
-                "repetition {repetition} open/warmth/ready-wait issued Lance object-store mutations (manifest={preparation_manifest_calls:?}, table={preparation_table_calls:?})"
+                "repetition {repetition} open/cache-preparation/ready-wait issued Lance object-store mutations (manifest={preparation_manifest_calls:?}, table={preparation_table_calls:?})"
             ),
         ));
     }
@@ -1438,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn repetitions_start_from_identical_frozen_bytes_and_verify_exact_content() {
+    fn cache_preparations_start_from_identical_frozen_bytes_and_verify_exact_content() {
         // The debug-build merge future plus two task-local measurement layers
         // exceeds libtest's 2 MiB worker stack. Public wall-clock execution is
         // release-only; keep this owning-layer debug regression on the same
@@ -1451,8 +1444,7 @@ mod tests {
                     .build()
                     .unwrap()
                     .block_on(async {
-                        let case = parse_case(
-                            r#"
+                        let warmed_source = r#"
 version: 1
 id: tiny-runner
 scenario: branch-merge-v1
@@ -1482,56 +1474,65 @@ environment:
   backend: { kind: local-fs, filesystem: apfs, storage_class: nvme-ssd }
   network_position: same-host
   execution: embedded
-  warmth: { regime: warm, program: branch-merge-read-set-v1, iterations: 1 }
+  cache_condition: { process: fresh-per-repetition, engine: warmed-by-program, page_cache: program-conditioned, program: branch-merge-read-set-v1, iterations: 1 }
 protocol:
   deadline_seconds: 60
   attribution: per-phase
   schedule: manual
   reset: plain-copy
   timer: monotonic
-"#,
-                        )
-                        .into_result()
-                        .unwrap();
-                        let run = ResolvedRun {
-                            case_path: PathBuf::from("tiny-runner.case-v1.yaml"),
-                            repetitions: 2,
-                            case,
-                        };
+"#;
+                        let process_cold_source = warmed_source
+                            .replace("engine: warmed-by-program", "engine: preparation-only")
+                            .replace(
+                                "page_cache: program-conditioned",
+                                "page_cache: uncontrolled",
+                            )
+                            .replace("program: branch-merge-read-set-v1", "program: none")
+                            .replace("iterations: 1", "iterations: 0");
 
-                        let execution = execute_run_inner(
-                            &run,
-                            &RunOptions::default(),
-                            ExecutionGuards {
-                                verify_environment: false,
-                                isolate_repetitions: false,
-                                allow_plain_copy: true,
-                            },
-                        )
-                        .await
-                        .unwrap();
+                        for source in [warmed_source.to_owned(), process_cold_source] {
+                            let case = parse_case(&source).into_result().unwrap();
+                            let run = ResolvedRun {
+                                case_path: PathBuf::from("tiny-runner.case-v1.yaml"),
+                                repetitions: 2,
+                                case,
+                            };
 
-                        assert_eq!(execution.fixture.source_history_depth, 9);
-                        assert_eq!(execution.fixture.target_history_depth, 9);
-                        assert_eq!(execution.samples.len(), 2);
-                        assert_eq!(
-                            execution.samples[0].input_physical_digest_sha256,
-                            execution.fixture.physical_digest_sha256
-                        );
-                        assert_eq!(
-                            execution.samples[1].input_physical_digest_sha256,
-                            execution.fixture.physical_digest_sha256
-                        );
-                        for sample in execution.samples {
-                            assert_eq!(sample.outcome, "merged");
-                            assert_eq!(sample.route.table_walk_intervals, 2);
-                            assert!(sample.verification.exact_content);
-                            assert!(sample.verification.source_exact_content);
-                            assert!(sample.verification.main_exact_content);
-                            assert!(sample.verification.protected_heads_unchanged);
-                            assert_eq!(sample.verification.tables, 2);
-                            assert_eq!(sample.verification.rows, 24);
-                            assert!(!sample.logical_store_calls.physical_attempts_observed);
+                            let execution = execute_run_inner(
+                                &run,
+                                &RunOptions::default(),
+                                ExecutionGuards {
+                                    verify_environment: false,
+                                    isolate_repetitions: false,
+                                    allow_plain_copy: true,
+                                },
+                            )
+                            .await
+                            .unwrap();
+
+                            assert_eq!(execution.fixture.source_history_depth, 9);
+                            assert_eq!(execution.fixture.target_history_depth, 9);
+                            assert_eq!(execution.samples.len(), 2);
+                            assert_eq!(
+                                execution.samples[0].input_physical_digest_sha256,
+                                execution.fixture.physical_digest_sha256
+                            );
+                            assert_eq!(
+                                execution.samples[1].input_physical_digest_sha256,
+                                execution.fixture.physical_digest_sha256
+                            );
+                            for sample in execution.samples {
+                                assert_eq!(sample.outcome, "merged");
+                                assert_eq!(sample.route.table_walk_intervals, 2);
+                                assert!(sample.verification.exact_content);
+                                assert!(sample.verification.source_exact_content);
+                                assert!(sample.verification.main_exact_content);
+                                assert!(sample.verification.protected_heads_unchanged);
+                                assert_eq!(sample.verification.tables, 2);
+                                assert_eq!(sample.verification.rows, 24);
+                                assert!(!sample.logical_store_calls.physical_attempts_observed);
+                            }
                         }
                     });
             })

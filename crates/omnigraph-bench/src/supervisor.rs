@@ -188,7 +188,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
                 "prepare-timeout",
                 "worker_prepare_timeout",
                 format!(
-                    "repetition {} did not finish open/warmth preparation within {} seconds",
+                    "repetition {} did not finish open/cache preparation within {} seconds",
                     input.repetition,
                     auxiliary_deadline.as_secs()
                 ),

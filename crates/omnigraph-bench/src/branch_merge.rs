@@ -874,15 +874,15 @@ pub async fn initialize_local_fixture(
     })
 }
 
-/// Execute the fixed, read-only `branch-merge-read-set-v1` warmth program.
+/// Execute the fixed, read-only `branch-merge-read-set-v1` warm-up program.
 ///
 /// One iteration reads `main`, [`SOURCE_BRANCH`], and [`TARGET_BRANCH`] in that
 /// order. For each branch it consumes the reachable commit listing, resolves
 /// one coherent snapshot, then fully consumes `id`, `name`, `cohort`, `val`,
 /// and `payload` for every declared diverged table. Scan batches use the same
 /// payload-derived row bound as fixture generation. The program performs no
-/// writes; post-invalidation callers drop and reopen the handle only after it
-/// returns.
+/// writes; `reopened-after-program` callers drop and reopen the handle only
+/// after it returns.
 pub async fn warm_read_set(
     db: &Omnigraph,
     plan: &BranchMergePlan,
@@ -890,7 +890,7 @@ pub async fn warm_read_set(
 ) -> BranchMergeResult<()> {
     if iterations == 0 {
         return Err(unsupported(
-            "environment.warmth.iterations",
+            "environment.cache_condition.iterations",
             "branch-merge-read-set-v1 requires at least one iteration",
         ));
     }
@@ -899,12 +899,12 @@ pub async fn warm_read_set(
         for branch in [MAIN_BRANCH, SOURCE_BRANCH, TARGET_BRANCH] {
             let commits = db.list_commits(Some(branch)).await.map_err(|error| {
                 fixture_error(format!(
-                    "warmth iteration {iteration}: list {branch} commits: {error}"
+                    "warm-up iteration {iteration}: list {branch} commits: {error}"
                 ))
             })?;
             if commits.is_empty() {
                 return Err(fixture_error(format!(
-                    "warmth iteration {iteration}: branch {branch} has no reachable commits"
+                    "warm-up iteration {iteration}: branch {branch} has no reachable commits"
                 )));
             }
             let snapshot = db
@@ -912,7 +912,7 @@ pub async fn warm_read_set(
                 .await
                 .map_err(|error| {
                     fixture_error(format!(
-                        "warmth iteration {iteration}: snapshot {branch}: {error}"
+                        "warm-up iteration {iteration}: snapshot {branch}: {error}"
                     ))
                 })?;
             let mut branch_rows = 0u64;
@@ -922,7 +922,7 @@ pub async fn warm_read_set(
                     .await
                     .map_err(|error| {
                         fixture_error(format!(
-                            "warmth iteration {iteration}: open table {table} on {branch}: {error}"
+                            "warm-up iteration {iteration}: open table {table} on {branch}: {error}"
                         ))
                     })?;
                 let mut scanner = dataset.scan();
@@ -936,19 +936,19 @@ pub async fn warm_read_set(
                     branch_rows = branch_rows
                         .checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
                             fixture_error(format!(
-                                "warmth iteration {iteration}: batch row count does not fit u64"
+                                "warm-up iteration {iteration}: batch row count does not fit u64"
                             ))
                         })?)
                         .ok_or_else(|| {
                             fixture_error(format!(
-                                "warmth iteration {iteration}: row count overflow on {branch}"
+                                "warm-up iteration {iteration}: row count overflow on {branch}"
                             ))
                         })?;
                 }
             }
             if branch_rows == 0 {
                 return Err(fixture_error(format!(
-                    "warmth iteration {iteration}: read set for {branch} was empty"
+                    "warm-up iteration {iteration}: read set for {branch} was empty"
                 )));
             }
         }

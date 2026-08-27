@@ -132,8 +132,7 @@ async fn execute_request(
         &request.expected_physical_digest,
         &request.expected_metadata_digest,
         &plan,
-        validated.definition.environment.warmth.regime,
-        validated.definition.environment.warmth.iterations,
+        &validated.definition.environment.cache_condition,
         deadline,
         signals,
     )
@@ -252,7 +251,7 @@ impl MeasurementSignals for ProtocolSignals {
 /// Own stdin from immediately after the immutable request is decoded.
 ///
 /// The thread waits for the one `Begin` frame while fixture preparation runs,
-/// so parent EOF terminates the process even if open or warmth hangs. After it
+/// so parent EOF terminates the process even if open or cache preparation hangs. After it
 /// forwards that frame it accepts no more protocol input and keeps watching
 /// the pipe until the worker process exits normally.
 fn spawn_parent_watch(
@@ -295,7 +294,7 @@ fn stage_for_error(error: &RunnerError) -> WorkerStageV1 {
         | "worker_identity_mismatch" => WorkerStageV1::Bootstrap,
         "pre_measurement_write_detected"
         | "pre_measurement_state_mismatch"
-        | "warmth_failed"
+        | "cache_preparation_failed"
         | "engine_open_failed"
         | "storage_open_failed" => WorkerStageV1::Prepare,
         "merge_failed" | "merge_deadline_exceeded" | "duration_overflow" => WorkerStageV1::Measure,
@@ -345,7 +344,7 @@ environment:
   backend: { kind: local-fs, filesystem: apfs, storage_class: nvme-ssd }
   network_position: same-host
   execution: embedded
-  warmth: { regime: warm, program: branch-merge-read-set-v1, iterations: 1 }
+  cache_condition: { process: fresh-per-repetition, engine: warmed-by-program, page_cache: program-conditioned, program: branch-merge-read-set-v1, iterations: 1 }
 protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, reset: local-clonefile, timer: monotonic }
 "#,
         )

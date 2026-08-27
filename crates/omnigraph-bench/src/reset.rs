@@ -62,7 +62,7 @@ pub struct PhysicalDigest {
 /// lengths, and can therefore be compared across a clone. `state_sha256` also
 /// contains stable Unix stat fields (including device, inode, mode, link count,
 /// mtime, and ctime) and is only compared against a later observation of the
-/// same tree. Access time is deliberately excluded because read-only warmth and
+/// same tree. Access time is deliberately excluded because read-only cache preparation and
 /// metadata traversal may update it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -274,7 +274,7 @@ impl PreparedClone {
         &self.metadata
     }
 
-    /// Prove without reading contents that open and warmth did not mutate the
+    /// Prove without reading contents that open and cache preparation did not mutate the
     /// measured input before the timer starts.
     pub fn verify_unchanged(&self) -> io::Result<MetadataDigest> {
         verify_metadata_tree(&self.root, &self.metadata, self.limits)
