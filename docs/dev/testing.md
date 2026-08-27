@@ -132,7 +132,7 @@ Commit the generated file with the API change. CI checks drift; it never updates
 
 ## Cost tests and benchmarks
 
-Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness, whose records are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; the engine's deterministic benchmark contracts remain in `crates/omnigraph/tests/`.
+Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time belongs in the `omnigraph-bench` scenario harness, while peak RSS remains owned by `crates/omnigraph/benches/scenarios.rs` until process-level measurement moves into that harness. Both are host-dependent evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; the engine's deterministic benchmark contracts remain in `crates/omnigraph/tests/`.
 
 Keep measurement fixtures separate from production schemas and recovery state. A no-go result belongs in the RFC or issue that consumed the experiment, not as a permanent narrative in this map.
 
