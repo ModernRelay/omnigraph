@@ -425,8 +425,8 @@ mod tests {
 
     use crate::counting::LogicalCallCounts;
     use crate::runner::{
-        ControlCallObservation, LogicalStoreCallObservation, MergeRouteObservation,
-        PhaseObservation, VerificationObservation,
+        ControlCallObservation, LogicalStoreCallObservation, VerificationObservation,
+        test_general_merge_route, test_general_merge_stored_phases,
     };
     use crate::validate_case;
 
@@ -528,22 +528,8 @@ protocol:
             elapsed_us: 42,
             peak_rss_bytes: None,
             outcome: "merged".to_string(),
-            phases: vec![PhaseObservation {
-                phase: "TableWalk".to_string(),
-                total_us: 20,
-                max_us: 20,
-                interval_count: 1,
-            }],
-            route: MergeRouteObservation {
-                table_walk_intervals: 1,
-                stage_merge_insert_calls: 1,
-                stage_merge_insert_rows: 2,
-                stage_known_present_update_calls: 1,
-                stage_known_present_update_rows: 2,
-                stage_fenced_insert_calls: 0,
-                stage_fenced_insert_rows: 0,
-                strict_insert_preflight_calls: 0,
-            },
+            phases: test_general_merge_stored_phases(1, 1),
+            route: test_general_merge_route(1, 1),
             logical_store_calls: LogicalStoreCallObservation {
                 manifest: LogicalCallCounts {
                     get: 1,

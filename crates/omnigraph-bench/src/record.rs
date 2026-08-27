@@ -10,7 +10,6 @@
 //! Rejecting reordered, duplicate, unknown, or otherwise non-canonical input
 //! makes the SHA-256 content address unambiguous.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -26,9 +25,9 @@ use crate::counting::LogicalCallCounts;
 use crate::machine::MachineIdentityV1;
 use crate::model::typed_sha256;
 use crate::runner::{
-    ControlCallObservation, EffectiveEnvironmentValue, MergeRouteObservation,
-    PHYSICAL_TREE_DIGEST_ALGORITHM, PhaseObservation, RepObservation, RunExecution,
-    VerificationObservation,
+    ControlCallObservation, EffectiveEnvironmentValue, MergePhaseEvidenceForm,
+    MergeRouteObservation, PHYSICAL_TREE_DIGEST_ALGORITHM, PhaseObservation, RepObservation,
+    RunExecution, VerificationObservation, validate_successful_merge_phase_topology,
 };
 use crate::suite::MAX_REPETITIONS_PER_CASE;
 use crate::{CASE_FORMAT_VERSION, POINT_IDENTITY_VERSION, ResolvedRun, validate_case};
@@ -40,6 +39,10 @@ pub use crate::runner::{
 };
 
 /// Version of the durable run-record contract.
+///
+/// RFC 0039 permits semantic corrections in place before the first published
+/// citation. After that boundary, any validity-rule change requires a new
+/// record version.
 pub const RUN_RECORD_FORMAT_VERSION: u32 = 1;
 /// Rule-7 default: a claim must exceed two times its applicable floor.
 pub const DEFAULT_FLOOR_MULTIPLIER_MILLIS: u32 = 2_000;
@@ -1306,14 +1309,25 @@ fn validate_measurements(
             ));
         }
         validate_projected_call_totals(index, sample)?;
-        if sample.route.table_walk_intervals != expected_walks {
-            return Err(RecordError::new(
-                "route_evidence_mismatch",
-                format!("measurements.raw_samples[{index}].route.table_walk_intervals"),
-                format!("expected exactly {expected_walks} TableWalk intervals"),
-            ));
+        for (phase_index, phase) in sample.phases.iter().enumerate() {
+            validate_text(
+                &phase.phase,
+                &format!("measurements.raw_samples[{index}].phases[{phase_index}].phase"),
+            )?;
         }
-        validate_phases(index, &sample.phases, expected_walks)?;
+        validate_successful_merge_phase_topology(
+            &sample.phases,
+            &sample.route,
+            expected_walks,
+            MergePhaseEvidenceForm::StoredSample,
+        )
+        .map_err(|error| {
+            RecordError::new(
+                error.code(),
+                format!("measurements.raw_samples[{index}].phases"),
+                error.to_string(),
+            )
+        })?;
         let verification = &sample.verification;
         validate_text(
             &verification.branch,
@@ -1440,53 +1454,6 @@ fn checked_call_sum(
         })?;
     }
     Ok(total)
-}
-
-fn validate_phases(
-    index: usize,
-    phases: &[PhaseObservation],
-    expected_walks: u64,
-) -> RecordResult<()> {
-    if phases.is_empty() {
-        return Err(RecordError::new(
-            "missing_phase_evidence",
-            format!("measurements.raw_samples[{index}].phases"),
-            "per-phase attribution requires at least one observed phase",
-        ));
-    }
-    let mut names = BTreeSet::new();
-    let mut table_walk = None;
-    for (phase_index, phase) in phases.iter().enumerate() {
-        validate_text(
-            &phase.phase,
-            &format!("measurements.raw_samples[{index}].phases[{phase_index}].phase"),
-        )?;
-        if !names.insert(phase.phase.as_str()) {
-            return Err(RecordError::new(
-                "duplicate_phase",
-                format!("measurements.raw_samples[{index}].phases[{phase_index}].phase"),
-                format!("phase `{}` occurs more than once", phase.phase),
-            ));
-        }
-        if phase.interval_count == 0 || phase.max_us > phase.total_us {
-            return Err(RecordError::new(
-                "invalid_phase_measurement",
-                format!("measurements.raw_samples[{index}].phases[{phase_index}]"),
-                "phase intervals must be nonzero and max_us cannot exceed total_us",
-            ));
-        }
-        if phase.phase == "TableWalk" {
-            table_walk = Some(phase.interval_count);
-        }
-    }
-    if table_walk != Some(expected_walks) {
-        return Err(RecordError::new(
-            "table_walk_phase_mismatch",
-            format!("measurements.raw_samples[{index}].phases"),
-            format!("TableWalk must contain exactly {expected_walks} intervals"),
-        ));
-    }
-    Ok(())
 }
 
 fn summarize_wall_clock(samples: &[RawSampleV1]) -> RecordResult<WallClockSummaryV1> {
@@ -1726,6 +1693,7 @@ pub(crate) mod tests {
     use crate::machine::MACHINE_IDENTITY_FORMAT_VERSION;
     use crate::runner::{
         BuildEvidence, FixtureObservation, LogicalStoreCallObservation, WallClockSummary,
+        test_general_merge_route, test_general_merge_stored_phases,
     };
     use crate::{RUNNER_OUTPUT_VERSION, parse_case};
 
@@ -1766,22 +1734,8 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
             elapsed_us,
             peak_rss_bytes: Some(32 * 1024 * 1024),
             outcome: "merged".to_string(),
-            phases: vec![PhaseObservation {
-                phase: "TableWalk".to_string(),
-                total_us: 8,
-                max_us: 3,
-                interval_count: 4,
-            }],
-            route: MergeRouteObservation {
-                table_walk_intervals: 4,
-                stage_merge_insert_calls: 1,
-                stage_merge_insert_rows: 10,
-                stage_known_present_update_calls: 1,
-                stage_known_present_update_rows: 10,
-                stage_fenced_insert_calls: 1,
-                stage_fenced_insert_rows: 10,
-                strict_insert_preflight_calls: 1,
-            },
+            phases: test_general_merge_stored_phases(4, 4),
+            route: test_general_merge_route(4, 4),
             logical_store_calls: LogicalStoreCallObservation {
                 manifest: LogicalCallCounts {
                     get: 2,
@@ -2033,6 +1987,37 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
             record.measurements.raw_samples[1].input_physical_digest_sha256
         );
         validate_run_record(&record).unwrap();
+    }
+
+    #[test]
+    fn durable_records_reject_empty_missing_publish_and_bad_enclosure_phase_evidence() {
+        let mut empty = valid_record();
+        empty.measurements.raw_samples[0].phases.clear();
+        assert_eq!(
+            validate_run_record(&empty).unwrap_err().code,
+            "missing_phase_evidence"
+        );
+
+        let mut missing_publish = valid_record();
+        missing_publish.measurements.raw_samples[0]
+            .phases
+            .retain(|phase| phase.phase != "PhysicalPublish");
+        assert_eq!(
+            validate_run_record(&missing_publish).unwrap_err().code,
+            "missing_phase_evidence"
+        );
+
+        let mut bad_enclosure = valid_record();
+        let physical_publish = bad_enclosure.measurements.raw_samples[0]
+            .phases
+            .iter_mut()
+            .find(|phase| phase.phase == "PhysicalPublish")
+            .unwrap();
+        physical_publish.total_us = 20;
+        physical_publish.max_us = 20;
+        let error = validate_run_record(&bad_enclosure).unwrap_err();
+        assert_eq!(error.code, "phase_topology_mismatch");
+        assert!(error.message.contains("does not enclose"));
     }
 
     #[test]

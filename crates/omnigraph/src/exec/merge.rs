@@ -3250,9 +3250,6 @@ async fn publish_proven_pure_insert_adopt(
     prepared_target: PreparedExistingMergeTarget,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
 ) -> Result<crate::db::DatasetUpdate> {
-    let publish_timing = crate::instrumentation::start_merge_timing(
-        crate::instrumentation::MergeTimingPhase::PhysicalPublish,
-    );
     let (current, full_path, table_branch) = prepared_target.into_parts();
     let source = SnapshotHandle::new(proven.source.clone());
     let stream = target_db
@@ -3290,7 +3287,6 @@ async fn publish_proven_pure_insert_adopt(
         .storage()
         .table_state(&full_path, &committed)
         .await?;
-    publish_timing.finish();
 
     Ok(crate::db::DatasetUpdate {
         identity,
@@ -4414,6 +4410,9 @@ impl Omnigraph {
                 )?;
             }
 
+            let physical_publish_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::PhysicalPublish,
+            );
             let mut updates = Vec::new();
             let mut changed_edge_tables = false;
             let mut confirmed_ref_identifiers = HashMap::new();
@@ -4542,6 +4541,7 @@ impl Omnigraph {
                 }
                 updates.push(update);
             }
+            physical_publish_timing.finish();
 
             // The Armed body remains rollback-only until every physical effect,
             // every first-touch ref identity, and every logical output slot are

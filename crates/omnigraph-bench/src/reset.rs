@@ -1581,6 +1581,26 @@ mod tests {
         assert!(error.to_string().contains("special files"));
     }
 
+    #[test]
+    fn retired_source_containment_accepts_a_sibling_but_refuses_the_source_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let active = workspace.path().join("active");
+        let template = workspace.path().join("template");
+        fs::create_dir(&template).unwrap();
+        assert!(!active.exists());
+
+        refuse_destination_below_retired_source(&active, &template).unwrap();
+
+        let error = refuse_destination_below_retired_source(&active, &active).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("must not equal or lie below the fixture root"),
+            "{error}"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn clonefile_template_restores_exact_active_path_with_cow_isolation() {
