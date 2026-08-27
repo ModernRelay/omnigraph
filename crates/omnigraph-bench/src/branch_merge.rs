@@ -10,11 +10,15 @@ use std::error::Error;
 use std::fmt::{Display, Formatter, Write as _};
 
 use arrow_array::{Array, Int32Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
+use arrow_schema::Schema as ArrowSchema;
 use futures::TryStreamExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::{compile_schema_shape, schema_shape_from_ir, schema_shape_json};
+use sha2::{Digest, Sha256};
 
 use crate::ValidatedCase;
 use crate::case::{
@@ -32,6 +36,7 @@ const BUILDER_VERSION: u32 = SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION;
 const SUPPORTED_SEED: u64 = 0;
 const UPDATE_VALUE: i32 = i32::MAX;
 const NEW_COHORT: &str = "new";
+const LOGICAL_FIXTURE_DIGEST_DOMAIN: &[u8] = b"omnigraph-bench-logical-fixture-v1\0";
 
 /// The engine's keyed-write limits. Chunks stay at or below half of either
 /// limit so JSON framing and future small schema additions cannot place a
@@ -779,6 +784,11 @@ pub struct FixtureBuildSummary {
     pub optimized_user_tables: usize,
     pub source_history_depth: u64,
     pub target_history_depth: u64,
+    /// Digest of the exactly verified user-visible schema, physically proven
+    /// empty index inventory, and rows on every frozen branch. Unlike the
+    /// physical tree digest, this remains stable across Lance ids, timestamps,
+    /// compaction layout, and encoding.
+    pub logical_content_sha256: String,
 }
 
 /// Initialize, fully diverge, and verify a local fixture at `root_uri`.
@@ -856,9 +866,43 @@ pub async fn initialize_local_fixture(
     diverge(&db, SOURCE_BRANCH, Side::Source, plan, &queries).await?;
     diverge(&db, TARGET_BRANCH, Side::Target, plan, &queries).await?;
 
-    verify_branch(&db, SOURCE_BRANCH, plan, BranchState::Source).await?;
-    verify_branch(&db, TARGET_BRANCH, plan, BranchState::Target).await?;
-
+    let schema_shape = verified_schema_shape_json(&db, plan)?;
+    let mut logical_digest = Sha256::new();
+    logical_digest.update(LOGICAL_FIXTURE_DIGEST_DOMAIN);
+    hash_logical_field(
+        &mut logical_digest,
+        b"schema-shape",
+        schema_shape.as_bytes(),
+    );
+    // Builder v2 declares no secondary indexes. The per-branch verification
+    // below proves that every node and edge manifest has an empty physical
+    // index inventory before this declared empty inventory is certified in the
+    // logical digest. Compaction layout and encoding remain derived state.
+    hash_logical_field(&mut logical_digest, b"logical-index-inventory", b"[]");
+    verify_branch(
+        &db,
+        MAIN_BRANCH,
+        plan,
+        BranchState::Main,
+        Some(&mut logical_digest),
+    )
+    .await?;
+    verify_branch(
+        &db,
+        SOURCE_BRANCH,
+        plan,
+        BranchState::Source,
+        Some(&mut logical_digest),
+    )
+    .await?;
+    verify_branch(
+        &db,
+        TARGET_BRANCH,
+        plan,
+        BranchState::Target,
+        Some(&mut logical_digest),
+    )
+    .await?;
     let source_history_depth = u64::try_from(
         db.list_commits(Some(SOURCE_BRANCH))
             .await
@@ -884,6 +928,7 @@ pub async fn initialize_local_fixture(
             ),
         ));
     }
+    let logical_content_sha256 = format!("{:x}", logical_digest.finalize());
 
     drop(db);
     Ok(FixtureBuildSummary {
@@ -891,7 +936,173 @@ pub async fn initialize_local_fixture(
         optimized_user_tables,
         source_history_depth,
         target_history_depth,
+        logical_content_sha256,
     })
+}
+
+fn verified_schema_shape_json(db: &Omnigraph, plan: &BranchMergePlan) -> BranchMergeResult<String> {
+    let catalog = db.catalog();
+    let accepted_ir = catalog.bound_schema_ir().ok_or_else(|| {
+        verification_error("fixture catalog is not bound to the accepted schema identity")
+    })?;
+    let observed = schema_shape_from_ir(accepted_ir).map_err(|error| {
+        verification_error(format!("project accepted fixture schema shape: {error}"))
+    })?;
+    let expected_source = schema_source(plan.tables);
+    let expected_ast = parse_schema(&expected_source)
+        .map_err(|error| verification_error(format!("parse builder-v2 schema: {error}")))?;
+    let expected = compile_schema_shape(&expected_ast)
+        .map_err(|error| verification_error(format!("compile builder-v2 schema shape: {error}")))?;
+    if observed != expected {
+        return Err(verification_error(
+            "accepted fixture schema differs from the complete canonical builder-v2 schema shape",
+        ));
+    }
+    schema_shape_json(&observed)
+        .map_err(|error| verification_error(format!("serialize fixture schema shape: {error}")))
+}
+
+fn logical_node_row_sha256(
+    ty: &str,
+    id: &str,
+    name: &str,
+    cohort: &str,
+    value: i32,
+    payload: &str,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"node-row\0");
+    for (label, bytes) in [
+        (b"type".as_slice(), ty.as_bytes()),
+        (b"id".as_slice(), id.as_bytes()),
+        (b"name".as_slice(), name.as_bytes()),
+        (b"cohort".as_slice(), cohort.as_bytes()),
+        (b"payload".as_slice(), payload.as_bytes()),
+    ] {
+        hash_logical_field(&mut digest, label, bytes);
+    }
+    hash_logical_field(&mut digest, b"val-i32-le", &value.to_le_bytes());
+    digest.finalize().into()
+}
+
+fn logical_edge_row_sha256(
+    ty: &str,
+    id: &str,
+    src: &str,
+    dst: &str,
+    cohort: &str,
+    value: i32,
+    payload: &str,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"edge-row\0");
+    for (label, bytes) in [
+        (b"type".as_slice(), ty.as_bytes()),
+        (b"id".as_slice(), id.as_bytes()),
+        (b"src".as_slice(), src.as_bytes()),
+        (b"dst".as_slice(), dst.as_bytes()),
+        (b"cohort".as_slice(), cohort.as_bytes()),
+        (b"payload".as_slice(), payload.as_bytes()),
+    ] {
+        hash_logical_field(&mut digest, label, bytes);
+    }
+    hash_logical_field(&mut digest, b"val-i32-le", &value.to_le_bytes());
+    digest.finalize().into()
+}
+
+/// Hash deterministic node rows only after the physical scan proved exact
+/// equality with the builder-v2 model.
+fn hash_verified_node_rows(
+    digest: &mut Sha256,
+    table: usize,
+    plan: &BranchMergePlan,
+    payload: &str,
+) -> BranchMergeResult<()> {
+    let ty = node_type_name(table);
+    for index in 0..plan.rows_per_table {
+        let value = i32::try_from(index).map_err(|_| {
+            verification_error(format!(
+                "node table {table}: canonical ordinal {index} does not fit I32"
+            ))
+        })?;
+        let name = node_name(table, index);
+        let row = logical_node_row_sha256(&ty, &name, &name, "keep", value, payload);
+        hash_logical_field(digest, b"row-sha256", &row);
+    }
+    Ok(())
+}
+
+/// Hash deterministic edge rows only after the physical scan proved exact
+/// equality with the builder-v2 model.
+fn hash_verified_edge_rows(
+    digest: &mut Sha256,
+    table: usize,
+    plan: &BranchMergePlan,
+    state: BranchState,
+    base_payload: &str,
+    insert_payload: &str,
+) -> BranchMergeResult<()> {
+    let ty = edge_type_name(table);
+    for index in 0..plan.rows_per_table {
+        let cohort = plan.base_cohort(table, index);
+        let present = match cohort {
+            BaseCohort::SourceDelete(_) => !state.has_source_effects(),
+            BaseCohort::TargetDelete(_) => !state.has_target_effects(),
+            _ => true,
+        };
+        if !present {
+            continue;
+        }
+        let value = match cohort {
+            BaseCohort::SourceUpdate(_) if state.has_source_effects() => UPDATE_VALUE,
+            BaseCohort::TargetUpdate(_) if state.has_target_effects() => UPDATE_VALUE,
+            _ => i32::try_from(index).map_err(|_| {
+                verification_error(format!(
+                    "edge table {table}: canonical base ordinal {index} does not fit I32"
+                ))
+            })?,
+        };
+        let id = base_edge_id(table, index);
+        let (src, dst) = edge_endpoints(plan, table, index);
+        let row =
+            logical_edge_row_sha256(&ty, &id, &src, &dst, cohort.label(), value, base_payload);
+        hash_logical_field(digest, b"row-sha256", &row);
+    }
+    for (side, enabled, count) in [
+        (
+            Side::Source,
+            state.has_source_effects(),
+            delta_for(plan, table).source.inserts,
+        ),
+        (
+            Side::Target,
+            state.has_target_effects(),
+            delta_for(plan, table).target.inserts,
+        ),
+    ] {
+        if !enabled {
+            continue;
+        }
+        for index in 0..count {
+            let value = i32::try_from(index).map_err(|_| {
+                verification_error(format!(
+                    "edge table {table}: canonical insert ordinal {index} does not fit I32"
+                ))
+            })?;
+            let id = insert_edge_id(side, table, index);
+            let (src, dst) = edge_endpoints(plan, table, index);
+            let row =
+                logical_edge_row_sha256(&ty, &id, &src, &dst, NEW_COHORT, value, insert_payload);
+            hash_logical_field(digest, b"row-sha256", &row);
+        }
+    }
+    Ok(())
+}
+fn hash_logical_field(digest: &mut Sha256, label: &[u8], value: &[u8]) {
+    digest.update((label.len() as u64).to_le_bytes());
+    digest.update(label);
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
 }
 
 /// Execute the fixed, read-only `branch-merge-read-set-v1` warm-up program.
@@ -1024,9 +1235,9 @@ pub async fn verify_merged_graph(
     plan: &BranchMergePlan,
     protected: &ProtectedBranchHeads,
 ) -> BranchMergeResult<MergeVerificationSummary> {
-    let target = verify_branch(db, TARGET_BRANCH, plan, BranchState::Merged).await?;
-    verify_branch(db, SOURCE_BRANCH, plan, BranchState::Source).await?;
-    verify_branch(db, MAIN_BRANCH, plan, BranchState::Main).await?;
+    let target = verify_branch(db, TARGET_BRANCH, plan, BranchState::Merged, None).await?;
+    verify_branch(db, SOURCE_BRANCH, plan, BranchState::Source, None).await?;
+    verify_branch(db, MAIN_BRANCH, plan, BranchState::Main, None).await?;
     let source_head = exact_branch_head(db, SOURCE_BRANCH).await?;
     let main_head = exact_branch_head(db, MAIN_BRANCH).await?;
     if source_head != protected.source || main_head != protected.main {
@@ -1390,6 +1601,7 @@ async fn verify_branch(
     branch: &str,
     plan: &BranchMergePlan,
     state: BranchState,
+    mut logical_digest: Option<&mut Sha256>,
 ) -> BranchMergeResult<VerificationSummary> {
     let snapshot = db
         .snapshot_of(ReadTarget::branch(branch))
@@ -1398,13 +1610,37 @@ async fn verify_branch(
     let mut total_rows = 0u64;
     let base_payload = "x".repeat(plan.payload_bytes);
     let insert_payload = "y".repeat(plan.payload_bytes);
+    if let Some(digest) = logical_digest.as_deref_mut() {
+        hash_logical_field(digest, b"branch", branch.as_bytes());
+    }
+    let catalog = db.catalog();
     for table in 0..plan.node_tables() {
+        let ty = node_type_name(table);
         let dataset = snapshot
             .open_dataset(&node_table_key(table))
             .await
             .map_err(|error| {
                 verification_error(format!("open node table {table} on {branch}: {error}"))
             })?;
+        let expected_schema = catalog.node_types.get(&ty).ok_or_else(|| {
+            verification_error(format!(
+                "accepted fixture catalog has no expected node type {ty}"
+            ))
+        })?;
+        let observed_schema = ArrowSchema::from(dataset.schema());
+        if observed_schema != *expected_schema.arrow_schema {
+            return Err(verification_error(format!(
+                "table {table} on {branch} has a physical schema that differs from the complete accepted schema for {ty}"
+            )));
+        }
+        if dataset.has_raw_index_section() {
+            return Err(verification_error(format!(
+                "node table {table} on {branch} carries a raw Lance index-metadata section, but builder v2 declares indexes: []"
+            )));
+        }
+        if let Some(digest) = logical_digest.as_deref_mut() {
+            hash_logical_field(digest, b"type", ty.as_bytes());
+        }
         let mut scanner = dataset.scan();
         scanner.project(&["id", "name", "cohort", "val", "payload"])?;
         let mut stream = scanner.try_into_stream().await?;
@@ -1425,15 +1661,42 @@ async fn verify_branch(
             )));
         }
         total_rows = checked_add_verified_rows(total_rows, actual_rows, "node", table)?;
+        if let Some(digest) = logical_digest.as_deref_mut() {
+            let rows = u64::try_from(actual_rows).map_err(|_| {
+                verification_error(format!("node row count does not fit u64 on table {table}"))
+            })?;
+            hash_logical_field(digest, b"row-count-u64-be", &rows.to_be_bytes());
+            hash_verified_node_rows(digest, table, plan, &base_payload)?;
+        }
     }
 
     for table in 0..plan.edge_tables() {
+        let ty = edge_type_name(table);
         let dataset = snapshot
             .open_dataset(&edge_table_key(table))
             .await
             .map_err(|error| {
                 verification_error(format!("open edge table {table} on {branch}: {error}"))
             })?;
+        let expected_schema = catalog.edge_types.get(&ty).ok_or_else(|| {
+            verification_error(format!(
+                "accepted fixture catalog has no expected edge type {ty}"
+            ))
+        })?;
+        let observed_schema = ArrowSchema::from(dataset.schema());
+        if observed_schema != *expected_schema.arrow_schema {
+            return Err(verification_error(format!(
+                "edge table {table} on {branch} has a physical schema that differs from the complete accepted schema for {ty}"
+            )));
+        }
+        if dataset.has_raw_index_section() {
+            return Err(verification_error(format!(
+                "edge table {table} on {branch} carries a raw Lance index-metadata section, but builder v2 declares indexes: []"
+            )));
+        }
+        if let Some(digest) = logical_digest.as_deref_mut() {
+            hash_logical_field(digest, b"type", ty.as_bytes());
+        }
         let mut scanner = dataset.scan();
         scanner.project(&["id", "src", "dst", "cohort", "val", "payload"])?;
         let mut stream = scanner.try_into_stream().await?;
@@ -1469,7 +1732,14 @@ async fn verify_branch(
                 "edge table {table} on {branch} has {actual_rows} exact-valid rows, expected {expected_rows}; at least one expected id is missing"
             )));
         }
+        let actual_rows_u64 = u64::try_from(actual_rows).map_err(|_| {
+            verification_error(format!("edge row count does not fit u64 on table {table}"))
+        })?;
         total_rows = checked_add_verified_rows(total_rows, actual_rows, "edge", table)?;
+        if let Some(digest) = logical_digest.as_deref_mut() {
+            hash_logical_field(digest, b"row-count-u64-be", &actual_rows_u64.to_be_bytes());
+            hash_verified_edge_rows(digest, table, plan, state, &base_payload, &insert_payload)?;
+        }
     }
     Ok(VerificationSummary {
         branch: branch.to_string(),
@@ -1996,6 +2266,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fixture_initialization_proves_logical_rebuild_stability_and_history_depth() {
+        // Two user tables require two base publications. Delta three yields one
+        // update, delete, and insert publication on each named branch.
+        let mut plan = plan(32, 1, 3);
+        plan.compaction_recency = CompactionRecency::NotOptimized;
+        plan.requested_history_depth = 6;
+        assert_eq!(plan.preflight().unwrap().expected_history_depth, 6);
+
+        let directory = tempfile::tempdir().unwrap();
+        let summary = initialize_local_fixture(directory.path().to_str().unwrap(), &plan)
+            .await
+            .unwrap();
+        assert_eq!(summary.base_load_commits, 2);
+        assert_eq!(summary.optimized_user_tables, 0);
+        assert_eq!(summary.source_history_depth, 6);
+        assert_eq!(summary.target_history_depth, 6);
+        assert_eq!(summary.logical_content_sha256.len(), 64);
+
+        let rebuilt_directory = tempfile::tempdir().unwrap();
+        let rebuilt = initialize_local_fixture(rebuilt_directory.path().to_str().unwrap(), &plan)
+            .await
+            .unwrap();
+        assert_eq!(
+            rebuilt.logical_content_sha256, summary.logical_content_sha256,
+            "fresh ULIDs, timestamps, and physical Lance bytes must not change logical identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn optimized_direct_plan_cannot_certify_declared_empty_index_state() {
+        let mut plan = plan(4_097, 1, 1);
+        plan.compaction_recency = CompactionRecency::Optimized;
+        plan.requested_history_depth = 7;
+        let preflight = plan.preflight().unwrap();
+        assert_eq!(preflight.optimize_commits, 1);
+
+        let directory = tempfile::tempdir().unwrap();
+        let error = initialize_local_fixture(directory.path().to_str().unwrap(), &plan)
+            .await
+            .expect_err("optimized manifests cannot certify builder v2's indexes: [] state");
+        let fixture_error = error
+            .downcast_ref::<BranchMergeError>()
+            .expect("fixture certification must return a classified scenario error");
+        assert_eq!(fixture_error.kind(), BranchMergeErrorKind::Verification);
+        assert!(
+            error
+                .to_string()
+                .contains("raw Lance index-metadata section, but builder v2 declares indexes: []"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn every_declared_diverged_table_requires_an_update_on_both_sides() {
         for tables in [1, 2, 4, 17] {
@@ -2092,6 +2415,77 @@ mod tests {
             );
         }
         assert_eq!(plan.expected_merged_rows().unwrap(), 7_998);
+    }
+
+    #[test]
+    fn logical_node_and_edge_digests_are_stable_and_content_sensitive() {
+        let node = logical_node_row_sha256(
+            "BenchN000",
+            "n000_r0000007",
+            "n000_r0000007",
+            "keep",
+            7,
+            "payload",
+        );
+        assert_eq!(
+            node,
+            logical_node_row_sha256(
+                "BenchN000",
+                "n000_r0000007",
+                "n000_r0000007",
+                "keep",
+                7,
+                "payload",
+            )
+        );
+        assert_ne!(
+            node,
+            logical_node_row_sha256(
+                "BenchN000",
+                "n000_r0000007",
+                "renamed",
+                "keep",
+                7,
+                "payload",
+            ),
+            "a logical node property change must change the row digest"
+        );
+
+        let edge = logical_edge_row_sha256(
+            "BenchE000",
+            "e000_r0000007",
+            "n000_r0000007",
+            "n001_r0000007",
+            "keep",
+            7,
+            "payload",
+        );
+        assert_eq!(
+            edge,
+            logical_edge_row_sha256(
+                "BenchE000",
+                "e000_r0000007",
+                "n000_r0000007",
+                "n001_r0000007",
+                "keep",
+                7,
+                "payload",
+            )
+        );
+        assert_ne!(
+            edge,
+            logical_edge_row_sha256(
+                "BenchE000",
+                "e000_r0000007",
+                "n000_r0000007",
+                "n000_r0000008",
+                "keep",
+                7,
+                "payload",
+            ),
+            "a logical edge endpoint change must change the row digest"
+        );
+        assert_ne!(node, edge, "node and edge rows use separate digest domains");
     }
 
     #[test]

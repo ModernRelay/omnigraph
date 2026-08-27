@@ -42,16 +42,23 @@ pub async fn run_worker_stdio_v1() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let worker_build = match std::env::current_exe()
+    let executable_digest = match std::env::current_exe()
         .map_err(|error| error.to_string())
         .and_then(|path| digest_worker_executable(&path).map_err(|error| error.to_string()))
     {
-        Ok(digest) => crate::runner::worker_build_attestation(digest),
+        Ok(digest) => digest,
         Err(message) => {
             let error = RunnerError::new(
                 "worker_attestation_failed",
                 format!("could not attest the running worker executable: {message}"),
             );
+            let _ = send_failure(&mut output, WorkerStageV1::Bootstrap, &error, None);
+            return ExitCode::FAILURE;
+        }
+    };
+    let worker_build = match crate::runner::worker_build_attestation(executable_digest) {
+        Ok(build) => build,
+        Err(error) => {
             let _ = send_failure(&mut output, WorkerStageV1::Bootstrap, &error, None);
             return ExitCode::FAILURE;
         }
@@ -81,9 +88,23 @@ pub async fn run_worker_stdio_v1() -> ExitCode {
             }
         }
         Err(error) => {
-            let stage = stage_for_error(&error);
             let settled = error.context.settled_sample.clone();
-            if let Err(protocol_error) = send_failure(&mut signals.output, stage, &error, settled) {
+            let (stage, emitted_error) = match stage_for_error(&error) {
+                Some(stage) => (stage, error),
+                None => (
+                    WorkerStageV1::Protocol,
+                    RunnerError::new(
+                        "worker_stage_unclassified",
+                        format!(
+                            "worker error code `{}` has no declared execution-stage mapping",
+                            error.code
+                        ),
+                    ),
+                ),
+            };
+            if let Err(protocol_error) =
+                send_failure(&mut signals.output, stage, &emitted_error, settled)
+            {
                 eprintln!("could not send structured worker failure: {protocol_error}");
             }
             ExitCode::FAILURE
@@ -118,6 +139,7 @@ async fn execute_request(
     signals: &mut ProtocolSignals,
 ) -> RunnerResult<crate::runner::RepObservation> {
     crate::runner::enforce_release_build()?;
+    crate::runner::validate_benchmark_child_runtime_overrides(&request.worker_scratch_root)?;
     let validated = validate_worker_case(request)?;
     let plan = BranchMergePlan::try_from(&validated)
         .map_err(|error| RunnerError::new("unsupported_runner_axis", error.to_string()))?;
@@ -147,6 +169,78 @@ fn validate_worker_case(request: &WorkerRequestV1) -> RunnerResult<ValidatedCase
                 "repetition root must be absolute: {}",
                 request.repetition_root.display()
             ),
+        ));
+    }
+    if !request.worker_scratch_root.is_absolute() {
+        return Err(RunnerError::new(
+            "worker_protocol_error",
+            "worker scratch root must be absolute",
+        ));
+    }
+    let expected_name = format!("worker-scratch-{:08}", request.repetition);
+    if request
+        .worker_scratch_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(expected_name.as_str())
+    {
+        return Err(RunnerError::new(
+            "worker_protocol_error",
+            "worker scratch root does not match the repetition identity",
+        ));
+    }
+    let scratch_metadata =
+        std::fs::symlink_metadata(&request.worker_scratch_root).map_err(|error| {
+            RunnerError::new(
+                "worker_protocol_error",
+                format!("could not inspect worker scratch root: {error}"),
+            )
+        })?;
+    if scratch_metadata.file_type().is_symlink() || !scratch_metadata.is_dir() {
+        return Err(RunnerError::new(
+            "worker_protocol_error",
+            "worker scratch root must be a real directory",
+        ));
+    }
+    let repetition_root = std::fs::canonicalize(&request.repetition_root).map_err(|error| {
+        RunnerError::new(
+            "worker_protocol_error",
+            format!("could not resolve worker repetition root: {error}"),
+        )
+    })?;
+    let worker_scratch_root =
+        std::fs::canonicalize(&request.worker_scratch_root).map_err(|error| {
+            RunnerError::new(
+                "worker_protocol_error",
+                format!("could not resolve worker scratch root: {error}"),
+            )
+        })?;
+    if repetition_root.parent() != worker_scratch_root.parent() {
+        return Err(RunnerError::new(
+            "worker_protocol_error",
+            "worker scratch root must be a sibling of the repetition store on the same verified scratch backend",
+        ));
+    }
+    let mut entries = std::fs::read_dir(&worker_scratch_root).map_err(|error| {
+        RunnerError::new(
+            "worker_protocol_error",
+            format!("could not inspect worker scratch contents: {error}"),
+        )
+    })?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|error| {
+            RunnerError::new(
+                "worker_protocol_error",
+                format!("could not inspect worker scratch entry: {error}"),
+            )
+        })?
+        .is_some()
+    {
+        return Err(RunnerError::new(
+            "worker_protocol_error",
+            "worker scratch root must be empty before measurement preparation",
         ));
     }
     let validated = validate_case(request.case.clone())
@@ -192,6 +286,15 @@ struct ProtocolSignals {
 
 impl MeasurementSignals for ProtocolSignals {
     fn ready(&mut self) -> RunnerResult<()> {
+        // Observe the child rather than the CLI/supervisor process. This probe
+        // runs after fixture preparation but before Ready releases the parent
+        // to start the measured clock.
+        let machine = crate::machine::capture_machine_identity().map_err(|error| {
+            RunnerError::new(
+                "machine_identity_capture_failed",
+                format!("could not capture repetition-worker machine identity: {error}"),
+            )
+        })?;
         write_frame(
             &mut self.output,
             &ChildFrameV1::Ready {
@@ -200,6 +303,7 @@ impl MeasurementSignals for ProtocolSignals {
                 point_id: self.request.expected_point_id.clone(),
                 case_digest: self.request.expected_case_digest.clone(),
                 worker_build: self.worker_build.clone(),
+                machine,
                 physical_digest: self.request.expected_physical_digest.clone(),
                 metadata_digest: self.request.expected_metadata_digest.clone(),
             },
@@ -286,18 +390,23 @@ fn spawn_parent_watch(
     Ok(receive)
 }
 
-fn stage_for_error(error: &RunnerError) -> WorkerStageV1 {
-    match error.code.as_str() {
+fn stage_for_error(error: &RunnerError) -> Option<WorkerStageV1> {
+    Some(match error.code.as_str() {
         "release_build_required"
         | "worker_attestation_failed"
+        | "worker_build_attestation_invalid"
         | "worker_case_invalid"
         | "worker_identity_mismatch"
+        | "invalid_lance_mem_pool_size"
+        | "unsupported_runtime_override"
+        | "build_attestation_environment_mismatch"
         | "unsupported_runner_axis" => WorkerStageV1::Bootstrap,
         "pre_measurement_write_detected"
         | "pre_measurement_shape_mismatch"
         | "cache_preparation_failed"
         | "protected_head_capture_failed"
         | "unsupported_cache_condition"
+        | "machine_identity_capture_failed"
         | "engine_open_failed"
         | "storage_open_failed"
         | "non_utf8_path" => WorkerStageV1::Prepare,
@@ -309,8 +418,8 @@ fn stage_for_error(error: &RunnerError) -> WorkerStageV1 {
         | "missing_table_walk_phase"
         | "interval_overflow" => WorkerStageV1::Verify,
         "worker_protocol_error" | "worker_parent_disconnected" => WorkerStageV1::Protocol,
-        _ => WorkerStageV1::Finalize,
-    }
+        _ => return None,
+    })
 }
 
 fn send_failure(
@@ -338,20 +447,29 @@ mod tests {
     #[test]
     fn pre_ready_protected_head_failure_is_classified_as_prepare() {
         let error = RunnerError::new("protected_head_capture_failed", "capture failed");
-        assert_eq!(stage_for_error(&error), WorkerStageV1::Prepare);
+        assert_eq!(stage_for_error(&error), Some(WorkerStageV1::Prepare));
     }
 
     #[test]
     fn reachable_errors_are_classified_at_their_owning_stage() {
         for (code, expected) in [
+            ("unsupported_runtime_override", WorkerStageV1::Bootstrap),
+            (
+                "build_attestation_environment_mismatch",
+                WorkerStageV1::Bootstrap,
+            ),
+            ("invalid_lance_mem_pool_size", WorkerStageV1::Bootstrap),
+            ("worker_build_attestation_invalid", WorkerStageV1::Bootstrap),
             ("unsupported_runner_axis", WorkerStageV1::Bootstrap),
             ("non_utf8_path", WorkerStageV1::Prepare),
             ("counter_regression", WorkerStageV1::Measure),
             ("interval_overflow", WorkerStageV1::Verify),
         ] {
             let error = RunnerError::new(code, "test failure");
-            assert_eq!(stage_for_error(&error), expected, "{code}");
+            assert_eq!(stage_for_error(&error), Some(expected), "{code}");
         }
+
+        assert_eq!(stage_for_error(&RunnerError::new("new_code", "test")), None);
     }
 
     #[test]
@@ -375,12 +493,18 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
 "#,
         )
         .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repetition_root = workspace.path().join("active");
+        let worker_scratch_root = workspace.path().join("worker-scratch-00000000");
+        std::fs::create_dir(&repetition_root).unwrap();
+        std::fs::create_dir(&worker_scratch_root).unwrap();
         let request = WorkerRequestV1 {
             repetition: 0,
             case,
             expected_point_id: "0".repeat(64),
             expected_case_digest: "1".repeat(64),
-            repetition_root: std::path::PathBuf::from("/tmp/does-not-open"),
+            repetition_root,
+            worker_scratch_root,
             expected_physical_digest: crate::reset::PhysicalDigest {
                 files: 0,
                 bytes: 0,

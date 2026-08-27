@@ -79,6 +79,7 @@ lance-io = { version = "10.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
 syn = { version = "2", features = ["full", "visit"] }
+toml = "0.9"
 # benches/scenarios.rs: wait4/rusage peak-RSS and benchmark memory caps.
 libc = "0.2"
 

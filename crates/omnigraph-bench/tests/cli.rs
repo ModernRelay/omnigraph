@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use omnigraph_bench::RUNNER_OUTPUT_VERSION;
 use predicates::prelude::*;
 
 fn repository_root() -> PathBuf {
@@ -185,7 +186,7 @@ fn suite_run_refuses_debug_wall_clock_measurement_before_fixture_setup() {
     assert!(!output.status.success(), "{output:?}");
     let failure: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("runner failure JSON");
-    assert_eq!(failure["runner_output_version"], 1);
+    assert_eq!(failure["runner_output_version"], RUNNER_OUTPUT_VERSION);
     assert_eq!(failure["suite"], "local-smoke");
     assert_eq!(failure["completed_runs"].as_array().unwrap().len(), 0);
     assert_eq!(failure["error"]["code"], "release_build_required");
@@ -240,4 +241,124 @@ fn case_list_rejects_duplicate_catalog_identity() {
         .assert()
         .failure()
         .stdout(predicate::str::contains("duplicate_point_id"));
+}
+
+#[test]
+fn archive_verify_accepts_an_empty_authority_without_inventing_records() {
+    let archive = tempfile::tempdir().expect("temporary archive");
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "archive",
+            "verify",
+            archive.path().to_str().expect("UTF-8 path"),
+            "--json",
+        ])
+        .output()
+        .expect("verify archive");
+
+    assert!(output.status.success(), "{output:?}");
+    let verification: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("archive verification JSON");
+    assert_eq!(verification["ok"], true);
+    assert_eq!(verification["archive_format_version"], 1);
+    assert_eq!(verification["record_count"], 0);
+    assert_eq!(
+        verification["authority_inventory_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(verification.get("records").is_none());
+}
+
+#[test]
+fn archive_verify_fails_closed_for_a_missing_root() {
+    let directory = tempfile::tempdir().expect("temporary parent");
+    let missing = directory.path().join("missing");
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "archive",
+            "verify",
+            missing.to_str().expect("UTF-8 path"),
+            "--json",
+        ])
+        .output()
+        .expect("verify missing archive");
+
+    assert!(!output.status.success(), "{output:?}");
+    let failure: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("archive failure JSON");
+    assert_eq!(failure["ok"], false);
+    assert_eq!(failure["error"]["code"], "archive_root_invalid");
+}
+
+#[test]
+fn archive_reconcile_reports_a_definitely_absent_candidate() {
+    let archive = tempfile::tempdir().expect("temporary archive");
+    let digest = "a".repeat(64);
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "archive",
+            "reconcile",
+            archive.path().to_str().expect("UTF-8 path"),
+            "--invocation-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--record-sha256",
+            &digest,
+            "--json",
+        ])
+        .output()
+        .expect("reconcile absent publication");
+
+    assert!(!output.status.success(), "{output:?}");
+    let reconciliation: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("reconciliation JSON");
+    assert_eq!(reconciliation["ok"], false);
+    assert_eq!(reconciliation["outcome"]["status"], "absent");
+    assert_eq!(
+        reconciliation["outcome"]["candidate"]["record_sha256"],
+        digest
+    );
+    assert_eq!(
+        reconciliation["archive_root"],
+        archive.path().to_string_lossy().as_ref()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_failures_remain_json_for_non_utf8_archive_and_projection_paths() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let directory = tempfile::tempdir().expect("temporary parent");
+    let non_utf8 = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"missing-\xff".to_vec()));
+
+    for (arguments, path_flag) in [
+        (vec!["archive", "verify"], None),
+        (vec!["projection", "list-points"], Some("--root")),
+    ] {
+        let mut command = Command::cargo_bin("omnigraph-bench").expect("benchmark binary");
+        command.args(arguments);
+        if let Some(flag) = path_flag {
+            command.arg(flag);
+        }
+        command.arg(&non_utf8).arg("--json");
+        let output = command.output().expect("run JSON failure command");
+        assert!(!output.status.success(), "{output:?}");
+        let failure: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("failure must be JSON: {error}; output={output:?}"));
+        assert_eq!(failure["ok"], false);
+        assert!(
+            failure["error"]["path"]
+                .as_str()
+                .expect("lossy path string")
+                .contains("missing-")
+        );
+    }
 }
