@@ -400,16 +400,39 @@ fn entry_type(metadata: &fs::Metadata) -> EntryType {
 
 #[cfg(unix)]
 fn classify_unix_mode(mode: u32) -> EntryType {
-    let file_type = mode & u32::from(nix::libc::S_IFMT);
-    if file_type == u32::from(nix::libc::S_IFDIR) {
+    let (file_type, directory, file, symlink) = unix_file_type_bits(mode);
+    if file_type == directory {
         EntryType::Directory
-    } else if file_type == u32::from(nix::libc::S_IFREG) {
+    } else if file_type == file {
         EntryType::File
-    } else if file_type == u32::from(nix::libc::S_IFLNK) {
+    } else if file_type == symlink {
         EntryType::Symlink
     } else {
         EntryType::Special
     }
+}
+
+// Darwin exposes these `mode_t` constants as `u16`; Linux exposes them as
+// `u32`. Keep the platform-specific widening at this seam so the shared
+// classifier is warning-free on both CI and the supported macOS runner.
+#[cfg(target_os = "macos")]
+fn unix_file_type_bits(mode: u32) -> (u32, u32, u32, u32) {
+    (
+        mode & u32::from(nix::libc::S_IFMT),
+        u32::from(nix::libc::S_IFDIR),
+        u32::from(nix::libc::S_IFREG),
+        u32::from(nix::libc::S_IFLNK),
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unix_file_type_bits(mode: u32) -> (u32, u32, u32, u32) {
+    (
+        mode & nix::libc::S_IFMT,
+        nix::libc::S_IFDIR,
+        nix::libc::S_IFREG,
+        nix::libc::S_IFLNK,
+    )
 }
 
 fn supported_inventory_kind(entry_type: EntryType, source: &Path) -> io::Result<EntryKind> {
