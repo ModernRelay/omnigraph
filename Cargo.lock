@@ -5081,6 +5081,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-bench"
+version = "0.10.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "predicates",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "omnigraph-cli"
 version = "0.10.0"
 dependencies = [

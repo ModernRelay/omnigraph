@@ -8,6 +8,7 @@ members = [
     "crates/omnigraph-api-types",
     "crates/omnigraph-cluster",
     "crates/omnigraph-azure-admission",
+    "crates/omnigraph-bench",
     "crates/omnigraph-policy",
     "crates/omnigraph-server",
     "crates/omnigraph-dst",

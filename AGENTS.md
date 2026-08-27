@@ -33,8 +33,8 @@ Tools that support `@` imports include these automatically:
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 10.0.0
 - Workspace: compiler, storage, engine (`omnigraph-engine` package), policy,
-  API types, cluster, CLI, server, Azure admission wrapper, and
-  `omnigraph-dst` (deterministic simulation testing; needs
+  API types, cluster, CLI, server, Azure admission wrapper, benchmark harness,
+  and `omnigraph-dst` (deterministic simulation testing; needs
   `--cfg tokio_unstable`, set by its crate-local `.cargo/config.toml` when
   cargo runs from the crate dir — compiles empty without it)
 - License: MIT
