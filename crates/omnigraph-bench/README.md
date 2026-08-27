@@ -18,8 +18,8 @@ measurement protocol and identity vocabulary.
   The readable `point_name` is display text, never a key.
 - Process lifecycle, engine preparation, OS page-cache treatment, and the
   named warm-up program are separate cache-condition fields in point identity.
-  Process-cold explicitly leaves the OS page cache uncontrolled; page-cache-
-  cold and storage-cold are not representable without stronger controls.
+  Process-cold explicitly leaves the OS page cache uncontrolled. Neither
+  page-cache-cold nor storage-cold is representable without stronger controls.
 - The engine does not depend on this crate. A later runner slice will depend on
   the engine and consume the plans produced here.
 - Raw immutable JSON run records will be the telemetry source of truth. A
