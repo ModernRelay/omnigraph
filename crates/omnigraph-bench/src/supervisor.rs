@@ -24,6 +24,10 @@ use crate::worker_protocol::{
 };
 
 const AUXILIARY_DEADLINE_FLOOR: Duration = Duration::from_secs(300);
+// `deadline_seconds: null` means the experiment declares no operation
+// deadline, not that the harness may wait forever. This independent ceiling
+// bounds the worker without turning the ceiling into experiment identity.
+const UNDECLARED_MEASUREMENT_WATCHDOG: Duration = Duration::from_secs(3_600);
 const PROTOCOL_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 const REAP_DEADLINE: Duration = Duration::from_secs(10);
 const PROCESS_GROUP_POLL: Duration = Duration::from_millis(10);
@@ -42,7 +46,7 @@ pub(crate) struct SupervisionInput {
     pub repetition_root: PathBuf,
     pub physical_digest: PhysicalDigest,
     pub metadata_digest: MetadataDigest,
-    pub deadline: Duration,
+    pub deadline: Option<Duration>,
     #[cfg(test)]
     pub auxiliary_deadline_override: Option<Duration>,
 }
@@ -50,6 +54,7 @@ pub(crate) struct SupervisionInput {
 /// Supervise one fresh worker process through exactly one mutation.
 #[cfg(unix)]
 pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepObservation> {
+    let measurement_watchdog = measurement_watchdog(&input);
     let mut command = Command::new(&input.worker_executable);
     command
         .arg("__worker-v1")
@@ -92,7 +97,8 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
         stderr_thread: None,
         process_group,
         repetition: input.repetition,
-        deadline: input.deadline,
+        declared_deadline: input.deadline,
+        measurement_watchdog,
         started: Instant::now(),
     };
     let Some(stdin) = worker.child.stdin.take() else {
@@ -248,38 +254,29 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
     let measured_started = Instant::now();
     if let Err(error) = worker.write(
         &begin,
-        remaining(input.deadline, measured_started.elapsed()),
+        remaining(measurement_watchdog, measured_started.elapsed()),
     ) {
         return worker.kill_error("begin-write", "worker_protocol_error", error);
     }
-    let settled = match worker.receive(remaining(input.deadline, measured_started.elapsed())) {
+    let settled = match worker.receive(remaining(measurement_watchdog, measured_started.elapsed()))
+    {
         Ok(frame) => frame,
         Err(ReceiveFailure::Timeout) => {
-            return worker.kill_error(
-                "measure-timeout",
-                "merge_deadline_exceeded",
-                format!(
-                    "repetition {} did not settle within the declared {} second deadline; the worker process group was killed and reaped",
-                    input.repetition,
-                    input.deadline.as_secs()
-                ),
-            );
+            let (code, message) =
+                measurement_timeout_failure(&input, "did not settle before the supervisor ceiling");
+            return worker.kill_error("measure-timeout", code, message);
         }
         Err(ReceiveFailure::Protocol(message)) => {
             return worker.kill_error("measure-protocol", "worker_protocol_error", message);
         }
     };
     let supervisor_settled_elapsed = measured_started.elapsed();
-    if supervisor_settled_elapsed > input.deadline {
-        return worker.kill_error(
-            "measure-timeout",
-            "merge_deadline_exceeded",
-            format!(
-                "repetition {} was not observed settled within the declared {} second supervisor deadline",
-                input.repetition,
-                input.deadline.as_secs()
-            ),
+    if supervisor_settled_elapsed > measurement_watchdog {
+        let (code, message) = measurement_timeout_failure(
+            &input,
+            "was not observed settled before the supervisor ceiling",
         );
+        return worker.kill_error("measure-timeout", code, message);
     }
     let settled_elapsed_us = match settled {
         ChildFrameV1::Settled {
@@ -446,6 +443,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
         .with_child_process(process_evidence(
             "finalize-protocol".to_string(),
             input.deadline,
+            measurement_watchdog,
             worker.started.elapsed(),
             "worker-completed".to_string(),
             Some(status),
@@ -454,17 +452,19 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
         )));
     }
 
-    let deadline_us = duration_us(input.deadline);
-    if settled_elapsed_us > deadline_us {
-        return Err(RunnerError::new(
-            "merge_deadline_exceeded",
-            format!(
-                "repetition {} settled in {}us, beyond the declared {}us deadline",
-                input.repetition, settled_elapsed_us, deadline_us
-            ),
-        )
-        .with_repetition(input.repetition)
-        .with_settled_sample(sample));
+    if let Some(deadline) = input.deadline {
+        let deadline_us = duration_us(deadline);
+        if settled_elapsed_us > deadline_us {
+            return Err(RunnerError::new(
+                "merge_deadline_exceeded",
+                format!(
+                    "repetition {} settled in {}us, beyond the declared {}us deadline",
+                    input.repetition, settled_elapsed_us, deadline_us
+                ),
+            )
+            .with_repetition(input.repetition)
+            .with_settled_sample(sample));
+        }
     }
     Ok(sample)
 }
@@ -496,7 +496,8 @@ struct WorkerProcess {
     stderr_thread: Option<JoinHandle<()>>,
     process_group: i32,
     repetition: u32,
-    deadline: Duration,
+    declared_deadline: Option<Duration>,
+    measurement_watchdog: Duration,
     started: Instant,
 }
 
@@ -589,7 +590,8 @@ impl WorkerProcess {
             .with_repetition(self.repetition)
             .with_child_process(process_evidence(
                 format!("{stage:?}"),
-                self.deadline,
+                self.declared_deadline,
+                self.measurement_watchdog,
                 self.started.elapsed(),
                 "worker-failed".to_string(),
                 status,
@@ -626,7 +628,8 @@ impl WorkerProcess {
             .with_repetition(self.repetition)
             .with_child_process(process_evidence(
                 stage.to_string(),
-                self.deadline,
+                self.declared_deadline,
+                self.measurement_watchdog,
                 self.started.elapsed(),
                 termination,
                 status,
@@ -978,7 +981,8 @@ fn finish_pipe_thread<T>(
 #[cfg(unix)]
 fn process_evidence(
     stage: String,
-    deadline: Duration,
+    declared_deadline: Option<Duration>,
+    measurement_watchdog: Duration,
     elapsed: Duration,
     termination: String,
     status: Option<ExitStatus>,
@@ -989,7 +993,8 @@ fn process_evidence(
 
     ChildProcessEvidence {
         stage,
-        declared_deadline_us: duration_us(deadline),
+        declared_deadline_us: declared_deadline.map(duration_us),
+        measurement_watchdog_us: duration_us(measurement_watchdog),
         supervisor_elapsed_us: duration_us(elapsed),
         termination,
         exit_code: status.as_ref().and_then(ExitStatus::code),
@@ -1118,7 +1123,32 @@ fn auxiliary_deadline(input: &SupervisionInput) -> Duration {
     if let Some(override_deadline) = input.auxiliary_deadline_override {
         return override_deadline;
     }
-    input.deadline.max(AUXILIARY_DEADLINE_FLOOR)
+    measurement_watchdog(input).max(AUXILIARY_DEADLINE_FLOOR)
+}
+
+fn measurement_watchdog(input: &SupervisionInput) -> Duration {
+    input.deadline.unwrap_or(UNDECLARED_MEASUREMENT_WATCHDOG)
+}
+
+fn measurement_timeout_failure(input: &SupervisionInput, action: &str) -> (&'static str, String) {
+    match input.deadline {
+        Some(deadline) => (
+            "merge_deadline_exceeded",
+            format!(
+                "repetition {} {action} within the declared {} second deadline; the worker process group was killed and reaped",
+                input.repetition,
+                deadline.as_secs()
+            ),
+        ),
+        None => (
+            "worker_measurement_watchdog_exceeded",
+            format!(
+                "repetition {} {action} within the independent {} second safety watchdog for an operation with no declared deadline; the worker process group was killed and reaped",
+                input.repetition,
+                UNDECLARED_MEASUREMENT_WATCHDOG.as_secs()
+            ),
+        ),
+    }
 }
 
 fn remaining(total: Duration, elapsed: Duration) -> Duration {
@@ -1191,9 +1221,23 @@ mod tests {
             repetition_root: PathBuf::from("/unused/supervisor-test-fixture"),
             physical_digest: physical_digest(),
             metadata_digest: metadata_digest(),
-            deadline: GENEROUS_DEADLINE,
+            deadline: Some(GENEROUS_DEADLINE),
             auxiliary_deadline_override: Some(GENEROUS_AUXILIARY_DEADLINE),
         }
+    }
+
+    #[test]
+    fn undeclared_operation_deadline_keeps_an_independent_safety_watchdog() {
+        let mut input = supervision_input(PathBuf::from("/unused"));
+        input.deadline = None;
+
+        assert_eq!(
+            measurement_watchdog(&input),
+            UNDECLARED_MEASUREMENT_WATCHDOG
+        );
+        let (code, message) = measurement_timeout_failure(&input, "did not settle");
+        assert_eq!(code, "worker_measurement_watchdog_exceeded");
+        assert!(message.contains("no declared deadline"), "{message}");
     }
 
     fn ready_frame(input: &SupervisionInput) -> ChildFrameV1 {
@@ -1367,7 +1411,7 @@ mod tests {
     fn worker_measurement_hang_is_killed_at_the_declared_deadline() {
         let placeholder = PathBuf::from("/placeholder");
         let mut input = supervision_input(placeholder);
-        input.deadline = QUICK_DEADLINE;
+        input.deadline = Some(QUICK_DEADLINE);
         let body = format!(
             "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\nsleep 300\n",
             emit(&ready_frame(&input)),

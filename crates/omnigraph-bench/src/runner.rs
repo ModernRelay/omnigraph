@@ -148,7 +148,9 @@ pub type RunnerResult<T> = Result<T, RunnerError>;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ChildProcessEvidence {
     pub stage: String,
-    pub declared_deadline_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_deadline_us: Option<u64>,
+    pub measurement_watchdog_us: u64,
     pub supervisor_elapsed_us: u64,
     pub termination: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -807,7 +809,12 @@ fn run_supervised_repetitions(
             repetition_root: template.active_root().to_path_buf(),
             physical_digest: template.physical_digest().clone(),
             metadata_digest: metadata,
-            deadline: Duration::from_secs(run.case.definition.protocol.deadline_seconds),
+            deadline: run
+                .case
+                .definition
+                .protocol
+                .deadline_seconds
+                .map(Duration::from_secs),
             #[cfg(test)]
             auxiliary_deadline_override: None,
         });
@@ -899,7 +906,11 @@ async fn run_in_process_repetitions(
             plan,
             run.case.definition.environment.warmth.regime,
             run.case.definition.environment.warmth.iterations,
-            Duration::from_secs(run.case.definition.protocol.deadline_seconds),
+            run.case
+                .definition
+                .protocol
+                .deadline_seconds
+                .map(Duration::from_secs),
         )
         .await;
         template.verify_unchanged()?;
@@ -990,7 +1001,7 @@ async fn execute_rep(
     plan: &BranchMergePlan,
     warmth: WarmthRegime,
     warmth_iterations: u32,
-    deadline: Duration,
+    deadline: Option<Duration>,
 ) -> RunnerResult<RepObservation> {
     let mut signals = ImmediateMeasurementSignals;
     execute_rep_signaled(
@@ -1033,7 +1044,7 @@ pub(crate) async fn execute_rep_signaled<S: MeasurementSignals>(
     plan: &BranchMergePlan,
     warmth: WarmthRegime,
     warmth_iterations: u32,
-    deadline: Duration,
+    deadline: Option<Duration>,
     signals: &mut S,
 ) -> RunnerResult<RepObservation> {
     let manifest_counter = LogicalCallCounter::default();
@@ -1072,7 +1083,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
     plan: &BranchMergePlan,
     warmth: WarmthRegime,
     warmth_iterations: u32,
-    deadline: Duration,
+    deadline: Option<Duration>,
     manifest_counter: LogicalCallCounter,
     table_counter: LogicalCallCounter,
     signals: &mut S,
@@ -1145,7 +1156,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
     let outcome = outcome.map_err(|error| {
         RunnerError::new("merge_failed", format!("repetition {repetition}: {error}"))
     })?;
-    let deadline_exceeded = elapsed > deadline;
+    let deadline_exceeded = deadline.is_some_and(|deadline| elapsed > deadline);
 
     let manifest_calls = manifest_counter.take();
     let table_calls = table_counter.take();
@@ -1229,6 +1240,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
         },
     };
     if deadline_exceeded {
+        let deadline = deadline.expect("deadline_exceeded requires a declared deadline");
         Err(RunnerError::new(
             "merge_deadline_exceeded",
             format!(

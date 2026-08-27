@@ -121,7 +121,11 @@ async fn execute_request(
     let validated = validate_worker_case(request)?;
     let plan = BranchMergePlan::try_from(&validated)
         .map_err(|error| RunnerError::new("unsupported_runner_axis", error.to_string()))?;
-    let deadline = Duration::from_secs(validated.definition.protocol.deadline_seconds);
+    let deadline = validated
+        .definition
+        .protocol
+        .deadline_seconds
+        .map(Duration::from_secs);
     execute_rep_signaled(
         request.repetition,
         &request.repetition_root,

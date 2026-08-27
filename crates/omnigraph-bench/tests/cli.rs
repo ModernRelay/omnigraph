@@ -122,7 +122,7 @@ fn suite_plan_resolves_relative_cases_and_supports_selection() {
     // deliberate factor change must update this fixture.
     assert_eq!(
         plan["runs"][0]["point_id"],
-        "eee6d8e8dd097564e791b8359c913a3e2a5821eef3506c33b1f521e26e5765d5"
+        "90400f5a735959b803f91345a24ea3e259e1fb285079167527da05e2f5514076"
     );
 }
 
@@ -191,7 +191,7 @@ fn suite_run_refuses_debug_wall_clock_measurement_before_fixture_setup() {
     assert_eq!(failure["error"]["case_id"], "branch-merge-d50-warm");
     assert_eq!(
         failure["error"]["point_id"],
-        "eee6d8e8dd097564e791b8359c913a3e2a5821eef3506c33b1f521e26e5765d5"
+        "90400f5a735959b803f91345a24ea3e259e1fb285079167527da05e2f5514076"
     );
 }
 
