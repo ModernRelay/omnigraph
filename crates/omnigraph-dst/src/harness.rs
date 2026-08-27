@@ -94,6 +94,8 @@ pub const DET_CRASH_CONTRACT: Detector = on(Channel::Query, Oracle::CrashContrac
 pub const DET_BIRTH: Detector = on(Channel::Claim, Oracle::BirthContract);
 pub const DET_RECOVERY_OBLIGATION: Detector = on(Channel::Physical, Oracle::RecoveryObligation);
 pub const DET_RESIDUE: Detector = on(Channel::Physical, Oracle::ResidueObligation);
+pub const DET_LIVE_WRITE_AVAILABILITY: Detector =
+    on(Channel::Session, Oracle::LiveWriteAvailability);
 pub const DET_MAINTENANCE: Detector = on(Channel::Query, Oracle::MaintenanceObligations);
 pub const DET_OCC: Detector = on(Channel::History, Oracle::CommitIdUniqueness);
 pub const DET_LIVENESS: Detector = Detector {
@@ -721,6 +723,18 @@ pub struct Scenario {
     /// for ops < this index. Early-only RED + late-only GREEN = the
     /// arming reads are entirely in the FIRST LIFE's window.
     pub world_match_until: Option<usize>,
+    /// KEEP-SERVING phase (issue #554): on a `RecoveryRequired` failure,
+    /// DEFER reconcile's reopen and keep the SAME handle serving — the
+    /// long-lived-server shape v1 structurally never had. The value is the
+    /// budget: this many consecutive refusals naming one operation id fire
+    /// the live-write-availability detector. The watch resolves (deferred
+    /// arbitration runs) on a success, any other failure — different-id
+    /// refusals and scheduled crashes included — or loop end. Scope-out:
+    /// a retry-born `RecoveryRequired` inside the ack-loss client-retry
+    /// path never arms or extends a watch (the original error already
+    /// resolved any watch, and that site reopens as in v1).
+    /// 0 = off (every pre-existing pinned seed keeps its exact behavior).
+    pub keep_serving_ops: usize,
 }
 
 /// the milestone steps a window's family needs before its op
@@ -1112,9 +1126,10 @@ pub struct UniverseReport {
     /// reopen-heals contract, asserted on injected residue too).
     pub attributed_residue: Vec<String>,
     /// Every reconcile arbitration this universe performed —
-    /// (context, verdict, channel) where context names what died
-    /// (`crash:<window>@op<i>`, `crash-state:write#k@op<i>`,
-    /// `fault@op<i>`), verdict is `Applied` / `ForkOnly` / `NotApplied`,
+    /// (context, verdict, channel) where context names what died or was
+    /// deferred (`crash:<window>@op<i>`, `crash-state:write#k@op<i>`,
+    /// `fault@op<i>`, `keep-serving-deferred@op<i>`),
+    /// verdict is `Applied` / `ForkOnly` / `NotApplied`,
     /// and channel is the observation surface the ruling rested on
     /// ("query", or "query+physical" when the ghost tie-break consulted
     /// the physical channel). The per-death RESULT the ledger records for
@@ -4160,6 +4175,82 @@ pub fn run_open_crash_universe(root: &'static str, window: &'static str) -> bool
 
 // ---------------------------------------------------------------- universe --
 
+/// The first `known_issues` label consumed across the crate boundary: the
+/// pinned panel's shape assert keys on it, so the spelling lives in exactly
+/// one place.
+pub const KEEP_SERVING_DEFER_PREFIX: &str = "keep-serving-defer@";
+
+/// KEEP-SERVING watch (issue #554): the pending recovery operation the live
+/// handle is currently refused on, with reconcile's REOPEN withheld — never
+/// the judgment: the deferred op's two-picture arbitration runs at watch
+/// resolution ([`resolve_keep_serving_watch`]).
+struct KeepServingWatch {
+    operation_id: String,
+    /// Op index of the deferred (wedging) op — the arbitration's `at_op`.
+    first_op: usize,
+    /// Consecutive `RecoveryRequired` refusals naming `operation_id`.
+    streak: usize,
+    /// The wedging op whose `reconcile_after_failure` the watch withheld.
+    deferred_wop: WorldOp,
+}
+
+/// Resolve a keep-serving watch: push the site's `known_issues` row
+/// (`keep-serving-<site>:<id> after N refusals (first at opK)`), then run
+/// the DEFERRED two-picture arbitration (reopen included) for the watch's
+/// op and apply the outcome to the model.
+///
+/// This is the canonical statement of the deferral contract: the watch
+/// withholds only the REOPEN, so resolution must run before any other
+/// reconcile can reopen, or the model would carry an unjudged effect
+/// window through Full recovery. No `maintenance_obligations` pass runs
+/// here: the deferred op was refused at the write entry and never
+/// executed, so no partial maintenance state can exist.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_keep_serving_watch(
+    db: Omnigraph,
+    storage: Arc<dyn StorageAdapter>,
+    root: &str,
+    failing: Option<&FailingStorage>,
+    world: &mut WorldModel,
+    reconcile_verdicts: &mut Vec<(String, String, String)>,
+    known_issues: &mut Vec<String>,
+    row_site: &str,
+    watch: KeepServingWatch,
+) -> Omnigraph {
+    known_issues.push(format!(
+        "keep-serving-{row_site}:{} after {} refusals (first at op{})",
+        watch.operation_id, watch.streak, watch.first_op
+    ));
+    if let Some(f) = failing {
+        f.suspend();
+    }
+    let (db, outcome, channel) = Box::pin(reconcile_after_failure(
+        db,
+        storage,
+        root,
+        &watch.deferred_wop,
+        world,
+        "keep-serving deferred arbitration",
+        watch.first_op,
+        None,
+    ))
+    .await;
+    if let Some(f) = failing {
+        f.resume();
+    }
+    reconcile_verdicts.push((
+        format!("keep-serving-deferred@op{}", watch.first_op),
+        format!("{outcome:?}"),
+        channel.to_string(),
+    ));
+    match outcome {
+        ReconcileOutcome::Applied => apply_world(world, &watch.deferred_wop),
+        ReconcileOutcome::ForkOnly => apply_fork_only(world, &watch.deferred_wop),
+        ReconcileOutcome::NotApplied => {}
+    }
+    db
+}
+
 pub fn run_universe(root: &str, sc: &Scenario) -> UniverseReport {
     match run_universe_caught(root, sc) {
         Ok(report) => report,
@@ -4367,6 +4458,9 @@ pub fn run_universe_caught(
         let mut maintenance_reruns = 0usize;
         let mut reconcile_verdicts: Vec<(String, String, String)> = Vec::new();
         let mut known_issues: Vec<String> = Vec::new();
+        // Armed only when `Scenario::keep_serving_ops > 0`; contract on
+        // [`KeepServingWatch`].
+        let mut keep_serving_watch: Option<KeepServingWatch> = None;
         // attributed detections — op failures whose reads
         // crossed the damage ledger (see the exec-site snapshot below).
         let mut corruption_detections: Vec<String> = Vec::new();
@@ -4480,6 +4574,24 @@ pub fn run_universe_caught(
                 }
             }
             if let Some(failpoint) = crash_now.filter(|_| !sc.probe_only) {
+                // A scheduled crash ends any keep-serving experiment first:
+                // crash_op MAY reconcile and reopen (the window can also miss
+                // the executed path), and resolving early is conservative —
+                // deferral contract on [`resolve_keep_serving_watch`].
+                if let Some(watch) = keep_serving_watch.take() {
+                    db = Box::pin(resolve_keep_serving_watch(
+                        db,
+                        storage.clone(),
+                        root,
+                        failing.as_deref(),
+                        &mut world,
+                        &mut reconcile_verdicts,
+                        &mut known_issues,
+                        &format!("interrupted@op{i}"),
+                        watch,
+                    ))
+                    .await;
+                }
                 let (new_db, outcome) = Box::pin(crash_op(
                     db,
                     storage.clone(),
@@ -4602,6 +4714,23 @@ pub fn run_universe_caught(
                     legal_rejections += 1;
                 }
                 ks.revive_and_disarm();
+                // Same rule as the crash-window arm: the deferred op precedes
+                // the crashed one, so it resolves before this reconcile's
+                // reopen — deferral contract on [`resolve_keep_serving_watch`].
+                if let Some(watch) = keep_serving_watch.take() {
+                    db = Box::pin(resolve_keep_serving_watch(
+                        db,
+                        storage.clone(),
+                        root,
+                        failing.as_deref(),
+                        &mut world,
+                        &mut reconcile_verdicts,
+                        &mut known_issues,
+                        &format!("interrupted@op{i}"),
+                        watch,
+                    ))
+                    .await;
+                }
                 if let Some(f) = &failing {
                     f.suspend();
                 }
@@ -4686,8 +4815,126 @@ pub fn run_universe_caught(
                             force_session_check = true;
                         }
                         apply_world(&mut world, &wop);
+                        // A success on the watched handle ends the watch: the
+                        // pending operation was resolved before this op ran —
+                        // by the write entry's own heal (the issue-554
+                        // contract holding) or, in the different-id
+                        // composition, by an interrupt-resolution reopen in
+                        // between; the row does not distinguish. Runs AFTER
+                        // this op's model apply so the deferred op's presence
+                        // is the arbitration's only open difference —
+                        // deferral contract on [`resolve_keep_serving_watch`].
+                        if let Some(watch) = keep_serving_watch.take() {
+                            db = Box::pin(resolve_keep_serving_watch(
+                                db,
+                                storage.clone(),
+                                root,
+                                failing.as_deref(),
+                                &mut world,
+                                &mut reconcile_verdicts,
+                                &mut known_issues,
+                                &format!("healed@op{i}"),
+                                watch,
+                            ))
+                            .await;
+                        }
                     }
                     Err(err) => {
+                        // KEEP-SERVING (issue #554): with the budget armed,
+                        // a `RecoveryRequired` refusal defers reconcile's
+                        // reopen and keeps the SAME handle serving — the
+                        // reopen runs Full recovery, the cure, so reopening
+                        // on first contact structurally hides any wedge a
+                        // long-lived server would sit in.
+                        //
+                        // Both keep-serving `continue`s below deliberately
+                        // skip the rest of this iteration: the damage-
+                        // attribution window (a refusal is raised at the
+                        // write entry BEFORE op execution, so no op reads
+                        // crossed the ledger), the `is_legal_rejection`
+                        // catalog (the variant match on `RecoveryRequired`
+                        // is a deliberate call-site catalog extension), and
+                        // the continuous-verification block (a mid-wedge
+                        // world-match would judge a deliberately-held
+                        // failure state, and `check_sessions`' fresh opens
+                        // would heal the wedge under observation).
+                        if sc.keep_serving_ops > 0
+                            && let OmniError::RecoveryRequired { operation_id, .. } = &err
+                            && let Some(mut watch) = keep_serving_watch
+                                .take_if(|watch| &watch.operation_id == operation_id)
+                        {
+                            watch.streak += 1;
+                            if watch.streak >= sc.keep_serving_ops {
+                                detectors::violation(
+                                    DET_LIVE_WRITE_AVAILABILITY,
+                                    i,
+                                    format!(
+                                        "writes wedged on pending recovery operation {}: \
+                                         {} consecutive RecoveryRequired refusals on the \
+                                         live handle (first at op{}), reopen deferred",
+                                        watch.operation_id, watch.streak, watch.first_op
+                                    ),
+                                    Oracle::LiveWriteAvailability.doc(),
+                                );
+                            }
+                            known_issues.push(format!(
+                                "{KEEP_SERVING_DEFER_PREFIX}op{i}:{}",
+                                watch.operation_id
+                            ));
+                            keep_serving_watch = Some(watch);
+                            legal_rejections += 1;
+                            continue;
+                        }
+                        // Any OTHER failure while a watch is active ends the
+                        // wedge experiment before this failure's own handling
+                        // — deferral contract on [`resolve_keep_serving_watch`].
+                        if let Some(watch) = keep_serving_watch.take() {
+                            db = Box::pin(resolve_keep_serving_watch(
+                                db,
+                                storage.clone(),
+                                root,
+                                failing.as_deref(),
+                                &mut world,
+                                &mut reconcile_verdicts,
+                                &mut known_issues,
+                                &format!("interrupted@op{i}"),
+                                watch,
+                            ))
+                            .await;
+                        }
+                        // Fresh watch: this failure names a pending recovery
+                        // operation nothing is watching yet — defer its
+                        // reconcile and start counting. The budget check runs
+                        // here too, so `keep_serving_ops: 1` fires on the
+                        // FIRST refusal as the field doc promises.
+                        if sc.keep_serving_ops > 0
+                            && let OmniError::RecoveryRequired { operation_id, .. } = &err
+                        {
+                            let watch = KeepServingWatch {
+                                operation_id: operation_id.clone(),
+                                first_op: i,
+                                streak: 1,
+                                deferred_wop: wop.clone(),
+                            };
+                            if watch.streak >= sc.keep_serving_ops {
+                                detectors::violation(
+                                    DET_LIVE_WRITE_AVAILABILITY,
+                                    i,
+                                    format!(
+                                        "writes wedged on pending recovery operation {}: \
+                                         refused on first contact with a keep-serving budget \
+                                         of {}, reopen deferred",
+                                        watch.operation_id, sc.keep_serving_ops
+                                    ),
+                                    Oracle::LiveWriteAvailability.doc(),
+                                );
+                            }
+                            known_issues
+                                .push(format!("{KEEP_SERVING_DEFER_PREFIX}op{i}:{operation_id}"));
+                            keep_serving_watch = Some(watch);
+                            legal_rejections += 1;
+                            continue;
+                        }
                         // attributed detection: this op's reads
                         // crossed the damage ledger, so its (engine-born,
                         // unmarked) failure is the detection half of the
@@ -4920,6 +5167,25 @@ pub fn run_universe_caught(
                     f.resume();
                 }
             }
+        }
+
+        // A watch outliving the op loop (the wedge stayed under the budget)
+        // resolves before the closing oracles, so the final audit never
+        // inherits an unjudged pending operation — deferral contract on
+        // [`resolve_keep_serving_watch`].
+        if let Some(watch) = keep_serving_watch.take() {
+            db = Box::pin(resolve_keep_serving_watch(
+                db,
+                storage.clone(),
+                root,
+                failing.as_deref(),
+                &mut world,
+                &mut reconcile_verdicts,
+                &mut known_issues,
+                "expired@end",
+                watch,
+            ))
+            .await;
         }
 
         // Closing oracle phase runs on clean storage — under its own cost

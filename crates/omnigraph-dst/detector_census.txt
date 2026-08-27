@@ -8,7 +8,7 @@
 # detector = one (observation source, oracle) pair — the unit that fires;
 # an oracle listed with two sources is two detectors.
 #
-# 21 oracles: differential 7 / prediction 4 / obligation 8 / meta 2 (named-mechanism grain;
+# 22 oracles: differential 7 / prediction 4 / obligation 9 / meta 2 (named-mechanism grain;
 # new oracles enter by deliberate census bump).
 
 [differential]  expectation = model state
@@ -76,6 +76,10 @@ ResidueObligation
   sources: Store(Physical)
   anchor:  harness.rs final audit residue check + tests::dst_residue_channel_sees_planted_file
   doc:     no universe ends owing recovery work: __recovery/ empty at quiesce, backed by the planted-file channel canary
+LiveWriteAvailability
+  sources: Store(Session)
+  anchor:  harness.rs::run_universe_caught keep-serving watch (Scenario::keep_serving_ops)
+  doc:     a live handle must not wedge permanently on one pending effect-free Armed recovery operation: with reconcile's reopen deferred, consecutive same-operation RecoveryRequired refusals stay under the keep-serving budget (issue #554)
 MaintenanceObligations
   sources: Store(Query)
   anchor:  harness.rs::maintenance_obligations

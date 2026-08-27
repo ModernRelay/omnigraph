@@ -1228,6 +1228,144 @@ fn dst_lance_realm_faults_bite_and_oracles_hold() {
     assert!(a.verified > 0);
 }
 
+/// ISSUE #554 CATCH: a lance-realm write fault fails one mutation between
+/// arming its v9 recovery sidecar and its table commit; the stranded Armed
+/// intent is effect-free, yet the write-entry heal defers it and every
+/// later write on the live handle is refused with the same operation id.
+/// With the keep-serving budget armed this test is RED at engine HEAD
+/// (detector=Store(Session)/LiveWriteAvailability) and goes green when the
+/// live heal retires provably effect-free Armed mutation/load intents.
+///
+/// PANEL, not a single pin: lance-realm universes sit outside the strict
+/// replay envelope (pool threads race the entropy shim), so any ONE seed's
+/// strand can evaporate or reappear with process context — observed in both
+/// directions on seed 0 even at `error_pct: 80`. Fourteen verified flip
+/// seeds make the verdict robust: RED if ANY panel seed wedges, green only
+/// when ALL heal — jitter would have to erase every member at once to fake
+/// a pass, and the shape assert catches even that as a loud wrong-reason
+/// failure.
+///
+/// Re-pinning after upstream drift is a two-step protocol: run
+/// `dst_keep_serving_wedge_seed_search` (deliberately broader parameters —
+/// ops 30, `error_pct: 15` — to survey the wedge population), then screen
+/// its wedge seeds at THIS test's parameters against the engine fix: a
+/// panel member must strand-and-wedge (or strand harmlessly) at HEAD and
+/// heal under the fix.
+#[test]
+#[serial]
+fn dst_keep_serving_wedge_issue_554() {
+    // ops is deliberately SHORT: the panel seeds strand early — a longer
+    // life under this fault plan eventually strands an EFFECTFUL Armed
+    // intent (partial multi-table commit), which the engine CORRECTLY
+    // refuses to retire live; the detector's effect-free precision is
+    // enforced by scenario construction (verifying effect-freedom in the
+    // oracle itself is a recorded open). error_pct is HIGH so retry chains
+    // die instead of rescuing the commit.
+    // Every member is a verified FLIP seed: wedges (or strands harmlessly)
+    // at engine HEAD and heals under the issue-554 engine fix. Seeds 12 and
+    // 18 were screened OUT — their strands stay wedged under the fix
+    // (effectful / excluded-class intents the engine correctly refuses to
+    // retire live; recorded as triage candidates).
+    const PANEL: [u64; 14] = [0, 4, 10, 11, 14, 15, 17, 20, 21, 22, 23, 25, 26, 28];
+    let mut wedged: Vec<String> = Vec::new();
+    let mut defer_rows = 0usize;
+    for seed in PANEL {
+        let sc = Scenario {
+            seed,
+            ops: 10,
+            faults: Some(omnigraph_dst::harness::FaultPlan {
+                seed: seed * 100,
+                error_pct: 80,
+                lance_realm: true,
+                ..Default::default()
+            }),
+            keep_serving_ops: 3,
+            ..Default::default()
+        };
+        let root = format!("shared-memory://dst-keep-serving-554-{seed}");
+        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
+            Ok(report) => {
+                defer_rows += report
+                    .known_issues
+                    .iter()
+                    .filter(|row| {
+                        row.starts_with(omnigraph_dst::harness::KEEP_SERVING_DEFER_PREFIX)
+                    })
+                    .count();
+            }
+            Err(panic) => {
+                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
+                if message.contains("detector=Store(Session)/LiveWriteAvailability") {
+                    wedged.push(format!("seed {seed}: {message}"));
+                } else {
+                    // A non-wedge red on a panel seed is a different bug —
+                    // surface it with its seed rather than folding it into
+                    // the wedge verdict.
+                    panic!("seed {seed}: {message}");
+                }
+            }
+        }
+    }
+    assert!(
+        wedged.is_empty(),
+        "live handles wedged on {} of {} panel seeds:\n{}",
+        wedged.len(),
+        PANEL.len(),
+        wedged.join("\n")
+    );
+    assert!(
+        defer_rows > 0,
+        "no panel seed entered the wedge shape (a deferred RecoveryRequired \
+         refusal) — re-pin the panel via dst_keep_serving_wedge_seed_search"
+    );
+}
+
+/// SEARCH INSTRUMENT for the issue-554 catch: enumerate seeds 0..60,
+/// printing each seed's outcome (green with defer counts, or RED with the
+/// rendered violation), so the panel above can be (re)chosen — see the
+/// panel's two-step re-pin protocol.
+/// Not part of the suite — run explicitly with `-- --ignored --nocapture`.
+#[test]
+#[serial]
+#[ignore = "search: enumerate seeds for the issue-554 keep-serving wedge pin"]
+fn dst_keep_serving_wedge_seed_search() {
+    for seed in 0..60u64 {
+        let sc = Scenario {
+            seed,
+            ops: 30,
+            faults: Some(omnigraph_dst::harness::FaultPlan {
+                seed: seed * 100,
+                error_pct: 15,
+                lance_realm: true,
+                ..Default::default()
+            }),
+            keep_serving_ops: 3,
+            ..Default::default()
+        };
+        let root = format!("shared-memory://dst-keep-serving-search-{seed}");
+        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
+            Ok(report) => {
+                let defers = report
+                    .known_issues
+                    .iter()
+                    .filter(|row| {
+                        row.starts_with(omnigraph_dst::harness::KEEP_SERVING_DEFER_PREFIX)
+                    })
+                    .count();
+                println!("seed {seed}: green (defer rows: {defers})");
+            }
+            Err(panic) => {
+                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
+                let hit = message.contains("detector=Store(Session)/LiveWriteAvailability");
+                println!(
+                    "seed {seed}: RED{} — {message}",
+                    if hit { " (WEDGE)" } else { "" }
+                );
+            }
+        }
+    }
+}
+
 /// ACK-LOSS: the inverse fault direction — the write HAPPENED, but you're
 /// told it failed (a dropped S3 200). Injected AFTER delegation on every
 /// adapter-realm write class — effect durable, marked error returned —

@@ -73,9 +73,9 @@ pub enum ObservationSource {
 macro_rules! oracles {
     ( $( $name:ident, $class:literal, $sources:expr, $anchor:literal, $doc:literal; )+ ) => {
         /// The expectation + comparison half of a verdict, at named-mechanism
-        /// grain (21 in the agreed census; oracles
-        /// born after v11, e.g. the concurrent-arm judges, extend this enum
-        /// via a deliberate census bump, never silently).
+        /// grain. Oracles born after the agreed v11 census extend this enum
+        /// via a deliberate census bump, never silently; `census_counts_hold`
+        /// owns the current numbers.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum Oracle {
             $( #[doc = $doc] $name, )+
@@ -182,6 +182,10 @@ oracles! {
         &[Store(Physical)],
         "harness.rs final audit residue check + tests::dst_residue_channel_sees_planted_file",
         "no universe ends owing recovery work: __recovery/ empty at quiesce, backed by the planted-file channel canary";
+    LiveWriteAvailability, "obligation",
+        &[Store(Session)],
+        "harness.rs::run_universe_caught keep-serving watch (Scenario::keep_serving_ops)",
+        "a live handle must not wedge permanently on one pending effect-free Armed recovery operation: with reconcile's reopen deferred, consecutive same-operation RecoveryRequired refusals stay under the keep-serving budget (issue #554)";
     MaintenanceObligations, "obligation",
         &[Store(Query)],
         "harness.rs::maintenance_obligations",
@@ -448,8 +452,8 @@ mod tests {
         );
     }
 
-    /// The documented shape: 21 oracles, differential 7 / prediction 4 /
-    /// obligation 8 / meta 2 (the documented counts, self-checked).
+    /// The documented shape: 22 oracles, differential 7 / prediction 4 /
+    /// obligation 9 / meta 2 (the documented counts, self-checked).
     #[test]
     fn census_counts_hold() {
         let count = |class: &str| {
@@ -460,17 +464,17 @@ mod tests {
         };
         assert_eq!(
             Oracle::ALL.len(),
-            21,
-            "oracle count drifted from the documented 21"
+            22,
+            "oracle count drifted from the documented 22"
         );
         assert_eq!(count("differential"), 7);
         assert_eq!(count("prediction"), 4);
-        assert_eq!(count("obligation"), 8);
+        assert_eq!(count("obligation"), 9);
         assert_eq!(count("meta"), 2);
         // Detector count: one per (source, oracle) pairing.
         let detectors: usize = Oracle::ALL.iter().map(|o| o.sources().len()).sum();
         assert_eq!(
-            detectors, 24,
+            detectors, 25,
             "detector count drifted (three oracles ride two sources each)"
         );
     }
