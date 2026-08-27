@@ -52,6 +52,24 @@ Each conflict identifies the affected type and, when applicable, entity id. The
 HTTP server returns conflicts with status `409`. Reconcile the data on one or
 both branches, then run the merge again.
 
+## Merge classification mode
+
+`OMNIGRAPH_MERGE_LINEAGE` selects how a branch merge finds what changed. `on`
+(the release default) discovers candidates from Lance version metadata —
+fragment lists and deletion files — and reads only the changed data, so merge
+cost tracks the delta size instead of the dataset size; a fail-closed
+precondition gate falls back to the full three-way scan whenever any
+assumption cannot be proven (Blob-bearing schema, differing schemas or storage
+paths across the pins, version pins not matching the manifest entries, missing
+stable identifiers or the exact-id primary-key contract, non-linear history,
+or a candidate set past its byte budget). `off` forces the full three-way scan
+everywhere — the operational fallback if merge results are ever in question.
+`verify` runs both, compares their decisions entity by entity, publishes the
+scan's result, and fails the merge loudly on any divergence (the debug-build
+default, used for validation; it costs both paths). A merge that succeeds
+produces the same result in every mode; only cost differs. An unrecognized
+value logs a warning and behaves as `off`.
+
 ## After a large merge
 
 Indexes do not define merge correctness. Newly merged entities remain queryable even

@@ -1834,7 +1834,7 @@ async fn fragment_deletion_vector(
     Ok(fragment
         .get_deletion_vector()
         .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
+        .map_err(OmniError::storage)?
         .map(|dv| dv.as_ref().clone())
         .unwrap_or_default())
 }
@@ -1881,11 +1881,7 @@ async fn gather_candidate_ids(
         },
     )
     .await?;
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
-    {
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
         let addresses = batch
             .column_by_name(lance_core::ROW_ADDR)
             .ok_or_else(|| {
@@ -2130,7 +2126,7 @@ async fn plan_lineage_merge(
         let base_identifier = base_dataset
             .branch_identifier()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         for (side_dataset, side_entry) in [(&source, source_entry), (&target, target_entry)] {
             let (Some(side_dataset), Some(side_entry)) = (side_dataset, side_entry) else {
                 continue;
@@ -2138,7 +2134,7 @@ async fn plan_lineage_merge(
             let side_identifier = side_dataset
                 .branch_identifier()
                 .await
-                .map_err(|error| OmniError::Lance(error.to_string()))?;
+                .map_err(OmniError::storage)?;
             if side_entry.native_dataset_branch == base_entry.native_dataset_branch {
                 if side_entry.published_dataset_version < base_entry.published_dataset_version
                     || side_identifier != base_identifier
