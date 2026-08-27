@@ -29,3 +29,4 @@ demo/*.omni/
 /schema-prior-art.md
 mdrip/
 crates/omnigraph/benches/results.jsonl
+.bench/

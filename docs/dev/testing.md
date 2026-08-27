@@ -138,16 +138,69 @@ The current runner executes the narrow, fail-closed local envelope documented
 in `crates/omnigraph-bench/README.md`. It requires a release binary, restores
 every repetition from a never-opened APFS clonefile template at the fixture's
 stable path, contains each measured merge in a fresh SHA-attested,
-hard-deadline worker process, verifies exact target/source/main state, and emits
-diagnostic output rather than a durable benchmark record:
+hard-deadline worker process, and verifies exact target/source/main state.
+Fixture and repetition children clear the host environment, pin locale, and
+receive protocol-owned scratch siblings as `TMPDIR` and cwd; measured workers
+also use their per-repetition scratch as `OMNIGRAPH_MERGE_STAGING_DIR`. The only
+inherited engine setting is the modeled `LANCE_MEM_POOL_SIZE`; Tokio/Rayon
+thread-count overrides are refused before execution. A
+run without `--archive` emits diagnostic output only:
 
 ```bash
 cargo run --release --locked -p omnigraph-bench -- \
   suite run benchmarks/suites/local-smoke.suite-v1.yaml
 ```
 
-Do not archive that diagnostic JSON as telemetry. Immutable records and their
-query projection are owned by the next harness slice.
+Do not archive that diagnostic JSON as telemetry. To publish authoritative
+records, first commit the exact source under test, build the release binary from
+that clean tree, and pass `--archive <DIR>`. The commit records source
+provenance; the executable digest and normalized build/engine facts bind the
+exact SUT bytes. Source revalidation compares raw tracked source bytes without
+Git clean filters, disables replacement objects and permissive stat-cache
+modes, and refuses hidden index flags or ignored untracked source inputs.
+Profile-file LTO/codegen/strip values are declarations, not
+effective compiler facts: Cargo does not expose the final target rustc command
+to build scripts, so records mark effective codegen options unproved until
+controlled infrastructure supplies a digest-bound receipt. Raw timing records remain
+useful evidence, but that absence cannot authorize a performance conclusion.
+Accordingly, the projection reports `claim_eligible: false` even for complete
+local acquisitions until a controlled digest-bound build receipt supplies that
+proof. Acquisition status and global claim eligibility are separate facts.
+Validate records independently with
+`archive verify`; rebuild the disposable OmniGraph read model with `projection
+rebuild --archive <DIR> --root <DIR>`. The content-addressed canonical JSON is
+authority. Projection generations and `CURRENT` may always be deleted and
+rebuilt from it. Archive verification streams a fixed invocation inventory;
+archive writers and inventory capture coordinate at the immutable pointer
+publication boundary. The current publication guarantee is local Unix
+file/directory durability through every descriptor-rooted ancestor back to the
+captured archive root. Readers fix the pointer inventory under the publication
+lock, then durability-close each yielded record once or fail; a substantive sync failure after pointer visibility is
+`possibly_published`, never success. Projection queries and rebuild verification use bounded,
+exclusive pages whose continuation cursors are pinned to an immutable
+generation, and publication verifies a canonical digest over every projected
+field rather than keys alone.
+
+Process-effective machine evidence is captured in each isolated repetition
+worker immediately before it declares readiness. All repetitions in a run must
+match exactly; the CLI does not reuse a session-start machine snapshot.
+
+Archive-mode suite execution publishes and releases each complete raw run
+before starting the next suite entry. Its command result contains a completed
+count and immutable receipts instead of duplicating the raw samples already in
+the authoritative records. If pointer visibility succeeds but bounded
+directory-sync recovery cannot prove durability, the JSON failure includes a
+`possibly_published` identity. Pass its invocation and record digest to
+`archive reconcile`; only a `durable`, `absent`, or `conflict` result closes the
+specific ambiguity. Do that before retrying under a different invocation. If
+an acquisition fails after at least one fully verified repetition, the CLI
+publishes only that prefix as a `censored`, permanently claim-ineligible record
+and still exits nonzero. A rep-zero failure publishes nothing, and a merely
+settled repetition never enters durable samples. If
+record construction or publication fails before authority exists, the bounded
+failure output retains that one complete execution or censored verified prefix
+as state-neutral `unpublished_run` evidence. Human mode prints the same complete
+JSON envelope.
 
 Keep measurement fixtures separate from production schemas and recovery state. A no-go result belongs in the RFC or issue that consumed the experiment, not as a permanent narrative in this map.
 

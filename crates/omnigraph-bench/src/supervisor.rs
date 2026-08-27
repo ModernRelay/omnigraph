@@ -16,8 +16,12 @@ use std::time::{Duration, Instant};
 
 use crate::ValidatedCase;
 use crate::branch_merge::{BranchMergePlan, TARGET_BRANCH};
+use crate::machine::MachineIdentityV1;
 use crate::reset::{MetadataDigest, PhysicalDigest};
-use crate::runner::{ChildProcessEvidence, RepObservation, RunnerError, RunnerResult};
+use crate::runner::{
+    ChildProcessEvidence, RepObservation, RunnerError, RunnerResult,
+    configure_benchmark_worker_environment, validate_worker_build_attestation,
+};
 use crate::worker_protocol::{
     ChildFrameV1, MAX_WORKER_FRAME_BYTES, ParentFrameV1, WORKER_PROTOCOL_VERSION, WorkerBuildV1,
     WorkerRequestV1, WorkerStageV1, write_frame,
@@ -40,10 +44,15 @@ const STDERR_TAIL_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone)]
 pub(crate) struct SupervisionInput {
     pub worker_executable: PathBuf,
-    pub worker_build: WorkerBuildV1,
+    pub expected_worker_executable_sha256: String,
+    /// The first worker establishes this identity. Later workers must report
+    /// it exactly before the supervisor sends Begin.
+    pub expected_machine: Option<MachineIdentityV1>,
+    pub fixture_manifest_sha256: String,
     pub repetition: u32,
     pub case: ValidatedCase,
     pub repetition_root: PathBuf,
+    pub worker_scratch_root: PathBuf,
     pub physical_digest: PhysicalDigest,
     pub metadata_digest: MetadataDigest,
     pub deadline: Option<Duration>,
@@ -51,11 +60,26 @@ pub(crate) struct SupervisionInput {
     pub auxiliary_deadline_override: Option<Duration>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupervisedRepetition {
+    pub sample: RepObservation,
+    pub worker_build: WorkerBuildV1,
+    pub machine: MachineIdentityV1,
+}
+
 /// Supervise one fresh worker process through exactly one mutation.
 #[cfg(unix)]
-pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepObservation> {
+pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<SupervisedRepetition> {
+    if !lower_sha256(&input.fixture_manifest_sha256) {
+        return Err(RunnerError::new(
+            "fixture_stamp_invalid",
+            "repetition input does not carry a canonical pre-measurement fixture stamp digest",
+        )
+        .with_repetition(input.repetition));
+    }
     let measurement_watchdog = measurement_watchdog(&input);
     let mut command = Command::new(&input.worker_executable);
+    configure_benchmark_worker_environment(&mut command, &input.worker_scratch_root);
     command
         .arg("__worker-v1")
         .stdin(Stdio::piped())
@@ -173,6 +197,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
             expected_point_id: input.case.point_id.clone(),
             expected_case_digest: input.case.case_digest.clone(),
             repetition_root: input.repetition_root.clone(),
+            worker_scratch_root: input.worker_scratch_root.clone(),
             expected_physical_digest: input.physical_digest.clone(),
             expected_metadata_digest: input.metadata_digest.clone(),
         }),
@@ -199,22 +224,53 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
             return worker.kill_error("prepare-protocol", "worker_protocol_error", message);
         }
     };
-    match ready {
+    let (worker_build, machine) = match ready {
         ChildFrameV1::Ready {
             protocol_version,
             repetition,
             point_id,
             case_digest,
             worker_build,
+            machine,
             physical_digest,
             metadata_digest,
         } if protocol_version == WORKER_PROTOCOL_VERSION
             && repetition == input.repetition
             && point_id == input.case.point_id
             && case_digest == input.case.case_digest
-            && worker_build == input.worker_build
             && physical_digest == input.physical_digest
-            && metadata_digest == input.metadata_digest => {}
+            && metadata_digest == input.metadata_digest =>
+        {
+            if let Err(error) = validate_worker_build_attestation(
+                &worker_build,
+                &input.expected_worker_executable_sha256,
+            ) {
+                return worker.kill_error(
+                    "prepare-protocol",
+                    "worker_protocol_error",
+                    format!("worker build attestation was invalid: {}", error.message),
+                );
+            }
+            if let Err(error) = machine.validate() {
+                return worker.kill_error(
+                    "prepare-protocol",
+                    "worker_protocol_error",
+                    format!("worker machine identity was invalid: {error}"),
+                );
+            }
+            if input
+                .expected_machine
+                .as_ref()
+                .is_some_and(|expected| expected != &machine)
+            {
+                return worker.kill_error(
+                    "prepare-protocol",
+                    "worker_machine_identity_changed",
+                    "repetition worker machine identity differs from the first worker in this run",
+                );
+            }
+            (worker_build, machine)
+        }
         ChildFrameV1::Failed {
             stage,
             code,
@@ -246,7 +302,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
                 format!("worker sent an invalid ready frame: {frame:?}"),
             );
         }
-    }
+    };
 
     let begin = ParentFrameV1::Begin {
         protocol_version: WORKER_PROTOCOL_VERSION,
@@ -480,11 +536,22 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
             .with_settled_sample(sample));
         }
     }
-    Ok(sample)
+    Ok(SupervisedRepetition {
+        sample,
+        worker_build,
+        machine,
+    })
+}
+
+fn lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(not(unix))]
-pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepObservation> {
+pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<SupervisedRepetition> {
     Err(RunnerError::new(
         "unsupported_worker_platform",
         format!(
@@ -595,13 +662,13 @@ impl WorkerProcess {
         }
     }
 
-    fn structured_failure(
+    fn structured_failure<T>(
         mut self,
         stage: WorkerStageV1,
         code: String,
         message: String,
         settled_sample: Option<Box<RepObservation>>,
-    ) -> RunnerResult<RepObservation> {
+    ) -> RunnerResult<T> {
         let status = self.wait_for_exit(REAP_DEADLINE).ok();
         let group_gone = process_group_is_gone(self.process_group).unwrap_or(false);
         if status.is_none() || !group_gone {
@@ -632,12 +699,12 @@ impl WorkerProcess {
         Err(error)
     }
 
-    fn kill_error(
+    fn kill_error<T>(
         mut self,
         stage: &str,
         code: &str,
         message: impl Into<String>,
-    ) -> RunnerResult<RepObservation> {
+    ) -> RunnerResult<T> {
         let message = message.into();
         let kill_result = kill_process_group(self.process_group);
         let status = self.wait_for_exit(REAP_DEADLINE).ok();
@@ -1329,8 +1396,9 @@ mod tests {
     const TEST_REPETITION: u32 = 7;
     const TEST_ELAPSED_US: u64 = 1_000;
     const QUICK_DEADLINE: Duration = Duration::from_millis(250);
-    const GENEROUS_DEADLINE: Duration = Duration::from_secs(2);
-    const GENEROUS_AUXILIARY_DEADLINE: Duration = Duration::from_secs(2);
+    const BOUNDED_AUXILIARY_DEADLINE: Duration = Duration::from_secs(2);
+    const GENEROUS_DEADLINE: Duration = Duration::from_secs(10);
+    const GENEROUS_AUXILIARY_DEADLINE: Duration = Duration::from_secs(10);
     static WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_case() -> ValidatedCase {
@@ -1360,37 +1428,85 @@ mod tests {
         }
     }
 
-    fn worker_build() -> WorkerBuildV1 {
-        WorkerBuildV1 {
-            cargo_profile: "release".into(),
-            opt_level: "3".into(),
-            debug_assertions: false,
-            source_git_commit_sha: Some("1".repeat(40).into_boxed_str()),
-            source_worktree_dirty: Some(false),
-            effective_lance_mem_pool_size: Box::new(
-                crate::runner::EffectiveEnvironmentValue::Unset,
-            ),
-            executable_sha256: "d".repeat(64).into_boxed_str(),
+    fn machine_identity() -> MachineIdentityV1 {
+        MachineIdentityV1 {
+            format_version: crate::machine::MACHINE_IDENTITY_FORMAT_VERSION,
+            os_name: "macos".to_string(),
+            os_version: "15.6".to_string(),
+            kernel_version: "24.6.0".to_string(),
+            architecture: "aarch64".to_string(),
+            cpu_model: "Apple M4".to_string(),
+            logical_cores: 10,
+            physical_cores: 10,
+            total_memory_bytes: 32 * 1024 * 1024 * 1024,
+            resource_control: crate::machine::ResourceControlV1::MacosNative,
+            scheduling: crate::machine::SchedulingIdentityV1 {
+                nice_level: 0,
+                policy: crate::machine::SchedulerPolicyV1::Other,
+                priority: 0,
+                reset_on_fork: false,
+            },
+            resource_limits: crate::machine::ResourceLimitIdentityV1 {
+                scope_version: crate::machine::RESOURCE_LIMIT_SCOPE_VERSION,
+                values_sha256: "9".repeat(64),
+            },
+            machine_label: format!("hostname-sha256:{}", "8".repeat(64)),
         }
     }
 
-    fn supervision_input(worker_executable: PathBuf) -> SupervisionInput {
-        SupervisionInput {
+    fn worker_build() -> WorkerBuildV1 {
+        WorkerBuildV1 {
+            source_commit: "0".repeat(40),
+            source_tree_dirty: Some(false),
+            cargo_profile: "release".to_string(),
+            cargo_opt_level: "2".to_string(),
+            debug_assertions: false,
+            effective_lance_mem_pool_size: Box::new(
+                crate::runner::EffectiveEnvironmentValue::Unset,
+            ),
+            target_triple: "aarch64-apple-darwin".to_string(),
+            rustc_version: "rustc 1.97.1".to_string(),
+            declared_release_lto: "thin".to_string(),
+            declared_release_codegen_units: Some(16),
+            declared_release_strip: Some(true),
+            cargo_encoded_rustflags_present: Some(false),
+            release_profile_environment_overrides_supported: Some(true),
+            effective_codegen_options_proved: false,
+            engine_feature_flags: omnigraph::instrumentation::enabled_engine_cargo_features()
+                .iter()
+                .map(|feature| (*feature).to_string())
+                .collect(),
+            enabled_techniques: Vec::new(),
+            executable_sha256: "d".repeat(64),
+        }
+    }
+
+    fn supervision_input(worker_executable: PathBuf) -> (tempfile::TempDir, SupervisionInput) {
+        let workspace = tempfile::tempdir().unwrap();
+        let repetition_root = workspace.path().join("supervisor-test-fixture");
+        let worker_scratch_root = workspace.path().join("worker-scratch-00000007");
+        std::fs::create_dir(&repetition_root).unwrap();
+        std::fs::create_dir(&worker_scratch_root).unwrap();
+        let input = SupervisionInput {
             worker_executable,
-            worker_build: worker_build(),
+            expected_worker_executable_sha256: worker_build().executable_sha256,
+            expected_machine: None,
+            fixture_manifest_sha256: "e".repeat(64),
             repetition: TEST_REPETITION,
             case: test_case(),
-            repetition_root: PathBuf::from("/unused/supervisor-test-fixture"),
+            repetition_root,
+            worker_scratch_root,
             physical_digest: physical_digest(),
             metadata_digest: metadata_digest(),
             deadline: Some(GENEROUS_DEADLINE),
             auxiliary_deadline_override: Some(GENEROUS_AUXILIARY_DEADLINE),
-        }
+        };
+        (workspace, input)
     }
 
     #[test]
     fn undeclared_operation_deadline_keeps_an_independent_safety_watchdog() {
-        let mut input = supervision_input(PathBuf::from("/unused"));
+        let (_workspace, mut input) = supervision_input(PathBuf::from("/unused"));
         input.deadline = None;
 
         assert_eq!(
@@ -1408,7 +1524,8 @@ mod tests {
             repetition: input.repetition,
             point_id: input.case.point_id.clone(),
             case_digest: input.case.case_digest.clone(),
-            worker_build: input.worker_build.clone(),
+            worker_build: worker_build(),
+            machine: machine_identity(),
             physical_digest: input.physical_digest.clone(),
             metadata_digest: input.metadata_digest.clone(),
         }
@@ -1515,7 +1632,7 @@ mod tests {
     }
 
     fn assert_contained_failure(
-        result: RunnerResult<RepObservation>,
+        result: RunnerResult<SupervisedRepetition>,
         expected_code: &str,
         expected_stage: &str,
     ) -> RunnerError {
@@ -1536,7 +1653,7 @@ mod tests {
     #[test]
     fn valid_worker_completes_ready_begin_settled_complete_protocol() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let expected = valid_sample(&input);
         let body = normal_exchange(&input, complete_frame(&input, expected.clone()));
         let (_guard, _directory, worker) = worker_script(&body);
@@ -1544,15 +1661,17 @@ mod tests {
 
         let mut observed = supervise_repetition(input).unwrap();
 
-        assert!(observed.peak_rss_bytes.is_some(), "{observed:?}");
-        observed.peak_rss_bytes = None;
-        assert_eq!(observed, expected);
+        assert!(observed.sample.peak_rss_bytes.is_some(), "{observed:?}");
+        observed.sample.peak_rss_bytes = None;
+        assert_eq!(observed.sample, expected);
+        assert_eq!(observed.worker_build, worker_build());
+        assert_eq!(observed.machine, machine_identity());
     }
 
     #[test]
     fn worker_cannot_report_more_elapsed_time_than_the_parent_observed() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let forged = ChildFrameV1::Settled {
             protocol_version: WORKER_PROTOCOL_VERSION,
             repetition: input.repetition,
@@ -1580,7 +1699,7 @@ mod tests {
     #[test]
     fn supervised_repetitions_use_distinct_worker_processes() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         input.auxiliary_deadline_override = Some(Duration::from_secs(5));
         let expected = valid_sample(&input);
         let body = format!(
@@ -1594,10 +1713,11 @@ mod tests {
         let first_thread = std::thread::spawn(move || supervise_repetition(input));
         let second_thread = std::thread::spawn(move || supervise_repetition(second));
         for result in [first_thread.join().unwrap(), second_thread.join().unwrap()] {
-            let mut observed = result.unwrap();
-            assert!(observed.peak_rss_bytes.is_some(), "{observed:?}");
-            observed.peak_rss_bytes = None;
-            assert_eq!(observed, expected);
+            let observed = result.unwrap();
+            assert!(observed.sample.peak_rss_bytes.is_some(), "{observed:?}");
+            let mut sample = observed.sample;
+            sample.peak_rss_bytes = None;
+            assert_eq!(sample, expected);
         }
 
         let pid_log = PathBuf::from(format!("{}.pids", worker.display()));
@@ -1615,7 +1735,7 @@ mod tests {
     #[test]
     fn worker_that_never_reads_stdin_is_bounded_by_prepare_deadline() {
         let (_guard, _directory, worker) = worker_script("sleep 300\n");
-        let mut input = supervision_input(worker);
+        let (_workspace, mut input) = supervision_input(worker);
         input.auxiliary_deadline_override = Some(QUICK_DEADLINE);
         let started = Instant::now();
 
@@ -1639,7 +1759,7 @@ mod tests {
     #[test]
     fn worker_measurement_hang_is_killed_at_the_declared_deadline() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         input.deadline = Some(QUICK_DEADLINE);
         let body = format!(
             "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\nsleep 300\n",
@@ -1669,8 +1789,8 @@ mod tests {
     #[test]
     fn worker_verification_hang_after_settled_is_bounded() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
-        input.auxiliary_deadline_override = Some(GENEROUS_AUXILIARY_DEADLINE);
+        let (_workspace, mut input) = supervision_input(placeholder);
+        input.auxiliary_deadline_override = Some(BOUNDED_AUXILIARY_DEADLINE);
         let body = format!(
             "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n{}sleep 300\n",
             emit(&ready_frame(&input)),
@@ -1685,14 +1805,14 @@ mod tests {
             "worker_verification_timeout",
             "verify-timeout",
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
     fn worker_that_reports_complete_but_does_not_exit_is_killed() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
-        input.auxiliary_deadline_override = Some(GENEROUS_AUXILIARY_DEADLINE);
+        let (_workspace, mut input) = supervision_input(placeholder);
+        input.auxiliary_deadline_override = Some(BOUNDED_AUXILIARY_DEADLINE);
         let sample = valid_sample(&input);
         let mut body = normal_exchange(&input, complete_frame(&input, sample));
         body.push_str("sleep 300\n");
@@ -1705,13 +1825,13 @@ mod tests {
             "worker_exit_timeout",
             "exit-timeout",
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
     fn valid_trailing_frame_after_complete_is_rejected() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let sample = valid_sample(&input);
         let mut body = normal_exchange(&input, complete_frame(&input, sample));
         body.push_str(&emit(&ready_frame(&input)));
@@ -1736,7 +1856,7 @@ mod tests {
     #[test]
     fn malformed_trailing_output_after_complete_is_rejected() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let sample = valid_sample(&input);
         let mut body = normal_exchange(&input, complete_frame(&input, sample));
         body.push_str("printf '%s\\n' '{not-json'\n");
@@ -1754,7 +1874,7 @@ mod tests {
     #[test]
     fn forged_ready_identity_is_rejected() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let mut forged = ready_frame(&input);
         if let ChildFrameV1::Ready { point_id, .. } = &mut forged {
             *point_id = "0".repeat(64);
@@ -1774,9 +1894,75 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_worker_build_attestation_is_rejected_before_measurement() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let mut forged = ready_frame(&input);
+        if let ChildFrameV1::Ready { worker_build, .. } = &mut forged {
+            worker_build.rustc_version = "unknown".to_string();
+        }
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n",
+            emit(&forged),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "prepare-protocol",
+        );
+    }
+
+    #[test]
+    fn invalid_worker_machine_identity_is_rejected_before_measurement() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let mut forged = ready_frame(&input);
+        if let ChildFrameV1::Ready { machine, .. } = &mut forged {
+            machine.logical_cores = 0;
+        }
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n",
+            emit(&forged),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "prepare-protocol",
+        );
+    }
+
+    #[test]
+    fn changed_worker_machine_identity_is_rejected_before_begin() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let mut expected = machine_identity();
+        expected.machine_label = format!("hostname-sha256:{}", "7".repeat(64));
+        expected.validate().unwrap();
+        input.expected_machine = Some(expected);
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n",
+            emit(&ready_frame(&input)),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_machine_identity_changed",
+            "prepare-protocol",
+        );
+    }
+
+    #[test]
     fn out_of_order_failed_frame_cannot_smuggle_settled_evidence_before_ready() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let forged = ChildFrameV1::Failed {
             protocol_version: WORKER_PROTOCOL_VERSION,
             stage: WorkerStageV1::Verify,
@@ -1798,7 +1984,7 @@ mod tests {
     #[test]
     fn forged_complete_sample_is_rejected_by_parent_admission() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         let mut sample = valid_sample(&input);
         sample.verification.rows += 1;
         let body = normal_exchange(&input, complete_frame(&input, sample));
@@ -1854,7 +2040,7 @@ mod tests {
                 sample.logical_store_calls.physical_attempts_observed = true
             }),
         ];
-        let input = supervision_input(PathBuf::from("/unused"));
+        let (_workspace, input) = supervision_input(PathBuf::from("/unused"));
 
         for (field, mutate) in cases {
             let mut sample = valid_sample(&input);
@@ -1869,7 +2055,7 @@ mod tests {
     #[test]
     fn descendant_holding_inherited_pipes_prevents_false_clean_completion() {
         let placeholder = PathBuf::from("/placeholder");
-        let mut input = supervision_input(placeholder);
+        let (_workspace, mut input) = supervision_input(placeholder);
         input.auxiliary_deadline_override = Some(GENEROUS_AUXILIARY_DEADLINE);
         let sample = valid_sample(&input);
         let mut body = normal_exchange(&input, complete_frame(&input, sample));

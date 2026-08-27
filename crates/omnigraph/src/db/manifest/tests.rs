@@ -472,6 +472,48 @@ async fn test_snapshot_open_sub_table() {
 }
 
 #[tokio::test]
+async fn snapshot_dataset_proves_index_inventory_from_raw_manifest_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/indexed.lance", dir.path().display());
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+    )
+    .unwrap();
+    let dataset = crate::table_store::TableStore::write_dataset(&uri, batch)
+        .await
+        .unwrap();
+    assert!(
+        !SnapshotDataset::new(dataset.clone()).has_raw_index_section(),
+        "a dataset created without indexes must have no raw index section"
+    );
+
+    let store = crate::table_store::TableStore::new(
+        dir.path().to_str().unwrap(),
+        Arc::new(lance::session::Session::default()),
+    );
+    let staged = store
+        .stage_create_indices(
+            &dataset,
+            &[crate::storage_layer::IndexBuildSpec::BTree {
+                column: "id".to_string(),
+                name: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let indexed = store
+        .commit_staged(Arc::new(dataset), staged)
+        .await
+        .unwrap();
+    assert!(
+        SnapshotDataset::new(indexed).has_raw_index_section(),
+        "the raw manifest witness must observe a committed index section"
+    );
+}
+
+#[tokio::test]
 async fn snapshot_scanner_strict_rows_survive_byte_target_override() {
     const ROWS: usize = 10_000;
     const BATCH_ROWS: usize = 8_192;

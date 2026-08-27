@@ -33,6 +33,42 @@ use lance::io::WrappingObjectStore;
 use crate::error::{OmniError, Result};
 use crate::storage::{ListDirBounds, StorageAdapter};
 
+macro_rules! declare_engine_cargo_features {
+    ($($feature:literal),+ $(,)?) => {
+        /// Every Cargo feature declared by `omnigraph-engine`.
+        ///
+        /// Benchmark admission compares this registry to the crate manifest
+        /// captured by its build script. Adding a Cargo feature without adding
+        /// it here therefore fails closed instead of collapsing two builds into
+        /// one benchmark identity.
+        #[doc(hidden)]
+        pub const fn declared_engine_cargo_features() -> &'static [&'static str] {
+            &[$($feature),+]
+        }
+
+        /// Cargo features compiled into this exact `omnigraph-engine` artifact.
+        ///
+        /// This read-only build seam lets benchmark and diagnostic binaries
+        /// report dependency features from the crate that owns them. A
+        /// dependent crate's `cfg(feature = ...)` namespace cannot observe
+        /// features enabled directly on `omnigraph-engine` by Cargo's workspace
+        /// feature graph.
+        #[doc(hidden)]
+        pub const fn enabled_engine_cargo_features() -> &'static [&'static str] {
+            &[
+                $(
+                    #[cfg(feature = $feature)]
+                    $feature,
+                )+
+            ]
+        }
+    };
+}
+
+// Keep this list sorted. Benchmark admission independently derives the same
+// registry from Cargo.toml and refuses execution on any mismatch.
+declare_engine_cargo_features!("default", "dst", "failpoints");
+
 /// Per-query IO probes, installed for a query's task via [`with_query_io_probes`].
 ///
 /// Each wrapper is attached (when present) to the datasets that category opens,
@@ -1014,6 +1050,71 @@ impl StorageAdapter for CountingStorageAdapter {
 #[cfg(test)]
 mod merge_timing_phase_tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn benchmark_feature_attestation_covers_every_engine_feature() {
+        let manifest = toml::from_str::<toml::Value>(include_str!("../Cargo.toml"))
+            .expect("engine Cargo.toml parses as TOML");
+        let declared = manifest["features"]
+            .as_table()
+            .expect("engine Cargo.toml has a features table")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let registry = declared_engine_cargo_features()
+            .iter()
+            .map(|feature| (*feature).to_string())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(declared, registry, "update the benchmark feature registry");
+
+        let suppressed_optional_dependencies = manifest["features"]
+            .as_table()
+            .unwrap()
+            .values()
+            .filter_map(toml::Value::as_array)
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .filter_map(|feature| feature.strip_prefix("dep:"))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut optional_dependencies = BTreeSet::new();
+        let mut inspect_dependencies = |value: Option<&toml::Value>| {
+            let Some(table) = value.and_then(toml::Value::as_table) else {
+                return;
+            };
+            optional_dependencies.extend(
+                table
+                    .iter()
+                    .filter(|(_name, specification)| {
+                        specification
+                            .as_table()
+                            .and_then(|fields| fields.get("optional"))
+                            .and_then(toml::Value::as_bool)
+                            .is_some_and(|optional| optional)
+                    })
+                    .map(|(name, _specification)| name.clone()),
+            );
+        };
+        for table in ["dependencies", "build-dependencies"] {
+            inspect_dependencies(manifest.get(table));
+        }
+        if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+            for target in targets.values() {
+                for table in ["dependencies", "build-dependencies"] {
+                    inspect_dependencies(target.get(table));
+                }
+            }
+        }
+        assert!(
+            optional_dependencies
+                .difference(&suppressed_optional_dependencies)
+                .next()
+                .is_none(),
+            "optional dependencies must use dep:name so no implicit feature escapes attestation"
+        );
+    }
 
     #[test]
     fn all_lists_every_phase_in_counter_order() {

@@ -7,8 +7,8 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs::File;
-use std::io::{self, BufRead, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::case::CaseV1;
+use crate::machine::MachineIdentityV1;
 use crate::reset::{MetadataDigest, PhysicalDigest};
 use crate::runner::{EffectiveEnvironmentValue, RepObservation};
 
 /// The only worker protocol understood by this build.
-pub const WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const WORKER_PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum compact JSON payload bytes in one frame, excluding its newline.
 ///
@@ -35,13 +36,37 @@ const EXECUTABLE_DIGEST_BUFFER_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerBuildV1 {
-    pub cargo_profile: Box<str>,
-    pub opt_level: Box<str>,
+    pub source_commit: String,
+    /// `None` is an explicit failed build-time probe and is never admissible
+    /// for a measured worker. Keeping the absence typed lets the parent fail
+    /// closed instead of accepting a fabricated clean/dirty value.
+    pub source_tree_dirty: Option<bool>,
+    pub cargo_profile: String,
+    /// Cargo's profile-level observation, not proof against direct target
+    /// rustc arguments.
+    pub cargo_opt_level: String,
     pub debug_assertions: bool,
-    pub source_git_commit_sha: Option<Box<str>>,
-    pub source_worktree_dirty: Option<bool>,
+    /// Effective Lance memory-pool setting inherited by the measured worker.
+    /// This is retained until the complete typed engine-environment registry
+    /// below replaces the one-setting representation.
     pub effective_lance_mem_pool_size: Box<EffectiveEnvironmentValue>,
-    pub executable_sha256: Box<str>,
+    pub target_triple: String,
+    pub rustc_version: String,
+    pub declared_release_lto: String,
+    pub declared_release_codegen_units: Option<u32>,
+    pub declared_release_strip: Option<bool>,
+    pub cargo_encoded_rustflags_present: Option<bool>,
+    pub release_profile_environment_overrides_supported: Option<bool>,
+    /// False until a controlled build wrapper supplies the final target rustc
+    /// command line in a digest-bound external receipt.
+    pub effective_codegen_options_proved: bool,
+    /// Canonical Cargo feature names reported by the linked
+    /// `omnigraph-engine` artifact itself, not inferred from this CLI crate.
+    pub engine_feature_flags: Vec<String>,
+    /// Canonical non-Cargo engine techniques enabled for this execution.
+    /// Runner-v1 has no such controls and therefore admits only an empty set.
+    pub enabled_techniques: Vec<String>,
+    pub executable_sha256: String,
 }
 
 /// Complete, immutable input for one worker process.
@@ -57,6 +82,10 @@ pub struct WorkerRequestV1 {
     pub expected_point_id: String,
     pub expected_case_digest: String,
     pub repetition_root: PathBuf,
+    /// Harness-owned empty sibling directory on the verified scratch backend.
+    /// Both generic process-temporary spill and OmniGraph merge staging must
+    /// resolve through this exact protocol field.
+    pub worker_scratch_root: PathBuf,
     pub expected_physical_digest: PhysicalDigest,
     pub expected_metadata_digest: MetadataDigest,
 }
@@ -105,6 +134,10 @@ pub enum WorkerStageV1 {
 /// Frames sent by one repetition worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "frame", rename_all = "kebab-case", deny_unknown_fields)]
+// Ready is handled once per process and the complete enum is bounded by the
+// framing limit; an extra allocation here would not reduce retained protocol
+// state or improve the supervisor's memory bound.
+#[allow(clippy::large_enum_variant)]
 pub enum ChildFrameV1 {
     /// Open, cache preparation, identity, and pre-measurement checks completed.
     Ready {
@@ -113,6 +146,9 @@ pub enum ChildFrameV1 {
         point_id: String,
         case_digest: String,
         worker_build: WorkerBuildV1,
+        /// Process-effective identity captured by this child immediately
+        /// before it declared itself ready for measurement.
+        machine: MachineIdentityV1,
         physical_digest: PhysicalDigest,
         metadata_digest: MetadataDigest,
     },
@@ -149,7 +185,26 @@ pub enum ChildFrameV1 {
 
 /// SHA-256 one bounded regular worker executable.
 pub fn digest_worker_executable(path: &Path) -> io::Result<String> {
-    let metadata = std::fs::metadata(path)?;
+    open_and_digest_worker_executable(path).map(|(_file, _bytes, digest)| digest)
+}
+
+/// Open and SHA-256 one bounded regular worker executable through the same
+/// file descriptor. Callers that must survive a later path replacement can
+/// retain the returned descriptor and stage those exact bytes elsewhere.
+pub(crate) fn open_and_digest_worker_executable(path: &Path) -> io::Result<(File, u64, String)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // The configured path is external input. Open it in a mode that cannot
+        // block on a FIFO/device and cannot follow a symlink, then attest only
+        // the object named by this exact descriptor.
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -168,7 +223,7 @@ pub fn digest_worker_executable(path: &Path) -> io::Result<String> {
             ),
         ));
     }
-    let mut file = File::open(path)?;
+    file.rewind()?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; EXECUTABLE_DIGEST_BUFFER_BYTES];
     let mut observed = 0_u64;
@@ -207,7 +262,8 @@ pub fn digest_worker_executable(path: &Path) -> io::Result<String> {
             ),
         ));
     }
-    Ok(format!("{:x}", digest.finalize()))
+    file.rewind()?;
+    Ok((file, observed, format!("{:x}", digest.finalize())))
 }
 
 impl ChildFrameV1 {
@@ -351,7 +407,7 @@ where
     }
 }
 
-/// Reject a frame from any worker protocol version other than V1.
+/// Reject a frame from any worker protocol version other than this build's.
 pub fn validate_protocol_version(observed: u32) -> Result<(), WorkerProtocolError> {
     if observed == WORKER_PROTOCOL_VERSION {
         Ok(())
@@ -439,6 +495,32 @@ protocol:
         }
     }
 
+    fn machine_identity() -> MachineIdentityV1 {
+        MachineIdentityV1 {
+            format_version: crate::machine::MACHINE_IDENTITY_FORMAT_VERSION,
+            os_name: "macos".to_string(),
+            os_version: "15.6".to_string(),
+            kernel_version: "24.6.0".to_string(),
+            architecture: "aarch64".to_string(),
+            cpu_model: "Apple M4".to_string(),
+            logical_cores: 10,
+            physical_cores: 10,
+            total_memory_bytes: 32 * 1024 * 1024 * 1024,
+            resource_control: crate::machine::ResourceControlV1::MacosNative,
+            scheduling: crate::machine::SchedulingIdentityV1 {
+                nice_level: 0,
+                policy: crate::machine::SchedulerPolicyV1::Other,
+                priority: 0,
+                reset_on_fork: false,
+            },
+            resource_limits: crate::machine::ResourceLimitIdentityV1 {
+                scope_version: crate::machine::RESOURCE_LIMIT_SCOPE_VERSION,
+                values_sha256: "9".repeat(64),
+            },
+            machine_label: format!("hostname-sha256:{}", "8".repeat(64)),
+        }
+    }
+
     fn sample() -> RepObservation {
         RepObservation {
             repetition: 3,
@@ -508,6 +590,99 @@ protocol:
         decoded
     }
 
+    #[cfg(unix)]
+    fn run_fifo_operation_with_deadline<T, F>(fifo: &Path, operation: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(PathBuf) -> T + Send + 'static,
+    {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let fifo_for_thread = fifo.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let result = operation(fifo_for_thread);
+            let _ = sender.send(result);
+        });
+        match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => {
+                handle.join().expect("FIFO executable reader panicked");
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                use std::os::unix::fs::OpenOptionsExt;
+
+                let mut options = std::fs::OpenOptions::new();
+                options
+                    .read(true)
+                    .write(true)
+                    .custom_flags(nix::libc::O_NONBLOCK);
+                let unblocker = options.open(fifo).expect("could not unblock test FIFO");
+                drop(unblocker);
+                if receiver
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .is_ok()
+                {
+                    handle
+                        .join()
+                        .expect("blocked FIFO executable reader panicked after release");
+                } else {
+                    std::mem::forget(handle);
+                }
+                panic!("worker executable reader blocked while opening a FIFO");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                handle.join().expect("FIFO executable reader panicked");
+                panic!("worker executable reader exited without reporting a result");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_executable_reader_rejects_fifo_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("worker.fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+
+        let error = run_fifo_operation_with_deadline(&fifo, |path| {
+            open_and_digest_worker_executable(&path)
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("regular file"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_executable_reader_rejects_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("worker");
+        let link = directory.path().join("worker-link");
+        std::fs::write(&target, b"worker-bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        open_and_digest_worker_executable(&link).unwrap_err();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_executable_reader_rejects_character_device() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let null = Path::new("/dev/null");
+        assert!(
+            std::fs::symlink_metadata(null)
+                .unwrap()
+                .file_type()
+                .is_char_device()
+        );
+
+        let error = open_and_digest_worker_executable(null).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("regular file"), "{error}");
+    }
+
     #[derive(Default)]
     struct FlushWitness {
         bytes: Vec<u8>,
@@ -538,6 +713,7 @@ protocol:
                 expected_point_id: validated.point_id,
                 expected_case_digest: validated.case_digest,
                 repetition_root: PathBuf::from("/tmp/worker-repetition"),
+                worker_scratch_root: PathBuf::from("/tmp/worker-scratch-00000003"),
                 expected_physical_digest: physical_digest(),
                 expected_metadata_digest: metadata_digest(),
             }),
@@ -562,16 +738,27 @@ protocol:
                 point_id: "d".repeat(64),
                 case_digest: "e".repeat(64),
                 worker_build: WorkerBuildV1 {
-                    cargo_profile: "release".into(),
-                    opt_level: "2".into(),
+                    source_commit: "0".repeat(40),
+                    source_tree_dirty: Some(false),
+                    cargo_profile: "release".to_string(),
+                    cargo_opt_level: "2".to_string(),
                     debug_assertions: false,
-                    source_git_commit_sha: Some("1".repeat(40).into_boxed_str()),
-                    source_worktree_dirty: Some(false),
-                    effective_lance_mem_pool_size: Box::new(EffectiveEnvironmentValue::Utf8 {
-                        value: "1GiB".to_string(),
+                    effective_lance_mem_pool_size: Box::new(EffectiveEnvironmentValue::Bytes {
+                        bytes: 1_073_741_824,
                     }),
-                    executable_sha256: "f".repeat(64).into_boxed_str(),
+                    target_triple: "aarch64-apple-darwin".to_string(),
+                    rustc_version: "rustc 1.97.1".to_string(),
+                    declared_release_lto: "thin".to_string(),
+                    declared_release_codegen_units: Some(16),
+                    declared_release_strip: Some(true),
+                    cargo_encoded_rustflags_present: Some(false),
+                    release_profile_environment_overrides_supported: Some(true),
+                    effective_codegen_options_proved: false,
+                    engine_feature_flags: Vec::new(),
+                    enabled_techniques: Vec::new(),
+                    executable_sha256: "f".repeat(64),
                 },
+                machine: machine_identity(),
                 physical_digest: physical_digest(),
                 metadata_digest: metadata_digest(),
             },
@@ -707,8 +894,8 @@ protocol:
             validate_protocol_version(WORKER_PROTOCOL_VERSION + 1).unwrap_err(),
             WorkerProtocolError::UnsupportedVersion {
                 expected: WORKER_PROTOCOL_VERSION,
-                observed: 2
-            }
+                observed
+            } if observed == WORKER_PROTOCOL_VERSION + 1
         ));
     }
 }

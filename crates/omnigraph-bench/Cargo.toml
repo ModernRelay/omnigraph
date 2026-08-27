@@ -14,6 +14,7 @@ path = "src/bin/omnigraph-bench.rs"
 
 [dependencies]
 arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
@@ -28,17 +29,19 @@ serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
+ulid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 nix = { version = "0.30", features = ["fs", "process", "signal"] }
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = { workspace = true }
+
+[build-dependencies]
+toml = "0.9"
 
 [lints]
 workspace = true

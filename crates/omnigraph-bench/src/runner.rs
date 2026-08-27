@@ -6,15 +6,19 @@
 //! Every worker restores the same stable path, performs the declared read-only
 //! cache-preparation treatment behind a preparation-write firewall, and
 //! executes exactly one bounded merge followed by exact verification. Durable
-//! run records, fixture caching, cold page-cache control, S3 reset, and AWS
-//! orchestration are separate slices.
+//! run records are finalized from its successful evidence by the archive
+//! layer; fixture caching, cold page-cache control, S3 reset, and AWS
+//! orchestration remain separate slices.
 
 use std::error::Error;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
 use lance::io::WrappingObjectStore;
@@ -27,16 +31,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::branch_merge::{
-    BranchMergePlan, FixturePreflight, SOURCE_BRANCH, TARGET_BRANCH,
+    BranchMergePlan, FixtureBuildSummary, FixturePreflight, SOURCE_BRANCH, TARGET_BRANCH,
     capture_protected_branch_heads, initialize_local_fixture, verify_merged_graph, warm_read_set,
 };
 use crate::case::{
-    Attribution, Backend, CacheCondition, EnginePreparation, MAX_WARMUP_ITERATIONS,
-    PageCacheCondition, ProcessLifecycle, ResetMode, WarmupProgram,
+    Attribution, Backend, CacheCondition, Data, EnginePreparation, FixtureBuilder,
+    MAX_WARMUP_ITERATIONS, PageCacheCondition, ProcessLifecycle, ResetMode, State, WarmupProgram,
 };
 use crate::counting::{LogicalCallCounter, LogicalCallCounts};
 use crate::environment::{LocalEnvironmentEvidence, verify_local_environment};
 use crate::fixture_worker::supervise_fixture_build;
+use crate::machine::{MachineIdentityV1, capture_machine_identity};
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
 use crate::reset::{
     ClonefileTemplate, MetadataDigest, PhysicalDigest, TraversalLimits,
@@ -45,15 +50,31 @@ use crate::reset::{
 };
 use crate::suite::{MAX_REPETITIONS_PER_CASE, MAX_SUITE_RUNS, MAX_TOTAL_REPETITIONS};
 use crate::supervisor::{SupervisionInput, supervise_repetition};
-use crate::worker_protocol::{WorkerBuildV1, digest_worker_executable};
+use crate::worker_protocol::{
+    WorkerBuildV1, digest_worker_executable, open_and_digest_worker_executable,
+};
 use crate::{ResolvedRun, ResolvedSuite, validate_case};
 
-pub const RUNNER_OUTPUT_VERSION: u32 = 1;
+pub const RUNNER_OUTPUT_VERSION: u32 = 2;
+pub const FIXTURE_MANIFEST_FORMAT_VERSION: u32 = 1;
+pub const FIXTURE_VALIDATOR_VERSION: u32 = 1;
+pub(crate) const PHYSICAL_TREE_DIGEST_ALGORITHM: &str = "omnigraph-bench-physical-tree-v1";
 const BUILD_PROFILE: &str = env!("OMNIGRAPH_BENCH_BUILD_PROFILE");
 const BUILD_OPT_LEVEL: &str = env!("OMNIGRAPH_BENCH_BUILD_OPT_LEVEL");
-const SOURCE_GIT_COMMIT: &str = env!("OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT");
-const SOURCE_WORKTREE_DIRTY: &str = env!("OMNIGRAPH_BENCH_SOURCE_WORKTREE_DIRTY");
-const MAX_RECORDED_ENV_VALUE_BYTES: usize = 256;
+const SOURCE_COMMIT: &str = env!("OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT");
+const SOURCE_DIRTY: &str = env!("OMNIGRAPH_BENCH_SOURCE_WORKTREE_DIRTY");
+const DECLARED_ENGINE_FEATURES: &str = env!("OMNIGRAPH_BENCH_DECLARED_ENGINE_FEATURES");
+const TARGET_TRIPLE: &str = env!("OMNIGRAPH_BENCH_TARGET_TRIPLE");
+const RUSTC_VERSION: &str = env!("OMNIGRAPH_BENCH_RUSTC_VERSION");
+const DECLARED_RELEASE_LTO: &str = env!("OMNIGRAPH_BENCH_DECLARED_RELEASE_LTO");
+const DECLARED_RELEASE_CODEGEN_UNITS: &str = env!("OMNIGRAPH_BENCH_DECLARED_RELEASE_CODEGEN_UNITS");
+const DECLARED_RELEASE_STRIP: &str = env!("OMNIGRAPH_BENCH_DECLARED_RELEASE_STRIP");
+const CARGO_ENCODED_RUSTFLAGS_PRESENT: &str =
+    env!("OMNIGRAPH_BENCH_CARGO_ENCODED_RUSTFLAGS_PRESENT");
+const RELEASE_PROFILE_ENVIRONMENT_OVERRIDES: &str =
+    env!("OMNIGRAPH_BENCH_RELEASE_PROFILE_ENVIRONMENT_OVERRIDES");
+const EFFECTIVE_CODEGEN_OPTIONS_PROVED: &str =
+    env!("OMNIGRAPH_BENCH_EFFECTIVE_CODEGEN_OPTIONS_PROVED");
 const RUN_OWNER_STACK_BYTES: usize = 64 * 1024 * 1024;
 const FIXTURE_BUILD_WATCHDOG: Duration = Duration::from_secs(3_600);
 
@@ -64,8 +85,8 @@ pub struct RunOptions {
     /// are created. The actual created tree is what environment probing checks.
     pub scratch_root: Option<PathBuf>,
     /// Executable that implements the private repetition-worker protocol.
-    /// The CLI uses its own executable; library and remote-infrastructure
-    /// callers may pin an explicit runner binary.
+    /// The fixture builder and every measured repetition use this exact binary;
+    /// its digest and self-reported build identity are verified and persisted.
     pub worker_executable: Option<PathBuf>,
 }
 
@@ -92,9 +113,19 @@ pub struct RunnerErrorContext {
     pub completed_samples: Vec<RepObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settled_sample: Option<Box<RepObservation>>,
+    /// Complete verified prefix plus the identities needed to finalize a
+    /// censored durable record. Kept out of the diagnostic envelope because a
+    /// successful archive receipt is the authority for those raw samples.
+    #[serde(skip)]
+    pub partial_run: Option<Box<RunExecution>>,
+    #[serde(skip)]
+    partial_worker_build: Option<WorkerBuildV1>,
+    #[serde(skip)]
+    partial_machine: Option<MachineIdentityV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_process: Option<ChildProcessEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "serialize_optional_path_lossy")]
     pub quarantined_workspace: Option<PathBuf>,
 }
 
@@ -125,6 +156,21 @@ impl RunnerError {
 
     fn with_completed_runs(mut self, runs: Vec<RunExecution>) -> Self {
         self.context.completed_runs = runs;
+        self
+    }
+
+    fn with_partial_worker_identity(
+        mut self,
+        build: Option<&WorkerBuildV1>,
+        machine: Option<&MachineIdentityV1>,
+    ) -> Self {
+        self.context.partial_worker_build = build.cloned();
+        self.context.partial_machine = machine.cloned();
+        self
+    }
+
+    fn with_partial_run(mut self, execution: RunExecution) -> Self {
+        self.context.partial_run = Some(Box::new(execution));
         self
     }
 
@@ -176,6 +222,7 @@ pub struct ChildProcessEvidence {
     pub stderr_tail: String,
     pub stderr_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "serialize_optional_path_lossy")]
     pub quarantined_workspace: Option<PathBuf>,
 }
 
@@ -183,6 +230,7 @@ pub struct ChildProcessEvidence {
 pub struct SuiteExecution {
     pub runner_output_version: u32,
     pub suite: String,
+    #[serde(serialize_with = "serialize_path_lossy")]
     pub suite_path: PathBuf,
     pub runs: Vec<RunExecution>,
 }
@@ -191,12 +239,15 @@ pub struct SuiteExecution {
 pub struct RunExecution {
     pub runner_output_version: u32,
     pub case_id: String,
+    #[serde(serialize_with = "serialize_path_lossy")]
     pub case_path: PathBuf,
     pub point_id: String,
     pub point_name: String,
     pub cache_condition: CacheCondition,
     pub requested_repetitions: u32,
     pub build: BuildEvidence,
+    /// Exact process-effective identity reported by every measured worker.
+    pub machine: MachineIdentityV1,
     pub environment: LocalEnvironmentEvidence,
     pub fixture: FixtureObservation,
     pub samples: Vec<RepObservation>,
@@ -208,38 +259,118 @@ pub struct RunExecution {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BuildEvidence {
+    pub source_commit: String,
+    pub source_tree_dirty: bool,
     pub cargo_profile: String,
-    pub opt_level: String,
+    pub cargo_opt_level: String,
     pub debug_assertions: bool,
-    /// Full source commit observed when the SUT executable was built.
-    /// `None` is an explicit unknown, never an inferred value.
-    pub source_git_commit_sha: Option<String>,
-    /// Whether the source worktree was dirty when the SUT executable was
-    /// built. `None` means the bounded build-time probe could not prove it.
-    pub source_worktree_dirty: Option<bool>,
     /// Effective `LANCE_MEM_POOL_SIZE` environment condition inherited by the
     /// measured process, retained in a bounded representation.
     pub effective_lance_mem_pool_size: EffectiveEnvironmentValue,
+    pub target_triple: String,
+    pub rustc_version: String,
+    pub declared_release_lto: String,
+    pub declared_release_codegen_units: u32,
+    pub declared_release_strip: bool,
+    pub cargo_encoded_rustflags_present: bool,
+    pub release_profile_environment_overrides_supported: bool,
+    pub effective_codegen_options_proved: bool,
+    pub engine_feature_flags: Vec<String>,
+    pub enabled_techniques: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_executable_sha256: Option<String>,
 }
 
 /// Bounded evidence for one effective process environment value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "kebab-case")]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum EffectiveEnvironmentValue {
     Unset,
-    Utf8 { value: String },
-    OversizedUtf8 { bytes: usize, sha256: String },
-    NonUtf8 { bytes: usize, sha256: String },
+    Bytes { bytes: u64 },
 }
 
+fn serialize_path_lossy<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&path.to_string_lossy())
+}
+
+fn serialize_optional_path_lossy<S>(
+    path: &Option<PathBuf>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    path.as_deref()
+        .map(Path::to_string_lossy)
+        .serialize(serializer)
+}
+
+/// Canonical pre-measurement fixture evidence. The runner seals this after
+/// exact logical validation and physical freezing, before it starts rep 0.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StampedFixtureManifestV1 {
+    pub manifest_sha256: String,
+    pub manifest: FixtureManifestV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureManifestV1 {
+    pub format_version: u32,
+    pub logical: LogicalFixtureIdentityV1,
+    pub physical: PhysicalFixtureIdentityV1,
+    pub validation: FixtureValidationStampV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogicalFixtureIdentityV1 {
+    pub builder: FixtureBuilder,
+    pub data: Data,
+    pub state: State,
+    pub logical_content_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalFixtureIdentityV1 {
+    pub digest_algorithm: String,
+    pub tree_sha256: String,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureValidationStampV1 {
+    pub validator: String,
+    pub validator_version: u32,
+    pub validated_at_unix_ms: u64,
+    pub logical_content_verified: bool,
+    pub declared_state_verified: bool,
+    pub frozen: bool,
+}
+
+impl FixtureValidationStampV1 {
+    pub fn verified(validated_at_unix_ms: u64) -> Self {
+        Self {
+            validator: "omnigraph-bench-fixture-validator".to_string(),
+            validator_version: FIXTURE_VALIDATOR_VERSION,
+            validated_at_unix_ms,
+            logical_content_verified: true,
+            declared_state_verified: true,
+            frozen: true,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FixtureObservation {
     pub preflight: FixturePreflight,
-    pub physical_digest_sha256: String,
-    pub files: u64,
-    pub bytes: u64,
+    pub stamp: StampedFixtureManifestV1,
     pub base_load_commits: usize,
     pub optimized_user_tables: usize,
     pub source_history_depth: u64,
@@ -336,6 +467,7 @@ pub async fn execute_suite(
 ) -> RunnerResult<SuiteExecution> {
     validate_execution_suite(suite)?;
     enforce_release_build()?;
+    refuse_unmodeled_runtime_overrides()?;
     if suite.runs.len() > MAX_SUITE_RUNS {
         return Err(RunnerError::new(
             "resolved_plan_unbounded",
@@ -378,6 +510,7 @@ pub async fn execute_suite(
 /// Execute one resolved suite entry.
 pub async fn execute_run(run: &ResolvedRun, options: &RunOptions) -> RunnerResult<RunExecution> {
     enforce_release_build().map_err(|error| error.with_run_identity(run))?;
+    refuse_unmodeled_runtime_overrides().map_err(|error| error.with_run_identity(run))?;
     Box::pin(execute_run_inner(run, options, ExecutionGuards::public()))
         .await
         .map_err(|error| error.with_run_identity(run))
@@ -401,102 +534,516 @@ impl ExecutionGuards {
 }
 
 pub(crate) fn enforce_release_build() -> RunnerResult<()> {
-    if cfg!(debug_assertions) || BUILD_PROFILE != "release" || BUILD_OPT_LEVEL != "2" {
+    let build = worker_build_attestation(String::new())?;
+    if let Err(configuration) = validate_supported_build_configuration(&build) {
         return Err(RunnerError::new(
             "release_build_required",
             format!(
-                "wall-clock execution requires the supported Cargo release configuration (profile=release, opt-level=2, debug-assertions=false), but this binary reports profile={BUILD_PROFILE}, opt-level={BUILD_OPT_LEVEL}, debug-assertions={}; run `cargo run --release --locked -p omnigraph-bench -- suite run ...`",
-                cfg!(debug_assertions)
+                "wall-clock execution requires Cargo profile=release, Cargo-reported opt-level=2, debug-assertions=false, the checked-in release-profile declaration, no build-script-visible encoded Rust flags, and no unsupported release-profile environment overrides: {}; effective LTO/codegen/strip options remain explicitly unproved until a controlled build receipt is available; run `cargo run --release --locked -p omnigraph-bench -- suite run ...`",
+                configuration.message
             ),
         ));
     }
     Ok(())
 }
 
-fn build_evidence(worker: Option<&ResolvedWorker>) -> BuildEvidence {
-    match worker {
-        Some(worker) => BuildEvidence {
-            cargo_profile: worker.build.cargo_profile.to_string(),
-            opt_level: worker.build.opt_level.to_string(),
-            debug_assertions: worker.build.debug_assertions,
-            source_git_commit_sha: worker
-                .build
-                .source_git_commit_sha
-                .as_deref()
-                .map(str::to_owned),
-            source_worktree_dirty: worker.build.source_worktree_dirty,
-            effective_lance_mem_pool_size: (*worker.build.effective_lance_mem_pool_size).clone(),
-            worker_executable_sha256: Some(worker.build.executable_sha256.to_string()),
-        },
-        None => {
-            let build = worker_build_attestation(String::new());
-            BuildEvidence {
-                cargo_profile: build.cargo_profile.into(),
-                opt_level: build.opt_level.into(),
-                debug_assertions: build.debug_assertions,
-                source_git_commit_sha: build.source_git_commit_sha.map(Into::into),
-                source_worktree_dirty: build.source_worktree_dirty,
-                effective_lance_mem_pool_size: *build.effective_lance_mem_pool_size,
-                worker_executable_sha256: None,
+/// Perform every process-local eligibility check required before an archive
+/// root may be created or modified. Execution repeats these checks at the run
+/// boundary; this entry point exists to keep refused recording side-effect
+/// free.
+#[doc(hidden)]
+pub fn validate_durable_recording_process() -> RunnerResult<()> {
+    enforce_release_build()?;
+    refuse_unmodeled_runtime_overrides()
+}
+
+/// Admit only runtime configuration with an explicit typed SUT-identity slot.
+///
+/// Values from fail-closed namespaces are never echoed: some supported
+/// variables can carry credentials. `LANCE_MEM_POOL_SIZE` is the first narrow
+/// exception and is captured in bounded form by every worker attestation.
+pub(crate) fn refuse_unmodeled_runtime_overrides() -> RunnerResult<()> {
+    validate_runtime_overrides(std::env::vars_os())
+}
+
+fn is_omnigraph_runtime_override(name: &OsStr) -> bool {
+    name.to_string_lossy().starts_with("OMNIGRAPH_")
+}
+
+fn is_lance_runtime_override(name: &OsStr) -> bool {
+    name.to_string_lossy().starts_with("LANCE_")
+}
+
+fn is_process_runtime_override(name: &OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some("TOKIO_WORKER_THREADS" | "RAYON_NUM_THREADS")
+    )
+}
+
+fn validate_runtime_overrides(
+    variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> RunnerResult<()> {
+    validate_runtime_overrides_with_scratch(variables, None)
+}
+
+pub(crate) fn validate_benchmark_child_runtime_overrides(
+    worker_scratch_root: &Path,
+) -> RunnerResult<()> {
+    validate_runtime_overrides_with_scratch(
+        std::env::vars_os(),
+        Some(ChildScratchExpectation::Worker(
+            worker_scratch_root.as_os_str(),
+        )),
+    )
+}
+
+pub(crate) fn validate_fixture_child_runtime_overrides(
+    fixture_scratch_root: &Path,
+) -> RunnerResult<()> {
+    validate_runtime_overrides_with_scratch(
+        std::env::vars_os(),
+        Some(ChildScratchExpectation::Fixture(
+            fixture_scratch_root.as_os_str(),
+        )),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChildScratchExpectation<'a> {
+    Fixture(&'a OsStr),
+    Worker(&'a OsStr),
+}
+
+impl<'a> ChildScratchExpectation<'a> {
+    fn root(self) -> &'a OsStr {
+        match self {
+            Self::Fixture(root) | Self::Worker(root) => root,
+        }
+    }
+
+    fn requires_merge_staging(self) -> bool {
+        matches!(self, Self::Worker(_))
+    }
+}
+
+fn validate_runtime_overrides_with_scratch(
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+    expected_scratch: Option<ChildScratchExpectation<'_>>,
+) -> RunnerResult<()> {
+    let mut tmpdir_seen = false;
+    let mut merge_staging_seen = false;
+    for (name, value) in variables {
+        if is_process_runtime_override(&name) {
+            return Err(RunnerError::new(
+                "unsupported_runtime_override",
+                "runner-v1 does not admit process-runtime thread-count overrides; unset TOKIO_WORKER_THREADS and RAYON_NUM_THREADS before execution",
+            ));
+        }
+        if name == OsStr::new("LANCE_MEM_POOL_SIZE") {
+            parse_effective_lance_mem_pool_size(Some(&value))?;
+            continue;
+        }
+        if name == OsStr::new("TMPDIR") {
+            let Some(expected) = expected_scratch else {
+                continue;
+            };
+            if value != expected.root() {
+                return Err(RunnerError::new(
+                    "unsupported_runtime_override",
+                    "TMPDIR must exactly name the harness-owned child scratch path",
+                ));
+            }
+            tmpdir_seen = true;
+            continue;
+        }
+        if name == OsStr::new("OMNIGRAPH_MERGE_STAGING_DIR") {
+            if expected_scratch.is_some_and(|expected| {
+                expected.requires_merge_staging() && value == expected.root()
+            }) {
+                merge_staging_seen = true;
+                continue;
+            }
+            return Err(RunnerError::new(
+                "unsupported_runtime_override",
+                "OMNIGRAPH_MERGE_STAGING_DIR is reserved for the harness-owned measured-worker scratch path",
+            ));
+        }
+        if is_lance_runtime_override(&name) {
+            return Err(RunnerError::new(
+                "unsupported_runtime_override",
+                "runner-v1 does not represent this LANCE_* runtime override in its SUT identity; unset it before execution",
+            ));
+        }
+        if is_omnigraph_runtime_override(&name) {
+            let Some(expected) = expected_build_attestation_environment(&name) else {
+                return Err(RunnerError::new(
+                    "unsupported_runtime_override",
+                    "runner-v1 does not represent this OMNIGRAPH_* runtime override in its SUT identity; unset it before execution",
+                ));
+            };
+            if value != OsStr::new(expected) {
+                return Err(RunnerError::new(
+                    "build_attestation_environment_mismatch",
+                    "a runtime OMNIGRAPH_BENCH_* build-attestation value differs from the facts compiled into this executable",
+                ));
             }
         }
     }
-}
-
-pub(crate) fn worker_build_attestation(executable_sha256: String) -> WorkerBuildV1 {
-    WorkerBuildV1 {
-        cargo_profile: BUILD_PROFILE.into(),
-        opt_level: BUILD_OPT_LEVEL.into(),
-        debug_assertions: cfg!(debug_assertions),
-        source_git_commit_sha: parse_source_git_commit(SOURCE_GIT_COMMIT)
-            .map(String::into_boxed_str),
-        source_worktree_dirty: parse_source_worktree_dirty(SOURCE_WORKTREE_DIRTY),
-        effective_lance_mem_pool_size: Box::new(classify_effective_environment_value(
-            std::env::var_os("LANCE_MEM_POOL_SIZE").as_deref(),
-        )),
-        executable_sha256: executable_sha256.into_boxed_str(),
+    if let Some(expected) = expected_scratch {
+        if !tmpdir_seen {
+            return Err(RunnerError::new(
+                "unsupported_runtime_override",
+                "benchmark child TMPDIR is missing from the closed child environment",
+            ));
+        }
+        if expected.requires_merge_staging() && !merge_staging_seen {
+            return Err(RunnerError::new(
+                "unsupported_runtime_override",
+                "measured worker OMNIGRAPH_MERGE_STAGING_DIR is missing from the closed child environment",
+            ));
+        }
     }
+    Ok(())
 }
 
-fn parse_source_git_commit(raw: &str) -> Option<String> {
-    ((raw.len() == 40 || raw.len() == 64) && raw.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| raw.to_ascii_lowercase())
+/// Give benchmark child processes a closed, versioned base environment.
+///
+/// The executable path is already absolute, workers do not launch tools, and
+/// scratch paths travel through the private protocols. Clearing inheritance
+/// prevents allocator, runtime, loader, locale, and dependency knobs from
+/// changing a measurement without entering identity. The one admitted engine
+/// setting is retained byte-for-byte and reported in bounded SUT evidence.
+fn configure_closed_child_environment(command: &mut Command) {
+    let admitted = admitted_child_environment(std::env::vars_os());
+    command.env_clear().env("LC_ALL", "C").env("LANG", "C");
+    command.envs(admitted);
 }
 
-fn parse_source_worktree_dirty(raw: &str) -> Option<bool> {
-    match raw {
-        "true" => Some(true),
-        "false" => Some(false),
+pub(crate) fn configure_benchmark_worker_environment(command: &mut Command, root: &Path) {
+    configure_closed_child_environment(command);
+    command
+        .current_dir(root)
+        .env("TMPDIR", root)
+        .env("OMNIGRAPH_MERGE_STAGING_DIR", root);
+}
+
+pub(crate) fn configure_fixture_child_environment(command: &mut Command, root: &Path) {
+    configure_closed_child_environment(command);
+    command.current_dir(root).env("TMPDIR", root);
+}
+
+fn admitted_child_environment(
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    variables
+        .into_iter()
+        .filter(|(name, _value)| name == OsStr::new("LANCE_MEM_POOL_SIZE"))
+        .collect()
+}
+
+fn expected_build_attestation_environment(name: &OsStr) -> Option<&'static str> {
+    match name.to_str()? {
+        "OMNIGRAPH_BENCH_BUILD_PROFILE" => Some(BUILD_PROFILE),
+        "OMNIGRAPH_BENCH_BUILD_OPT_LEVEL" => Some(BUILD_OPT_LEVEL),
+        "OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT" => Some(SOURCE_COMMIT),
+        "OMNIGRAPH_BENCH_SOURCE_WORKTREE_DIRTY" => Some(SOURCE_DIRTY),
+        "OMNIGRAPH_BENCH_DECLARED_ENGINE_FEATURES" => Some(DECLARED_ENGINE_FEATURES),
+        "OMNIGRAPH_BENCH_TARGET_TRIPLE" => Some(TARGET_TRIPLE),
+        "OMNIGRAPH_BENCH_RUSTC_VERSION" => Some(RUSTC_VERSION),
+        "OMNIGRAPH_BENCH_DECLARED_RELEASE_LTO" => Some(DECLARED_RELEASE_LTO),
+        "OMNIGRAPH_BENCH_DECLARED_RELEASE_CODEGEN_UNITS" => Some(DECLARED_RELEASE_CODEGEN_UNITS),
+        "OMNIGRAPH_BENCH_DECLARED_RELEASE_STRIP" => Some(DECLARED_RELEASE_STRIP),
+        "OMNIGRAPH_BENCH_CARGO_ENCODED_RUSTFLAGS_PRESENT" => Some(CARGO_ENCODED_RUSTFLAGS_PRESENT),
+        "OMNIGRAPH_BENCH_RELEASE_PROFILE_ENVIRONMENT_OVERRIDES" => {
+            Some(RELEASE_PROFILE_ENVIRONMENT_OVERRIDES)
+        }
+        "OMNIGRAPH_BENCH_EFFECTIVE_CODEGEN_OPTIONS_PROVED" => {
+            Some(EFFECTIVE_CODEGEN_OPTIONS_PROVED)
+        }
         _ => None,
     }
 }
 
-fn classify_effective_environment_value(value: Option<&OsStr>) -> EffectiveEnvironmentValue {
-    let Some(value) = value else {
-        return EffectiveEnvironmentValue::Unset;
+fn build_evidence(worker: Option<&WorkerBuildV1>) -> RunnerResult<BuildEvidence> {
+    let build = match worker {
+        Some(worker) => worker.clone(),
+        None => worker_build_attestation(String::new())?,
     };
-    let encoded = value.as_encoded_bytes();
-    let bytes = encoded.len();
-    let sha256 = || format!("{:x}", Sha256::digest(encoded));
-    match value.to_str() {
-        Some(value) if bytes <= MAX_RECORDED_ENV_VALUE_BYTES => EffectiveEnvironmentValue::Utf8 {
-            value: value.to_string(),
-        },
-        Some(_) => EffectiveEnvironmentValue::OversizedUtf8 {
-            bytes,
-            sha256: sha256(),
-        },
-        None => EffectiveEnvironmentValue::NonUtf8 {
-            bytes,
-            sha256: sha256(),
-        },
+    let source_tree_dirty = build.source_tree_dirty.ok_or_else(|| {
+        RunnerError::new(
+            "worker_build_attestation_invalid",
+            "worker build-time source-tree state is unavailable",
+        )
+    })?;
+    if worker.is_some() {
+        validate_worker_build_attestation(&build, &build.executable_sha256)?;
+    } else {
+        validate_build_text(&build.source_commit, "source commit")?;
+        validate_build_text(&build.target_triple, "target triple")?;
+        validate_build_text(&build.rustc_version, "rustc version")?;
     }
+    let declared_release_codegen_units = build.declared_release_codegen_units.ok_or_else(|| {
+        RunnerError::new(
+            "worker_build_attestation_invalid",
+            "worker checked-in release-profile codegen-unit declaration is unavailable",
+        )
+    })?;
+    let declared_release_strip = build.declared_release_strip.ok_or_else(|| {
+        RunnerError::new(
+            "worker_build_attestation_invalid",
+            "worker checked-in release-profile strip declaration is unavailable",
+        )
+    })?;
+    let cargo_encoded_rustflags_present =
+        build.cargo_encoded_rustflags_present.ok_or_else(|| {
+            RunnerError::new(
+                "worker_build_attestation_invalid",
+                "worker build-script observation of CARGO_ENCODED_RUSTFLAGS is unavailable",
+            )
+        })?;
+    let release_profile_environment_overrides_supported = build
+        .release_profile_environment_overrides_supported
+        .ok_or_else(|| {
+            RunnerError::new(
+                "worker_build_attestation_invalid",
+                "worker build-script observation of release-profile environment overrides is unavailable",
+            )
+        })?;
+    Ok(BuildEvidence {
+        source_commit: build.source_commit,
+        source_tree_dirty,
+        cargo_profile: build.cargo_profile,
+        cargo_opt_level: build.cargo_opt_level,
+        debug_assertions: build.debug_assertions,
+        effective_lance_mem_pool_size: *build.effective_lance_mem_pool_size,
+        target_triple: build.target_triple,
+        rustc_version: build.rustc_version,
+        declared_release_lto: build.declared_release_lto,
+        declared_release_codegen_units,
+        declared_release_strip,
+        cargo_encoded_rustflags_present,
+        release_profile_environment_overrides_supported,
+        effective_codegen_options_proved: build.effective_codegen_options_proved,
+        engine_feature_flags: build.engine_feature_flags,
+        enabled_techniques: build.enabled_techniques,
+        worker_executable_sha256: worker.map(|build| build.executable_sha256.clone()),
+    })
+}
+
+pub(crate) fn worker_build_attestation(executable_sha256: String) -> RunnerResult<WorkerBuildV1> {
+    validate_engine_feature_registry()?;
+    let engine_feature_flags = omnigraph::instrumentation::enabled_engine_cargo_features()
+        .iter()
+        .map(|feature| (*feature).to_string())
+        .collect();
+    Ok(WorkerBuildV1 {
+        source_commit: SOURCE_COMMIT.to_string(),
+        source_tree_dirty: match SOURCE_DIRTY {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        cargo_profile: BUILD_PROFILE.to_string(),
+        cargo_opt_level: BUILD_OPT_LEVEL.to_string(),
+        debug_assertions: cfg!(debug_assertions),
+        effective_lance_mem_pool_size: Box::new(parse_effective_lance_mem_pool_size(
+            std::env::var_os("LANCE_MEM_POOL_SIZE").as_deref(),
+        )?),
+        target_triple: TARGET_TRIPLE.to_string(),
+        rustc_version: RUSTC_VERSION.to_string(),
+        declared_release_lto: DECLARED_RELEASE_LTO.to_string(),
+        declared_release_codegen_units: DECLARED_RELEASE_CODEGEN_UNITS.parse().ok(),
+        declared_release_strip: match DECLARED_RELEASE_STRIP {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        cargo_encoded_rustflags_present: match CARGO_ENCODED_RUSTFLAGS_PRESENT {
+            "false" => Some(false),
+            "true" => Some(true),
+            _ => None,
+        },
+        release_profile_environment_overrides_supported: match RELEASE_PROFILE_ENVIRONMENT_OVERRIDES
+        {
+            "supported" => Some(true),
+            "unsupported" => Some(false),
+            _ => None,
+        },
+        effective_codegen_options_proved: EFFECTIVE_CODEGEN_OPTIONS_PROVED == "true",
+        engine_feature_flags,
+        // Runner-v1 exposes no runtime technique selector, and the runtime
+        // override gate refuses the environment-based engine controls.
+        enabled_techniques: Vec::new(),
+        executable_sha256,
+    })
+}
+
+fn parse_effective_lance_mem_pool_size(
+    value: Option<&OsStr>,
+) -> RunnerResult<EffectiveEnvironmentValue> {
+    let Some(value) = value else {
+        return Ok(EffectiveEnvironmentValue::Unset);
+    };
+    let Some(value) = value.to_str() else {
+        return Err(RunnerError::new(
+            "invalid_lance_mem_pool_size",
+            "LANCE_MEM_POOL_SIZE must be a canonical decimal u64 byte count",
+        ));
+    };
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(RunnerError::new(
+            "invalid_lance_mem_pool_size",
+            "LANCE_MEM_POOL_SIZE must be a canonical decimal u64 byte count",
+        ));
+    }
+    let bytes = value.parse::<u64>().map_err(|_| {
+        RunnerError::new(
+            "invalid_lance_mem_pool_size",
+            "LANCE_MEM_POOL_SIZE must be a canonical decimal u64 byte count",
+        )
+    })?;
+    Ok(EffectiveEnvironmentValue::Bytes { bytes })
+}
+
+pub(crate) fn validate_worker_build_attestation(
+    build: &WorkerBuildV1,
+    expected_executable_sha256: &str,
+) -> RunnerResult<()> {
+    validate_supported_build_configuration(build)?;
+    if build.source_tree_dirty.is_none() {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            "worker build-time source-tree state is unavailable",
+        ));
+    }
+    if !valid_lower_hex(&build.source_commit, &[40, 64]) {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            "worker source commit must be exactly 40 or 64 lowercase hexadecimal characters",
+        ));
+    }
+    validate_build_text(&build.target_triple, "target triple")?;
+    validate_build_text(&build.rustc_version, "rustc version")?;
+    if !valid_lower_hex(&build.executable_sha256, &[64])
+        || build.executable_sha256 != expected_executable_sha256
+    {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            "worker executable digest does not match the parent-attested executable",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_supported_build_configuration(build: &WorkerBuildV1) -> RunnerResult<()> {
+    validate_engine_feature_registry()?;
+    if build.cargo_profile != "release"
+        || build.cargo_opt_level != "2"
+        || build.debug_assertions
+        || build.declared_release_lto != "thin"
+        || build.declared_release_codegen_units != Some(16)
+        || build.declared_release_strip != Some(true)
+    {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            "worker must report Cargo profile=release, Cargo opt-level=2, debug-assertions=false, and the checked-in release declaration lto=thin/codegen-units=16/strip=true",
+        ));
+    }
+    if build.cargo_encoded_rustflags_present != Some(false) {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            "runner-v1 refuses build-script-visible CARGO_ENCODED_RUSTFLAGS",
+        ));
+    }
+    if build.release_profile_environment_overrides_supported != Some(true) {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            "runner-v1 refuses unsupported CARGO_PROFILE_RELEASE_* overrides",
+        ));
+    }
+    if build.effective_codegen_options_proved {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            "runner-v1 has no controlled build receipt and must not claim that effective codegen options were proved",
+        ));
+    }
+    let expected_engine_features = omnigraph::instrumentation::enabled_engine_cargo_features();
+    if build.engine_feature_flags.len() != expected_engine_features.len()
+        || !build
+            .engine_feature_flags
+            .iter()
+            .map(String::as_str)
+            .eq(expected_engine_features.iter().copied())
+    {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            "worker engine feature flags do not match the linked omnigraph-engine build",
+        ));
+    }
+    if !build.enabled_techniques.is_empty() {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            "runner-v1 does not admit configured engine techniques",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_engine_feature_registry() -> RunnerResult<()> {
+    let declared_by_engine = omnigraph::instrumentation::declared_engine_cargo_features();
+    let declared_by_manifest = DECLARED_ENGINE_FEATURES.split(',').collect::<Vec<_>>();
+    if DECLARED_ENGINE_FEATURES == "unknown"
+        || declared_by_manifest
+            .iter()
+            .any(|feature| feature.is_empty())
+        || declared_by_manifest != declared_by_engine
+    {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            "omnigraph-engine Cargo features do not match the benchmark attestation registry",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_build_text(value: &str, noun: &str) -> RunnerResult<()> {
+    if value.is_empty()
+        || value == "unknown"
+        || value.len() > 1024
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(RunnerError::new(
+            "worker_build_attestation_invalid",
+            format!("worker {noun} is unavailable or non-canonical"),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_lower_hex(value: &str, lengths: &[usize]) -> bool {
+    lengths.contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Debug, Clone)]
+struct BoundWorkerSource {
+    configured_executable: PathBuf,
+    executable_file: Arc<File>,
+    executable_bytes: u64,
+    executable_sha256: String,
 }
 
 #[derive(Debug, Clone)]
 struct ResolvedWorker {
     executable: PathBuf,
-    build: WorkerBuildV1,
+    executable_sha256: String,
 }
 
 async fn execute_run_inner(
@@ -576,7 +1123,7 @@ async fn execute_owned_run(
     run: ResolvedRun,
     options: RunOptions,
     guards: ExecutionGuards,
-    worker: Option<ResolvedWorker>,
+    worker: Option<BoundWorkerSource>,
     plan: BranchMergePlan,
     preflight: FixturePreflight,
 ) -> RunnerResult<RunExecution> {
@@ -588,17 +1135,27 @@ async fn execute_owned_run(
     }
     let workspace = scratch_workspace(&options)?;
     let environment = local_environment(&run, workspace.path(), guards.verify_environment)?;
-    if environment.available_bytes < preflight.required_scratch_bytes {
+    let required_scratch_bytes = preflight
+        .required_scratch_bytes
+        .checked_add(worker.as_ref().map_or(0, |worker| worker.executable_bytes))
+        .ok_or_else(|| {
+            RunnerError::new(
+                "required_scratch_capacity_overflow",
+                "fixture and bound-worker scratch requirement overflowed u64",
+            )
+        })?;
+    if environment.available_bytes < required_scratch_bytes {
         return Err(RunnerError::new(
             "insufficient_scratch_capacity",
             format!(
                 "runner-v1 requires at least {} available scratch bytes for this fixture recipe, but {} are available at {}",
-                preflight.required_scratch_bytes,
-                environment.available_bytes,
-                environment.mount_point
+                required_scratch_bytes, environment.available_bytes, environment.mount_point
             ),
         ));
     }
+    let worker = worker
+        .map(|worker| stage_bound_worker(worker, workspace.path()))
+        .transpose()?;
 
     let fixture = std::panic::AssertUnwindSafe(Box::pin(async {
         let active_root = workspace.path().join("active");
@@ -674,11 +1231,13 @@ async fn execute_owned_run(
             let physical = template.physical_digest().clone();
             (build, template, physical)
         };
-        Ok::<_, RunnerError>((build, template, physical))
+        let validated_at_unix_ms = unix_time_millis()?;
+        let stamp = stamp_frozen_fixture(&run, &build, &physical, validated_at_unix_ms)?;
+        Ok::<_, RunnerError>((build, template, stamp))
     }))
     .catch_unwind()
     .await;
-    let (build, template, physical) = match fixture {
+    let (build, template, fixture_stamp) = match fixture {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             let quarantined = workspace.keep();
@@ -694,7 +1253,7 @@ async fn execute_owned_run(
         }
     };
 
-    let samples = if guards.isolate_repetitions {
+    let (samples, attested_worker_build, machine) = if guards.isolate_repetitions {
         let worker = worker.clone().ok_or_else(|| {
             RunnerError::new(
                 "worker_executable_required",
@@ -702,9 +1261,17 @@ async fn execute_owned_run(
             )
         })?;
         let supervised_run = run.clone();
+        let supervised_stamp = fixture_stamp.clone();
         let repetitions = run.repetitions;
-        tokio::task::spawn_blocking(move || {
-            supervise_workspace(workspace, template, supervised_run, worker, repetitions)
+        let supervised = tokio::task::spawn_blocking(move || {
+            supervise_workspace(
+                workspace,
+                template,
+                supervised_run,
+                supervised_stamp,
+                worker,
+                repetitions,
+            )
         })
         .await
         .map_err(|error| {
@@ -712,9 +1279,57 @@ async fn execute_owned_run(
                 "worker_supervisor_panicked",
                 format!("repetition supervisor task failed: {error}"),
             )
-        })??
+        })?;
+        match supervised {
+            Ok((samples, worker_build, machine)) => (samples, Some(worker_build), machine),
+            Err(mut error) => {
+                let samples = error.context.completed_samples.clone();
+                let worker_build = error.context.partial_worker_build.take();
+                let partial_machine = error.context.partial_machine.take();
+                if !samples.is_empty()
+                    && let (Some(worker_build), Some(machine)) =
+                        (worker_build.as_ref(), partial_machine)
+                    && let (Ok(build_evidence), Ok(wall_clock)) = (
+                        build_evidence(Some(worker_build)),
+                        summarize_wall_clock(&samples),
+                    )
+                {
+                    error = error.with_partial_run(RunExecution {
+                        runner_output_version: RUNNER_OUTPUT_VERSION,
+                        case_id: run.case.definition.id.clone(),
+                        case_path: run.case_path.clone(),
+                        point_id: run.case.point_id.clone(),
+                        point_name: run.case.point_name.clone(),
+                        cache_condition: run.case.definition.environment.cache_condition.clone(),
+                        requested_repetitions: run.repetitions,
+                        build: build_evidence,
+                        machine,
+                        environment,
+                        fixture: FixtureObservation {
+                            preflight,
+                            stamp: fixture_stamp,
+                            base_load_commits: build.base_load_commits,
+                            optimized_user_tables: build.optimized_user_tables,
+                            source_history_depth: build.source_history_depth,
+                            target_history_depth: build.target_history_depth,
+                        },
+                        samples,
+                        wall_clock,
+                        durable_record: false,
+                    });
+                }
+                return Err(error);
+            }
+        }
     } else {
-        run_in_process_repetitions(&workspace, &template, &run, &plan).await?
+        let machine = capture_machine_identity().map_err(|error| {
+            RunnerError::new(
+                "machine_identity_capture_failed",
+                format!("could not capture in-process runner machine identity: {error}"),
+            )
+        })?;
+        let samples = run_in_process_repetitions(&workspace, &template, &run, &plan).await?;
+        (samples, None, machine)
     };
 
     let wall_clock = summarize_wall_clock(&samples)?;
@@ -726,13 +1341,12 @@ async fn execute_owned_run(
         point_name: run.case.point_name.clone(),
         cache_condition: run.case.definition.environment.cache_condition.clone(),
         requested_repetitions: run.repetitions,
-        build: build_evidence(worker.as_ref()),
+        build: build_evidence(attested_worker_build.as_ref())?,
+        machine,
         environment,
         fixture: FixtureObservation {
             preflight,
-            physical_digest_sha256: physical.digest_sha256,
-            files: physical.files,
-            bytes: physical.bytes,
+            stamp: fixture_stamp,
             base_load_commits: build.base_load_commits,
             optimized_user_tables: build.optimized_user_tables,
             source_history_depth: build.source_history_depth,
@@ -741,6 +1355,70 @@ async fn execute_owned_run(
         samples,
         wall_clock,
         durable_record: false,
+    })
+}
+
+fn unix_time_millis() -> RunnerResult<u64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            RunnerError::new(
+                "system_clock_invalid",
+                format!("system clock is before the Unix epoch: {error}"),
+            )
+        })?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| {
+        RunnerError::new(
+            "system_clock_invalid",
+            "current Unix timestamp in milliseconds does not fit u64",
+        )
+    })
+}
+
+fn stamp_frozen_fixture(
+    run: &ResolvedRun,
+    build: &FixtureBuildSummary,
+    physical: &PhysicalDigest,
+    validated_at_unix_ms: u64,
+) -> RunnerResult<StampedFixtureManifestV1> {
+    if !valid_lower_hex(&build.logical_content_sha256, &[64])
+        || !valid_lower_hex(&physical.digest_sha256, &[64])
+        || physical.files == 0
+        || physical.bytes == 0
+        || validated_at_unix_ms == 0
+    {
+        return Err(RunnerError::new(
+            "fixture_stamp_invalid",
+            "validated fixture evidence is incomplete and cannot be sealed before measurement",
+        ));
+    }
+    let manifest = FixtureManifestV1 {
+        format_version: FIXTURE_MANIFEST_FORMAT_VERSION,
+        logical: LogicalFixtureIdentityV1 {
+            builder: run.case.definition.fixture.builder.clone(),
+            data: run.case.definition.fixture.data.clone(),
+            state: run.case.definition.fixture.state.clone(),
+            logical_content_sha256: build.logical_content_sha256.clone(),
+        },
+        physical: PhysicalFixtureIdentityV1 {
+            digest_algorithm: PHYSICAL_TREE_DIGEST_ALGORITHM.to_string(),
+            tree_sha256: physical.digest_sha256.clone(),
+            files: physical.files,
+            bytes: physical.bytes,
+        },
+        validation: FixtureValidationStampV1::verified(validated_at_unix_ms),
+    };
+    let bytes = serde_json::to_vec(&manifest).map_err(|error| {
+        RunnerError::new(
+            "fixture_stamp_failed",
+            format!("could not serialize canonical pre-measurement fixture manifest: {error}"),
+        )
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    Ok(StampedFixtureManifestV1 {
+        manifest_sha256: format!("{:x}", digest.finalize()),
+        manifest,
     })
 }
 
@@ -813,7 +1491,7 @@ fn validate_execution_suite(suite: &ResolvedSuite) -> RunnerResult<()> {
 fn resolve_worker(
     options: &RunOptions,
     guards: ExecutionGuards,
-) -> RunnerResult<Option<ResolvedWorker>> {
+) -> RunnerResult<Option<BoundWorkerSource>> {
     if !guards.isolate_repetitions {
         return Ok(None);
     }
@@ -823,6 +1501,10 @@ fn resolve_worker(
             "RunOptions.worker_executable must name the exact runner binary used for isolated repetitions",
         )
     })?;
+    resolve_bound_worker(executable).map(Some)
+}
+
+fn resolve_bound_worker(executable: &Path) -> RunnerResult<BoundWorkerSource> {
     let executable = std::fs::canonicalize(executable).map_err(|error| {
         RunnerError::new(
             "worker_executable_error",
@@ -832,19 +1514,197 @@ fn resolve_worker(
             ),
         )
     })?;
-    let digest = digest_worker_executable(&executable).map_err(|error| {
+    let (executable_file, executable_bytes, executable_sha256) =
+        open_and_digest_worker_executable(&executable).map_err(|error| {
+            RunnerError::new(
+                "worker_executable_error",
+                format!(
+                    "could not attest worker executable {}: {error}",
+                    executable.display()
+                ),
+            )
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if executable_file
+            .metadata()
+            .map_err(|error| {
+                RunnerError::new(
+                    "worker_executable_error",
+                    format!(
+                        "could not inspect worker executable permissions {}: {error}",
+                        executable.display()
+                    ),
+                )
+            })?
+            .permissions()
+            .mode()
+            & 0o111
+            == 0
+        {
+            return Err(RunnerError::new(
+                "worker_executable_error",
+                format!(
+                    "configured worker is not executable: {}",
+                    executable.display()
+                ),
+            ));
+        }
+    }
+    Ok(BoundWorkerSource {
+        configured_executable: executable,
+        executable_file: Arc::new(executable_file),
+        executable_bytes,
+        executable_sha256,
+    })
+}
+
+fn stage_bound_worker(source: BoundWorkerSource, workspace: &Path) -> RunnerResult<ResolvedWorker> {
+    let executable = workspace.join("bound-worker-v1");
+    let mut input = source.executable_file.try_clone().map_err(|error| {
         RunnerError::new(
             "worker_executable_error",
             format!(
-                "could not attest worker executable {}: {error}",
+                "could not retain the attested worker {}: {error}",
+                source.configured_executable.display()
+            ),
+        )
+    })?;
+    input.rewind().map_err(|error| {
+        RunnerError::new(
+            "worker_executable_error",
+            format!(
+                "could not rewind the attested worker {}: {error}",
+                source.configured_executable.display()
+            ),
+        )
+    })?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&executable)
+        .map_err(|error| {
+            RunnerError::new(
+                "worker_executable_error",
+                format!(
+                    "could not create run-owned worker {}: {error}",
+                    executable.display()
+                ),
+            )
+        })?;
+    let copy_limit = source.executable_bytes.checked_add(1).ok_or_else(|| {
+        RunnerError::new(
+            "worker_executable_error",
+            "attested worker size cannot be bounded for staging",
+        )
+    })?;
+    let copied = std::io::copy(&mut input.take(copy_limit), &mut output).map_err(|error| {
+        RunnerError::new(
+            "worker_executable_error",
+            format!(
+                "could not stage attested worker {} as {}: {error}",
+                source.configured_executable.display(),
                 executable.display()
             ),
         )
     })?;
-    Ok(Some(ResolvedWorker {
+    if copied != source.executable_bytes {
+        return Err(RunnerError::new(
+            "worker_executable_changed",
+            format!(
+                "attested worker {} changed length before its run-owned copy was sealed: expected {} bytes, copied {copied}",
+                source.configured_executable.display(),
+                source.executable_bytes
+            ),
+        ));
+    }
+    output
+        .flush()
+        .and_then(|()| output.sync_all())
+        .map_err(|error| {
+            RunnerError::new(
+                "worker_executable_error",
+                format!(
+                    "could not seal run-owned worker {}: {error}",
+                    executable.display()
+                ),
+            )
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o500)).map_err(
+            |error| {
+                RunnerError::new(
+                    "worker_executable_error",
+                    format!(
+                        "could not make run-owned worker {} read/execute-only: {error}",
+                        executable.display()
+                    ),
+                )
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = output
+            .metadata()
+            .map_err(|error| {
+                RunnerError::new(
+                    "worker_executable_error",
+                    format!(
+                        "could not inspect run-owned worker {}: {error}",
+                        executable.display()
+                    ),
+                )
+            })?
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&executable, permissions).map_err(|error| {
+            RunnerError::new(
+                "worker_executable_error",
+                format!(
+                    "could not make run-owned worker {} read-only: {error}",
+                    executable.display()
+                ),
+            )
+        })?;
+    }
+    output.sync_all().map_err(|error| {
+        RunnerError::new(
+            "worker_executable_error",
+            format!(
+                "could not sync run-owned worker metadata {}: {error}",
+                executable.display()
+            ),
+        )
+    })?;
+    drop(output);
+    let observed_sha256 = digest_worker_executable(&executable).map_err(|error| {
+        RunnerError::new(
+            "worker_executable_error",
+            format!(
+                "could not verify run-owned worker {}: {error}",
+                executable.display()
+            ),
+        )
+    })?;
+    if observed_sha256 != source.executable_sha256 {
+        return Err(RunnerError::new(
+            "worker_executable_changed",
+            format!(
+                "run-owned worker {} does not match the configured executable attestation",
+                executable.display()
+            ),
+        ));
+    }
+    Ok(ResolvedWorker {
         executable,
-        build: worker_build_attestation(digest),
-    }))
+        executable_sha256: source.executable_sha256,
+    })
 }
 
 enum FrozenTemplate {
@@ -930,22 +1790,68 @@ impl FrozenTemplate {
 }
 
 fn run_supervised_repetitions(
-    _workspace: &tempfile::TempDir,
+    workspace: &tempfile::TempDir,
     template: FrozenTemplate,
     run: ResolvedRun,
+    fixture_stamp: StampedFixtureManifestV1,
     worker: ResolvedWorker,
     repetitions: u32,
-) -> RunnerResult<Vec<RepObservation>> {
+) -> RunnerResult<(Vec<RepObservation>, WorkerBuildV1, MachineIdentityV1)> {
+    if fixture_stamp.manifest.physical.tree_sha256 != template.physical_digest().digest_sha256 {
+        return Err(RunnerError::new(
+            "fixture_stamp_mismatch",
+            "pre-measurement fixture stamp does not name the frozen repetition template",
+        ));
+    }
     let mut samples = Vec::with_capacity(repetitions as usize);
+    let mut attested_build = None::<WorkerBuildV1>;
+    let mut attested_machine = None::<MachineIdentityV1>;
     for repetition in 0..repetitions {
-        template.verify_unchanged()?;
-        let metadata = template.restore_active()?;
+        if let Err(error) = template.verify_unchanged() {
+            return Err(supervised_prefix_error(
+                error,
+                samples,
+                attested_build.as_ref(),
+                attested_machine.as_ref(),
+            ));
+        }
+        let metadata = match template.restore_active() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Err(supervised_prefix_error(
+                    error,
+                    samples,
+                    attested_build.as_ref(),
+                    attested_machine.as_ref(),
+                ));
+            }
+        };
+        let worker_scratch_root = workspace
+            .path()
+            .join(format!("worker-scratch-{repetition:08}"));
+        if let Err(error) = std::fs::create_dir(&worker_scratch_root) {
+            return Err(supervised_prefix_error(
+                RunnerError::new(
+                    "worker_scratch_directory_error",
+                    format!(
+                        "could not create harness-owned worker scratch directory {}: {error}",
+                        worker_scratch_root.display()
+                    ),
+                ),
+                samples,
+                attested_build.as_ref(),
+                attested_machine.as_ref(),
+            ));
+        }
         let result = supervise_repetition(SupervisionInput {
             worker_executable: worker.executable.clone(),
-            worker_build: worker.build.clone(),
+            expected_worker_executable_sha256: worker.executable_sha256.clone(),
+            expected_machine: attested_machine.clone(),
+            fixture_manifest_sha256: fixture_stamp.manifest_sha256.clone(),
             repetition,
             case: run.case.clone(),
             repetition_root: template.active_root().to_path_buf(),
+            worker_scratch_root: worker_scratch_root.clone(),
             physical_digest: template.physical_digest().clone(),
             metadata_digest: metadata,
             deadline: run
@@ -963,36 +1869,128 @@ fn run_supervised_repetitions(
             .err()
             .is_some_and(|error| !containment_proven(error))
         {
-            return Err(result
-                .expect_err("containment status came from an error")
-                .with_completed_samples(samples));
+            return Err(supervised_prefix_error(
+                result.expect_err("containment status came from an error"),
+                samples,
+                attested_build.as_ref(),
+                attested_machine.as_ref(),
+            ));
         }
 
         let template_result = template.verify_unchanged();
         let cleanup_result = remove_active_tree(template.active_root());
+        let scratch_cleanup_result = remove_active_tree(&worker_scratch_root);
         if let Err(error) = template_result {
-            return Err(error.with_completed_samples(samples));
+            return Err(supervised_prefix_error(
+                error,
+                samples,
+                attested_build.as_ref(),
+                attested_machine.as_ref(),
+            ));
         }
         if let Err(error) = cleanup_result {
-            return Err(error.with_completed_samples(samples));
+            return Err(supervised_prefix_error(
+                error,
+                samples,
+                attested_build.as_ref(),
+                attested_machine.as_ref(),
+            ));
+        }
+        if let Err(error) = scratch_cleanup_result {
+            return Err(supervised_prefix_error(
+                error,
+                samples,
+                attested_build.as_ref(),
+                attested_machine.as_ref(),
+            ));
         }
         match result {
-            Ok(sample) => samples.push(sample),
-            Err(error) => return Err(error.with_completed_samples(samples)),
+            Ok(observed) => {
+                if attested_build
+                    .as_ref()
+                    .is_some_and(|previous| previous != &observed.worker_build)
+                {
+                    return Err(supervised_prefix_error(
+                        RunnerError::new(
+                            "worker_build_attestation_changed",
+                            "repetitions from one run reported different worker build identities",
+                        ),
+                        samples,
+                        attested_build.as_ref(),
+                        attested_machine.as_ref(),
+                    ));
+                }
+                if attested_machine
+                    .as_ref()
+                    .is_some_and(|previous| previous != &observed.machine)
+                {
+                    return Err(supervised_prefix_error(
+                        RunnerError::new(
+                            "worker_machine_identity_changed",
+                            "repetitions from one run reported different process-effective machine identities",
+                        ),
+                        samples,
+                        attested_build.as_ref(),
+                        attested_machine.as_ref(),
+                    ));
+                }
+                attested_build.get_or_insert(observed.worker_build);
+                attested_machine.get_or_insert(observed.machine);
+                samples.push(observed.sample);
+            }
+            Err(error) => {
+                return Err(supervised_prefix_error(
+                    error,
+                    samples,
+                    attested_build.as_ref(),
+                    attested_machine.as_ref(),
+                ));
+            }
         }
     }
-    Ok(samples)
+    let attested_build = attested_build.ok_or_else(|| {
+        RunnerError::new(
+            "worker_build_attestation_missing",
+            "successful supervised run produced no worker build attestation",
+        )
+    })?;
+    let attested_machine = attested_machine.ok_or_else(|| {
+        RunnerError::new(
+            "worker_machine_identity_missing",
+            "successful supervised run produced no worker machine identity",
+        )
+    })?;
+    Ok((samples, attested_build, attested_machine))
+}
+
+fn supervised_prefix_error(
+    error: RunnerError,
+    samples: Vec<RepObservation>,
+    build: Option<&WorkerBuildV1>,
+    machine: Option<&MachineIdentityV1>,
+) -> RunnerError {
+    error
+        .with_completed_samples(samples)
+        .with_partial_worker_identity(build, machine)
 }
 
 fn supervise_workspace(
     workspace: tempfile::TempDir,
     template: FrozenTemplate,
     run: ResolvedRun,
+    fixture_stamp: StampedFixtureManifestV1,
     worker: ResolvedWorker,
     repetitions: u32,
-) -> RunnerResult<Vec<RepObservation>> {
+) -> RunnerResult<(Vec<RepObservation>, WorkerBuildV1, MachineIdentityV1)> {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_supervised_repetitions(&workspace, template, run, worker, repetitions)
+        run_supervised_repetitions(
+            &workspace,
+            template,
+            run,
+            fixture_stamp,
+            worker,
+            repetitions,
+        )
     }));
     match outcome {
         Ok(Ok(samples)) => Ok(samples),
@@ -1581,84 +2579,428 @@ fn utf8_path<'a>(path: &'a Path, label: &str) -> RunnerResult<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::parse_case;
 
-    #[test]
-    fn source_provenance_parser_never_turns_unknown_into_a_claim() {
-        assert_eq!(parse_source_git_commit("unknown"), None);
-        assert_eq!(parse_source_git_commit(&"a".repeat(39)), None);
-        assert_eq!(parse_source_git_commit(&"G".repeat(40)), None);
-        assert_eq!(
-            parse_source_git_commit(&"A".repeat(40)),
-            Some("a".repeat(40))
-        );
-        assert_eq!(parse_source_worktree_dirty("true"), Some(true));
-        assert_eq!(parse_source_worktree_dirty("false"), Some(false));
-        assert_eq!(parse_source_worktree_dirty("unknown"), None);
-    }
-
-    #[test]
-    fn effective_environment_evidence_is_explicit_and_bounded() {
-        assert_eq!(
-            classify_effective_environment_value(None),
-            EffectiveEnvironmentValue::Unset
-        );
-        assert_eq!(
-            classify_effective_environment_value(Some(OsStr::new("1GiB"))),
-            EffectiveEnvironmentValue::Utf8 {
-                value: "1GiB".to_string()
-            }
-        );
-        let oversized = "1".repeat(MAX_RECORDED_ENV_VALUE_BYTES + 1);
-        assert!(matches!(
-            classify_effective_environment_value(Some(OsStr::new(&oversized))),
-            EffectiveEnvironmentValue::OversizedUtf8 { bytes, sha256 }
-                if bytes == MAX_RECORDED_ENV_VALUE_BYTES + 1 && sha256.len() == 64
-        ));
+    fn assert_json_object_keys(value: &serde_json::Value, expected: &[&str]) {
+        let actual = value
+            .as_object()
+            .expect("JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[cfg(unix)]
     #[test]
-    fn non_utf8_environment_evidence_is_hashed_not_lossily_rewritten() {
+    fn recovery_evidence_serializes_non_utf8_quarantine_paths_lossily() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"quarantined-\xff".to_vec()));
+        let error = RunnerError::new("worker_failed", "worker failed")
+            .with_quarantined_workspace(path.clone())
+            .with_child_process(ChildProcessEvidence {
+                quarantined_workspace: Some(path),
+                ..ChildProcessEvidence::default()
+            });
+
+        let encoded = serde_json::to_value(error).expect("recovery evidence JSON");
+        assert!(
+            encoded["quarantined_workspace"]
+                .as_str()
+                .expect("lossy outer quarantine path")
+                .contains("quarantined-")
+        );
+        assert!(
+            encoded["child_process"]["quarantined_workspace"]
+                .as_str()
+                .expect("lossy child quarantine path")
+                .contains("quarantined-")
+        );
+    }
+
+    fn complete_worker_attestation() -> WorkerBuildV1 {
+        WorkerBuildV1 {
+            source_commit: "a".repeat(40),
+            source_tree_dirty: Some(false),
+            cargo_profile: "release".to_string(),
+            cargo_opt_level: "2".to_string(),
+            debug_assertions: false,
+            effective_lance_mem_pool_size: Box::new(EffectiveEnvironmentValue::Unset),
+            target_triple: "aarch64-apple-darwin".to_string(),
+            rustc_version: "rustc 1.97.1".to_string(),
+            declared_release_lto: "thin".to_string(),
+            declared_release_codegen_units: Some(16),
+            declared_release_strip: Some(true),
+            cargo_encoded_rustflags_present: Some(false),
+            release_profile_environment_overrides_supported: Some(true),
+            effective_codegen_options_proved: false,
+            engine_feature_flags: omnigraph::instrumentation::enabled_engine_cargo_features()
+                .iter()
+                .map(|feature| (*feature).to_string())
+                .collect(),
+            enabled_techniques: Vec::new(),
+            executable_sha256: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn worker_build_attestation_requires_every_worker_reported_fact() {
+        let valid = complete_worker_attestation();
+        validate_worker_build_attestation(&valid, &valid.executable_sha256).unwrap();
+
+        let mut invalid = valid.clone();
+        invalid.source_commit = "unknown".to_string();
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.source_tree_dirty = None;
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.cargo_opt_level = "3".to_string();
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.target_triple = "unknown".to_string();
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.rustc_version = "unknown".to_string();
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.declared_release_lto = "fat".to_string();
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.cargo_encoded_rustflags_present = Some(true);
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.release_profile_environment_overrides_supported = Some(false);
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.effective_codegen_options_proved = true;
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.engine_feature_flags.push("invented".to_string());
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.enabled_techniques.push("invented".to_string());
+        assert!(validate_worker_build_attestation(&invalid, &valid.executable_sha256).is_err());
+
+        assert!(validate_worker_build_attestation(&valid, &"c".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn worker_reports_features_from_the_linked_engine_artifact() {
+        let build = worker_build_attestation("b".repeat(64)).unwrap();
+        assert_eq!(
+            build.engine_feature_flags,
+            omnigraph::instrumentation::enabled_engine_cargo_features()
+                .iter()
+                .map(|feature| (*feature).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn engine_feature_registry_matches_the_cargo_manifest_attestation() {
+        validate_engine_feature_registry().unwrap();
+        assert_eq!(
+            DECLARED_ENGINE_FEATURES.split(',').collect::<Vec<_>>(),
+            omnigraph::instrumentation::declared_engine_cargo_features()
+        );
+    }
+
+    #[test]
+    fn isolated_worker_is_bound_to_the_configured_executable_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker = directory.path().join("worker");
+        std::fs::write(&worker, b"other-build").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let resolved = resolve_bound_worker(&worker).unwrap();
+        assert_eq!(
+            resolved.executable_sha256,
+            digest_worker_executable(&worker).unwrap()
+        );
+        assert_eq!(resolved.executable_bytes, 11);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_owned_worker_survives_configured_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let configured = directory.path().join("worker");
+        std::fs::write(&configured, b"attested-build").unwrap();
+        std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = resolve_bound_worker(&configured).unwrap();
+
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, b"different-build").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&replacement, &configured).unwrap();
+
+        let workspace = tempfile::tempdir().unwrap();
+        let staged = stage_bound_worker(source, workspace.path()).unwrap();
+        assert_eq!(
+            std::fs::read(&staged.executable).unwrap(),
+            b"attested-build"
+        );
+        assert_eq!(
+            staged.executable_sha256,
+            digest_worker_executable(&staged.executable).unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&staged.executable)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+    }
+
+    #[test]
+    fn runtime_override_namespace_is_fail_closed() {
+        assert!(is_omnigraph_runtime_override(OsStr::new(
+            "OMNIGRAPH_TRAVERSAL_MODE"
+        )));
+        assert!(is_omnigraph_runtime_override(OsStr::new(
+            "OMNIGRAPH_MERGE_STAGING_DIR"
+        )));
+        assert!(!is_omnigraph_runtime_override(OsStr::new(
+            "AWS_ENDPOINT_URL"
+        )));
+        assert!(!is_omnigraph_runtime_override(OsStr::new("OMNIGRAPH")));
+        assert!(is_lance_runtime_override(OsStr::new("LANCE_MEM_POOL_SIZE")));
+        assert!(is_process_runtime_override(OsStr::new(
+            "TOKIO_WORKER_THREADS"
+        )));
+        assert!(is_process_runtime_override(OsStr::new("RAYON_NUM_THREADS")));
+
+        let names = [
+            "OMNIGRAPH_BENCH_BUILD_PROFILE",
+            "OMNIGRAPH_BENCH_BUILD_OPT_LEVEL",
+            "OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT",
+            "OMNIGRAPH_BENCH_SOURCE_WORKTREE_DIRTY",
+            "OMNIGRAPH_BENCH_TARGET_TRIPLE",
+            "OMNIGRAPH_BENCH_RUSTC_VERSION",
+            "OMNIGRAPH_BENCH_DECLARED_RELEASE_LTO",
+            "OMNIGRAPH_BENCH_DECLARED_RELEASE_CODEGEN_UNITS",
+            "OMNIGRAPH_BENCH_DECLARED_RELEASE_STRIP",
+            "OMNIGRAPH_BENCH_CARGO_ENCODED_RUSTFLAGS_PRESENT",
+            "OMNIGRAPH_BENCH_RELEASE_PROFILE_ENVIRONMENT_OVERRIDES",
+            "OMNIGRAPH_BENCH_EFFECTIVE_CODEGEN_OPTIONS_PROVED",
+        ];
+        let exact = names
+            .iter()
+            .map(|name| {
+                (
+                    std::ffi::OsString::from(name),
+                    std::ffi::OsString::from(
+                        expected_build_attestation_environment(OsStr::new(name)).unwrap(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        validate_runtime_overrides(exact.clone()).unwrap();
+
+        let mut mismatched = exact;
+        mismatched[0].1 = std::ffi::OsString::from("forged");
+        assert_eq!(
+            validate_runtime_overrides(mismatched).unwrap_err().code,
+            "build_attestation_environment_mismatch"
+        );
+        assert_eq!(
+            validate_runtime_overrides([(
+                std::ffi::OsString::from("OMNIGRAPH_TRAVERSAL_MODE"),
+                std::ffi::OsString::from("indexed"),
+            )])
+            .unwrap_err()
+            .code,
+            "unsupported_runtime_override"
+        );
+        validate_runtime_overrides([(
+            std::ffi::OsString::from("LANCE_MEM_POOL_SIZE"),
+            std::ffi::OsString::from("805306368"),
+        )])
+        .unwrap();
+        assert_eq!(
+            validate_runtime_overrides([(
+                std::ffi::OsString::from("LANCE_CACHE_CAPACITY"),
+                std::ffi::OsString::from("secret-not-reported"),
+            )])
+            .unwrap_err()
+            .code,
+            "unsupported_runtime_override"
+        );
+        for name in ["TOKIO_WORKER_THREADS", "RAYON_NUM_THREADS"] {
+            assert_eq!(
+                validate_runtime_overrides([(
+                    std::ffi::OsString::from(name),
+                    std::ffi::OsString::from("17"),
+                )])
+                .unwrap_err()
+                .code,
+                "unsupported_runtime_override"
+            );
+        }
+    }
+
+    #[test]
+    fn child_environment_inherits_only_the_modeled_engine_setting() {
+        let admitted = admitted_child_environment([
+            (OsString::from("PATH"), OsString::from("/untrusted")),
+            (OsString::from("TOKIO_WORKER_THREADS"), OsString::from("17")),
+            (OsString::from("RAYON_NUM_THREADS"), OsString::from("19")),
+            (
+                OsString::from("AWS_SECRET_ACCESS_KEY"),
+                OsString::from("secret"),
+            ),
+            (
+                OsString::from("LANCE_MEM_POOL_SIZE"),
+                OsString::from("805306368"),
+            ),
+        ]);
+
+        assert_eq!(
+            admitted,
+            vec![(
+                OsString::from("LANCE_MEM_POOL_SIZE"),
+                OsString::from("805306368")
+            )]
+        );
+    }
+
+    #[test]
+    fn benchmark_children_run_from_their_verified_scratch_directory() {
+        let worker_root = tempfile::tempdir().unwrap();
+        let mut worker = Command::new("unused-worker");
+        configure_benchmark_worker_environment(&mut worker, worker_root.path());
+        assert_eq!(worker.get_current_dir(), Some(worker_root.path()));
+
+        let fixture_root = tempfile::tempdir().unwrap();
+        let mut fixture = Command::new("unused-fixture-worker");
+        configure_fixture_child_environment(&mut fixture, fixture_root.path());
+        assert_eq!(fixture.get_current_dir(), Some(fixture_root.path()));
+    }
+
+    #[test]
+    fn child_runtime_requires_exact_protocol_owned_scratch() {
+        let worker_root = OsStr::new("/verified/worker-scratch-00000003");
+        validate_runtime_overrides_with_scratch(
+            [
+                (OsString::from("TMPDIR"), OsString::from(worker_root)),
+                (
+                    OsString::from("OMNIGRAPH_MERGE_STAGING_DIR"),
+                    OsString::from(worker_root),
+                ),
+            ],
+            Some(ChildScratchExpectation::Worker(worker_root)),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_runtime_overrides_with_scratch(
+                [(OsString::from("TMPDIR"), OsString::from(worker_root))],
+                Some(ChildScratchExpectation::Worker(worker_root)),
+            )
+            .unwrap_err()
+            .code,
+            "unsupported_runtime_override"
+        );
+
+        let fixture_root = OsStr::new("/verified/fixture-scratch-v1");
+        validate_runtime_overrides_with_scratch(
+            [(OsString::from("TMPDIR"), OsString::from(fixture_root))],
+            Some(ChildScratchExpectation::Fixture(fixture_root)),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_runtime_overrides_with_scratch(
+                [
+                    (OsString::from("TMPDIR"), OsString::from(fixture_root)),
+                    (
+                        OsString::from("OMNIGRAPH_MERGE_STAGING_DIR"),
+                        OsString::from(fixture_root),
+                    ),
+                ],
+                Some(ChildScratchExpectation::Fixture(fixture_root)),
+            )
+            .unwrap_err()
+            .code,
+            "unsupported_runtime_override"
+        );
+    }
+
+    #[test]
+    fn lance_memory_evidence_accepts_only_effective_decimal_bytes() {
+        assert_eq!(
+            parse_effective_lance_mem_pool_size(None).unwrap(),
+            EffectiveEnvironmentValue::Unset
+        );
+        assert_eq!(
+            parse_effective_lance_mem_pool_size(Some(OsStr::new("1073741824"))).unwrap(),
+            EffectiveEnvironmentValue::Bytes {
+                bytes: 1_073_741_824
+            }
+        );
+        for invalid in ["", "01", "+1", "1GiB", "18446744073709551616"] {
+            assert_eq!(
+                parse_effective_lance_mem_pool_size(Some(OsStr::new(invalid)))
+                    .unwrap_err()
+                    .code,
+                "invalid_lance_mem_pool_size"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_lance_memory_setting_is_refused() {
         use std::os::unix::ffi::OsStrExt;
 
         let value = OsStr::from_bytes(b"1\xffGiB");
-        assert!(matches!(
-            classify_effective_environment_value(Some(value)),
-            EffectiveEnvironmentValue::NonUtf8 { bytes: 5, sha256 }
-                if sha256.len() == 64
-        ));
+        assert_eq!(
+            parse_effective_lance_mem_pool_size(Some(value))
+                .unwrap_err()
+                .code,
+            "invalid_lance_mem_pool_size"
+        );
     }
 
     #[test]
     fn run_build_evidence_is_derived_from_the_measured_worker() {
-        let worker = ResolvedWorker {
-            executable: PathBuf::from("/not-opened"),
-            build: WorkerBuildV1 {
-                cargo_profile: "sut-profile".into(),
-                opt_level: "sut-opt".into(),
-                debug_assertions: true,
-                source_git_commit_sha: Some("2".repeat(40).into_boxed_str()),
-                source_worktree_dirty: Some(true),
-                effective_lance_mem_pool_size: Box::new(EffectiveEnvironmentValue::Utf8 {
-                    value: "768MiB".to_string(),
-                }),
-                executable_sha256: "3".repeat(64).into_boxed_str(),
-            },
-        };
+        let mut worker = complete_worker_attestation();
+        *worker.effective_lance_mem_pool_size =
+            EffectiveEnvironmentValue::Bytes { bytes: 805_306_368 };
+        worker.executable_sha256 = "3".repeat(64);
 
-        let evidence = build_evidence(Some(&worker));
-        assert_eq!(evidence.cargo_profile, "sut-profile");
-        assert_eq!(evidence.opt_level, "sut-opt");
-        assert!(evidence.debug_assertions);
-        assert_eq!(evidence.source_git_commit_sha, Some("2".repeat(40)));
-        assert_eq!(evidence.source_worktree_dirty, Some(true));
+        let evidence = build_evidence(Some(&worker)).unwrap();
+        assert_eq!(evidence.cargo_profile, "release");
+        assert_eq!(evidence.cargo_opt_level, "2");
+        assert!(!evidence.debug_assertions);
+        assert_eq!(evidence.source_commit, "a".repeat(40));
+        assert!(!evidence.source_tree_dirty);
         assert_eq!(
             evidence.effective_lance_mem_pool_size,
-            EffectiveEnvironmentValue::Utf8 {
-                value: "768MiB".to_string()
-            }
+            EffectiveEnvironmentValue::Bytes { bytes: 805_306_368 }
         );
         assert_eq!(evidence.worker_executable_sha256, Some("3".repeat(64)));
     }
@@ -1830,7 +3172,6 @@ protocol:
                             "engine: warmed-by-program",
                             "engine: reopened-after-program",
                         );
-
                         for source in [warmed_source.to_owned(), post_reopen_source] {
                             let case = parse_case(&source).into_result().unwrap();
                             let run = ResolvedRun {
@@ -1851,6 +3192,63 @@ protocol:
                             .await
                             .unwrap();
 
+                            assert_eq!(execution.runner_output_version, RUNNER_OUTPUT_VERSION);
+                            let mut wire_execution = execution.clone();
+                            wire_execution.build.worker_executable_sha256 = Some("a".repeat(64));
+                            let encoded = serde_json::to_value(&wire_execution)
+                                .expect("runner success JSON");
+                            assert_json_object_keys(
+                                &encoded,
+                                &[
+                                    "build",
+                                    "cache_condition",
+                                    "case_id",
+                                    "case_path",
+                                    "durable_record",
+                                    "environment",
+                                    "fixture",
+                                    "machine",
+                                    "point_id",
+                                    "point_name",
+                                    "requested_repetitions",
+                                    "runner_output_version",
+                                    "samples",
+                                    "wall_clock",
+                                ],
+                            );
+                            assert_json_object_keys(
+                                &encoded["build"],
+                                &[
+                                    "cargo_encoded_rustflags_present",
+                                    "cargo_opt_level",
+                                    "cargo_profile",
+                                    "debug_assertions",
+                                    "declared_release_codegen_units",
+                                    "declared_release_lto",
+                                    "declared_release_strip",
+                                    "effective_codegen_options_proved",
+                                    "effective_lance_mem_pool_size",
+                                    "enabled_techniques",
+                                    "engine_feature_flags",
+                                    "release_profile_environment_overrides_supported",
+                                    "rustc_version",
+                                    "source_commit",
+                                    "source_tree_dirty",
+                                    "target_triple",
+                                    "worker_executable_sha256",
+                                ],
+                            );
+                            assert_json_object_keys(
+                                &encoded["fixture"],
+                                &[
+                                    "base_load_commits",
+                                    "optimized_user_tables",
+                                    "preflight",
+                                    "source_history_depth",
+                                    "stamp",
+                                    "target_history_depth",
+                                ],
+                            );
                             assert_eq!(
                                 execution.cache_condition,
                                 run.case.definition.environment.cache_condition
@@ -1862,14 +3260,15 @@ protocol:
                             );
                             assert_eq!(execution.fixture.source_history_depth, 6);
                             assert_eq!(execution.fixture.target_history_depth, 6);
+                            execution.machine.validate().unwrap();
                             assert_eq!(execution.samples.len(), 2);
                             assert_eq!(
                                 execution.samples[0].input_physical_digest_sha256,
-                                execution.fixture.physical_digest_sha256
+                                execution.fixture.stamp.manifest.physical.tree_sha256
                             );
                             assert_eq!(
                                 execution.samples[1].input_physical_digest_sha256,
-                                execution.fixture.physical_digest_sha256
+                                execution.fixture.stamp.manifest.physical.tree_sha256
                             );
                             for sample in execution.samples {
                                 assert_eq!(sample.outcome, "merged");

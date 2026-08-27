@@ -300,6 +300,17 @@ impl SnapshotDataset {
             .map_err(OmniError::storage)
     }
 
+    /// Whether this pinned Lance manifest carries any raw index-metadata
+    /// section, without filtering entries by the current reader's supported
+    /// index versions.
+    ///
+    /// An absent section proves an empty physical index inventory. Callers
+    /// that require that proof must not substitute [`Self::load_indices`],
+    /// whose compatibility filtering can hide unsupported metadata.
+    pub fn has_raw_index_section(&self) -> bool {
+        self.dataset.manifest().index_section.is_some()
+    }
+
     /// Whether `column` has complete usable BTREE coverage.
     pub async fn index_coverage(&self, column: &str) -> Result<crate::IndexCoverage> {
         crate::table_store::TableStore::key_column_index_coverage(&self.dataset, column).await
