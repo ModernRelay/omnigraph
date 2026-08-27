@@ -6,10 +6,12 @@
 //! physical requests, round trips, or cloud cost.
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance::io::WrappingObjectStore;
 use object_store::path::Path;
@@ -137,6 +139,7 @@ impl MultipartUpload for CountingMultipart {
 }
 
 #[async_trait]
+#[deny(clippy::missing_trait_methods)]
 impl ObjectStore for CountingStore {
     async fn put_opts(
         &self,
@@ -171,6 +174,11 @@ impl ObjectStore for CountingStore {
             self.counter.0.get.fetch_add(1, Ordering::Relaxed);
         }
         self.target.get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> StoreResult<Vec<Bytes>> {
+        self.counter.0.get.fetch_add(1, Ordering::Relaxed);
+        self.target.get_ranges(location, ranges).await
     }
 
     fn delete_stream(
@@ -217,6 +225,74 @@ impl ObjectStore for CountingStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
+    use object_store::memory::InMemory;
+
+    #[derive(Debug)]
+    struct RangeSpyStore {
+        target: Arc<dyn ObjectStore>,
+        get_opts: AtomicU64,
+        get_ranges: AtomicU64,
+    }
+
+    impl fmt::Display for RangeSpyStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "RangeSpyStore({})", self.target)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RangeSpyStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> StoreResult<PutResult> {
+            self.target.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> StoreResult<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> StoreResult<GetResult> {
+            self.get_opts.fetch_add(1, Ordering::Relaxed);
+            self.target.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> StoreResult<Vec<Bytes>> {
+            self.get_ranges.fetch_add(1, Ordering::Relaxed);
+            self.target.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, StoreResult<Path>>,
+        ) -> BoxStream<'static, StoreResult<Path>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> StoreResult<ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> StoreResult<()> {
+            self.target.copy_opts(from, to, options).await
+        }
+    }
 
     #[test]
     fn take_resets_every_tally() {
@@ -254,5 +330,38 @@ mod tests {
         ] {
             assert_eq!(value[class], 0, "missing zero-valued class {class}");
         }
+    }
+
+    #[tokio::test]
+    async fn get_ranges_remains_one_delegated_logical_call() {
+        let location = Path::from("ranges");
+        let target = Arc::new(InMemory::new());
+        target
+            .put(&location, PutPayload::from_static(b"abcdef"))
+            .await
+            .unwrap();
+        let spy = Arc::new(RangeSpyStore {
+            target,
+            get_opts: AtomicU64::new(0),
+            get_ranges: AtomicU64::new(0),
+        });
+        let counter = LogicalCallCounter::default();
+        let store = counter.wrap("test", spy.clone());
+
+        let result = store.get_ranges(&location, &[0..2, 4..6]).await.unwrap();
+
+        assert_eq!(
+            result,
+            vec![Bytes::from_static(b"ab"), Bytes::from_static(b"ef")]
+        );
+        assert_eq!(spy.get_ranges.load(Ordering::Relaxed), 1);
+        assert_eq!(spy.get_opts.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            counter.take(),
+            LogicalCallCounts {
+                get: 1,
+                ..Default::default()
+            }
+        );
     }
 }

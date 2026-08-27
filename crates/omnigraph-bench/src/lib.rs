@@ -9,6 +9,8 @@ pub mod branch_merge;
 pub mod case;
 pub mod counting;
 pub mod environment;
+#[doc(hidden)]
+pub mod fixture_worker;
 pub mod model;
 mod preparation;
 pub mod reset;

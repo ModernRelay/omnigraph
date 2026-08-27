@@ -203,6 +203,66 @@ pub fn freeze_clonefile_template(
     })
 }
 
+/// Accept a clonefile template produced by the contained fixture worker.
+///
+/// The worker owns the only full byte read and clone operation. The parent
+/// reconstructs the typed handle only after the child is reaped, checks that
+/// the active path is absent, and independently re-stats the complete template
+/// against the handed-off metadata witness without reopening file contents.
+pub(crate) fn accept_clonefile_template_handoff(
+    active_root: &Path,
+    template_root: &Path,
+    physical: PhysicalDigest,
+    metadata: MetadataDigest,
+    limits: TraversalLimits,
+) -> io::Result<ClonefileTemplate> {
+    require_clonefile_platform()?;
+    let active_root = stable_absolute_path("active fixture root", active_root)?;
+    let template_root = stable_absolute_path("clonefile template root", template_root)?;
+    refuse_destination_below_source(&active_root, &template_root)?;
+    match fs::symlink_metadata(&active_root) {
+        Ok(_) => {
+            return Err(invalid_data(format!(
+                "contained fixture worker left the active path behind: {}",
+                active_root.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(contextual(
+                error,
+                format!("checking active fixture path {}", active_root.display()),
+            ));
+        }
+    }
+    if physical.files != metadata.files || physical.bytes != metadata.bytes {
+        return Err(invalid_data(format!(
+            "fixture handoff disagrees on template totals: physical files={} bytes={}, metadata files={} bytes={}",
+            physical.files, physical.bytes, metadata.files, metadata.bytes
+        )));
+    }
+    if !is_lowercase_sha256(&physical.digest_sha256) {
+        return Err(invalid_data(
+            "fixture handoff physical digest must be exactly 64 lowercase hexadecimal characters",
+        ));
+    }
+    verify_metadata_tree(&template_root, &metadata, limits)?;
+    Ok(ClonefileTemplate {
+        template_root,
+        active_root,
+        physical,
+        metadata,
+        limits,
+    })
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(target_os = "macos")]
 fn require_clonefile_platform() -> io::Result<()> {
     Ok(())
@@ -320,6 +380,60 @@ impl EntryKind {
             Self::Directory => b'd',
             Self::File => b'f',
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryType {
+    Directory,
+    File,
+    Symlink,
+    Special,
+}
+
+#[cfg(unix)]
+fn entry_type(metadata: &fs::Metadata) -> EntryType {
+    use std::os::unix::fs::MetadataExt;
+
+    classify_unix_mode(metadata.mode())
+}
+
+#[cfg(unix)]
+fn classify_unix_mode(mode: u32) -> EntryType {
+    let file_type = mode & u32::from(nix::libc::S_IFMT);
+    if file_type == u32::from(nix::libc::S_IFDIR) {
+        EntryType::Directory
+    } else if file_type == u32::from(nix::libc::S_IFREG) {
+        EntryType::File
+    } else if file_type == u32::from(nix::libc::S_IFLNK) {
+        EntryType::Symlink
+    } else {
+        EntryType::Special
+    }
+}
+
+fn supported_inventory_kind(entry_type: EntryType, source: &Path) -> io::Result<EntryKind> {
+    match entry_type {
+        EntryType::Directory => Ok(EntryKind::Directory),
+        EntryType::File => Ok(EntryKind::File),
+        EntryType::Symlink | EntryType::Special => Err(invalid_data(format!(
+            "unsupported fixture entry (symlinks and special files are refused): {}",
+            source.display()
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+fn entry_type(metadata: &fs::Metadata) -> EntryType {
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        EntryType::Directory
+    } else if file_type.is_file() {
+        EntryType::File
+    } else if file_type.is_symlink() {
+        EntryType::Symlink
+    } else {
+        EntryType::Special
     }
 }
 
@@ -473,27 +587,25 @@ fn inventory(root: &Path, limits: TraversalLimits) -> io::Result<Vec<TreeEntry>>
                     format!("inspecting fixture entry {}", source.display()),
                 )
             })?;
-            let file_type = metadata.file_type();
-            let (kind, len) = if file_type.is_dir() {
-                pending.push((source.clone(), relative.clone(), child_depth));
-                (EntryKind::Directory, 0)
-            } else if file_type.is_file() {
-                total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
-                    invalid_data("fixture byte counter overflowed while inventorying")
-                })?;
-                if total_bytes > limits.max_bytes {
-                    return Err(invalid_data(format!(
-                        "fixture tree exceeds max_bytes {} at {}",
-                        limits.max_bytes,
-                        source.display()
-                    )));
+            let kind = supported_inventory_kind(entry_type(&metadata), &source)?;
+            let len = match kind {
+                EntryKind::Directory => {
+                    pending.push((source.clone(), relative.clone(), child_depth));
+                    0
                 }
-                (EntryKind::File, metadata.len())
-            } else {
-                return Err(invalid_data(format!(
-                    "unsupported fixture entry (symlinks and special files are refused): {}",
-                    source.display()
-                )));
+                EntryKind::File => {
+                    total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+                        invalid_data("fixture byte counter overflowed while inventorying")
+                    })?;
+                    if total_bytes > limits.max_bytes {
+                        return Err(invalid_data(format!(
+                            "fixture tree exceeds max_bytes {} at {}",
+                            limits.max_bytes,
+                            source.display()
+                        )));
+                    }
+                    metadata.len()
+                }
             };
 
             entries.push(TreeEntry {
@@ -580,15 +692,15 @@ fn digest_metadata_inventory(
                 format!("rechecking fixture entry {}", entry.source.display()),
             )
         })?;
-        let observed_kind = if metadata.file_type().is_dir() {
-            EntryKind::Directory
-        } else if metadata.file_type().is_file() {
-            EntryKind::File
-        } else {
-            return Err(invalid_data(format!(
-                "fixture entry changed to a symlink or special file: {}",
-                entry.source.display()
-            )));
+        let observed_kind = match entry_type(&metadata) {
+            EntryType::Directory => EntryKind::Directory,
+            EntryType::File => EntryKind::File,
+            EntryType::Symlink | EntryType::Special => {
+                return Err(invalid_data(format!(
+                    "fixture entry changed to a symlink or special file: {}",
+                    entry.source.display()
+                )));
+            }
         };
         if observed_kind != entry.kind
             || (entry.kind == EntryKind::File && metadata.len() != entry.len)
@@ -724,15 +836,15 @@ fn digest_inventory(entries: &[TreeEntry], limits: TraversalLimits) -> io::Resul
                 format!("rechecking fixture entry {}", entry.source.display()),
             )
         })?;
-        let observed_kind = if metadata.file_type().is_dir() {
-            EntryKind::Directory
-        } else if metadata.file_type().is_file() {
-            EntryKind::File
-        } else {
-            return Err(invalid_data(format!(
-                "fixture entry changed to a symlink or special file: {}",
-                entry.source.display()
-            )));
+        let observed_kind = match entry_type(&metadata) {
+            EntryType::Directory => EntryKind::Directory,
+            EntryType::File => EntryKind::File,
+            EntryType::Symlink | EntryType::Special => {
+                return Err(invalid_data(format!(
+                    "fixture entry changed to a symlink or special file: {}",
+                    entry.source.display()
+                )));
+            }
         };
         if observed_kind != entry.kind
             || (entry.kind == EntryKind::File && metadata.len() != entry.len)
@@ -1182,6 +1294,46 @@ fn contextual(error: io::Error, context: impl Into<String>) -> io::Error {
 mod tests {
     use super::*;
 
+    #[test]
+    fn handoff_physical_digest_requires_canonical_sha256() {
+        assert!(is_lowercase_sha256(&"0".repeat(64)));
+        assert!(is_lowercase_sha256(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_lowercase_sha256("junk"));
+        assert!(!is_lowercase_sha256(&"A".repeat(64)));
+        assert!(!is_lowercase_sha256(&"0".repeat(63)));
+        assert!(!is_lowercase_sha256(&"0".repeat(65)));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn apfs_tempdir() -> Option<tempfile::TempDir> {
+        use std::os::fd::AsRawFd;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = File::open(workspace.path()).unwrap();
+        // SAFETY: `stats` is initialized storage for `fstatfs`, and the open
+        // directory descriptor remains valid for the duration of the call.
+        let mut stats = unsafe { std::mem::zeroed::<libc::statfs>() };
+        let result = unsafe { libc::fstatfs(directory.as_raw_fd(), &mut stats) };
+        assert_eq!(result, 0, "fstatfs failed: {}", io::Error::last_os_error());
+        let filesystem_bytes = stats
+            .f_fstypename
+            .iter()
+            .map(|&byte| byte as u8)
+            .take_while(|&byte| byte != 0)
+            .collect::<Vec<_>>();
+        let filesystem = String::from_utf8_lossy(&filesystem_bytes);
+        if filesystem != "apfs" {
+            eprintln!(
+                "SKIP clonefile proof: temporary directory {} is on {filesystem}, not APFS",
+                workspace.path().display()
+            );
+            return None;
+        }
+        Some(workspace)
+    }
+
     fn fixture_tree(root: &Path) {
         fs::create_dir(root.join("data")).unwrap();
         fs::create_dir(root.join("empty")).unwrap();
@@ -1351,7 +1503,6 @@ mod tests {
     #[test]
     fn symlinks_and_special_files_are_refused_without_following() {
         use std::os::unix::fs::symlink;
-        use std::os::unix::net::UnixListener;
 
         let fixture = tempfile::tempdir().unwrap();
         fs::write(fixture.path().join("target"), b"outside").unwrap();
@@ -1360,15 +1511,18 @@ mod tests {
         assert!(error.to_string().contains("symlinks"));
 
         fs::remove_file(fixture.path().join("link")).unwrap();
-        let _socket = UnixListener::bind(fixture.path().join("socket")).unwrap();
-        let error = digest_physical_tree(fixture.path(), TraversalLimits::default()).unwrap_err();
+        let socket = classify_unix_mode(u32::from(nix::libc::S_IFSOCK | 0o600));
+        assert_eq!(socket, EntryType::Special);
+        let error = supported_inventory_kind(socket, Path::new("socket")).unwrap_err();
         assert!(error.to_string().contains("special files"));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn clonefile_template_restores_exact_active_path_with_cow_isolation() {
-        let workspace = tempfile::tempdir().unwrap();
+        let Some(workspace) = apfs_tempdir() else {
+            return;
+        };
         let active = workspace.path().join("active");
         let template = workspace.path().join("template");
         fs::create_dir(&active).unwrap();
@@ -1410,7 +1564,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn changed_template_is_refused_before_restoring_active() {
-        let workspace = tempfile::tempdir().unwrap();
+        let Some(workspace) = apfs_tempdir() else {
+            return;
+        };
         let active = workspace.path().join("active");
         let template = workspace.path().join("template");
         fs::create_dir(&active).unwrap();

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::case::CaseV1;
 use crate::reset::{MetadataDigest, PhysicalDigest};
-use crate::runner::RepObservation;
+use crate::runner::{EffectiveEnvironmentValue, RepObservation};
 
 /// The only worker protocol understood by this build.
 pub const WORKER_PROTOCOL_VERSION: u32 = 1;
@@ -35,10 +35,13 @@ const EXECUTABLE_DIGEST_BUFFER_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerBuildV1 {
-    pub cargo_profile: String,
-    pub opt_level: String,
+    pub cargo_profile: Box<str>,
+    pub opt_level: Box<str>,
     pub debug_assertions: bool,
-    pub executable_sha256: String,
+    pub source_git_commit_sha: Option<Box<str>>,
+    pub source_worktree_dirty: Option<bool>,
+    pub effective_lance_mem_pool_size: Box<EffectiveEnvironmentValue>,
+    pub executable_sha256: Box<str>,
 }
 
 /// Complete, immutable input for one worker process.
@@ -380,10 +383,10 @@ version: 1
 id: worker-protocol-test
 scenario: branch-merge-v1
 fixture:
-  builder: { kind: synthetic-branch-merge, version: 1, seed: 0 }
+  builder: { kind: synthetic-branch-merge, version: 2, seed: 0 }
   data:
     provenance: synthetic
-    tables: 1
+    tables: 2
     rows_per_table: 12
     payload_bytes: 8
     column_shape: scalars
@@ -393,7 +396,7 @@ fixture:
     indexes: []
     deletion_history: none
     compaction_recency: not-optimized
-    history_depth: 5
+    history_depth: 6
 workload:
   delta_rows_per_side: 6
   diverged_tables: 1
@@ -441,6 +444,7 @@ protocol:
             repetition: 3,
             input_physical_digest_sha256: "a".repeat(64),
             elapsed_us: 42,
+            peak_rss_bytes: None,
             outcome: "merged".to_string(),
             phases: vec![PhaseObservation {
                 phase: "TableWalk".to_string(),
@@ -558,10 +562,15 @@ protocol:
                 point_id: "d".repeat(64),
                 case_digest: "e".repeat(64),
                 worker_build: WorkerBuildV1 {
-                    cargo_profile: "release".to_string(),
-                    opt_level: "2".to_string(),
+                    cargo_profile: "release".into(),
+                    opt_level: "2".into(),
                     debug_assertions: false,
-                    executable_sha256: "f".repeat(64),
+                    source_git_commit_sha: Some("1".repeat(40).into_boxed_str()),
+                    source_worktree_dirty: Some(false),
+                    effective_lance_mem_pool_size: Box::new(EffectiveEnvironmentValue::Utf8 {
+                        value: "1GiB".to_string(),
+                    }),
+                    executable_sha256: "f".repeat(64).into_boxed_str(),
                 },
                 physical_digest: physical_digest(),
                 metadata_digest: metadata_digest(),

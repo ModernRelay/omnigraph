@@ -10,6 +10,7 @@
 //! orchestration are separate slices.
 
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use omnigraph::instrumentation::{
     with_merge_write_probes, with_query_io_probes,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::branch_merge::{
     BranchMergePlan, FixturePreflight, SOURCE_BRANCH, TARGET_BRANCH,
@@ -34,11 +36,12 @@ use crate::case::{
 };
 use crate::counting::{LogicalCallCounter, LogicalCallCounts};
 use crate::environment::{LocalEnvironmentEvidence, verify_local_environment};
+use crate::fixture_worker::supervise_fixture_build;
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
 use crate::reset::{
-    ClonefileTemplate, MetadataDigest, PhysicalDigest, TraversalLimits, copy_verified,
-    digest_metadata_tree, digest_physical_tree, freeze_clonefile_template, verify_metadata_shape,
-    verify_metadata_tree,
+    ClonefileTemplate, MetadataDigest, PhysicalDigest, TraversalLimits,
+    accept_clonefile_template_handoff, copy_verified, digest_metadata_tree, digest_physical_tree,
+    freeze_clonefile_template, verify_metadata_shape, verify_metadata_tree,
 };
 use crate::suite::{MAX_REPETITIONS_PER_CASE, MAX_SUITE_RUNS, MAX_TOTAL_REPETITIONS};
 use crate::supervisor::{SupervisionInput, supervise_repetition};
@@ -48,7 +51,11 @@ use crate::{ResolvedRun, ResolvedSuite, validate_case};
 pub const RUNNER_OUTPUT_VERSION: u32 = 1;
 const BUILD_PROFILE: &str = env!("OMNIGRAPH_BENCH_BUILD_PROFILE");
 const BUILD_OPT_LEVEL: &str = env!("OMNIGRAPH_BENCH_BUILD_OPT_LEVEL");
+const SOURCE_GIT_COMMIT: &str = env!("OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT");
+const SOURCE_WORKTREE_DIRTY: &str = env!("OMNIGRAPH_BENCH_SOURCE_WORKTREE_DIRTY");
+const MAX_RECORDED_ENV_VALUE_BYTES: usize = 256;
 const RUN_OWNER_STACK_BYTES: usize = 64 * 1024 * 1024;
+const FIXTURE_BUILD_WATCHDOG: Duration = Duration::from_secs(3_600);
 
 /// Invocation-only options. No option may override experiment identity.
 #[derive(Debug, Clone, Default)]
@@ -147,7 +154,7 @@ impl Error for RunnerError {}
 
 pub type RunnerResult<T> = Result<T, RunnerError>;
 
-/// Containment evidence retained when a repetition worker fails or times out.
+/// Containment evidence retained when a fixture or repetition child fails.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ChildProcessEvidence {
     pub stage: String,
@@ -160,6 +167,8 @@ pub struct ChildProcessEvidence {
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_rss_bytes: Option<u64>,
     pub direct_child_reaped: bool,
     pub process_group_gone: bool,
     pub stdio_closed_cleanly: bool,
@@ -202,8 +211,27 @@ pub struct BuildEvidence {
     pub cargo_profile: String,
     pub opt_level: String,
     pub debug_assertions: bool,
+    /// Full source commit observed when the SUT executable was built.
+    /// `None` is an explicit unknown, never an inferred value.
+    pub source_git_commit_sha: Option<String>,
+    /// Whether the source worktree was dirty when the SUT executable was
+    /// built. `None` means the bounded build-time probe could not prove it.
+    pub source_worktree_dirty: Option<bool>,
+    /// Effective `LANCE_MEM_POOL_SIZE` environment condition inherited by the
+    /// measured process, retained in a bounded representation.
+    pub effective_lance_mem_pool_size: EffectiveEnvironmentValue,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_executable_sha256: Option<String>,
+}
+
+/// Bounded evidence for one effective process environment value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum EffectiveEnvironmentValue {
+    Unset,
+    Utf8 { value: String },
+    OversizedUtf8 { bytes: usize, sha256: String },
+    NonUtf8 { bytes: usize, sha256: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -223,6 +251,8 @@ pub struct RepObservation {
     pub repetition: u32,
     pub input_physical_digest_sha256: String,
     pub elapsed_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_rss_bytes: Option<u64>,
     pub outcome: String,
     pub phases: Vec<PhaseObservation>,
     pub route: MergeRouteObservation,
@@ -384,20 +414,82 @@ pub(crate) fn enforce_release_build() -> RunnerResult<()> {
 }
 
 fn build_evidence(worker: Option<&ResolvedWorker>) -> BuildEvidence {
-    BuildEvidence {
-        cargo_profile: BUILD_PROFILE.to_string(),
-        opt_level: BUILD_OPT_LEVEL.to_string(),
-        debug_assertions: cfg!(debug_assertions),
-        worker_executable_sha256: worker.map(|worker| worker.build.executable_sha256.clone()),
+    match worker {
+        Some(worker) => BuildEvidence {
+            cargo_profile: worker.build.cargo_profile.to_string(),
+            opt_level: worker.build.opt_level.to_string(),
+            debug_assertions: worker.build.debug_assertions,
+            source_git_commit_sha: worker
+                .build
+                .source_git_commit_sha
+                .as_deref()
+                .map(str::to_owned),
+            source_worktree_dirty: worker.build.source_worktree_dirty,
+            effective_lance_mem_pool_size: (*worker.build.effective_lance_mem_pool_size).clone(),
+            worker_executable_sha256: Some(worker.build.executable_sha256.to_string()),
+        },
+        None => {
+            let build = worker_build_attestation(String::new());
+            BuildEvidence {
+                cargo_profile: build.cargo_profile.into(),
+                opt_level: build.opt_level.into(),
+                debug_assertions: build.debug_assertions,
+                source_git_commit_sha: build.source_git_commit_sha.map(Into::into),
+                source_worktree_dirty: build.source_worktree_dirty,
+                effective_lance_mem_pool_size: *build.effective_lance_mem_pool_size,
+                worker_executable_sha256: None,
+            }
+        }
     }
 }
 
 pub(crate) fn worker_build_attestation(executable_sha256: String) -> WorkerBuildV1 {
     WorkerBuildV1 {
-        cargo_profile: BUILD_PROFILE.to_string(),
-        opt_level: BUILD_OPT_LEVEL.to_string(),
+        cargo_profile: BUILD_PROFILE.into(),
+        opt_level: BUILD_OPT_LEVEL.into(),
         debug_assertions: cfg!(debug_assertions),
-        executable_sha256,
+        source_git_commit_sha: parse_source_git_commit(SOURCE_GIT_COMMIT)
+            .map(String::into_boxed_str),
+        source_worktree_dirty: parse_source_worktree_dirty(SOURCE_WORKTREE_DIRTY),
+        effective_lance_mem_pool_size: Box::new(classify_effective_environment_value(
+            std::env::var_os("LANCE_MEM_POOL_SIZE").as_deref(),
+        )),
+        executable_sha256: executable_sha256.into_boxed_str(),
+    }
+}
+
+fn parse_source_git_commit(raw: &str) -> Option<String> {
+    ((raw.len() == 40 || raw.len() == 64) && raw.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| raw.to_ascii_lowercase())
+}
+
+fn parse_source_worktree_dirty(raw: &str) -> Option<bool> {
+    match raw {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn classify_effective_environment_value(value: Option<&OsStr>) -> EffectiveEnvironmentValue {
+    let Some(value) = value else {
+        return EffectiveEnvironmentValue::Unset;
+    };
+    let encoded = value.as_encoded_bytes();
+    let bytes = encoded.len();
+    let sha256 = || format!("{:x}", Sha256::digest(encoded));
+    match value.to_str() {
+        Some(value) if bytes <= MAX_RECORDED_ENV_VALUE_BYTES => EffectiveEnvironmentValue::Utf8 {
+            value: value.to_string(),
+        },
+        Some(_) => EffectiveEnvironmentValue::OversizedUtf8 {
+            bytes,
+            sha256: sha256(),
+        },
+        None => EffectiveEnvironmentValue::NonUtf8 {
+            bytes,
+            sha256: sha256(),
+        },
     }
 }
 
@@ -417,7 +509,7 @@ async fn execute_run_inner(
     if run.case.definition.protocol.attribution != Attribution::PerPhase {
         return Err(RunnerError::new(
             "unsupported_runner_axis",
-            "runner-v1 executes the micro profile and requires protocol.attribution: per-phase",
+            "runner-v1 requires protocol.attribution: per-phase so every measured merge carries exact phase evidence",
         ));
     }
     if run.case.definition.protocol.reset != ResetMode::LocalClonefile && !guards.allow_plain_copy {
@@ -517,36 +609,81 @@ async fn execute_owned_run(
                 format!("could not create {}: {error}", active_root.display()),
             )
         })?;
-        let active_uri = utf8_path(&active_root, "active fixture")?;
-        let build = initialize_local_fixture(active_uri, &plan)
-            .await
-            .map_err(|error| RunnerError::new("fixture_build_failed", error.to_string()))?;
         let limits = TraversalLimits::default();
-        let template = if run.case.definition.protocol.reset == ResetMode::LocalClonefile {
-            FrozenTemplate::Clonefile(
-                freeze_clonefile_template(&active_root, &template_root, limits).map_err(
-                    |error| {
-                        RunnerError::new(
-                            "fixture_freeze_failed",
-                            format!(
-                                "could not freeze {} as an APFS clonefile template: {error}",
-                                active_root.display()
-                            ),
-                        )
-                    },
-                )?,
+        let (build, template, physical) = if guards.isolate_repetitions {
+            let executable = worker.as_ref().ok_or_else(|| {
+                RunnerError::new(
+                    "worker_executable_required",
+                    "contained fixture construction requires an explicit worker executable",
+                )
+            })?;
+            let handoff = supervise_fixture_build(
+                &executable.executable,
+                &run.case,
+                &active_root,
+                &template_root,
+                workspace.path(),
+                FIXTURE_BUILD_WATCHDOG,
+            )?;
+            let template = accept_clonefile_template_handoff(
+                &active_root,
+                &template_root,
+                handoff.physical.clone(),
+                handoff.template_metadata,
+                limits,
+            )
+            .map_err(|error| {
+                RunnerError::new(
+                    "fixture_handoff_failed",
+                    format!(
+                        "could not accept contained fixture template {}: {error}",
+                        template_root.display()
+                    ),
+                )
+            })?;
+            (
+                handoff.summary,
+                FrozenTemplate::Clonefile(template),
+                handoff.physical,
             )
         } else {
-            FrozenTemplate::plain_copy_for_test(&active_root, &template_root, limits)?
+            // Owning-layer tests keep their tiny fixtures in-process. Public
+            // wall-clock execution always takes the bounded child path above.
+            let active_uri = utf8_path(&active_root, "active fixture")?;
+            let build = initialize_local_fixture(active_uri, &plan)
+                .await
+                .map_err(|error| RunnerError::new("fixture_build_failed", error.to_string()))?;
+            let template = if run.case.definition.protocol.reset == ResetMode::LocalClonefile {
+                FrozenTemplate::Clonefile(
+                    freeze_clonefile_template(&active_root, &template_root, limits).map_err(
+                        |error| {
+                            RunnerError::new(
+                                "fixture_freeze_failed",
+                                format!(
+                                    "could not freeze {} as an APFS clonefile template: {error}",
+                                    active_root.display()
+                                ),
+                            )
+                        },
+                    )?,
+                )
+            } else {
+                FrozenTemplate::plain_copy_for_test(&active_root, &template_root, limits)?
+            };
+            remove_active_tree(&active_root)?;
+            let physical = template.physical_digest().clone();
+            (build, template, physical)
         };
-        remove_active_tree(&active_root)?;
-        let physical = template.physical_digest().clone();
         Ok::<_, RunnerError>((build, template, physical))
     }))
     .catch_unwind()
     .await;
     let (build, template, physical) = match fixture {
-        Ok(result) => result?,
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            let quarantined = workspace.keep();
+            return Err(error.with_quarantined_workspace(quarantined));
+        }
         Err(_) => {
             let quarantined = workspace.keep();
             return Err(RunnerError::new(
@@ -885,9 +1022,15 @@ fn supervise_workspace(
 }
 
 fn containment_proven(error: &RunnerError) -> bool {
-    error.context.child_process.as_ref().is_none_or(|evidence| {
-        evidence.direct_child_reaped && evidence.process_group_gone && evidence.stdio_closed_cleanly
-    })
+    error
+        .context
+        .child_process
+        .as_ref()
+        .is_some_and(|evidence| {
+            evidence.direct_child_reaped
+                && evidence.process_group_gone
+                && evidence.stdio_closed_cleanly
+        })
 }
 
 async fn run_in_process_repetitions(
@@ -1162,13 +1305,13 @@ async fn execute_rep_body<S: MeasurementSignals>(
 
     // The engine handle must be read-write for the measured mutation. Prove
     // that open and the declared cache-preparation treatment issued no write through either
-    // storage seam, then compare the complete metadata state without reading
+    // storage seam, then compare the complete metadata shape without reading
     // file contents. The clonefile syscall already proved byte identity.
     verify_metadata_shape(root, input_metadata, TraversalLimits::default()).map_err(|error| {
         RunnerError::new(
-            "pre_measurement_state_mismatch",
+            "pre_measurement_shape_mismatch",
             format!(
-                "repetition {repetition} did not retain the clonefile metadata state through open and cache preparation: {error}"
+                "repetition {repetition} did not retain the clonefile metadata shape through open and cache preparation: {error}"
             ),
         )
     })?;
@@ -1259,6 +1402,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
         repetition,
         input_physical_digest_sha256: input_digest.digest_sha256.clone(),
         elapsed_us,
+        peak_rss_bytes: None,
         outcome: "merged".to_string(),
         phases: phase_readings
             .into_iter()
@@ -1441,12 +1585,106 @@ mod tests {
     use crate::parse_case;
 
     #[test]
+    fn source_provenance_parser_never_turns_unknown_into_a_claim() {
+        assert_eq!(parse_source_git_commit("unknown"), None);
+        assert_eq!(parse_source_git_commit(&"a".repeat(39)), None);
+        assert_eq!(parse_source_git_commit(&"G".repeat(40)), None);
+        assert_eq!(
+            parse_source_git_commit(&"A".repeat(40)),
+            Some("a".repeat(40))
+        );
+        assert_eq!(parse_source_worktree_dirty("true"), Some(true));
+        assert_eq!(parse_source_worktree_dirty("false"), Some(false));
+        assert_eq!(parse_source_worktree_dirty("unknown"), None);
+    }
+
+    #[test]
+    fn effective_environment_evidence_is_explicit_and_bounded() {
+        assert_eq!(
+            classify_effective_environment_value(None),
+            EffectiveEnvironmentValue::Unset
+        );
+        assert_eq!(
+            classify_effective_environment_value(Some(OsStr::new("1GiB"))),
+            EffectiveEnvironmentValue::Utf8 {
+                value: "1GiB".to_string()
+            }
+        );
+        let oversized = "1".repeat(MAX_RECORDED_ENV_VALUE_BYTES + 1);
+        assert!(matches!(
+            classify_effective_environment_value(Some(OsStr::new(&oversized))),
+            EffectiveEnvironmentValue::OversizedUtf8 { bytes, sha256 }
+                if bytes == MAX_RECORDED_ENV_VALUE_BYTES + 1 && sha256.len() == 64
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_environment_evidence_is_hashed_not_lossily_rewritten() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let value = OsStr::from_bytes(b"1\xffGiB");
+        assert!(matches!(
+            classify_effective_environment_value(Some(value)),
+            EffectiveEnvironmentValue::NonUtf8 { bytes: 5, sha256 }
+                if sha256.len() == 64
+        ));
+    }
+
+    #[test]
+    fn run_build_evidence_is_derived_from_the_measured_worker() {
+        let worker = ResolvedWorker {
+            executable: PathBuf::from("/not-opened"),
+            build: WorkerBuildV1 {
+                cargo_profile: "sut-profile".into(),
+                opt_level: "sut-opt".into(),
+                debug_assertions: true,
+                source_git_commit_sha: Some("2".repeat(40).into_boxed_str()),
+                source_worktree_dirty: Some(true),
+                effective_lance_mem_pool_size: Box::new(EffectiveEnvironmentValue::Utf8 {
+                    value: "768MiB".to_string(),
+                }),
+                executable_sha256: "3".repeat(64).into_boxed_str(),
+            },
+        };
+
+        let evidence = build_evidence(Some(&worker));
+        assert_eq!(evidence.cargo_profile, "sut-profile");
+        assert_eq!(evidence.opt_level, "sut-opt");
+        assert!(evidence.debug_assertions);
+        assert_eq!(evidence.source_git_commit_sha, Some("2".repeat(40)));
+        assert_eq!(evidence.source_worktree_dirty, Some(true));
+        assert_eq!(
+            evidence.effective_lance_mem_pool_size,
+            EffectiveEnvironmentValue::Utf8 {
+                value: "768MiB".to_string()
+            }
+        );
+        assert_eq!(evidence.worker_executable_sha256, Some("3".repeat(64)));
+    }
+
+    #[test]
+    fn missing_child_evidence_never_authorizes_cleanup() {
+        let error = RunnerError::new("worker_spawn_failed", "no child was contained");
+        assert!(!containment_proven(&error));
+
+        let contained = error.with_child_process(ChildProcessEvidence {
+            direct_child_reaped: true,
+            process_group_gone: true,
+            stdio_closed_cleanly: true,
+            ..ChildProcessEvidence::default()
+        });
+        assert!(containment_proven(&contained));
+    }
+
+    #[test]
     fn percentile_summary_never_invents_an_unsupported_tail() {
         let samples = (0..5)
             .map(|repetition| RepObservation {
                 repetition,
                 input_physical_digest_sha256: "d".repeat(64),
                 elapsed_us: u64::from(repetition + 1) * 10,
+                peak_rss_bytes: None,
                 outcome: "merged".to_string(),
                 phases: Vec::new(),
                 route: MergeRouteObservation {
@@ -1555,7 +1793,7 @@ version: 1
 id: tiny-runner
 scenario: branch-merge-v1
 fixture:
-  builder: { kind: synthetic-branch-merge, version: 1, seed: 0 }
+  builder: { kind: synthetic-branch-merge, version: 2, seed: 0 }
   data:
     provenance: synthetic
     tables: 2
@@ -1568,10 +1806,10 @@ fixture:
     indexes: []
     deletion_history: none
     compaction_recency: not-optimized
-    history_depth: 9
+    history_depth: 6
 workload:
   delta_rows_per_side: 6
-  diverged_tables: 2
+  diverged_tables: 1
   arrival: unscheduled-single-shot
   clients: 1
   read_write_mix: write-heavy
@@ -1622,8 +1860,8 @@ protocol:
                                     ["page_cache"],
                                 "program-conditioned"
                             );
-                            assert_eq!(execution.fixture.source_history_depth, 9);
-                            assert_eq!(execution.fixture.target_history_depth, 9);
+                            assert_eq!(execution.fixture.source_history_depth, 6);
+                            assert_eq!(execution.fixture.target_history_depth, 6);
                             assert_eq!(execution.samples.len(), 2);
                             assert_eq!(
                                 execution.samples[0].input_physical_digest_sha256,
@@ -1635,7 +1873,7 @@ protocol:
                             );
                             for sample in execution.samples {
                                 assert_eq!(sample.outcome, "merged");
-                                assert_eq!(sample.route.table_walk_intervals, 2);
+                                assert_eq!(sample.route.table_walk_intervals, 1);
                                 assert!(sample.verification.exact_content);
                                 assert!(sample.verification.source_exact_content);
                                 assert!(sample.verification.main_exact_content);

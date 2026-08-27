@@ -5087,6 +5087,7 @@ dependencies = [
  "arrow-array",
  "assert_cmd",
  "async-trait",
+ "bytes",
  "clap",
  "futures",
  "lance",

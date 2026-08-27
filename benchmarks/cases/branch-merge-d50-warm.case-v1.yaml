@@ -5,7 +5,7 @@ scenario: branch-merge-v1
 fixture:
   builder:
     kind: synthetic-branch-merge
-    version: 1
+    version: 2
     seed: 0
   data:
     provenance: synthetic

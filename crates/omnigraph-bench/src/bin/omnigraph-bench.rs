@@ -40,6 +40,9 @@ enum Command {
     /// Private one-repetition worker endpoint used by the supervising runner.
     #[command(name = "__worker-v1", hide = true)]
     WorkerV1,
+    /// Private bounded fixture-builder endpoint used by the supervising runner.
+    #[command(name = "__fixture-worker-v1", hide = true)]
+    FixtureWorkerV1 { request: PathBuf, result: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -140,6 +143,9 @@ async fn main() -> ExitCode {
         Command::Case { command } => run_case(command),
         Command::Suite { command } => run_suite(command).await,
         Command::WorkerV1 => omnigraph_bench::worker::run_worker_stdio_v1().await,
+        Command::FixtureWorkerV1 { request, result } => {
+            omnigraph_bench::fixture_worker::run_fixture_worker_files_v1(&request, &result).await
+        }
     }
 }
 

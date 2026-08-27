@@ -30,13 +30,20 @@ measurement protocol and identity vocabulary.
   engine surface and consumes the plans produced here.
 - Runner-v1 builds one already-diverged fixture at a stable `active` path,
   verifies it, closes it, and freezes its complete physical tree by SHA-256.
-  It then makes a never-opened APFS clonefile template. Every repetition
-  clone-restores the template to that same `active` path, so Lance shallow
+  Public execution performs construction in a dedicated process group under a
+  bounded watchdog. That child also byte-digests the completed tree, makes the
+  never-opened APFS clonefile template, and removes `active` before returning
+  an identity-checked handoff. The parent accepts it only after the direct child
+  has been reaped and the process group is gone. Any failed, partial, or
+  panicked fixture build quarantines its disposable workspace instead of
+  deleting possibly active state. Every repetition clone-restores the template
+  to that same `active` path, so Lance shallow
   branches retain valid absolute base paths and samples do not accumulate
   branch, manifest, or deletion history. Reset and pre-timer proof traverse
   metadata but never read file contents or fall back to a byte copy.
-- Every repetition runs in a fresh worker process whose executable SHA-256 and
-  release-profile facts must match the parent attestation. Its complete cache
+- Every repetition runs in a fresh worker process whose executable SHA-256,
+  release-profile facts, source commit/dirty evidence, and effective
+  `LANCE_MEM_POOL_SIZE` must match the parent attestation. Its complete cache
   condition is part of point identity. When declared, its read-only warm-up
   program runs before measured counters and the monotonic merge timer begin. A
   storage firewall permits only the engine's one balanced,
@@ -49,29 +56,41 @@ measurement protocol and identity vocabulary.
   `preparation-only` is executable as process-cold: it has no declared warm-up,
   while ordinary engine open and protected-head capture still occur and the OS
   page cache remains explicitly uncontrolled.
-- After the measured window closes, verification checks the exact expected
-  rows and values across every target table, including untouched tables. It
-  separately proves that source and main still have their exact frozen content
-  and that their branch heads did not move. The run also requires a real
-  three-way merge and one `TableWalk` interval per diverged table, so a
-  fast-forward or otherwise vacuous sample fails loudly.
+- After the measured window closes, the worker reads and verifies the exact
+  expected rows and values across every table on target, source, and main,
+  including untouched tables, and proves that source and main branch heads did
+  not move. The parent does not independently read those content bytes. It
+  independently derives and validates the point/case identities, merge route,
+  and declared table/total-row count attestations returned by the worker. The
+  run also requires a real three-way merge and one `TableWalk` interval per
+  diverged edge table, so a fast-forward or otherwise vacuous sample fails
+  loudly. This runner-v1 verification is deliberately O(store), outside the
+  measured window. Receipt-based O(delta) certification begins with the future
+  versioned-S3 reset slice. A future DST oracle may add an independent check,
+  but never replaces the per-repetition content probes.
 - The supervisor starts the declared hard deadline immediately before sending
   `Begin`. If the worker has not sent `Settled` by that deadline, the supervisor
   sends `SIGKILL` to its process group, waits for and reaps the child, and proves
-  the group is gone before the active tree can be removed. Finalization also
-  requires bounded, clean EOF on stdout and stderr with no trailing protocol
-  frame; otherwise the disposable workspace is quarantined. A killed or
-  partial mutation never becomes a sample. Preparation and exact verification
-  use separate bounded watchdogs, each with a 300-second minimum allowance.
+  the group is gone. Every repetition failure, including a trailing protocol
+  frame after `Complete`, rejects the sample. Cleanup is permitted only when
+  the direct child was reaped, its process group is gone, and bounded
+  stdout/stderr capture reached clean EOF; otherwise the disposable workspace
+  is quarantined. Thus a contained failure may be cleaned up, while an unproved
+  containment state is preserved for inspection. A killed or partial mutation
+  never becomes a sample.
+  Preparation and exact verification use separate bounded watchdogs, each with
+  a 300-second minimum allowance.
 - Store counts are **logical store calls** made by the engine. They do not
   observe retries, pagination, multipart fan-out, or other physical attempts,
   and therefore are not network-request or cloud-cost measurements.
 
 ## Runner-v1 support envelope
 
-Execution currently supports only synthetic builder v1 with seed `0`, scalar
-uniform bulk-loaded data, no indexes or pre-existing deletion history, local
-filesystem storage, same-host embedded execution, one client, distinct-key
+Execution currently supports only synthetic builder v2 with seed `0`. Its even
+total table count is split equally between immutable node endpoint tables and
+uniform-ring edge tables; declared divergence applies to edge tables. It uses
+scalar uniform bulk-loaded data, no indexes or pre-existing deletion history,
+local filesystem storage, same-host embedded execution, one client, distinct-key
 write-heavy divergence, manual scheduling, local-clonefile reset, per-phase
 attribution, and a monotonic timer. Process-cold, warmed-by-program, and
 reopened-after-program engine preparation are supported with their exact
@@ -95,9 +114,11 @@ not case-schema or engine limits.
 
 `suite run --json` emits a versioned diagnostic execution projection with
 `durable_record: false`. It is useful for inspecting samples, phase timings,
-logical calls, parent/worker build attestation, fixture identity, and
-verification, but it is not a benchmark record and must not be archived as
-one. Immutable JSON records, their
+per-repetition worker peak RSS, logical calls, the exact worker executable
+SHA-256 plus release profile/optimization/debug-assertion attestation, source
+commit/dirty evidence, effective `LANCE_MEM_POOL_SIZE`, fixture identity, and
+verification, but it is not a benchmark record and must not be
+archived as one. Immutable JSON records, their
 rebuildable database projection, fixture caching, and AWS orchestration belong
 to later, separately reviewed slices.
 

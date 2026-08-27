@@ -20,14 +20,15 @@ use crate::ValidatedCase;
 use crate::case::{
     Aging, Arrival, Backend, ColumnShape, CompactionRecency, Contention, DataProvenance,
     DeletionHistory, Execution, FixtureBuilderKind, NetworkPosition, ReadWriteMix, ResetMode,
-    Scenario, Schedule, Timer, TopologySkew,
+    SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION, Scenario, Schedule, TopologySkew,
+    branch_merge_change_mix,
 };
 
 pub const SOURCE_BRANCH: &str = "bench-source";
 pub const TARGET_BRANCH: &str = "bench-target";
 
 const MAIN_BRANCH: &str = "main";
-const BUILDER_VERSION: u32 = 1;
+const BUILDER_VERSION: u32 = SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION;
 const SUPPORTED_SEED: u64 = 0;
 const UPDATE_VALUE: i32 = i32::MAX;
 const NEW_COHORT: &str = "new";
@@ -37,7 +38,10 @@ const NEW_COHORT: &str = "new";
 /// multi-row chunk on the admission boundary.
 const KEYED_WRITE_MAX_ROWS: usize = 8_192;
 const KEYED_WRITE_MAX_BYTES: usize = 32 * 1024 * 1024;
-const ROW_OVERHEAD_BYTES: usize = 160;
+// Edge JSON carries an explicit id plus both endpoint keys. Use the larger
+// row shape for every chunk and byte-budget proof so neither the node nor edge
+// generator can cross the engine's keyed-write admission boundary.
+const MAX_ROW_OVERHEAD_BYTES: usize = 256;
 const WARM_SCAN_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUNNER_TABLES: usize = 256;
 const MAX_RUNNER_BASE_ROWS: usize = 10_000_000;
@@ -194,7 +198,7 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
             return Err(unsupported(
                 "fixture.builder.seed",
                 format!(
-                    "seed {} was requested; deterministic builder v1 currently defines only seed {SUPPORTED_SEED}",
+                    "seed {} was requested; deterministic builder v2 currently defines only seed {SUPPORTED_SEED}",
                     case.fixture.builder.seed
                 ),
             ));
@@ -202,19 +206,19 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
         if case.fixture.data.provenance != DataProvenance::Synthetic {
             return Err(unsupported(
                 "fixture.data.provenance",
-                "builder v1 requires synthetic data",
+                "builder v2 requires synthetic data",
             ));
         }
         if case.fixture.data.column_shape != ColumnShape::Scalars {
             return Err(unsupported(
                 "fixture.data.column_shape",
-                "builder v1 implements the scalar schema only",
+                "builder v2 implements the scalar schema only",
             ));
         }
         if case.fixture.data.topology_skew != TopologySkew::Uniform {
             return Err(unsupported(
                 "fixture.data.topology_skew",
-                "builder v1 implements uniform topology only",
+                "builder v2 implements uniform topology only",
             ));
         }
         if case.fixture.state.aging != Aging::BulkLoaded {
@@ -256,7 +260,7 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
         if case.workload.contention != Contention::DistinctKey {
             return Err(unsupported(
                 "workload.contention",
-                "builder v1 creates disjoint source and target cohorts",
+                "builder v2 creates disjoint source and target edge cohorts",
             ));
         }
         if !matches!(&case.environment.backend, Backend::LocalFs { .. }) {
@@ -292,13 +296,6 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
                 "this runner slice executes manually scheduled suites only",
             ));
         }
-        if case.protocol.timer != Timer::Monotonic {
-            return Err(unsupported(
-                "protocol.timer",
-                "this runner slice supports the monotonic timer only",
-            ));
-        }
-
         let tables = checked_usize("fixture.data.tables", case.fixture.data.tables)?;
         let rows_per_table = checked_usize(
             "fixture.data.rows_per_table",
@@ -315,19 +312,22 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
             case.workload.delta_rows_per_side,
         )?;
 
-        if tables == 0 || rows_per_table == 0 {
-            return Err(invalid_plan("tables and rows_per_table must both be >= 1"));
+        if tables < 2 || !tables.is_multiple_of(2) || rows_per_table == 0 {
+            return Err(invalid_plan(
+                "builder v2 requires an even total table count >= 2 and rows_per_table >= 1",
+            ));
         }
-        if diverged_tables == 0 || diverged_tables > tables {
+        let edge_tables = tables / 2;
+        if diverged_tables == 0 || diverged_tables > edge_tables {
             return Err(invalid_plan(format!(
-                "diverged_tables must be in 1..={tables}, got {diverged_tables}"
+                "builder v2 diverges edge tables and requires diverged_tables in 1..={edge_tables}, got {diverged_tables}"
             )));
         }
         if delta_rows_per_side == 0 {
             return Err(invalid_plan("delta_rows_per_side must be >= 1"));
         }
         let row_bytes = payload_bytes
-            .checked_add(ROW_OVERHEAD_BYTES)
+            .checked_add(MAX_ROW_OVERHEAD_BYTES)
             .ok_or_else(|| invalid_plan("payload plus JSON row overhead overflowed usize"))?;
         if row_bytes > KEYED_WRITE_MAX_BYTES {
             return Err(unsupported(
@@ -388,7 +388,7 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
                     return Err(unsupported(
                         "workload.delta_rows_per_side",
                         format!(
-                            "table {table} has {inserts} {side} inserts; builder v1's exact I32 payload can represent at most {} insert ordinals",
+                            "edge table {table} has {inserts} {side} inserts; builder v2's exact I32 payload can represent at most {} insert ordinals",
                             i32::MAX
                         ),
                     ));
@@ -414,11 +414,24 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
 }
 
 impl BranchMergePlan {
+    fn node_tables(&self) -> usize {
+        self.tables / 2
+    }
+
+    fn edge_tables(&self) -> usize {
+        self.tables / 2
+    }
+
     /// Exact total target rows after both sides' effects are merged.
     pub(crate) fn expected_merged_rows(&self) -> BranchMergeResult<u64> {
-        let mut total = 0_u64;
-        for table in 0..self.tables {
-            let rows = expected_table_rows(self, table, BranchState::Merged)?;
+        let node_rows = self
+            .node_tables()
+            .checked_mul(self.rows_per_table)
+            .ok_or_else(|| verification_error("expected node row total overflowed usize"))?;
+        let mut total = u64::try_from(node_rows)
+            .map_err(|_| verification_error("expected node row total does not fit u64"))?;
+        for table in 0..self.edge_tables() {
+            let rows = expected_edge_rows(self, table, BranchState::Merged)?;
             total = total
                 .checked_add(u64::try_from(rows).map_err(|_| {
                     verification_error(format!(
@@ -444,13 +457,16 @@ fn split_delta(delta: usize) -> BranchMergeResult<ChangeSplit> {
     if delta == 0 {
         return Err(invalid_plan("delta must be >= 1"));
     }
-    let updates = delta.div_ceil(3);
-    let remaining = delta - updates;
-    let deletes = remaining.div_ceil(2);
+    let change_mix = branch_merge_change_mix(
+        u64::try_from(delta).map_err(|_| invalid_plan("delta does not fit u64"))?,
+    );
     Ok(ChangeSplit {
-        updates,
-        deletes,
-        inserts: remaining - deletes,
+        updates: usize::try_from(change_mix.updates)
+            .map_err(|_| invalid_plan("update count does not fit usize"))?,
+        deletes: usize::try_from(change_mix.deletes)
+            .map_err(|_| invalid_plan("delete count does not fit usize"))?,
+        inserts: usize::try_from(change_mix.inserts)
+            .map_err(|_| invalid_plan("insert count does not fit usize"))?,
     })
 }
 
@@ -480,7 +496,7 @@ fn require_update_bearing_tables(
         return Err(unsupported(
             "workload.delta_rows_per_side",
             format!(
-                "delta {delta_rows_per_side} leaves declared diverged table {table} without an update on both sides, so it cannot guarantee the general TableWalk route; {diverged_tables} diverged tables require delta_rows_per_side >= {minimum_delta}"
+                "delta {delta_rows_per_side} leaves declared diverged edge table {table} without an update on both sides, so it cannot guarantee the general TableWalk route; {diverged_tables} diverged edge tables require delta_rows_per_side >= {minimum_delta}"
             ),
         ));
     }
@@ -489,7 +505,7 @@ fn require_update_bearing_tables(
 
 fn load_chunk_rows(payload_bytes: usize) -> BranchMergeResult<usize> {
     let row_bytes = payload_bytes
-        .checked_add(ROW_OVERHEAD_BYTES)
+        .checked_add(MAX_ROW_OVERHEAD_BYTES)
         .ok_or_else(|| invalid_plan("payload plus JSON row overhead overflowed usize"))?;
     if row_bytes > KEYED_WRITE_MAX_BYTES {
         return Err(invalid_plan(format!(
@@ -509,7 +525,7 @@ fn chunk_count(rows: usize, chunk_rows: usize) -> usize {
 }
 
 impl BranchMergePlan {
-    /// Derive and bound the exact builder-v1 publication recipe plus
+    /// Derive and bound the exact builder-v2 publication recipe plus
     /// conservative local scratch requirements before initialization.
     pub fn preflight(&self) -> BranchMergeResult<FixturePreflight> {
         if self.tables > MAX_RUNNER_TABLES {
@@ -540,7 +556,7 @@ impl BranchMergePlan {
             return Err(unsupported(
                 "fixture.state.compaction_recency",
                 format!(
-                    "builder-v1 optimized fixtures require at least two base fragments per table for productive compaction; rows_per_table={} and chunk_rows={chunk_rows} produce {chunks_per_table}",
+                    "builder-v2 optimized fixtures require at least two base fragments per table for productive compaction; rows_per_table={} and chunk_rows={chunk_rows} produce {chunks_per_table}",
                     self.rows_per_table
                 ),
             ));
@@ -555,7 +571,7 @@ impl BranchMergePlan {
                     Side::Source => delta.source,
                     Side::Target => delta.target,
                 };
-                let publications = usize::from(split.updates > 0)
+                let publications = chunk_count(split.updates, chunk_rows)
                     .checked_add(usize::from(split.deletes > 0))
                     .and_then(|value| value.checked_add(chunk_count(split.inserts, chunk_rows)))
                     .ok_or_else(|| invalid_plan("divergence publication count overflowed"))?;
@@ -568,7 +584,7 @@ impl BranchMergePlan {
         let target_divergence_commits = divergence_commits(Side::Target)?;
         if source_divergence_commits != target_divergence_commits {
             return Err(invalid_plan(format!(
-                "builder v1 requires symmetric branch publication recipes, got source={source_divergence_commits}, target={target_divergence_commits}"
+                "builder v2 requires symmetric branch publication recipes, got source={source_divergence_commits}, target={target_divergence_commits}"
             )));
         }
         let optimize_commits = usize::from(self.compaction_recency == CompactionRecency::Optimized);
@@ -591,24 +607,26 @@ impl BranchMergePlan {
             return Err(unsupported(
                 "fixture.state.history_depth",
                 format!(
-                    "builder-v1 recipe requires exactly {expected_history_depth} reachable commits per frozen branch (genesis 1 + base loads {base_load_commits} + optimize {optimize_commits} + divergence {source_divergence_commits}), but the case declares {}",
+                    "builder-v2 recipe requires exactly {expected_history_depth} reachable commits per frozen branch (genesis 1 + base loads {base_load_commits} + optimize {optimize_commits} + divergence {source_divergence_commits}), but the case declares {}",
                     self.requested_history_depth
                 ),
             ));
         }
 
-        let inserted_rows = self.table_deltas.iter().try_fold(0usize, |total, delta| {
+        let divergent_input_rows = self.table_deltas.iter().try_fold(0usize, |total, delta| {
             total
-                .checked_add(delta.source.inserts)
+                .checked_add(delta.source.updates)
+                .and_then(|value| value.checked_add(delta.target.updates))
+                .and_then(|value| value.checked_add(delta.source.inserts))
                 .and_then(|value| value.checked_add(delta.target.inserts))
-                .ok_or_else(|| invalid_plan("generated insert-row count overflowed"))
+                .ok_or_else(|| invalid_plan("generated divergence-row count overflowed"))
         })?;
         let generated_rows = base_rows
-            .checked_add(inserted_rows)
+            .checked_add(divergent_input_rows)
             .ok_or_else(|| invalid_plan("generated row count overflowed usize"))?;
         let row_bytes = self
             .payload_bytes
-            .checked_add(ROW_OVERHEAD_BYTES)
+            .checked_add(MAX_ROW_OVERHEAD_BYTES)
             .ok_or_else(|| invalid_plan("estimated generated row bytes overflowed usize"))?;
         let estimated_generated_bytes = u64::try_from(generated_rows)
             .ok()
@@ -755,7 +773,7 @@ impl BranchState {
 }
 
 /// Observable facts from a completed, exactly verified fixture build.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FixtureBuildSummary {
     pub base_load_commits: usize,
     pub optimized_user_tables: usize,
@@ -786,7 +804,7 @@ pub async fn initialize_local_fixture(
     let base_load_commits = load_base(&db, plan).await?;
     if u64::try_from(base_load_commits).ok() != Some(preflight.base_load_commits) {
         return Err(fixture_error(format!(
-            "builder-v1 base-load recipe drifted: preflight declared {} publications, execution produced {base_load_commits}",
+            "builder-v2 base-load recipe drifted: preflight declared {} publications, execution produced {base_load_commits}",
             preflight.base_load_commits
         )));
     }
@@ -796,8 +814,10 @@ pub async fn initialize_local_fixture(
                 .optimize()
                 .await
                 .map_err(|error| fixture_error(format!("optimize fixture main branch: {error}")))?;
-            for table in 0..plan.tables {
-                let key = table_key(table);
+            let intended_keys = (0..plan.node_tables())
+                .map(node_table_key)
+                .chain((0..plan.edge_tables()).map(edge_table_key));
+            for key in intended_keys {
                 let outcome = outcomes
                     .iter()
                     .find(|outcome| outcome.type_key == key)
@@ -859,7 +879,7 @@ pub async fn initialize_local_fixture(
         return Err(unsupported(
             "fixture.state.history_depth",
             format!(
-                "requested exactly {} reachable commits per branch, but deterministic construction produced {source_history_depth} on {SOURCE_BRANCH} and {target_history_depth} on {TARGET_BRANCH}; builder v1 does not silently pad or squash history — declare the observed depth or add an explicit history recipe",
+                "requested exactly {} reachable commits per branch, but deterministic construction produced {source_history_depth} on {SOURCE_BRANCH} and {target_history_depth} on {TARGET_BRANCH}; builder v2 does not silently pad or squash history — declare the observed depth or revise the versioned deterministic builder contract",
                 plan.requested_history_depth
             ),
         ));
@@ -879,10 +899,12 @@ pub async fn initialize_local_fixture(
 /// One iteration reads `main`, [`SOURCE_BRANCH`], and [`TARGET_BRANCH`] in that
 /// order. For each branch it consumes the reachable commit listing, resolves
 /// one coherent snapshot, then fully consumes `id`, `name`, `cohort`, `val`,
-/// and `payload` for every declared diverged table. Scan batches use the same
-/// payload-derived row bound as fixture generation. The program performs no
-/// writes; `reopened-after-program` callers drop and reopen the handle only
-/// after it returns.
+/// and `payload` for every declared diverged edge table. Scan batches use the same
+/// payload-derived row bound as fixture generation. It scans every diverged
+/// edge plus the union of those edges' endpoint node tables, matching the
+/// validation read set of the measured merge. The program performs no writes;
+/// `reopened-after-program` callers drop and reopen the handle only after it
+/// returns.
 pub async fn warm_read_set(
     db: &Omnigraph,
     plan: &BranchMergePlan,
@@ -916,18 +938,37 @@ pub async fn warm_read_set(
                     ))
                 })?;
             let mut branch_rows = 0u64;
+            let mut endpoint_nodes = vec![false; plan.node_tables()];
             for table in 0..plan.diverged_tables {
-                let dataset = snapshot
-                    .open_dataset(&table_key(table))
-                    .await
-                    .map_err(|error| {
-                        fixture_error(format!(
-                            "warm-up iteration {iteration}: open table {table} on {branch}: {error}"
-                        ))
-                    })?;
+                endpoint_nodes[table % plan.node_tables()] = true;
+                endpoint_nodes[(table + 1) % plan.node_tables()] = true;
+            }
+            let mut read_set = endpoint_nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, included)| **included)
+                .map(|(table, _)| {
+                    (
+                        node_table_key(table),
+                        &["id", "name", "cohort", "val", "payload"][..],
+                    )
+                })
+                .collect::<Vec<_>>();
+            read_set.extend((0..plan.diverged_tables).map(|table| {
+                (
+                    edge_table_key(table),
+                    &["id", "src", "dst", "cohort", "val", "payload"][..],
+                )
+            }));
+            for (table_key, projection) in read_set {
+                let dataset = snapshot.open_dataset(&table_key).await.map_err(|error| {
+                    fixture_error(format!(
+                        "warm-up iteration {iteration}: open {table_key} on {branch}: {error}"
+                    ))
+                })?;
                 let mut scanner = dataset.scan();
                 scanner
-                    .project(&["id", "name", "cohort", "val", "payload"])?
+                    .project(projection)?
                     .batch_size(batch_rows)
                     .batch_size_bytes(WARM_SCAN_TARGET_BYTES)
                     .strict_batch_size(true);
@@ -1030,12 +1071,25 @@ pub struct VerificationSummary {
 }
 
 fn schema_source(tables: usize) -> String {
+    debug_assert!(tables >= 2 && tables.is_multiple_of(2));
+    let node_tables = tables / 2;
+    let edge_tables = tables / 2;
     let mut source = String::new();
-    for table in 0..tables {
+    for table in 0..node_tables {
         writeln!(
             source,
             "node {} {{\n    name: String @key\n    cohort: String?\n    val: I32?\n    payload: String?\n}}\n",
-            type_name(table)
+            node_type_name(table)
+        )
+        .expect("writing to String cannot fail");
+    }
+    for table in 0..edge_tables {
+        writeln!(
+            source,
+            "edge {}: {} -> {} {{\n    cohort: String?\n    val: I32?\n    payload: String?\n}}\n",
+            edge_type_name(table),
+            node_type_name(table % node_tables),
+            node_type_name((table + 1) % node_tables),
         )
         .expect("writing to String cannot fail");
     }
@@ -1045,12 +1099,7 @@ fn schema_source(tables: usize) -> String {
 fn mutation_queries(diverged_tables: usize) -> String {
     let mut source = String::new();
     for table in 0..diverged_tables {
-        let ty = type_name(table);
-        writeln!(
-            source,
-            "query upd_{table}($v: I32, $c: String) {{\n    update {ty} set {{ val: $v }} where cohort = $c\n}}\n"
-        )
-        .expect("writing to String cannot fail");
+        let ty = edge_type_name(table);
         writeln!(
             source,
             "query del_{table}($c: String) {{\n    delete {ty} where cohort = $c\n}}\n"
@@ -1060,20 +1109,32 @@ fn mutation_queries(diverged_tables: usize) -> String {
     source
 }
 
-fn type_name(table: usize) -> String {
-    format!("BenchT{table:03}")
+fn node_type_name(table: usize) -> String {
+    format!("BenchN{table:03}")
 }
 
-fn table_key(table: usize) -> String {
-    format!("node:{}", type_name(table))
+fn edge_type_name(table: usize) -> String {
+    format!("BenchE{table:03}")
 }
 
-fn base_name(table: usize, row: usize) -> String {
-    format!("t{table:03}_r{row:07}")
+fn node_table_key(table: usize) -> String {
+    format!("node:{}", node_type_name(table))
 }
 
-fn insert_name(side: Side, table: usize, row: usize) -> String {
-    format!("{}_t{table:03}_n{row:07}", side.tag())
+fn edge_table_key(table: usize) -> String {
+    format!("edge:{}", edge_type_name(table))
+}
+
+fn node_name(table: usize, row: usize) -> String {
+    format!("n{table:03}_r{row:07}")
+}
+
+fn base_edge_id(table: usize, row: usize) -> String {
+    format!("e{table:03}_r{row:07}")
+}
+
+fn insert_edge_id(side: Side, table: usize, row: usize) -> String {
+    format!("{}_e{table:03}_n{row:07}", side.tag())
 }
 
 fn jsonl_node_row(ty: &str, name: &str, cohort: &str, val: i32, payload: &str) -> String {
@@ -1089,12 +1150,44 @@ fn jsonl_node_row(ty: &str, name: &str, cohort: &str, val: i32, payload: &str) -
     .to_string()
 }
 
+fn jsonl_edge_row(
+    ty: &str,
+    id: &str,
+    from: &str,
+    to: &str,
+    cohort: &str,
+    val: i32,
+    payload: &str,
+) -> String {
+    serde_json::json!({
+        "edge": ty,
+        "from": from,
+        "to": to,
+        "data": {
+            "id": id,
+            "cohort": cohort,
+            "val": val,
+            "payload": payload,
+        }
+    })
+    .to_string()
+}
+
+fn edge_endpoints(plan: &BranchMergePlan, table: usize, row: usize) -> (String, String) {
+    let nodes = plan.node_tables();
+    let ordinal = row % plan.rows_per_table;
+    (
+        node_name(table % nodes, ordinal),
+        node_name((table + 1) % nodes, ordinal),
+    )
+}
+
 async fn load_base(db: &Omnigraph, plan: &BranchMergePlan) -> BranchMergeResult<usize> {
     let payload = "x".repeat(plan.payload_bytes);
     let chunk_rows = load_chunk_rows(plan.payload_bytes)?;
     let mut commits = 0usize;
-    for table in 0..plan.tables {
-        let ty = type_name(table);
+    for table in 0..plan.node_tables() {
+        let ty = node_type_name(table);
         let mut start = 0usize;
         while start < plan.rows_per_table {
             let end = start.saturating_add(chunk_rows).min(plan.rows_per_table);
@@ -1102,12 +1195,47 @@ async fn load_base(db: &Omnigraph, plan: &BranchMergePlan) -> BranchMergeResult<
             for row in start..end {
                 let val = i32::try_from(row).map_err(|_| {
                     invalid_plan(format!(
-                        "base row ordinal {row} cannot be represented by builder v1's I32 val"
+                        "base node ordinal {row} cannot be represented by builder v2's I32 val"
                     ))
                 })?;
                 chunk.push_str(&jsonl_node_row(
                     &ty,
-                    &base_name(table, row),
+                    &node_name(table, row),
+                    "keep",
+                    val,
+                    &payload,
+                ));
+                chunk.push('\n');
+            }
+            db.load(MAIN_BRANCH, &chunk, LoadMode::Append)
+                .await
+                .map_err(|error| {
+                    fixture_error(format!(
+                        "load base node table {table} rows {start}..{end}: {error}"
+                    ))
+                })?;
+            commits += 1;
+            start = end;
+        }
+    }
+    for table in 0..plan.edge_tables() {
+        let ty = edge_type_name(table);
+        let mut start = 0usize;
+        while start < plan.rows_per_table {
+            let end = start.saturating_add(chunk_rows).min(plan.rows_per_table);
+            let mut chunk = String::new();
+            for row in start..end {
+                let val = i32::try_from(row).map_err(|_| {
+                    invalid_plan(format!(
+                        "base edge ordinal {row} cannot be represented by builder v2's I32 val"
+                    ))
+                })?;
+                let (from, to) = edge_endpoints(plan, table, row);
+                chunk.push_str(&jsonl_edge_row(
+                    &ty,
+                    &base_edge_id(table, row),
+                    &from,
+                    &to,
                     plan.base_cohort(table, row).label(),
                     val,
                     &payload,
@@ -1118,7 +1246,7 @@ async fn load_base(db: &Omnigraph, plan: &BranchMergePlan) -> BranchMergeResult<
                 .await
                 .map_err(|error| {
                     fixture_error(format!(
-                        "load base table {table} rows {start}..{end}: {error}"
+                        "load base edge table {table} rows {start}..{end}: {error}"
                     ))
                 })?;
             commits += 1;
@@ -1150,6 +1278,8 @@ async fn diverge(
     plan: &BranchMergePlan,
     queries: &str,
 ) -> BranchMergeResult<()> {
+    let base_payload = "x".repeat(plan.payload_bytes);
+    let chunk_rows = load_chunk_rows(plan.payload_bytes)?;
     for (table, delta) in plan.table_deltas.iter().enumerate() {
         let split = match side {
             Side::Source => delta.source,
@@ -1160,17 +1290,43 @@ async fn diverge(
             Side::Target => (&plan.target_update_cohort, &plan.target_delete_cohort),
         };
         if split.updates > 0 {
-            let mut params = ParamMap::new();
-            params.insert("v".to_string(), Literal::Integer(i64::from(UPDATE_VALUE)));
-            params.insert("c".to_string(), Literal::String(update_cohort.clone()));
-            db.mutate(branch, queries, &format!("upd_{table}"), &params)
-                .await
-                .map_err(|error| {
-                    fixture_error(format!(
-                        "apply {} update to table {table} on {branch}: {error}",
-                        side.tag()
-                    ))
-                })?;
+            // The public mutation grammar intentionally refuses edge updates.
+            // A Merge load with the same explicit edge id is the supported
+            // keyed replacement path, and produces the same ordinary table
+            // history the measured branch merge consumes.
+            let start = match side {
+                Side::Source => 0,
+                Side::Target => delta.source.updates + delta.source.deletes,
+            };
+            let update_end = start + split.updates;
+            let ty = edge_type_name(table);
+            let mut chunk_start = start;
+            while chunk_start < update_end {
+                let chunk_end = chunk_start.saturating_add(chunk_rows).min(update_end);
+                let mut chunk = String::new();
+                for row in chunk_start..chunk_end {
+                    let (from, to) = edge_endpoints(plan, table, row);
+                    chunk.push_str(&jsonl_edge_row(
+                        &ty,
+                        &base_edge_id(table, row),
+                        &from,
+                        &to,
+                        update_cohort,
+                        UPDATE_VALUE,
+                        &base_payload,
+                    ));
+                    chunk.push('\n');
+                }
+                db.load(branch, &chunk, LoadMode::Merge)
+                    .await
+                    .map_err(|error| {
+                        fixture_error(format!(
+                            "apply {} Merge update to edge table {table} rows {chunk_start}..{chunk_end} on {branch}: {error}",
+                            side.tag()
+                        ))
+                    })?;
+                chunk_start = chunk_end;
+            }
         }
         if split.deletes > 0 {
             let mut params = ParamMap::new();
@@ -1179,7 +1335,7 @@ async fn diverge(
                 .await
                 .map_err(|error| {
                     fixture_error(format!(
-                        "apply {} delete to table {table} on {branch}: {error}",
+                        "apply {} delete to edge table {table} on {branch}: {error}",
                         side.tag()
                     ))
                 })?;
@@ -1187,13 +1343,12 @@ async fn diverge(
     }
 
     let payload = "y".repeat(plan.payload_bytes);
-    let chunk_rows = load_chunk_rows(plan.payload_bytes)?;
     for (table, delta) in plan.table_deltas.iter().enumerate() {
         let inserts = match side {
             Side::Source => delta.source.inserts,
             Side::Target => delta.target.inserts,
         };
-        let ty = type_name(table);
+        let ty = edge_type_name(table);
         let mut start = 0usize;
         while start < inserts {
             let end = start.saturating_add(chunk_rows).min(inserts);
@@ -1201,12 +1356,15 @@ async fn diverge(
             for row in start..end {
                 let val = i32::try_from(row).map_err(|_| {
                     invalid_plan(format!(
-                        "insert ordinal {row} cannot be represented by builder v1's I32 val"
+                        "edge insert ordinal {row} cannot be represented by builder v2's I32 val"
                     ))
                 })?;
-                chunk.push_str(&jsonl_node_row(
+                let (from, to) = edge_endpoints(plan, table, row);
+                chunk.push_str(&jsonl_edge_row(
                     &ty,
-                    &insert_name(side, table, row),
+                    &insert_edge_id(side, table, row),
+                    &from,
+                    &to,
                     NEW_COHORT,
                     val,
                     &payload,
@@ -1217,7 +1375,7 @@ async fn diverge(
                 .await
                 .map_err(|error| {
                     fixture_error(format!(
-                        "load {} inserts into table {table} rows {start}..{end} on {branch}: {error}",
+                        "load {} inserts into edge table {table} rows {start}..{end} on {branch}: {error}",
                         side.tag()
                     ))
                 })?;
@@ -1240,15 +1398,44 @@ async fn verify_branch(
     let mut total_rows = 0u64;
     let base_payload = "x".repeat(plan.payload_bytes);
     let insert_payload = "y".repeat(plan.payload_bytes);
-    for table in 0..plan.tables {
+    for table in 0..plan.node_tables() {
         let dataset = snapshot
-            .open_dataset(&table_key(table))
+            .open_dataset(&node_table_key(table))
             .await
             .map_err(|error| {
-                verification_error(format!("open table {table} on {branch}: {error}"))
+                verification_error(format!("open node table {table} on {branch}: {error}"))
             })?;
         let mut scanner = dataset.scan();
         scanner.project(&["id", "name", "cohort", "val", "payload"])?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut seen_base = SeenBits::new(plan.rows_per_table)?;
+        let mut actual_rows = 0usize;
+        while let Some(batch) = stream.try_next().await? {
+            verify_node_batch(&batch, branch, table, plan, &base_payload, &mut seen_base)?;
+            actual_rows = actual_rows.checked_add(batch.num_rows()).ok_or_else(|| {
+                verification_error(format!(
+                    "row count overflow on node table {table} of {branch}"
+                ))
+            })?;
+        }
+        if actual_rows != plan.rows_per_table {
+            return Err(verification_error(format!(
+                "node table {table} on {branch} has {actual_rows} exact-valid rows, expected {}; at least one expected key is missing",
+                plan.rows_per_table
+            )));
+        }
+        total_rows = checked_add_verified_rows(total_rows, actual_rows, "node", table)?;
+    }
+
+    for table in 0..plan.edge_tables() {
+        let dataset = snapshot
+            .open_dataset(&edge_table_key(table))
+            .await
+            .map_err(|error| {
+                verification_error(format!("open edge table {table} on {branch}: {error}"))
+            })?;
+        let mut scanner = dataset.scan();
+        scanner.project(&["id", "src", "dst", "cohort", "val", "payload"])?;
         let mut stream = scanner.try_into_stream().await?;
         let mut seen_base = SeenBits::new(plan.rows_per_table)?;
         let delta = plan.table_deltas.get(table).copied().unwrap_or(TableDelta {
@@ -1259,7 +1446,7 @@ async fn verify_branch(
         let mut seen_target_inserts = SeenBits::new(delta.target.inserts)?;
         let mut actual_rows = 0usize;
         while let Some(batch) = stream.try_next().await? {
-            verify_batch(
+            verify_edge_batch(
                 &batch,
                 branch,
                 table,
@@ -1276,17 +1463,13 @@ async fn verify_branch(
             })?;
         }
 
-        let expected_rows = expected_table_rows(plan, table, state)?;
+        let expected_rows = expected_edge_rows(plan, table, state)?;
         if actual_rows != expected_rows {
             return Err(verification_error(format!(
-                "table {table} on {branch} has {actual_rows} exact-valid rows, expected {expected_rows}; at least one expected key is missing"
+                "edge table {table} on {branch} has {actual_rows} exact-valid rows, expected {expected_rows}; at least one expected id is missing"
             )));
         }
-        total_rows = total_rows
-            .checked_add(u64::try_from(actual_rows).map_err(|_| {
-                verification_error(format!("row count does not fit u64 on table {table}"))
-            })?)
-            .ok_or_else(|| verification_error("verified row total overflowed u64"))?;
+        total_rows = checked_add_verified_rows(total_rows, actual_rows, "edge", table)?;
     }
     Ok(VerificationSummary {
         branch: branch.to_string(),
@@ -1295,8 +1478,73 @@ async fn verify_branch(
     })
 }
 
+fn checked_add_verified_rows(
+    total: u64,
+    rows: usize,
+    kind: &str,
+    table: usize,
+) -> BranchMergeResult<u64> {
+    total
+        .checked_add(u64::try_from(rows).map_err(|_| {
+            verification_error(format!(
+                "row count does not fit u64 on {kind} table {table}"
+            ))
+        })?)
+        .ok_or_else(|| verification_error("verified row total overflowed u64"))
+}
+
+fn verify_node_batch(
+    batch: &RecordBatch,
+    branch: &str,
+    table: usize,
+    plan: &BranchMergePlan,
+    base_payload: &str,
+    seen_base: &mut SeenBits,
+) -> BranchMergeResult<()> {
+    let id = required_column(batch, "id", branch, table)?;
+    let name = required_column(batch, "name", branch, table)?;
+    let cohort = required_column(batch, "cohort", branch, table)?;
+    let val = required_column(batch, "val", branch, table)?;
+    let payload = required_column(batch, "payload", branch, table)?;
+    let val = required_i32(val.as_ref(), branch, table)?;
+    for row in 0..batch.num_rows() {
+        let id = required_string(id.as_ref(), row, "id", branch, table)?;
+        let name = required_string(name.as_ref(), row, "name", branch, table)?;
+        let cohort = required_string(cohort.as_ref(), row, "cohort", branch, table)?;
+        let payload = required_string(payload.as_ref(), row, "payload", branch, table)?;
+        let value = required_i32_value(val, row, branch, table)?;
+        let Some(index) = parse_node_name(name, table) else {
+            return Err(verification_error(format!(
+                "node table {table} on {branch}: unknown key {name:?}"
+            )));
+        };
+        if id != name || index >= plan.rows_per_table || !seen_base.insert(index) {
+            return Err(verification_error(format!(
+                "node table {table} on {branch}: invalid, duplicate, or out-of-range id/name {id:?}/{name:?}"
+            )));
+        }
+        let expected_val = i32::try_from(index).map_err(|_| {
+            verification_error(format!(
+                "node table {table}: ordinal {index} does not fit I32"
+            ))
+        })?;
+        verify_values(
+            branch,
+            table,
+            name,
+            cohort,
+            "keep",
+            value,
+            expected_val,
+            payload,
+            base_payload,
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-fn verify_batch(
+fn verify_edge_batch(
     batch: &RecordBatch,
     branch: &str,
     table: usize,
@@ -1309,43 +1557,30 @@ fn verify_batch(
     seen_target_inserts: &mut SeenBits,
 ) -> BranchMergeResult<()> {
     let id = required_column(batch, "id", branch, table)?;
-    let name = required_column(batch, "name", branch, table)?;
+    let src = required_column(batch, "src", branch, table)?;
+    let dst = required_column(batch, "dst", branch, table)?;
     let cohort = required_column(batch, "cohort", branch, table)?;
     let val = required_column(batch, "val", branch, table)?;
     let payload = required_column(batch, "payload", branch, table)?;
-    let val = val.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-        verification_error(format!(
-            "table {table} on {branch} has {:?} val, expected non-null Int32",
-            val.data_type()
-        ))
-    })?;
+    let val = required_i32(val.as_ref(), branch, table)?;
 
     for row in 0..batch.num_rows() {
         let id = required_string(id.as_ref(), row, "id", branch, table)?;
-        let name = required_string(name.as_ref(), row, "name", branch, table)?;
+        let src = required_string(src.as_ref(), row, "src", branch, table)?;
+        let dst = required_string(dst.as_ref(), row, "dst", branch, table)?;
         let cohort = required_string(cohort.as_ref(), row, "cohort", branch, table)?;
         let payload = required_string(payload.as_ref(), row, "payload", branch, table)?;
-        if val.is_null(row) {
-            return Err(verification_error(format!(
-                "table {table} on {branch}, row {row}: val is null"
-            )));
-        }
-        let val = val.value(row);
-        if id != name {
-            return Err(verification_error(format!(
-                "table {table} on {branch}: physical id {id:?} differs from scalar @key name {name:?}"
-            )));
-        }
+        let val = required_i32_value(val, row, branch, table)?;
 
-        if let Some(index) = parse_base_name(name, table) {
+        if let Some(index) = parse_base_edge_id(id, table) {
             if index >= plan.rows_per_table {
                 return Err(verification_error(format!(
-                    "table {table} on {branch}: base key {name:?} has out-of-range ordinal {index}"
+                    "edge table {table} on {branch}: base id {id:?} has out-of-range ordinal {index}"
                 )));
             }
             if !seen_base.insert(index) {
                 return Err(verification_error(format!(
-                    "table {table} on {branch}: duplicate base key {name:?}"
+                    "edge table {table} on {branch}: duplicate base id {id:?}"
                 )));
             }
             let base_cohort = plan.base_cohort(table, index);
@@ -1356,7 +1591,7 @@ fn verify_batch(
             };
             if !present {
                 return Err(verification_error(format!(
-                    "table {table} on {branch}: deleted base key {name:?} is still present"
+                    "edge table {table} on {branch}: deleted base id {id:?} is still present"
                 )));
             }
             let expected_val = match base_cohort {
@@ -1364,14 +1599,14 @@ fn verify_batch(
                 BaseCohort::TargetUpdate(_) if state.has_target_effects() => UPDATE_VALUE,
                 _ => i32::try_from(index).map_err(|_| {
                     verification_error(format!(
-                        "table {table}: expected base ordinal {index} does not fit I32"
+                        "edge table {table}: expected base ordinal {index} does not fit I32"
                     ))
                 })?,
             };
             verify_values(
                 branch,
                 table,
-                name,
+                id,
                 cohort,
                 base_cohort.label(),
                 val,
@@ -1379,14 +1614,15 @@ fn verify_batch(
                 payload,
                 base_payload,
             )?;
+            verify_edge_endpoints(branch, table, id, src, dst, plan, index)?;
             continue;
         }
 
-        if let Some(index) = parse_insert_name(name, Side::Source, table) {
+        if let Some(index) = parse_insert_edge_id(id, Side::Source, table) {
             verify_insert(
                 branch,
                 table,
-                name,
+                id,
                 index,
                 state.has_source_effects(),
                 delta_for(plan, table).source.inserts,
@@ -1396,13 +1632,14 @@ fn verify_batch(
                 insert_payload,
                 seen_source_inserts,
             )?;
+            verify_edge_endpoints(branch, table, id, src, dst, plan, index)?;
             continue;
         }
-        if let Some(index) = parse_insert_name(name, Side::Target, table) {
+        if let Some(index) = parse_insert_edge_id(id, Side::Target, table) {
             verify_insert(
                 branch,
                 table,
-                name,
+                id,
                 index,
                 state.has_target_effects(),
                 delta_for(plan, table).target.inserts,
@@ -1412,13 +1649,59 @@ fn verify_batch(
                 insert_payload,
                 seen_target_inserts,
             )?;
+            verify_edge_endpoints(branch, table, id, src, dst, plan, index)?;
             continue;
         }
         return Err(verification_error(format!(
-            "table {table} on {branch}: unknown key {name:?}"
+            "edge table {table} on {branch}: unknown id {id:?}"
         )));
     }
     Ok(())
+}
+
+fn verify_edge_endpoints(
+    branch: &str,
+    table: usize,
+    id: &str,
+    src: &str,
+    dst: &str,
+    plan: &BranchMergePlan,
+    row: usize,
+) -> BranchMergeResult<()> {
+    let (expected_src, expected_dst) = edge_endpoints(plan, table, row);
+    if src != expected_src || dst != expected_dst {
+        return Err(verification_error(format!(
+            "edge table {table} on {branch}, id {id:?}: endpoints {src:?}->{dst:?}, expected {expected_src:?}->{expected_dst:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn required_i32<'a>(
+    array: &'a dyn Array,
+    branch: &str,
+    table: usize,
+) -> BranchMergeResult<&'a Int32Array> {
+    array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+        verification_error(format!(
+            "table {table} on {branch} has {:?} val, expected non-null Int32",
+            array.data_type()
+        ))
+    })
+}
+
+fn required_i32_value(
+    array: &Int32Array,
+    row: usize,
+    branch: &str,
+    table: usize,
+) -> BranchMergeResult<i32> {
+    if array.is_null(row) {
+        return Err(verification_error(format!(
+            "table {table} on {branch}, row {row}: val is null"
+        )));
+    }
+    Ok(array.value(row))
 }
 
 fn required_column<'a>(
@@ -1525,7 +1808,7 @@ fn verify_insert(
     )
 }
 
-fn expected_table_rows(
+fn expected_edge_rows(
     plan: &BranchMergePlan,
     table: usize,
     state: BranchState,
@@ -1558,20 +1841,28 @@ fn delta_for(plan: &BranchMergePlan, table: usize) -> TableDelta {
     })
 }
 
-fn parse_base_name(name: &str, table: usize) -> Option<usize> {
-    let remainder = name.strip_prefix('t')?;
+fn parse_node_name(name: &str, table: usize) -> Option<usize> {
+    let remainder = name.strip_prefix('n')?;
     let (found_table, row) = remainder.split_once("_r")?;
     let found_table = found_table.parse::<usize>().ok()?;
     let row = row.parse::<usize>().ok()?;
-    (found_table == table && base_name(table, row) == name).then_some(row)
+    (found_table == table && node_name(table, row) == name).then_some(row)
 }
 
-fn parse_insert_name(name: &str, side: Side, table: usize) -> Option<usize> {
-    let remainder = name.strip_prefix(side.tag())?.strip_prefix("_t")?;
+fn parse_base_edge_id(id: &str, table: usize) -> Option<usize> {
+    let remainder = id.strip_prefix('e')?;
+    let (found_table, row) = remainder.split_once("_r")?;
+    let found_table = found_table.parse::<usize>().ok()?;
+    let row = row.parse::<usize>().ok()?;
+    (found_table == table && base_edge_id(table, row) == id).then_some(row)
+}
+
+fn parse_insert_edge_id(id: &str, side: Side, table: usize) -> Option<usize> {
+    let remainder = id.strip_prefix(side.tag())?.strip_prefix("_e")?;
     let (found_table, row) = remainder.split_once("_n")?;
     let found_table = found_table.parse::<usize>().ok()?;
     let row = row.parse::<usize>().ok()?;
-    (found_table == table && insert_name(side, table, row) == name).then_some(row)
+    (found_table == table && insert_edge_id(side, table, row) == id).then_some(row)
 }
 
 #[derive(Debug)]
@@ -1623,7 +1914,7 @@ mod tests {
             })
             .collect();
         BranchMergePlan {
-            tables: diverged_tables + 2,
+            tables: diverged_tables * 2,
             rows_per_table: rows,
             payload_bytes: 64,
             diverged_tables,
@@ -1731,7 +2022,7 @@ mod tests {
                 let error = require_update_bearing_tables(&deltas, minimum - 1, tables)
                     .expect_err("an update-free declared table must be refused");
                 assert!(error.to_string().contains(&format!(
-                    "{tables} diverged tables require delta_rows_per_side >= {minimum}"
+                    "{tables} diverged edge tables require delta_rows_per_side >= {minimum}"
                 )));
             }
             let exact = split_delta(minimum).unwrap();
@@ -1783,37 +2074,88 @@ mod tests {
     #[test]
     fn expected_counts_cover_source_target_and_merged_states() {
         let plan = plan(1_000, 4, 50);
-        for table in 0..plan.tables {
+        for table in 0..plan.edge_tables() {
             let delta = delta_for(&plan, table);
             assert_eq!(
-                expected_table_rows(&plan, table, BranchState::Source).unwrap(),
+                expected_edge_rows(&plan, table, BranchState::Source).unwrap(),
                 1_000 - delta.source.deletes + delta.source.inserts
             );
             assert_eq!(
-                expected_table_rows(&plan, table, BranchState::Target).unwrap(),
+                expected_edge_rows(&plan, table, BranchState::Target).unwrap(),
                 1_000 - delta.target.deletes + delta.target.inserts
             );
             assert_eq!(
-                expected_table_rows(&plan, table, BranchState::Merged).unwrap(),
+                expected_edge_rows(&plan, table, BranchState::Merged).unwrap(),
                 1_000 - delta.source.deletes - delta.target.deletes
                     + delta.source.inserts
                     + delta.target.inserts
             );
         }
+        assert_eq!(plan.expected_merged_rows().unwrap(), 7_998);
     }
 
     #[test]
     fn key_parsers_accept_only_canonical_names_for_the_current_table() {
-        assert_eq!(parse_base_name("t003_r0000042", 3), Some(42));
-        assert_eq!(parse_base_name("t3_r42", 3), None);
-        assert_eq!(parse_base_name("t003_r0000042", 2), None);
+        assert_eq!(parse_node_name("n003_r0000042", 3), Some(42));
+        assert_eq!(parse_node_name("n3_r42", 3), None);
+        assert_eq!(parse_base_edge_id("e003_r0000042", 3), Some(42));
+        assert_eq!(parse_base_edge_id("e003_r0000042", 2), None);
         assert_eq!(
-            parse_insert_name("src_t003_n0000042", Side::Source, 3),
+            parse_insert_edge_id("src_e003_n0000042", Side::Source, 3),
             Some(42)
         );
         assert_eq!(
-            parse_insert_name("tgt_t003_n0000042", Side::Source, 3),
+            parse_insert_edge_id("tgt_e003_n0000042", Side::Source, 3),
             None
         );
+    }
+
+    #[test]
+    fn builder_v2_schema_is_balanced_and_ring_endpoints_are_uniform() {
+        let schema = schema_source(8);
+        assert_eq!(schema.matches("node BenchN").count(), 4);
+        assert_eq!(schema.matches("edge BenchE").count(), 4);
+        assert!(schema.contains("edge BenchE003: BenchN003 -> BenchN000"));
+
+        let plan = plan(100, 4, 50);
+        assert_eq!(
+            edge_endpoints(&plan, 3, 42),
+            (node_name(3, 42), node_name(0, 42))
+        );
+    }
+
+    #[tokio::test]
+    async fn real_node_edge_fixture_merges_and_verifies_two_table_walks() {
+        use omnigraph::db::MergeOutcome;
+        use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+
+        let mut plan = plan(16, 2, 6);
+        plan.compaction_recency = CompactionRecency::NotOptimized;
+        plan.requested_history_depth = 11;
+        let directory = tempfile::tempdir().unwrap();
+        let uri = directory.path().to_str().unwrap();
+        let built = initialize_local_fixture(uri, &plan).await.unwrap();
+        assert_eq!(built.base_load_commits, 4);
+        assert_eq!(built.source_history_depth, 11);
+        assert_eq!(built.target_history_depth, 11);
+
+        let db = Omnigraph::open(uri).await.unwrap();
+        let protected = capture_protected_branch_heads(&db).await.unwrap();
+        let probes = MergeWriteProbes::default();
+        let outcome = with_merge_write_probes(
+            probes.clone(),
+            db.branch_merge(SOURCE_BRANCH, TARGET_BRANCH),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, MergeOutcome::Merged);
+        assert_eq!(probes.table_walk_interval_count(), 2);
+
+        let verified = verify_merged_graph(&db, &plan, &protected).await.unwrap();
+        assert_eq!(verified.target.tables, 4);
+        assert_eq!(verified.target.rows, 64);
+        assert!(verified.source_exact_content);
+        assert!(verified.main_exact_content);
+        assert!(verified.protected_heads_unchanged);
     }
 }

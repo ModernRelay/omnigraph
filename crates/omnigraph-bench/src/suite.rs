@@ -377,9 +377,9 @@ version: 1
 id: base-case
 scenario: branch-merge-v1
 fixture:
-  builder: { kind: synthetic-branch-merge, version: 1, seed: 0 }
+  builder: { kind: synthetic-branch-merge, version: 2, seed: 0 }
   data: { provenance: synthetic, tables: 8, rows_per_table: 1000, payload_bytes: 64, column_shape: scalars, topology_skew: uniform }
-  state: { aging: bulk-loaded, indexes: [], deletion_history: none, compaction_recency: not-optimized, history_depth: 1 }
+  state: { aging: bulk-loaded, indexes: [], deletion_history: none, compaction_recency: not-optimized, history_depth: 21 }
 workload: { delta_rows_per_side: 50, diverged_tables: 4, arrival: unscheduled-single-shot, clients: 1, read_write_mix: write-heavy, contention: distinct-key }
 environment:
   backend: { kind: local-fs, filesystem: apfs, storage_class: nvme-ssd }

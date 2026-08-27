@@ -291,18 +291,23 @@ fn stage_for_error(error: &RunnerError) -> WorkerStageV1 {
         "release_build_required"
         | "worker_attestation_failed"
         | "worker_case_invalid"
-        | "worker_identity_mismatch" => WorkerStageV1::Bootstrap,
+        | "worker_identity_mismatch"
+        | "unsupported_runner_axis" => WorkerStageV1::Bootstrap,
         "pre_measurement_write_detected"
-        | "pre_measurement_state_mismatch"
+        | "pre_measurement_shape_mismatch"
         | "cache_preparation_failed"
         | "protected_head_capture_failed"
         | "unsupported_cache_condition"
         | "engine_open_failed"
-        | "storage_open_failed" => WorkerStageV1::Prepare,
-        "merge_failed" | "merge_deadline_exceeded" | "duration_overflow" => WorkerStageV1::Measure,
-        "verification_failed" | "vacuous_merge" | "missing_table_walk_phase" => {
-            WorkerStageV1::Verify
+        | "storage_open_failed"
+        | "non_utf8_path" => WorkerStageV1::Prepare,
+        "merge_failed" | "merge_deadline_exceeded" | "duration_overflow" | "counter_regression" => {
+            WorkerStageV1::Measure
         }
+        "verification_failed"
+        | "vacuous_merge"
+        | "missing_table_walk_phase"
+        | "interval_overflow" => WorkerStageV1::Verify,
         "worker_protocol_error" | "worker_parent_disconnected" => WorkerStageV1::Protocol,
         _ => WorkerStageV1::Finalize,
     }
@@ -337,6 +342,19 @@ mod tests {
     }
 
     #[test]
+    fn reachable_errors_are_classified_at_their_owning_stage() {
+        for (code, expected) in [
+            ("unsupported_runner_axis", WorkerStageV1::Bootstrap),
+            ("non_utf8_path", WorkerStageV1::Prepare),
+            ("counter_regression", WorkerStageV1::Measure),
+            ("interval_overflow", WorkerStageV1::Verify),
+        ] {
+            let error = RunnerError::new(code, "test failure");
+            assert_eq!(stage_for_error(&error), expected, "{code}");
+        }
+    }
+
+    #[test]
     fn worker_refuses_identity_mismatch_before_opening_a_store() {
         let case: crate::CaseV1 = serde_yaml::from_str(
             r#"
@@ -344,9 +362,9 @@ version: 1
 id: worker-identity-test
 scenario: branch-merge-v1
 fixture:
-  builder: { kind: synthetic-branch-merge, version: 1, seed: 0 }
-  data: { provenance: synthetic, tables: 1, rows_per_table: 12, payload_bytes: 8, column_shape: scalars, topology_skew: uniform }
-  state: { aging: bulk-loaded, indexes: [], deletion_history: none, compaction_recency: not-optimized, history_depth: 5 }
+  builder: { kind: synthetic-branch-merge, version: 2, seed: 0 }
+  data: { provenance: synthetic, tables: 2, rows_per_table: 12, payload_bytes: 8, column_shape: scalars, topology_skew: uniform }
+  state: { aging: bulk-loaded, indexes: [], deletion_history: none, compaction_recency: not-optimized, history_depth: 6 }
 workload: { delta_rows_per_side: 6, diverged_tables: 1, arrival: unscheduled-single-shot, clients: 1, read_write_mix: write-heavy, contention: distinct-key }
 environment:
   backend: { kind: local-fs, filesystem: apfs, storage_class: nvme-ssd }

@@ -100,6 +100,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
         declared_deadline: input.deadline,
         measurement_watchdog,
         started: Instant::now(),
+        reaped: None,
     };
     let Some(stdin) = worker.child.stdin.take() else {
         return worker.kill_error(
@@ -318,6 +319,16 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
             );
         }
     };
+    let supervisor_settled_elapsed_us = duration_us(supervisor_settled_elapsed);
+    if settled_elapsed_us > supervisor_settled_elapsed_us {
+        return worker.kill_error(
+            "measure-protocol",
+            "worker_protocol_error",
+            format!(
+                "worker reported elapsed_us={settled_elapsed_us}, but the parent observed only {supervisor_settled_elapsed_us}us from before Begin through Settled"
+            ),
+        );
+    }
 
     let complete = match worker.receive(auxiliary_deadline) {
         Ok(frame) => frame,
@@ -336,7 +347,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
             return worker.kill_error("verify-protocol", "worker_protocol_error", message);
         }
     };
-    let sample = match complete {
+    let mut sample = match complete {
         ChildFrameV1::Complete {
             protocol_version,
             point_id,
@@ -391,8 +402,8 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
         return worker.kill_error("finalize-protocol", "worker_protocol_error", message);
     }
 
-    let status = match worker.wait_for_exit(auxiliary_deadline) {
-        Ok(status) => status,
+    let child_exit = match worker.wait_for_exit(auxiliary_deadline) {
+        Ok(child_exit) => child_exit,
         Err(message) => {
             return worker.kill_error("exit-timeout", "worker_exit_timeout", message);
         }
@@ -407,12 +418,13 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
             );
         }
     };
-    if !status.success() || !group_gone {
+    if !child_exit.status.success() || !group_gone {
         return worker.kill_error(
             "finalize-exit",
             "worker_exit_failed",
             format!(
-                "worker reported completion but exited with {status}; process_group_gone={group_gone}"
+                "worker reported completion but exited with {}; process_group_gone={group_gone}",
+                child_exit.status
             ),
         );
     }
@@ -446,11 +458,13 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<RepO
             measurement_watchdog,
             worker.started.elapsed(),
             "worker-completed".to_string(),
-            Some(status),
+            Some(&child_exit),
             group_gone,
             capture,
         )));
     }
+
+    sample.peak_rss_bytes = Some(child_exit.peak_rss_bytes);
 
     if let Some(deadline) = input.deadline {
         let deadline_us = duration_us(deadline);
@@ -499,6 +513,14 @@ struct WorkerProcess {
     declared_deadline: Option<Duration>,
     measurement_watchdog: Duration,
     started: Instant,
+    reaped: Option<ReapedChild>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct ReapedChild {
+    status: ExitStatus,
+    peak_rss_bytes: u64,
 }
 
 #[cfg(unix)]
@@ -548,11 +570,17 @@ impl WorkerProcess {
         }
     }
 
-    fn wait_for_exit(&mut self, timeout: Duration) -> Result<ExitStatus, String> {
+    fn wait_for_exit(&mut self, timeout: Duration) -> Result<ReapedChild, String> {
+        if let Some(reaped) = &self.reaped {
+            return Ok(reaped.clone());
+        }
         let started = Instant::now();
         loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
+            match wait4_nonblocking(self.process_group) {
+                Ok(Some(reaped)) => {
+                    self.reaped = Some(reaped.clone());
+                    return Ok(reaped);
+                }
                 Ok(None) if started.elapsed() < timeout => {
                     std::thread::sleep(PROCESS_GROUP_POLL);
                 }
@@ -594,7 +622,7 @@ impl WorkerProcess {
                 self.measurement_watchdog,
                 self.started.elapsed(),
                 "worker-failed".to_string(),
-                status,
+                status.as_ref(),
                 group_gone,
                 capture,
             ));
@@ -632,7 +660,7 @@ impl WorkerProcess {
                 self.measurement_watchdog,
                 self.started.elapsed(),
                 termination,
-                status,
+                status.as_ref(),
                 group_gone,
                 capture,
             )))
@@ -676,7 +704,7 @@ impl WorkerProcess {
 #[cfg(unix)]
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        let child_reaped = matches!(self.child.try_wait(), Ok(Some(_)));
+        let child_reaped = self.reaped.is_some();
         let group_gone = process_group_is_gone(self.process_group).unwrap_or(false);
         if !child_reaped || !group_gone {
             let _ = kill_process_group(self.process_group);
@@ -985,7 +1013,7 @@ fn process_evidence(
     measurement_watchdog: Duration,
     elapsed: Duration,
     termination: String,
-    status: Option<ExitStatus>,
+    child_exit: Option<&ReapedChild>,
     process_group_gone: bool,
     capture: CaptureOutcome,
 ) -> ChildProcessEvidence {
@@ -997,9 +1025,10 @@ fn process_evidence(
         measurement_watchdog_us: duration_us(measurement_watchdog),
         supervisor_elapsed_us: duration_us(elapsed),
         termination,
-        exit_code: status.as_ref().and_then(ExitStatus::code),
-        signal: status.as_ref().and_then(ExitStatusExt::signal),
-        direct_child_reaped: status.is_some(),
+        exit_code: child_exit.and_then(|exit| exit.status.code()),
+        signal: child_exit.and_then(|exit| exit.status.signal()),
+        peak_rss_bytes: child_exit.map(|exit| exit.peak_rss_bytes),
+        direct_child_reaped: child_exit.is_some(),
         process_group_gone,
         stdio_closed_cleanly: capture.threads_stopped
             && capture.stdout_clean_eof
@@ -1008,6 +1037,50 @@ fn process_evidence(
         stderr_truncated: capture.stderr.truncated,
         quarantined_workspace: None,
     }
+}
+
+#[cfg(unix)]
+fn wait4_nonblocking(pid: i32) -> Result<Option<ReapedChild>, String> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut status = 0;
+    let mut usage = std::mem::MaybeUninit::<nix::libc::rusage>::zeroed();
+    loop {
+        // SAFETY: `status` and `usage` point to valid writable storage, and
+        // `pid` is the direct child identifier captured immediately at spawn.
+        let reaped =
+            unsafe { nix::libc::wait4(pid, &mut status, nix::libc::WNOHANG, usage.as_mut_ptr()) };
+        if reaped == 0 {
+            return Ok(None);
+        }
+        if reaped == pid {
+            // SAFETY: a successful `wait4` initialized the rusage output.
+            let usage = unsafe { usage.assume_init() };
+            return Ok(Some(ReapedChild {
+                status: ExitStatus::from_raw(status),
+                peak_rss_bytes: normalized_peak_rss_bytes(&usage),
+            }));
+        }
+        if reaped == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(nix::libc::EINTR) {
+                continue;
+            }
+            return Err(error.to_string());
+        }
+        return Err(format!(
+            "wait4 reaped unexpected process {reaped}; expected {pid}"
+        ));
+    }
+}
+
+#[cfg(unix)]
+fn normalized_peak_rss_bytes(usage: &nix::libc::rusage) -> u64 {
+    let peak = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+    #[cfg(target_os = "macos")]
+    return peak;
+    #[cfg(not(target_os = "macos"))]
+    return peak.saturating_mul(1024);
 }
 
 #[cfg(unix)]
@@ -1077,41 +1150,125 @@ fn validate_sample_admission(
         .filter(|phase| phase.phase == "TableWalk")
         .collect::<Vec<_>>();
 
-    if sample.repetition != input.repetition
-        || sample.elapsed_us != settled_elapsed_us
-        || sample.input_physical_digest_sha256 != input.physical_digest.digest_sha256
-        || sample.outcome != "merged"
-        || sample.route.table_walk_intervals != expected_intervals
-        || table_walk_phases.len() != 1
-        || table_walk_phases[0].interval_count != expected_intervals
-        || sample.verification.branch != TARGET_BRANCH
-        || sample.verification.tables != plan.tables
-        || sample.verification.rows != expected_rows
-        || !sample.verification.exact_content
-        || !sample.verification.source_exact_content
-        || !sample.verification.main_exact_content
-        || !sample.verification.protected_heads_unchanged
-        || sample.logical_store_calls.physical_attempts_observed
-    {
+    let table_walk_interval_counts = table_walk_phases
+        .iter()
+        .map(|phase| phase.interval_count)
+        .collect::<Vec<_>>();
+    let expected_table_walk_interval_counts = vec![expected_intervals];
+    let expected_outcome = "merged".to_string();
+    let expected_branch = TARGET_BRANCH.to_string();
+    let mut mismatches = Vec::new();
+    record_admission_mismatch(
+        &mut mismatches,
+        "repetition",
+        &input.repetition,
+        &sample.repetition,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "elapsed_us",
+        &settled_elapsed_us,
+        &sample.elapsed_us,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "input_physical_digest_sha256",
+        &input.physical_digest.digest_sha256,
+        &sample.input_physical_digest_sha256,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "peak_rss_bytes",
+        &None::<u64>,
+        &sample.peak_rss_bytes,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "outcome",
+        &expected_outcome,
+        &sample.outcome,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "route.table_walk_intervals",
+        &expected_intervals,
+        &sample.route.table_walk_intervals,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "table_walk_phase_interval_counts",
+        &expected_table_walk_interval_counts,
+        &table_walk_interval_counts,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.branch",
+        &expected_branch,
+        &sample.verification.branch,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.tables",
+        &plan.tables,
+        &sample.verification.tables,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.rows",
+        &expected_rows,
+        &sample.verification.rows,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.exact_content",
+        &true,
+        &sample.verification.exact_content,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.source_exact_content",
+        &true,
+        &sample.verification.source_exact_content,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.main_exact_content",
+        &true,
+        &sample.verification.main_exact_content,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.protected_heads_unchanged",
+        &true,
+        &sample.verification.protected_heads_unchanged,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "logical_store_calls.physical_attempts_observed",
+        &false,
+        &sample.logical_store_calls.physical_attempts_observed,
+    );
+    if !mismatches.is_empty() {
         return Err(format!(
-            "worker sample failed parent admission: repetition={} elapsed_us={} digest={} outcome={} table_walk={} table_walk_phases={} verification_branch={} verification_tables={} verification_rows={} exact_target={} exact_source={} exact_main={} protected_heads={} physical_attempts_observed={}",
-            sample.repetition,
-            sample.elapsed_us,
-            sample.input_physical_digest_sha256,
-            sample.outcome,
-            sample.route.table_walk_intervals,
-            table_walk_phases.len(),
-            sample.verification.branch,
-            sample.verification.tables,
-            sample.verification.rows,
-            sample.verification.exact_content,
-            sample.verification.source_exact_content,
-            sample.verification.main_exact_content,
-            sample.verification.protected_heads_unchanged,
-            sample.logical_store_calls.physical_attempts_observed,
+            "worker sample failed parent admission: {}",
+            mismatches.join("; ")
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn record_admission_mismatch<T: std::fmt::Debug + PartialEq>(
+    mismatches: &mut Vec<String>,
+    field: &str,
+    expected: &T,
+    observed: &T,
+) {
+    if expected != observed {
+        mismatches.push(format!(
+            "{field}: expected={expected:?}, observed={observed:?}"
+        ));
+    }
 }
 
 fn duration_us(duration: Duration) -> u64 {
@@ -1205,10 +1362,15 @@ mod tests {
 
     fn worker_build() -> WorkerBuildV1 {
         WorkerBuildV1 {
-            cargo_profile: "release".to_string(),
-            opt_level: "3".to_string(),
+            cargo_profile: "release".into(),
+            opt_level: "3".into(),
             debug_assertions: false,
-            executable_sha256: "d".repeat(64),
+            source_git_commit_sha: Some("1".repeat(40).into_boxed_str()),
+            source_worktree_dirty: Some(false),
+            effective_lance_mem_pool_size: Box::new(
+                crate::runner::EffectiveEnvironmentValue::Unset,
+            ),
+            executable_sha256: "d".repeat(64).into_boxed_str(),
         }
     }
 
@@ -1267,6 +1429,7 @@ mod tests {
             repetition: input.repetition,
             input_physical_digest_sha256: input.physical_digest.digest_sha256.clone(),
             elapsed_us: TEST_ELAPSED_US,
+            peak_rss_bytes: None,
             outcome: "merged".to_string(),
             phases: vec![PhaseObservation {
                 phase: "TableWalk".to_string(),
@@ -1365,6 +1528,7 @@ mod tests {
             .expect("spawned worker failures must carry containment evidence");
         assert_eq!(evidence.stage, expected_stage, "{evidence:?}");
         assert!(evidence.direct_child_reaped, "{evidence:?}");
+        assert!(evidence.peak_rss_bytes.is_some(), "{evidence:?}");
         assert!(evidence.process_group_gone, "{evidence:?}");
         error
     }
@@ -1378,9 +1542,39 @@ mod tests {
         let (_guard, _directory, worker) = worker_script(&body);
         input.worker_executable = worker;
 
-        let observed = supervise_repetition(input).unwrap();
+        let mut observed = supervise_repetition(input).unwrap();
 
+        assert!(observed.peak_rss_bytes.is_some(), "{observed:?}");
+        observed.peak_rss_bytes = None;
         assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn worker_cannot_report_more_elapsed_time_than_the_parent_observed() {
+        let placeholder = PathBuf::from("/placeholder");
+        let mut input = supervision_input(placeholder);
+        let forged = ChildFrameV1::Settled {
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            repetition: input.repetition,
+            elapsed_us: u64::MAX,
+        };
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n{}",
+            emit(&ready_frame(&input)),
+            emit(&forged),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        let error = assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "measure-protocol",
+        );
+        assert!(
+            error.message.contains("the parent observed only"),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -1399,8 +1593,12 @@ mod tests {
 
         let first_thread = std::thread::spawn(move || supervise_repetition(input));
         let second_thread = std::thread::spawn(move || supervise_repetition(second));
-        assert_eq!(first_thread.join().unwrap().unwrap(), expected);
-        assert_eq!(second_thread.join().unwrap().unwrap(), expected);
+        for result in [first_thread.join().unwrap(), second_thread.join().unwrap()] {
+            let mut observed = result.unwrap();
+            assert!(observed.peak_rss_bytes.is_some(), "{observed:?}");
+            observed.peak_rss_bytes = None;
+            assert_eq!(observed, expected);
+        }
 
         let pid_log = PathBuf::from(format!("{}.pids", worker.display()));
         let mut pids = std::fs::read_to_string(pid_log)
@@ -1612,6 +1810,60 @@ mod tests {
             "worker_protocol_error",
             "finalize-protocol",
         );
+    }
+
+    #[test]
+    fn parent_admission_names_every_mismatched_field_and_both_values() {
+        type MutateSample = fn(&mut RepObservation);
+        let cases: &[(&str, MutateSample)] = &[
+            ("repetition", |sample| sample.repetition += 1),
+            ("elapsed_us", |sample| sample.elapsed_us += 1),
+            ("input_physical_digest_sha256", |sample| {
+                sample.input_physical_digest_sha256 = "f".repeat(64);
+            }),
+            ("peak_rss_bytes", |sample| sample.peak_rss_bytes = Some(1)),
+            ("outcome", |sample| sample.outcome = "conflict".to_string()),
+            ("route.table_walk_intervals", |sample| {
+                sample.route.table_walk_intervals += 1;
+            }),
+            ("table_walk_phase_interval_counts", |sample| {
+                sample.phases[0].interval_count += 1;
+            }),
+            ("verification.branch", |sample| {
+                sample.verification.branch = "source".to_string();
+            }),
+            ("verification.tables", |sample| {
+                sample.verification.tables += 1;
+            }),
+            ("verification.rows", |sample| {
+                sample.verification.rows += 1;
+            }),
+            ("verification.exact_content", |sample| {
+                sample.verification.exact_content = false;
+            }),
+            ("verification.source_exact_content", |sample| {
+                sample.verification.source_exact_content = false;
+            }),
+            ("verification.main_exact_content", |sample| {
+                sample.verification.main_exact_content = false;
+            }),
+            ("verification.protected_heads_unchanged", |sample| {
+                sample.verification.protected_heads_unchanged = false;
+            }),
+            ("logical_store_calls.physical_attempts_observed", |sample| {
+                sample.logical_store_calls.physical_attempts_observed = true
+            }),
+        ];
+        let input = supervision_input(PathBuf::from("/unused"));
+
+        for (field, mutate) in cases {
+            let mut sample = valid_sample(&input);
+            mutate(&mut sample);
+            let message = validate_sample_admission(&sample, &input, TEST_ELAPSED_US).unwrap_err();
+            assert!(message.contains(field), "field={field}: {message}");
+            assert!(message.contains("expected="), "field={field}: {message}");
+            assert!(message.contains("observed="), "field={field}: {message}");
+        }
     }
 
     #[test]

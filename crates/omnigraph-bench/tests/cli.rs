@@ -122,7 +122,7 @@ fn suite_plan_resolves_relative_cases_and_supports_selection() {
     // deliberate factor change must update this fixture.
     assert_eq!(
         plan["runs"][0]["point_id"],
-        "6338f7707513cdb5944b8902483ce9c1098b857708bacb1e20d69d4b9b62ffd1"
+        "a1308122ea6fac81dbdf4f978e05f5dca45e383b1a65117a6d86df430cae5e8c"
     );
 }
 
@@ -166,6 +166,7 @@ fn missing_case_selector_fails_instead_of_running_the_full_suite() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn suite_run_refuses_debug_wall_clock_measurement_before_fixture_setup() {
     let output = Command::cargo_bin("omnigraph-bench")
         .expect("benchmark binary")
@@ -191,7 +192,7 @@ fn suite_run_refuses_debug_wall_clock_measurement_before_fixture_setup() {
     assert_eq!(failure["error"]["case_id"], "branch-merge-d50-warm");
     assert_eq!(
         failure["error"]["point_id"],
-        "6338f7707513cdb5944b8902483ce9c1098b857708bacb1e20d69d4b9b62ffd1"
+        "a1308122ea6fac81dbdf4f978e05f5dca45e383b1a65117a6d86df430cae5e8c"
     );
 }
 

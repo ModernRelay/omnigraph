@@ -21,9 +21,17 @@ code contracts that interpret the remaining typed fields.
 
 Index state is an inventory rather than a global label. Use `indexes: []` for
 an unindexed fixture; each indexed entry names its `table`, `column`, `kind`,
-and `freshness`. Synthetic branch-merge builder v1 supports only
+and `freshness`. Synthetic branch-merge builder v2 supports only
 `compaction_recency: not-optimized`, because OmniGraph optimization
 materializes physical indexes outside this builder's exact inventory contract.
+
+Builder v2 interprets `fixture.data.tables` as the total user-table count and
+requires an even value: half are immutable node endpoint tables and half are
+edge tables in a uniform type ring. Every edge row connects equal ordinals in
+adjacent node types. `workload.diverged_tables` selects edge tables only, so it
+must not exceed half of `fixture.data.tables`. Source and target update
+disjoint stable edge IDs, delete disjoint edge cohorts, and append distinct
+edge IDs while retaining valid endpoints.
 
 `protocol.deadline_seconds` is required. Set it to an integer from 1 through
 3600, or to YAML `null` when the measured operation has no deadline; the
@@ -77,11 +85,11 @@ than the case's experiment identity.
 `fixture.state.history_depth` is the exact number of reachable OmniGraph graph
 commits on **each already-diverged frozen branch**, including the history
 shared before the branch was created. It is not merely the number of commits
-made after branching. Builder v1 measures both frozen branches and refuses a
+made after branching. Builder v2 measures both frozen branches and refuses a
 case whose declaration does not match; it does not silently pad or squash
-history. For the checked case, the reachable depth is 214: one genesis commit,
-200 base-load publications (25 chunks for each of eight tables), one optimize
-publication, and 12 branch-local divergence publications.
+history. For the checked case, the reachable depth is 213: one genesis commit,
+200 base-load publications (25 chunks for each of four node and four edge
+tables), and 12 branch-local edge-divergence publications on each branch.
 
 ## Validate and inspect
 
@@ -135,25 +143,35 @@ Runner-v1 constructs and verifies one fixture whose `bench-source` and
 `bench-target` branches are already diverged, closes it, and freezes the
 complete directory by physical SHA-256. The fixture is built at a stable
 `active` path because Lance shallow-branch manifests can retain absolute base
-paths. The runner makes a never-opened APFS clonefile template, removes
-`active`, and clone-restores every repetition to that exact path. Forced
-clonefile reset has no byte-copy fallback. Reset and the pre-timer witness walk
-metadata but do not read file contents, so they do not prewarm the fixture's
-data pages merely to prove identity.
+paths. Public execution constructs it in a dedicated process group under a
+bounded watchdog. That child also byte-digests the completed tree, makes the
+never-opened APFS clonefile template, and removes `active` before returning an
+identity-checked handoff. The parent accepts it only after the direct child is
+reaped and the group is gone. A failed, partial, or panicked build quarantines
+the entire disposable workspace. Every repetition clone-restores the template
+to that exact `active` path. Forced clonefile reset has no byte-copy fallback.
+Handoff acceptance, reset, and the pre-timer witness walk metadata but do not
+read file contents, so they do not prewarm the fixture's data pages merely to
+prove identity.
 
 Every repetition uses a fresh worker process and starts from the same frozen
 state. The parent pins and records the worker executable SHA-256 and requires
-matching release-profile attestation in the private handshake. The complete
-cache condition is part of point identity. A declared read-only warm-up program
-runs inside each repetition before measurement. A storage firewall allows
-only each read-write open's one balanced, empty create-if-absent capability
-probe and rejects any other preparation write; a complete metadata-shape
-witness independently catches path, kind, or length drift. Measured counters
-are then cleared and exactly one branch merge is timed. The repetition's writes
-disappear when `active` is removed rather than aging the next sample, and the
-never-opened template is checked after every worker exits.
+matching release profile, optimization level, and debug-assertion attestation
+in the private handshake, together with the full source commit and worktree
+dirty status (each explicitly unknown when its bounded probe cannot prove an
+answer) and effective `LANCE_MEM_POOL_SIZE`. The supervisor
+also records the repetition worker's peak RSS. The complete cache condition is
+part of point identity. A declared
+read-only warm-up program runs inside each repetition before measurement. A
+storage firewall allows only each read-write open's one balanced, empty
+create-if-absent capability probe and rejects any other preparation write; a
+complete metadata-shape witness independently catches path, kind, or length
+drift. Measured counters are then cleared and exactly one branch merge is timed.
+The repetition's writes disappear when `active` is removed rather than aging
+the next sample, and the never-opened template is checked after every worker
+exits.
 
-Before it initializes a fixture, the runner derives the exact builder-v1
+Before it initializes a fixture, the runner derives the exact builder-v2
 publication count, rejects a mismatched history declaration, applies explicit
 local row/byte/entry/history limits, and proves that the scratch volume has its
 conservative frozen-copy capacity allowance. The concrete runner limits are
@@ -164,23 +182,32 @@ The supervisor starts the declared hard deadline immediately before releasing
 the prepared worker with `Begin`. The worker must send `Settled` after its merge
 future returns. On timeout the supervisor kills the worker's complete process
 group without a grace period, waits for and reaps it, and proves the group is
-gone before cleanup. No killed or partial operation becomes a sample.
-Preparation and exact verification have separate bounded watchdogs with a
-300-second minimum allowance. Successful finalization additionally requires
-clean, bounded EOF on both captured pipes and no frame after `Complete`; an
-unproved containment state quarantines the disposable workspace.
+gone. Every repetition failure, including a frame after `Complete`, rejects the
+sample. Cleanup is allowed only after the direct child is reaped, its process
+group is gone, and bounded capture has observed clean EOF on both pipes;
+otherwise the disposable workspace is quarantined. A failure with complete
+containment may therefore clean up safely, but no killed or partial operation
+becomes a sample. Preparation and exact verification have separate bounded
+watchdogs with a 300-second minimum allowance.
 
-After timing and call counters stop, the runner verifies exact IDs, values,
-cohorts, payloads, insertions, and deletions across every target table,
-including the tables that should remain untouched. Source and main must retain
-their exact frozen content and unchanged branch heads. The runner also requires
-the general three-way route and exactly one `TableWalk` interval per diverged
-table. The reported storage counts are logical engine calls, not physical
-requests or cloud-cost estimates.
+After timing and call counters stop, the worker reads and verifies exact IDs,
+values, cohorts, payloads, insertions, and deletions across every table on
+target, source, and main, including tables that should remain untouched, and
+requires unchanged source/main branch heads. The parent does not reread those
+content bytes; it independently derives and validates the point/case identity,
+general three-way route, and declared table/total-row count attestations
+returned by the worker. Exactly one `TableWalk` interval is required per
+diverged edge table. This
+full runner-v1 verification is O(store), deliberately outside timing.
+Receipt-based O(delta) certification starts with the future versioned-S3 reset
+slice. A future DST oracle adds independent evidence but never replaces these
+per-repetition probes. Reported storage counts are logical engine calls, not
+physical requests or cloud-cost estimates.
 
 The warm-up program `branch-merge-read-set-v1` reads the reachable commit list
 and a coherent snapshot for `main`, `bench-source`, and `bench-target`, then
-fully consumes the projected benchmark columns of every diverged table. A
+fully consumes every diverged edge table plus the union of its endpoint node
+tables using type-appropriate projections. A
 `reopened-after-program` point runs that same program and reopens the engine
 handle before measurement; it does not claim invalidation. A process-cold point
 uses `preparation-only`, `program: none`, and `iterations: 0`: the worker is

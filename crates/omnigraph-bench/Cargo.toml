@@ -15,6 +15,7 @@ path = "src/bin/omnigraph-bench.rs"
 [dependencies]
 arrow-array = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 lance = { workspace = true }
