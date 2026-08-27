@@ -18,8 +18,9 @@ const MAX_TOTAL_ROWS: u64 = 10_000_000_000;
 const MAX_PAYLOAD_BYTES_PER_ROW: u64 = 64 * 1024 * 1024;
 const MAX_LOGICAL_PAYLOAD_BYTES: u64 = 1 << 50;
 const MAX_HISTORY_DEPTH: u64 = 1_000_000;
-const MAX_WARMUP_ITERATIONS: u32 = 1_000;
+pub(crate) const MAX_WARMUP_ITERATIONS: u32 = 1_000;
 const MAX_DEADLINE_SECONDS: u64 = 3_600;
+pub(crate) const SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION: u32 = 2;
 
 /// A complete V1 branch-merge experiment. `id` is a human selector only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,6 +421,28 @@ pub enum Timer {
     Monotonic,
 }
 
+/// Deterministic source/target change mix for `branch-merge-v1`.
+///
+/// Fixture admission and fixture construction must use this one definition so
+/// the capacity proof cannot drift from the rows the builder actually writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BranchMergeChangeMix {
+    pub updates: u64,
+    pub deletes: u64,
+    pub inserts: u64,
+}
+
+pub(crate) fn branch_merge_change_mix(delta: u64) -> BranchMergeChangeMix {
+    let updates = delta.div_ceil(3);
+    let remaining = delta - updates;
+    let deletes = remaining.div_ceil(2);
+    BranchMergeChangeMix {
+        updates,
+        deletes,
+        inserts: remaining - deletes,
+    }
+}
+
 /// Versioned, canonical point identity. It deliberately has no case id,
 /// source path, suite, or repetition quantity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,13 +534,13 @@ pub fn validate_case(mut definition: CaseV1) -> ValidationOutcome<ValidatedCase>
             "case id must be 1..=128 characters of kebab-case ASCII ([a-z0-9]+(?:-[a-z0-9]+)*)",
         ));
     }
-    if definition.fixture.builder.version != 1 {
+    if definition.fixture.builder.version != SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION {
         diagnostics.push(Diagnostic::error(
             "unsupported_builder_version",
             "fixture.builder.version",
             format!(
-                "synthetic-branch-merge builder version {} is unsupported; this build supports version 1",
-                definition.fixture.builder.version
+                "synthetic-branch-merge builder version {} is unsupported; this build supports version {SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION}",
+                definition.fixture.builder.version,
             ),
         ));
     }
@@ -604,6 +627,7 @@ impl CacheCondition {
 fn validate_workload(case: &CaseV1, diagnostics: &mut Vec<Diagnostic>) {
     let data = &case.fixture.data;
     let workload = &case.workload;
+    let edge_tables = data.tables / 2;
     if workload.delta_rows_per_side == 0 {
         diagnostics.push(Diagnostic::error(
             "invalid_delta",
@@ -611,13 +635,12 @@ fn validate_workload(case: &CaseV1, diagnostics: &mut Vec<Diagnostic>) {
             "delta_rows_per_side must be >= 1",
         ));
     }
-    if workload.diverged_tables == 0 || workload.diverged_tables > data.tables {
+    if workload.diverged_tables == 0 || workload.diverged_tables > edge_tables {
         diagnostics.push(Diagnostic::error(
             "invalid_diverged_tables",
             "workload.diverged_tables",
             format!(
-                "diverged_tables must be between 1 and fixture.data.tables ({})",
-                data.tables
+                "builder v2 diverges edge tables and requires diverged_tables between 1 and the fixture's {edge_tables} edge tables"
             ),
         ));
     }
@@ -644,18 +667,17 @@ fn validate_workload(case: &CaseV1, diagnostics: &mut Vec<Diagnostic>) {
     }
 
     // The builder pre-tags separate source/target update and delete cohorts in
-    // each diverged table. Prove the busiest table can hold those rows without
+    // each diverged edge table. Prove the busiest table can hold those rows without
     // overflow rather than letting fixture construction fail much later.
     if workload.delta_rows_per_side > 0
         && workload.diverged_tables > 0
-        && workload.diverged_tables <= data.tables
+        && workload.diverged_tables <= edge_tables
     {
-        let updates = workload.delta_rows_per_side.div_ceil(3);
-        let rest = workload.delta_rows_per_side - updates;
-        let deletes = rest.div_ceil(2);
-        let per_table = updates
+        let change_mix = branch_merge_change_mix(workload.delta_rows_per_side);
+        let per_table = change_mix
+            .updates
             .div_ceil(workload.diverged_tables)
-            .checked_add(deletes.div_ceil(workload.diverged_tables))
+            .checked_add(change_mix.deletes.div_ceil(workload.diverged_tables))
             .and_then(|rows| rows.checked_mul(2));
         match per_table {
             Some(required) if required <= data.rows_per_table => {}
@@ -683,6 +705,13 @@ fn validate_fixture_scale(fixture: &Fixture, diagnostics: &mut Vec<Diagnostic>) 
             "invalid_table_count",
             "fixture.data.tables",
             format!("table count must be in 1..={MAX_TABLES}"),
+        ));
+    }
+    if data.tables < 2 || !data.tables.is_multiple_of(2) {
+        diagnostics.push(Diagnostic::error(
+            "invalid_graph_table_mix",
+            "fixture.data.tables",
+            "synthetic-branch-merge builder v2 requires an even total table count >= 2, split equally between node and edge tables",
         ));
     }
     if !(1..=MAX_ROWS_PER_TABLE).contains(&data.rows_per_table) {
@@ -740,13 +769,13 @@ fn validate_fixture_scale(fixture: &Fixture, diagnostics: &mut Vec<Diagnostic>) 
 
 fn validate_fixture_state(fixture: &Fixture, diagnostics: &mut Vec<Diagnostic>) {
     if fixture.builder.kind == FixtureBuilderKind::SyntheticBranchMerge
-        && fixture.builder.version == 1
+        && fixture.builder.version == SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION
         && fixture.state.compaction_recency == CompactionRecency::Optimized
     {
         diagnostics.push(Diagnostic::error(
             "impossible_optimized_index_state",
             "fixture.state.compaction_recency",
-            "synthetic-branch-merge builder v1 cannot truthfully declare optimized state because OmniGraph optimization materializes indexes outside this builder's exact inventory contract; use not-optimized",
+            "synthetic-branch-merge builder v2 cannot truthfully declare optimized state because OmniGraph optimization materializes indexes outside this builder's exact inventory contract; use not-optimized",
         ));
     }
 }
@@ -981,7 +1010,7 @@ scenario: branch-merge-v1
 fixture:
   builder:
     kind: synthetic-branch-merge
-    version: 1
+    version: 2
     seed: 0
   data:
     provenance: synthetic
@@ -1148,8 +1177,14 @@ protocol:
             parse_case(&future).diagnostics[0].code,
             "unsupported_case_version"
         );
+        let old_builder =
+            VALID.replace("    version: 2\n    seed: 0", "    version: 1\n    seed: 0");
+        assert_eq!(
+            parse_case(&old_builder).diagnostics[0].code,
+            "unsupported_builder_version"
+        );
         let future_builder =
-            VALID.replace("    version: 1\n    seed: 0", "    version: 2\n    seed: 0");
+            VALID.replace("    version: 2\n    seed: 0", "    version: 3\n    seed: 0");
         assert_eq!(
             parse_case(&future_builder).diagnostics[0].code,
             "unsupported_builder_version"
@@ -1224,7 +1259,7 @@ protocol:
     }
 
     #[test]
-    fn builder_v1_rejects_optimized_fixture_state_for_any_index_inventory() {
+    fn builder_v2_rejects_optimized_fixture_state_for_any_index_inventory() {
         let optimized = VALID.replace(
             "compaction_recency: not-optimized",
             "compaction_recency: optimized",
@@ -1260,6 +1295,32 @@ protocol:
             .collect();
         assert!(codes.contains(&"invalid_diverged_tables".to_string()));
         assert!(codes.contains(&"empty_index_table".to_string()));
+    }
+
+    #[test]
+    fn builder_v2_requires_balanced_node_edge_tables_and_edge_divergence() {
+        for (yaml, code) in [
+            (
+                VALID.replace("tables: 8", "tables: 1"),
+                "invalid_graph_table_mix",
+            ),
+            (
+                VALID.replace("tables: 8", "tables: 7"),
+                "invalid_graph_table_mix",
+            ),
+            (
+                VALID.replace("diverged_tables: 4", "diverged_tables: 5"),
+                "invalid_diverged_tables",
+            ),
+        ] {
+            assert!(
+                parse_case(&yaml)
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code),
+                "missing {code} for {yaml}"
+            );
+        }
     }
 
     #[test]

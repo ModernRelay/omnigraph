@@ -5,8 +5,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use omnigraph_bench::{
-    Diagnostic, PLAN_FORMAT_VERSION, ResolvedRun, ValidatedCase, ValidationOutcome, load_case,
-    load_suite,
+    Diagnostic, PLAN_FORMAT_VERSION, RUNNER_OUTPUT_VERSION, ResolvedRun, ResolvedSuite,
+    RunExecution, RunOptions, RunnerError, SuiteExecution, ValidatedCase, ValidationOutcome,
+    execute_run, load_case, load_suite,
 };
 use serde::Serialize;
 
@@ -17,7 +18,7 @@ const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 #[command(
     name = "omnigraph-bench",
     version,
-    about = "Validate and plan declarative OmniGraph benchmarks"
+    about = "Validate, plan, and run declarative OmniGraph benchmarks"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,6 +37,12 @@ enum Command {
         #[command(subcommand)]
         command: SuiteCommand,
     },
+    /// Private one-repetition worker endpoint used by the supervising runner.
+    #[command(name = "__worker-v1", hide = true)]
+    WorkerV1,
+    /// Private bounded fixture-builder endpoint used by the supervising runner.
+    #[command(name = "__fixture-worker-v1", hide = true)]
+    FixtureWorkerV1 { request: PathBuf, result: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -72,6 +79,19 @@ enum SuiteCommand {
         #[arg(long)]
         case: Option<String>,
         /// Emit a machine-readable execution plan.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Execute a validated suite against the supported local runner-v1 envelope.
+    Run {
+        file: PathBuf,
+        /// Select exactly one case id from the suite.
+        #[arg(long)]
+        case: Option<String>,
+        /// Place disposable fixture trees below this existing directory.
+        #[arg(long)]
+        scratch_root: Option<PathBuf>,
+        /// Emit machine-readable diagnostic execution output.
         #[arg(long)]
         json: bool,
     },
@@ -117,10 +137,15 @@ struct PlanRun<'a> {
     identity: &'a omnigraph_bench::PointIdentityV1,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Case { command } => run_case(command),
-        Command::Suite { command } => run_suite(command),
+        Command::Suite { command } => run_suite(command).await,
+        Command::WorkerV1 => omnigraph_bench::worker::run_worker_stdio_v1().await,
+        Command::FixtureWorkerV1 { request, result } => {
+            omnigraph_bench::fixture_worker::run_fixture_worker_files_v1(&request, &result).await
+        }
     }
 }
 
@@ -138,7 +163,7 @@ fn run_case(command: CaseCommand) -> ExitCode {
     }
 }
 
-fn run_suite(command: SuiteCommand) -> ExitCode {
+async fn run_suite(command: SuiteCommand) -> ExitCode {
     match command {
         SuiteCommand::Validate { file, json } => {
             let outcome = load_suite(&file);
@@ -159,6 +184,23 @@ fn run_suite(command: SuiteCommand) -> ExitCode {
             }
         }
         SuiteCommand::Plan { file, case, json } => plan_suite(&file, case.as_deref(), json),
+        SuiteCommand::Run {
+            file,
+            case,
+            scratch_root,
+            json,
+        } => {
+            run_suite_execution(
+                &file,
+                case.as_deref(),
+                RunOptions {
+                    scratch_root,
+                    worker_executable: std::env::current_exe().ok(),
+                },
+                json,
+            )
+            .await
+        }
     }
 }
 
@@ -329,23 +371,10 @@ fn plan_suite(path: &Path, selector: Option<&str>, json: bool) -> ExitCode {
         Ok(suite) => suite,
         Err(diagnostics) => return print_cli_failures(diagnostics, json),
     };
-    let selected: Vec<&ResolvedRun> = suite
-        .runs
-        .iter()
-        .filter(|run| selector.is_none_or(|id| run.case.definition.id == id))
-        .collect();
-    if let Some(id) = selector
-        && selected.is_empty()
-    {
-        return print_cli_failure(
-            Diagnostic::error(
-                "unknown_case_selector",
-                "--case",
-                format!("suite '{}' has no case id '{id}'", suite.definition.name),
-            ),
-            json,
-        );
-    }
+    let selected = match select_runs(&suite, selector) {
+        Ok(selected) => selected,
+        Err(diagnostic) => return print_cli_failure(diagnostic, json),
+    };
     let plan = Plan {
         plan_version: PLAN_FORMAT_VERSION,
         suite: &suite.definition.name,
@@ -378,6 +407,143 @@ fn plan_suite(path: &Path, selector: Option<&str>, json: bool) -> ExitCode {
         }
         ExitCode::SUCCESS
     }
+}
+
+fn select_runs<'a>(
+    suite: &'a ResolvedSuite,
+    selector: Option<&str>,
+) -> Result<Vec<&'a ResolvedRun>, Diagnostic> {
+    let selected = suite
+        .runs
+        .iter()
+        .filter(|run| selector.is_none_or(|id| run.case.definition.id == id))
+        .collect::<Vec<_>>();
+    if let Some(id) = selector
+        && selected.is_empty()
+    {
+        return Err(Diagnostic::error(
+            "unknown_case_selector",
+            "--case",
+            format!("suite '{}' has no case id '{id}'", suite.definition.name),
+        ));
+    }
+    Ok(selected)
+}
+
+async fn run_suite_execution(
+    path: &Path,
+    selector: Option<&str>,
+    options: RunOptions,
+    json: bool,
+) -> ExitCode {
+    let suite = match load_suite(path).into_result() {
+        Ok(suite) => suite,
+        Err(diagnostics) => return print_cli_failures(diagnostics, json),
+    };
+    let selected = match select_runs(&suite, selector) {
+        Ok(selected) => selected,
+        Err(diagnostic) => return print_cli_failure(diagnostic, json),
+    };
+    let mut runs = Vec::with_capacity(selected.len());
+    for run in selected {
+        match execute_run(run, &options).await {
+            Ok(execution) => runs.push(execution),
+            Err(error) => return print_runner_failure(&suite, &runs, &error, json),
+        }
+    }
+    let execution = SuiteExecution {
+        runner_output_version: RUNNER_OUTPUT_VERSION,
+        suite: suite.definition.name,
+        suite_path: suite.suite_path,
+        runs,
+    };
+    if json {
+        print_json_success(&execution)
+    } else {
+        print_execution(&execution)
+    }
+}
+
+fn print_execution(execution: &SuiteExecution) -> ExitCode {
+    println!(
+        "completed suite {} ({} run{})",
+        execution.suite,
+        execution.runs.len(),
+        if execution.runs.len() == 1 { "" } else { "s" }
+    );
+    for run in &execution.runs {
+        print_run_execution(run);
+    }
+    println!("diagnostic output only; no durable benchmark record was written");
+    ExitCode::SUCCESS
+}
+
+fn print_run_execution(run: &RunExecution) {
+    let tail = run.wall_clock.p95_us.map_or_else(
+        || "p95=unsupported".to_string(),
+        |value| format!("p95={value}us"),
+    );
+    println!(
+        "{} repetitions={} p50={}us min={}us max={}us {} build={}/O{} fixture_sha256={}",
+        run.case_id,
+        run.wall_clock.observed_repetitions,
+        run.wall_clock.p50_us,
+        run.wall_clock.min_us,
+        run.wall_clock.max_us,
+        tail,
+        run.build.cargo_profile,
+        run.build.opt_level,
+        run.fixture.physical_digest_sha256
+    );
+    let cache_condition = serde_json::to_string(&run.cache_condition)
+        .unwrap_or_else(|_| "<serialization-failed>".to_string());
+    println!("  cache_condition={cache_condition}");
+    for sample in &run.samples {
+        println!(
+            "  rep={} outcome={} elapsed={}us exact_tables={} exact_rows={}",
+            sample.repetition,
+            sample.outcome,
+            sample.elapsed_us,
+            sample.verification.tables,
+            sample.verification.rows
+        );
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RunnerFailure<'a> {
+    ok: bool,
+    runner_output_version: u32,
+    suite: &'a str,
+    suite_path: &'a Path,
+    completed_runs: &'a [RunExecution],
+    error: &'a RunnerError,
+}
+
+fn print_runner_failure(
+    suite: &ResolvedSuite,
+    completed_runs: &[RunExecution],
+    error: &RunnerError,
+    json: bool,
+) -> ExitCode {
+    if json {
+        let _ = print_json_success(&RunnerFailure {
+            ok: false,
+            runner_output_version: RUNNER_OUTPUT_VERSION,
+            suite: &suite.definition.name,
+            suite_path: &suite.suite_path,
+            completed_runs,
+            error,
+        });
+    } else {
+        eprintln!(
+            "error[{}] after {} completed suite run(s): {}",
+            error.code,
+            completed_runs.len(),
+            error.message
+        );
+    }
+    ExitCode::FAILURE
 }
 
 fn print_json<T: Serialize>(outcome: &ValidationOutcome<T>) -> ExitCode {
