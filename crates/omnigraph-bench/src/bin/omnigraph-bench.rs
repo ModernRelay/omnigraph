@@ -489,6 +489,9 @@ fn print_run_execution(run: &RunExecution) {
         run.build.opt_level,
         run.fixture.physical_digest_sha256
     );
+    let cache_condition = serde_json::to_string(&run.cache_condition)
+        .unwrap_or_else(|_| "<serialization-failed>".to_string());
+    println!("  cache_condition={cache_condition}");
     for sample in &run.samples {
         println!(
             "  rep={} outcome={} elapsed={}us exact_tables={} exact_rows={}",

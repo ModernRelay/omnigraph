@@ -4,7 +4,7 @@
 //! APFS storage, an already-diverged branch-merge fixture frozen once as a
 //! clonefile template, and one fresh attested worker process per repetition.
 //! Every worker restores the same stable path, performs the declared read-only
-//! cache-preparation program behind a preparation-write firewall, and
+//! cache-preparation treatment behind a preparation-write firewall, and
 //! executes exactly one bounded merge followed by exact verification. Durable
 //! run records, fixture caching, cold page-cache control, S3 reset, and AWS
 //! orchestration are separate slices.
@@ -28,7 +28,10 @@ use crate::branch_merge::{
     BranchMergePlan, FixturePreflight, SOURCE_BRANCH, TARGET_BRANCH,
     capture_protected_branch_heads, initialize_local_fixture, verify_merged_graph, warm_read_set,
 };
-use crate::case::{Attribution, Backend, CacheCondition, EnginePreparation, ResetMode};
+use crate::case::{
+    Attribution, Backend, CacheCondition, EnginePreparation, MAX_WARMUP_ITERATIONS,
+    PageCacheCondition, ProcessLifecycle, ResetMode, WarmupProgram,
+};
 use crate::counting::{LogicalCallCounter, LogicalCallCounts};
 use crate::environment::{LocalEnvironmentEvidence, verify_local_environment};
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
@@ -182,6 +185,7 @@ pub struct RunExecution {
     pub case_path: PathBuf,
     pub point_id: String,
     pub point_name: String,
+    pub cache_condition: CacheCondition,
     pub requested_repetitions: u32,
     pub build: BuildEvidence,
     pub environment: LocalEnvironmentEvidence,
@@ -484,6 +488,12 @@ async fn execute_owned_run(
     plan: BranchMergePlan,
     preflight: FixturePreflight,
 ) -> RunnerResult<RunExecution> {
+    if !guards.isolate_repetitions && !cfg!(test) {
+        return Err(RunnerError::new(
+            "process_isolation_required",
+            "every current cache condition requires one fresh worker process per repetition",
+        ));
+    }
     let workspace = scratch_workspace(&options)?;
     let environment = local_environment(&run, workspace.path(), guards.verify_environment)?;
     if environment.available_bytes < preflight.required_scratch_bytes {
@@ -577,6 +587,7 @@ async fn execute_owned_run(
         case_path: run.case_path.clone(),
         point_id: run.case.point_id.clone(),
         point_name: run.case.point_name.clone(),
+        cache_condition: run.case.definition.environment.cache_condition.clone(),
         requested_repetitions: run.repetitions,
         build: build_evidence(worker.as_ref()),
         environment,
@@ -1009,6 +1020,53 @@ async fn execute_rep(
     .await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachePreparationAction {
+    PreparationOnly,
+    WarmSameHandle { iterations: u32 },
+    WarmThenReopen { iterations: u32 },
+}
+
+fn cache_preparation_action(condition: &CacheCondition) -> RunnerResult<CachePreparationAction> {
+    match (
+        condition.process,
+        condition.engine,
+        condition.page_cache,
+        condition.program,
+        condition.iterations,
+    ) {
+        (
+            ProcessLifecycle::FreshPerRepetition,
+            EnginePreparation::PreparationOnly,
+            PageCacheCondition::Uncontrolled,
+            WarmupProgram::None,
+            0,
+        ) => Ok(CachePreparationAction::PreparationOnly),
+        (
+            ProcessLifecycle::FreshPerRepetition,
+            EnginePreparation::WarmedByProgram,
+            PageCacheCondition::ProgramConditioned,
+            WarmupProgram::BranchMergeReadSetV1,
+            iterations,
+        ) if (1..=MAX_WARMUP_ITERATIONS).contains(&iterations) => {
+            Ok(CachePreparationAction::WarmSameHandle { iterations })
+        }
+        (
+            ProcessLifecycle::FreshPerRepetition,
+            EnginePreparation::ReopenedAfterProgram,
+            PageCacheCondition::ProgramConditioned,
+            WarmupProgram::BranchMergeReadSetV1,
+            iterations,
+        ) if (1..=MAX_WARMUP_ITERATIONS).contains(&iterations) => {
+            Ok(CachePreparationAction::WarmThenReopen { iterations })
+        }
+        _ => Err(RunnerError::new(
+            "unsupported_cache_condition",
+            "runner-v1 refuses a cache-condition tuple that is not one of the schema's exact supported treatments",
+        )),
+    }
+}
+
 pub(crate) trait MeasurementSignals {
     fn ready(&mut self) -> RunnerResult<()>;
     fn settled(&mut self, elapsed_us: u64) -> RunnerResult<()>;
@@ -1077,19 +1135,24 @@ async fn execute_rep_body<S: MeasurementSignals>(
     signals: &mut S,
 ) -> RunnerResult<RepObservation> {
     let root_uri = utf8_path(root, "repetition store")?;
+    let preparation_action = cache_preparation_action(cache_condition)?;
     let (mut db, mut control_counts, mut preparation_gate) = open_counting(root_uri).await?;
-    match cache_condition.engine {
-        EnginePreparation::PreparationOnly => {}
-        EnginePreparation::WarmedByProgram | EnginePreparation::ReopenedAfterProgram => {
-            warm_read_set(&db, plan, cache_condition.iterations)
+    match preparation_action {
+        CachePreparationAction::PreparationOnly => {}
+        CachePreparationAction::WarmSameHandle { iterations }
+        | CachePreparationAction::WarmThenReopen { iterations } => {
+            warm_read_set(&db, plan, iterations)
                 .await
                 .map_err(|error| RunnerError::new("cache_preparation_failed", error.to_string()))?;
         }
     }
     let protected_heads = capture_protected_branch_heads(&db)
         .await
-        .map_err(|error| RunnerError::new("verification_failed", error.to_string()))?;
-    if cache_condition.engine == EnginePreparation::ReopenedAfterProgram {
+        .map_err(|error| RunnerError::new("protected_head_capture_failed", error.to_string()))?;
+    if matches!(
+        preparation_action,
+        CachePreparationAction::WarmThenReopen { .. }
+    ) {
         preparation_gate
             .validate_preparation()
             .map_err(|message| RunnerError::new("pre_measurement_write_detected", message))?;
@@ -1098,7 +1161,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
     }
 
     // The engine handle must be read-write for the measured mutation. Prove
-    // that open and the declared cache-preparation program issued no write through either
+    // that open and the declared cache-preparation treatment issued no write through either
     // storage seam, then compare the complete metadata state without reading
     // file contents. The clonefile syscall already proved byte identity.
     verify_metadata_shape(root, input_metadata, TraversalLimits::default()).map_err(|error| {
@@ -1431,7 +1494,50 @@ mod tests {
     }
 
     #[test]
-    fn cache_preparations_start_from_identical_frozen_bytes_and_verify_exact_content() {
+    fn complete_cache_condition_selects_one_exact_preparation_action() {
+        let process_cold = CacheCondition {
+            process: ProcessLifecycle::FreshPerRepetition,
+            engine: EnginePreparation::PreparationOnly,
+            page_cache: PageCacheCondition::Uncontrolled,
+            program: WarmupProgram::None,
+            iterations: 0,
+        };
+        assert_eq!(
+            cache_preparation_action(&process_cold).unwrap(),
+            CachePreparationAction::PreparationOnly
+        );
+
+        let warm = CacheCondition {
+            engine: EnginePreparation::WarmedByProgram,
+            page_cache: PageCacheCondition::ProgramConditioned,
+            program: WarmupProgram::BranchMergeReadSetV1,
+            iterations: 2,
+            ..process_cold.clone()
+        };
+        assert_eq!(
+            cache_preparation_action(&warm).unwrap(),
+            CachePreparationAction::WarmSameHandle { iterations: 2 }
+        );
+
+        let post_reopen = CacheCondition {
+            engine: EnginePreparation::ReopenedAfterProgram,
+            ..warm.clone()
+        };
+        assert_eq!(
+            cache_preparation_action(&post_reopen).unwrap(),
+            CachePreparationAction::WarmThenReopen { iterations: 2 }
+        );
+
+        let mismatched = CacheCondition {
+            page_cache: PageCacheCondition::Uncontrolled,
+            ..warm
+        };
+        let error = cache_preparation_action(&mismatched).unwrap_err();
+        assert_eq!(error.code, "unsupported_cache_condition");
+    }
+
+    #[test]
+    fn warm_and_post_reopen_start_from_identical_frozen_bytes_and_verify_exact_content() {
         // The debug-build merge future plus two task-local measurement layers
         // exceeds libtest's 2 MiB worker stack. Public wall-clock execution is
         // release-only; keep this owning-layer debug regression on the same
@@ -1482,16 +1588,12 @@ protocol:
   reset: plain-copy
   timer: monotonic
 "#;
-                        let process_cold_source = warmed_source
-                            .replace("engine: warmed-by-program", "engine: preparation-only")
-                            .replace(
-                                "page_cache: program-conditioned",
-                                "page_cache: uncontrolled",
-                            )
-                            .replace("program: branch-merge-read-set-v1", "program: none")
-                            .replace("iterations: 1", "iterations: 0");
+                        let post_reopen_source = warmed_source.replace(
+                            "engine: warmed-by-program",
+                            "engine: reopened-after-program",
+                        );
 
-                        for source in [warmed_source.to_owned(), process_cold_source] {
+                        for source in [warmed_source.to_owned(), post_reopen_source] {
                             let case = parse_case(&source).into_result().unwrap();
                             let run = ResolvedRun {
                                 case_path: PathBuf::from("tiny-runner.case-v1.yaml"),
@@ -1511,6 +1613,15 @@ protocol:
                             .await
                             .unwrap();
 
+                            assert_eq!(
+                                execution.cache_condition,
+                                run.case.definition.environment.cache_condition
+                            );
+                            assert_eq!(
+                                serde_json::to_value(&execution).unwrap()["cache_condition"]
+                                    ["page_cache"],
+                                "program-conditioned"
+                            );
                             assert_eq!(execution.fixture.source_history_depth, 9);
                             assert_eq!(execution.fixture.target_history_depth, 9);
                             assert_eq!(execution.samples.len(), 2);

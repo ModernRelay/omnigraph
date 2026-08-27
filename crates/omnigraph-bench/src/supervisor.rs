@@ -1384,6 +1384,37 @@ mod tests {
     }
 
     #[test]
+    fn supervised_repetitions_use_distinct_worker_processes() {
+        let placeholder = PathBuf::from("/placeholder");
+        let mut input = supervision_input(placeholder);
+        input.auxiliary_deadline_override = Some(Duration::from_secs(5));
+        let expected = valid_sample(&input);
+        let body = format!(
+            "printf '%s\\n' \"$$\" >> \"$0.pids\"\nsleep 1\n{}",
+            normal_exchange(&input, complete_frame(&input, expected.clone()))
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker.clone();
+        let second = input.clone();
+
+        let first_thread = std::thread::spawn(move || supervise_repetition(input));
+        let second_thread = std::thread::spawn(move || supervise_repetition(second));
+        assert_eq!(first_thread.join().unwrap().unwrap(), expected);
+        assert_eq!(second_thread.join().unwrap().unwrap(), expected);
+
+        let pid_log = PathBuf::from(format!("{}.pids", worker.display()));
+        let mut pids = std::fs::read_to_string(pid_log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2, "{pids:?}");
+        pids.sort();
+        pids.dedup();
+        assert_eq!(pids.len(), 2, "each repetition needs a fresh process");
+    }
+
+    #[test]
     fn worker_that_never_reads_stdin_is_bounded_by_prepare_deadline() {
         let (_guard, _directory, worker) = worker_script("sleep 300\n");
         let mut input = supervision_input(worker);

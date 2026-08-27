@@ -295,6 +295,8 @@ fn stage_for_error(error: &RunnerError) -> WorkerStageV1 {
         "pre_measurement_write_detected"
         | "pre_measurement_state_mismatch"
         | "cache_preparation_failed"
+        | "protected_head_capture_failed"
+        | "unsupported_cache_condition"
         | "engine_open_failed"
         | "storage_open_failed" => WorkerStageV1::Prepare,
         "merge_failed" | "merge_deadline_exceeded" | "duration_overflow" => WorkerStageV1::Measure,
@@ -327,6 +329,12 @@ fn send_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_ready_protected_head_failure_is_classified_as_prepare() {
+        let error = RunnerError::new("protected_head_capture_failed", "capture failed");
+        assert_eq!(stage_for_error(&error), WorkerStageV1::Prepare);
+    }
 
     #[test]
     fn worker_refuses_identity_mismatch_before_opening_a_store() {

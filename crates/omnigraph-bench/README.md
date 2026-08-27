@@ -47,8 +47,8 @@ measurement protocol and identity vocabulary.
   additionally drops and reopens the engine handle after the warm-up while the
   firewall remains closed; it makes no cache-invalidation claim.
   `preparation-only` is executable as process-cold: it has no declared warm-up,
-  while ordinary engine open and harness verification-preparation reads still
-  occur and the OS page cache remains explicitly uncontrolled.
+  while ordinary engine open and protected-head capture still occur and the OS
+  page cache remains explicitly uncontrolled.
 - After the measured window closes, verification checks the exact expected
   rows and values across every target table, including untouched tables. It
   separately proves that source and main still have their exact frozen content
@@ -82,7 +82,8 @@ debug build, S3 or Azure backend, server execution, plain-copy reset, unproved
 host declaration, unsupported scenario axis, deadline breach, reset witness
 mismatch, non-general merge route, or content mismatch is refused instead of
 being approximated. A true OS-page-cache-cold claim is not representable yet;
-it requires a named platform/backend control and an observed eviction witness.
+it requires a named platform/backend control and a post-control eviction
+witness. Storage-cold is likewise unsupported and unrepresentable.
 
 Before initialization, runner-v1 derives the exact builder publication recipe
 and refuses an emergent history depth. Its local construction envelope is at

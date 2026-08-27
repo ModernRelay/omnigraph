@@ -144,8 +144,8 @@ data pages merely to prove identity.
 Every repetition uses a fresh worker process and starts from the same frozen
 state. The parent pins and records the worker executable SHA-256 and requires
 matching release-profile attestation in the private handshake. The complete
-cache condition is point identity. A declared read-only warm-up program runs
-inside each repetition before measurement. A storage firewall allows
+cache condition is part of point identity. A declared read-only warm-up program
+runs inside each repetition before measurement. A storage firewall allows
 only each read-write open's one balanced, empty create-if-absent capability
 probe and rejects any other preparation write; a complete metadata-shape
 witness independently catches path, kind, or length drift. Measured counters
@@ -178,16 +178,17 @@ the general three-way route and exactly one `TableWalk` interval per diverged
 table. The reported storage counts are logical engine calls, not physical
 requests or cloud-cost estimates.
 
-The warm-up program `branch-merge-read-set-v1` reads the reachable commit list and
-a coherent snapshot for `main`, `bench-source`, and `bench-target`, then fully
-consumes the projected benchmark columns of every diverged table. A
+The warm-up program `branch-merge-read-set-v1` reads the reachable commit list
+and a coherent snapshot for `main`, `bench-source`, and `bench-target`, then
+fully consumes the projected benchmark columns of every diverged table. A
 `reopened-after-program` point runs that same program and reopens the engine
 handle before measurement; it does not claim invalidation. A process-cold point
 uses `preparation-only`, `program: none`, and `iterations: 0`: the worker is
-fresh and no workload-shaped warm-up runs, but ordinary open and harness
-preparation reads still occur and `page_cache: uncontrolled` states the OS
-cache limitation explicitly. A true page-cache-cold point remains refused
-until a named platform/backend eviction control has an observed witness.
+fresh and no declared warm-up program runs, but ordinary engine open and
+protected-head capture still occur and `page_cache: uncontrolled` states the
+OS cache limitation explicitly. A true page-cache-cold point remains refused
+until a named platform/backend eviction control has a post-control witness;
+storage-cold is also unsupported and unrepresentable.
 
 ## Delivery boundary
 

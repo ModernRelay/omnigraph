@@ -18,7 +18,7 @@ const MAX_TOTAL_ROWS: u64 = 10_000_000_000;
 const MAX_PAYLOAD_BYTES_PER_ROW: u64 = 64 * 1024 * 1024;
 const MAX_LOGICAL_PAYLOAD_BYTES: u64 = 1 << 50;
 const MAX_HISTORY_DEPTH: u64 = 1_000_000;
-const MAX_WARMUP_ITERATIONS: u32 = 1_000;
+pub(crate) const MAX_WARMUP_ITERATIONS: u32 = 1_000;
 const MAX_DEADLINE_SECONDS: u64 = 3_600;
 
 /// A complete V1 branch-merge experiment. `id` is a human selector only.
