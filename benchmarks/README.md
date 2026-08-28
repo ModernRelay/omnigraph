@@ -14,6 +14,9 @@ records, fixtures, or result storage.
   resolved relative to the suite file that contains it, and its canonical
   target must remain under the same catalog's `cases/` directory. Suite and
   referenced-case symlinks cannot escape the catalog.
+- `*.fixture-reference-v1.yaml` is the future logical contract for an imported
+  node-and-edge graph. No FinBench reference is checked in until its complete
+  logical content is independently digested and its physical root is frozen.
 
 The `version` field selects the document schema. Keep identifiers and enum
 values in kebab-case. The scenario and fixture-builder versions identify the
@@ -109,6 +112,9 @@ cargo run --locked -p omnigraph-bench -- \
 
 cargo run --locked -p omnigraph-bench -- \
   suite plan benchmarks/suites/local-smoke.suite-v1.yaml
+
+cargo run --locked -p omnigraph-bench -- \
+  fixture reference validate /path/to/graph.fixture-reference-v1.yaml
 ```
 
 Each command accepts `--json` for machine-readable output. `suite plan` also
@@ -146,13 +152,13 @@ target/release/omnigraph-bench fixture preflight-copy \
 These commands prove only physical byte identity and copy preflight. Physical
 identity is audit/reset evidence, not `point_id` input. They do not add the
 fixture to a CaseV1 suite or run a benchmark; CaseV1 remains the synthetic
-builder contract. No copied tree remains after preflight success. Next is a
-versioned real-graph case/reference contract, graph-level logical validation,
-a non-vacuous node/edge workload adapter, and a Lance relocation preflight.
-That case/reference must independently pin the expected validated logical
-fixture stamp; `ID=BUNDLE` preflight only reports its adjacent physical-source
-descriptor and observed bytes. See the crate README for the small descriptor
-schema and the intentional boundary.
+builder contract. No copied tree remains after preflight success. The strict
+logical reference declaration is available through `fixture reference
+validate`, but that command only checks the document. Graph-level validation,
+a non-vacuous node/edge workload adapter, and a Lance relocation preflight are
+still required. `ID=BUNDLE` preflight only reports its adjacent physical-source
+descriptor and observed bytes. See the crate README for both small schemas and
+the intentional boundary.
 
 Validation loads every referenced case and checks cross-field rules, including
 checked scale budgets, table bounds, cache-condition declarations, and

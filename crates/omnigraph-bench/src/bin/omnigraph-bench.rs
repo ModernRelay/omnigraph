@@ -9,6 +9,7 @@ use omnigraph_bench::archive::{
     iter_archive, preflight_archive_publication, publish_record, reconcile_archive_publication,
 };
 use omnigraph_bench::case::Backend;
+use omnigraph_bench::fixture_reference::load_fixture_reference;
 use omnigraph_bench::projection::{
     DEFAULT_PROJECTION_PAGE_SIZE, ProjectionCursorV1, ProjectionError, ProjectionPageV1,
     list_points_page, list_runs_for_point_page, rebuild_projection,
@@ -98,6 +99,11 @@ enum CaseCommand {
 
 #[derive(Debug, Subcommand)]
 enum FixtureCommand {
+    /// Inspect logical references for externally built node-and-edge fixtures.
+    Reference {
+        #[command(subcommand)]
+        command: FixtureReferenceCommand,
+    },
     /// Print a location-free JSON manifest for one stable local tree.
     Fingerprint {
         /// Path-free identity assigned to this exact physical snapshot.
@@ -126,6 +132,17 @@ enum FixtureCommand {
         #[arg(long)]
         scratch_root: Option<PathBuf>,
         /// Emit a machine-readable verification result after cleanup.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FixtureReferenceCommand {
+    /// Strictly parse and validate one fixture-reference-v1 YAML file.
+    Validate {
+        file: PathBuf,
+        /// Emit a machine-readable validation result.
         #[arg(long)]
         json: bool,
     },
@@ -570,6 +587,25 @@ fn run_case(command: CaseCommand) -> ExitCode {
 
 fn run_fixture(command: FixtureCommand) -> ExitCode {
     match command {
+        FixtureCommand::Reference { command } => match command {
+            FixtureReferenceCommand::Validate { file, json } => {
+                let outcome = load_fixture_reference(&file);
+                if json {
+                    print_json(&outcome)
+                } else {
+                    match outcome.into_result() {
+                        Ok(reference) => {
+                            println!(
+                                "valid fixture reference {} reference_sha256={}",
+                                reference.definition.fixture_id, reference.reference_sha256,
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Err(diagnostics) => print_diagnostics(&diagnostics),
+                    }
+                }
+            }
+        },
         FixtureCommand::Fingerprint { id, root } => {
             match fingerprint_registered_fixture(id, &root).into_result() {
                 Ok(fixture) => print_json_success(&fixture),

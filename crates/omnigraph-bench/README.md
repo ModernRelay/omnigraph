@@ -109,6 +109,92 @@ measurement protocol and identity vocabulary.
   is stable across rebuilt Lance ids, timestamps, and encodings; a separate
   physical tree digest pins the exact bytes restored for every repetition.
 
+## Logical references for real graphs
+
+An externally built graph first needs a strict logical declaration. A
+`fixture-reference-v1.yaml` records only rebuild-stable identity:
+
+- the imported-graph builder version, digest-pinned recipe and inputs, and
+  typed parameters;
+- Data as canonical schema shape, non-empty node and edge inventories with
+  exact row counts, payload/column shape, provenance, and topology skew;
+- State as aging, structured index inventory, deletion history, compaction
+  recency, and history depth; and
+- the full logical-content digest that a later graph validator is expected to
+  reproduce.
+
+The authoring shape is deliberately location-free and scalar:
+
+```yaml
+version: 1
+fixture_id: finbench-sf10-main
+logical:
+  builder:
+    id: finbench-import
+    version: 1
+    recipe_sha256: "<64 lowercase hex characters>"
+    parameters:
+      - { name: scale-factor, value: 10 }
+    inputs:
+      - role: source-snapshot
+        sha256: "<64 lowercase hex characters>"
+  data:
+    provenance: corpus-derived
+    schema_shape:
+      algorithm: future-schema-shape-v1
+      sha256: "<64 lowercase hex characters>"
+    node_tables:
+      - { name: Person, rows: 582672 }
+    edge_tables:
+      - { name: PersonOwnAccount, rows: 1022914 }
+    payload:
+      kind: variable
+      algorithm: future-logical-payload-v1
+      total_bytes: 4096
+    column_shape: scalars
+    topology_skew: source-defined
+  state:
+    aging: small-commits
+    indexes: []
+    deletion_history: none
+    compaction_recency: optimized
+    history_depth: 3972
+expected:
+  logical_content:
+    algorithm: future-logical-graph-v1
+    sha256: "<64 lowercase hex characters>"
+```
+
+Builder parameters are limited to `null`, booleans, and unsigned integers;
+arbitrary strings cannot store literal paths, URIs, or credentials. Parameter
+names and numeric meanings are still trusted builder-contract input that a
+future builder adapter must validate. Input roles are path-free semantic labels
+and each input's content is pinned by SHA-256; this slice does not resolve that
+content.
+
+Validate the declaration with:
+
+```bash
+target/debug/omnigraph-bench fixture reference validate \
+  /path/to/graph.fixture-reference-v1.yaml --json
+```
+
+The result reports `reference_sha256`, an audit hash of the complete normalized,
+versioned declaration. It is not a point id. A future real-graph case must
+materialize builder, Data, and State into its typed run spec; the fixture id,
+reference path/hash, expected digest, graph commits, timestamps, and every
+physical/source location remain outside point identity.
+
+This command validates and normalizes the document only. Any 64-hex expected
+digest is still an unverified expectation: the command does not open a store or
+turn the supplied value into evidence. No executable real-graph reference is
+checked in until it has a canonical full-content digest and a frozen registered
+root. The next slice must define and implement the named canonical schema,
+payload, and graph hashing algorithms, with golden vectors, then compare the
+result on a disposable verified copy before any case can consume the reference.
+Algorithm ids in this document are explicit future contracts; validation does
+not claim to implement them.
+
 ## Registered fixture byte verification
 
 Large graph snapshots can be registered without putting a machine path, S3
@@ -193,12 +279,13 @@ anything.
 This interface is deliberately physical-only. It neither downloads from S3
 nor opens or mutates the source graph, proves graph-level logical Data/State or
 Lance relocation safety, prepares branches, or makes the registered fixture
-runnable by the synthetic CaseV1 executor. Next is an RFC-backed, versioned
-real-graph case/reference contract, graph-level logical validation of the
-registered node/edge fixture, a scenario adapter that prepares and verifies
-non-vacuous node/edge work, and a Lance relocation preflight. That later runner
-must keep its existing run-owned workspace alive and open only its copied
-`root/`, never the bundle source.
+runnable by the synthetic CaseV1 executor. The logical reference format above
+is now the independent expectation, but it is not yet bound to these copied
+bytes. Next is read-only graph-level validation of the copied node/edge
+fixture, then a scenario adapter that prepares and verifies non-vacuous work
+and a Lance relocation preflight. That later runner must keep its existing
+run-owned workspace alive and open only its copied `root/`, never the bundle
+source.
 
 The local source namespace is a trusted-input boundary: the operator must keep
 it quiescent for the command. Digest/copy verification detects ordinary drift

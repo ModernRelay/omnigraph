@@ -47,6 +47,118 @@ fn registered_fixture(directory: &Path) -> (PathBuf, PathBuf) {
     (source_path, root)
 }
 
+fn fixture_reference_yaml(logical_digest: &str) -> String {
+    format!(
+        r#"version: 1
+fixture_id: example-graph-v1
+logical:
+  builder:
+    id: example-import
+    version: 1
+    recipe_sha256: "{}"
+    parameters:
+      - {{ name: scale-factor, value: 1 }}
+    inputs:
+      - role: source
+        sha256: "{}"
+  data:
+    provenance: corpus-derived
+    schema_shape:
+      algorithm: future-schema-shape-v1
+      sha256: "{}"
+    node_tables:
+      - {{ name: Person, rows: 10 }}
+    edge_tables:
+      - {{ name: Knows, rows: 20 }}
+    payload:
+      kind: variable
+      algorithm: future-logical-payload-v1
+      total_bytes: 1920
+    column_shape: scalars
+    topology_skew: source-defined
+  state:
+    aging: bulk-loaded
+    indexes: []
+    deletion_history: none
+    compaction_recency: not-optimized
+    history_depth: 1
+expected:
+  logical_content:
+    algorithm: future-logical-graph-v1
+    sha256: "{logical_digest}"
+"#,
+        "1".repeat(64),
+        "2".repeat(64),
+        "3".repeat(64),
+    )
+}
+
+#[test]
+fn fixture_reference_validate_reports_the_normalized_reference_digest() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("example.fixture-reference-v1.yaml");
+    fs::write(&path, fixture_reference_yaml(&"4".repeat(64))).expect("fixture reference");
+
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "fixture",
+            "reference",
+            "validate",
+            path.to_str().expect("UTF-8 reference path"),
+            "--json",
+        ])
+        .output()
+        .expect("validate fixture reference");
+
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("validation JSON");
+    assert_eq!(result["ok"], true);
+    assert_eq!(
+        result["value"]["definition"]["fixture_id"],
+        "example-graph-v1"
+    );
+    assert_eq!(
+        result["value"]["reference_sha256"]
+            .as_str()
+            .expect("reference digest")
+            .len(),
+        64
+    );
+}
+
+#[test]
+fn fixture_reference_validate_refuses_a_missing_expected_content_digest() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory
+        .path()
+        .join("incomplete.fixture-reference-v1.yaml");
+    let incomplete = fixture_reference_yaml(&"4".repeat(64))
+        .replace(&format!("    sha256: \"{}\"\n", "4".repeat(64)), "");
+    fs::write(&path, incomplete).expect("incomplete fixture reference");
+
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "fixture",
+            "reference",
+            "validate",
+            path.to_str().expect("UTF-8 reference path"),
+            "--json",
+        ])
+        .output()
+        .expect("reject incomplete fixture reference");
+
+    assert!(!output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("failure JSON");
+    assert_eq!(result["ok"], false);
+    assert_eq!(
+        result["diagnostics"][0]["code"],
+        "invalid_fixture_reference_yaml"
+    );
+}
+
 #[test]
 fn fixture_verify_binds_a_local_tree_and_fails_closed_on_drift() {
     let directory = tempfile::tempdir().expect("temporary directory");
