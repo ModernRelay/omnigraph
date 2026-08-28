@@ -32,16 +32,18 @@ measurement protocol and identity vocabulary.
 - Runner-v1 builds one already-diverged fixture at a stable `active` path,
   verifies it, closes it, and freezes its complete physical tree by SHA-256.
   Public execution performs construction in a dedicated process group under a
-  bounded watchdog. That child also byte-digests the completed tree, makes the
-  never-opened APFS clonefile template, and removes `active` before returning
-  an identity-checked handoff. The parent accepts it only after the direct child
+  bounded watchdog. That child byte-digests the completed tree, makes a
+  never-opened reset template, and removes `active` before returning an
+  identity-checked handoff. APFS uses forced clonefile; Linux XFS uses a full
+  verified copy only for process-fresh points with an uncontrolled page cache.
+  The parent accepts it only after the direct child
   has been reaped and the process group is gone. Any failed, partial, or
   panicked fixture build quarantines its disposable workspace instead of
-  deleting possibly active state. Every repetition clone-restores the template
+  deleting possibly active state. Every repetition restores the template
   to that same `active` path, so Lance shallow
   branches retain valid absolute base paths and samples do not accumulate
-  branch, manifest, or deletion history. Reset and pre-timer proof traverse
-  metadata but never read file contents or fall back to a byte copy.
+  branch, manifest, or deletion history. Clonefile never falls back to copying;
+  plain-copy reset reads and verifies all bytes outside timing.
 - Every repetition runs in a fresh worker process whose executable SHA-256,
   source commit/dirty state, Cargo's
   release/opt-level observations, compiler-effective debug assertions, the
@@ -402,8 +404,9 @@ attribution, and a monotonic timer. Process-cold, warmed-by-program, and
 reopened-after-program engine preparation are supported with their exact
 cross-validated cache declarations.
 
-The host probe currently proves APFS on an internal macOS NVMe or SATA SSD. A
-debug build, S3 or Azure backend, server execution, plain-copy reset, unproved
+The host probe proves APFS on an internal macOS NVMe or SATA SSD, or XFS on a
+direct EC2 instance-store NVMe namespace (and distinguishes EBS). A debug
+build, S3 or Azure backend, server execution, unproved
 host declaration, unsupported scenario axis, deadline breach, reset witness
 mismatch, non-general merge route, or content mismatch is refused instead of
 being approximated. A true OS-page-cache-cold claim is not representable yet;

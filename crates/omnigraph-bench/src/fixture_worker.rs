@@ -18,8 +18,11 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::branch_merge::{BranchMergePlan, FixtureBuildSummary, initialize_local_fixture};
-use crate::case::CaseV1;
-use crate::reset::{MetadataDigest, PhysicalDigest, TraversalLimits, freeze_clonefile_template};
+use crate::case::{CaseV1, ResetMode};
+use crate::reset::{
+    MetadataDigest, PhysicalDigest, TraversalLimits, copy_verified, digest_metadata_tree,
+    digest_physical_tree, freeze_clonefile_template,
+};
 #[cfg(unix)]
 use crate::runner::{
     ChildProcessEvidence, configure_fixture_child_environment,
@@ -144,16 +147,48 @@ async fn execute_fixture_request(request: FixtureRequestV1) -> FixtureResultV1 {
         Ok(summary) => summary,
         Err(error) => return failure("fixture_build_failed", error.to_string()),
     };
-    let frozen = match freeze_clonefile_template(
-        &request.active_root,
-        &request.template_root,
-        TraversalLimits::default(),
-    ) {
-        Ok(frozen) => frozen,
-        Err(error) => return failure("fixture_freeze_failed", error.to_string()),
+    let limits = TraversalLimits::default();
+    let (physical, template_metadata) = match case.definition.protocol.reset {
+        ResetMode::LocalClonefile => {
+            let frozen = match freeze_clonefile_template(
+                &request.active_root,
+                &request.template_root,
+                limits,
+            ) {
+                Ok(frozen) => frozen,
+                Err(error) => return failure("fixture_freeze_failed", error.to_string()),
+            };
+            (
+                frozen.physical_digest().clone(),
+                frozen.metadata_digest().clone(),
+            )
+        }
+        ResetMode::PlainCopy => {
+            let physical = match digest_physical_tree(&request.active_root, limits) {
+                Ok(physical) => physical,
+                Err(error) => return failure("fixture_digest_failed", error.to_string()),
+            };
+            if let Err(error) = copy_verified(
+                &request.active_root,
+                &request.template_root,
+                &physical,
+                limits,
+            ) {
+                return failure("fixture_copy_failed", error.to_string());
+            }
+            let metadata = match digest_metadata_tree(&request.template_root, limits) {
+                Ok(metadata) => metadata,
+                Err(error) => return failure("fixture_metadata_failed", error.to_string()),
+            };
+            (physical, metadata)
+        }
+        ResetMode::S3Versioning => {
+            return failure(
+                "unsupported_runner_axis",
+                "local fixture worker cannot freeze an S3 reset template",
+            );
+        }
     };
-    let physical = frozen.physical_digest().clone();
-    let template_metadata = frozen.metadata_digest().clone();
     if let Err(error) = remove_active_tree(&request.active_root) {
         return failure("fixture_active_remove_failed", error);
     }
@@ -744,8 +779,7 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(target_os = "macos")]
-    fn tiny_case() -> ValidatedCase {
+    fn tiny_case(reset: ResetMode) -> ValidatedCase {
         let mut definition = test_case().definition;
         definition.id = "fixture-worker-tiny".to_string();
         definition.fixture.data.tables = 2;
@@ -753,6 +787,7 @@ mod tests {
         definition.fixture.state.history_depth = 6;
         definition.workload.delta_rows_per_side = 3;
         definition.workload.diverged_tables = 1;
+        definition.protocol.reset = reset;
         validate_case(definition).into_result().unwrap()
     }
 
@@ -1007,16 +1042,14 @@ mod tests {
         assert!(error.context.child_process.is_some(), "{error:?}");
     }
 
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn fixture_request_revalidates_builds_and_returns_checked_identity() {
+    async fn assert_fixture_request_round_trip(reset: ResetMode) {
         let workspace = tempfile::tempdir().unwrap();
         let active = workspace.path().join("active");
         let template = workspace.path().join("template");
         let fixture_scratch_root = workspace.path().join("fixture-scratch-v1");
         std::fs::create_dir(&active).unwrap();
         std::fs::create_dir(&fixture_scratch_root).unwrap();
-        let case = tiny_case();
+        let case = tiny_case(reset);
         let result_path = workspace.path().join("result.json");
         let request = FixtureRequestV1 {
             protocol_version: FIXTURE_PROTOCOL_VERSION,
@@ -1047,5 +1080,16 @@ mod tests {
             }
             result => panic!("unexpected fixture result: {result:?}"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn clonefile_fixture_request_revalidates_and_returns_checked_identity() {
+        assert_fixture_request_round_trip(ResetMode::LocalClonefile).await;
+    }
+
+    #[tokio::test]
+    async fn plain_copy_fixture_request_revalidates_and_returns_checked_identity() {
+        assert_fixture_request_round_trip(ResetMode::PlainCopy).await;
     }
 }
