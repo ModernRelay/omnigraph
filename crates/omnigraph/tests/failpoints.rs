@@ -5777,6 +5777,182 @@ async fn stage_a_barrier_reports_exact_operation_before_drift_guard() {
     );
 }
 
+/// Issue #554: a direct `optimize` compacts the graph; the first
+/// post-compaction write dies between arming its v9 recovery intent and its
+/// first table effect (production: the client disconnecting inside the armed
+/// window, or a transient storage failure there). The stranded sidecar is
+/// Armed and effect-free — Lance HEAD still equals the published dataset
+/// version, so `repair` sees no drift — yet before the fix the RFC-022 write
+/// barrier rejected every subsequent write on main with the same operation id
+/// until a read-write reopen, because the roll-forward-only live healer
+/// deferred the rollback-eligible intent forever.
+///
+/// The fixed behavior pinned here: the next write's entry heal retires the
+/// provably effect-free Armed intent under its held schema → branch → table
+/// gates (exact transaction-identity classification, same contract as
+/// `finalize_effect_free_occ_sidecar`) and the write proceeds — a long-lived
+/// server self-heals instead of wedging until restart.
+#[tokio::test]
+#[serial]
+async fn interrupted_write_self_heals_effect_free_armed_intent_issue_554() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    // Several single-insert commits → several fragments for optimize to
+    // compact.
+    for (i, name) in ["alice", "bob", "carol"].into_iter().enumerate() {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", 30 + i as i64)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    // The direct `optimize` between the seed writes and the next write.
+    let optimize_stats = db.optimize().await.unwrap();
+    assert!(
+        !optimize_stats.is_empty(),
+        "optimize must report per-dataset stats"
+    );
+
+    // First post-compaction write dies after its recovery intent is durable
+    // but before any table transaction commits.
+    {
+        let _fp = ScopedFailPoint::new(names::MUTATION_POST_ARM_PRE_EFFECT, "return");
+        let err = mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "dave")], &[("$age", 40)]),
+        )
+        .await
+        .expect_err("armed-window failure must surface as RecoveryRequired");
+        let failed_operation_id = match err {
+            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+            other => panic!("expected RecoveryRequired from the armed window; got: {other}"),
+        };
+        // The interrupted writer stranded exactly its own Armed intent: the
+        // barrier attributes the stranded sidecar, not some other operation.
+        assert_eq!(
+            failed_operation_id,
+            single_sidecar_operation_id(dir.path()),
+            "the RecoveryRequired must name the stranded sidecar's operation id"
+        );
+    }
+
+    // The stranded intent is effect-free: Lance HEAD == published dataset
+    // version on the pinned dataset, so `repair` sees no drift.
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let person_entry = snapshot.dataset("node:Person").unwrap();
+    let person_uri = node_table_uri(&db, "Person").await;
+    let person_head = Dataset::open(&person_uri).await.unwrap().version().version;
+    assert_eq!(
+        person_head, person_entry.published_dataset_version,
+        "the stranded sidecar must be effect-free (no Lance drift)"
+    );
+
+    // The next write through the SAME long-lived handle must retire the
+    // provably effect-free intent at its entry heal and then succeed — no
+    // read-write reopen required.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "erin")], &[("$age", 50)]),
+    )
+    .await
+    .expect("the live handle must self-heal the effect-free intent and write");
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "the effect-free Armed intent must be retired by the write's entry heal"
+    );
+
+    // The interrupted write left nothing; the healed write landed.
+    assert_eq!(
+        sorted_person_names(&db).await,
+        vec!["alice", "bob", "carol", "erin"],
+        "seed writes plus the healed write — and no dave from the interrupted write"
+    );
+}
+
+/// The version-gate exclusion of the issue #554 live retirement: a pre-v9
+/// sidecar carrying the exact-effect protocol (schema-v3, the RFC-022
+/// generation before identity-aware v9) must keep deferring to the next
+/// ReadWrite open. This is the exclusion whose failure mode is an error, not
+/// a decline — `finalize_effect_free_occ_sidecar` ERRORS on pre-v9 input —
+/// so without the `schema_version` gate the live heal would abort the whole
+/// sweep instead of fencing the one branch.
+#[tokio::test]
+#[serial]
+async fn live_heal_defers_pre_v9_armed_effect_free_sidecar() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "alice")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+
+    // Strand a REAL Armed effect-free v9 sidecar, then rewrite it on disk as
+    // its schema-v3 generation ancestor. v9 retains the exact-effect
+    // `protocol_v3` payload shape, so only the declared generation changes —
+    // producing the pre-identity envelope the version gate must exclude.
+    {
+        let _fp = ScopedFailPoint::new(names::MUTATION_POST_ARM_PRE_EFFECT, "return");
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "bob")], &[("$age", 40)]),
+        )
+        .await
+        .expect_err("armed-window failure must surface as RecoveryRequired");
+    }
+    let stranded_operation_id = single_sidecar_operation_id(dir.path());
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{stranded_operation_id}.json"));
+    let mut sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    sidecar["schema_version"] = 3.into();
+    std::fs::write(&sidecar_path, serde_json::to_string(&sidecar).unwrap()).unwrap();
+
+    // The live heal must DEFER the pre-v9 intent (no retirement, no sweep
+    // abort): the next write fails typed with the stranded operation id.
+    let err = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "carol")], &[("$age", 50)]),
+    )
+    .await
+    .expect_err("a pre-v9 Armed intent must keep fencing writes on its branch");
+    match err {
+        OmniError::RecoveryRequired { operation_id, .. } => assert_eq!(
+            operation_id, stranded_operation_id,
+            "the barrier must still attribute the deferred pre-v9 intent"
+        ),
+        other => panic!("expected RecoveryRequired from the deferred pre-v9 intent; got: {other}"),
+    }
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()),
+        vec![stranded_operation_id],
+        "the pre-v9 sidecar must survive the live heal untouched"
+    );
+}
+
 /// The other half of the orphan-discard fault matrix: the audit append
 /// fails AFTER the recovery commit landed. The retry (keyed on the
 /// audit row, the operator-facing record) must converge to exactly one

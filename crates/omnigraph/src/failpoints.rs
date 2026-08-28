@@ -294,6 +294,12 @@ pub mod names {
     /// After the v3 ownership sidecar is durable but before the first deferred
     /// named-table ref is created. Recovery must accept the absent target ref.
     pub const MUTATION_POST_SIDECAR_PRE_FORK: &str = "mutation.post_sidecar_pre_fork";
+    /// The v9 mutation/load recovery intent is durable (Armed) but no table
+    /// transaction has committed yet — the window where a writer failure or
+    /// cancellation strands an effect-free sidecar (issue #554). Unlike
+    /// `MUTATION_POST_SIDECAR_PRE_FORK`, this fires for every enrolled
+    /// mutation/load, main-branch writes included.
+    pub const MUTATION_POST_ARM_PRE_EFFECT: &str = "mutation.post_arm_pre_effect";
     /// Deterministic OCC rendezvous after a mutation has validated and staged
     /// its complete attempt, but before the RFC-022 branch effect gate is
     /// acquired and the write authority token is revalidated. Tests park the
