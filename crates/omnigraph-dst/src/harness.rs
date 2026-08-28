@@ -47,6 +47,10 @@ pub const UNIVERSE_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// `#[serial]` test — so without this, a panicked faulty universe arms
 /// the next universe's realm (weather/kill into a concurrent race, an
 /// arbiter into a sequential universe, a bytes canary into anything).
+/// ALSO runs at `run_universe_caught`'s exit (both outcomes): the
+/// start-side clear only protects the next UNIVERSE, and a manual
+/// (non-universe) test following a panicked faulty universe would
+/// otherwise inherit its armed weather.
 pub(crate) fn clear_process_slots() {
     crate::lance_faults::set_active(None);
     crate::lance_faults::set_kill(None);
@@ -725,15 +729,16 @@ pub struct Scenario {
     pub world_match_until: Option<usize>,
     /// KEEP-SERVING phase (issue #554): on a `RecoveryRequired` failure,
     /// DEFER reconcile's reopen and keep the SAME handle serving — the
-    /// long-lived-server shape v1 structurally never had. The value is the
-    /// budget: this many consecutive refusals naming one operation id fire
-    /// the live-write-availability detector. The watch resolves (deferred
-    /// arbitration runs) on a success, any other failure — different-id
-    /// refusals and scheduled crashes included — or loop end. Scope-out:
-    /// a retry-born `RecoveryRequired` inside the ack-loss client-retry
-    /// path never arms or extends a watch (the original error already
-    /// resolved any watch, and that site reopens as in v1).
-    /// 0 = off (every pre-existing pinned seed keeps its exact behavior).
+    /// long-lived-server shape where the handle is never reopened on first
+    /// refusal. The value is the budget: this many refusals naming one
+    /// operation id fire the live-write-availability detector. The watch
+    /// resolves (deferred arbitration runs) on a success, any other
+    /// failure — different-id refusals and scheduled crashes included,
+    /// EXCEPT a clean-recovery-state maintenance refusal, which continues
+    /// the watch without counting — or loop end. `client_retry` is
+    /// mutually scoped out (enforced by assert at universe start).
+    /// 0 = off; standing constraint: the knob must never perturb an
+    /// existing pin's op stream or rng draws.
     pub keep_serving_ops: usize,
 }
 
@@ -1068,7 +1073,8 @@ pub struct UniverseReport {
     /// Continuous-verification passes performed during the run.
     pub verified: usize,
     /// Ops that failed for a LEGAL reason (injected fault, RI rejection,
-    /// model-predicted merge conflict).
+    /// model-predicted merge conflict, keep-serving deferral refusals —
+    /// the watched streak and the maintenance-barrier spelling).
     pub legal_rejections: usize,
     /// errors the Lance-realm injector actually delivered —
     /// evidence the table realm saw weather (0 in clean universes).
@@ -1128,19 +1134,30 @@ pub struct UniverseReport {
     /// Every reconcile arbitration this universe performed —
     /// (context, verdict, channel) where context names what died or was
     /// deferred (`crash:<window>@op<i>`, `crash-state:write#k@op<i>`,
-    /// `fault@op<i>`, `keep-serving-deferred@op<i>`),
-    /// verdict is `Applied` / `ForkOnly` / `NotApplied`,
+    /// `fault@op<i>`, `watch-interrupt@op<i>` for a watch-ending op judged
+    /// inside the resolution, `keep-serving-deferred@op<i>`),
+    /// verdict is `Applied` / `ForkOnly` / `NotApplied` — the
+    /// keep-serving-deferred rows append ` matched=<composition>`
+    /// provenance (e.g. `Applied matched=A+E`), a human-triage surface,
+    /// deliberately unasserted (lance-realm compositions are
+    /// process-context-sensitive) —
     /// and channel is the observation surface the ruling rested on
     /// ("query", or "query+physical" when the ghost tie-break consulted
     /// the physical channel). The per-death RESULT the ledger records for
-    /// hits. Deterministic and replay-compared: an arbitration that flips
-    /// between same-seed runs is itself a caught bug.
+    /// hits. Deterministic and replay-compared for adapter-realm one-op
+    /// rows — an arbitration that flips between same-seed runs is itself
+    /// a caught bug; the keep-serving rows carry the lance-realm envelope
+    /// carve-out.
     pub reconcile_verdicts: Vec<(String, String, String)>,
-    /// Known-defect encounters this universe had —
-    /// carve-outs and by-design behaviors firing during workload ops, each
-    /// tagged with its tracking reference (e.g.
-    /// `reopen-heals-barrier@op12`, `recovery-barrier-on-retry@op9`).
-    /// The "did this run meet any known issue" column.
+    /// Known-defect encounters AND experiment bookkeeping this universe
+    /// had — carve-outs and by-design behaviors firing during workload
+    /// ops, each tagged with its tracking reference (e.g.
+    /// `reopen-heals-barrier@op12`, `recovery-barrier-on-retry@op9`),
+    /// plus the keep-serving rows: `keep-serving-defer@op<i>:<id>` (or
+    /// `:recovery-barrier` for the clean-recovery-state spelling that
+    /// names no id; consumed by the pinned panel's shape assert) and the
+    /// resolution rows (`keep-serving-healed@/interrupted@/expired@end`,
+    /// asserted defer-implies-resolution by the widened regression pin).
     pub known_issues: Vec<String>,
     /// bounded-staleness bite counters — content reads served
     /// as-of an earlier tick, listings served with as-of membership
@@ -1170,6 +1187,11 @@ impl Model {
             .iter()
             .map(|(name, (age, ver))| (name.clone(), *age, *ver))
             .collect()
+    }
+    /// The raw-channel expectation: logical edges ∪ ghosts, sorted (BTreeSet
+    /// union) — the one spelling of what `physical_view_on` must show.
+    fn edges_with_ghosts(&self) -> Vec<(String, String)> {
+        self.edges.union(&self.ghosts).cloned().collect()
     }
     fn edge_pairs(&self) -> Vec<(String, String)> {
         self.edges.iter().cloned().collect()
@@ -1250,10 +1272,17 @@ struct WorldModel {
 
 impl WorldModel {
     fn state_of(&self, branch: &str) -> &Model {
+        self.state_of_opt(branch).expect("live branch")
+    }
+    /// Branch-absence-safe sibling of [`Self::state_of`]: `None` for a branch
+    /// the model does not hold. Callers judging state that can lag or lead
+    /// the model (a keep-serving ruling may have removed a branch between an
+    /// op's sampling and its judgment) use this, never the panicking form.
+    fn state_of_opt(&self, branch: &str) -> Option<&Model> {
         if branch == "main" {
-            &self.main
+            Some(&self.main)
         } else {
-            &self.branches[branch].state
+            self.branches.get(branch).map(|slot| &slot.state)
         }
     }
     fn state_of_mut(&mut self, branch: &str) -> &mut Model {
@@ -2092,10 +2121,15 @@ fn three_way_ghosts(
 /// Does the model expect the engine to reject this op as a merge conflict?
 fn expects_merge_conflict(world: &WorldModel, wop: &WorldOp) -> bool {
     match wop {
-        WorldOp::BranchMerge { source } => {
-            let slot = &world.branches[source.as_str()];
-            predict_merge(&slot.base, &slot.state, &world.main).is_none()
-        }
+        // `get`, not the panicking index: a keep-serving ruling can remove
+        // the source branch between the op's sampling and a post-ruling
+        // recompute. A merge on an absent branch predicts no conflict — its
+        // refusal is legalized by `is_legal_rejection`'s dead-target member.
+        WorldOp::BranchMerge { source } => world
+            .branches
+            .get(source.as_str())
+            .map(|slot| predict_merge(&slot.base, &slot.state, &world.main).is_none())
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -2115,6 +2149,12 @@ fn is_merge_conflict_err(err: &OmniError) -> bool {
 /// rejection; the harness answers it like a real client — reopen (the
 /// documented heal) via the reconcile path. Repro pinned:
 /// `dst_discovery5_stale_sidecar_blocks_maintenance_until_reopen`.
+/// The engine's second spelling of a pending-sidecar refusal — the
+/// `manifest_conflict` text optimize/cleanup/schema-apply raise instead of
+/// typed `RecoveryRequired`. One spelling: the keep-serving barrier branch
+/// and [`is_recovery_barrier_rejection`] both key on it.
+const CLEAN_RECOVERY_BARRIER_TEXT: &str = "requires a clean recovery state";
+
 fn is_recovery_barrier_rejection(wop: &WorldOp, err: &OmniError) -> bool {
     matches!(
         wop,
@@ -2122,7 +2162,7 @@ fn is_recovery_barrier_rejection(wop: &WorldOp, err: &OmniError) -> bool {
             op: Op::Optimize | Op::Cleanup | Op::SchemaAddProperty { .. },
             ..
         }
-    ) && format!("{err:?}").contains("requires a clean recovery state")
+    ) && format!("{err:?}").contains(CLEAN_RECOVERY_BARRIER_TEXT)
 }
 
 // ------------------------------------------------------------------ faults --
@@ -3146,6 +3186,11 @@ async fn assert_world_matches(db: &Omnigraph, world: &WorldModel, where_: &str) 
 /// matter which op kinds produce commits (mutations, loads, merges,
 /// maintenance) — whatever advances the head gets an entry paired with the
 /// model state the claim channel asserts for that moment.
+/// Coherence dependency for keep-serving universes: a mid-watch capture
+/// pairs the CURRENT head with a model that excludes the deferred op —
+/// sound because a pending strand never advances the manifest head (a
+/// partial multi-table commit does not publish), and every head-advancing
+/// entry heal resolves the watch within its own iteration.
 async fn capture_history(db: &Omnigraph, main: &Model, history: &mut Vec<(String, Model)>) {
     // Boxed: composes with the big engine op futures in run_universe's poll
     // frame (2 MiB test-stack trait).
@@ -3272,7 +3317,7 @@ async fn assert_physical_matches(db: &Omnigraph, world: &WorldModel, where_: &st
             m.person_rows(),
             "{where_}: EXPORT persons diverged from model on '{branch}'"
         );
-        let expected: Vec<(String, String)> = m.edges.union(&m.ghosts).cloned().collect();
+        let expected = m.edges_with_ghosts();
         assert_eq!(
             knows, expected,
             "{where_}: EXPORT Knows diverged from model (logical ∪ ghosts) on '{branch}'"
@@ -3280,12 +3325,27 @@ async fn assert_physical_matches(db: &Omnigraph, world: &WorldModel, where_: &st
     }
 }
 
+/// INPUT CONTRACT — the catalog reads `world` to judge the refusal; a
+/// post-ruling world is the correct input (the engine state that produced
+/// the refusal included the healed strand). Every member must be an
+/// ENTRY-TIME refusal with no durable effects: the no-interrupt resolution
+/// path relies on that property, and a future member with durable effects
+/// would silently break it. The dead-target member below covers ops whose
+/// model target a ruling removed.
 fn is_legal_rejection(
     err: &OmniError,
     world: &WorldModel,
     wop: &WorldOp,
     expected_conflict: bool,
 ) -> bool {
+    // Dead-target member: an op whose target is absent from the (post-
+    // ruling) world fails legally per se — the engine refuses a missing
+    // branch with its not-found/already-exists spellings, entry-time and
+    // effect-free. Without this member a mid-watch heal that changes
+    // branch topology turns a correct refusal into a false LegalClaim red.
+    if !op_targets_live(world, wop) {
+        return true;
+    }
     let text = format!("{err:?}");
     if text.contains(FAULT_MARKER) {
         return true;
@@ -3309,11 +3369,14 @@ fn is_legal_rejection(
         return true;
     }
     // RI hypothesis: deleting a person with live edges may be refused.
+    // `state_of_opt`: the branch can be absent from a post-ruling world.
     if let WorldOp::Data {
         branch,
         op: Op::DeletePerson { name },
     } = wop
-        && world.state_of(branch).has_edges_touching(name)
+        && world
+            .state_of_opt(branch)
+            .is_some_and(|m| m.has_edges_touching(name))
         && (text.contains("referential") || text.contains("edge"))
     {
         return true;
@@ -3322,7 +3385,10 @@ fn is_legal_rejection(
 }
 
 /// How a failed op's world state settled after reconcile + recovery reopen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Doubles as an op's standing inside a composition hypothesis
+/// ([`composition_hypotheses`]). Declaration order IS the arbitration's
+/// preference order (`Ord`): more-applied wins ties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ReconcileOutcome {
     /// The op left no trace (rolled back / never landed).
     NotApplied,
@@ -3333,6 +3399,18 @@ enum ReconcileOutcome {
     ForkOnly,
     /// The op survived recovery (rolled forward / was already durable).
     Applied,
+}
+
+impl ReconcileOutcome {
+    /// Fold this outcome's effect into the model — the ONE spelling of the
+    /// outcome→apply match.
+    fn apply(self, world: &mut WorldModel, wop: &WorldOp) {
+        match self {
+            ReconcileOutcome::NotApplied => {}
+            ReconcileOutcome::ForkOnly => apply_fork_only(world, wop),
+            ReconcileOutcome::Applied => apply_world(world, wop),
+        }
+    }
 }
 
 #[cfg_attr(not(feature = "failpoints"), allow(unused_variables))]
@@ -3437,6 +3515,95 @@ async fn maintenance_obligations(
     true
 }
 
+/// Reopen over the same storage after a failure — the recovery sweep. The
+/// caller drops the failed handle first. Carries the DOUBLE-FAULT lever
+/// (kill the FIRST recovery sweep mid-pass, then prove a second clean
+/// reopen still converges) and the bounded retry: the recovery sweep can
+/// ITSELF hit injected faults (it writes sidecars) — a real client
+/// retries. Bounded and seeded, so still deterministic. Shared by
+/// [`reconcile_after_failure`] and [`reconcile_watch_resolution`].
+async fn reopen_under_storm(
+    storage: &Arc<dyn StorageAdapter>,
+    root: &str,
+    label: &str,
+    at_op: usize,
+    recovery_crash: Option<&'static str>,
+) -> Omnigraph {
+    #[cfg(feature = "failpoints")]
+    if let Some(rc) = recovery_crash {
+        let _fp = omnigraph::failpoints::ScopedFailPoint::new(rc, "return");
+        // Best-effort double fault: if the window IS on this crash's recovery
+        // path, the first recovery sweep dies here and we prove a SECOND clean reopen
+        // still converges (below). If it isn't reached, no double fault
+        // happened — window reachability is workload-dependent (the hunt's
+        // lesson); fall through to the normal reopen either way.
+        let _ = Box::pin(Omnigraph::open_with_storage(root, storage.clone())).await;
+        // guard drops here → recovery crash no longer scheduled for the real reopen below
+    }
+    #[cfg(not(feature = "failpoints"))]
+    let _ = recovery_crash;
+
+    const REOPEN_ATTEMPT_CAP: u32 = 16;
+    let mut reopen_attempts = 0u32;
+    loop {
+        match Box::pin(Omnigraph::open_with_storage(root, storage.clone())).await {
+            Ok(db) => break db,
+            Err(e) => {
+                let text = format!("{e:?}");
+                if !text.contains(FAULT_MARKER) {
+                    detectors::violation(
+                        DET_CRASH_CONTRACT,
+                        at_op,
+                        format!("{label}: reopen failed for a NON-injected reason: {e:?}"),
+                        "the recovery reopen fails only on injected faults",
+                    );
+                }
+                reopen_attempts += 1;
+                assert!(
+                    reopen_attempts < REOPEN_ATTEMPT_CAP,
+                    "{label}: recovery never survived the fault storm \
+                     ({REOPEN_ATTEMPT_CAP} attempts; last error: {e:?})"
+                );
+            }
+        }
+    }
+}
+
+/// RECOVERY-OBLIGATION ORACLE (2026-08-12, from the seeded-recovery-no-op
+/// honesty experiment): the state hypotheses alone CANNOT distinguish a
+/// correct rollback from a recovery that silently did nothing — "not
+/// applied" is always legal, and the barrier carve-out excuses subsequent
+/// rejections. With heal_pending_sidecars_roll_forward stubbed to a
+/// no-op, 25 of 26 tests stayed green; only the discovery-5 pin (which
+/// asserts the healing SIDE-EFFECT) went red. So assert recovery's
+/// obligation, not just state legality: a successful read-write reopen
+/// leaves no sidecar residue (the reopen-heals contract).
+/// Runs fault-suspended (callers suspend around reconcile), so this read
+/// is clean. Shared by [`reconcile_after_failure`] and
+/// [`reconcile_watch_resolution`].
+async fn assert_no_recovery_residue(
+    storage: &Arc<dyn StorageAdapter>,
+    root: &str,
+    label: &str,
+    at_op: usize,
+) {
+    let residue = recovery_residue(storage, root).await;
+    // Persisted tier: foreign-named (injected-misdirect) residue is the named
+    // carve-out `s11b-foreign-sidecar-ignored` — recorded, tolerated;
+    // real-named residue still panics (reopen heals what it recognizes).
+    let residue = partition_residue(residue, root, label);
+    if !residue.is_empty() {
+        detectors::violation(
+            DET_RECOVERY_OBLIGATION,
+            at_op,
+            format!(
+                "{label}: recovery reopen left sidecar residue (recovery dead or incomplete?): {residue:?}"
+            ),
+            "a successful read-write reopen leaves __recovery/ empty",
+        );
+    }
+}
+
 /// After ANY failed op (crash window or injected fault): assert atomicity,
 /// reopen over the same storage (= the recovery sweep; a
 /// fault-killed mutation arms a recovery sidecar and the engine BLOCKS
@@ -3446,6 +3613,12 @@ async fn maintenance_obligations(
 /// XOR op applied, plus the fork-survives third state for `LoadFork`) cover
 /// branch existence and every branch's state, so torn branch
 /// creates/deletes/merges violate atomicity exactly like torn mutations.
+///
+/// INPUT CONTRACT — at most ONE unjudged op: `world` must hold the settled
+/// truth of every op except `wop`, whose fate is the single open question
+/// the hypotheses cover. A keep-serving resolution violates that contract
+/// (two ops unjudged: the deferred op and the interrupting op) and uses
+/// [`reconcile_watch_resolution`] instead.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_after_failure(
     db: Omnigraph,
@@ -3457,9 +3630,17 @@ async fn reconcile_after_failure(
     at_op: usize,
     recovery_crash: Option<&'static str>,
 ) -> (Omnigraph, ReconcileOutcome, &'static str) {
+    // Stale-capture rule on [`resolve_keep_serving_watch`]: a ruling can
+    // remove the op's target between its sampling and this judgment. A
+    // dead-target op has exactly one legal outcome — NotApplied — enforced
+    // below at the outcome derivation and the tie-break gate, not just the
+    // `as_with` build.
+    let target_live = op_targets_live(world, wop);
     let with = {
         let mut w = world.clone();
-        apply_world(&mut w, wop);
+        if target_live {
+            apply_world(&mut w, wop);
+        }
         w
     };
     let visible = observe_world(&db).await;
@@ -3488,45 +3669,7 @@ async fn reconcile_after_failure(
     let fork_was_visible = as_fork_only.as_ref() == Some(&visible);
 
     drop(db);
-
-    // DOUBLE-FAULT lever: kill the FIRST recovery sweep mid-pass, then
-    // prove a second (clean) reopen still converges to a legal state.
-    #[cfg(feature = "failpoints")]
-    if let Some(rc) = recovery_crash {
-        let _fp = omnigraph::failpoints::ScopedFailPoint::new(rc, "return");
-        // Best-effort double fault: if the window IS on this crash's recovery
-        // path, the first recovery sweep dies here and we prove a SECOND clean reopen
-        // still converges (below). If it isn't reached, no double fault
-        // happened — window reachability is workload-dependent (the hunt's
-        // lesson); fall through to the normal reopen either way.
-        let _ = Box::pin(Omnigraph::open_with_storage(root, storage.clone())).await;
-        // guard drops here → recovery crash no longer scheduled for the real reopen below
-    }
-
-    // The recovery sweep can ITSELF hit injected faults (it writes sidecars) — a real
-    // client retries. Bounded and seeded, so still deterministic.
-    let mut reopen_attempts = 0u32;
-    let db = loop {
-        match Box::pin(Omnigraph::open_with_storage(root, storage.clone())).await {
-            Ok(db) => break db,
-            Err(e) => {
-                let text = format!("{e:?}");
-                if !text.contains(FAULT_MARKER) {
-                    detectors::violation(
-                        DET_CRASH_CONTRACT,
-                        at_op,
-                        format!("{label}: reopen failed for a NON-injected reason: {e:?}"),
-                        "the recovery reopen fails only on injected faults",
-                    );
-                }
-                reopen_attempts += 1;
-                assert!(
-                    reopen_attempts < 16,
-                    "{label}: recovery never survived the fault storm"
-                );
-            }
-        }
-    };
+    let db = reopen_under_storm(&storage, root, label, at_op, recovery_crash).await;
     let after = observe_world(&db).await;
     if !legal(&after) {
         detectors::violation(
@@ -3536,32 +3679,7 @@ async fn reconcile_after_failure(
             "post-recovery world renders as base, applied, or fork-only",
         );
     }
-    // RECOVERY-OBLIGATION ORACLE (2026-08-12, from the seeded-recovery-no-op
-    // honesty experiment): the state hypotheses alone CANNOT distinguish a
-    // correct rollback from a recovery that silently did nothing — "not
-    // applied" is always legal, and the barrier carve-out excuses subsequent
-    // rejections. With heal_pending_sidecars_roll_forward stubbed to a
-    // no-op, 25 of 26 tests stayed green; only the discovery-5 pin (which
-    // asserts the healing SIDE-EFFECT) went red. So assert recovery's
-    // obligation, not just state legality: a successful read-write reopen
-    // leaves no sidecar residue (the reopen-heals contract).
-    // Runs fault-suspended (callers suspend around reconcile), so this read
-    // is clean.
-    let residue = recovery_residue(&storage, root).await;
-    // Persisted tier: foreign-named (injected-misdirect) residue is the named
-    // carve-out `s11b-foreign-sidecar-ignored` — recorded, tolerated;
-    // real-named residue still panics (reopen heals what it recognizes).
-    let residue = partition_residue(residue, root, label);
-    if !residue.is_empty() {
-        detectors::violation(
-            DET_RECOVERY_OBLIGATION,
-            at_op,
-            format!(
-                "{label}: recovery reopen left sidecar residue (recovery dead or incomplete?): {residue:?}"
-            ),
-            "a successful read-write reopen leaves __recovery/ empty",
-        );
-    }
+    assert_no_recovery_residue(&storage, root, label, at_op).await;
     if committed && after != as_with {
         detectors::violation(
             DET_CRASH_CONTRACT,
@@ -3580,11 +3698,15 @@ async fn reconcile_after_failure(
             "recovery monotonicity: a durably created fork branch survives recovery",
         );
     }
-    let mut outcome = if after == as_with {
+    let mut outcome = if target_live && after == as_with {
         ReconcileOutcome::Applied
     } else if as_fork_only.as_ref() == Some(&after) {
         ReconcileOutcome::ForkOnly
     } else {
+        // Includes the dead-target case: `as_with == as_model` there, and
+        // the Applied arm above is gated off so the collapse cannot be
+        // mislabeled Applied (and the caller's `outcome.apply` stays a
+        // no-op instead of panicking or overwriting a slot).
         ReconcileOutcome::NotApplied
     };
     // Which channel the ruling rests on — recorded so the run tables carry
@@ -3598,8 +3720,9 @@ async fn reconcile_after_failure(
     // guesses. Before the physical-channel oracle existed, that guess quietly
     // recorded ghosts that never landed (caught at final audit). The raw
     // channel is the one read that can resolve it: consult it for the
-    // touched branch.
-    if as_model == as_with {
+    // touched branch. `target_live` gate: a dead-target collapse also makes
+    // the renders equal, but its branch is gone — nothing to consult.
+    if target_live && as_model == as_with {
         let touched = match wop {
             WorldOp::Data { branch, .. } => Some(branch),
             _ => None,
@@ -3610,14 +3733,8 @@ async fn reconcile_after_failure(
             if g_world != g_with {
                 channel = "query+physical";
                 let (_, knows) = Box::pin(physical_view_on(&db, branch)).await;
-                let expect_with: Vec<(String, String)> =
-                    with.state_of(branch).edges.union(g_with).cloned().collect();
-                let expect_world: Vec<(String, String)> = world
-                    .state_of(branch)
-                    .edges
-                    .union(g_world)
-                    .cloned()
-                    .collect();
+                let expect_with = with.state_of(branch).edges_with_ghosts();
+                let expect_world = world.state_of(branch).edges_with_ghosts();
                 outcome = if knows == expect_with {
                     ReconcileOutcome::Applied
                 } else if knows == expect_world {
@@ -3685,12 +3802,7 @@ async fn assert_traversal_modes_agree(
         }
         // Bound arm: gated ∪ ghosts, exactly.
         let bound = Box::pin(knows_pairs_bound_target(db, ReadTarget::branch(branch))).await;
-        let expected_bound: Vec<(String, String)> = world
-            .state_of(branch)
-            .edges
-            .union(&world.state_of(branch).ghosts)
-            .cloned()
-            .collect();
+        let expected_bound = world.state_of(branch).edges_with_ghosts();
         assert_eq!(
             bound, expected_bound,
             "{where_}: BOUND-ARM divergence on '{branch}' — the bound-edge spelling must \
@@ -3992,6 +4104,7 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
     // arming, and the 16 MiB universe thread — birth universes run a
     // fixed handful of init calls with no workload randomness and no
     // deep engine futures; per-call Box::pin covers the stack.
+    detectors::install_violation_panic_hook();
     clear_process_slots();
     crate::env_knobs::require_pool_env();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4120,6 +4233,7 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
 #[cfg(feature = "failpoints")]
 pub fn run_open_crash_universe(root: &'static str, window: &'static str) -> bool {
     // Same deliberate omissions as `run_birth_universe` (its note).
+    detectors::install_violation_panic_hook();
     clear_process_slots();
     crate::env_knobs::require_pool_env();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4175,10 +4289,22 @@ pub fn run_open_crash_universe(root: &'static str, window: &'static str) -> bool
 
 // ---------------------------------------------------------------- universe --
 
-/// The first `known_issues` label consumed across the crate boundary: the
-/// pinned panel's shape assert keys on it, so the spelling lives in exactly
-/// one place.
+/// Consumed across the crate boundary — the pinned panel's shape assert
+/// keys on it, so the spelling lives in exactly one place.
 pub const KEEP_SERVING_DEFER_PREFIX: &str = "keep-serving-defer@";
+/// Watch-resolution row prefixes — same one-spelling rule as the defer
+/// prefix: the widened regression test's resolution-row assert keys on
+/// these, so producer and reader share the consts.
+pub const KEEP_SERVING_HEALED_PREFIX: &str = "keep-serving-healed@";
+pub const KEEP_SERVING_INTERRUPTED_PREFIX: &str = "keep-serving-interrupted@";
+pub const KEEP_SERVING_EXPIRED_PREFIX: &str = "keep-serving-expired@end";
+
+/// One spelling of the defer row (`keep-serving-defer@op<i>:<tail>` where
+/// the tail is the refused operation id, or `recovery-barrier` for the
+/// clean-recovery-state spelling that names none).
+fn keep_serving_defer_row(i: usize, tail: &str) -> String {
+    format!("{KEEP_SERVING_DEFER_PREFIX}op{i}:{tail}")
+}
 
 /// KEEP-SERVING watch (issue #554): the pending recovery operation the live
 /// handle is currently refused on, with reconcile's REOPEN withheld — never
@@ -4194,17 +4320,435 @@ struct KeepServingWatch {
     deferred_wop: WorldOp,
 }
 
-/// Resolve a keep-serving watch: push the site's `known_issues` row
-/// (`keep-serving-<site>:<id> after N refusals (first at opK)`), then run
-/// the DEFERRED two-picture arbitration (reopen included) for the watch's
-/// op and apply the outcome to the model.
+/// The interrupting event at a keep-serving resolution: the op whose
+/// outcome ended the watch — the second unjudged op the widened
+/// arbitration exists for ([`reconcile_watch_resolution`]).
+struct WatchInterrupt<'a> {
+    wop: &'a WorldOp,
+    /// true = E is known applied (a success ended the watch — the healed
+    /// composition): the E-absent hypotheses are impossible and dropped.
+    /// false = E failed/died with possibly-durable effects: its fate is
+    /// judged here alongside A's.
+    applied: bool,
+}
+
+/// The standings one op can take inside a composition: `Applied`, the
+/// `LoadFork` fork-survives half-state, `NotApplied`.
+fn op_modes(wop: &WorldOp) -> Vec<ReconcileOutcome> {
+    let mut modes = vec![ReconcileOutcome::Applied];
+    if matches!(wop, WorldOp::LoadFork { .. }) {
+        modes.push(ReconcileOutcome::ForkOnly);
+    }
+    modes.push(ReconcileOutcome::NotApplied);
+    modes
+}
+
+/// One composition hypothesis: what the deferred op (A) and the
+/// interrupting op (E) did, in which order, with the model and render that
+/// history produces.
+struct CompositionHypothesis {
+    a: ReconcileOutcome,
+    e: ReconcileOutcome,
+    /// Order: E composed BEFORE A. A distinct hypothesis exactly because
+    /// state-derived ops (`BranchCreate`, `LoadFork`, `BranchMerge`) read
+    /// branch state at their moment — `A+E` and `E+A` render differently
+    /// when E forks a branch A's effect lives on (specimen seed 24).
+    e_first: bool,
+    world: WorldModel,
+    render: WorldState,
+}
+
+impl CompositionHypothesis {
+    /// Report provenance: which composition this is, e.g. `A+E`, `E`,
+    /// `fork(A)+E`, `none`.
+    fn desc(&self, has_interrupt: bool) -> String {
+        let name = |m: ReconcileOutcome, tag: &str| match m {
+            ReconcileOutcome::NotApplied => None,
+            ReconcileOutcome::ForkOnly => Some(format!("fork({tag})")),
+            ReconcileOutcome::Applied => Some(tag.to_string()),
+        };
+        let a = name(self.a, "A");
+        let e = if has_interrupt {
+            name(self.e, "E")
+        } else {
+            None
+        };
+        let parts: Vec<String> = if self.e_first {
+            [e, a].into_iter().flatten().collect()
+        } else {
+            [a, e].into_iter().flatten().collect()
+        };
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join("+")
+        }
+    }
+}
+
+/// Can `wop` be applied to this model at all? Guards every panic
+/// `apply_world` can raise ("live branch" on `Data`, the `BranchMerge`
+/// source index, `BranchDelete` of an absent name) plus the create dual:
+/// a `BranchCreate` of a name the model already holds is physically
+/// impossible (the engine refuses an existing name), and building it
+/// would overwrite the slot and rule provenance on a phantom composition.
+/// A composition ORDER can legitimately produce any of these states —
+/// e.g. E-first `BranchDelete b0` followed by A on `b0` — and such an
+/// order is structurally impossible, not a bug: the hypothesis is
+/// dropped, never built. Scope-out: a `LoadFork` applied after its branch
+/// already exists models the engine's load-into-existing path as
+/// fork-plus-load (slot overwrite) — a semantic approximation, kept
+/// because excluding the order could drop the true composition.
+fn op_targets_live(world: &WorldModel, wop: &WorldOp) -> bool {
+    match wop {
+        WorldOp::Data { branch, .. } => world.state_of_opt(branch).is_some(),
+        WorldOp::BranchMerge { source } => world.branches.contains_key(source),
+        WorldOp::BranchDelete { name } => world.branches.contains_key(name),
+        WorldOp::BranchCreate { name } => !world.branches.contains_key(name),
+        WorldOp::LoadFork { .. } => true,
+    }
+}
+
+/// Render every legal composition of the deferred op A and (when present)
+/// the interrupting op E from the CURRENT model: for each combination of
+/// standings, clone the model, apply the ops in the composition's order,
+/// render. Orders whose next op targets a branch state that makes it
+/// impossible are skipped ([`op_targets_live`]). Sorted most-applied-first
+/// (A's standing, then E's, then A-first order — `ReconcileOutcome`'s
+/// `Ord`) so first-match preference mirrors [`reconcile_after_failure`]'s
+/// `Applied`-before-`ForkOnly`-before-`NotApplied` outcome order. With no
+/// interrupt this is exactly the one-op set {applied, (fork-only,)
+/// absent}.
+fn composition_hypotheses(
+    world: &WorldModel,
+    deferred: &WorldOp,
+    interrupt: Option<&WatchInterrupt<'_>>,
+) -> Vec<CompositionHypothesis> {
+    let a_modes = op_modes(deferred);
+    let e_modes = match interrupt {
+        None => vec![ReconcileOutcome::NotApplied],
+        Some(i) if i.applied => vec![ReconcileOutcome::Applied],
+        Some(i) => op_modes(i.wop),
+    };
+    let mut hyps = Vec::new();
+    for &a in &a_modes {
+        for &e in &e_modes {
+            let orders: &[bool] =
+                if a != ReconcileOutcome::NotApplied && e != ReconcileOutcome::NotApplied {
+                    &[false, true]
+                } else {
+                    &[false]
+                };
+            'order: for &e_first in orders {
+                let mut w = world.clone();
+                let seq: [(Option<&WorldOp>, ReconcileOutcome); 2] = if e_first {
+                    [(interrupt.map(|i| i.wop), e), (Some(deferred), a)]
+                } else {
+                    [(Some(deferred), a), (interrupt.map(|i| i.wop), e)]
+                };
+                for (op, mode) in seq {
+                    let Some(op) = op else { continue };
+                    if mode == ReconcileOutcome::NotApplied {
+                        continue;
+                    }
+                    if !op_targets_live(&w, op) {
+                        continue 'order;
+                    }
+                    mode.apply(&mut w, op);
+                }
+                let render = w.render();
+                hyps.push(CompositionHypothesis {
+                    a,
+                    e,
+                    e_first,
+                    world: w,
+                    render,
+                });
+            }
+        }
+    }
+    hyps.sort_by(|x, y| {
+        y.a.cmp(&x.a)
+            .then(y.e.cmp(&x.e))
+            .then(x.e_first.cmp(&y.e_first))
+    });
+    hyps
+}
+
+/// The widened resolution's verdict: both ops' outcomes, the matched
+/// composition (report provenance), and that composition's model — the
+/// matching composition becomes the model, wholesale.
+struct WatchRuling {
+    a_outcome: ReconcileOutcome,
+    /// `Some` exactly when an interrupt was passed. CANONICAL exactly-once
+    /// contract: the interrupting op's judgment is FINAL here and the call
+    /// site MUST NOT judge it again — the resolution's reopen empties
+    /// `__recovery/` of every recognized-name strand (the tolerated
+    /// foreign-named carve-out is an injected misdirect, never an op's own
+    /// strand), so nothing survives to change the op's fate.
+    e_outcome: Option<ReconcileOutcome>,
+    matched: String,
+    world: WorldModel,
+}
+
+/// The keep-serving resolution's arbitration (the #559 composition
+/// widening; regression evidence in
+/// `dst_keep_serving_widened_arbitration_no_false_reds`): judge the
+/// deferred op A and the interrupting op E TOGETHER, against every legal
+/// composition and order of the pair. [`reconcile_after_failure`]'s one-op
+/// set assumes at most one unjudged op separates model from store; the
+/// watch's deferral breaks that invariant — the regression test's doc
+/// carries the three proven break shapes. Red only when NO composition
+/// matches; the matching composition becomes the model.
 ///
-/// This is the canonical statement of the deferral contract: the watch
-/// withholds only the REOPEN, so resolution must run before any other
-/// reconcile can reopen, or the model would carry an unjudged effect
-/// window through Full recovery. No `maintenance_obligations` pass runs
-/// here: the deferred op was refused at the write entry and never
-/// executed, so no partial maintenance state can exist.
+/// Same six steps as [`reconcile_after_failure`] — look, reopen
+/// ([`reopen_under_storm`]), look again, residue
+/// ([`assert_no_recovery_residue`]), monotonicity, rule — with the checks
+/// generalized to the widened set: a fact every pre-reopen match agrees on
+/// must survive recovery, and render ties whose models differ resolve
+/// through the physical channel like the one-op ghost tie-break.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_watch_resolution(
+    db: Omnigraph,
+    storage: Arc<dyn StorageAdapter>,
+    root: &str,
+    deferred: &WorldOp,
+    interrupt: Option<&WatchInterrupt<'_>>,
+    world: &WorldModel,
+    label: &str,
+    at_op: usize,
+) -> (Omnigraph, WatchRuling, &'static str) {
+    let hyps = composition_hypotheses(world, deferred, interrupt);
+    // The failure carries its own triage: a no-match red prints every
+    // candidate composition it compared, so the reader can diff instead of
+    // re-deriving (the #559 root-cause lesson — with the renders in the
+    // message, diagnosis took two runs; without, a dedicated session).
+    let candidates = |hyps: &[CompositionHypothesis]| {
+        hyps.iter()
+            .map(|h| format!("{}={:?}", h.desc(interrupt.is_some()), h.render))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let matches_of = |state: &WorldState| -> Vec<usize> {
+        hyps.iter()
+            .enumerate()
+            .filter(|(_, h)| h.render == *state)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let visible = observe_world(&db).await;
+    let visible_matches = matches_of(&visible);
+    if visible_matches.is_empty() {
+        detectors::violation(
+            DET_CRASH_CONTRACT,
+            at_op,
+            format!(
+                "{label}: PARTIAL application (deferred={deferred:?}, interrupt={:?}); \
+                 visible={visible:?}; candidates: {}",
+                interrupt.map(|i| i.wop),
+                candidates(&hyps)
+            ),
+            "the pre-reopen world renders as a legal composition of the unjudged ops",
+        );
+    }
+    drop(db);
+    // `recovery_crash: None` — the double-fault lever is deliberately not
+    // exercised at watch resolutions (parity with the kill/fault reconcile
+    // sites; the crash-window arm resolves BEFORE `crash_op`, so the lever
+    // still fires on that crash's own reconcile). A keep-serving ×
+    // double-fault arm is recorded future work.
+    let db = reopen_under_storm(&storage, root, label, at_op, None).await;
+    let after = observe_world(&db).await;
+    let mut after_matches = matches_of(&after);
+    if after_matches.is_empty() {
+        detectors::violation(
+            DET_CRASH_CONTRACT,
+            at_op,
+            format!(
+                "{label}: recovery produced an illegal state (deferred={deferred:?}, \
+                 interrupt={:?}); after={after:?}; candidates: {}",
+                interrupt.map(|i| i.wop),
+                candidates(&hyps)
+            ),
+            "the post-recovery world renders as a legal composition of the unjudged ops",
+        );
+    }
+    assert_no_recovery_residue(&storage, root, label, at_op).await;
+    // Ambiguity: several compositions can render identically while their
+    // MODELS differ in ghost content. Resolve through the physical channel
+    // per touched branch; a raw read matching NO tied composition is its
+    // own violation. Runs BEFORE the monotonicity checks so they judge the
+    // narrowed set — quantifying over pre-narrowing ties could let the
+    // tie-break eliminate the only Applied match after a demotion check
+    // already passed, installing a demoted model with no red. Scope:
+    // `touched` covers the `Data` branches of A and E only — a ghost
+    // divergence born inside a `LoadFork`'s fork copy or a `BranchMerge`'s
+    // ghost import falls to preference order. Acceptable while ghosts are
+    // empty by construction (post-#474; the ghost set is a regression
+    // tripwire), and inherited from [`reconcile_after_failure`]'s identical
+    // Data-only tie-break scope. Ties whose models are ghost-identical fall
+    // to preference order — the models being equal, the pick is immaterial.
+    let mut channel: &'static str = "query";
+    if after_matches.len() > 1 {
+        let mut touched: Vec<&String> = Vec::new();
+        if let WorldOp::Data { branch, .. } = deferred {
+            touched.push(branch);
+        }
+        if let Some(i) = interrupt
+            && let WorldOp::Data { branch, .. } = i.wop
+        {
+            touched.push(branch);
+        }
+        for branch in touched {
+            // The raw expectation per tied composition: edges ∪ ghosts on
+            // the touched branch (None = branch absent in that model —
+            // uniform across ties, since the shared render lists branches).
+            let expectations: Vec<Option<Vec<(String, String)>>> = after_matches
+                .iter()
+                .map(|&idx| {
+                    hyps[idx]
+                        .world
+                        .state_of_opt(branch)
+                        .map(Model::edges_with_ghosts)
+                })
+                .collect();
+            let first = &expectations[0];
+            if first.is_none() || expectations.iter().all(|e| e == first) {
+                continue;
+            }
+            channel = "query+physical";
+            let (_, knows) = Box::pin(physical_view_on(&db, branch)).await;
+            let keep: Vec<usize> = after_matches
+                .iter()
+                .zip(&expectations)
+                .filter(|(_, e)| e.as_deref() == Some(knows.as_slice()))
+                .map(|(&idx, _)| idx)
+                .collect();
+            if keep.is_empty() {
+                detectors::violation(
+                    DET_ARBITRATION_PHYSICAL,
+                    at_op,
+                    format!(
+                        "{label}: physical channel matches NO tied composition on \
+                         '{branch}' (physical={knows:?}; tied expectations: {:?})",
+                        expectations
+                    ),
+                    "the export tie-break resolves ghost-only differences to one composition",
+                );
+            }
+            after_matches = keep;
+        }
+    }
+    // Monotonicity across the widened set, judged on the NARROWED matches:
+    // a fact EVERY pre-reopen match agrees on must not be undone by
+    // recovery. Quantified over all matches ([`reconcile_after_failure`]
+    // uses exact equality on its single `as_with`) so render ambiguity
+    // never manufactures a false demotion.
+    let demoted = |get: &dyn Fn(&CompositionHypothesis) -> ReconcileOutcome| {
+        visible_matches
+            .iter()
+            .all(|&i| get(&hyps[i]) == ReconcileOutcome::Applied)
+            && !after_matches
+                .iter()
+                .any(|&i| get(&hyps[i]) == ReconcileOutcome::Applied)
+    };
+    // Fork-survives oracle, both operands: the implicit fork is a fully
+    // published branch create; recovery must never delete it (it may still
+    // roll the LOAD forward).
+    let fork_deleted = |get: &dyn Fn(&CompositionHypothesis) -> ReconcileOutcome| {
+        visible_matches
+            .iter()
+            .all(|&i| get(&hyps[i]) != ReconcileOutcome::NotApplied)
+            && after_matches
+                .iter()
+                .all(|&i| get(&hyps[i]) == ReconcileOutcome::NotApplied)
+    };
+    if demoted(&|h| h.a) {
+        detectors::violation(
+            DET_CRASH_CONTRACT,
+            at_op,
+            format!(
+                "{label}: recovery DEMOTED a committed write (deferred={deferred:?}); after={after:?}"
+            ),
+            "recovery monotonicity: a committed write stays applied",
+        );
+    }
+    if matches!(deferred, WorldOp::LoadFork { .. }) && fork_deleted(&|h| h.a) {
+        detectors::violation(
+            DET_CRASH_CONTRACT,
+            at_op,
+            format!(
+                "{label}: recovery DELETED a durably created implicit fork branch \
+                 (deferred={deferred:?}); after={after:?}"
+            ),
+            "recovery monotonicity: a durably created fork branch survives recovery",
+        );
+    }
+    if let Some(i) = interrupt
+        && !i.applied
+    {
+        if matches!(i.wop, WorldOp::LoadFork { .. }) && fork_deleted(&|h| h.e) {
+            detectors::violation(
+                DET_CRASH_CONTRACT,
+                at_op,
+                format!(
+                    "{label}: recovery DELETED the interrupting op's durably created \
+                     implicit fork branch (interrupt={:?}); after={after:?}",
+                    i.wop
+                ),
+                "recovery monotonicity: a durably created fork branch survives recovery",
+            );
+        }
+        if demoted(&|h| h.e) {
+            detectors::violation(
+                DET_CRASH_CONTRACT,
+                at_op,
+                format!(
+                    "{label}: recovery DEMOTED the interrupting op's committed write (interrupt={:?}); after={after:?}",
+                    i.wop
+                ),
+                "recovery monotonicity: a committed write stays applied",
+            );
+        }
+    }
+    let winner = &hyps[after_matches[0]];
+    let ruling = WatchRuling {
+        a_outcome: winner.a,
+        e_outcome: interrupt.map(|_| winner.e),
+        matched: winner.desc(interrupt.is_some()),
+        world: winner.world.clone(),
+    };
+    (db, ruling, channel)
+}
+
+/// Resolve a keep-serving watch: push the site's `known_issues` row
+/// (`<site-prefix>op<i>:<id> after N refusals (first at opK)`), run the
+/// DEFERRED arbitration ([`reconcile_watch_resolution`]) — widened with
+/// the interrupting op E when one exists — and install the matched
+/// composition as the model.
+///
+/// CANONICAL, the deferral contract: the watch withholds only the REOPEN,
+/// so resolution must run before any other reconcile can reopen, or the
+/// model would carry an unjudged effect window through Full recovery.
+///
+/// CANONICAL, the stale-capture rule: this resolution replaces the model
+/// and reopens the store, so any predicate captured before it (a merge
+/// prediction, a damage snapshot) must be re-derived — or deliberately
+/// snapshotted pre-resolution — before judging THIS iteration's op
+/// against the post-ruling world.
+///
+/// The returned interrupt outcome is final — exactly-once contract on
+/// [`WatchRuling::e_outcome`]. Violations inside carry the DEFERRED op's
+/// index as `at_op`; the interrupt's identity is in the message.
+/// Mid-watch history stays coherent without an assert: a pending strand's
+/// head is un-advanced (a partial multi-table commit never advances the
+/// manifest head), and every head-advancing path (an entry heal) resolves
+/// the watch within its own iteration before the next capture. No
+/// `maintenance_obligations` pass runs here — parity with the
+/// injected-fault reconcile path, which never ran one either; a deferred
+/// MAINTENANCE op that executed and armed its own strand gets no
+/// obligations judgment on this path — future work; crash/kill deaths
+/// remain the only obligation triggers.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_keep_serving_watch(
     db: Omnigraph,
@@ -4216,23 +4760,24 @@ async fn resolve_keep_serving_watch(
     known_issues: &mut Vec<String>,
     row_site: &str,
     watch: KeepServingWatch,
-) -> Omnigraph {
+    interrupt: Option<&WatchInterrupt<'_>>,
+) -> (Omnigraph, Option<(ReconcileOutcome, &'static str)>) {
     known_issues.push(format!(
-        "keep-serving-{row_site}:{} after {} refusals (first at op{})",
+        "{row_site}:{} after {} refusals (first at op{})",
         watch.operation_id, watch.streak, watch.first_op
     ));
     if let Some(f) = failing {
         f.suspend();
     }
-    let (db, outcome, channel) = Box::pin(reconcile_after_failure(
+    let (db, ruling, channel) = Box::pin(reconcile_watch_resolution(
         db,
         storage,
         root,
         &watch.deferred_wop,
+        interrupt,
         world,
         "keep-serving deferred arbitration",
         watch.first_op,
-        None,
     ))
     .await;
     if let Some(f) = failing {
@@ -4240,15 +4785,11 @@ async fn resolve_keep_serving_watch(
     }
     reconcile_verdicts.push((
         format!("keep-serving-deferred@op{}", watch.first_op),
-        format!("{outcome:?}"),
+        format!("{:?} matched={}", ruling.a_outcome, ruling.matched),
         channel.to_string(),
     ));
-    match outcome {
-        ReconcileOutcome::Applied => apply_world(world, &watch.deferred_wop),
-        ReconcileOutcome::ForkOnly => apply_fork_only(world, &watch.deferred_wop),
-        ReconcileOutcome::NotApplied => {}
-    }
-    db
+    *world = ruling.world;
+    (db, ruling.e_outcome.map(|o| (o, channel)))
 }
 
 pub fn run_universe(root: &str, sc: &Scenario) -> UniverseReport {
@@ -4296,15 +4837,31 @@ pub fn run_universe_caught(
     root: &str,
     sc: &Scenario,
 ) -> Result<UniverseReport, Box<dyn std::any::Any + Send>> {
-    // Seed logging: a failed CI run is reproducible from this line alone.
+    // Seed logging: the knobs the pinned scenarios vary, so a failed run's
+    // line names its universe (remaining Scenario knobs come from the
+    // test's own source).
     println!(
-        "dst universe [root={root} seed={} ops={} crash={:?} crash_on_match={:?} faults={} kill={:?}]",
+        "dst universe [root={root} seed={} ops={} crash={:?} crash_on_match={:?} faults={} kill={:?} keep_serving={}]",
         sc.seed,
         sc.ops,
         sc.crash_at,
         sc.crash_on_match,
-        sc.faults.is_some(),
-        sc.die_at_write
+        sc.faults
+            .as_ref()
+            .map(|p| format!(
+                "seed={} error_pct={} lance_realm={}",
+                p.seed, p.error_pct, p.lance_realm
+            ))
+            .unwrap_or_else(|| "none".to_string()),
+        sc.die_at_write,
+        sc.keep_serving_ops
+    );
+    // Structural scope-out: the ack-loss client-retry re-executes an op the
+    // keep-serving machinery may have already judged at a watch resolution —
+    // the combination is undesigned. Enforced here, not by comment alone.
+    assert!(
+        sc.keep_serving_ops == 0 || !sc.faults.as_ref().map(|p| p.client_retry).unwrap_or(false),
+        "keep_serving_ops and FaultPlan::client_retry are mutually scoped out"
     );
 
     let mut seeds = SplitMix64(sc.seed);
@@ -4313,6 +4870,7 @@ pub fn run_universe_caught(
     let workload_seed = seeds.next_u64();
     let entropy_seed = seeds.next_u64();
 
+    detectors::install_violation_panic_hook();
     clear_process_slots();
     crate::env_knobs::require_pool_env();
 
@@ -4330,7 +4888,7 @@ pub fn run_universe_caught(
     // per-universe entropy reseed must happen INSIDE this thread; panics
     // (oracle verdicts) propagate via resume_unwind so test messages
     // survive. One fresh thread per universe keeps replay exact.
-    std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("dst-universe".into())
             .stack_size(UNIVERSE_STACK_BYTES)
@@ -4574,12 +5132,13 @@ pub fn run_universe_caught(
                 }
             }
             if let Some(failpoint) = crash_now.filter(|_| !sc.probe_only) {
-                // A scheduled crash ends any keep-serving experiment first:
-                // crash_op MAY reconcile and reopen (the window can also miss
-                // the executed path), and resolving early is conservative —
-                // deferral contract on [`resolve_keep_serving_watch`].
+                // A scheduled crash ends any keep-serving experiment first —
+                // deferral contract on [`resolve_keep_serving_watch`]. No
+                // interrupt: the crashing op has not executed yet, so it
+                // cannot be in the store.
+                let mut expected_conflict = expected_conflict;
                 if let Some(watch) = keep_serving_watch.take() {
-                    db = Box::pin(resolve_keep_serving_watch(
+                    let (new_db, _) = Box::pin(resolve_keep_serving_watch(
                         db,
                         storage.clone(),
                         root,
@@ -4587,10 +5146,16 @@ pub fn run_universe_caught(
                         &mut world,
                         &mut reconcile_verdicts,
                         &mut known_issues,
-                        &format!("interrupted@op{i}"),
+                        &format!("{KEEP_SERVING_INTERRUPTED_PREFIX}op{i}"),
                         watch,
+                        None,
                     ))
                     .await;
+                    db = new_db;
+                    // Stale-capture rule on [`resolve_keep_serving_watch`]:
+                    // re-derive the prediction from the world crash_op will
+                    // actually judge against.
+                    expected_conflict = expects_merge_conflict(&world, &wop);
                 }
                 let (new_db, outcome) = Box::pin(crash_op(
                     db,
@@ -4616,25 +5181,28 @@ pub fn run_universe_caught(
                             format!("{outcome:?}"),
                             channel.to_string(),
                         ));
-                        match outcome {
-                            ReconcileOutcome::Applied => apply_world(&mut world, &wop),
-                            ReconcileOutcome::ForkOnly => apply_fork_only(&mut world, &wop),
-                            ReconcileOutcome::NotApplied => {}
-                        }
+                        outcome.apply(&mut world, &wop);
                         // a maintenance death gets its
-                        // obligations judged, fault-suspended.
+                        // obligations judged, fault-suspended. Gated on the
+                        // target still existing: a same-iteration ruling can
+                        // remove it, and the convergence rerun would fail
+                        // "not found" — a false red, not a divergence.
                         if let Some(f) = &failing {
                             f.suspend();
                         }
-                        let ran = Box::pin(maintenance_obligations(
-                            &mut db,
-                            &world,
-                            &wop,
-                            &format!("crash:{failpoint}@op{i}"),
-                            i,
-                            sc.fail_maintenance_rerun,
-                        ))
-                        .await;
+                        let ran = if op_targets_live(&world, &wop) {
+                            Box::pin(maintenance_obligations(
+                                &mut db,
+                                &world,
+                                &wop,
+                                &format!("crash:{failpoint}@op{i}"),
+                                i,
+                                sc.fail_maintenance_rerun,
+                            ))
+                            .await
+                        } else {
+                            false
+                        };
                         if let Some(f) = &failing {
                             f.resume();
                         }
@@ -4714,11 +5282,19 @@ pub fn run_universe_caught(
                     legal_rejections += 1;
                 }
                 ks.revive_and_disarm();
-                // Same rule as the crash-window arm: the deferred op precedes
-                // the crashed one, so it resolves before this reconcile's
-                // reopen — deferral contract on [`resolve_keep_serving_watch`].
-                if let Some(watch) = keep_serving_watch.take() {
-                    db = Box::pin(resolve_keep_serving_watch(
+                // Deferral contract on [`resolve_keep_serving_watch`].
+                // Unlike the crash-window arm, the dying op EXECUTED (the
+                // kill fired mid-op), so it rides into the resolution as the
+                // uncertain interrupting op — DELIBERATELY uncertain even on
+                // the ABSORBED `Ok`: here the dead flag, not the op's claim,
+                // is the authority, so a kill-context success is exactly the
+                // claim the arbitration must not trust.
+                let interrupt_ruling = if let Some(watch) = keep_serving_watch.take() {
+                    let interrupt = WatchInterrupt {
+                        wop: &wop,
+                        applied: false,
+                    };
+                    let (new_db, ruling) = Box::pin(resolve_keep_serving_watch(
                         db,
                         storage.clone(),
                         root,
@@ -4726,53 +5302,67 @@ pub fn run_universe_caught(
                         &mut world,
                         &mut reconcile_verdicts,
                         &mut known_issues,
-                        &format!("interrupted@op{i}"),
+                        &format!("{KEEP_SERVING_INTERRUPTED_PREFIX}op{i}"),
                         watch,
+                        Some(&interrupt),
                     ))
                     .await;
-                }
-                if let Some(f) = &failing {
-                    f.suspend();
-                }
-                let (new_db, outcome, channel) = Box::pin(reconcile_after_failure(
-                    db,
-                    storage.clone(),
-                    root,
-                    &wop,
-                    &world,
-                    "crash-state death",
-                    i,
-                    None,
-                ))
-                .await;
-                db = new_db;
-                if let Some(f) = &failing {
-                    f.resume();
-                }
+                    db = new_db;
+                    ruling
+                } else {
+                    None
+                };
+                let (outcome, channel) = if let Some((outcome, channel)) = interrupt_ruling {
+                    // Exactly-once contract on [`WatchRuling::e_outcome`] —
+                    // row only.
+                    (outcome, channel)
+                } else {
+                    if let Some(f) = &failing {
+                        f.suspend();
+                    }
+                    let (new_db, outcome, channel) = Box::pin(reconcile_after_failure(
+                        db,
+                        storage.clone(),
+                        root,
+                        &wop,
+                        &world,
+                        "crash-state death",
+                        i,
+                        None,
+                    ))
+                    .await;
+                    db = new_db;
+                    if let Some(f) = &failing {
+                        f.resume();
+                    }
+                    outcome.apply(&mut world, &wop);
+                    (outcome, channel)
+                };
                 reconcile_verdicts.push((
                     format!("crash-state:write#{}@op{i}", ks.writes_observed()),
                     format!("{outcome:?}"),
                     channel.to_string(),
                 ));
-                match outcome {
-                    ReconcileOutcome::Applied => apply_world(&mut world, &wop),
-                    ReconcileOutcome::ForkOnly => apply_fork_only(&mut world, &wop),
-                    ReconcileOutcome::NotApplied => {}
-                }
                 // a maintenance death gets its obligations
-                // judged, fault-suspended.
+                // judged, fault-suspended. Gated on the target still
+                // existing — same rule as the crash-window arm: a ruling
+                // can remove it, and the rerun would false-red "not found".
                 if let Some(f) = &failing {
                     f.suspend();
                 }
-                let ran = Box::pin(maintenance_obligations(
-                    &mut db,
-                    &world,
-                    &wop,
-                    &format!("crash-state:write#{}@op{i}", ks.writes_observed()),
-                    i,
-                    sc.fail_maintenance_rerun,
-                ))
-                .await;
+                let ran = if op_targets_live(&world, &wop) {
+                    Box::pin(maintenance_obligations(
+                        &mut db,
+                        &world,
+                        &wop,
+                        &format!("crash-state:write#{}@op{i}", ks.writes_observed()),
+                        i,
+                        sc.fail_maintenance_rerun,
+                    ))
+                    .await
+                } else {
+                    false
+                };
                 if let Some(f) = &failing {
                     f.resume();
                 }
@@ -4792,8 +5382,19 @@ pub fn run_universe_caught(
                 match exec_result {
                     Ok(()) => {
                         // A merge the model predicted as conflicting MUST NOT
-                        // succeed — dual-hypothesis assert (H-A/H-B live here).
-                        if expected_conflict {
+                        // succeed — dual-hypothesis assert (H-A/H-B live
+                        // here). Scope-out with a watch active: the flag was
+                        // captured from a model the deferred op's roll-forward
+                        // may have outrun, and the true prediction epoch is
+                        // only knowable after the resolution (stale-capture
+                        // rule on [`resolve_keep_serving_watch`]). An
+                        // engine-accepted conflicting merge mid-watch is
+                        // still caught — as the resolution's no-composition
+                        // `CrashContract` red: `apply_world` no-ops a
+                        // predicted-conflict merge, so no hypothesis can
+                        // render the merged state (the conflict is an
+                        // absorbing element of the composition algebra).
+                        if expected_conflict && keep_serving_watch.is_none() {
                             detectors::violation(
                                 DET_MERGE_PREDICTION,
                                 i,
@@ -4814,18 +5415,27 @@ pub fn run_universe_caught(
                         ) {
                             force_session_check = true;
                         }
-                        apply_world(&mut world, &wop);
                         // A success on the watched handle ends the watch: the
-                        // pending operation was resolved before this op ran —
+                        // pending operation was resolved before this op ran,
                         // by the write entry's own heal (the issue-554
-                        // contract holding) or, in the different-id
-                        // composition, by an interrupt-resolution reopen in
-                        // between; the row does not distinguish. Runs AFTER
-                        // this op's model apply so the deferred op's presence
-                        // is the arbitration's only open difference —
+                        // contract holding). Premise scope-out: an op that
+                        // bypasses the write entry (a view sync; an
+                        // `EnsureIndices` not touching the pending branch)
+                        // can succeed with the strand still pending — the
+                        // resolution then cures the wedge; op-class filter is
+                        // future work, the pinned scenarios never sample
+                        // those mid-wedge. The succeeding op is NOT applied
+                        // to the model first — it rides into the resolution
+                        // as the known-applied interrupting op (the break
+                        // shapes live on
+                        // `dst_keep_serving_widened_arbitration_no_false_reds`);
                         // deferral contract on [`resolve_keep_serving_watch`].
                         if let Some(watch) = keep_serving_watch.take() {
-                            db = Box::pin(resolve_keep_serving_watch(
+                            let interrupt = WatchInterrupt {
+                                wop: &wop,
+                                applied: true,
+                            };
+                            let (new_db, _) = Box::pin(resolve_keep_serving_watch(
                                 db,
                                 storage.clone(),
                                 root,
@@ -4833,10 +5443,14 @@ pub fn run_universe_caught(
                                 &mut world,
                                 &mut reconcile_verdicts,
                                 &mut known_issues,
-                                &format!("healed@op{i}"),
+                                &format!("{KEEP_SERVING_HEALED_PREFIX}op{i}"),
                                 watch,
+                                Some(&interrupt),
                             ))
                             .await;
+                            db = new_db;
+                        } else {
+                            apply_world(&mut world, &wop);
                         }
                     }
                     Err(err) => {
@@ -4847,17 +5461,20 @@ pub fn run_universe_caught(
                         // on first contact structurally hides any wedge a
                         // long-lived server would sit in.
                         //
-                        // Both keep-serving `continue`s below deliberately
+                        // The keep-serving `continue`s below deliberately
                         // skip the rest of this iteration: the damage-
-                        // attribution window (a refusal is raised at the
-                        // write entry BEFORE op execution, so no op reads
-                        // crossed the ledger), the `is_legal_rejection`
-                        // catalog (the variant match on `RecoveryRequired`
-                        // is a deliberate call-site catalog extension), and
-                        // the continuous-verification block (a mid-wedge
-                        // world-match would judge a deliberately-held
-                        // failure state, and `check_sessions`' fresh opens
-                        // would heal the wedge under observation).
+                        // attribution window (a streak refusal is raised at
+                        // the write entry BEFORE op execution, so no op
+                        // reads crossed the ledger; a FRESH-watch op may
+                        // have executed — the discovery-#3 arming shape —
+                        // and its ledger crossing is deliberately dropped, a
+                        // recorded telemetry-only gap: no judgment depends
+                        // on the row), the `is_legal_rejection` catalog (the
+                        // variant match on `RecoveryRequired` is a call-site
+                        // catalog extension), and continuous verification (a
+                        // mid-wedge world-match would judge a deliberately-
+                        // held failure state, and `check_sessions`' fresh
+                        // opens would heal the wedge under observation).
                         if sc.keep_serving_ops > 0
                             && let OmniError::RecoveryRequired { operation_id, .. } = &err
                             && let Some(mut watch) = keep_serving_watch
@@ -4877,19 +5494,72 @@ pub fn run_universe_caught(
                                     Oracle::LiveWriteAvailability.doc(),
                                 );
                             }
-                            known_issues.push(format!(
-                                "{KEEP_SERVING_DEFER_PREFIX}op{i}:{}",
-                                watch.operation_id
-                            ));
+                            known_issues.push(keep_serving_defer_row(i, &watch.operation_id));
                             keep_serving_watch = Some(watch);
+                            legal_rejections += 1;
+                            continue;
+                        }
+                        // A refusal against the SAME pending strand can
+                        // arrive as the clean-recovery-state spelling (the
+                        // `manifest_conflict` "requires a clean recovery
+                        // state" text — keyed on the TEXT, not an op set, so
+                        // any future emitter rides this branch too), not
+                        // typed `RecoveryRequired` — the engine's second
+                        // spelling of the wedge. Ending the watch on it would
+                        // reopen and CURE the wedge under observation — see
+                        // the arm-intro comment above. It continues the watch
+                        // as a defer row but does NOT count toward the
+                        // budget: the oracle's contract counts refusals
+                        // naming one operation id, and this spelling names
+                        // none. Supersedes the `reopen-heals-barrier@` tag
+                        // mid-watch — the defer row encodes the encounter.
+                        if keep_serving_watch.is_some()
+                            && !matches!(&err, OmniError::RecoveryRequired { .. })
+                            && format!("{err:?}").contains(CLEAN_RECOVERY_BARRIER_TEXT)
+                        {
+                            known_issues.push(keep_serving_defer_row(i, "recovery-barrier"));
                             legal_rejections += 1;
                             continue;
                         }
                         // Any OTHER failure while a watch is active ends the
                         // wedge experiment before this failure's own handling
                         // — deferral contract on [`resolve_keep_serving_watch`].
+                        // A failure class that can leave durable effects
+                        // (fault-marked, ack-lost, damage-attributed) rides
+                        // into the resolution as the UNCERTAIN interrupting
+                        // op and is judged there. A DIFFERENT-id
+                        // `RecoveryRequired` is in that class too: a same-id
+                        // refusal never reaches here (the streak branch), so
+                        // a watch-ending `RecoveryRequired` names a FRESH
+                        // strand this op armed by executing and failing
+                        // mid-write. Only a plain legal rejection (no marker,
+                        // no damage, no recovery arm) provably left nothing
+                        // and resolves with no interrupt.
+                        let mut interrupt_judged: Option<(ReconcileOutcome, &'static str)> = None;
+                        let mut watch_resolved = false;
+                        // One damage snapshot for the WHOLE failure handling:
+                        // persisted-damage consumption counts through
+                        // suspension by design, so a post-resolution read of
+                        // the ledger would blame this op for the resolution's
+                        // own reads. Captured once, pre-resolution, shared by
+                        // the uncertainty classifier and the attribution
+                        // below.
+                        let damaged_now = failing
+                            .as_ref()
+                            .map(|f| f.damage_events())
+                            .unwrap_or(0)
+                            > damage_before;
                         if let Some(watch) = keep_serving_watch.take() {
-                            db = Box::pin(resolve_keep_serving_watch(
+                            let err_text = format!("{err:?}");
+                            let uncertain = matches!(&err, OmniError::RecoveryRequired { .. })
+                                || err_text.contains(FAULT_MARKER)
+                                || err_text.contains(ACK_LOSS_MARKER)
+                                || damaged_now;
+                            let interrupt = WatchInterrupt {
+                                wop: &wop,
+                                applied: false,
+                            };
+                            let (new_db, ruling) = Box::pin(resolve_keep_serving_watch(
                                 db,
                                 storage.clone(),
                                 root,
@@ -4897,17 +5567,36 @@ pub fn run_universe_caught(
                                 &mut world,
                                 &mut reconcile_verdicts,
                                 &mut known_issues,
-                                &format!("interrupted@op{i}"),
+                                &format!("{KEEP_SERVING_INTERRUPTED_PREFIX}op{i}"),
                                 watch,
+                                uncertain.then_some(&interrupt),
                             ))
                             .await;
+                            db = new_db;
+                            interrupt_judged = ruling;
+                            watch_resolved = true;
                         }
+                        // Stale-capture rule on
+                        // [`resolve_keep_serving_watch`]: re-derive the
+                        // merge prediction from the post-ruling model for
+                        // every judgment of THIS op below.
+                        let expected_conflict = if watch_resolved {
+                            expects_merge_conflict(&world, &wop)
+                        } else {
+                            expected_conflict
+                        };
                         // Fresh watch: this failure names a pending recovery
                         // operation nothing is watching yet — defer its
                         // reconcile and start counting. The budget check runs
                         // here too, so `keep_serving_ops: 1` fires on the
-                        // FIRST refusal as the field doc promises.
-                        if sc.keep_serving_ops > 0
+                        // FIRST refusal as the field doc promises. Skipped
+                        // when an interrupt-resolution just judged this op:
+                        // its strand was healed by that resolution's reopen,
+                        // so no pending operation is left to watch, and a
+                        // fresh watch would re-judge a judged op — the
+                        // exactly-once contract on [`WatchRuling::e_outcome`].
+                        if interrupt_judged.is_none()
+                            && sc.keep_serving_ops > 0
                             && let OmniError::RecoveryRequired { operation_id, .. } = &err
                         {
                             let watch = KeepServingWatch {
@@ -4929,8 +5618,7 @@ pub fn run_universe_caught(
                                     Oracle::LiveWriteAvailability.doc(),
                                 );
                             }
-                            known_issues
-                                .push(format!("{KEEP_SERVING_DEFER_PREFIX}op{i}:{operation_id}"));
+                            known_issues.push(keep_serving_defer_row(i, operation_id));
                             keep_serving_watch = Some(watch);
                             legal_rejections += 1;
                             continue;
@@ -4941,11 +5629,6 @@ pub fn run_universe_caught(
                         // detected-or-harmless contract — legal, recorded
                         // for typed-vs-raw triage. Detection quality is
                         // first-contact evidence, not a pass/fail axis yet.
-                        let damaged_now = failing
-                            .as_ref()
-                            .map(|f| f.damage_events())
-                            .unwrap_or(0)
-                            > damage_before;
                         if damaged_now {
                             // Root-normalized: the report must stay
                             // root-independent so same-seed universes on
@@ -4954,7 +5637,19 @@ pub fn run_universe_caught(
                             let snippet: String = text.chars().take(240).collect();
                             corruption_detections.push(format!("op{i} {wop:?}: {snippet}"));
                         }
+                        // Call-site catalog extension by VARIANT: a
+                        // watch-ending `RecoveryRequired` the resolution just
+                        // judged is legal per se — relying on the engine
+                        // embedding its cause's marker text into the error
+                        // would couple legality to message formatting. With
+                        // `keep_serving_ops: 0` a typed `RecoveryRequired`
+                        // reaching this check reds — a correct tripwire: no
+                        // v1-shaped universe can produce one here (every
+                        // failure reconciles in its own iteration).
+                        let judged_recovery_refusal = interrupt_judged.is_some()
+                            && matches!(&err, OmniError::RecoveryRequired { .. });
                         if !(damaged_now
+                            || judged_recovery_refusal
                             || is_legal_rejection(&err, &world, &wop, expected_conflict))
                         {
                             detectors::violation(
@@ -4972,8 +5667,15 @@ pub fn run_universe_caught(
                         }
                         // CLIENT RETRY after ack-loss — semantics on
                         // `FaultPlan::client_retry`. Reconcile below still
-                        // arbitrates the settled world either way.
-                        if format!("{err:?}").contains(ACK_LOSS_MARKER)
+                        // arbitrates the settled world either way. Skipped
+                        // when the watch resolution already judged this op:
+                        // its reopen superseded the state the op failed
+                        // under, and a retry would execute against a world
+                        // the ruling already installed in the model
+                        // (keep-serving scenarios do not set client_retry;
+                        // the combination is scoped out, not exercised).
+                        if interrupt_judged.is_none()
+                            && format!("{err:?}").contains(ACK_LOSS_MARKER)
                             && sc
                                 .faults
                                 .as_ref()
@@ -5022,49 +5724,59 @@ pub fn run_universe_caught(
                         // two-picture arbitration can decide Applied vs
                         // NotApplied (silently assuming "failed ⇒
                         // invisible" was v0's original bug).
-                        if format!("{err:?}").contains(FAULT_MARKER)
-                            || format!("{err:?}").contains(ACK_LOSS_MARKER)
-                            // corruption-attributed failures (and
-                            // marked latent sector errors, which advance the
-                            // same ledger) MUST reconcile — the op may have
-                            // durably written before its poisoned read, and
-                            // only the two-picture arbitration can rule
-                            // Applied vs NotApplied on a garbage-fed op.
-                            || damaged_now
-                            || is_recovery_barrier_rejection(&wop, &err)
-                        {
-                            // The engine arms recovery and bars
-                            // writes until reopen — behave like a real client.
-                            // Reconcile runs fault-suspended (reopen-under-storm
-                            // resilience proven in the pre-suspension run).
-                            if let Some(f) = &failing {
-                                f.suspend();
-                            }
-                            let (new_db, outcome, channel) = Box::pin(reconcile_after_failure(
-                                db,
-                                storage.clone(),
-                                root,
-                                &wop,
-                                &world,
-                                "injected-fault failure",
-                                i,
-                                None,
-                            ))
-                            .await;
-                            db = new_db;
-                            if let Some(f) = &failing {
-                                f.resume();
-                            }
+                        // Row context is honest provenance: a judged
+                        // interrupt records as `watch-interrupt@` — its
+                        // failure need not be an injected fault (a fresh
+                        // different-id `RecoveryRequired` is engine-born).
+                        let fault_verdict: Option<(ReconcileOutcome, &'static str, &'static str)> =
+                            if let Some((outcome, channel)) = interrupt_judged {
+                                // Exactly-once contract on
+                                // [`WatchRuling::e_outcome`] — row only.
+                                Some((outcome, channel, "watch-interrupt"))
+                            } else if format!("{err:?}").contains(FAULT_MARKER)
+                                || format!("{err:?}").contains(ACK_LOSS_MARKER)
+                                // corruption-attributed failures (and
+                                // marked latent sector errors, which advance the
+                                // same ledger) MUST reconcile — the op may have
+                                // durably written before its poisoned read, and
+                                // only the two-picture arbitration can rule
+                                // Applied vs NotApplied on a garbage-fed op.
+                                || damaged_now
+                                || is_recovery_barrier_rejection(&wop, &err)
+                            {
+                                // The engine arms recovery and bars
+                                // writes until reopen — behave like a real client.
+                                // Reconcile runs fault-suspended (reopen-under-storm
+                                // resilience proven in the pre-suspension run).
+                                if let Some(f) = &failing {
+                                    f.suspend();
+                                }
+                                let (new_db, outcome, channel) = Box::pin(reconcile_after_failure(
+                                    db,
+                                    storage.clone(),
+                                    root,
+                                    &wop,
+                                    &world,
+                                    "injected-fault failure",
+                                    i,
+                                    None,
+                                ))
+                                .await;
+                                db = new_db;
+                                if let Some(f) = &failing {
+                                    f.resume();
+                                }
+                                outcome.apply(&mut world, &wop);
+                                Some((outcome, channel, "fault"))
+                            } else {
+                                None
+                            };
+                        if let Some((outcome, channel, context)) = fault_verdict {
                             reconcile_verdicts.push((
-                                format!("fault@op{i}"),
+                                format!("{context}@op{i}"),
                                 format!("{outcome:?}"),
                                 channel.to_string(),
                             ));
-                            match outcome {
-                                ReconcileOutcome::Applied => apply_world(&mut world, &wop),
-                                ReconcileOutcome::ForkOnly => apply_fork_only(&mut world, &wop),
-                                ReconcileOutcome::NotApplied => {}
-                            }
                         }
                     }
                 }
@@ -5172,9 +5884,12 @@ pub fn run_universe_caught(
         // A watch outliving the op loop (the wedge stayed under the budget)
         // resolves before the closing oracles, so the final audit never
         // inherits an unjudged pending operation — deferral contract on
-        // [`resolve_keep_serving_watch`].
+        // [`resolve_keep_serving_watch`]. No interrupt: no op is in flight
+        // at loop end. Closing traffic: its reopen and reads bill to
+        // `_close`, never the last op's row.
+        crate::cost::set_label("_close");
         if let Some(watch) = keep_serving_watch.take() {
-            db = Box::pin(resolve_keep_serving_watch(
+            let (new_db, _) = Box::pin(resolve_keep_serving_watch(
                 db,
                 storage.clone(),
                 root,
@@ -5182,10 +5897,12 @@ pub fn run_universe_caught(
                 &mut world,
                 &mut reconcile_verdicts,
                 &mut known_issues,
-                "expired@end",
+                KEEP_SERVING_EXPIRED_PREFIX,
                 watch,
+                None,
             ))
             .await;
+            db = new_db;
         }
 
         // Closing oracle phase runs on clean storage — under its own cost
@@ -5501,7 +6218,11 @@ pub fn run_universe_caught(
             })
             .expect("spawn universe thread")
             .join()
-    })
+    });
+    // Exit-side leak clear, BOTH outcomes — rationale on
+    // [`clear_process_slots`].
+    clear_process_slots();
+    result
 }
 
 // Pure-classifier honesty (unit level): the mutation

@@ -73,7 +73,7 @@ pub enum ObservationSource {
 macro_rules! oracles {
     ( $( $name:ident, $class:literal, $sources:expr, $anchor:literal, $doc:literal; )+ ) => {
         /// The expectation + comparison half of a verdict, at named-mechanism
-        /// grain. Oracles born after the agreed v11 census extend this enum
+        /// grain. Oracles born after the v11 census extend this enum
         /// via a deliberate census bump, never silently; `census_counts_hold`
         /// owns the current numbers.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,8 +150,8 @@ oracles! {
     // ---- prediction (expectation = the model's per-op prediction) -------
     OpArbitration, "prediction",
         &[Store(Query), Store(Physical)],
-        "harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break)",
-        "after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects";
+        "harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break) / reconcile_watch_resolution (keep-serving composition widening)",
+        "after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects; a keep-serving resolution instead matches against every composition and order of the deferred and interrupting ops";
     MergePrediction, "prediction",
         &[Store(Claim)],
         "harness.rs::predict_merge + the accept/conflict asserts around branch_merge",
@@ -168,7 +168,7 @@ oracles! {
     // ---- obligation (expectation = a standing contract) -----------------
     CrashContract, "obligation",
         &[Store(Query)],
-        "harness.rs::reconcile_after_failure (legal-state + monotonicity asserts)",
+        "harness.rs::reconcile_after_failure + reconcile_watch_resolution (legal-state + monotonicity asserts)",
         "the two-sided crash contract: atomicity (no partial application) and recovery monotonicity (no demoted commit, no deleted durable fork)";
     BirthContract, "obligation",
         &[Store(Claim)],
@@ -176,7 +176,7 @@ oracles! {
         "a store that dies during init is honestly-unopenable or indistinguishable from never-inited, and a crashed open is effect-free";
     RecoveryObligation, "obligation",
         &[Store(Physical)],
-        "harness.rs::reconcile_after_failure residue check (recovery_residue)",
+        "harness.rs::assert_no_recovery_residue (every reconcile + watch-resolution reopen)",
         "a successful read-write reopen leaves __recovery/ empty — recovery may not silently do nothing (added after the recovery-no-op honesty audit)";
     ResidueObligation, "obligation",
         &[Store(Physical)],
@@ -185,7 +185,7 @@ oracles! {
     LiveWriteAvailability, "obligation",
         &[Store(Session)],
         "harness.rs::run_universe_caught keep-serving watch (Scenario::keep_serving_ops)",
-        "a live handle must not wedge permanently on one pending effect-free Armed recovery operation: with reconcile's reopen deferred, consecutive same-operation RecoveryRequired refusals stay under the keep-serving budget (issue #554)";
+        "a live handle must not wedge permanently on one pending effect-free Armed recovery operation: with reconcile's reopen deferred, consecutive same-operation RecoveryRequired refusals (clean-recovery-state maintenance refusals interleave without resetting the streak) stay under the keep-serving budget (issue #554)";
     MaintenanceObligations, "obligation",
         &[Store(Query)],
         "harness.rs::maintenance_obligations",
@@ -297,9 +297,48 @@ impl fmt::Display for Violation {
     }
 }
 
+/// Install (once, process-wide) a panic hook that renders [`Violation`]
+/// payloads. Without it, `panic_any(Violation)` prints `Box<dyn Any>` at
+/// the panic site — the default hook cannot format a typed payload — and a
+/// CI log shows noise where the detector row should be.
+/// Non-violation panics fall through to the previous hook unchanged.
+/// Expected noise: CAUGHT violations print too (the fleet path, the
+/// panel's tolerated designed reds) — deliberate, the row in the log is
+/// the point.
+pub(crate) fn install_violation_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(v) = info.payload().downcast_ref::<Violation>() {
+                let location = info
+                    .location()
+                    .map(|l| format!(" (raised at {l})"))
+                    .unwrap_or_default();
+                eprintln!("{}{location}", v.render());
+                // The default hook (not called for this payload) owns the
+                // backtrace machinery — restore it: `capture()` honors
+                // RUST_BACKTRACE itself, so this prints only on request.
+                let backtrace = std::backtrace::Backtrace::capture();
+                if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                    eprintln!("{backtrace}");
+                }
+            } else {
+                prev(info);
+            }
+        }));
+    });
+}
+
 /// Record a red verdict: panic with a [`Violation`] payload so the fleet's
 /// catch path records a detector-tagged row instead of a bare string
 /// (guard 2 — a recorded violation without a detector does not exist).
+/// `#[track_caller]`: `panic_any` records THIS function's caller as the
+/// panic location, so the hook's `raised at` names the oracle site — for
+/// DIRECT callers; `tagged`'s wrap re-raise records its own funnel line
+/// (an async fn cannot be `#[track_caller]`), and the wrapped panic's own
+/// hook print already carried the true site.
+#[track_caller]
 pub fn violation(
     detector: Detector,
     at_op: usize,
