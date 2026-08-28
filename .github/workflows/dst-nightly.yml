@@ -27,7 +27,7 @@ on:
         required: false
         default: ""
       det_seeds:
-        description: "Seeds per det-fleet shard (empty = 60; shard stride follows it)"
+        description: "Seeds per det-fleet shard, 1..=100 (empty = 60; shard stride follows it)"
         required: false
         default: ""
 
@@ -89,7 +89,11 @@ jobs:
           seeds="${DET_SEEDS_INPUT:-60}"
           case "$seeds" in (*[!0-9]*|'') echo "det_seeds must be numeric"; exit 1;; esac
           seeds=$(( 10#$seeds ))
-          if [ "$seeds" -lt 1 ]; then echo "det_seeds must be >= 1"; exit 1; fi
+          # Cap 100: 6 shards x 100 = 600, where the concurrent offsets
+          # begin — any higher and det shards replay concurrent seeds.
+          if [ "$seeds" -lt 1 ] || [ "$seeds" -gt 100 ]; then
+            echo "det_seeds must be 1..=100 (det tier owns night offsets 0..600)"; exit 1
+          fi
           # Shard stride follows the seed count so overridden counts stay disjoint.
           export DST_FLEET_SEED_BASE=$(( night_base + ${{ matrix.shard }} * seeds ))
           export DST_FLEET_SEEDS="$seeds"
