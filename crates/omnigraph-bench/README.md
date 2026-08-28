@@ -399,10 +399,11 @@ total table count is split equally between immutable node endpoint tables and
 uniform-ring edge tables; declared divergence applies to edge tables. It uses
 scalar uniform bulk-loaded data, no indexes or pre-existing deletion history,
 local filesystem storage, same-host embedded execution, one client, distinct-key
-write-heavy divergence, manual scheduling, local-clonefile reset, per-phase
-attribution, and a monotonic timer. Process-cold, warmed-by-program, and
-reopened-after-program engine preparation are supported with their exact
-cross-validated cache declarations.
+write-heavy divergence, manual scheduling, per-phase attribution, and a
+monotonic timer. APFS uses local-clonefile reset and supports process-cold,
+warmed-by-program, and reopened-after-program engine preparation. Linux/XFS
+admits only verified plain-copy reset with the exact process-fresh,
+preparation-only, uncontrolled-page-cache, no-program contract described below.
 
 The host probe proves APFS on an internal macOS NVMe or SATA SSD, or XFS on a
 direct EC2 instance-store NVMe namespace (and distinguishes EBS). A debug

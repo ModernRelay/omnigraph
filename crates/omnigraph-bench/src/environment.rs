@@ -131,8 +131,8 @@ fn verify_linux(
         storage_protocol: match observed_storage {
             LocalStorageClass::NvmeSsd => "nvme-ec2-instance-store",
             LocalStorageClass::NetworkBlock => "nvme-ebs",
-            LocalStorageClass::SataSsd => {
-                return Err("Linux NVMe probe produced a SATA storage class".to_string());
+            LocalStorageClass::SataSsd | LocalStorageClass::RamDisk => {
+                return Err("Linux NVMe probe produced a non-NVMe storage class".to_string());
             }
         }
         .to_string(),
