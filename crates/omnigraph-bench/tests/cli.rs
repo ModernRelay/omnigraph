@@ -13,6 +13,204 @@ fn benchmark_path(relative: &str) -> PathBuf {
     repository_root().join("benchmarks").join(relative)
 }
 
+fn registered_fixture(directory: &Path) -> (PathBuf, PathBuf) {
+    let root = directory.join("root");
+    fs::create_dir_all(root.join("tables")).expect("fixture tree");
+    fs::write(root.join("graph-manifest"), b"head").expect("fixture manifest object");
+    fs::write(root.join("tables/nodes.lance"), b"nodes").expect("fixture table");
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "fixture",
+            "fingerprint",
+            "--id",
+            "monarch-main-20260829",
+            "--root",
+            root.to_str().expect("UTF-8 root path"),
+        ])
+        .output()
+        .expect("fingerprint fixture");
+    assert!(output.status.success(), "{output:?}");
+    let source: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("registered fixture JSON");
+    assert_eq!(source["format_version"], 1);
+    assert_eq!(source["fixture_id"], "monarch-main-20260829");
+    assert_eq!(
+        source["physical"]["tree_sha256"]
+            .as_str()
+            .expect("tree digest")
+            .len(),
+        64
+    );
+    let source_path = directory.join("fixture-source.json");
+    fs::write(&source_path, output.stdout).expect("registered fixture source descriptor");
+    (source_path, root)
+}
+
+#[test]
+fn fixture_verify_binds_a_local_tree_and_fails_closed_on_drift() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (source, root) = registered_fixture(directory.path());
+
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "fixture",
+            "verify",
+            source.to_str().expect("UTF-8 source descriptor path"),
+            "--root",
+            root.to_str().expect("UTF-8 root path"),
+            "--json",
+        ])
+        .output()
+        .expect("verify fixture");
+    assert!(output.status.success(), "{output:?}");
+    let verified: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("verification JSON");
+    assert_eq!(verified["ok"], true);
+    assert_eq!(verified["value"]["fixture_id"], "monarch-main-20260829");
+    assert_eq!(
+        verified["value"]["physical"]["tree_sha256"]
+            .as_str()
+            .expect("tree digest")
+            .len(),
+        64
+    );
+    assert_eq!(
+        verified["value"]["source_descriptor_sha256"]
+            .as_str()
+            .expect("source descriptor digest")
+            .len(),
+        64
+    );
+
+    fs::write(root.join("graph-manifest"), b"tail").expect("mutate fixture");
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "fixture",
+            "verify",
+            source.to_str().expect("UTF-8 source descriptor path"),
+            "--root",
+            root.to_str().expect("UTF-8 root path"),
+            "--json",
+        ])
+        .output()
+        .expect("verify changed fixture");
+    assert!(!output.status.success(), "{output:?}");
+    let failure: serde_json::Value = serde_json::from_slice(&output.stdout).expect("failure JSON");
+    assert_eq!(failure["ok"], false);
+    assert_eq!(
+        failure["diagnostics"][0]["code"],
+        "registered_fixture_verification_failed"
+    );
+}
+
+#[test]
+fn fixture_preflight_copy_uses_owned_scratch_and_removes_it() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let bundle = directory.path().join("bundle");
+    fs::create_dir(&bundle).expect("bundle");
+    let (_source, root) = registered_fixture(&bundle);
+    let scratch = directory.path().join("scratch");
+    fs::create_dir(&scratch).expect("scratch root");
+    let binding = format!("monarch-main-20260829={}", bundle.display());
+
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "fixture",
+            "preflight-copy",
+            "--fixture",
+            &binding,
+            "--scratch-root",
+            scratch.to_str().expect("UTF-8 scratch path"),
+            "--json",
+        ])
+        .output()
+        .expect("stage fixture");
+
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("preflight result JSON");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["value"][0]["fixture_id"], "monarch-main-20260829");
+    assert_eq!(
+        report["value"][0]["physical"]["tree_sha256"]
+            .as_str()
+            .expect("tree digest")
+            .len(),
+        64
+    );
+    let output_text = String::from_utf8(output.stdout).expect("UTF-8 stage output");
+    assert!(!output_text.contains(root.to_str().expect("UTF-8 root path")));
+    assert_eq!(fs::read_dir(&scratch).expect("clean scratch").count(), 0);
+}
+
+#[test]
+fn fixture_preflight_copy_rejects_duplicates_before_scratch_copy() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let bundle = directory.path().join("bundle");
+    fs::create_dir(&bundle).expect("bundle");
+    registered_fixture(&bundle);
+    let scratch = directory.path().join("scratch");
+    fs::create_dir(&scratch).expect("scratch root");
+    let binding = format!("monarch-main-20260829={}", bundle.display());
+
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "fixture",
+            "preflight-copy",
+            "--fixture",
+            &binding,
+            "--fixture",
+            &binding,
+            "--scratch-root",
+            scratch.to_str().expect("UTF-8 scratch path"),
+            "--json",
+        ])
+        .output()
+        .expect("reject duplicate fixture binding");
+
+    assert!(!output.status.success(), "{output:?}");
+    let failure: serde_json::Value = serde_json::from_slice(&output.stdout).expect("failure JSON");
+    assert_eq!(failure["ok"], false);
+    assert!(
+        failure["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "duplicate_fixture_binding")
+    );
+    assert_eq!(
+        fs::read_dir(&scratch).expect("untouched scratch").count(),
+        0
+    );
+}
+
+#[test]
+fn fixture_preflight_copy_rejects_default_scratch_inside_bundle() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (_source, root) = registered_fixture(directory.path());
+    let binding = format!("monarch-main-20260829={}", directory.path().display());
+
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .env("TMPDIR", &root)
+        .args(["fixture", "preflight-copy", "--fixture", &binding, "--json"])
+        .output()
+        .expect("reject contained default scratch");
+
+    assert!(!output.status.success(), "{output:?}");
+    let failure: serde_json::Value = serde_json::from_slice(&output.stdout).expect("failure JSON");
+    assert_eq!(
+        failure["diagnostics"][0]["code"],
+        "fixture_preflight_scratch_inside_bundle"
+    );
+    assert_eq!(fs::read_dir(&root).expect("untouched root").count(), 2);
+}
+
 #[test]
 fn checked_in_case_and_suite_validate() {
     Command::cargo_bin("omnigraph-bench")

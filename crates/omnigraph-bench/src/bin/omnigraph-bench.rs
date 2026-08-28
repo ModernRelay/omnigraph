@@ -17,6 +17,9 @@ use omnigraph_bench::record::{
     AcquisitionTerminalStageV1, AcquisitionTerminalV1, InvocationIdentityV1, ObservedBackendV1,
     RecordInputV1, build_censored_run_record, build_run_record, sut_identity_for_execution,
 };
+use omnigraph_bench::registered_fixture::{
+    fingerprint_registered_fixture, preflight_copy_fixture_bindings, verify_registered_fixture,
+};
 use omnigraph_bench::{
     Diagnostic, PLAN_FORMAT_VERSION, RUNNER_OUTPUT_VERSION, ResolvedRun, ResolvedSuite,
     RunExecution, RunOptions, RunnerError, ValidatedCase, ValidationOutcome, execute_run,
@@ -46,6 +49,11 @@ enum Command {
     Case {
         #[command(subcommand)]
         command: CaseCommand,
+    },
+    /// Verify registered frozen fixture trees before benchmark preparation.
+    Fixture {
+        #[command(subcommand)]
+        command: FixtureCommand,
     },
     /// Inspect suites of benchmark cases.
     Suite {
@@ -83,6 +91,41 @@ enum CaseCommand {
     List {
         directory: PathBuf,
         /// Emit a machine-readable array.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FixtureCommand {
+    /// Print a location-free JSON manifest for one stable local tree.
+    Fingerprint {
+        /// Path-free identity assigned to this exact physical snapshot.
+        #[arg(long)]
+        id: String,
+        /// Local graph-root directory to read completely.
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// Verify a local frozen tree against a location-free copy-source descriptor.
+    Verify {
+        source: PathBuf,
+        /// Local graph-root directory whose complete bytes must match.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit a machine-readable verification result.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify bundles while copying them through disposable harness scratch.
+    PreflightCopy {
+        /// Repeatable invocation-local fixture mapping in ID=BUNDLE form.
+        #[arg(long = "fixture", value_name = "ID=BUNDLE", required = true)]
+        fixtures: Vec<String>,
+        /// Create the disposable staging workspace below this existing directory.
+        #[arg(long)]
+        scratch_root: Option<PathBuf>,
+        /// Emit a machine-readable verification result after cleanup.
         #[arg(long)]
         json: bool,
     },
@@ -239,6 +282,7 @@ struct PlanRun<'a> {
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Case { command } => run_case(command),
+        Command::Fixture { command } => run_fixture(command),
         Command::Suite { command } => run_suite(command).await,
         Command::Archive { command } => run_archive(command),
         Command::Projection { command } => run_projection(command).await,
@@ -521,6 +565,67 @@ fn run_case(command: CaseCommand) -> ExitCode {
             }
         }
         CaseCommand::List { directory, json } => list_cases(&directory, json),
+    }
+}
+
+fn run_fixture(command: FixtureCommand) -> ExitCode {
+    match command {
+        FixtureCommand::Fingerprint { id, root } => {
+            match fingerprint_registered_fixture(id, &root).into_result() {
+                Ok(fixture) => print_json_success(&fixture),
+                Err(diagnostics) => print_diagnostics(&diagnostics),
+            }
+        }
+        FixtureCommand::Verify { source, root, json } => {
+            let outcome = verify_registered_fixture(&source, &root);
+            if json {
+                print_json(&outcome)
+            } else {
+                match outcome.into_result() {
+                    Ok(verified) => {
+                        println!(
+                            "verified fixture {} source_descriptor_sha256={} root={} files={} bytes={} tree_sha256={}",
+                            verified.fixture_id,
+                            verified.source_descriptor_sha256,
+                            verified.canonical_root.display(),
+                            verified.physical.files,
+                            verified.physical.bytes,
+                            verified.physical.tree_sha256,
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(diagnostics) => print_diagnostics(&diagnostics),
+                }
+            }
+        }
+        FixtureCommand::PreflightCopy {
+            fixtures,
+            scratch_root,
+            json,
+        } => {
+            let outcome = preflight_copy_fixture_bindings(&fixtures, scratch_root.as_deref());
+            if json {
+                print_json(&outcome)
+            } else {
+                match outcome.into_result() {
+                    Ok(fixtures) => {
+                        for fixture in fixtures {
+                            println!(
+                                "preflight-copied fixture {} source_descriptor_sha256={} files={} bytes={} tree_sha256={}",
+                                fixture.fixture_id,
+                                fixture.source_descriptor_sha256,
+                                fixture.physical.files,
+                                fixture.physical.bytes,
+                                fixture.physical.tree_sha256,
+                            );
+                        }
+                        println!("disposable scratch removed");
+                        ExitCode::SUCCESS
+                    }
+                    Err(diagnostics) => print_diagnostics(&diagnostics),
+                }
+            }
+        }
     }
 }
 

@@ -18,6 +18,7 @@ pub mod model;
 mod preparation;
 pub mod projection;
 pub mod record;
+pub mod registered_fixture;
 pub mod reset;
 pub mod runner;
 #[doc(hidden)]

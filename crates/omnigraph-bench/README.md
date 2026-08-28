@@ -109,6 +109,102 @@ measurement protocol and identity vocabulary.
   is stable across rebuilt Lance ids, timestamps, and encodings; a separate
   physical tree digest pins the exact bytes restored for every repetition.
 
+## Registered fixture byte verification
+
+Large graph snapshots can be registered without putting a machine path, S3
+URI, account, or credentials into their identity. A strict
+`fixture-source.json` describes only a format version, a path-free id, and the
+physical tree identity:
+
+```json
+{
+  "format_version": 1,
+  "fixture_id": "monarch-main-20260829",
+  "physical": {
+    "digest_algorithm": "omnigraph-bench-physical-tree-v1",
+    "tree_sha256": "<64 lowercase hex characters>",
+    "files": 16279,
+    "bytes": 3893489669
+  }
+}
+```
+
+Keep the descriptor beside, not inside, the graph root. The local bundle
+convention is deliberately small:
+
+```text
+BUNDLE/
+  fixture-source.json
+  root/
+```
+
+After an operator has quiesced a local snapshot tree, fingerprint its complete
+bytes into the small descriptor:
+
+```bash
+target/release/omnigraph-bench fixture fingerprint \
+  --id monarch-main-20260829 \
+  --root /mnt/nvme/fixtures/monarch/root \
+  > /mnt/nvme/fixtures/monarch/fixture-source.json
+```
+
+The command only prints JSON; it does not modify the tree or write a registry.
+Bind any later local copy to that descriptor and re-read its complete bytes with:
+
+```bash
+target/release/omnigraph-bench fixture verify fixture-source.json \
+  --root /mnt/nvme/fixtures/monarch/root --json
+```
+
+Success returns the canonical typed `source_descriptor_sha256`, the canonical
+local path, and the observed physical identity. The local path and descriptor
+digest are transport/audit evidence, not the harness's stamped logical fixture
+manifest and, per RFC 0039, must not become `point_id` input.
+
+Exercise the same-invocation binding and copy seam with a repeatable
+`ID=BUNDLE` mapping:
+
+```bash
+target/release/omnigraph-bench fixture preflight-copy \
+  --fixture monarch-main-20260829=/mnt/nvme/fixtures/monarch \
+  --scratch-root /mnt/nvme/omnigraph-bench-scratch \
+  --json
+```
+
+The command resolves the two required direct bundle entries, checks that the
+binding id matches the typed source descriptor, verifies the source while
+copying it into a private disposable workspace, re-digests the copy, and
+explicitly removes the workspace. Duplicate/malformed mappings, symlinked required
+entries, source drift, copy failure or drift, and cleanup failure all fail
+closed. Paths are invocation-only and do not appear in the success result.
+Unrelated bundle siblings are ignored. Bindings are copied and removed one at
+a time, so peak scratch usage is bounded by the largest fixture rather than
+their sum. Because this is a copy preflight, no staged tree remains after
+success.
+
+`ID=BUNDLE` is not yet an authoritative benchmark binding: this command reads
+the adjacent source descriptor and returns its canonical digest, but has no
+independent expected logical fixture stamp to compare it with. Replacing both
+`fixture-source.json` and `root/` under the same id therefore produces a
+different successful preflight receipt. The future case/runner contract must
+supply and enforce the expected logical fixture stamp before it can measure
+anything.
+
+This interface is deliberately physical-only. It neither downloads from S3
+nor opens or mutates the source graph, proves graph-level logical Data/State or
+Lance relocation safety, prepares branches, or makes the registered fixture
+runnable by the synthetic CaseV1 executor. Next is an RFC-backed, versioned
+real-graph case/reference contract, graph-level logical validation of the
+registered node/edge fixture, a scenario adapter that prepares and verifies
+non-vacuous node/edge work, and a Lance relocation preflight. That later runner
+must keep its existing run-owned workspace alive and open only its copied
+`root/`, never the bundle source.
+
+The local source namespace is a trusted-input boundary: the operator must keep
+it quiescent for the command. Digest/copy verification detects ordinary drift
+and prevents a mismatching copy from succeeding, but this path traversal is
+not a sandbox for an adversary racing file types or path entries.
+
 ## Durable records and archive
 
 Passing `--archive <DIR>` changes successful `suite run` finalization from a

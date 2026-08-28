@@ -114,6 +114,46 @@ cargo run --locked -p omnigraph-bench -- \
 Each command accepts `--json` for machine-readable output. `suite plan` also
 accepts `--case <ID>` to select one case from a suite.
 
+An operator-quiesced external snapshot tree uses a location-free two-entry
+bundle:
+
+```text
+BUNDLE/
+  fixture-source.json
+  root/
+```
+
+Create the physical copy-source descriptor from a quiescent local copy, then
+verify any later copy:
+
+```bash
+target/release/omnigraph-bench fixture fingerprint \
+  --id monarch-main-20260829 --root /mnt/nvme/fixtures/monarch/root \
+  > /path/to/fixture-source.json
+target/release/omnigraph-bench fixture verify /path/to/fixture-source.json \
+  --root /mnt/nvme/fixtures/monarch/root --json
+```
+
+The harness can also resolve `ID=BUNDLE`, copy the source into private
+disposable scratch, verify the copy, and clean it in the same invocation:
+
+```bash
+target/release/omnigraph-bench fixture preflight-copy \
+  --fixture monarch-main-20260829=/mnt/nvme/fixtures/monarch \
+  --scratch-root /mnt/nvme/omnigraph-bench-scratch --json
+```
+
+These commands prove only physical byte identity and copy preflight. Physical
+identity is audit/reset evidence, not `point_id` input. They do not add the
+fixture to a CaseV1 suite or run a benchmark; CaseV1 remains the synthetic
+builder contract. No copied tree remains after preflight success. Next is a
+versioned real-graph case/reference contract, graph-level logical validation,
+a non-vacuous node/edge workload adapter, and a Lance relocation preflight.
+That case/reference must independently pin the expected validated logical
+fixture stamp; `ID=BUNDLE` preflight only reports its adjacent physical-source
+descriptor and observed bytes. See the crate README for the small descriptor
+schema and the intentional boundary.
+
 Validation loads every referenced case and checks cross-field rules, including
 checked scale budgets, table bounds, cache-condition declarations, and
 reset/backend compatibility. Planning expands the suite into ordered run
