@@ -2,10 +2,12 @@
 //!
 //! Case validation proves that factor combinations are internally coherent;
 //! execution must additionally prove that the scratch tree really resides on
-//! the declared filesystem and storage class. This first runner slice supports
-//! the checked-in APFS case on macOS and fails closed elsewhere.
+//! the declared filesystem and storage class. Runner-v1 supports APFS on
+//! macOS and EC2 instance-store NVMe-backed XFS on Linux.
 
 use std::path::Path;
+#[cfg(any(target_os = "linux", test))]
+use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::{
     collections::VecDeque,
@@ -22,6 +24,8 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+use std::{fs::File, io::Read, os::unix::fs::MetadataExt};
 
 use serde::Serialize;
 
@@ -37,6 +41,8 @@ const PROBE_REAP_DEADLINE: Duration = Duration::from_secs(2);
 const PROBE_PIPE_STOP_DEADLINE: Duration = Duration::from_secs(1);
 #[cfg(target_os = "macos")]
 const PROBE_POLL: Duration = Duration::from_millis(5);
+#[cfg(target_os = "linux")]
+const MAX_LINUX_PROBE_BYTES: u64 = 1024 * 1024;
 
 /// Facts observed from the mounted volume that owns the runner scratch tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -59,13 +65,172 @@ pub fn verify_local_environment(
     {
         verify_macos(scratch_path, declared_filesystem, declared_storage)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        verify_linux(scratch_path, declared_filesystem, declared_storage)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (scratch_path, declared_filesystem, declared_storage);
         Err(
-            "local environment verification is implemented only for macOS/APFS in runner-v1; refusing to trust unproved filesystem and storage-class declarations"
+            "local environment verification is implemented only for macOS/APFS and Linux/XFS in runner-v1; refusing unproved declarations"
                 .to_string(),
         )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux(
+    scratch_path: &Path,
+    declared_filesystem: LocalFilesystem,
+    declared_storage: LocalStorageClass,
+) -> Result<LocalEnvironmentEvidence, String> {
+    let path = std::fs::canonicalize(scratch_path)
+        .map_err(|error| format!("could not resolve benchmark scratch path: {error}"))?;
+    let device = std::fs::metadata(&path)
+        .map_err(|error| format!("could not stat benchmark scratch path: {error}"))?
+        .dev();
+    let major = nix::sys::stat::major(device);
+    let minor = nix::sys::stat::minor(device);
+    let mountinfo = read_bounded_utf8(Path::new("/proc/self/mountinfo"), MAX_LINUX_PROBE_BYTES)?;
+    let mount_point = linux_xfs_mount(&mountinfo, major, minor, &path)?;
+    let device_root = std::fs::canonicalize(format!("/sys/dev/block/{major}:{minor}"))
+        .map_err(|error| format!("could not resolve Linux scratch device: {error}"))?;
+    let device_name = device_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Linux scratch device name is not canonical UTF-8".to_string())?;
+    if !is_nvme_namespace(device_name) {
+        return Err(format!(
+            "runner-v1 requires a directly mounted NVMe namespace, observed `{device_name}`"
+        ));
+    }
+    if read_trimmed(device_root.join("queue/rotational"))? != "0" {
+        return Err("runner-v1 requires non-rotating NVMe instance storage".to_string());
+    }
+    let model = read_trimmed(device_root.join("device/model"))?;
+    let observed_storage = classify_linux_nvme(&model)?;
+    if declared_filesystem != LocalFilesystem::Xfs || declared_storage != observed_storage {
+        return Err(format!(
+            "declared Linux backend {}/{} does not match observed xfs/{} (model `{model}`)",
+            filesystem_name(declared_filesystem),
+            storage_name(declared_storage),
+            storage_name(observed_storage),
+        ));
+    }
+    let status = nix::sys::statvfs::statvfs(&path)
+        .map_err(|error| format!("could not statvfs benchmark scratch: {error}"))?;
+    let available_bytes = status
+        .fragment_size()
+        .checked_mul(status.blocks_available())
+        .ok_or_else(|| "statvfs available-byte count overflowed u64".to_string())?;
+    Ok(LocalEnvironmentEvidence {
+        filesystem: "xfs".to_string(),
+        storage_class: storage_name(observed_storage).to_string(),
+        mount_point: mount_point.display().to_string(),
+        storage_protocol: match observed_storage {
+            LocalStorageClass::NvmeSsd => "nvme-ec2-instance-store",
+            LocalStorageClass::NetworkBlock => "nvme-ebs",
+            LocalStorageClass::SataSsd | LocalStorageClass::RamDisk => {
+                return Err("Linux NVMe probe produced a non-NVMe storage class".to_string());
+            }
+        }
+        .to_string(),
+        available_bytes,
+        probe: "linux-mountinfo-sysfs-v1",
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_utf8(path: &Path, limit: u64) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "Linux probe {} exceeded {limit} bytes",
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| format!("Linux probe {} is not UTF-8: {error}", path.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn read_trimmed(path: PathBuf) -> Result<String, String> {
+    let value = read_bounded_utf8(&path, 4096)?;
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(format!("Linux probe {} was non-canonical", path.display()));
+    }
+    Ok(value.to_string())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_xfs_mount(
+    mountinfo: &str,
+    major: u64,
+    minor: u64,
+    scratch_path: &Path,
+) -> Result<PathBuf, String> {
+    let device = format!("{major}:{minor}");
+    let mut best = None::<PathBuf>;
+    for line in mountinfo.lines() {
+        let Some((mount_fields, fs_fields)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut fields = mount_fields.split_ascii_whitespace();
+        let observed_device = fields.nth(2);
+        let _root = fields.next();
+        let mount = fields.next();
+        if observed_device != Some(device.as_str()) || mount.is_none() {
+            continue;
+        }
+        let mount = mount.expect("checked above");
+        if mount.contains('\\') {
+            return Err("runner-v1 refuses an escaped Linux mount path".to_string());
+        }
+        let mount = PathBuf::from(mount);
+        if !scratch_path.starts_with(&mount) {
+            continue;
+        }
+        if fs_fields.split_ascii_whitespace().next() != Some("xfs") {
+            return Err(format!("scratch device {device} is not XFS"));
+        }
+        if best
+            .as_ref()
+            .is_none_or(|current| mount.as_os_str().len() > current.as_os_str().len())
+        {
+            best = Some(mount);
+        }
+    }
+    best.ok_or_else(|| format!("could not locate XFS scratch device {device} in mountinfo"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_nvme_namespace(device_name: &str) -> bool {
+    let Some(suffix) = device_name.strip_prefix("nvme") else {
+        return false;
+    };
+    let controller_digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
+    let Some(namespace) = suffix
+        .get(controller_digits..)
+        .and_then(|rest| rest.strip_prefix('n'))
+    else {
+        return false;
+    };
+    controller_digits > 0
+        && !namespace.is_empty()
+        && namespace.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn classify_linux_nvme(model: &str) -> Result<LocalStorageClass, String> {
+    match model {
+        "Amazon EC2 NVMe Instance Storage" => Ok(LocalStorageClass::NvmeSsd),
+        "Amazon Elastic Block Store" => Ok(LocalStorageClass::NetworkBlock),
+        _ => Err(format!("unknown Linux NVMe storage model `{model}`")),
     }
 }
 
@@ -696,7 +861,7 @@ fn probe_value<'a>(output: &'a str, field: &str) -> Result<&'a str, String> {
     Ok(value)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn filesystem_name(filesystem: LocalFilesystem) -> &'static str {
     match filesystem {
         LocalFilesystem::Apfs => "apfs",
@@ -705,13 +870,52 @@ fn filesystem_name(filesystem: LocalFilesystem) -> &'static str {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn storage_name(storage: LocalStorageClass) -> &'static str {
     match storage {
         LocalStorageClass::NvmeSsd => "nvme-ssd",
         LocalStorageClass::SataSsd => "sata-ssd",
         LocalStorageClass::NetworkBlock => "network-block",
         LocalStorageClass::RamDisk => "ram-disk",
+    }
+}
+
+#[cfg(test)]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn mountinfo_selects_the_deepest_matching_xfs_mount() {
+        let mountinfo = "1 0 259:1 / / rw - xfs /dev/nvme1n1 rw\n\
+                         2 1 259:1 /bench /mnt/nvme rw - xfs /dev/nvme1n1 rw\n";
+        assert_eq!(
+            linux_xfs_mount(mountinfo, 259, 1, Path::new("/mnt/nvme/run")).unwrap(),
+            PathBuf::from("/mnt/nvme")
+        );
+        assert!(
+            linux_xfs_mount(
+                "1 0 259:1 / /mnt rw - ext4 /dev/nvme1n1 rw",
+                259,
+                1,
+                Path::new("/mnt/run")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn linux_storage_class_refuses_partitions_and_distinguishes_ebs() {
+        assert!(is_nvme_namespace("nvme12n3"));
+        assert!(!is_nvme_namespace("nvme12n3p1"));
+        assert_eq!(
+            classify_linux_nvme("Amazon EC2 NVMe Instance Storage").unwrap(),
+            LocalStorageClass::NvmeSsd
+        );
+        assert_eq!(
+            classify_linux_nvme("Amazon Elastic Block Store").unwrap(),
+            LocalStorageClass::NetworkBlock
+        );
+        assert!(classify_linux_nvme("Generic PCIe NVMe").is_err());
     }
 }
 

@@ -388,6 +388,19 @@ fn checked_in_case_and_suite_validate() {
         .assert()
         .success()
         .stdout(predicate::str::contains("local-smoke"));
+
+    Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "suite",
+            "validate",
+            benchmark_path("suites/aws-xfs-process-cold.suite-v1.yaml")
+                .to_str()
+                .expect("UTF-8 path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("aws-xfs-process-cold"));
 }
 
 #[test]

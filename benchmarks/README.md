@@ -211,10 +211,10 @@ checked scale budgets, table bounds, cache-condition declarations, and
 reset/backend compatibility. Planning expands the suite into ordered run
 entries; it does not execute a benchmark.
 
-The checked-in smoke point declares APFS on local NVMe storage. Validation is
-host-independent; runner-v1 probes the actual scratch volume on macOS and
-refuses to measure when its APFS and internal-storage evidence does not match
-the declaration. S3-compatible cases likewise carry region, storage class,
+The checked-in smoke point declares APFS on local NVMe storage. The AWS point
+declares XFS on EC2 instance-store NVMe and a fresh process with an uncontrolled
+page cache. Validation is host-independent; runner-v1 probes the actual scratch
+volume and refuses declarations that do not match. S3-compatible cases carry region, storage class,
 implementation/version, bucket-versioning state, and a digest pin for MinIO or
 RustFS images in their point identity, but they are not executable by this
 runner slice.
@@ -229,6 +229,11 @@ Wall-clock execution is available only from a release-profile binary:
 cargo run --release --locked -p omnigraph-bench -- \
   suite run benchmarks/suites/local-smoke.suite-v1.yaml \
   --archive .bench/archive
+
+# On the AWS lab's XFS instance-store mount:
+target/release/omnigraph-bench suite run \
+  benchmarks/suites/aws-xfs-process-cold.suite-v1.yaml \
+  --scratch-root /mnt/nvme --archive /mnt/nvme/omnigraph-bench-archive
 ```
 
 Use `--case <ID>` to select one suite entry, `--scratch-root <EXISTING-DIR>` to
@@ -249,15 +254,12 @@ Runner-v1 constructs and verifies one fixture whose `bench-source` and
 complete directory by physical SHA-256. The fixture is built at a stable
 `active` path because Lance shallow-branch manifests can retain absolute base
 paths. Public execution constructs it in a dedicated process group under a
-bounded watchdog. That child also byte-digests the completed tree, makes the
-never-opened APFS clonefile template, and removes `active` before returning an
-identity-checked handoff. The parent accepts it only after the direct child is
-reaped and the group is gone. A failed, partial, or panicked build quarantines
-the entire disposable workspace. Every repetition clone-restores the template
-to that exact `active` path. Forced clonefile reset has no byte-copy fallback.
-Handoff acceptance, reset, and the pre-timer witness walk metadata but do not
-read file contents, so they do not prewarm the fixture's data pages merely to
-prove identity.
+bounded watchdog. The child freezes a byte-digested template and removes
+`active` before returning an identity-checked handoff. APFS uses forced
+clonefile with no byte-copy fallback. Linux XFS uses verified copies only for
+the process-fresh point: reset reads bytes outside timing, so its page cache is
+truthfully declared uncontrolled. Every repetition restores the exact stable
+`active` path; failed construction quarantines the workspace.
 
 Every repetition uses a fresh worker process and starts from the same frozen
 state. The parent pins and records the worker executable SHA-256 and requires

@@ -136,8 +136,10 @@ Correctness tests may assert deterministic logical or object-store operation cou
 
 The current runner executes the narrow, fail-closed local envelope documented
 in `crates/omnigraph-bench/README.md`. It requires a release binary, restores
-every repetition from a never-opened APFS clonefile template at the fixture's
-stable path, contains each measured merge in a fresh SHA-attested,
+every repetition at the fixture's stable path from a never-opened APFS
+clonefile template or a verified Linux/XFS plain-copy template. Plain-copy
+reads fixture bytes before measurement and declares the page cache uncontrolled.
+The runner contains each measured merge in a fresh SHA-attested,
 hard-deadline worker process, and verifies exact target/source/main state.
 Fixture and repetition children clear the host environment, pin locale, and
 receive protocol-owned scratch siblings as `TMPDIR` and cwd; measured workers
