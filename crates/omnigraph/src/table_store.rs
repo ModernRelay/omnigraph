@@ -1731,6 +1731,12 @@ impl TableStore {
         .await
     }
 
+    /// INPUT CONTRACT: every `projection` name must exist in `ds`'s schema at
+    /// its pinned version (`Scanner::project` errors typed otherwise);
+    /// `filter`/`order_by` columns need not be projected (Lance
+    /// late-materializes them); a caller whose consumers correlate rows must
+    /// project the correlating column itself — compare `scan_with_pending`,
+    /// which enforces that for its key column.
     pub fn scan_stream_with<F>(
         ds: &Dataset,
         projection: Option<&[&str]>,
