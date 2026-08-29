@@ -681,7 +681,8 @@ impl Omnigraph {
             // processes additionally converge in-process: the staged-
             // write entry points and `refresh` run the roll-forward-only
             // heal (`heal_pending_sidecars_roll_forward`); only
-            // rollback-eligible sidecars wait for this open-time sweep.
+            // rollback-eligible sidecars it can neither roll forward nor
+            // retire as provably effect-free wait for this open-time sweep.
             crate::db::manifest::recover_manifest_drift(
                 &root,
                 Arc::clone(&storage),
@@ -1825,7 +1826,9 @@ impl Omnigraph {
     }
 
     /// Broad write-entry heal: converge any roll-forward-eligible recovery
-    /// sidecars and leave rollback-eligible intents for the next ReadWrite open.
+    /// sidecars, retire provably effect-free Armed mutation/load intents
+    /// (issue #554), and leave the remaining rollback-eligible intents for the
+    /// next ReadWrite open.
     ///
     /// Schema apply calls this broad barrier before acquiring its schema gate;
     /// exact adapters then relist and revalidate relevant recovery and authority
