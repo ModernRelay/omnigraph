@@ -36,7 +36,7 @@ mod state;
 pub(crate) use graph::{GenesisManifestAttempt, ManifestInitError};
 use graph::{
     init_manifest_graph, load_initial_manifest_state, open_exact_genesis_manifest,
-    open_manifest_graph, open_manifest_graph_with_lineage, snapshot_state_at,
+    open_manifest_graph, snapshot_state_at,
 };
 pub(crate) use layout::manifest_uri;
 #[cfg(test)]
@@ -73,7 +73,10 @@ pub use state::DatasetEntry;
 #[cfg(test)]
 use state::string_column;
 pub(crate) use state::{GraphLineageRow, read_graph_lineage};
-use state::{ManifestState, read_manifest_state};
+use state::{
+    ManifestState, ProjectionAccumulator, fold_projection_delta, read_manifest_projection,
+    read_manifest_state, read_object_identities_at_offsets,
+};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
 /// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
@@ -92,6 +95,9 @@ const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
 /// Mutable per-branch head pointer for the graph lineage (RFC-013 Phase 7).
 /// `object_id` is `graph_head:<branch>` (`graph_head:main` for the main branch).
 const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
+/// `object_id` prefix of the head rows — one constant for row minting, row
+/// decode, and the incremental fold's dead-row classification.
+pub(super) const GRAPH_HEAD_OBJECT_ID_PREFIX: &str = "graph_head:";
 
 /// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
 /// `table_branch`/`manifest_branch` encode main as null, but `object_id` must be
@@ -740,6 +746,19 @@ pub struct DatasetUpdate {
     pub(crate) version_metadata: TableVersionMetadata,
 }
 
+/// The set of deleted row offsets of one fragment (empty when it has no
+/// deletion vector).
+async fn fragment_deletion_offsets(
+    fragment: &lance::dataset::fragment::FileFragment,
+) -> Result<std::collections::HashSet<u32>> {
+    Ok(fragment
+        .get_deletion_vector()
+        .await
+        .map_err(OmniError::storage)?
+        .map(|dv| dv.as_ref().iter().collect())
+        .unwrap_or_default())
+}
+
 /// Coordinates cross-dataset state through the namespace `__manifest` table.
 ///
 /// Table rows register stable metadata such as location. Append-only
@@ -756,6 +775,15 @@ pub(crate) struct ManifestCoordinator {
     /// receives a new value after delete/recreate.
     branch_identifier: lance::dataset::refs::BranchIdentifier,
     publisher: Arc<dyn ManifestBatchPublisher>,
+    /// Retained fold accumulators of the projection, tagged with the manifest
+    /// version they describe; `refresh_with_lineage` folds only the catalog
+    /// fragments appended since that version instead of re-scanning
+    /// O(history). The tag is the staleness fence: a path that advances
+    /// `dataset` without folding must clear this, and a missed clear is
+    /// caught by the tag mismatch — stale accumulators degrade to a full
+    /// scan, never serve as current. One extra lineage-row copy beside the
+    /// commit graph's; the maps are O(tables + branches).
+    projection: Option<(u64, ProjectionAccumulator)>,
 }
 
 impl ManifestCoordinator {
@@ -786,6 +814,7 @@ impl ManifestCoordinator {
             active_branch,
             branch_identifier,
             publisher,
+            projection: None,
         }
     }
 
@@ -967,20 +996,43 @@ impl ManifestCoordinator {
         branch: Option<&str>,
         control_session: &Arc<lance::session::Session>,
     ) -> Result<(Self, Vec<GraphLineageRow>)> {
+        // Boxed wholesale for the same stack-depth reason as
+        // `refresh_with_lineage`: this body now builds the projection
+        // accumulators and is awaited inside the merge future via
+        // coordinator swaps.
+        Box::pin(Self::open_with_lineage_inner(
+            root_uri,
+            branch,
+            control_session,
+        ))
+        .await
+    }
+
+    async fn open_with_lineage_inner(
+        root_uri: &str,
+        branch: Option<&str>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<(Self, Vec<GraphLineageRow>)> {
         let root = root_uri.trim_end_matches('/');
         let branch = branch.filter(|branch| *branch != "main");
-        let (dataset, known_state, lineage_rows, branch_identifier) =
-            open_manifest_graph_with_lineage(root, branch, control_session).await?;
-        Ok((
-            Self::from_parts_with_default_publisher(
-                root,
-                dataset,
-                known_state,
-                branch.map(str::to_string),
-                branch_identifier,
-            ),
-            lineage_rows,
-        ))
+        // Retain the fold accumulators alongside the state (the incremental merge-authority projection): the
+        // scan this open pays anyway becomes the base a later refresh folds
+        // deltas into, instead of a sunk cost repeated per refresh.
+        let (dataset, branch_identifier) =
+            open_manifest_dataset_with_identifier_with_session(root, branch, control_session)
+                .await?;
+        let (known_state, projection) = read_manifest_projection(&dataset).await?;
+        let lineage_rows = projection.lineage_rows().to_vec();
+        let projection_version = dataset.version().version;
+        let mut coordinator = Self::from_parts_with_default_publisher(
+            root,
+            dataset,
+            known_state,
+            branch.map(str::to_string),
+            branch_identifier,
+        );
+        coordinator.projection = Some((projection_version, projection));
+        Ok((coordinator, lineage_rows))
     }
 
     pub async fn snapshot_at(
@@ -1045,18 +1097,223 @@ impl ManifestCoordinator {
     }
 
     pub(crate) async fn refresh_with_lineage(&mut self) -> Result<Vec<GraphLineageRow>> {
+        // Boxed wholesale: this body carries the incremental fold (fragment
+        // maps, fold clone, debug verify) plus the full-scan fallback, and it
+        // is awaited deep inside the merge future — the engine's known
+        // stack-depth hazard. The box keeps that layout out of every caller's
+        // generator frame.
+        Box::pin(self.refresh_with_lineage_inner()).await
+    }
+
+    async fn refresh_with_lineage_inner(&mut self) -> Result<Vec<GraphLineageRow>> {
+        // Incremental first (the incremental-projection design): fold only the catalog fragments
+        // appended since the held pin. Every unprovable precondition falls
+        // back to the full scan below — provably current or full read.
+        if let Some(lineage_rows) = self.refresh_incremental().await? {
+            return Ok(lineage_rows);
+        }
+        crate::instrumentation::record_projection_full_refresh();
         let control_session = self.dataset.session();
-        let (dataset, known_state, lineage_rows, branch_identifier) =
-            open_manifest_graph_with_lineage(
-                &self.root_uri,
-                self.active_branch.as_deref(),
-                &control_session,
-            )
-            .await?;
+        let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
+            &self.root_uri,
+            self.active_branch.as_deref(),
+            &control_session,
+        )
+        .await?;
+        let (known_state, projection) = read_manifest_projection(&dataset).await?;
+        let lineage_rows = projection.lineage_rows().to_vec();
+        let projection_version = dataset.version().version;
         self.dataset = dataset;
         self.known_state = known_state;
         self.branch_identifier = branch_identifier;
+        self.projection = Some((projection_version, projection));
         Ok(lineage_rows)
+    }
+
+    /// Incremental projection refresh. `Ok(None)` = a precondition
+    /// was unprovable — the caller does the full scan. `Ok(Some(rows))` = the
+    /// coordinator now describes the latest catalog version, having read only
+    /// the appended fragments (plus the deletion-vector differences on shared
+    /// ones).
+    ///
+    /// Soundness rests on the catalog's write shape: publishes append new
+    /// fragments and, for the mutable `graph_head:<branch>` rows, mark the
+    /// superseded row deleted in an existing fragment's deletion vector. So a
+    /// provable delta is: every held fragment still present with identical
+    /// data files and overlays (compaction rewrites fail this and fall back),
+    /// deletion-vector growth explained entirely by `graph_head` rows (any
+    /// other deleted row means machinery this fold does not model — full
+    /// read), and new fragments whose LIVE rows are the appended state. In
+    /// debug builds every successful fold is verified against a full scan of
+    /// the same version and any divergence fails loudly, so the entire test
+    /// suite oracles this path.
+    async fn refresh_incremental(&mut self) -> Result<Option<Vec<GraphLineageRow>>> {
+        let Some((projection_version, projection)) = self.projection.as_ref() else {
+            return Ok(None);
+        };
+        // The staleness fence: accumulators describing any version other than
+        // the held pin cannot be folded onto (some path advanced the dataset
+        // without them) — full scan.
+        if *projection_version != self.dataset.version().version {
+            return Ok(None);
+        }
+        let control_session = self.dataset.session();
+        let (new_dataset, new_identifier) = open_manifest_dataset_with_identifier_with_session(
+            &self.root_uri,
+            self.active_branch.as_deref(),
+            &control_session,
+        )
+        .await?;
+        // Delete/recreate ABA fence: a same-named branch with a new lifetime
+        // must never fold onto the old lifetime's projection.
+        if new_identifier != self.branch_identifier {
+            tracing::debug!("projection refresh: branch identifier changed; full scan");
+            return Ok(None);
+        }
+        if new_dataset.version().version == self.dataset.version().version {
+            crate::instrumentation::record_projection_incremental_refresh();
+            return Ok(Some(projection.lineage_rows().to_vec()));
+        }
+
+        let old_fragments: std::collections::HashMap<u64, lance::dataset::fragment::FileFragment> =
+            self.dataset
+                .get_fragments()
+                .into_iter()
+                .map(|fragment| (fragment.metadata().id, fragment))
+                .collect();
+        let mut delta_fragments = Vec::new();
+        let mut dead_head_rows: Vec<(
+            lance_table::format::Fragment,
+            std::collections::HashSet<u32>,
+        )> = Vec::new();
+        for new_fragment in new_dataset.get_fragments() {
+            let new_meta = new_fragment.metadata().clone();
+            let Some(old_fragment) = old_fragments.get(&new_meta.id) else {
+                delta_fragments.push(new_meta);
+                continue;
+            };
+            let old_meta = old_fragment.metadata();
+            if old_meta.files != new_meta.files || old_meta.overlays != new_meta.overlays {
+                // Rewritten in place (compaction shape) — not an append.
+                tracing::debug!("projection refresh: fragment rewritten; full scan");
+                return Ok(None);
+            }
+            if old_meta.deletion_file == new_meta.deletion_file {
+                continue;
+            }
+            let old_dv = fragment_deletion_offsets(old_fragment).await?;
+            let new_dv = fragment_deletion_offsets(&new_fragment).await?;
+            if old_dv.difference(&new_dv).next().is_some() {
+                // A row came back to life; no forward publish does that.
+                tracing::debug!("projection refresh: deletion vector shrank; full scan");
+                return Ok(None);
+            }
+            let newly_dead: std::collections::HashSet<u32> =
+                new_dv.difference(&old_dv).copied().collect();
+            if !newly_dead.is_empty() {
+                dead_head_rows.push((old_meta.clone(), newly_dead));
+            }
+        }
+        // Held fragments absent from the new version (cleanup/compaction
+        // shapes) are not an append either.
+        let new_ids: std::collections::HashSet<u64> = new_dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().id)
+            .collect();
+        if old_fragments.keys().any(|id| !new_ids.contains(id)) {
+            tracing::debug!("projection refresh: held fragment removed; full scan");
+            return Ok(None);
+        }
+
+        // Exception safety: fold a clone (CPU-only, O(history) rows in
+        // memory), install on success.
+        let mut folded = projection.clone();
+        for (fragment, offsets) in &dead_head_rows {
+            let identities =
+                read_object_identities_at_offsets(&self.dataset, fragment.clone(), offsets).await?;
+            if identities.len() != offsets.len() {
+                tracing::debug!("projection refresh: dead rows unaccounted; full scan");
+                return Ok(None);
+            }
+            for (object_type, object_id) in identities {
+                if object_type != OBJECT_TYPE_GRAPH_HEAD {
+                    // A deleted row this fold does not model (retention,
+                    // repair, future machinery): the append assumption is
+                    // gone.
+                    tracing::debug!(
+                        object_type,
+                        "projection refresh: non-head row deleted; full scan"
+                    );
+                    return Ok(None);
+                }
+                let Some(branch_key) = object_id.strip_prefix(GRAPH_HEAD_OBJECT_ID_PREFIX) else {
+                    // A head-typed row without the head prefix is a
+                    // malformed-row signal, not a routine fallback shape —
+                    // say so before degrading to the full scan (which
+                    // re-checks it loudly).
+                    tracing::warn!(
+                        object_id,
+                        "projection refresh: malformed graph_head object id; full scan"
+                    );
+                    return Ok(None);
+                };
+                folded.remove_head(branch_key);
+            }
+        }
+        let known_state =
+            match fold_projection_delta(&new_dataset, delta_fragments, &mut folded).await {
+                Ok(state) => state,
+                Err(error) => {
+                    // A fold inconsistency means a precondition this gate missed,
+                    // not a caller error — degrade to the full scan.
+                    tracing::debug!(error = %error, "projection refresh: fold failed; full scan");
+                    return Ok(None);
+                }
+            };
+
+        #[cfg(debug_assertions)]
+        {
+            let (full_state, full_projection) = read_manifest_projection(&new_dataset).await?;
+            let mut folded_lineage = folded.lineage_rows().to_vec();
+            let mut full_lineage = full_projection.lineage_rows().to_vec();
+            folded_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+            full_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+            // Entries are a sorted Vec (Debug-comparable); graph_heads is a
+            // HashMap, whose Debug order is nondeterministic — compare it as
+            // an ordered map.
+            let full_heads: std::collections::BTreeMap<_, _> =
+                full_state.graph_heads.iter().collect();
+            let folded_heads: std::collections::BTreeMap<_, _> =
+                known_state.graph_heads.iter().collect();
+            if format!("{:?}", full_state.entries) != format!("{:?}", known_state.entries)
+                || full_state.version != known_state.version
+                || full_heads != folded_heads
+                || folded_lineage != full_lineage
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "incremental projection diverged from the full scan at manifest version {} \
+                     (branch {:?}) — this is a bug in the incremental-projection fold.\nfull state:   {:?}\n\
+                     folded state: {:?}\nfull lineage ({}): {:?}\nfolded lineage ({}): {:?}",
+                    new_dataset.version().version,
+                    self.active_branch,
+                    full_state,
+                    known_state,
+                    full_lineage.len(),
+                    full_lineage,
+                    folded_lineage.len(),
+                    folded_lineage,
+                )));
+            }
+        }
+
+        crate::instrumentation::record_projection_incremental_refresh();
+        let lineage_rows = folded.lineage_rows().to_vec();
+        let projection_version = new_dataset.version().version;
+        self.dataset = new_dataset;
+        self.known_state = known_state;
+        self.projection = Some((projection_version, folded));
+        Ok(Some(lineage_rows))
     }
 
     /// Refresh one live-read view without ever installing a manifest state
@@ -1104,6 +1361,10 @@ impl ManifestCoordinator {
         self.dataset = dataset;
         self.known_state = known_state;
         self.branch_identifier = branch_identifier;
+        // Same staleness rule as the post-publish fold: this refresh advances
+        // `dataset` without folding the projection accumulators, so they must
+        // not survive it.
+        self.projection = None;
         Ok(lineage_rows)
     }
 
@@ -1216,6 +1477,10 @@ impl ManifestCoordinator {
         // so adopt it directly instead of an O(fragments) `read_manifest_state`.
         self.dataset = dataset;
         self.known_state = known_state;
+        // The projection accumulators do not ride this fold — cleared so a
+        // later incremental refresh cannot serve the pre-publish lineage as
+        // "unchanged" (the staleness fence on the `projection` field).
+        self.projection = None;
         Ok(CommitOutcome {
             version: self.version(),
             parent_commit_id,

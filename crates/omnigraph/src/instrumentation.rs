@@ -149,6 +149,12 @@ pub struct QueryIoProbes {
     /// read managed Blob payloads). A continuation sentinel must not increment
     /// this counter.
     pub change_images_materialized: Arc<AtomicU64>,
+    /// Manifest-projection refreshes served by the incremental projection fold
+    /// (only appended catalog fragments read) vs the full O(history) scan.
+    /// Cost tests assert the incremental path engages so a silent
+    /// always-full-scan regression is structurally visible.
+    pub projection_incremental_refreshes: Arc<AtomicU64>,
+    pub projection_full_refreshes: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -352,6 +358,23 @@ pub(crate) fn record_open(uri: &str) {
 pub(crate) fn record_manifest_scan() {
     let _ = current(|p| {
         p.manifest_scan_count.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one manifest-projection refresh served by the incremental
+/// fold. No-op unless a cost probe is active.
+pub(crate) fn record_projection_incremental_refresh() {
+    let _ = current(|p| {
+        p.projection_incremental_refreshes
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one manifest-projection refresh that fell back to (or started as)
+/// the full O(history) scan. No-op unless a cost probe is active.
+pub(crate) fn record_projection_full_refresh() {
+    let _ = current(|p| {
+        p.projection_full_refreshes.fetch_add(1, Ordering::Relaxed);
     });
 }
 

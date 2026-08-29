@@ -42,7 +42,7 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: OS, architecture, and storage backend (local FS / S3 / RustFS / MinIO).
+      description: OS, architecture, and storage backend (local FS / S3 / RustFS / MinIO / Azure Blob (Azurite)).
     validations:
       required: false
   - type: textarea
