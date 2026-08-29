@@ -22,7 +22,8 @@ location and metadata, and registry agreement.
 
 `Graph Vocabulary Guard` remains a required reporting context, but its
 substrate-sized audit steps are currently disabled everywhere (decision of
-2026-08-28; the `if: false` gates in `ci.yml` are the switch). The job still
+2026-08-28; the job-level `VOCABULARY_AUDIT_ENABLED` variable in `ci.yml` is
+the single switch). The job still
 runs its unit tests and reports success so the exact-SHA release gates stay
 wired. When re-enabled it checks OpenAPI, Rust presentation strings, and public
 Rust against the reviewed terminology inventory after merge, on tags, and by manual
