@@ -98,6 +98,61 @@ struct StagedFixtureBundlesV1 {
     fixtures: BTreeMap<String, FixtureCopyPreflightReceiptV1>,
 }
 
+/// One verified registered fixture retained in harness-owned disposable
+/// storage for the lifetime of a validation or diagnostic run.
+///
+/// The source bundle is never opened as an OmniGraph database. Only [`root`](Self::root)
+/// may be handed to graph code, and dropping this guard removes that copy.
+#[derive(Debug)]
+pub struct StagedRegisteredFixtureV1 {
+    workspace: Option<tempfile::TempDir>,
+    root: PathBuf,
+    receipt: FixtureCopyPreflightReceiptV1,
+}
+
+impl StagedRegisteredFixtureV1 {
+    /// Invocation-local root containing the verified copy.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Path-free evidence identifying the registered source and copied bytes.
+    pub fn receipt(&self) -> &FixtureCopyPreflightReceiptV1 {
+        &self.receipt
+    }
+
+    /// Re-read the staged tree and prove graph inspection did not change any
+    /// registered byte before the disposable copy is removed.
+    pub fn verify_unchanged(&self) -> Result<(), Diagnostic> {
+        let expected = physical_digest(&self.receipt.physical);
+        verify_physical_tree(&self.root, &expected, TraversalLimits::default())
+            .map(|_| ())
+            .map_err(|error| {
+                Diagnostic::error(
+                    "staged_fixture_changed",
+                    "$",
+                    format!("disposable registered fixture changed during inspection: {error}"),
+                )
+            })
+    }
+
+    /// Explicitly remove the disposable copy and report cleanup failures.
+    pub fn finish(mut self) -> Result<FixtureCopyPreflightReceiptV1, Diagnostic> {
+        let workspace = self
+            .workspace
+            .take()
+            .expect("staged fixture workspace is present until finish");
+        workspace.close().map_err(|error| {
+            Diagnostic::error(
+                "fixture_preflight_cleanup_failed",
+                "$",
+                format!("could not remove disposable fixture staging workspace: {error}"),
+            )
+        })?;
+        Ok(self.receipt.clone())
+    }
+}
+
 impl StagedFixtureBundlesV1 {
     /// Delete the disposable workspace and return path-free staging evidence.
     fn finish(mut self) -> Result<Vec<FixtureCopyPreflightReceiptV1>, Diagnostic> {
@@ -229,6 +284,78 @@ pub fn preflight_copy_fixture_bindings(
         Ok(receipts) => ValidationOutcome::success(receipts),
         Err(diagnostic) => ValidationOutcome::failure(vec![diagnostic]),
     }
+}
+
+/// Resolve exactly one `ID=BUNDLE` binding, verify its registered source while
+/// copying it into harness-owned scratch, and retain the copy for the caller.
+///
+/// This is the execution twin of [`preflight_copy_fixture_bindings`]. It keeps
+/// the same physical trust boundary but does not delete the copy before graph
+/// validation can inspect it.
+pub fn stage_registered_fixture_binding(
+    value: &str,
+    scratch_root: Option<&Path>,
+) -> ValidationOutcome<StagedRegisteredFixtureV1> {
+    let resolved = match resolve_fixture_bundle_bindings(&[value.to_string()]).into_result() {
+        Ok(mut resolved) => resolved
+            .pop()
+            .expect("one binding resolves to exactly one fixture"),
+        Err(diagnostics) => return ValidationOutcome::failure(diagnostics),
+    };
+    let staging_base = match canonical_staging_base(scratch_root) {
+        Ok(base) => base,
+        Err(diagnostic) => return ValidationOutcome::failure(vec![diagnostic]),
+    };
+    if staging_base.starts_with(&resolved.canonical_bundle) {
+        return ValidationOutcome::failure(vec![Diagnostic::error(
+            "fixture_preflight_scratch_inside_bundle",
+            "--scratch-root",
+            format!(
+                "fixture staging scratch must not equal or lie below bundle for '{}'",
+                resolved.fixture_id
+            ),
+        )]);
+    }
+    let workspace = match staging_workspace(&staging_base) {
+        Ok(workspace) => workspace,
+        Err(diagnostic) => return ValidationOutcome::failure(vec![diagnostic]),
+    };
+    let root = workspace.path().join("root");
+    let expected = physical_digest(&resolved.source.physical);
+    let copied = match copy_verified(
+        &resolved.canonical_root,
+        &root,
+        &expected,
+        TraversalLimits::default(),
+    ) {
+        Ok(copied) => copied,
+        Err(error) => {
+            let mut diagnostics = vec![Diagnostic::error(
+                "fixture_preflight_copy_failed",
+                &resolved.fixture_id,
+                format!(
+                    "could not verify and copy registered fixture into disposable scratch: {error}"
+                ),
+            )];
+            if let Err(cleanup_error) = workspace.close() {
+                diagnostics.push(Diagnostic::error(
+                    "fixture_preflight_cleanup_failed",
+                    "$",
+                    format!("could not remove failed fixture staging workspace: {cleanup_error}"),
+                ));
+            }
+            return ValidationOutcome::failure(diagnostics);
+        }
+    };
+    ValidationOutcome::success(StagedRegisteredFixtureV1 {
+        workspace: Some(workspace),
+        root,
+        receipt: FixtureCopyPreflightReceiptV1 {
+            fixture_id: resolved.fixture_id,
+            source_descriptor_sha256: resolved.source_descriptor_sha256,
+            physical: registered_physical(&copied),
+        },
+    })
 }
 
 /// Parse one invocation-local `ID=BUNDLE` argument.
@@ -1030,6 +1157,59 @@ mod tests {
             source_before
         );
         assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retained_staging_exposes_only_the_verified_copy_and_cleans_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let bundle = bundle(directory.path(), "monarch-main-20260829");
+        let scratch = directory.path().join("scratch");
+        fs::create_dir(&scratch).unwrap();
+        let binding = format!("monarch-main-20260829={}", bundle.display());
+
+        let staged = stage_registered_fixture_binding(&binding, Some(&scratch))
+            .into_result()
+            .unwrap();
+
+        assert_ne!(staged.root(), bundle.join("root"));
+        assert_eq!(
+            fs::read(staged.root().join("manifest")).unwrap(),
+            b"graph-head"
+        );
+        assert_eq!(staged.receipt().fixture_id, "monarch-main-20260829");
+        staged.verify_unchanged().unwrap();
+        let receipt = staged.finish().unwrap();
+        assert_eq!(receipt.fixture_id, "monarch-main-20260829");
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        assert_eq!(
+            fs::read(bundle.join("root/manifest")).unwrap(),
+            b"graph-head"
+        );
+    }
+
+    #[test]
+    fn retained_staging_detects_inspection_writes_before_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let bundle = bundle(directory.path(), "monarch-main-20260829");
+        let scratch = directory.path().join("scratch");
+        fs::create_dir(&scratch).unwrap();
+        let binding = format!("monarch-main-20260829={}", bundle.display());
+        let staged = stage_registered_fixture_binding(&binding, Some(&scratch))
+            .into_result()
+            .unwrap();
+
+        fs::write(staged.root().join("manifest"), b"changed!!!").unwrap();
+
+        assert_eq!(
+            staged.verify_unchanged().unwrap_err().code,
+            "staged_fixture_changed"
+        );
+        staged.finish().unwrap();
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        assert_eq!(
+            fs::read(bundle.join("root/manifest")).unwrap(),
+            b"graph-head"
+        );
     }
 
     #[test]

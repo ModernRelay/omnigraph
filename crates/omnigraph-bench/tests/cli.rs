@@ -160,6 +160,44 @@ fn fixture_reference_validate_refuses_a_missing_expected_content_digest() {
 }
 
 #[test]
+fn real_graph_run_refuses_debug_timing_before_fixture_setup() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let reference = directory.path().join("example.fixture-reference-v1.yaml");
+    fs::write(&reference, fixture_reference_yaml(&"4".repeat(64))).expect("fixture reference");
+    let spec = directory.path().join("example.run-v1.yaml");
+    fs::write(
+        &spec,
+        r#"version: 1
+fixture_id: example-graph-v1
+workload: finbench-disjoint-insert-merge
+repetitions: 1
+operation_deadline_seconds: 1
+"#,
+    )
+    .expect("real graph run spec");
+
+    let output = Command::cargo_bin("omnigraph-bench")
+        .expect("benchmark binary")
+        .args([
+            "fixture",
+            "run-graph",
+            spec.to_str().expect("UTF-8 run spec"),
+            "--reference",
+            reference.to_str().expect("UTF-8 reference"),
+            "--fixture",
+            "example-graph-v1=/not/inspected/in-debug",
+            "--json",
+        ])
+        .output()
+        .expect("refuse debug real graph timing");
+
+    assert!(!output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("failure JSON");
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["diagnostics"][0]["code"], "release_build_required");
+}
+
+#[test]
 fn fixture_verify_binds_a_local_tree_and_fails_closed_on_drift() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let (source, root) = registered_fixture(directory.path());

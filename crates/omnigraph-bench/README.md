@@ -120,80 +120,42 @@ An externally built graph first needs a strict logical declaration. A
   exact row counts, payload/column shape, provenance, and topology skew;
 - State as aging, structured index inventory, deletion history, compaction
   recency, and history depth; and
-- the full logical-content digest that a later graph validator is expected to
-  reproduce.
+- the full logical-content digest that `fixture validate-graph` recomputes
+  against a byte-verified disposable copy.
 
-The authoring shape is deliberately location-free and scalar:
-
-```yaml
-version: 1
-fixture_id: finbench-sf10-main
-logical:
-  builder:
-    id: finbench-import
-    version: 1
-    recipe_sha256: "<64 lowercase hex characters>"
-    parameters:
-      - { name: scale-factor, value: 10 }
-    inputs:
-      - role: source-snapshot
-        sha256: "<64 lowercase hex characters>"
-  data:
-    provenance: corpus-derived
-    schema_shape:
-      algorithm: future-schema-shape-v1
-      sha256: "<64 lowercase hex characters>"
-    node_tables:
-      - { name: Person, rows: 582672 }
-    edge_tables:
-      - { name: PersonOwnAccount, rows: 1022914 }
-    payload:
-      kind: variable
-      algorithm: future-logical-payload-v1
-      total_bytes: 4096
-    column_shape: scalars
-    topology_skew: source-defined
-  state:
-    aging: small-commits
-    indexes: []
-    deletion_history: none
-    compaction_recency: optimized
-    history_depth: 3972
-expected:
-  logical_content:
-    algorithm: future-logical-graph-v1
-    sha256: "<64 lowercase hex characters>"
-```
+The checked-in FinGraph declaration is
+`benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml`.
+Its implemented algorithms are `omnigraph-schema-shape-v1`,
+`omnigraph-logical-properties-v1`, and
+`omnigraph-logical-graph-multiset-v1`. The document remains deliberately
+location-free and scalar.
 
 Builder parameters are limited to `null`, booleans, and unsigned integers;
 arbitrary strings cannot store literal paths, URIs, or credentials. Parameter
 names and numeric meanings are still trusted builder-contract input that a
-future builder adapter must validate. Input roles are path-free semantic labels
-and each input's content is pinned by SHA-256; this slice does not resolve that
-content.
+builder contract must define. Input roles are path-free semantic labels and
+each input's content is pinned by SHA-256. The current validator verifies the
+resulting graph facts; it does not replay the import recipe or resolve its
+inputs.
 
 Validate the declaration with:
 
 ```bash
-target/debug/omnigraph-bench fixture reference validate \
-  /path/to/graph.fixture-reference-v1.yaml --json
+target/release/omnigraph-bench fixture reference validate \
+  benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  --json
 ```
 
 The result reports `reference_sha256`, an audit hash of the complete normalized,
-versioned declaration. It is not a point id. A future real-graph case must
-materialize builder, Data, and State into its typed run spec; the fixture id,
-reference path/hash, expected digest, graph commits, timestamps, and every
-physical/source location remain outside point identity.
-
-This command validates and normalizes the document only. Any 64-hex expected
-digest is still an unverified expectation: the command does not open a store or
-turn the supplied value into evidence. No executable real-graph reference is
-checked in until it has a canonical full-content digest and a frozen registered
-root. The next slice must define and implement the named canonical schema,
-payload, and graph hashing algorithms, with golden vectors, then compare the
-result on a disposable verified copy before any case can consume the reference.
-Algorithm ids in this document are explicit future contracts; validation does
-not claim to implement them.
+versioned declaration. It is not a point id. This command validates and
+normalizes the document only; it does not open a store or prove a supplied
+digest. `fixture observe-graph` derives the implemented witnesses, and `fixture
+validate-graph` compares all of them with the declaration while also requiring
+a relocation-self-contained graph. Aging, deletion history, compaction
+recency, unknown raw Lance index metadata, and per-index FTS/ANN freshness
+remain explicitly unverified, so the result is claim-ineligible. See the
+[benchmark catalog](../../benchmarks/README.md#observe-and-validate-a-registered-graph)
+for the exact observation and validation commands.
 
 ## Registered fixture byte verification
 
@@ -268,24 +230,27 @@ a time, so peak scratch usage is bounded by the largest fixture rather than
 their sum. Because this is a copy preflight, no staged tree remains after
 success.
 
-`ID=BUNDLE` is not yet an authoritative benchmark binding: this command reads
-the adjacent source descriptor and returns its canonical digest, but has no
-independent expected logical fixture stamp to compare it with. Replacing both
-`fixture-source.json` and `root/` under the same id therefore produces a
-different successful preflight receipt. The future case/runner contract must
-supply and enforce the expected logical fixture stamp before it can measure
-anything.
+`fixture preflight-copy` remains physical-only: it has no independent logical
+expectation, so replacing both `fixture-source.json` and `root/` under the same
+id produces a different successful physical receipt. `fixture observe-graph`
+and `fixture validate-graph` build on this seam. They retain the verified
+disposable copy, open only that copy read-only, compute the canonical schema,
+payload, and full node/edge content witnesses, check table/index/history
+observations and relocation safety, recheck its physical bytes, and then clean
+it up. They neither download from S3 nor open or mutate the registered source
+as an OmniGraph database.
 
-This interface is deliberately physical-only. It neither downloads from S3
-nor opens or mutates the source graph, proves graph-level logical Data/State or
-Lance relocation safety, prepares branches, or makes the registered fixture
-runnable by the synthetic CaseV1 executor. The logical reference format above
-is now the independent expectation, but it is not yet bound to these copied
-bytes. Next is read-only graph-level validation of the copied node/edge
-fixture, then a scenario adapter that prepares and verifies non-vacuous work
-and a Lance relocation preflight. That later runner must keep its existing
-run-owned workspace alive and open only its copied `root/`, never the bundle
-source.
+`fixture run-graph` is the narrow runnable adapter for the checked-in FinGraph
+reference and strict real-graph run YAML. From a release binary on local APFS,
+it validates the copied graph, prepares a deterministic disjoint node-and-edge
+delta on two branches, freezes that prepared state, and restores identical
+clonefile inputs for fresh-process merge repetitions. This path is deliberately
+diagnostic: its output always records `claim_eligible: false` and
+`durable_record: false`, has no warm-up, leaves the OS page cache uncontrolled,
+and cannot publish through `--archive`. It also does not dispatch through the
+AWS benchmark infrastructure or publish durable telemetry. See the
+[FinGraph diagnostic instructions](../../benchmarks/README.md#fingraph-diagnostic-runner)
+for the declarative run shape and exact command.
 
 The local source namespace is a trusted-input boundary: the operator must keep
 it quiescent for the command. Digest/copy verification detects ordinary drift

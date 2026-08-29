@@ -18,6 +18,8 @@ pub mod machine;
 pub mod model;
 mod preparation;
 pub mod projection;
+pub mod real_graph;
+pub mod real_graph_run;
 pub mod record;
 pub mod registered_fixture;
 pub mod reset;

@@ -615,6 +615,17 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
     }
 
+    /// Whether the selected graph-manifest dataset references files outside
+    /// its own root through Lance `base_paths`.
+    ///
+    /// This is relocation audit evidence. A copied graph is self-contained
+    /// only when this returns false and every pinned user dataset reports
+    /// [`SnapshotDataset::has_external_base_paths`](crate::db::SnapshotDataset::has_external_base_paths)
+    /// as false.
+    pub async fn manifest_has_external_base_paths(&self, branch: Option<&str>) -> Result<bool> {
+        crate::db::manifest::manifest_has_external_base_paths(&self.root_uri, branch).await
+    }
+
     /// Open with a caller-supplied [`StorageAdapter`]. Used by init/test paths
     /// and by embedding/test consumers that wrap storage (e.g. a counting
     /// decorator for IO-budget tests). Defaults to `OpenMode::ReadWrite`.
@@ -2706,6 +2717,22 @@ impl Omnigraph {
         writer: &mut W,
     ) -> Result<()> {
         export::export_jsonl_to_writer(self, branch, type_names, writer).await
+    }
+
+    /// Stream export rows without a defined physical row order.
+    ///
+    /// The logical row encoding and coherent branch cut match
+    /// [`Self::export_jsonl_to_writer`]. This variant avoids ordered-scan work
+    /// for commutative consumers; callers must not infer meaning from emission
+    /// order.
+    #[doc(hidden)]
+    pub async fn export_jsonl_unordered_to_writer<W: Write>(
+        &self,
+        branch: &str,
+        type_names: &[String],
+        writer: &mut W,
+    ) -> Result<()> {
+        export::export_jsonl_unordered_to_writer(self, branch, type_names, writer).await
     }
 
     /// The change-feed baseline handshake: stream one exact data-only entity

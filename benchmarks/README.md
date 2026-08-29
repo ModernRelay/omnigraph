@@ -14,9 +14,12 @@ records, fixtures, or result storage.
   resolved relative to the suite file that contains it, and its canonical
   target must remain under the same catalog's `cases/` directory. Suite and
   referenced-case symlinks cannot escape the catalog.
-- `*.fixture-reference-v1.yaml` is the future logical contract for an imported
-  node-and-edge graph. No FinBench reference is checked in until its complete
-  logical content is independently digested and its physical root is frozen.
+- `fixtures/*.fixture-reference-v1.yaml` is the path-free logical contract for
+  an imported node-and-edge graph: builder provenance, logical data shape,
+  declared physical state, and expected schema/content digests.
+- `real-graph/*.run-v1.yaml` selects one registered fixture, the fixed
+  real-graph workload, repetition count, and operation deadline. This narrow
+  diagnostic path is separate from CaseV1 suites and durable run records.
 
 The `version` field selects the document schema. Keep identifiers and enum
 values in kebab-case. The scenario and fixture-builder versions identify the
@@ -152,13 +155,56 @@ target/release/omnigraph-bench fixture preflight-copy \
 These commands prove only physical byte identity and copy preflight. Physical
 identity is audit/reset evidence, not `point_id` input. They do not add the
 fixture to a CaseV1 suite or run a benchmark; CaseV1 remains the synthetic
-builder contract. No copied tree remains after preflight success. The strict
-logical reference declaration is available through `fixture reference
-validate`, but that command only checks the document. Graph-level validation,
-a non-vacuous node/edge workload adapter, and a Lance relocation preflight are
-still required. `ID=BUNDLE` preflight only reports its adjacent physical-source
-descriptor and observed bytes. See the crate README for both small schemas and
-the intentional boundary.
+builder contract. No copied tree remains after preflight success.
+
+### Observe and validate a registered graph
+
+`fixture observe-graph` copies and byte-verifies the bundle into disposable
+scratch, opens only that copy read-only, and computes the implemented logical
+witnesses:
+
+```bash
+target/release/omnigraph-bench fixture observe-graph \
+  --fixture finbench-2026-08-21-sf10-v1=/path/to/finbench-2026-08-21-sf10-v1 \
+  --scratch-root /path/to/existing-apfs-scratch --json
+```
+
+The observation includes accepted schema shape, complete per-type node and
+edge counts, a canonical logical-content digest, logical payload bytes,
+engine-managed index observations, main history depth, branch inventory, and a
+relocation-self-contained witness. The command rechecks the copied physical
+tree after observation and removes it. It never opens the registered source as
+an OmniGraph database and does not mutate that source.
+
+The declarative expectations for the frozen FinGraph fixture live in
+`benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml`.
+Validate the YAML structure first, then recompute its implemented witnesses
+against the registered bytes:
+
+```bash
+target/release/omnigraph-bench fixture reference validate \
+  benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  --json
+
+target/release/omnigraph-bench fixture validate-graph \
+  benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  --fixture finbench-2026-08-21-sf10-v1=/path/to/finbench-2026-08-21-sf10-v1 \
+  --scratch-root /path/to/existing-apfs-scratch --json
+```
+
+`fixture reference validate` parses and normalizes the strict document only;
+it does not inspect a graph or prove a supplied digest. `fixture
+validate-graph` binds that declaration to one byte-verified disposable copy and
+fails when an implemented witness differs. Aging, deletion-history,
+compaction-recency, unknown raw Lance indexes, and per-index FTS/ANN freshness
+still lack exact substrate-owned witnesses and remain explicit in
+`unverified_state_fields`. Accordingly, graph inspection and validation always
+report `claim_eligible: false`.
+
+The logical reference and run file deliberately contain no local path, S3 URI,
+account, or credentials. The `ID=BUNDLE` argument is invocation-local transport
+configuration; replacing both bundle entries changes the observed physical
+receipt and the logical validation must still pass.
 
 Validation loads every referenced case and checks cross-field rules, including
 checked scale budgets, table bounds, cache-condition declarations, and
@@ -174,6 +220,8 @@ RustFS images in their point identity, but they are not executable by this
 runner slice.
 
 ## Run locally
+
+### CaseV1 suite runner
 
 Wall-clock execution is available only from a release-profile binary:
 
@@ -284,6 +332,62 @@ protected-head capture still occur and `page_cache: uncontrolled` states the
 OS cache limitation explicitly. A true page-cache-cold point remains refused
 until a named platform/backend eviction control has a post-control witness;
 storage-cold is also unsupported and unrepresentable.
+
+### FinGraph diagnostic runner
+
+The real-graph run is declared independently from the synthetic CaseV1 suite.
+The checked-in run file has this strict shape:
+
+```yaml
+version: 1
+fixture_id: finbench-2026-08-21-sf10-v1
+workload: finbench-disjoint-insert-merge
+repetitions: 5
+operation_deadline_seconds: 600
+```
+
+`repetitions` must be from 1 through 20 and
+`operation_deadline_seconds` from 1 through 3600. Unknown fields are refused.
+The logical reference path and local bundle path stay outside the run file so
+neither a checkout location nor an operator's storage location becomes
+experiment identity.
+
+Build the CLI in release mode and run the checked-in FinGraph declaration and
+logical reference against a local registered bundle:
+
+```bash
+cargo build --release --locked -p omnigraph-bench
+
+target/release/omnigraph-bench fixture run-graph \
+  benchmarks/real-graph/finbench-2026-08-21-sf10-v1.run-v1.yaml \
+  --reference \
+    benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  --fixture finbench-2026-08-21-sf10-v1=/path/to/finbench-2026-08-21-sf10-v1 \
+  --scratch-root /path/to/existing-apfs-scratch --json
+```
+
+`run-graph` refuses a debug build. It is currently a local APFS diagnostic:
+the harness copies and validates the registered graph, prepares two branches
+whose disjoint changes each contain two `Account` nodes and one
+`AccountTransferAccount` edge, and freezes that prepared input. Each repetition
+restores the same path with APFS clonefiles and runs only the branch merge in a
+fresh worker process. The registered source is never opened as an OmniGraph
+database and remains unchanged.
+The result includes raw elapsed samples, p50, merge route/phases, the prepared
+physical digest, and verification evidence for the inserted delta, protected
+heads, and untouched tables. Pre-existing rows in the two changed tables are
+not yet fully re-read and are reported as unverified rather than implied to be
+proved.
+
+This path deliberately does not make a publishable performance claim. Every
+result says `claim_eligible: false` and `durable_record: false`; it has no
+warm-up program, and although each measurement uses a fresh process, the
+operating-system page cache is uncontrolled. `run-graph` does not accept
+`--archive`, publish durable telemetry, calculate a noise floor, download an
+S3 fixture, or dispatch work through the AWS benchmark infrastructure. AWS may
+hold the source snapshot, but an operator must first provide the verified local
+two-entry bundle used above. AWS orchestration and durable-record integration
+are later connector work, not behavior hidden behind this command.
 
 ## Telemetry and delivery boundary
 
