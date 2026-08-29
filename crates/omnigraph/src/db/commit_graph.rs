@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use crate::error::Result;
 
@@ -49,8 +50,16 @@ pub(crate) struct FirstParentEdge {
 pub struct CommitGraph {
     root_uri: String,
     active_branch: Option<String>,
-    commit_by_id: HashMap<String, GraphCommit>,
+    commit_by_id: Arc<HashMap<String, GraphCommit>>,
     head_commit: Option<GraphCommit>,
+}
+
+/// Immutable view handed from authority capture to merge-base selection.
+/// Cloning it is O(1); coordinator updates use copy-on-write, so an authority
+/// capture cannot change underneath its merge-base walk.
+#[derive(Clone)]
+pub(crate) struct CommitGraphSnapshot {
+    commit_by_id: Arc<HashMap<String, GraphCommit>>,
 }
 
 impl CommitGraph {
@@ -64,7 +73,7 @@ impl CommitGraph {
         Ok(Self {
             root_uri: root.to_string(),
             active_branch: None,
-            commit_by_id,
+            commit_by_id: Arc::new(commit_by_id),
             head_commit,
         })
     }
@@ -80,7 +89,7 @@ impl CommitGraph {
         Self {
             root_uri: root_uri.trim_end_matches('/').to_string(),
             active_branch: active_branch.map(str::to_string),
-            commit_by_id,
+            commit_by_id: Arc::new(commit_by_id),
             head_commit,
         }
     }
@@ -92,8 +101,28 @@ impl CommitGraph {
         rows: Vec<crate::db::manifest::GraphLineageRow>,
     ) {
         let (commit_by_id, head_commit) = build_commit_cache(rows);
-        self.commit_by_id = commit_by_id;
+        self.commit_by_id = Arc::new(commit_by_id);
         self.head_commit = head_commit;
+    }
+
+    /// Extend the cache with lineage rows decoded from newly appended
+    /// manifest fragments. The head reduction is identical to a full rebuild,
+    /// but no historical map or row vector is cloned.
+    pub(crate) fn append_manifest_rows(&mut self, rows: Vec<crate::db::manifest::GraphLineageRow>) {
+        let commits = Arc::make_mut(&mut self.commit_by_id);
+        for row in rows {
+            let commit = graph_commit_from_manifest_row(row);
+            if should_replace_head(self.head_commit.as_ref(), &commit) {
+                self.head_commit = Some(commit.clone());
+            }
+            commits.insert(commit.graph_commit_id.clone(), commit);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> CommitGraphSnapshot {
+        CommitGraphSnapshot {
+            commit_by_id: Arc::clone(&self.commit_by_id),
+        }
     }
 
     /// Insert a just-published commit into the in-memory cache (RFC-013 Phase 7).
@@ -109,8 +138,7 @@ impl CommitGraph {
         if should_replace_head(self.head_commit.as_ref(), &commit) {
             self.head_commit = Some(commit.clone());
         }
-        self.commit_by_id
-            .insert(commit.graph_commit_id.clone(), commit);
+        Arc::make_mut(&mut self.commit_by_id).insert(commit.graph_commit_id.clone(), commit);
     }
 
     pub async fn open(root_uri: &str) -> Result<Self> {
@@ -119,7 +147,7 @@ impl CommitGraph {
         Ok(Self {
             root_uri: root.to_string(),
             active_branch: None,
-            commit_by_id,
+            commit_by_id: Arc::new(commit_by_id),
             head_commit,
         })
     }
@@ -132,7 +160,7 @@ impl CommitGraph {
         Ok(Self {
             root_uri: root.to_string(),
             active_branch: Some(branch.to_string()),
-            commit_by_id,
+            commit_by_id: Arc::new(commit_by_id),
             head_commit,
         })
     }
@@ -140,7 +168,7 @@ impl CommitGraph {
     pub async fn refresh(&mut self) -> Result<()> {
         let (commit_by_id, head_commit) =
             load_commit_cache_for_branch(&self.root_uri, self.active_branch.as_deref()).await?;
-        self.commit_by_id = commit_by_id;
+        self.commit_by_id = Arc::new(commit_by_id);
         self.head_commit = head_commit;
         Ok(())
     }
@@ -210,56 +238,40 @@ impl CommitGraph {
         source_commit_id: &str,
         target_commit_id: &str,
     ) -> Result<Option<GraphCommit>> {
-        Ok(Self::merge_base_from_commits(
-            source.load_commits().await?,
-            target.load_commits().await?,
+        Ok(Self::merge_base_from_snapshots(
+            source.snapshot(),
+            target.snapshot(),
             source_commit_id,
             target_commit_id,
         ))
     }
 
-    /// Compute a merge base from two already-captured lineage projections.
-    /// The caller is responsible for coupling each projection to the branch
-    /// authority snapshot it captured; this function is pure and performs no
-    /// storage I/O.
-    pub(crate) fn merge_base_from_commits(
-        source_commits: Vec<GraphCommit>,
-        target_commits: Vec<GraphCommit>,
+    /// Compute a merge base from two O(1) authority snapshots without cloning
+    /// either branch's complete lineage. The maps are read-only for the
+    /// duration of this synchronous walk. Snapshots are consumed so their Arc
+    /// references are structurally gone before a later publish updates either
+    /// coordinator via copy-on-write.
+    pub(crate) fn merge_base_from_snapshots(
+        source: CommitGraphSnapshot,
+        target: CommitGraphSnapshot,
         source_commit_id: &str,
         target_commit_id: &str,
     ) -> Option<GraphCommit> {
-        let mut commits = HashMap::new();
-        for commit in source_commits {
-            commits.insert(commit.graph_commit_id.clone(), commit);
-        }
-        for commit in target_commits {
-            commits.insert(commit.graph_commit_id.clone(), commit);
-        }
-
-        if !commits.contains_key(source_commit_id) || !commits.contains_key(target_commit_id) {
-            return None;
+        if Arc::ptr_eq(&source.commit_by_id, &target.commit_by_id) {
+            return merge_base_from_maps(
+                &source.commit_by_id,
+                &source.commit_by_id,
+                source_commit_id,
+                target_commit_id,
+            );
         }
 
-        let source_distances = ancestor_distances(source_commit_id, &commits);
-        let target_distances = ancestor_distances(target_commit_id, &commits);
-
-        source_distances
-            .iter()
-            .filter_map(|(id, source_distance)| {
-                target_distances.get(id).and_then(|target_distance| {
-                    commits.get(id).map(|commit| {
-                        (
-                            (
-                                *source_distance + *target_distance,
-                                u64::MAX - commit.graph_manifest_version,
-                            ),
-                            commit.clone(),
-                        )
-                    })
-                })
-            })
-            .min_by_key(|(score, _)| *score)
-            .map(|(_, commit)| commit)
+        merge_base_from_maps(
+            &source.commit_by_id,
+            &target.commit_by_id,
+            source_commit_id,
+            target_commit_id,
+        )
     }
 }
 
@@ -294,15 +306,7 @@ fn build_commit_cache(
     let mut commit_by_id = HashMap::with_capacity(rows.len());
     let mut head_commit = None;
     for row in rows {
-        let commit = GraphCommit {
-            graph_commit_id: row.graph_commit_id,
-            graph_branch: row.graph_branch,
-            graph_manifest_version: row.graph_manifest_version,
-            parent_commit_id: row.parent_commit_id,
-            merged_parent_commit_id: row.merged_parent_commit_id,
-            actor_id: row.actor_id,
-            created_at: row.created_at,
-        };
+        let commit = graph_commit_from_manifest_row(row);
         if should_replace_head(head_commit.as_ref(), &commit) {
             head_commit = Some(commit.clone());
         }
@@ -311,26 +315,67 @@ fn build_commit_cache(
     (commit_by_id, head_commit)
 }
 
-fn should_replace_head(current: Option<&GraphCommit>, candidate: &GraphCommit) -> bool {
-    current.is_none_or(|existing| candidate.lineage_key() > existing.lineage_key())
+fn graph_commit_from_manifest_row(row: crate::db::manifest::GraphLineageRow) -> GraphCommit {
+    GraphCommit {
+        graph_commit_id: row.graph_commit_id,
+        graph_branch: row.graph_branch,
+        graph_manifest_version: row.graph_manifest_version,
+        parent_commit_id: row.parent_commit_id,
+        merged_parent_commit_id: row.merged_parent_commit_id,
+        actor_id: row.actor_id,
+        created_at: row.created_at,
+    }
 }
 
-fn ancestor_distances(
+fn merge_base_from_maps(
+    source_commits: &HashMap<String, GraphCommit>,
+    target_commits: &HashMap<String, GraphCommit>,
+    source_commit_id: &str,
+    target_commit_id: &str,
+) -> Option<GraphCommit> {
+    let get = |id: &str| source_commits.get(id).or_else(|| target_commits.get(id));
+    if get(source_commit_id).is_none() || get(target_commit_id).is_none() {
+        return None;
+    }
+
+    let source_distances = ancestor_distances_from(source_commit_id, &get);
+    let target_distances = ancestor_distances_from(target_commit_id, &get);
+    source_distances
+        .iter()
+        .filter_map(|(id, source_distance)| {
+            target_distances.get(id).and_then(|target_distance| {
+                get(id).map(|commit| {
+                    (
+                        (
+                            *source_distance + *target_distance,
+                            u64::MAX - commit.graph_manifest_version,
+                        ),
+                        commit.clone(),
+                    )
+                })
+            })
+        })
+        .min_by_key(|(score, _)| *score)
+        .map(|(_, commit)| commit)
+}
+
+fn ancestor_distances_from<'a>(
     start_id: &str,
-    commits: &HashMap<String, GraphCommit>,
+    get: &impl Fn(&str) -> Option<&'a GraphCommit>,
 ) -> HashMap<String, u64> {
     let mut distances = HashMap::new();
     let mut queue = VecDeque::from([(start_id.to_string(), 0u64)]);
 
     while let Some((id, distance)) = queue.pop_front() {
-        if let Some(existing) = distances.get(&id) {
-            if *existing <= distance {
-                continue;
-            }
+        if distances
+            .get(&id)
+            .is_some_and(|existing| *existing <= distance)
+        {
+            continue;
         }
         distances.insert(id.clone(), distance);
 
-        if let Some(commit) = commits.get(&id) {
+        if let Some(commit) = get(&id) {
             if let Some(parent) = &commit.parent_commit_id {
                 queue.push_back((parent.clone(), distance + 1));
             }
@@ -339,8 +384,11 @@ fn ancestor_distances(
             }
         }
     }
-
     distances
+}
+
+fn should_replace_head(current: Option<&GraphCommit>, candidate: &GraphCommit) -> bool {
+    current.is_none_or(|existing| candidate.lineage_key() > existing.lineage_key())
 }
 
 async fn open_for_branch(root_uri: &str, branch: Option<&str>) -> Result<CommitGraph> {

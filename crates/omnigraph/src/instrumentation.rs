@@ -155,6 +155,10 @@ pub struct QueryIoProbes {
     /// always-full-scan regression is structurally visible.
     pub projection_incremental_refreshes: Arc<AtomicU64>,
     pub projection_full_refreshes: Arc<AtomicU64>,
+    /// Physical manifest rows hydrated to classify deletion-vector deltas.
+    /// This must equal the newly deleted offset count; a fragment scan would
+    /// make it grow with the compacted catalog's history instead.
+    pub projection_identity_rows: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -375,6 +379,15 @@ pub(crate) fn record_projection_incremental_refresh() {
 pub(crate) fn record_projection_full_refresh() {
     let _ = current(|p| {
         p.projection_full_refreshes.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record rows returned by the physical-address take used to classify newly
+/// deleted manifest rows. No-op unless a cost probe is active.
+pub(crate) fn record_projection_identity_rows(rows: usize) {
+    let _ = current(|p| {
+        p.projection_identity_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
     });
 }
 

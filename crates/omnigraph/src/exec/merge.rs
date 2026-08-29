@@ -4517,7 +4517,7 @@ impl Omnigraph {
             .effective_graph_head
             .clone()
             .ok_or_else(|| OmniError::manifest("target branch has no head commit".to_string()))?;
-        let base_commit = CommitGraph::merge_base_from_commits(
+        let base_commit = CommitGraph::merge_base_from_snapshots(
             source_commits,
             target_commits,
             &source_head_commit_id,

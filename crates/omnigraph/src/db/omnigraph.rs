@@ -22,6 +22,7 @@ use omnigraph_compiler::{
     plan_schema_migration,
 };
 
+use crate::db::commit_graph::CommitGraphSnapshot;
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, ResolvedCommitRange};
 use crate::error::{OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
@@ -262,18 +263,22 @@ pub struct Omnigraph {
     /// `branch_create_from_impl`. Deferred because it requires unwinding
     /// every `self.snapshot()` call inside the merge body.
     merge_exclusive: Arc<tokio::sync::Mutex<()>>,
-    /// Per-branch merge-authority coordinators: one per branch a merge has
-    /// touched, so a merge's non-bound side stops paying a fresh open with a
-    /// full O(history) `__manifest` scan. Each use revalidates with the
+    /// One hot non-bound merge-authority coordinator, so a repeated merge
+    /// stops paying a fresh open with a full O(history) `__manifest` scan.
+    /// Each use revalidates with the
     /// manifest-incarnation probe (the same currency the bound-branch fast
     /// path trusts, including the BranchIdentifier delete/recreate fence)
     /// and refreshes via the incremental projection fold — provably current
     /// or full read. Entries are evicted on refresh failure and purged on
-    /// branch delete; growth is bounded by the live branch count (an
-    /// eviction policy is deferred until telemetry shows it matters). The
-    /// mutex serializes merge captures — acceptable because the schema
+    /// branch delete. Capacity is deliberately one: the handle's bound
+    /// coordinator is the common target and retaining one counterpart covers
+    /// that hot shape without multiplying complete lineage by live branches.
+    /// A merge between two non-bound branches temporarily references both
+    /// complete maps through O(1)-to-clone immutable snapshots, but persists
+    /// only the most recently used coordinator.
+    /// The mutex serializes merge captures — acceptable because the schema
     /// serial queue already serializes merges at capture time.
-    merge_authority_cache: tokio::sync::Mutex<std::collections::HashMap<String, GraphCoordinator>>,
+    merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
     /// Optional policy checker for engine-layer enforcement (MR-722).
     /// `None` = no enforcement; mutating methods are unconditionally
     /// allowed (this is the embedded/dev default). `Some` = every
@@ -589,7 +594,7 @@ impl Omnigraph {
             })),
             write_queue,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
-            merge_authority_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            merge_authority_cache: tokio::sync::Mutex::new(None),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -758,7 +763,7 @@ impl Omnigraph {
             })),
             write_queue,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
-            merge_authority_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            merge_authority_cache: tokio::sync::Mutex::new(None),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -1210,7 +1215,7 @@ impl Omnigraph {
         &self,
         source_branch: Option<&str>,
         target_branch: Option<&str>,
-    ) -> Result<(WriteTxn, WriteTxn, Vec<GraphCommit>, Vec<GraphCommit>)> {
+    ) -> Result<(WriteTxn, WriteTxn, CommitGraphSnapshot, CommitGraphSnapshot)> {
         const MAX_CAPTURE_RETRIES: usize = 8;
         let source_branch = normalize_branch_name(source_branch.unwrap_or("main"))?;
         let target_branch = normalize_branch_name(target_branch.unwrap_or("main"))?;
@@ -1504,7 +1509,7 @@ impl Omnigraph {
         Option<String>,
         Option<String>,
         Snapshot,
-        Vec<GraphCommit>,
+        CommitGraphSnapshot,
         crate::db::manifest::CapturedManifestProbe,
     )> {
         {
@@ -1520,7 +1525,7 @@ impl Omnigraph {
                             .await?
                             .map(|head| head.as_str().to_string()),
                         coord.snapshot(),
-                        coord.load_commits().await?,
+                        coord.commit_graph_snapshot(),
                         coord.captured_manifest_probe(),
                     ));
                 }
@@ -1544,34 +1549,41 @@ impl Omnigraph {
         Option<String>,
         Option<String>,
         Snapshot,
-        Vec<GraphCommit>,
+        CommitGraphSnapshot,
         crate::db::manifest::CapturedManifestProbe,
     )> {
         let key = branch.unwrap_or("main").to_string();
         let mut cache = self.merge_authority_cache.lock().await;
-        if let Some(coord) = cache.get_mut(&key) {
+        if cache
+            .as_ref()
+            .is_some_and(|(cached_key, _)| cached_key != &key)
+        {
+            *cache = None;
+        }
+        if let Some((_, coord)) = cache.as_mut() {
             let held = coord.manifest_incarnation();
             let current = match coord.probe_latest_incarnation().await {
                 Ok(latest) => latest.matches(&held),
                 Err(error) => {
                     // A branch that no longer probes (deleted, storage error)
                     // must not linger as a cache entry.
-                    cache.remove(&key);
+                    *cache = None;
                     return Err(error);
                 }
             };
             if !current {
                 if let Err(error) = coord.refresh().await {
-                    cache.remove(&key);
+                    *cache = None;
                     return Err(error);
                 }
             }
         } else {
             let coord = self.open_coordinator_for_branch(branch).await?;
-            cache.insert(key.clone(), coord);
+            *cache = Some((key.clone(), coord));
         }
         let coord = cache
-            .get(&key)
+            .as_ref()
+            .map(|(_, coord)| coord)
             .expect("merge authority cache entry inserted above");
         Ok((
             coord.branch_identifier().await?,
@@ -1581,7 +1593,7 @@ impl Omnigraph {
                 .await?
                 .map(|head| head.as_str().to_string()),
             coord.snapshot(),
-            coord.load_commits().await?,
+            coord.commit_graph_snapshot(),
             coord.captured_manifest_probe(),
         ))
     }
@@ -3216,14 +3228,6 @@ impl Omnigraph {
         ensure_public_branch_ref(name, "branch_delete")?;
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
-        // Purge the branch's merge-authority coordinator: correctness is
-        // fenced without this (the identifier probe refuses a recreated
-        // lifetime), but a deleted branch's entry would otherwise retain its
-        // O(history) projection until a future merge happens to probe it.
-        self.merge_authority_cache
-            .lock()
-            .await
-            .remove(branch.as_str());
         let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
         self.heal_pending_recovery_sidecars_for_branch_delete(&branch)
@@ -3236,6 +3240,17 @@ impl Omnigraph {
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
         let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await;
+        // Purge only after taking the branch gate. Merge capture takes the
+        // same branch-gate -> cache-lock order, so no later insert for this
+        // incarnation can race between invalidation and deletion.
+        let mut cache = self.merge_authority_cache.lock().await;
+        if cache
+            .as_ref()
+            .is_some_and(|(cached_branch, _)| cached_branch == &branch)
+        {
+            *cache = None;
+        }
+        drop(cache);
         self.ensure_schema_apply_not_locked("branch_delete").await?;
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys =

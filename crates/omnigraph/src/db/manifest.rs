@@ -786,6 +786,15 @@ pub(crate) struct ManifestCoordinator {
     projection: Option<(u64, ProjectionAccumulator)>,
 }
 
+/// How a manifest refresh updates the already-loaded commit projection.
+/// Incremental refreshes return only newly appended lineage rows; full
+/// refreshes replace the projection. Keeping the distinction avoids cloning
+/// all historical lineage merely to append one commit.
+pub(crate) enum LineageRefresh {
+    Replace(Vec<GraphLineageRow>),
+    Append(Vec<GraphLineageRow>),
+}
+
 impl ManifestCoordinator {
     fn default_batch_publisher(
         root_uri: &str,
@@ -1021,8 +1030,7 @@ impl ManifestCoordinator {
         let (dataset, branch_identifier) =
             open_manifest_dataset_with_identifier_with_session(root, branch, control_session)
                 .await?;
-        let (known_state, projection) = read_manifest_projection(&dataset).await?;
-        let lineage_rows = projection.lineage_rows().to_vec();
+        let (known_state, projection, lineage_rows) = read_manifest_projection(&dataset).await?;
         let projection_version = dataset.version().version;
         let mut coordinator = Self::from_parts_with_default_publisher(
             root,
@@ -1096,21 +1104,21 @@ impl ManifestCoordinator {
         }
     }
 
-    pub(crate) async fn refresh_with_lineage(&mut self) -> Result<Vec<GraphLineageRow>> {
+    pub(crate) async fn refresh_with_lineage(&mut self) -> Result<LineageRefresh> {
         // Boxed wholesale: this body carries the incremental fold (fragment
-        // maps, fold clone, debug verify) plus the full-scan fallback, and it
-        // is awaited deep inside the merge future — the engine's known
-        // stack-depth hazard. The box keeps that layout out of every caller's
-        // generator frame.
+        // maps and compact projection rollback state) plus the full-scan
+        // fallback, and it is awaited deep inside the merge future — the
+        // engine's known stack-depth hazard. The box keeps that layout out of
+        // every caller's generator frame.
         Box::pin(self.refresh_with_lineage_inner()).await
     }
 
-    async fn refresh_with_lineage_inner(&mut self) -> Result<Vec<GraphLineageRow>> {
+    async fn refresh_with_lineage_inner(&mut self) -> Result<LineageRefresh> {
         // Incremental first (the incremental-projection design): fold only the catalog fragments
         // appended since the held pin. Every unprovable precondition falls
         // back to the full scan below — provably current or full read.
         if let Some(lineage_rows) = self.refresh_incremental().await? {
-            return Ok(lineage_rows);
+            return Ok(LineageRefresh::Append(lineage_rows));
         }
         crate::instrumentation::record_projection_full_refresh();
         let control_session = self.dataset.session();
@@ -1120,21 +1128,21 @@ impl ManifestCoordinator {
             &control_session,
         )
         .await?;
-        let (known_state, projection) = read_manifest_projection(&dataset).await?;
-        let lineage_rows = projection.lineage_rows().to_vec();
+        let (known_state, projection, lineage_rows) = read_manifest_projection(&dataset).await?;
         let projection_version = dataset.version().version;
         self.dataset = dataset;
         self.known_state = known_state;
         self.branch_identifier = branch_identifier;
         self.projection = Some((projection_version, projection));
-        Ok(lineage_rows)
+        Ok(LineageRefresh::Replace(lineage_rows))
     }
 
     /// Incremental projection refresh. `Ok(None)` = a precondition
     /// was unprovable — the caller does the full scan. `Ok(Some(rows))` = the
     /// coordinator now describes the latest catalog version, having read only
     /// the appended fragments (plus the deletion-vector differences on shared
-    /// ones).
+    /// ones). The returned rows are only the lineage delta, not a clone of the
+    /// coordinator's complete commit history.
     ///
     /// Soundness rests on the catalog's write shape: publishes append new
     /// fragments and, for the mutable `graph_head:<branch>` rows, mark the
@@ -1144,9 +1152,6 @@ impl ManifestCoordinator {
     /// deletion-vector growth explained entirely by `graph_head` rows (any
     /// other deleted row means machinery this fold does not model — full
     /// read), and new fragments whose LIVE rows are the appended state. In
-    /// debug builds every successful fold is verified against a full scan of
-    /// the same version and any divergence fails loudly, so the entire test
-    /// suite oracles this path.
     async fn refresh_incremental(&mut self) -> Result<Option<Vec<GraphLineageRow>>> {
         let Some((projection_version, projection)) = self.projection.as_ref() else {
             return Ok(None);
@@ -1172,7 +1177,7 @@ impl ManifestCoordinator {
         }
         if new_dataset.version().version == self.dataset.version().version {
             crate::instrumentation::record_projection_incremental_refresh();
-            return Ok(Some(projection.lineage_rows().to_vec()));
+            return Ok(Some(Vec::new()));
         }
 
         let old_fragments: std::collections::HashMap<u64, lance::dataset::fragment::FileFragment> =
@@ -1226,8 +1231,8 @@ impl ManifestCoordinator {
             return Ok(None);
         }
 
-        // Exception safety: fold a clone (CPU-only, O(history) rows in
-        // memory), install on success.
+        // Exception safety: fold a compact O(tables + branches) clone and
+        // install only after every row classification succeeds.
         let mut folded = projection.clone();
         for (fragment, offsets) in &dead_head_rows {
             let identities =
@@ -1261,9 +1266,9 @@ impl ManifestCoordinator {
                 folded.remove_head(branch_key);
             }
         }
-        let known_state =
+        let (known_state, lineage_rows) =
             match fold_projection_delta(&new_dataset, delta_fragments, &mut folded).await {
-                Ok(state) => state,
+                Ok(delta) => delta,
                 Err(error) => {
                     // A fold inconsistency means a precondition this gate missed,
                     // not a caller error — degrade to the full scan.
@@ -1272,43 +1277,7 @@ impl ManifestCoordinator {
                 }
             };
 
-        #[cfg(debug_assertions)]
-        {
-            let (full_state, full_projection) = read_manifest_projection(&new_dataset).await?;
-            let mut folded_lineage = folded.lineage_rows().to_vec();
-            let mut full_lineage = full_projection.lineage_rows().to_vec();
-            folded_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
-            full_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
-            // Entries are a sorted Vec (Debug-comparable); graph_heads is a
-            // HashMap, whose Debug order is nondeterministic — compare it as
-            // an ordered map.
-            let full_heads: std::collections::BTreeMap<_, _> =
-                full_state.graph_heads.iter().collect();
-            let folded_heads: std::collections::BTreeMap<_, _> =
-                known_state.graph_heads.iter().collect();
-            if format!("{:?}", full_state.entries) != format!("{:?}", known_state.entries)
-                || full_state.version != known_state.version
-                || full_heads != folded_heads
-                || folded_lineage != full_lineage
-            {
-                return Err(OmniError::manifest_internal(format!(
-                    "incremental projection diverged from the full scan at manifest version {} \
-                     (branch {:?}) — this is a bug in the incremental-projection fold.\nfull state:   {:?}\n\
-                     folded state: {:?}\nfull lineage ({}): {:?}\nfolded lineage ({}): {:?}",
-                    new_dataset.version().version,
-                    self.active_branch,
-                    full_state,
-                    known_state,
-                    full_lineage.len(),
-                    full_lineage,
-                    folded_lineage.len(),
-                    folded_lineage,
-                )));
-            }
-        }
-
         crate::instrumentation::record_projection_incremental_refresh();
-        let lineage_rows = folded.lineage_rows().to_vec();
         let projection_version = new_dataset.version().version;
         self.dataset = new_dataset;
         self.known_state = known_state;

@@ -2939,18 +2939,12 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
     assert_linear_chain(uri, N + 1).await;
 }
 
-/// Micro-benchmark of the exact operation the incremental projection
-/// replaces: ONE authority refresh on a deep catalog, full O(history) scan
-/// vs incremental fold, everything else excluded. Ignored by default (it
-/// builds a deep commit history); numbers are meaningful in RELEASE only
-/// (debug builds run the fold-vs-full oracle inside the incremental path):
-///
-/// `cargo test -p omnigraph-engine --release --lib \
-///  projection_refresh_deep_catalog -- --ignored --nocapture`
+/// The incremental fold and a clean full reopen must produce the same state
+/// and lineage. This is an explicit correctness oracle, kept out of the
+/// production refresh path so debug cost tests measure the same I/O shape as a
+/// release build.
 #[tokio::test]
-#[ignore = "micro-benchmark: builds a deep catalog; run --release --ignored --nocapture"]
-async fn projection_refresh_deep_catalog_full_vs_incremental() {
-    const HISTORY: usize = 1500;
+async fn projection_refresh_matches_clean_full_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
@@ -2970,44 +2964,40 @@ async fn projection_refresh_deep_catalog_full_vs_incremental() {
             .map(|_| ())
     }
     let publisher = GraphNamespacePublisher::new(uri, None);
-    for i in 0..HISTORY {
-        publish_empty_commit(&publisher).await.unwrap();
-        if i % 500 == 0 {
-            println!("history {i}/{HISTORY}");
-        }
-    }
-
-    // The reader = the merge-authority shape: a coordinator that did not
-    // write and must refresh to current.
     let control_session = crate::lance_access::control_session();
-    let (mut reader, _) = ManifestCoordinator::open_with_lineage(uri, None, &control_session)
-        .await
-        .unwrap();
+    let (mut reader, mut folded_lineage) =
+        ManifestCoordinator::open_with_lineage(uri, None, &control_session)
+            .await
+            .unwrap();
+    let old_head = reader.known_state.graph_heads[MAIN_BRANCH_HEAD_KEY].clone();
 
-    // Stale by one commit; force the full path by clearing the accumulators.
-    publish_empty_commit(&publisher).await.unwrap();
-    reader.projection = None;
-    let started = std::time::Instant::now();
-    let full_rows = reader.refresh_with_lineage().await.unwrap().len();
-    let full = started.elapsed();
-
-    // Stale by one commit again; the incremental path serves it.
-    publish_empty_commit(&publisher).await.unwrap();
-    let started = std::time::Instant::now();
-    let incremental_rows = reader.refresh_with_lineage().await.unwrap().len();
-    let incremental = started.elapsed();
-
-    assert_eq!(incremental_rows, full_rows + 1);
-    println!(
-        "authority refresh on a {HISTORY}-commit catalog: full scan {:.1} ms, \
-         incremental fold {:.3} ms ({}x)",
-        full.as_secs_f64() * 1000.0,
-        incremental.as_secs_f64() * 1000.0,
-        (full.as_secs_f64() / incremental.as_secs_f64().max(1e-9)) as u64,
+    for _ in 0..8 {
+        publish_empty_commit(&publisher).await.unwrap();
+    }
+    let LineageRefresh::Append(delta) = reader.refresh_with_lineage().await.unwrap() else {
+        panic!("append-only history must take the incremental refresh path");
+    };
+    assert_eq!(delta.len(), 8, "refresh must return only new lineage rows");
+    folded_lineage.extend(delta);
+    assert_ne!(
+        reader.known_state.graph_heads[MAIN_BRANCH_HEAD_KEY], old_head,
+        "the oracle must exercise mutable graph-head replacement, not only appends"
     );
-    #[cfg(not(debug_assertions))]
-    assert!(
-        incremental < full,
-        "the incremental fold must beat the full scan on a deep catalog"
+
+    let (fresh, mut full_lineage) =
+        ManifestCoordinator::open_with_lineage(uri, None, &control_session)
+            .await
+            .unwrap();
+    assert_eq!(reader.known_state.version, fresh.known_state.version);
+    assert_eq!(
+        format!("{:?}", reader.known_state.entries),
+        format!("{:?}", fresh.known_state.entries)
     );
+    assert_eq!(
+        reader.known_state.graph_heads,
+        fresh.known_state.graph_heads
+    );
+    folded_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+    full_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+    assert_eq!(folded_lineage, full_lineage);
 }
