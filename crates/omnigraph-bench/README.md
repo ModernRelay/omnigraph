@@ -243,14 +243,24 @@ it up. They neither download from S3 nor open or mutate the registered source
 as an OmniGraph database.
 
 `fixture run-graph` is the narrow runnable adapter for the checked-in FinGraph
-reference and strict real-graph run YAML. From a release binary on local APFS,
-it validates the copied graph, prepares a deterministic disjoint node-and-edge
-delta on two branches, freezes that prepared state, and restores identical
-clonefile inputs for fresh-process merge repetitions. This path is deliberately
-diagnostic: its output always records `claim_eligible: false` and
-`durable_record: false`, has no warm-up, leaves the OS page cache uncontrolled,
-and cannot publish through `--archive`. It also does not dispatch through the
-AWS benchmark infrastructure or publish durable telemetry. See the
+reference and strict real-graph run YAML. From a release binary, it validates
+the copied graph, prepares a deterministic disjoint node-and-edge delta on two
+branches, freezes that prepared state, and restores identical inputs at the
+same path for fresh-process merge repetitions. macOS uses forced APFS
+clonefiles. Linux requires XFS on a directly mounted EC2 instance-store NVMe
+namespace and uses complete verified plain copies; it reserves one additional
+prepared-tree copy plus 1 GiB before freezing. On a dedicated benchmark mount,
+it waits for filesystem-wide writeback with `syncfs` after freezing and after
+each restore, outside timing. The result records
+`xfs-plain-copy-syncfs-same-active-path`, backend evidence, and machine evidence
+captured in each measured worker; differing worker identities fail the run.
+
+This path is deliberately diagnostic: its output always records
+`claim_eligible: false` and `durable_record: false`, has no warm-up, leaves the
+OS page cache uncontrolled, and cannot publish through `--archive`. Plain-copy
+reset reads the complete tree outside timing and can warm that cache. The
+command still does not download a fixture, dispatch through AWS, or publish
+durable telemetry. See the
 [FinGraph diagnostic instructions](../../benchmarks/README.md#fingraph-diagnostic-runner)
 for the declarative run shape and exact command.
 

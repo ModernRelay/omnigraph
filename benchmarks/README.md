@@ -365,29 +365,37 @@ target/release/omnigraph-bench fixture run-graph \
   --reference \
     benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
   --fixture finbench-2026-08-21-sf10-v1=/path/to/finbench-2026-08-21-sf10-v1 \
-  --scratch-root /path/to/existing-apfs-scratch --json
+  --scratch-root /path/to/existing-qualified-scratch --json
 ```
 
-`run-graph` refuses a debug build. It is currently a local APFS diagnostic:
-the harness copies and validates the registered graph, prepares two branches
-whose disjoint changes each contain two `Account` nodes and one
-`AccountTransferAccount` edge, and freezes that prepared input. Each repetition
-restores the same path with APFS clonefiles and runs only the branch merge in a
-fresh worker process. The registered source is never opened as an OmniGraph
-database and remains unchanged.
+`run-graph` refuses a debug build. The harness copies and validates the
+registered graph, prepares two branches whose disjoint changes each contain
+two `Account` nodes and one `AccountTransferAccount` edge, and freezes that
+prepared input. Each repetition restores the same path and runs only the branch
+merge in a fresh worker process. macOS requires qualified local APFS and uses
+forced clonefiles. Linux requires XFS on a directly mounted EC2 instance-store
+NVMe namespace, refuses EBS, and uses a complete verified plain copy outside
+the timer. Use a dedicated benchmark mount: after freezing and after each
+restore, Linux `syncfs` waits for all writeback on that filesystem so reset I/O
+does not overlap the merge. The recorded reset is
+`xfs-plain-copy-syncfs-same-active-path`. Before making that template, the Linux
+path requires free space for one prepared-tree copy plus 1 GiB. The registered
+source is never opened as an OmniGraph database and remains unchanged.
 Before returning either success or failure, the command explicitly attempts to
 remove its disposable workspace. A cleanup failure is reported, and a run plus
 cleanup double failure retains both causes.
 The result includes raw elapsed samples, p50, merge route/phases, the prepared
-physical digest, and verification evidence for the inserted delta, protected
-heads, and untouched tables. Pre-existing rows in the two changed tables are
-not yet fully re-read and are reported as unverified rather than implied to be
-proved.
+physical digest, per-worker machine and backend evidence, and verification evidence for
+the inserted delta, protected heads, and untouched tables. Pre-existing rows
+in the two changed tables are not yet fully re-read and are reported as
+unverified rather than implied to be proved. Machine identity is captured just
+before timing in every worker; differing identities fail the run.
 
 This path deliberately does not make a publishable performance claim. Every
 result says `claim_eligible: false` and `durable_record: false`; it has no
 warm-up program, and although each measurement uses a fresh process, the
-operating-system page cache is uncontrolled. `run-graph` does not accept
+operating-system page cache is uncontrolled; Linux plain-copy reset reads every
+fixture byte outside timing and can warm it. `run-graph` does not accept
 `--archive`, publish durable telemetry, calculate a noise floor, download an
 S3 fixture, or dispatch work through the AWS benchmark infrastructure. AWS may
 hold the source snapshot, but an operator must first provide the verified local

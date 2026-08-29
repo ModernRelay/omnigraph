@@ -3,9 +3,10 @@
 //! V1 deliberately supports one FinGraph-native branch-merge probe. The
 //! imported graph supplies realistic catalog size, history, fragments, and
 //! indexes; each side inserts two `Account` nodes and one transfer edge. The
-//! prepared tree is frozen once, every repetition is restored with APFS
-//! clonefiles, and the measured merge runs in a fresh process. Results are
-//! diagnostic JSON only and cannot enter the durable benchmark archive.
+//! prepared tree is frozen once, every repetition is restored at the same
+//! path with APFS clonefiles or verified Linux/XFS plain copies, and the
+//! measured merge runs in a fresh process. Results are diagnostic JSON only
+//! and cannot enter the durable benchmark archive.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,7 +22,10 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::case::{LocalFilesystem, LocalStorageClass};
+use crate::environment::{LocalEnvironmentEvidence, verify_local_environment};
 use crate::fixture_reference::NormalizedFixtureReferenceV1;
+use crate::machine::{MachineIdentityV1, capture_machine_identity};
 use crate::model::{
     Diagnostic, ValidationOutcome, declared_version, read_yaml_file, strict_yaml, valid_kebab_id,
 };
@@ -29,7 +33,10 @@ use crate::real_graph::{observe_real_graph, validate_real_graph_reference};
 use crate::registered_fixture::{
     FixtureCopyPreflightReceiptV1, StagedRegisteredFixtureV1, stage_registered_fixture_binding,
 };
-use crate::reset::{PhysicalDigest, TraversalLimits, freeze_clonefile_template};
+use crate::reset::{
+    ClonefileTemplate, PhysicalDigest, PlainCopyTemplate, PreparedFixtureTree, TraversalLimits,
+    digest_metadata_tree, freeze_clonefile_template, freeze_plain_copy_template,
+};
 use crate::runner::{
     MergePhaseEvidenceForm, MergeRouteObservation, PhaseObservation,
     configure_benchmark_worker_environment, phase_observations,
@@ -42,6 +49,7 @@ const MAX_REPETITIONS: u32 = 20;
 const MAX_DEADLINE_SECONDS: u64 = 3_600;
 const MAX_WORKER_FILE_BYTES: u64 = 1024 * 1024;
 const WORKER_VERIFY_GRACE_SECONDS: u64 = 120;
+const PLAIN_COPY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 const SOURCE_BRANCH: &str = "bench-source";
 const TARGET_BRANCH: &str = "bench-target";
 const ACCOUNT_TABLE: &str = "node:Account";
@@ -164,6 +172,8 @@ pub struct RealGraphRunReportV1 {
     pub fixture: FixtureCopyPreflightReceiptV1,
     pub reference_sha256: String,
     pub prepared_input_physical: PhysicalDigest,
+    pub machine: MachineIdentityV1,
+    pub environment: LocalEnvironmentEvidence,
     pub reset: String,
     pub process_state: String,
     pub page_cache_state: String,
@@ -214,7 +224,124 @@ struct WorkerEnvelopeV1 {
     version: u32,
     ok: bool,
     sample: Option<RealGraphRepV1>,
+    machine: Option<MachineIdentityV1>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealGraphReset {
+    Clonefile,
+    PlainCopy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RealGraphLocalProfile {
+    filesystem: LocalFilesystem,
+    storage_class: LocalStorageClass,
+    reset: RealGraphReset,
+    reset_label: &'static str,
+}
+
+#[cfg(target_os = "macos")]
+fn real_graph_local_profile() -> Result<RealGraphLocalProfile, RealGraphRunError> {
+    Ok(RealGraphLocalProfile {
+        filesystem: LocalFilesystem::Apfs,
+        storage_class: LocalStorageClass::NvmeSsd,
+        reset: RealGraphReset::Clonefile,
+        reset_label: "apfs-clonefile-same-active-path",
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn real_graph_local_profile() -> Result<RealGraphLocalProfile, RealGraphRunError> {
+    Ok(RealGraphLocalProfile {
+        filesystem: LocalFilesystem::Xfs,
+        storage_class: LocalStorageClass::NvmeSsd,
+        reset: RealGraphReset::PlainCopy,
+        reset_label: "xfs-plain-copy-syncfs-same-active-path",
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn real_graph_local_profile() -> Result<RealGraphLocalProfile, RealGraphRunError> {
+    Err(RealGraphRunError::new(
+        "unsupported_real_graph_platform",
+        "real-graph execution supports macOS/APFS clonefile or Linux/XFS EC2 instance-store NVMe only",
+    ))
+}
+
+enum RealGraphTemplate {
+    Clonefile(ClonefileTemplate),
+    PlainCopy(PlainCopyTemplate),
+}
+
+impl RealGraphTemplate {
+    fn freeze(
+        profile: RealGraphLocalProfile,
+        active: &Path,
+        template: &Path,
+        limits: TraversalLimits,
+    ) -> std::io::Result<Self> {
+        match profile.reset {
+            RealGraphReset::Clonefile => {
+                freeze_clonefile_template(active, template, limits).map(Self::Clonefile)
+            }
+            RealGraphReset::PlainCopy => {
+                let frozen = freeze_plain_copy_template(active, template, limits)?;
+                sync_plain_copy_filesystem(frozen.template_root())?;
+                Ok(Self::PlainCopy(frozen))
+            }
+        }
+    }
+
+    fn physical_digest(&self) -> &PhysicalDigest {
+        match self {
+            Self::Clonefile(template) => template.physical_digest(),
+            Self::PlainCopy(template) => template.physical_digest(),
+        }
+    }
+
+    fn verify_unchanged(&self) -> std::io::Result<()> {
+        match self {
+            Self::Clonefile(template) => template.verify_unchanged().map(|_| ()),
+            Self::PlainCopy(template) => template.verify_unchanged().map(|_| ()),
+        }
+    }
+
+    fn restore_active(&self) -> std::io::Result<PreparedFixtureTree> {
+        match self {
+            Self::Clonefile(template) => template.restore_active(),
+            Self::PlainCopy(template) => {
+                let prepared = template.restore_active()?;
+                sync_plain_copy_filesystem(prepared.root())?;
+                Ok(prepared)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sync_plain_copy_filesystem(root: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let directory = fs::File::open(root)?;
+    // SAFETY: the descriptor remains open for this call; syncfs does not
+    // retain it. This waits for the entire dedicated benchmark filesystem,
+    // including data and directory metadata, outside the measured interval.
+    let result = unsafe { libc::syncfs(directory.as_raw_fd()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_plain_copy_filesystem(_root: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "real-graph plain-copy writeback synchronization requires Linux syncfs",
+    ))
 }
 
 pub async fn execute_real_graph_run(
@@ -261,6 +388,16 @@ async fn execute_staged_real_graph_run(
             ),
         ));
     }
+    let active = staged.root().to_path_buf();
+    let workspace = active.parent().ok_or_else(|| {
+        RealGraphRunError::new(
+            "real_graph_scratch_failed",
+            "staged graph root has no run-owned parent",
+        )
+    })?;
+    let profile = real_graph_local_profile()?;
+    let mut environment = observe_real_graph_environment(workspace, profile)?;
+
     let observation = observe_real_graph(staged.root()).await.map_err(|error| {
         RealGraphRunError::new("real_graph_observation_failed", error.to_string())
     })?;
@@ -271,22 +408,33 @@ async fn execute_staged_real_graph_run(
         RealGraphRunError::new("staged_fixture_changed", diagnostic.message)
     })?;
 
-    let active = staged.root().to_path_buf();
-    let workspace = active.parent().ok_or_else(|| {
-        RealGraphRunError::new(
-            "real_graph_scratch_failed",
-            "staged graph root has no run-owned parent",
-        )
-    })?;
     let template = workspace.join("template");
     let fixture_receipt = staged.receipt().clone();
 
     prepare_finbench_delta(&active).await?;
-    let frozen = freeze_clonefile_template(&active, &template, TraversalLimits::default())
-        .map_err(|error| {
+    let limits = TraversalLimits::default();
+    if profile.reset == RealGraphReset::PlainCopy {
+        let prepared = digest_metadata_tree(&active, limits).map_err(|error| {
+            RealGraphRunError::new(
+                "real_graph_capacity_probe_failed",
+                format!("inventory prepared graph before plain-copy freeze: {error}"),
+            )
+        })?;
+        environment = observe_real_graph_environment(&active, profile)?;
+        require_plain_copy_capacity(
+            prepared.bytes,
+            environment.available_bytes,
+            &environment.mount_point,
+        )?;
+    }
+    let frozen =
+        RealGraphTemplate::freeze(profile, &active, &template, limits).map_err(|error| {
             RealGraphRunError::new(
                 "real_graph_freeze_failed",
-                format!("freeze prepared graph with APFS clonefiles: {error}"),
+                format!(
+                    "freeze prepared graph with {}: {error}",
+                    profile.reset_label
+                ),
             )
         })?;
     remove_active(&active, workspace)?;
@@ -298,6 +446,7 @@ async fn execute_staged_real_graph_run(
         )
     })?;
     let mut samples = Vec::with_capacity(spec.repetitions as usize);
+    let mut worker_machine = None::<MachineIdentityV1>;
     for repetition in 1..=spec.repetitions {
         frozen.verify_unchanged().map_err(|error| {
             RealGraphRunError::new(
@@ -347,7 +496,7 @@ async fn execute_staged_real_graph_run(
                 format!("write worker request: {error}"),
             )
         })?;
-        let sample = invoke_worker(
+        let outcome = invoke_worker(
             &executable,
             &request_path,
             &result_path,
@@ -356,12 +505,20 @@ async fn execute_staged_real_graph_run(
         )
         .await;
         remove_active(&active, workspace)?;
-        samples.push(sample?);
+        let (sample, machine) = outcome?;
+        accept_worker_machine(&mut worker_machine, machine, repetition)?;
+        samples.push(sample);
     }
     frozen.verify_unchanged().map_err(|error| {
         RealGraphRunError::new(
             "real_graph_template_changed",
             format!("prepared template changed after execution: {error}"),
+        )
+    })?;
+    let machine = worker_machine.ok_or_else(|| {
+        RealGraphRunError::new(
+            "real_graph_worker_protocol_failed",
+            "real-graph execution produced no repetition-worker machine identity",
         )
     })?;
 
@@ -379,7 +536,9 @@ async fn execute_staged_real_graph_run(
         fixture: fixture_receipt,
         reference_sha256: reference.reference_sha256.clone(),
         prepared_input_physical,
-        reset: "apfs-clonefile-same-active-path".to_string(),
+        machine,
+        environment,
+        reset: profile.reset_label.to_string(),
         process_state: "fresh-process-per-repetition".to_string(),
         page_cache_state: "uncontrolled".to_string(),
         warmup: "none".to_string(),
@@ -390,6 +549,56 @@ async fn execute_staged_real_graph_run(
         p50_us,
         samples,
     })
+}
+
+fn observe_real_graph_environment(
+    scratch_path: &Path,
+    profile: RealGraphLocalProfile,
+) -> Result<LocalEnvironmentEvidence, RealGraphRunError> {
+    verify_local_environment(scratch_path, profile.filesystem, profile.storage_class)
+        .map_err(|message| RealGraphRunError::new("environment_mismatch", message))
+}
+
+fn require_plain_copy_capacity(
+    prepared_bytes: u64,
+    available_bytes: u64,
+    mount_point: &str,
+) -> Result<u64, RealGraphRunError> {
+    let required = prepared_bytes
+        .checked_add(PLAIN_COPY_HEADROOM_BYTES)
+        .ok_or_else(|| {
+            RealGraphRunError::new(
+                "required_scratch_capacity_overflow",
+                "prepared graph plus plain-copy headroom overflowed u64",
+            )
+        })?;
+    if available_bytes < required {
+        return Err(RealGraphRunError::new(
+            "insufficient_scratch_capacity",
+            format!(
+                "real-graph plain-copy reset requires at least {required} available bytes, but {available_bytes} are available at {mount_point}"
+            ),
+        ));
+    }
+    Ok(required)
+}
+
+fn accept_worker_machine(
+    expected: &mut Option<MachineIdentityV1>,
+    observed: MachineIdentityV1,
+    repetition: u32,
+) -> Result<(), RealGraphRunError> {
+    match expected {
+        Some(machine) if machine != &observed => Err(RealGraphRunError::new(
+            "machine_identity_changed",
+            format!("repetition-worker machine identity changed before repetition {repetition}"),
+        )),
+        None => {
+            *expected = Some(observed);
+            Ok(())
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 fn complete_real_graph_run<T>(
@@ -548,7 +757,7 @@ async fn invoke_worker(
     result: &Path,
     worker_scratch: &Path,
     deadline_seconds: u64,
-) -> Result<RealGraphRepV1, RealGraphRunError> {
+) -> Result<(RealGraphRepV1, MachineIdentityV1), RealGraphRunError> {
     let mut command = Command::new(executable);
     configure_benchmark_worker_environment(command.as_std_mut(), worker_scratch);
     command
@@ -603,12 +812,19 @@ async fn invoke_worker(
                 .unwrap_or_else(|| format!("worker exited {status}")),
         ));
     }
-    envelope.sample.ok_or_else(|| {
+    let sample = envelope.sample.ok_or_else(|| {
         RealGraphRunError::new(
             "real_graph_worker_protocol_failed",
             "successful worker returned no sample",
         )
-    })
+    })?;
+    let machine = envelope.machine.ok_or_else(|| {
+        RealGraphRunError::new(
+            "real_graph_worker_protocol_failed",
+            "successful worker returned no machine identity",
+        )
+    })?;
+    Ok((sample, machine))
 }
 
 pub async fn run_real_graph_worker_files(request: &Path, result: &Path) -> ExitCode {
@@ -617,16 +833,18 @@ pub async fn run_real_graph_worker_files(request: &Path, result: &Path) -> ExitC
         Err(error) => Err(error),
     };
     let envelope = match outcome {
-        Ok(sample) => WorkerEnvelopeV1 {
+        Ok((sample, machine)) => WorkerEnvelopeV1 {
             version: WORKER_PROTOCOL_VERSION,
             ok: true,
             sample: Some(sample),
+            machine: Some(machine),
             error: None,
         },
         Err(error) => WorkerEnvelopeV1 {
             version: WORKER_PROTOCOL_VERSION,
             ok: false,
             sample: None,
+            machine: None,
             error: Some(error.to_string()),
         },
     };
@@ -648,7 +866,9 @@ pub async fn run_real_graph_worker_files(request: &Path, result: &Path) -> ExitC
     }
 }
 
-async fn execute_worker(request: WorkerRequestV1) -> Result<RealGraphRepV1, RealGraphRunError> {
+async fn execute_worker(
+    request: WorkerRequestV1,
+) -> Result<(RealGraphRepV1, MachineIdentityV1), RealGraphRunError> {
     if request.version != WORKER_PROTOCOL_VERSION {
         return Err(RealGraphRunError::new(
             "real_graph_worker_protocol_failed",
@@ -676,6 +896,15 @@ async fn execute_worker(request: WorkerRequestV1) -> Result<RealGraphRepV1, Real
         .snapshot_of(ReadTarget::branch(TARGET_BRANCH))
         .await
         .map_err(engine_worker_error)?;
+    // Capture process-effective facts in the fresh repetition worker after
+    // preparation and immediately before the measured operation. The CLI
+    // parent can have different affinity, cgroup, scheduling, or limits.
+    let machine = capture_machine_identity().map_err(|error| {
+        RealGraphRunError::new(
+            "machine_identity_capture_failed",
+            format!("capture repetition-worker machine identity: {error}"),
+        )
+    })?;
     let probes = MergeWriteProbes::default();
     let started = Instant::now();
     let outcome = with_merge_write_probes(
@@ -737,19 +966,22 @@ async fn execute_worker(request: WorkerRequestV1) -> Result<RealGraphRepV1, Real
     verify_reserved_entities(&db, TARGET_BRANCH, SideExpectation::All).await?;
     verify_merge_commit(&db, &source_before, &target_before, &target_after).await?;
     drop(db);
-    Ok(RealGraphRepV1 {
-        repetition: request.repetition,
-        elapsed_us,
-        outcome: "merged".to_string(),
-        phases,
-        route,
-        before_target_manifest_version: target_before.graph_manifest_version(),
-        after_target_manifest_version: target_after.graph_manifest_version(),
-        inserted_delta_verified: true,
-        existing_rows_in_changed_tables_verified: false,
-        protected_heads_verified: true,
-        untouched_tables_verified,
-    })
+    Ok((
+        RealGraphRepV1 {
+            repetition: request.repetition,
+            elapsed_us,
+            outcome: "merged".to_string(),
+            phases,
+            route,
+            before_target_manifest_version: target_before.graph_manifest_version(),
+            after_target_manifest_version: target_after.graph_manifest_version(),
+            inserted_delta_verified: true,
+            existing_rows_in_changed_tables_verified: false,
+            protected_heads_verified: true,
+            untouched_tables_verified,
+        },
+        machine,
+    ))
 }
 
 fn require_snapshot_unchanged(
@@ -1122,6 +1354,7 @@ fn read_worker_envelope(path: &Path) -> Result<WorkerEnvelopeV1, RealGraphRunErr
     })?;
     if envelope.version != WORKER_PROTOCOL_VERSION
         || envelope.ok != envelope.sample.is_some()
+        || envelope.ok != envelope.machine.is_some()
         || envelope.ok == envelope.error.is_some()
     {
         return Err(RealGraphRunError::new(
@@ -1232,6 +1465,71 @@ mod tests {
         assert!(complete_real_graph_run(Ok(7_u8), Ok(())).is_ok());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_real_graph_profile_remains_apfs_clonefile() {
+        let profile = real_graph_local_profile().unwrap();
+        assert_eq!(profile.filesystem, LocalFilesystem::Apfs);
+        assert_eq!(profile.storage_class, LocalStorageClass::NvmeSsd);
+        assert_eq!(profile.reset, RealGraphReset::Clonefile);
+        assert_eq!(profile.reset_label, "apfs-clonefile-same-active-path");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_real_graph_profile_is_xfs_instance_nvme_plain_copy() {
+        let profile = real_graph_local_profile().unwrap();
+        assert_eq!(profile.filesystem, LocalFilesystem::Xfs);
+        assert_eq!(profile.storage_class, LocalStorageClass::NvmeSsd);
+        assert_eq!(profile.reset, RealGraphReset::PlainCopy);
+        assert_eq!(
+            profile.reset_label,
+            "xfs-plain-copy-syncfs-same-active-path"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_real_graph_plain_copy_syncs_and_restores_the_exact_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let active = directory.path().join("root");
+        let template = directory.path().join("template");
+        fs::create_dir(&active).unwrap();
+        fs::write(active.join("data"), b"prepared graph").unwrap();
+        let frozen = RealGraphTemplate::freeze(
+            real_graph_local_profile().unwrap(),
+            &active,
+            &template,
+            TraversalLimits::default(),
+        )
+        .unwrap();
+        fs::remove_dir_all(&active).unwrap();
+
+        let restored = frozen.restore_active().unwrap();
+        assert_eq!(restored.root(), active);
+        assert_eq!(fs::read(active.join("data")).unwrap(), b"prepared graph");
+        restored.verify_unchanged().unwrap();
+        frozen.verify_unchanged().unwrap();
+        assert!(sync_plain_copy_filesystem(&directory.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn plain_copy_capacity_is_checked_at_the_exact_boundary() {
+        let prepared_bytes = 42;
+        let required = prepared_bytes + PLAIN_COPY_HEADROOM_BYTES;
+
+        let insufficient =
+            require_plain_copy_capacity(prepared_bytes, required - 1, "/scratch").unwrap_err();
+        assert_eq!(insufficient.code, "insufficient_scratch_capacity");
+        assert_eq!(
+            require_plain_copy_capacity(prepared_bytes, required, "/scratch").unwrap(),
+            required
+        );
+
+        let overflow = require_plain_copy_capacity(u64::MAX, u64::MAX, "/scratch").unwrap_err();
+        assert_eq!(overflow.code, "required_scratch_capacity_overflow");
+    }
+
     #[tokio::test]
     async fn native_finbench_delta_merges_and_verifies_exactly() {
         const SCHEMA: &str = r#"
@@ -1268,7 +1566,7 @@ mod tests {
         drop(db);
 
         prepare_finbench_delta(&root).await.unwrap();
-        let sample = execute_worker(WorkerRequestV1 {
+        let (sample, machine) = execute_worker(WorkerRequestV1 {
             version: WORKER_PROTOCOL_VERSION,
             repetition: 1,
             root,
@@ -1278,9 +1576,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(sample.outcome, "merged");
+        machine.validate().unwrap();
         assert_eq!(sample.route.table_walk_intervals, 2);
         assert!(sample.inserted_delta_verified);
         assert!(!sample.existing_rows_in_changed_tables_verified);
         assert!(sample.protected_heads_verified);
+    }
+
+    #[test]
+    fn worker_machine_identity_is_established_once_and_drift_is_refused() {
+        let first = capture_machine_identity().unwrap();
+        let mut expected = None;
+        accept_worker_machine(&mut expected, first.clone(), 1).unwrap();
+        assert_eq!(expected.as_ref(), Some(&first));
+        accept_worker_machine(&mut expected, first.clone(), 2).unwrap();
+
+        let mut changed = first.clone();
+        changed.machine_label = format!("hostname-sha256:{}", "0".repeat(64));
+        let error = accept_worker_machine(&mut expected, changed, 3).unwrap_err();
+        assert_eq!(error.code, "machine_identity_changed");
+        assert!(error.message.contains("repetition 3"));
+        assert_eq!(expected, Some(first));
     }
 }

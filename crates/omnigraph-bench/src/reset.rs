@@ -91,13 +91,32 @@ pub struct ClonefileTemplate {
     limits: TraversalLimits,
 }
 
-/// One clonefile-restored active tree and its pre-open metadata witness.
+/// A byte-identified plain-copy template that must never be opened as a database.
+///
+/// Like [`ClonefileTemplate`], this remembers the exact absolute path at which
+/// the source fixture was built. Restoring to that lexical path keeps absolute
+/// Lance base paths valid. Unlike clonefile reset, every restore reads and
+/// writes the complete tree; callers must keep that work outside measurement
+/// and must not describe the operating-system page cache as cold.
 #[derive(Debug, Clone)]
-pub struct PreparedClone {
+pub struct PlainCopyTemplate {
+    template_root: PathBuf,
+    active_root: PathBuf,
+    physical: PhysicalDigest,
+    metadata: MetadataDigest,
+    limits: TraversalLimits,
+}
+
+/// One restored active fixture tree and its pre-open metadata witness.
+#[derive(Debug, Clone)]
+pub struct PreparedFixtureTree {
     root: PathBuf,
     metadata: MetadataDigest,
     limits: TraversalLimits,
 }
+
+/// Backward-compatible name for a clonefile-restored fixture tree.
+pub type PreparedClone = PreparedFixtureTree;
 
 /// Compute the physical identity of a quiescent fixture root.
 ///
@@ -205,6 +224,38 @@ pub fn freeze_clonefile_template(
     })
 }
 
+/// Freeze a quiescent active fixture into a never-opened plain-copy template.
+///
+/// Both paths must be stable absolute paths without parent traversal.
+/// `active_root` must be the exact path used to build the database; the
+/// returned template restores only that same path. The caller must remove
+/// `active_root` after this function succeeds and before the first restore.
+///
+/// This is deliberately a byte copy rather than a reflink. It verifies the
+/// complete source and destination contents before returning, so its cost is
+/// proportional to fixture size and can populate the operating-system page
+/// cache.
+pub fn freeze_plain_copy_template(
+    active_root: &Path,
+    template_root: &Path,
+    limits: TraversalLimits,
+) -> io::Result<PlainCopyTemplate> {
+    let active_root = stable_absolute_path("active fixture root", active_root)?;
+    let template_root = stable_absolute_path("plain-copy template root", template_root)?;
+    refuse_destination_below_source(&active_root, &template_root)?;
+    let physical = digest_physical_tree(&active_root, limits)?;
+    copy_verified(&active_root, &template_root, &physical, limits)?;
+    let metadata = digest_metadata_tree(&template_root, limits)?;
+
+    Ok(PlainCopyTemplate {
+        template_root,
+        active_root,
+        physical,
+        metadata,
+        limits,
+    })
+}
+
 /// Accept a clonefile template produced by the contained fixture worker.
 ///
 /// The worker owns the only full byte read and clone operation. The parent
@@ -219,8 +270,51 @@ pub(crate) fn accept_clonefile_template_handoff(
     limits: TraversalLimits,
 ) -> io::Result<ClonefileTemplate> {
     require_clonefile_platform()?;
+    let (active_root, template_root) =
+        retired_template_handoff_paths(active_root, template_root, "clonefile template root")?;
+    validate_handoff_identity(&physical, &metadata)?;
+    verify_metadata_tree(&template_root, &metadata, limits)?;
+    Ok(ClonefileTemplate {
+        template_root,
+        active_root,
+        physical,
+        metadata,
+        limits,
+    })
+}
+
+/// Accept a plain-copy template produced by the contained fixture worker.
+///
+/// Unlike clonefile handoff, the parent re-reads the complete template because
+/// no kernel clone contract connects it to the worker's physical digest.
+pub(crate) fn accept_plain_copy_template_handoff(
+    active_root: &Path,
+    template_root: &Path,
+    physical: PhysicalDigest,
+    metadata: MetadataDigest,
+    limits: TraversalLimits,
+) -> io::Result<PlainCopyTemplate> {
+    let (active_root, template_root) =
+        retired_template_handoff_paths(active_root, template_root, "plain-copy template root")?;
+    validate_handoff_identity(&physical, &metadata)?;
+    verify_physical_tree(&template_root, &physical, limits)?;
+    verify_metadata_tree(&template_root, &metadata, limits)?;
+    Ok(PlainCopyTemplate {
+        template_root,
+        active_root,
+        physical,
+        metadata,
+        limits,
+    })
+}
+
+fn retired_template_handoff_paths(
+    active_root: &Path,
+    template_root: &Path,
+    template_label: &str,
+) -> io::Result<(PathBuf, PathBuf)> {
     let active_root = stable_absolute_path("active fixture root", active_root)?;
-    let template_root = stable_absolute_path("clonefile template root", template_root)?;
+    let template_root = stable_absolute_path(template_label, template_root)?;
     refuse_destination_below_retired_source(&active_root, &template_root)?;
     match fs::symlink_metadata(&active_root) {
         Ok(_) => {
@@ -237,6 +331,13 @@ pub(crate) fn accept_clonefile_template_handoff(
             ));
         }
     }
+    Ok((active_root, template_root))
+}
+
+fn validate_handoff_identity(
+    physical: &PhysicalDigest,
+    metadata: &MetadataDigest,
+) -> io::Result<()> {
     if physical.files != metadata.files || physical.bytes != metadata.bytes {
         return Err(invalid_data(format!(
             "fixture handoff disagrees on template totals: physical files={} bytes={}, metadata files={} bytes={}",
@@ -248,14 +349,7 @@ pub(crate) fn accept_clonefile_template_handoff(
             "fixture handoff physical digest must be exactly 64 lowercase hexadecimal characters",
         ));
     }
-    verify_metadata_tree(&template_root, &metadata, limits)?;
-    Ok(ClonefileTemplate {
-        template_root,
-        active_root,
-        physical,
-        metadata,
-        limits,
-    })
+    Ok(())
 }
 
 fn is_lowercase_sha256(value: &str) -> bool {
@@ -310,14 +404,14 @@ impl ClonefileTemplate {
     /// can leave a partial active tree, which must not be opened. The caller
     /// owns deletion of the previous repetition after all engine handles have
     /// quiesced.
-    pub fn restore_active(&self) -> io::Result<PreparedClone> {
+    pub fn restore_active(&self) -> io::Result<PreparedFixtureTree> {
         let metadata = clonefile_tree_from_witness(
             &self.template_root,
             &self.active_root,
             &self.metadata,
             self.limits,
         )?;
-        Ok(PreparedClone {
+        Ok(PreparedFixtureTree {
             root: self.active_root.clone(),
             metadata,
             limits: self.limits,
@@ -325,7 +419,54 @@ impl ClonefileTemplate {
     }
 }
 
-impl PreparedClone {
+impl PlainCopyTemplate {
+    /// Exact path of the never-opened template tree.
+    pub fn template_root(&self) -> &Path {
+        &self.template_root
+    }
+
+    /// Exact stable path at which every repetition must run.
+    pub fn active_root(&self) -> &Path {
+        &self.active_root
+    }
+
+    /// Full byte identity captured before the template was made.
+    pub fn physical_digest(&self) -> &PhysicalDigest {
+        &self.physical
+    }
+
+    /// Metadata witness for proving that the template remains immutable.
+    pub fn metadata_digest(&self) -> &MetadataDigest {
+        &self.metadata
+    }
+
+    /// Prove without reading file contents that the template is unchanged.
+    pub fn verify_unchanged(&self) -> io::Result<MetadataDigest> {
+        verify_metadata_tree(&self.template_root, &self.metadata, self.limits)
+    }
+
+    /// Restore one repetition to the exact path used to build the fixture.
+    ///
+    /// The active path may be absent or an existing empty directory. This
+    /// verifies every source and destination byte. An error can leave a
+    /// partial active tree, which must not be opened.
+    pub fn restore_active(&self) -> io::Result<PreparedFixtureTree> {
+        copy_verified(
+            &self.template_root,
+            &self.active_root,
+            &self.physical,
+            self.limits,
+        )?;
+        let metadata = digest_metadata_tree(&self.active_root, self.limits)?;
+        Ok(PreparedFixtureTree {
+            root: self.active_root.clone(),
+            metadata,
+            limits: self.limits,
+        })
+    }
+}
+
+impl PreparedFixtureTree {
     /// Exact active path to pass to the engine.
     pub fn root(&self) -> &Path {
         &self.root
@@ -1483,6 +1624,111 @@ mod tests {
         assert_eq!(fs::read(destination.join("a.txt")).unwrap(), b"alpha");
         assert_eq!(fs::read(destination.join("data/b.bin")).unwrap(), b"beta");
         assert!(destination.join("empty").is_dir());
+    }
+
+    #[test]
+    fn plain_copy_template_restores_exact_active_path_with_byte_isolation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let active = workspace.path().join("active");
+        let template = workspace.path().join("template");
+        fs::create_dir(&active).unwrap();
+        fixture_tree(&active);
+        let limits = TraversalLimits::default();
+
+        let frozen = freeze_plain_copy_template(&active, &template, limits).unwrap();
+        assert_eq!(frozen.active_root(), active);
+        assert_eq!(frozen.template_root(), template);
+        assert_eq!(
+            digest_physical_tree(&template, limits).unwrap(),
+            *frozen.physical_digest()
+        );
+        frozen.verify_unchanged().unwrap();
+
+        fs::remove_dir_all(&active).unwrap();
+        let prepared = frozen.restore_active().unwrap();
+        assert_eq!(prepared.root(), active);
+        assert_eq!(
+            digest_physical_tree(&active, limits).unwrap(),
+            *frozen.physical_digest()
+        );
+        prepared.verify_unchanged().unwrap();
+
+        fs::write(active.join("a.txt"), b"ALPHA").unwrap();
+        assert!(prepared.verify_unchanged().is_err());
+        assert_eq!(fs::read(template.join("a.txt")).unwrap(), b"alpha");
+        frozen.verify_unchanged().unwrap();
+
+        fs::remove_dir_all(&active).unwrap();
+        let second = frozen.restore_active().unwrap();
+        assert_eq!(fs::read(active.join("a.txt")).unwrap(), b"alpha");
+        second.verify_unchanged().unwrap();
+        frozen.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn changed_plain_copy_template_is_refused_before_restoring_active() {
+        let workspace = tempfile::tempdir().unwrap();
+        let active = workspace.path().join("active");
+        let template = workspace.path().join("template");
+        fs::create_dir(&active).unwrap();
+        fixture_tree(&active);
+        let limits = TraversalLimits::default();
+        let frozen = freeze_plain_copy_template(&active, &template, limits).unwrap();
+        fs::remove_dir_all(&active).unwrap();
+        fs::write(template.join("a.txt"), b"ALPHA").unwrap();
+
+        let error = frozen.restore_active().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!active.exists());
+    }
+
+    #[test]
+    fn plain_copy_handoff_requires_retired_active_and_exact_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let active = workspace.path().join("active");
+        let template = workspace.path().join("template");
+        fs::create_dir(&active).unwrap();
+        fixture_tree(&active);
+        let limits = TraversalLimits::default();
+        let frozen = freeze_plain_copy_template(&active, &template, limits).unwrap();
+        let physical = frozen.physical_digest().clone();
+        let metadata = frozen.metadata_digest().clone();
+
+        let left_behind = accept_plain_copy_template_handoff(
+            &active,
+            &template,
+            physical.clone(),
+            metadata.clone(),
+            limits,
+        )
+        .unwrap_err();
+        assert!(
+            left_behind
+                .to_string()
+                .contains("left the active path behind"),
+            "{left_behind}"
+        );
+
+        fs::remove_dir_all(&active).unwrap();
+        let accepted = accept_plain_copy_template_handoff(
+            &active,
+            &template,
+            physical.clone(),
+            metadata.clone(),
+            limits,
+        )
+        .unwrap();
+        let prepared = accepted.restore_active().unwrap();
+        assert_eq!(prepared.root(), active);
+        verify_physical_tree(&active, &physical, limits).unwrap();
+
+        fs::remove_dir_all(&active).unwrap();
+        fs::write(template.join("a.txt"), b"ALPHA").unwrap();
+        let tampered =
+            accept_plain_copy_template_handoff(&active, &template, physical, metadata, limits)
+                .unwrap_err();
+        assert_eq!(tampered.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
