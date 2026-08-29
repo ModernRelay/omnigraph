@@ -81,6 +81,13 @@ resource validation before staging. `stage_all` produces one exact transaction
 per touched table without moving HEAD; `commit_all` enters the gate and
 recovery sequence above.
 
+Existing-table constructive transactions stage independently with bounded
+concurrency. `OMNIGRAPH_LOAD_CONCURRENCY` selects that width for both Load and
+ordinary insert/update mutations (default 8). Deferred first-touch branch
+effects and delete transactions remain serial. The setting changes only
+fragment preparation: every participant still crosses the same recovery
+boundary and one graph-manifest publication.
+
 The D2 rule keeps one mutation query constructive (insert/update) or
 destructive (delete), never both. Compose mixed work through separate
 mutations, or through a branch when a later merge must expose one combined

@@ -1228,6 +1228,231 @@ fn dst_lance_realm_faults_bite_and_oracles_hold() {
     assert!(a.verified > 0);
 }
 
+/// ONE spelling of the keep-serving scenario shared by the panel, the
+/// widened-arbitration regression, and the seed search — the panel's
+/// re-pin protocol ("screen at THIS test's parameters") holds by
+/// construction, not copy discipline.
+fn keep_serving_scenario(seed: u64, ops: usize, error_pct: u64) -> Scenario {
+    Scenario {
+        seed,
+        ops,
+        faults: Some(omnigraph_dst::harness::FaultPlan {
+            seed: seed * 100,
+            error_pct,
+            lance_realm: true,
+            ..Default::default()
+        }),
+        keep_serving_ops: 3,
+        ..Default::default()
+    }
+}
+
+/// The rendered detector tag a wedge red carries — built from the detector
+/// const, never hand-spelled.
+fn wedge_detector_tag() -> String {
+    format!(
+        "detector={}",
+        omnigraph_dst::harness::DET_LIVE_WRITE_AVAILABILITY
+    )
+}
+
+/// Keep-serving defer rows in a report (the wedge-shape evidence the
+/// panel's and the regression's shape asserts count).
+fn keep_serving_defer_rows(report: &omnigraph_dst::harness::UniverseReport) -> usize {
+    report
+        .known_issues
+        .iter()
+        .filter(|row| row.starts_with(omnigraph_dst::harness::KEEP_SERVING_DEFER_PREFIX))
+        .count()
+}
+
+/// Defer-implies-resolution invariant: a universe that deferred must also
+/// have resolved — the watch never outlives its universe unjudged. Keyed
+/// on the producer's exported prefixes, one spelling.
+fn assert_resolution_row(report: &omnigraph_dst::harness::UniverseReport, seed: u64) {
+    assert!(
+        report.known_issues.iter().any(|row| {
+            row.starts_with(omnigraph_dst::harness::KEEP_SERVING_HEALED_PREFIX)
+                || row.starts_with(omnigraph_dst::harness::KEEP_SERVING_INTERRUPTED_PREFIX)
+                || row.starts_with(omnigraph_dst::harness::KEEP_SERVING_EXPIRED_PREFIX)
+        }),
+        "seed {seed}: defer rows without a resolution row"
+    );
+}
+
+/// ISSUE #554 CATCH: a lance-realm write fault fails one mutation between
+/// arming its v9 recovery sidecar and its table commit; the stranded Armed
+/// intent is effect-free, yet the write-entry heal defers it and every
+/// later write on the live handle is refused with the same operation id.
+/// With the keep-serving budget armed this test is RED at engine HEAD
+/// (detector=Store(Session)/LiveWriteAvailability) and goes green when the
+/// live heal retires provably effect-free Armed mutation/load intents.
+///
+/// PANEL, not a single pin: lance-realm universes sit outside the strict
+/// replay envelope (pool threads race the entropy shim), so any ONE seed's
+/// strand can evaporate or reappear with process context — observed in
+/// both directions on seed 0 even at `error_pct: 80`. Every member is a
+/// verified flip seed, and the panel verdict is robust: RED if ANY member
+/// wedges, green only when ALL heal — jitter would have to erase every
+/// member at once to fake a pass, and the shape assert catches even that
+/// as a loud wrong-reason failure.
+///
+/// Re-pinning after upstream drift is a two-step protocol: run
+/// `dst_keep_serving_wedge_seed_search` (deliberately broader parameters —
+/// ops 30, `error_pct: 15` — to survey the wedge population), then screen
+/// its wedge seeds at THIS test's parameters against the engine fix: a
+/// panel member must strand-and-wedge (or strand harmlessly) at HEAD and
+/// heal under the fix.
+#[test]
+#[serial]
+fn dst_keep_serving_wedge_issue_554() {
+    // ops is deliberately SHORT: the panel seeds strand early — a longer
+    // life under this fault plan eventually strands an EFFECTFUL Armed
+    // intent (partial multi-table commit), which the engine CORRECTLY
+    // refuses to retire live; the detector's effect-free precision is
+    // enforced by scenario construction (verifying effect-freedom in the
+    // oracle itself is future work). error_pct is HIGH so retry chains
+    // die instead of rescuing the commit.
+    // Every member is a verified FLIP seed: wedges (or strands harmlessly)
+    // at engine HEAD and heals under the issue-554 engine fix. Seeds 12 and
+    // 18 were screened OUT — their strands stay wedged under the fix
+    // (effectful / excluded-class intents the engine correctly refuses to
+    // retire live — the detector's precision boundary, observed in the
+    // wild; not panel material).
+    const PANEL: [u64; 14] = [0, 4, 10, 11, 14, 15, 17, 20, 21, 22, 23, 25, 26, 28];
+    let mut wedged: Vec<String> = Vec::new();
+    let mut defer_rows = 0usize;
+    for seed in PANEL {
+        let sc = keep_serving_scenario(seed, 10, 80);
+        let root = format!("shared-memory://dst-keep-serving-554-{seed}");
+        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
+            Ok(report) => {
+                let defers = keep_serving_defer_rows(&report);
+                if defers > 0 {
+                    assert_resolution_row(&report, seed);
+                }
+                defer_rows += defers;
+            }
+            Err(panic) => {
+                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
+                if message.contains(&wedge_detector_tag()) {
+                    wedged.push(format!("seed {seed}: {message}"));
+                } else {
+                    // A non-wedge red on a panel seed is a different bug —
+                    // surface it with its seed rather than folding it into
+                    // the wedge verdict.
+                    panic!("seed {seed}: {message}");
+                }
+            }
+        }
+    }
+    assert!(
+        wedged.is_empty(),
+        "ISSUE-554 PANEL RED: live handles wedged on {} of {} panel seeds.\n\
+         Orientation for a CI reader: at engine HEAD WITHOUT the #554 live-heal \
+         engine fix this red is DESIGNED and expected to flip green when that \
+         fix merges. If that fix is already on this branch's base, this is a \
+         REGRESSION in the live retirement of effect-free Armed intents.\n{}",
+        wedged.len(),
+        PANEL.len(),
+        wedged.join("\n")
+    );
+    assert!(
+        defer_rows > 0,
+        "no panel seed entered the wedge shape (a deferred RecoveryRequired \
+         refusal) — re-pin the panel via dst_keep_serving_wedge_seed_search"
+    );
+}
+
+/// ARBITRATION-WIDENING REGRESSION (#559, "arbitration uses future
+/// state"): a keep-serving resolution judges TWO unjudged ops — the
+/// deferred op and the interrupting op — so its legal set is every
+/// composition and order of the pair (`reconcile_watch_resolution`), never
+/// the one-op set. CANONICAL record of the three proven break shapes:
+/// before the widening these seeds fired false `CrashContract` reds on a
+/// correct engine because (1) the write-entry heal rolled the deferred
+/// op's strand forward mid-watch (the store outran the model), (2) a
+/// state-derived success baked the wrong composition ORDER into the model
+/// (seed 24: the fork copied model-main without the rolled-forward write),
+/// and (3) the resolution's own reopen healed the interrupting op's strand
+/// (seed 47: the after-state held an op no hypothesis contained).
+///
+/// The assert is shape-typed, not outcome-pinned: lance-realm strands are
+/// process-context-sensitive (the panel's lesson), so each seed may end
+/// green or wedge-red (`LiveWriteAvailability` — the pin's designed red at
+/// engine HEAD). Any OTHER red — `CrashContract`, `ArbitrationPhysical`, a
+/// bare panic — is the arbitration bug regressing. The defer-row shape
+/// assert makes total strand evaporation a loud re-pin signal instead of a
+/// vacuous green, and gives the resolution rows a mechanical reader.
+#[test]
+#[serial]
+fn dst_keep_serving_widened_arbitration_no_false_reds() {
+    // The identified false-red class members from the 0..60 search: the two
+    // instrumented specimens (24, 47) plus the other four CrashContract
+    // reds observed under the pre-widening arbitration (8, 16, 46, 51).
+    // The search totals implied a seventh; it never re-fired identifiably
+    // across contexts (lance-realm jitter) and is not individually pinned.
+    const SPECIMENS: [u64; 6] = [8, 16, 24, 46, 47, 51];
+    let mut defer_rows = 0usize;
+    for seed in SPECIMENS {
+        let sc = keep_serving_scenario(seed, 30, 15);
+        let root = format!("shared-memory://dst-keep-serving-widened-{seed}");
+        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
+            Ok(report) => {
+                let defers = keep_serving_defer_rows(&report);
+                if defers > 0 {
+                    assert_resolution_row(&report, seed);
+                }
+                defer_rows += defers;
+            }
+            Err(panic) => {
+                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
+                assert!(
+                    message.contains(&wedge_detector_tag()),
+                    "seed {seed}: non-wedge red on a widened-arbitration specimen \
+                     (a legal composition is missing from the arbitration's set): {message}"
+                );
+                // A wedge red proves the deferral shape was entered.
+                defer_rows += 1;
+            }
+        }
+    }
+    assert!(
+        defer_rows > 0,
+        "no specimen entered the keep-serving shape — the regression pin is \
+         vacuous; re-pick specimens via dst_keep_serving_wedge_seed_search"
+    );
+}
+
+/// SEARCH INSTRUMENT for the issue-554 catch: enumerate seeds 0..60,
+/// printing each seed's outcome (green with defer counts, or RED with the
+/// rendered violation), so the panel above can be (re)chosen — see the
+/// panel's two-step re-pin protocol.
+/// Not part of the suite — run explicitly with `-- --ignored --nocapture`.
+#[test]
+#[serial]
+#[ignore = "search: enumerate seeds for the issue-554 keep-serving wedge pin"]
+fn dst_keep_serving_wedge_seed_search() {
+    for seed in 0..60u64 {
+        let sc = keep_serving_scenario(seed, 30, 15);
+        let root = format!("shared-memory://dst-keep-serving-search-{seed}");
+        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
+            Ok(report) => {
+                let defers = keep_serving_defer_rows(&report);
+                println!("seed {seed}: green (defer rows: {defers})");
+            }
+            Err(panic) => {
+                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
+                let hit = message.contains(&wedge_detector_tag());
+                println!(
+                    "seed {seed}: RED{} — {message}",
+                    if hit { " (WEDGE)" } else { "" }
+                );
+            }
+        }
+    }
+}
+
 /// ACK-LOSS: the inverse fault direction — the write HAPPENED, but you're
 /// told it failed (a dropped S3 200). Injected AFTER delegation on every
 /// adapter-realm write class — effect durable, marked error returned —
@@ -2689,6 +2914,20 @@ fn dst_window_reach_probe() {
     );
 }
 
+/// Family tag for a FAILURE_JSON row: a substring match against a triaged
+/// finding's signature, or None = novel. Report-only: the pass reds either
+/// way. Scope-in accepted: ANY Arrow batch-length panic is claimed by this
+/// family until a second source exists — the alternative, a looser pattern,
+/// would hide novel failures from the nightly report's NOVEL section.
+fn known_failure_family(msg: &str) -> Option<&'static str> {
+    // Deferred-fork staging corruption on a reborn branch
+    // (create -> delete -> create again); standalone repro exists.
+    if msg.contains("all columns in a record batch must have the same length") {
+        return Some("deferred-fork-arrow-batch-length");
+    }
+    None
+}
+
 /// THE FLEET: the volume instrument. Runs the full portfolio
 /// across FRESH seed space (seeds no pin or hunt has ever used), each seed
 /// one new life: (a) clean wide universe, (b) adapter-realm fault storm,
@@ -2756,6 +2995,17 @@ fn dst_fleet() {
             Err(p) => {
                 let msg = omnigraph_dst::harness::panic_message(p.as_ref());
                 println!("dst fleet FAILURE seed={seed} arm={arm}: {msg}");
+                // Machine-readable twin of the row above; consumers rely on
+                // one \n-delimited line (the report greps, then json.loads).
+                println!(
+                    "dst fleet FAILURE_JSON {}",
+                    serde_json::json!({
+                        "seed": seed,
+                        "arm": arm,
+                        "known": known_failure_family(&msg),
+                        "msg": msg,
+                    })
+                );
                 fails.push((seed, arm.to_string(), msg, root, sc));
                 None
             }

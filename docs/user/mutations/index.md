@@ -95,6 +95,12 @@ in one commit. Every strict load also rejects an input whose projected in-memory
 representation exceeds 32 MiB. Split a larger import into explicit commits; use
 one initial overwrite only when it fits, followed by merge chunks.
 
+Independent existing constructive datasets stage concurrently. The
+`OMNIGRAPH_LOAD_CONCURRENCY` environment variable controls that width for both
+Load and insert/update mutations (default 8); first-touch branch effects are
+deferred and delete staging remains serial. This affects preparation only—one
+request still publishes exactly one graph commit.
+
 A stale strict update, delete, or overwrite can return `read_set_conflict`.
 Refresh the branch and retry deliberately. A `key_conflict` means an append or
 strict insert found an existing id; it never silently becomes an upsert.
