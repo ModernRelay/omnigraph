@@ -23,6 +23,9 @@ use lance::Dataset;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
+use omnigraph::instrumentation::{
+    StageWriteProbes, with_stage_write_concurrency, with_stage_write_probes,
+};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
@@ -490,6 +493,12 @@ query insert_then_update_same_person(
 query insert_two_friends($from: String, $a: String, $b: String) {
     insert Knows { from: $from, to: $a }
     insert Knows { from: $from, to: $b }
+}
+
+query person_with_two_friends($name: String, $age: I32, $a: String, $b: String) {
+    insert Person { name: $name, age: $age }
+    insert Knows { from: $name, to: $a }
+    insert Knows { from: $name, to: $b }
 }
 
 query mixed_insert_and_delete($name: String, $age: I32, $victim: String) {
@@ -2599,4 +2608,126 @@ async fn insert_only_mutation_stale_expected_head_is_terminal_issue_365() {
     .await
     .unwrap();
     assert_eq!(absent.num_rows(), 0, "rejected insert must leave no row");
+}
+
+/// `stage_all` now stages independent tables at the loader's concurrency
+/// (issue #504). The deterministic rendezvous proves both table-storage futures
+/// are in flight together at width 4, while width 1 peaks at one. The same query
+/// also runs against two fresh stores and must land the same observable effects:
+/// affected counts, per-table row counts, the inserted person's row values, and
+/// the exact edge endpoint pairs all agree.
+///
+/// The width is forced through the task-local seam rather than the env var on
+/// purpose: `#[serial]` only excludes other `#[serial]` tests, so an env-mutating
+/// test still races every unannotated test in this binary — and `set_var` under a
+/// live multi-thread runtime violates `setenv`'s thread-safety precondition. The
+/// scoped override is process-safe and cannot leak past the future.
+#[tokio::test]
+async fn multi_table_staging_matches_serial_staging() {
+    type Observation = (
+        usize,
+        usize,
+        usize,
+        usize,
+        Option<i32>,
+        Vec<(String, String)>,
+    );
+
+    async fn run_once(concurrency: usize, release_after: usize) -> (Observation, u64, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        let probes = StageWriteProbes::rendezvous(release_after);
+        let observed = probes.clone();
+        let mutation_params = mixed_params(
+            &[("$name", "Nadia"), ("$a", "Alice"), ("$b", "Bob")],
+            &[("$age", 41)],
+        );
+        // Keep the large mutation state machine behind one pointer while two
+        // task-local scopes wrap it; debug test threads otherwise retain the
+        // complete nested future on their stack.
+        let mutation = Box::pin(db.mutate(
+            "main",
+            STAGED_QUERIES,
+            "person_with_two_friends",
+            &mutation_params,
+        ));
+        let mutation =
+            with_stage_write_probes(probes, with_stage_write_concurrency(concurrency, mutation));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), mutation)
+            .await
+            .expect("configured staging width never reached the rendezvous")
+            .unwrap();
+        // Nadia's stored age proves the node batch landed with its values,
+        // not just its cardinality.
+        let mut nadia_age: Option<i32> = None;
+        for batch in &read_table(&db, "node:Person").await {
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            let ages = batch
+                .column_by_name("age")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                if names.value(i) == "Nadia" {
+                    nadia_age = Some(ages.value(i));
+                }
+            }
+        }
+        // The exact endpoint pairs prove the edge batches landed unswapped.
+        let mut edges: Vec<(String, String)> = Vec::new();
+        for batch in &read_table(&db, "edge:Knows").await {
+            let from = batch
+                .column_by_name("src")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            let to = batch
+                .column_by_name("dst")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                edges.push((from.value(i).to_string(), to.value(i).to_string()));
+            }
+        }
+        edges.sort();
+        let result = (
+            result.affected_nodes,
+            result.affected_edges,
+            count_rows(&db, "node:Person").await,
+            count_rows(&db, "edge:Knows").await,
+            nadia_age,
+            edges,
+        );
+        (result, observed.entered(), observed.peak_in_flight())
+    }
+
+    let (serial, serial_entered, serial_peak) = run_once(1, 1).await;
+    assert_eq!(
+        serial_entered, 2,
+        "the mutation must stage exactly two tables"
+    );
+    assert_eq!(serial_peak, 1, "width 1 must keep table staging serial");
+
+    let (concurrent, concurrent_entered, concurrent_peak) = run_once(4, 2).await;
+    assert_eq!(
+        concurrent_entered, 2,
+        "the mutation must stage exactly two tables"
+    );
+    assert_eq!(
+        concurrent_peak, 2,
+        "width 4 must overlap both independent table-storage futures"
+    );
+    assert_eq!(
+        serial, concurrent,
+        "staging concurrency must not change any observable effect"
+    );
 }

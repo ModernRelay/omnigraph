@@ -810,7 +810,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
 
     // Phase 4: Atomic manifest commit with publisher-level OCC.
     let staged = staging
-        .stage_all_with_concurrency(db, branch, load_write_concurrency())
+        .stage_all_with_concurrency(db, branch, crate::exec::staging::stage_write_concurrency())
         .await?;
     crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
     let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
@@ -2637,26 +2637,6 @@ fn parse_date64_json_value(value: &JsonValue) -> Result<Option<i64>> {
         return Ok(Some(parse_date64_literal(value)?));
     }
     Ok(None)
-}
-
-/// Write a batch to a Lance dataset, returning (new_version, total_row_count).
-/// How many per-type Lance writes to run concurrently during a load.
-///
-/// Each write is an independent S3 manifest + fragment write against a
-/// different table. Ops within a single table must still be serial (Lance
-/// OCC on the manifest), but cross-table writes have no shared state.
-///
-/// 8 is a conservative default — enough to overlap S3 round-trip latency
-/// across the typical 10-30 table schemas without flooding the runtime.
-/// Override via `OMNIGRAPH_LOAD_CONCURRENCY` for benchmarking.
-const DEFAULT_LOAD_WRITE_CONCURRENCY: usize = 8;
-
-fn load_write_concurrency() -> usize {
-    std::env::var("OMNIGRAPH_LOAD_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_LOAD_WRITE_CONCURRENCY)
 }
 
 fn generate_id() -> String {
