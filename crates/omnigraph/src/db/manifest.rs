@@ -152,6 +152,22 @@ pub(crate) async fn refuse_if_internal_schema_unsupported(root_uri: &str) -> Res
     migrations::guard_stamp(&dataset).map(|_| ())
 }
 
+/// Whether the selected graph-manifest dataset depends on files outside its
+/// own dataset root.
+///
+/// A directory copy is self-contained only when both this manifest dataset
+/// and every user dataset have no Lance `base_paths`. Keep the paths private:
+/// callers need a relocation eligibility bit, not access to storage
+/// locations that may contain credentials or deployment details.
+pub(crate) async fn manifest_has_external_base_paths(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<bool> {
+    let control_session = crate::lance_access::control_session();
+    let dataset = open_manifest_dataset_with_session(root_uri, branch, &control_session).await?;
+    Ok(!dataset.manifest().base_paths.is_empty())
+}
+
 /// Immutable point-in-time view of the database.
 ///
 /// Cheap to create (no storage I/O). All reads within a query go through one
@@ -315,6 +331,15 @@ impl SnapshotDataset {
     /// whose compatibility filtering can hide unsupported metadata.
     pub fn has_raw_index_section(&self) -> bool {
         self.dataset.manifest().index_section.is_some()
+    }
+
+    /// Whether this pinned table version depends on files outside its dataset
+    /// root through Lance's `base_paths` relocation mechanism.
+    ///
+    /// The actual paths remain private so this read-only metadata surface
+    /// cannot disclose source locations or expose a writable Lance handle.
+    pub fn has_external_base_paths(&self) -> bool {
+        !self.dataset.manifest().base_paths.is_empty()
     }
 
     /// Whether `column` has complete usable BTREE coverage.

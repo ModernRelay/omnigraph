@@ -45,9 +45,9 @@ use crate::fixture_worker::supervise_fixture_build;
 use crate::machine::{MachineIdentityV1, capture_machine_identity};
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
 use crate::reset::{
-    ClonefileTemplate, MetadataDigest, PhysicalDigest, TraversalLimits,
-    accept_clonefile_template_handoff, copy_verified, digest_metadata_tree, digest_physical_tree,
-    freeze_clonefile_template, verify_metadata_shape, verify_metadata_tree,
+    ClonefileTemplate, MetadataDigest, PHYSICAL_TREE_DIGEST_ALGORITHM, PhysicalDigest,
+    TraversalLimits, accept_clonefile_template_handoff, copy_verified, digest_metadata_tree,
+    digest_physical_tree, freeze_clonefile_template, verify_metadata_shape, verify_metadata_tree,
 };
 use crate::suite::{MAX_REPETITIONS_PER_CASE, MAX_SUITE_RUNS, MAX_TOTAL_REPETITIONS};
 use crate::supervisor::{SupervisionInput, supervise_repetition};
@@ -59,7 +59,6 @@ use crate::{ResolvedRun, ResolvedSuite, validate_case};
 pub const RUNNER_OUTPUT_VERSION: u32 = 2;
 pub const FIXTURE_MANIFEST_FORMAT_VERSION: u32 = 1;
 pub const FIXTURE_VALIDATOR_VERSION: u32 = 1;
-pub(crate) const PHYSICAL_TREE_DIGEST_ALGORITHM: &str = "omnigraph-bench-physical-tree-v1";
 const BUILD_PROFILE: &str = env!("OMNIGRAPH_BENCH_BUILD_PROFILE");
 const BUILD_OPT_LEVEL: &str = env!("OMNIGRAPH_BENCH_BUILD_OPT_LEVEL");
 const SOURCE_COMMIT: &str = env!("OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT");

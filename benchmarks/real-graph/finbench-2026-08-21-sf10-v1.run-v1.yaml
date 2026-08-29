@@ -1,0 +1,5 @@
+version: 1
+fixture_id: finbench-2026-08-21-sf10-v1
+workload: finbench-disjoint-insert-merge
+repetitions: 5
+operation_deadline_seconds: 600

@@ -1,0 +1,126 @@
+version: 1
+fixture_id: finbench-2026-08-21-sf10-v1
+logical:
+  builder:
+    id: finbench-import
+    version: 1
+    recipe_sha256: 93810507ac01300e9ec8bc4d4052a9ebae1fbaa596a5892d2a7d030344c915da
+    parameters:
+      - { name: optimize-every, value: 200 }
+      - { name: scale-factor, value: 10 }
+      - { name: shard-lines, value: 8192 }
+    inputs:
+      - role: graph-schema
+        sha256: e2d8cd2430a4b79792c1a8b271c24add98862a367bcb54a500226e5a175d9116
+      - role: transformed-manifest
+        sha256: 5e0b3d93716055e5238d70ef9fb6edea592c49500cf9b99b0e8c84790860d835
+  data:
+    provenance: corpus-derived
+    schema_shape:
+      algorithm: omnigraph-schema-shape-v1
+      sha256: 51653ed5394949b966869c0194310a3d05d8a12096f2b7681eebbc413d8b27bc
+    node_tables:
+      - { name: Account, rows: 1534180 }
+      - { name: Company, rows: 291235 }
+      - { name: Loan, rows: 1028775 }
+      - { name: Medium, rows: 1940119 }
+      - { name: Person, rows: 582672 }
+    edge_tables:
+      - { name: AccountRepayLoan, rows: 1964476 }
+      - { name: AccountTransferAccount, rows: 6219881 }
+      - { name: AccountWithdrawAccount, rows: 6766001 }
+      - { name: CompanyApplyLoan, rows: 343454 }
+      - { name: CompanyGuaranteeCompany, rows: 141653 }
+      - { name: CompanyInvestCompany, rows: 512922 }
+      - { name: CompanyOwnAccount, rows: 511266 }
+      - { name: LoanDepositAccount, rows: 2024665 }
+      - { name: MediumSignInAccount, rows: 5127913 }
+      - { name: PersonApplyLoan, rows: 685321 }
+      - { name: PersonGuaranteePerson, rows: 284060 }
+      - { name: PersonInvestCompany, rows: 1028625 }
+      - { name: PersonOwnAccount, rows: 1022914 }
+    payload:
+      kind: variable
+      algorithm: omnigraph-logical-properties-v1
+      total_bytes: 4223187890
+    column_shape: scalars
+    topology_skew: source-defined
+  state:
+    aging: small-commits
+    indexes:
+      - { table: "edge:AccountRepayLoan", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:AccountRepayLoan", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:AccountRepayLoan", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:AccountTransferAccount", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:AccountTransferAccount", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:AccountTransferAccount", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:AccountWithdrawAccount", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:AccountWithdrawAccount", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:AccountWithdrawAccount", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyApplyLoan", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyApplyLoan", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyApplyLoan", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyGuaranteeCompany", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyGuaranteeCompany", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyGuaranteeCompany", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyInvestCompany", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyInvestCompany", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyInvestCompany", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyOwnAccount", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyOwnAccount", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:CompanyOwnAccount", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:LoanDepositAccount", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:LoanDepositAccount", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:LoanDepositAccount", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:MediumSignInAccount", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:MediumSignInAccount", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:MediumSignInAccount", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:PersonApplyLoan", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:PersonApplyLoan", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:PersonApplyLoan", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:PersonGuaranteePerson", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:PersonGuaranteePerson", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:PersonGuaranteePerson", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:PersonInvestCompany", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:PersonInvestCompany", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:PersonInvestCompany", column: src, kind: btree, freshness: optimized }
+      - { table: "edge:PersonOwnAccount", column: dst, kind: btree, freshness: optimized }
+      - { table: "edge:PersonOwnAccount", column: id, kind: btree, freshness: optimized }
+      - { table: "edge:PersonOwnAccount", column: src, kind: btree, freshness: optimized }
+      - { table: "node:Account", column: accountId, kind: fts, freshness: optimized }
+      - { table: "node:Account", column: accountLevel, kind: btree, freshness: optimized }
+      - { table: "node:Account", column: accountType, kind: btree, freshness: optimized }
+      - { table: "node:Account", column: createTime, kind: btree, freshness: optimized }
+      - { table: "node:Account", column: id, kind: btree, freshness: optimized }
+      - { table: "node:Account", column: isBlocked, kind: btree, freshness: optimized }
+      - { table: "node:Company", column: city, kind: fts, freshness: optimized }
+      - { table: "node:Company", column: companyId, kind: fts, freshness: optimized }
+      - { table: "node:Company", column: companyName, kind: fts, freshness: optimized }
+      - { table: "node:Company", column: country, kind: fts, freshness: optimized }
+      - { table: "node:Company", column: createTime, kind: btree, freshness: optimized }
+      - { table: "node:Company", column: id, kind: btree, freshness: optimized }
+      - { table: "node:Company", column: isBlocked, kind: btree, freshness: optimized }
+      - { table: "node:Loan", column: createTime, kind: btree, freshness: optimized }
+      - { table: "node:Loan", column: id, kind: btree, freshness: optimized }
+      - { table: "node:Loan", column: loanAmount, kind: btree, freshness: optimized }
+      - { table: "node:Loan", column: loanId, kind: fts, freshness: optimized }
+      - { table: "node:Medium", column: createTime, kind: btree, freshness: optimized }
+      - { table: "node:Medium", column: id, kind: btree, freshness: optimized }
+      - { table: "node:Medium", column: isBlocked, kind: btree, freshness: optimized }
+      - { table: "node:Medium", column: mediumId, kind: fts, freshness: optimized }
+      - { table: "node:Medium", column: mediumType, kind: btree, freshness: optimized }
+      - { table: "node:Medium", column: riskLevel, kind: btree, freshness: optimized }
+      - { table: "node:Person", column: city, kind: fts, freshness: optimized }
+      - { table: "node:Person", column: country, kind: fts, freshness: optimized }
+      - { table: "node:Person", column: createTime, kind: btree, freshness: optimized }
+      - { table: "node:Person", column: id, kind: btree, freshness: optimized }
+      - { table: "node:Person", column: isBlocked, kind: btree, freshness: optimized }
+      - { table: "node:Person", column: personId, kind: fts, freshness: optimized }
+      - { table: "node:Person", column: personName, kind: fts, freshness: optimized }
+    deletion_history: none
+    compaction_recency: not-optimized
+    history_depth: 3934
+expected:
+  logical_content:
+    algorithm: omnigraph-logical-graph-multiset-v1
+    sha256: cf3115b85de3bf06ff68017f0bc65c9735640131be9ae04403e2081894209f96

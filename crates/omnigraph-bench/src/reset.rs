@@ -20,6 +20,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Stable algorithm identifier for [`digest_physical_tree`].
+pub(crate) const PHYSICAL_TREE_DIGEST_ALGORITHM: &str = "omnigraph-bench-physical-tree-v1";
 const DIGEST_DOMAIN: &[u8] = b"omnigraph-bench-physical-tree-v1\0";
 const METADATA_SHAPE_DOMAIN: &[u8] = b"omnigraph-bench-metadata-shape-v1\0";
 const METADATA_STATE_DOMAIN: &[u8] = b"omnigraph-bench-metadata-state-v1\0";
@@ -877,7 +879,6 @@ fn digest_inventory(entries: &[TreeEntry], limits: TraversalLimits) -> io::Resul
                 entry.source.display()
             )));
         }
-
         hasher.update([entry.kind.digest_tag()]);
         hasher.update((entry.portable_path.len() as u64).to_le_bytes());
         hasher.update(entry.portable_path.as_bytes());
@@ -1080,7 +1081,6 @@ fn copy_regular_file(entry: &TreeEntry, target: &Path, buffer: &mut [u8]) -> io:
             entry.source.display()
         )));
     }
-
     let mut source = BufReader::new(File::open(&entry.source).map_err(|error| {
         contextual(
             error,

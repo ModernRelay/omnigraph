@@ -9,13 +9,24 @@ use omnigraph_bench::archive::{
     iter_archive, preflight_archive_publication, publish_record, reconcile_archive_publication,
 };
 use omnigraph_bench::case::Backend;
+use omnigraph_bench::fixture_reference::load_fixture_reference;
 use omnigraph_bench::projection::{
     DEFAULT_PROJECTION_PAGE_SIZE, ProjectionCursorV1, ProjectionError, ProjectionPageV1,
     list_points_page, list_runs_for_point_page, rebuild_projection,
 };
+use omnigraph_bench::real_graph::{
+    RealGraphObservationV1, observe_real_graph, validate_real_graph_reference,
+};
+use omnigraph_bench::real_graph_run::{
+    execute_real_graph_run, load_real_graph_run_spec, run_real_graph_worker_files,
+};
 use omnigraph_bench::record::{
     AcquisitionTerminalStageV1, AcquisitionTerminalV1, InvocationIdentityV1, ObservedBackendV1,
     RecordInputV1, build_censored_run_record, build_run_record, sut_identity_for_execution,
+};
+use omnigraph_bench::registered_fixture::{
+    FixtureCopyPreflightReceiptV1, fingerprint_registered_fixture, preflight_copy_fixture_bindings,
+    stage_registered_fixture_binding, verify_registered_fixture,
 };
 use omnigraph_bench::{
     Diagnostic, PLAN_FORMAT_VERSION, RUNNER_OUTPUT_VERSION, ResolvedRun, ResolvedSuite,
@@ -47,6 +58,11 @@ enum Command {
         #[command(subcommand)]
         command: CaseCommand,
     },
+    /// Verify registered frozen fixture trees before benchmark preparation.
+    Fixture {
+        #[command(subcommand)]
+        command: FixtureCommand,
+    },
     /// Inspect suites of benchmark cases.
     Suite {
         #[command(subcommand)]
@@ -68,6 +84,9 @@ enum Command {
     /// Private bounded fixture-builder endpoint used by the supervising runner.
     #[command(name = "__fixture-worker-v1", hide = true)]
     FixtureWorkerV1 { request: PathBuf, result: PathBuf },
+    /// Private real-graph diagnostic worker endpoint.
+    #[command(name = "__real-graph-worker-v1", hide = true)]
+    RealGraphWorkerV1 { request: PathBuf, result: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -83,6 +102,97 @@ enum CaseCommand {
     List {
         directory: PathBuf,
         /// Emit a machine-readable array.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FixtureCommand {
+    /// Inspect logical references for externally built node-and-edge fixtures.
+    Reference {
+        #[command(subcommand)]
+        command: FixtureReferenceCommand,
+    },
+    /// Print a location-free JSON manifest for one stable local tree.
+    Fingerprint {
+        /// Path-free identity assigned to this exact physical snapshot.
+        #[arg(long)]
+        id: String,
+        /// Local graph-root directory to read completely.
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// Verify a local frozen tree against a location-free copy-source descriptor.
+    Verify {
+        source: PathBuf,
+        /// Local graph-root directory whose complete bytes must match.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit a machine-readable verification result.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify bundles while copying them through disposable harness scratch.
+    PreflightCopy {
+        /// Repeatable invocation-local fixture mapping in ID=BUNDLE form.
+        #[arg(long = "fixture", value_name = "ID=BUNDLE", required = true)]
+        fixtures: Vec<String>,
+        /// Create the disposable staging workspace below this existing directory.
+        #[arg(long)]
+        scratch_root: Option<PathBuf>,
+        /// Emit a machine-readable verification result after cleanup.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect the logical node-and-edge content of one copied registered fixture.
+    ObserveGraph {
+        /// Invocation-local fixture mapping in ID=BUNDLE form.
+        #[arg(long = "fixture", value_name = "ID=BUNDLE")]
+        fixture: String,
+        /// Create the disposable staging workspace below this existing directory.
+        #[arg(long)]
+        scratch_root: Option<PathBuf>,
+        /// Emit a machine-readable observation.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate one copied registered fixture against a logical reference.
+    ValidateGraph {
+        reference: PathBuf,
+        /// Invocation-local fixture mapping in ID=BUNDLE form.
+        #[arg(long = "fixture", value_name = "ID=BUNDLE")]
+        fixture: String,
+        /// Create the disposable staging workspace below this existing directory.
+        #[arg(long)]
+        scratch_root: Option<PathBuf>,
+        /// Emit machine-readable validation evidence.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the fixed FinGraph-native diagnostic workload from a strict YAML spec.
+    RunGraph {
+        spec: PathBuf,
+        #[arg(long)]
+        reference: PathBuf,
+        /// Invocation-local fixture mapping in ID=BUNDLE form.
+        #[arg(long = "fixture", value_name = "ID=BUNDLE")]
+        fixture: String,
+        /// Place all disposable graph copies below this existing directory.
+        #[arg(long)]
+        scratch_root: Option<PathBuf>,
+        /// Emit machine-readable diagnostic results.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FixtureReferenceCommand {
+    /// Strictly parse and validate one fixture-reference-v1 YAML file.
+    Validate {
+        file: PathBuf,
+        /// Emit a machine-readable validation result.
         #[arg(long)]
         json: bool,
     },
@@ -239,12 +349,16 @@ struct PlanRun<'a> {
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Case { command } => run_case(command),
+        Command::Fixture { command } => run_fixture(command).await,
         Command::Suite { command } => run_suite(command).await,
         Command::Archive { command } => run_archive(command),
         Command::Projection { command } => run_projection(command).await,
         Command::WorkerV1 => omnigraph_bench::worker::run_worker_stdio_v1().await,
         Command::FixtureWorkerV1 { request, result } => {
             omnigraph_bench::fixture_worker::run_fixture_worker_files_v1(&request, &result).await
+        }
+        Command::RealGraphWorkerV1 { request, result } => {
+            run_real_graph_worker_files(&request, &result).await
         }
     }
 }
@@ -521,6 +635,250 @@ fn run_case(command: CaseCommand) -> ExitCode {
             }
         }
         CaseCommand::List { directory, json } => list_cases(&directory, json),
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RealGraphInspectionV1 {
+    version: u32,
+    fixture: FixtureCopyPreflightReceiptV1,
+    reference_sha256: Option<String>,
+    implemented_witnesses_match: bool,
+    claim_eligible: bool,
+    observation: RealGraphObservationV1,
+}
+
+async fn run_fixture(command: FixtureCommand) -> ExitCode {
+    match command {
+        FixtureCommand::Reference { command } => match command {
+            FixtureReferenceCommand::Validate { file, json } => {
+                let outcome = load_fixture_reference(&file);
+                if json {
+                    print_json(&outcome)
+                } else {
+                    match outcome.into_result() {
+                        Ok(reference) => {
+                            println!(
+                                "valid fixture reference {} reference_sha256={}",
+                                reference.definition.fixture_id, reference.reference_sha256,
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Err(diagnostics) => print_diagnostics(&diagnostics),
+                    }
+                }
+            }
+        },
+        FixtureCommand::Fingerprint { id, root } => {
+            match fingerprint_registered_fixture(id, &root).into_result() {
+                Ok(fixture) => print_json_success(&fixture),
+                Err(diagnostics) => print_diagnostics(&diagnostics),
+            }
+        }
+        FixtureCommand::Verify { source, root, json } => {
+            let outcome = verify_registered_fixture(&source, &root);
+            if json {
+                print_json(&outcome)
+            } else {
+                match outcome.into_result() {
+                    Ok(verified) => {
+                        println!(
+                            "verified fixture {} source_descriptor_sha256={} root={} files={} bytes={} tree_sha256={}",
+                            verified.fixture_id,
+                            verified.source_descriptor_sha256,
+                            verified.canonical_root.display(),
+                            verified.physical.files,
+                            verified.physical.bytes,
+                            verified.physical.tree_sha256,
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(diagnostics) => print_diagnostics(&diagnostics),
+                }
+            }
+        }
+        FixtureCommand::PreflightCopy {
+            fixtures,
+            scratch_root,
+            json,
+        } => {
+            let outcome = preflight_copy_fixture_bindings(&fixtures, scratch_root.as_deref());
+            if json {
+                print_json(&outcome)
+            } else {
+                match outcome.into_result() {
+                    Ok(fixtures) => {
+                        for fixture in fixtures {
+                            println!(
+                                "preflight-copied fixture {} source_descriptor_sha256={} files={} bytes={} tree_sha256={}",
+                                fixture.fixture_id,
+                                fixture.source_descriptor_sha256,
+                                fixture.physical.files,
+                                fixture.physical.bytes,
+                                fixture.physical.tree_sha256,
+                            );
+                        }
+                        println!("disposable scratch removed");
+                        ExitCode::SUCCESS
+                    }
+                    Err(diagnostics) => print_diagnostics(&diagnostics),
+                }
+            }
+        }
+        FixtureCommand::ObserveGraph {
+            fixture,
+            scratch_root,
+            json,
+        } => inspect_real_graph_fixture(&fixture, scratch_root.as_deref(), None, json).await,
+        FixtureCommand::ValidateGraph {
+            reference,
+            fixture,
+            scratch_root,
+            json,
+        } => {
+            let reference = match load_fixture_reference(&reference).into_result() {
+                Ok(reference) => reference,
+                Err(diagnostics) => return print_cli_failures(diagnostics, json),
+            };
+            inspect_real_graph_fixture(&fixture, scratch_root.as_deref(), Some(&reference), json)
+                .await
+        }
+        FixtureCommand::RunGraph {
+            spec,
+            reference,
+            fixture,
+            scratch_root,
+            json,
+        } => {
+            let spec = match load_real_graph_run_spec(&spec).into_result() {
+                Ok(spec) => spec,
+                Err(diagnostics) => return print_cli_failures(diagnostics, json),
+            };
+            let reference = match load_fixture_reference(&reference).into_result() {
+                Ok(reference) => reference,
+                Err(diagnostics) => return print_cli_failures(diagnostics, json),
+            };
+            match execute_real_graph_run(&spec, &reference, &fixture, scratch_root.as_deref()).await
+            {
+                Ok(report) => {
+                    if json {
+                        print_json_success(&report)
+                    } else {
+                        println!(
+                            "FinGraph diagnostic: p50={}us over {} repetitions; claim-eligible=false, durable-record=false",
+                            report.p50_us, report.repetitions
+                        );
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(error) => {
+                    print_cli_failure(Diagnostic::error(error.code, "$", error.message), json)
+                }
+            }
+        }
+    }
+}
+
+async fn inspect_real_graph_fixture(
+    fixture: &str,
+    scratch_root: Option<&Path>,
+    reference: Option<&omnigraph_bench::fixture_reference::NormalizedFixtureReferenceV1>,
+    json: bool,
+) -> ExitCode {
+    let staged = match stage_registered_fixture_binding(fixture, scratch_root).into_result() {
+        Ok(staged) => staged,
+        Err(diagnostics) => return print_cli_failures(diagnostics, json),
+    };
+    if let Some(reference) = reference
+        && reference.definition.fixture_id != staged.receipt().fixture_id
+    {
+        let diagnostic = Diagnostic::error(
+            "fixture_reference_id_mismatch",
+            "--fixture",
+            format!(
+                "logical reference identifies fixture {:?}, but the registered bundle identifies {:?}",
+                reference.definition.fixture_id,
+                staged.receipt().fixture_id
+            ),
+        );
+        let cleanup = staged.finish();
+        return match cleanup {
+            Ok(_) => print_cli_failure(diagnostic, json),
+            Err(cleanup) => print_cli_failures(vec![diagnostic, cleanup], json),
+        };
+    }
+    let observation = match observe_real_graph(staged.root()).await {
+        Ok(observation) => observation,
+        Err(error) => {
+            let diagnostic =
+                Diagnostic::error("real_graph_observation_failed", "$", error.to_string());
+            let cleanup = staged.finish();
+            return match cleanup {
+                Ok(_) => print_cli_failure(diagnostic, json),
+                Err(cleanup) => print_cli_failures(vec![diagnostic, cleanup], json),
+            };
+        }
+    };
+    if let Some(reference) = reference
+        && let Err(error) = validate_real_graph_reference(reference, &observation)
+    {
+        let diagnostic = Diagnostic::error(
+            "real_graph_reference_mismatch",
+            "reference",
+            error.to_string(),
+        );
+        let cleanup = staged.finish();
+        return match cleanup {
+            Ok(_) => print_cli_failure(diagnostic, json),
+            Err(cleanup) => print_cli_failures(vec![diagnostic, cleanup], json),
+        };
+    }
+    if let Err(diagnostic) = staged.verify_unchanged() {
+        let cleanup = staged.finish();
+        return match cleanup {
+            Ok(_) => print_cli_failure(diagnostic, json),
+            Err(cleanup) => print_cli_failures(vec![diagnostic, cleanup], json),
+        };
+    }
+    let receipt = match staged.finish() {
+        Ok(receipt) => receipt,
+        Err(diagnostic) => return print_cli_failure(diagnostic, json),
+    };
+    let inspection = RealGraphInspectionV1 {
+        version: 1,
+        fixture: receipt,
+        reference_sha256: reference.map(|reference| reference.reference_sha256.clone()),
+        implemented_witnesses_match: reference.is_some(),
+        claim_eligible: false,
+        observation,
+    };
+    if json {
+        print_json_success(&inspection)
+    } else {
+        println!(
+            "observed real graph fixture {}: {} node rows, {} edge rows, history depth {}; claim-eligible=false{}",
+            inspection.fixture.fixture_id,
+            inspection
+                .observation
+                .node_tables
+                .iter()
+                .map(|table| table.rows)
+                .sum::<u64>(),
+            inspection
+                .observation
+                .edge_tables
+                .iter()
+                .map(|table| table.rows)
+                .sum::<u64>(),
+            inspection.observation.history_depth,
+            if inspection.implemented_witnesses_match {
+                " (implemented reference witnesses match; declared state remains partially unverified)"
+            } else {
+                ""
+            },
+        );
+        ExitCode::SUCCESS
     }
 }
 
