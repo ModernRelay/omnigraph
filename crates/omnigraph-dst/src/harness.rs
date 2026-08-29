@@ -4813,7 +4813,9 @@ pub fn assert_strict_replay(first: &UniverseReport, second: &UniverseReport, con
     }
 }
 
-/// Render a caught universe panic as a one-line repro-bearing message.
+/// Render a caught universe panic as a repro-bearing message. MAY SPAN
+/// LINES (a violation's `observed` can embed newlines — e.g. the strict
+/// replay diff); the fleet's FAILURE_JSON row is the single-line form.
 /// Detector-tagged violations render their `detector=` field —
 /// the fleet's failure records carry it without any caller change.
 pub fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {

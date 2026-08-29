@@ -2914,6 +2914,20 @@ fn dst_window_reach_probe() {
     );
 }
 
+/// Family tag for a FAILURE_JSON row: a substring match against a triaged
+/// finding's signature, or None = novel. Report-only: the pass reds either
+/// way. Scope-in accepted: ANY Arrow batch-length panic is claimed by this
+/// family until a second source exists — the alternative, a looser pattern,
+/// would hide novel failures from the nightly report's NOVEL section.
+fn known_failure_family(msg: &str) -> Option<&'static str> {
+    // Deferred-fork staging corruption on a reborn branch
+    // (create -> delete -> create again); standalone repro exists.
+    if msg.contains("all columns in a record batch must have the same length") {
+        return Some("deferred-fork-arrow-batch-length");
+    }
+    None
+}
+
 /// THE FLEET: the volume instrument. Runs the full portfolio
 /// across FRESH seed space (seeds no pin or hunt has ever used), each seed
 /// one new life: (a) clean wide universe, (b) adapter-realm fault storm,
@@ -2981,6 +2995,17 @@ fn dst_fleet() {
             Err(p) => {
                 let msg = omnigraph_dst::harness::panic_message(p.as_ref());
                 println!("dst fleet FAILURE seed={seed} arm={arm}: {msg}");
+                // Machine-readable twin of the row above; consumers rely on
+                // one \n-delimited line (the report greps, then json.loads).
+                println!(
+                    "dst fleet FAILURE_JSON {}",
+                    serde_json::json!({
+                        "seed": seed,
+                        "arm": arm,
+                        "known": known_failure_family(&msg),
+                        "msg": msg,
+                    })
+                );
                 fails.push((seed, arm.to_string(), msg, root, sc));
                 None
             }

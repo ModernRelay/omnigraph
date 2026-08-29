@@ -1242,6 +1242,10 @@ impl StagedMutation {
         let sidecar_handle =
             Some(write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?);
         let operation_id = sidecar.operation_id.clone();
+        crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_ARM_PRE_EFFECT)
+            .map_err(|error| {
+                OmniError::recovery_required(operation_id.clone(), error.to_string())
+            })?;
         if staged
             .iter()
             .any(|entry| entry.path.deferred_fork.is_some())

@@ -90,9 +90,12 @@ run as an in-process heal while writers may be active.
 Long-lived handles and write-entry barriers use the concurrency-safe
 roll-forward-only sweep. It takes the same ordered gates, re-reads the artifact
 under those gates, and may publish a complete confirmed outcome with the
-manifest CAS. Anything requiring Restore, destructive compensation, or an
-unproven decision remains on disk for the next Full open and blocks only the
-authority it affects.
+manifest CAS. It may also retire a provably effect-free Armed mutation/load
+intent whose exact transaction-identity classification proves no owned effect,
+under the same one-mutation-process boundary destructive full-recovery
+decisions assume (see invariants.md, current support boundaries). Anything
+requiring Restore, destructive compensation, or an unproven decision remains on
+disk for the next Full open and blocks only the authority it affects.
 
 This split lets the common “all table commits landed; final manifest publish
 failed” case heal without a restart while preserving concurrent writers.

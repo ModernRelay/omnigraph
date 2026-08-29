@@ -4971,7 +4971,7 @@ fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &
     Ok(())
 }
 
-fn exact_id_primary_key_field_id(ds: &Dataset, context: &'static str) -> Result<i32> {
+pub(crate) fn exact_id_primary_key_field_id(ds: &Dataset, context: &'static str) -> Result<i32> {
     let primary_key = ds.schema().unenforced_primary_key();
     if primary_key.len() == 1
         && primary_key[0].name == "id"
