@@ -8,7 +8,7 @@
 # detector = one (observation source, oracle) pair — the unit that fires;
 # an oracle listed with two sources is two detectors.
 #
-# 21 oracles: differential 7 / prediction 4 / obligation 8 / meta 2 (named-mechanism grain;
+# 22 oracles: differential 7 / prediction 4 / obligation 9 / meta 2 (named-mechanism grain;
 # new oracles enter by deliberate census bump).
 
 [differential]  expectation = model state
@@ -44,8 +44,8 @@ SessionDifferential
 [prediction]  expectation = the model's per-op prediction
 OpArbitration
   sources: Store(Query), Store(Physical)
-  anchor:  harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break)
-  doc:     after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects
+  anchor:  harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break) / reconcile_watch_resolution (keep-serving composition widening)
+  doc:     after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects; a keep-serving resolution instead matches against every composition and order of the deferred and interrupting ops
 MergePrediction
   sources: Store(Claim)
   anchor:  harness.rs::predict_merge + the accept/conflict asserts around branch_merge
@@ -62,7 +62,7 @@ AckLossArbitration
 [obligation]  expectation = a standing contract
 CrashContract
   sources: Store(Query)
-  anchor:  harness.rs::reconcile_after_failure (legal-state + monotonicity asserts)
+  anchor:  harness.rs::reconcile_after_failure + reconcile_watch_resolution (legal-state + monotonicity asserts)
   doc:     the two-sided crash contract: atomicity (no partial application) and recovery monotonicity (no demoted commit, no deleted durable fork)
 BirthContract
   sources: Store(Claim)
@@ -70,12 +70,16 @@ BirthContract
   doc:     a store that dies during init is honestly-unopenable or indistinguishable from never-inited, and a crashed open is effect-free
 RecoveryObligation
   sources: Store(Physical)
-  anchor:  harness.rs::reconcile_after_failure residue check (recovery_residue)
+  anchor:  harness.rs::assert_no_recovery_residue (every reconcile + watch-resolution reopen)
   doc:     a successful read-write reopen leaves __recovery/ empty — recovery may not silently do nothing (added after the recovery-no-op honesty audit)
 ResidueObligation
   sources: Store(Physical)
   anchor:  harness.rs final audit residue check + tests::dst_residue_channel_sees_planted_file
   doc:     no universe ends owing recovery work: __recovery/ empty at quiesce, backed by the planted-file channel canary
+LiveWriteAvailability
+  sources: Store(Session)
+  anchor:  harness.rs::run_universe_caught keep-serving watch (Scenario::keep_serving_ops)
+  doc:     a live handle must not wedge permanently on one pending effect-free Armed recovery operation: with reconcile's reopen deferred, consecutive same-operation RecoveryRequired refusals (clean-recovery-state maintenance refusals interleave without resetting the streak) stay under the keep-serving budget (issue #554)
 MaintenanceObligations
   sources: Store(Query)
   anchor:  harness.rs::maintenance_obligations

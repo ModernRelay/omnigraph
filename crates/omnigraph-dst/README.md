@@ -46,7 +46,7 @@ default of this crate.
 ## What a universe checks (the oracles)
 
 The five GROUPS below are the reader's map; the enforced census counts
-21 oracles at detector grain (`src/detectors.rs`, the generated
+22 oracles at detector grain (`src/detectors.rs`, the generated
 `detector_census.txt`).
 
 1. **Differential model** — persons *and* edges mirrored in a `BTreeMap`/
