@@ -373,6 +373,9 @@ whose disjoint changes each contain two `Account` nodes and one
 restores the same path with APFS clonefiles and runs only the branch merge in a
 fresh worker process. The registered source is never opened as an OmniGraph
 database and remains unchanged.
+Before returning either success or failure, the command explicitly attempts to
+remove its disposable workspace. A cleanup failure is reported, and a run plus
+cleanup double failure retains both causes.
 The result includes raw elapsed samples, p50, merge route/phases, the prepared
 physical digest, and verification evidence for the inserted delta, protected
 heads, and untouched tables. Pre-existing rows in the two changed tables are

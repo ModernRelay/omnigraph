@@ -26,7 +26,9 @@ use crate::model::{
     Diagnostic, ValidationOutcome, declared_version, read_yaml_file, strict_yaml, valid_kebab_id,
 };
 use crate::real_graph::{observe_real_graph, validate_real_graph_reference};
-use crate::registered_fixture::{FixtureCopyPreflightReceiptV1, stage_registered_fixture_binding};
+use crate::registered_fixture::{
+    FixtureCopyPreflightReceiptV1, StagedRegisteredFixtureV1, stage_registered_fixture_binding,
+};
 use crate::reset::{PhysicalDigest, TraversalLimits, freeze_clonefile_template};
 use crate::runner::{
     MergePhaseEvidenceForm, MergeRouteObservation, PhaseObservation,
@@ -239,9 +241,18 @@ pub async fn execute_real_graph_run(
     let staged = stage_registered_fixture_binding(fixture_binding, scratch_root)
         .into_result()
         .map_err(|diagnostics| diagnostics_error("real_graph_staging_failed", diagnostics))?;
+    let outcome = execute_staged_real_graph_run(spec, reference, &staged).await;
+    let cleanup = staged.finish().map(|_| ());
+    complete_real_graph_run(outcome, cleanup)
+}
+
+async fn execute_staged_real_graph_run(
+    spec: &RealGraphRunSpecV1,
+    reference: &NormalizedFixtureReferenceV1,
+    staged: &StagedRegisteredFixtureV1,
+) -> Result<RealGraphRunReportV1, RealGraphRunError> {
     if staged.receipt().fixture_id != spec.fixture_id {
         let observed = staged.receipt().fixture_id.clone();
-        let _ = staged.finish();
         return Err(RealGraphRunError::new(
             "real_graph_fixture_id_mismatch",
             format!(
@@ -361,9 +372,6 @@ pub async fn execute_real_graph_run(
     elapsed.sort_unstable();
     let p50_us = elapsed[(elapsed.len() - 1) / 2];
     let prepared_input_physical = frozen.physical_digest().clone();
-    staged.finish().map_err(|diagnostic| {
-        RealGraphRunError::new("fixture_cleanup_failed", diagnostic.message)
-    })?;
     Ok(RealGraphRunReportV1 {
         version: REAL_GRAPH_RUN_SPEC_VERSION,
         fixture_id: spec.fixture_id.clone(),
@@ -382,6 +390,27 @@ pub async fn execute_real_graph_run(
         p50_us,
         samples,
     })
+}
+
+fn complete_real_graph_run<T>(
+    outcome: Result<T, RealGraphRunError>,
+    cleanup: Result<(), Diagnostic>,
+) -> Result<T, RealGraphRunError> {
+    match (outcome, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(RealGraphRunError::new(
+            "fixture_cleanup_failed",
+            format!("{} at {}: {}", cleanup.code, cleanup.path, cleanup.message),
+        )),
+        (Err(error), Err(cleanup)) => Err(RealGraphRunError::new(
+            "real_graph_run_and_cleanup_failed",
+            format!(
+                "run failed with {}: {}; cleanup also failed with {} at {}: {}",
+                error.code, error.message, cleanup.code, cleanup.path, cleanup.message
+            ),
+        )),
+    }
 }
 
 fn diagnostics_error(code: &'static str, diagnostics: Vec<Diagnostic>) -> RealGraphRunError {
@@ -1159,6 +1188,48 @@ mod tests {
             load_real_graph_run_spec(&valid).diagnostics[0].code,
             "invalid_real_graph_repetitions"
         );
+    }
+
+    #[test]
+    fn cleanup_failure_is_never_hidden_by_the_run_outcome() {
+        let cleanup = || {
+            Diagnostic::error(
+                "fixture_preflight_cleanup_failed",
+                "$",
+                "could not remove staged fixture",
+            )
+        };
+
+        let cleanup_only = complete_real_graph_run::<()>(Ok(()), Err(cleanup())).unwrap_err();
+        assert_eq!(cleanup_only.code, "fixture_cleanup_failed");
+        assert!(
+            cleanup_only
+                .message
+                .contains("fixture_preflight_cleanup_failed")
+        );
+
+        let both = complete_real_graph_run::<()>(
+            Err(RealGraphRunError::new(
+                "real_graph_worker_failed",
+                "worker failed",
+            )),
+            Err(cleanup()),
+        )
+        .unwrap_err();
+        assert_eq!(both.code, "real_graph_run_and_cleanup_failed");
+        assert!(both.message.contains("real_graph_worker_failed"));
+        assert!(both.message.contains("fixture_preflight_cleanup_failed"));
+
+        let primary = complete_real_graph_run::<()>(
+            Err(RealGraphRunError::new(
+                "real_graph_worker_failed",
+                "worker failed",
+            )),
+            Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(primary.code, "real_graph_worker_failed");
+        assert!(complete_real_graph_run(Ok(7_u8), Ok(())).is_ok());
     }
 
     #[tokio::test]
