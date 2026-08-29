@@ -159,6 +159,18 @@ pub struct QueryIoProbes {
     /// This must equal the newly deleted offset count; a fragment scan would
     /// make it grow with the compacted catalog's history instead.
     pub projection_identity_rows: Arc<AtomicU64>,
+    /// Uncapped retries taken after a capped BM25 scan under-filled. For a
+    /// plain `bm25()` ordering, capped and uncapped runs are result-identical
+    /// (the capped scan is the uncapped scan's score prefix; `rrf()`'s arm
+    /// truncation is disclosed on `execute_rrf_fusion`), so result assertions
+    /// cannot see the cap; this counter and `bm25_scan_rows` below are how
+    /// tests assert it actually engaged.
+    pub bm25_uncapped_retries: Arc<AtomicU64>,
+    /// Rows returned by BM25-ranked scans, summed over scans (capped and
+    /// uncapped passes alike). Lets a test pin the cap's MAGNITUDE — a factor
+    /// regression changes this count while every result assertion still
+    /// passes.
+    pub bm25_scan_rows: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -414,6 +426,18 @@ pub(crate) fn record_pushed_filter_exprs(n: u64) {
 /// probes are installed (production).
 pub(crate) fn record_in_memory_filter() {
     let _ = current(|p| p.in_memory_filters.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one uncapped retry after a capped BM25 scan under-filled. No-op when
+/// no probes are installed (production).
+pub(crate) fn record_bm25_uncapped_retry() {
+    let _ = current(|p| p.bm25_uncapped_retries.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record `rows` returned by one BM25-ranked scan. No-op when no probes are
+/// installed (production).
+pub(crate) fn record_bm25_scan_rows(rows: u64) {
+    let _ = current(|p| p.bm25_scan_rows.fetch_add(rows, Ordering::Relaxed));
 }
 
 /// Record `commits` walked into a change-feed poll's first-parent chain. No-op

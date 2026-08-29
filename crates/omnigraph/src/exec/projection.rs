@@ -338,6 +338,13 @@ fn literal_scalar_type(lit: &Literal) -> Result<ScalarType> {
     }
 }
 
+/// True when any projection is an aggregate — such a return collapses rows.
+pub(super) fn projections_have_aggregates(projections: &[IRProjection]) -> bool {
+    projections
+        .iter()
+        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }))
+}
+
 /// Project return expressions into a result batch.
 pub(super) fn project_return(
     wide_batch: &RecordBatch,
@@ -351,10 +358,7 @@ pub(super) fn project_return(
     }
 
     // Route to aggregate path if any projection contains an aggregate
-    let has_aggregates = projections
-        .iter()
-        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
-    if has_aggregates {
+    if projections_have_aggregates(projections) {
         return aggregate_return(wide_batch, projections, params);
     }
 
