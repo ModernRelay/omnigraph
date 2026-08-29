@@ -163,9 +163,8 @@ pub(crate) struct MutationStaging {
 /// table stay serial under Lance's manifest OCC, so cross-table staging has
 /// no shared state to race.
 ///
-/// 8 is a conservative default — enough to overlap S3 round-trip latency
-/// across the typical 10-30 table schemas without flooding the runtime.
-/// Override via `OMNIGRAPH_LOAD_CONCURRENCY`.
+/// The default of 8 preserves the loader's existing bound. Override it via
+/// `OMNIGRAPH_LOAD_CONCURRENCY`.
 pub(crate) const DEFAULT_STAGE_WRITE_CONCURRENCY: usize = 8;
 
 /// Resolution order: the scoped test override
@@ -470,12 +469,14 @@ impl MutationStaging {
     /// run between staging (slow S3 PUTs, no queue) and commit (fast,
     /// under per-`(table_key, branch)` queue).
     ///
-    /// Stages independent Lance datasets concurrently at
-    /// [`stage_write_concurrency`] — the same knob the loader path has
-    /// always run at. Publication is untouched: everything after staging
-    /// still funnels through the single manifest CAS. Failure semantics are
-    /// also untouched: the staging stream drains before the first error
-    /// surfaces, exactly as the width-1 delegation it replaces did (any
+    /// Stages independent constructive (insert/update/overwrite) Lance
+    /// datasets concurrently at [`stage_write_concurrency`] — the same knob
+    /// the loader path has always run at. Deferred first-touch branch effects
+    /// and delete transactions remain serial. Publication is untouched:
+    /// everything after staging still funnels through the single manifest CAS.
+    /// Failure semantics are also untouched: the constructive staging stream
+    /// drains before the first error surfaces, exactly as the width-1
+    /// delegation it replaces did (any
     /// staged-but-unpublished residue was already reclaimable, not
     /// graph-visible).
     pub(crate) async fn stage_all(
@@ -784,6 +785,11 @@ async fn stage_pending_table(
             planned_transaction,
         }));
     }
+
+    // Bracket the actual storage future, not preparation or publication. The
+    // task-local probe is unset in production; tests use its rendezvous to
+    // prove that the configured cross-table width is exercised.
+    let _stage_write_probe = crate::instrumentation::enter_stage_write_probe().await;
 
     // Stage produces uncommitted fragments + transaction. No Lance HEAD
     // advance until `commit_all` runs `commit_staged`.

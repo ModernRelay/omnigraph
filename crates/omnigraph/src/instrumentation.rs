@@ -196,6 +196,87 @@ pub(crate) fn traversal_mode_override() -> Option<&'static str> {
 
 tokio::task_local! {
     static STAGE_WRITE_CONCURRENCY_OVERRIDE: Option<usize>;
+    static STAGE_WRITE_PROBES: StageWriteProbes;
+}
+
+/// Deterministic probe for the number of table-fragment staging futures that
+/// are inside their storage call at once.
+///
+/// `release_after` is a test rendezvous: the first staged tables wait until
+/// that many participants have entered. A concurrency regression therefore
+/// times out instead of passing from result equivalence alone. Production
+/// leaves this task-local unset, so staging only pays the unset lookup.
+#[derive(Clone)]
+pub struct StageWriteProbes {
+    state: Arc<StageWriteProbeState>,
+}
+
+struct StageWriteProbeState {
+    active: AtomicU64,
+    entered: AtomicU64,
+    peak: AtomicU64,
+    rendezvous: tokio::sync::Barrier,
+}
+
+impl StageWriteProbes {
+    /// Create a probe that releases each group after `release_after` staged
+    /// tables have entered the storage-call boundary.
+    pub fn rendezvous(release_after: usize) -> Self {
+        assert!(release_after > 0, "stage-write rendezvous must be non-zero");
+        Self {
+            state: Arc::new(StageWriteProbeState {
+                active: AtomicU64::new(0),
+                entered: AtomicU64::new(0),
+                peak: AtomicU64::new(0),
+                rendezvous: tokio::sync::Barrier::new(release_after),
+            }),
+        }
+    }
+
+    /// Number of table-storage staging calls that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.state.entered.load(Ordering::Relaxed)
+    }
+
+    /// Maximum table-storage staging calls simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.state.peak.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) struct StageWriteProbeGuard {
+    state: Arc<StageWriteProbeState>,
+}
+
+impl Drop for StageWriteProbeGuard {
+    fn drop(&mut self) {
+        self.state.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Run `fut` with deterministic table-staging probes installed.
+pub async fn with_stage_write_probes<F>(probes: StageWriteProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    STAGE_WRITE_PROBES.scope(probes, fut).await
+}
+
+pub(crate) async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
+    let state = STAGE_WRITE_PROBES
+        .try_with(|probes| probes.state.clone())
+        .ok()?;
+    state.entered.fetch_add(1, Ordering::Relaxed);
+    // Count only after every participant is released. The first staging call
+    // must then remain pending in its real storage future for a second call to
+    // raise the peak above one; parked rendezvous waiters do not count.
+    state.rendezvous.wait().await;
+    let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
+    state.peak.fetch_max(active, Ordering::Relaxed);
+    let guard = StageWriteProbeGuard {
+        state: state.clone(),
+    };
+    Some(guard)
 }
 
 /// Force the fragment-writing stage width for the scope of `fut` WITHOUT

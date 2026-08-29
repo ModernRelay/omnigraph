@@ -2639,7 +2639,6 @@ fn parse_date64_json_value(value: &JsonValue) -> Result<Option<i64>> {
     Ok(None)
 }
 
-/// Write a batch to a Lance dataset, returning (new_version, total_row_count).
 fn generate_id() -> String {
     crate::dst_ids::new_ulid().to_string()
 }

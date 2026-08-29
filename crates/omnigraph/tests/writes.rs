@@ -23,7 +23,9 @@ use lance::Dataset;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
-use omnigraph::instrumentation::with_stage_write_concurrency;
+use omnigraph::instrumentation::{
+    StageWriteProbes, with_stage_write_concurrency, with_stage_write_probes,
+};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
@@ -2609,13 +2611,11 @@ async fn insert_only_mutation_stale_expected_head_is_terminal_issue_365() {
 }
 
 /// `stage_all` now stages independent tables at the loader's concurrency
-/// (issue #504). The risk a reviewer cares about is not speed but sameness:
-/// a multi-table mutation staged concurrently must land the same observable
-/// effects as the serial staging it replaces. Same query, two fresh stores,
-/// concurrency forced to 1 and then 4 through the scoped
-/// `with_stage_write_concurrency` seam; affected counts, per-table row counts,
-/// the inserted person's row values, and the exact edge endpoint pairs must all
-/// agree.
+/// (issue #504). The deterministic rendezvous proves both table-storage futures
+/// are in flight together at width 4, while width 1 peaks at one. The same query
+/// also runs against two fresh stores and must land the same observable effects:
+/// affected counts, per-table row counts, the inserted person's row values, and
+/// the exact edge endpoint pairs all agree.
 ///
 /// The width is forced through the task-local seam rather than the env var on
 /// purpose: `#[serial]` only excludes other `#[serial]` tests, so an env-mutating
@@ -2624,40 +2624,38 @@ async fn insert_only_mutation_stale_expected_head_is_terminal_issue_365() {
 /// scoped override is process-safe and cannot leak past the future.
 #[tokio::test]
 async fn multi_table_staging_matches_serial_staging() {
-    async fn run_at(
-        concurrency: usize,
-    ) -> (
+    type Observation = (
         usize,
         usize,
         usize,
         usize,
         Option<i32>,
         Vec<(String, String)>,
-    ) {
-        with_stage_write_concurrency(concurrency, run_once()).await
-    }
+    );
 
-    async fn run_once() -> (
-        usize,
-        usize,
-        usize,
-        usize,
-        Option<i32>,
-        Vec<(String, String)>,
-    ) {
+    async fn run_once(concurrency: usize, release_after: usize) -> (Observation, u64, u64) {
         let dir = tempfile::tempdir().unwrap();
         let db = init_and_load(&dir).await;
-        let result = db
-            .mutate(
-                "main",
-                STAGED_QUERIES,
-                "person_with_two_friends",
-                &mixed_params(
-                    &[("$name", "Nadia"), ("$a", "Alice"), ("$b", "Bob")],
-                    &[("$age", 41)],
-                ),
-            )
+        let probes = StageWriteProbes::rendezvous(release_after);
+        let observed = probes.clone();
+        let mutation_params = mixed_params(
+            &[("$name", "Nadia"), ("$a", "Alice"), ("$b", "Bob")],
+            &[("$age", 41)],
+        );
+        // Keep the large mutation state machine behind one pointer while two
+        // task-local scopes wrap it; debug test threads otherwise retain the
+        // complete nested future on their stack.
+        let mutation = Box::pin(db.mutate(
+            "main",
+            STAGED_QUERIES,
+            "person_with_two_friends",
+            &mutation_params,
+        ));
+        let mutation =
+            with_stage_write_probes(probes, with_stage_write_concurrency(concurrency, mutation));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), mutation)
             .await
+            .expect("configured staging width never reached the rendezvous")
             .unwrap();
         // Nadia's stored age proves the node batch landed with its values,
         // not just its cardinality.
@@ -2701,18 +2699,33 @@ async fn multi_table_staging_matches_serial_staging() {
             }
         }
         edges.sort();
-        (
+        let result = (
             result.affected_nodes,
             result.affected_edges,
             count_rows(&db, "node:Person").await,
             count_rows(&db, "edge:Knows").await,
             nadia_age,
             edges,
-        )
+        );
+        (result, observed.entered(), observed.peak_in_flight())
     }
 
-    let serial = run_at(1).await;
-    let concurrent = run_at(4).await;
+    let (serial, serial_entered, serial_peak) = run_once(1, 1).await;
+    assert_eq!(
+        serial_entered, 2,
+        "the mutation must stage exactly two tables"
+    );
+    assert_eq!(serial_peak, 1, "width 1 must keep table staging serial");
+
+    let (concurrent, concurrent_entered, concurrent_peak) = run_once(4, 2).await;
+    assert_eq!(
+        concurrent_entered, 2,
+        "the mutation must stage exactly two tables"
+    );
+    assert_eq!(
+        concurrent_peak, 2,
+        "width 4 must overlap both independent table-storage futures"
+    );
     assert_eq!(
         serial, concurrent,
         "staging concurrency must not change any observable effect"
