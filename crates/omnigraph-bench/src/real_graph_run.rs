@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::case::{LocalFilesystem, LocalStorageClass};
+use crate::case::{LocalFilesystem, LocalStorageClass, ResetMode};
 use crate::environment::{LocalEnvironmentEvidence, verify_local_environment};
 use crate::fixture_reference::NormalizedFixtureReferenceV1;
 use crate::machine::{MachineIdentityV1, capture_machine_identity};
@@ -229,16 +229,10 @@ struct WorkerEnvelopeV1 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RealGraphReset {
-    Clonefile,
-    PlainCopy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RealGraphLocalProfile {
     filesystem: LocalFilesystem,
     storage_class: LocalStorageClass,
-    reset: RealGraphReset,
+    reset: ResetMode,
     reset_label: &'static str,
 }
 
@@ -247,7 +241,7 @@ fn real_graph_local_profile() -> Result<RealGraphLocalProfile, RealGraphRunError
     Ok(RealGraphLocalProfile {
         filesystem: LocalFilesystem::Apfs,
         storage_class: LocalStorageClass::NvmeSsd,
-        reset: RealGraphReset::Clonefile,
+        reset: ResetMode::LocalClonefile,
         reset_label: "apfs-clonefile-same-active-path",
     })
 }
@@ -257,7 +251,7 @@ fn real_graph_local_profile() -> Result<RealGraphLocalProfile, RealGraphRunError
     Ok(RealGraphLocalProfile {
         filesystem: LocalFilesystem::Xfs,
         storage_class: LocalStorageClass::NvmeSsd,
-        reset: RealGraphReset::PlainCopy,
+        reset: ResetMode::PlainCopy,
         reset_label: "xfs-plain-copy-syncfs-same-active-path",
     })
 }
@@ -283,14 +277,18 @@ impl RealGraphTemplate {
         limits: TraversalLimits,
     ) -> std::io::Result<Self> {
         match profile.reset {
-            RealGraphReset::Clonefile => {
+            ResetMode::LocalClonefile => {
                 freeze_clonefile_template(active, template, limits).map(Self::Clonefile)
             }
-            RealGraphReset::PlainCopy => {
+            ResetMode::PlainCopy => {
                 let frozen = freeze_plain_copy_template(active, template, limits)?;
                 sync_plain_copy_filesystem(frozen.template_root())?;
                 Ok(Self::PlainCopy(frozen))
             }
+            ResetMode::S3Versioning => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "real-graph execution supports only local reset modes",
+            )),
         }
     }
 
@@ -413,7 +411,7 @@ async fn execute_staged_real_graph_run(
 
     prepare_finbench_delta(&active).await?;
     let limits = TraversalLimits::default();
-    if profile.reset == RealGraphReset::PlainCopy {
+    if profile.reset == ResetMode::PlainCopy {
         let prepared = digest_metadata_tree(&active, limits).map_err(|error| {
             RealGraphRunError::new(
                 "real_graph_capacity_probe_failed",
@@ -1471,7 +1469,7 @@ mod tests {
         let profile = real_graph_local_profile().unwrap();
         assert_eq!(profile.filesystem, LocalFilesystem::Apfs);
         assert_eq!(profile.storage_class, LocalStorageClass::NvmeSsd);
-        assert_eq!(profile.reset, RealGraphReset::Clonefile);
+        assert_eq!(profile.reset, ResetMode::LocalClonefile);
         assert_eq!(profile.reset_label, "apfs-clonefile-same-active-path");
     }
 
@@ -1481,7 +1479,7 @@ mod tests {
         let profile = real_graph_local_profile().unwrap();
         assert_eq!(profile.filesystem, LocalFilesystem::Xfs);
         assert_eq!(profile.storage_class, LocalStorageClass::NvmeSsd);
-        assert_eq!(profile.reset, RealGraphReset::PlainCopy);
+        assert_eq!(profile.reset, ResetMode::PlainCopy);
         assert_eq!(
             profile.reset_label,
             "xfs-plain-copy-syncfs-same-active-path"
