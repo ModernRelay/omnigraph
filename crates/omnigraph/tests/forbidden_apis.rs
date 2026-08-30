@@ -342,6 +342,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "all_native_branches",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "branch_descendants",
     ),
     (
@@ -430,6 +435,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/manifest.rs",
         "ManifestCoordinator",
         "list_graph_branches",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "list_native_graph_branches",
     ),
     (
         "db/manifest.rs",

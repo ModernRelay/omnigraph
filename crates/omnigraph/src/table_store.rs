@@ -1034,7 +1034,33 @@ impl TableStore {
         if entry.native_dataset_branch.is_none() {
             return self.open_at_entry(entry).await;
         }
-        let dataset = entry.open(&self.root_uri, None).await?;
+        let dataset = match entry.open(&self.root_uri, None).await {
+            Ok(dataset) => dataset,
+            Err(OmniError::HistoricalVersionReclaimed { .. }) => {
+                // Cleanup can reclaim a pinned version of a live fork (a
+                // retention gap), but a fork whose tree is gone altogether was
+                // reclaimed with its deleted branch; under incarnation-suffixed
+                // refs the branch may already live on elsewhere. Distinguish
+                // the two before reporting a gap.
+                let native = entry
+                    .native_dataset_branch
+                    .as_deref()
+                    .expect("named-fork arm checked above");
+                let uri = self.dataset_uri(&entry.dataset_path);
+                return match self.open_dataset_head(&uri, Some(native)).await {
+                    Ok(_) => Err(OmniError::HistoricalVersionReclaimed {
+                        published_dataset_version: entry.published_dataset_version,
+                    }),
+                    Err(_) => Err(OmniError::manifest(format!(
+                        "change feed table '{}' has no persisted native-branch incarnation \
+                         witness at the reopened dataset; the branch was deleted and \
+                         recreated during the poll",
+                        entry.type_key,
+                    ))),
+                };
+            }
+            Err(error) => return Err(error),
+        };
         // Defense-in-depth only: the e_tag is not a sufficient native-branch
         // incarnation witness (a store may persist none, and equality is a
         // content heuristic, not identity). The load-bearing witness is the

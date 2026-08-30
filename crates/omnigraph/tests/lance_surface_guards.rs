@@ -1075,6 +1075,67 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 //      must therefore refuse graph-branch deletion while checkpoint authority
 //      names that branch; the Lance tag alone is not a deletion fence.
 
+// Incarnation-suffixed ref names. OmniGraph names every graph-branch life
+// `{logical}.{ULID}`. This pins the substrate facts that design relies on:
+// Lance accepts the name, stores the life at `tree/{logical}.{ULID}/` as a
+// SIBLING of any bare `tree/{logical}/`, and a recreation under a new suffix
+// shares no path with a lingering dead tree, so the dead tree is inert
+// garbage rather than a clone-target collision.
+#[tokio::test]
+async fn incarnation_suffixed_branch_names_are_path_disjoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard-incarnation.lance");
+    let uri = uri.to_str().unwrap();
+    let mut ds = fresh_dataset(uri).await;
+    let base = ds.version().version;
+
+    let first = "feature.01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let second = "feature.01BX5ZZKBKACTAV9WEVGEMMVRZ";
+    ds.create_branch(first, base, None)
+        .await
+        .expect("Lance must accept a `.`-suffixed segment as a branch name");
+    let tree = std::path::Path::new(uri).join("tree");
+    assert!(tree.join(first).is_dir(), "the life lives at tree/{first}");
+    assert!(
+        !tree.join("feature").exists(),
+        "a suffixed life must not create or nest under a bare tree/feature/"
+    );
+
+    // Simulate a delete whose tree removal never settled: remove only the ref.
+    std::fs::remove_file(
+        std::path::Path::new(uri)
+            .join("_refs")
+            .join("branches")
+            .join(format!("{first}.json")),
+    )
+    .unwrap();
+    assert!(
+        tree.join(first).is_dir(),
+        "precondition: the dead life's tree lingers"
+    );
+
+    // A new life under a new suffix is unaffected by the dead tree.
+    ds.create_branch(second, base, None)
+        .await
+        .expect("a recreation under a new incarnation never collides with a dead tree");
+    assert!(tree.join(second).is_dir());
+    let branches = ds.list_branches().await.unwrap();
+    assert!(branches.contains_key(second));
+    assert!(
+        !branches.contains_key(first),
+        "the dead life is unlisted: ref absence is the only authority Lance keeps"
+    );
+    // Lance's checkout is PATH-based: it reads tree/{name} whether or not
+    // the ref exists, so a dead life's lingering tree is still readable by
+    // name. That is why OmniGraph resolves a logical name through the ref
+    // listing and only checks out a name the listing proves live.
+    assert!(
+        ds.checkout_branch(first).await.is_ok(),
+        "Lance checkout reads a dead life's tree by path; if this now fails, the \
+         listing-first resolution rule could be relaxed"
+    );
+}
+
 #[tokio::test]
 async fn force_delete_branch_semantics() {
     let dir = tempfile::tempdir().unwrap();

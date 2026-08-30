@@ -2399,19 +2399,35 @@ fn dst_reborn_branch_cache_poison_reader_ablation() {
     }
 }
 
-/// the STANDALONE-REPRO probe: the faithful 10177 op replay
-/// (which passes bare) plus ONLY the two arming reads the ablation
-/// localized — full world traversals (branch list + person and edge
-/// traversals on every branch) after op 2 (post branch-create) and op 5
-/// (post the first life's edge op). RED here = the finding's standalone
-/// engine-level repro: 29 public API calls + 2 read passes, no harness
-/// machinery. GREEN = the arming needs more than those two reads carry
-/// (e.g. their exact interleaving with the sampler's rejected no-op
-/// deletes at ops 14/17) — recorded either way.
+/// REGRESSION PIN built from the standalone repro: whole-world read
+/// passes (branch list + per-branch person and edge traversals) during a
+/// branch's first life warm the handle's path-keyed session metadata; a
+/// same-name delete + recreate must then accept its first Person write and
+/// serve its second-life content. Incarnation-suffixed native refs put each
+/// life on its own storage path, so the dead life's cached entries are
+/// unreachable by construction. Dedicated big-stack thread: the engine
+/// futures overflow the default test-thread stack.
 #[test]
 #[serial]
-#[ignore = "instrument: reborn-branch cache-poison standalone repro — run explicitly"]
 fn dst_reborn_branch_cache_poison_standalone_repro() {
+    let handle = std::thread::Builder::new()
+        .name("dst-reborn-branch-regression".into())
+        .stack_size(omnigraph_dst::harness::UNIVERSE_STACK_BYTES)
+        .spawn(reborn_branch_cache_poison_body)
+        .expect("spawn regression thread");
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn reborn_branch_cache_poison_body() {
+    struct DstHookGuard;
+    impl Drop for DstHookGuard {
+        fn drop(&mut self) {
+            omnigraph::dst_clock::uninstall_logical_clock();
+            omnigraph::dst_ids::uninstall_seeded_ulids();
+        }
+    }
     let mut seeds = SplitMix64(9401);
     let runtime_seed = seeds.next_u64();
     let ulid_seed = seeds.next_u64();
@@ -2426,6 +2442,9 @@ fn dst_reborn_branch_cache_poison_standalone_repro() {
     runtime.block_on(Box::pin(async move {
         omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
         omnigraph::dst_clock::install_logical_clock();
+        // Uninstall on BOTH exits: a failing assertion below must not leak
+        // the process-global DST hooks into the next #[serial] test.
+        let _dst_hooks = DstHookGuard;
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let db = Omnigraph::init_with_storage(
             "shared-memory://dst-f9-standalone",
@@ -2603,39 +2622,53 @@ fn dst_reborn_branch_cache_poison_standalone_repro() {
             &[]
         )
         .expect("op27");
-        match m!(
+        m!(
             db,
             "b0",
             "insert_person_v",
             &[("$name", "w4")],
             &[("$age", 11), ("$ver", 9)]
-        ) {
-            Ok(_) => println!(
-                "F9 STANDALONE: op28 SUCCEEDED — two reads alone do not carry the \
-                 arming; next differential = the sampler's rejected no-op deletes \
-                 (ops 14/17) or read-position interleaving"
-            ),
-            Err(e) => {
-                let text = format!("{e:?}");
-                if text.contains("record batch must have the same length")
-                    || text.contains("row id index corrupt")
-                {
-                    println!(
-                        "F9 STANDALONE: CLASS A REPRODUCED — 29 public API calls + 2 \
-                         world reads, no harness. THE standalone repro: {}",
-                        &text[..text.len().min(600)]
-                    );
-                } else {
-                    println!(
-                        "F9 STANDALONE: op28 failed OTHER: {}",
-                        &text[..text.len().min(200)]
-                    );
-                }
-            }
-        }
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        )
+        .expect(
+            "op28: the reborn branch's first Person write must succeed — a failure here \
+             is the stale-session-metadata rebirth regression",
+        );
+        // The silent arm of the same defect: a reborn-branch READ served
+        // from first-life metadata misses the second life's writes without
+        // erroring. Pin the content, not just the write's success.
+        let people = Box::pin(omnigraph_dst::fixtures::person_rows_on(&db, "b0")).await;
+        assert!(
+            people.contains(&("w4".to_string(), 11, 9)),
+            "reborn b0 must serve its second-life insert (w4, 11, 9); got {people:?}"
+        );
+        let knows = Box::pin(omnigraph_dst::fixtures::knows_pairs_on(&db, "b0")).await;
+        assert!(
+            knows.contains(&("w6".to_string(), "Diana".to_string())),
+            "reborn b0 must serve its second-life edge (w6 -> Diana); got {knows:?}"
+        );
     }));
+}
+
+/// REGRESSION PIN, second face of the rebirth family (the reader-ablation
+/// doc above): seed 10133, wide shape, LoadFork victim — run as a full
+/// universe. Keeps the family's non-InsertV face in CI.
+#[test]
+#[serial]
+fn dst_reborn_branch_cache_poison_wide_face_regression() {
+    let _s = omnigraph::failpoints::FailScenario::setup();
+    let sc = Scenario {
+        seed: 10_133,
+        ops: 30,
+        die_at_write: None,
+        wide: true,
+        ..Default::default()
+    };
+    if let Err(panic) =
+        omnigraph_dst::harness::run_universe_caught("shared-memory://dst-f9-10133-regression", &sc)
+    {
+        let msg = omnigraph_dst::harness::panic_message(panic.as_ref());
+        panic!("seed 10133 wide universe must pass post-fix (LoadFork rebirth face): {msg}");
+    }
 }
 
 /// the minimal-shape probe: the ablation matrix pinned the

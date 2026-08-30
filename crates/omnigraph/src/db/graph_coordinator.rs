@@ -356,6 +356,17 @@ impl GraphCoordinator {
         self.manifest.list_graph_branches().await
     }
 
+    /// The native Lance ref this coordinator's branch resolved to; `None` on
+    /// main. Every table fork of the branch carries exactly this name.
+    pub(crate) fn native_branch(&self) -> Option<&str> {
+        self.manifest.native_branch()
+    }
+
+    /// Every live native branch ref except `main` (logical names may differ).
+    pub(crate) async fn all_native_branches(&self) -> Result<Vec<String>> {
+        self.manifest.list_native_graph_branches().await
+    }
+
     pub async fn branch_descendants(&self, name: &str) -> Result<Vec<String>> {
         self.manifest
             .descendant_branches(name)
@@ -837,6 +848,7 @@ fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
     if branch == "main" {
         return Ok(None);
     }
+    crate::branch_names::ensure_logical_branch_name(branch)?;
     Ok(Some(branch.to_string()))
 }
 

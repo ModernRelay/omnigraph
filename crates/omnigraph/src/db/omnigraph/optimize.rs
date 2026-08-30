@@ -1324,11 +1324,13 @@ async fn reconcile_orphaned_branches_with_catalog(
 
     // Live manifest branches: the set whose per-table placements are
     // authoritative. A branch absent here is a whole-branch (origin-1) orphan.
+    // Native refs: a fork of a dead incarnation is an orphan even while the
+    // same logical branch lives on under a fresh incarnation.
     let live_branches: HashSet<String> = db
         .coordinator
         .read()
         .await
-        .all_branches()
+        .all_native_branches()
         .await?
         .into_iter()
         .collect();
@@ -1376,7 +1378,8 @@ async fn reconcile_orphaned_branches_with_catalog(
         for branch in listed {
             // `main` is not a named Lance branch; system/internal branches
             // (e.g. the schema-apply lock) own legitimate forks — never touch.
-            if branch == "main" || crate::db::is_internal_system_branch(&branch) {
+            let logical = crate::branch_names::logical_branch_name(&branch).to_string();
+            if branch == "main" || crate::db::is_internal_system_branch(&logical) {
                 continue;
             }
             let is_orphan = if !live_branches.contains(&branch) {
@@ -1391,7 +1394,7 @@ async fn reconcile_orphaned_branches_with_catalog(
                     let branch_snapshot = match crate::failpoints::maybe_fail(
                         crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
                     ) {
-                        Ok(()) => db.snapshot_for_branch(Some(&branch)).await,
+                        Ok(()) => db.snapshot_for_branch(Some(&logical)).await,
                         Err(injected) => Err(injected),
                     };
                     match branch_snapshot {
@@ -1439,7 +1442,10 @@ async fn reconcile_orphaned_branches_with_catalog(
             // lock-order inversion against multi-table `acquire_many` writers.
             let _guard = db
                 .write_queue()
-                .acquire(&(table_key.clone(), Some(branch.clone())))
+                .acquire(&(
+                    table_key.clone(),
+                    Some(crate::branch_names::logical_branch_name(&branch).to_string()),
+                ))
                 .await;
             // Decide under the queue from FRESH authority via the shared
             // classifier (same decision the write-path reclaim uses) — never
@@ -1572,13 +1578,14 @@ mod tests {
         .await
         .unwrap();
         db.branch_create("feature").await.unwrap();
+        let feature_native = db.native_branch_for("feature").await.unwrap();
 
         for type_name in ["Person", "Company"] {
             let table_uri = node_table_uri(&db, type_name).await;
             // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
             let mut ds = lance::Dataset::open(&table_uri).await.unwrap();
             let base = ds.version().version;
-            ds.create_branch("feature", base, None).await.unwrap();
+            ds.create_branch(&feature_native, base, None).await.unwrap();
         }
 
         let _fp = ScopedFailPoint::new(

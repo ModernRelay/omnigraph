@@ -243,6 +243,7 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
     // violation; roll-forward-only mode leaves it for the next ReadWrite
     // open) — it persists through the write attempt below.
     let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
+    let feature_native = helpers::graph_native_ref(db.uri(), "feature").await;
     let sidecar_json = format!(
         r#"{{
         "schema_version": 1,
@@ -258,7 +259,7 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
                 "table_path": "{person_uri}",
                 "expected_version": 999,
                 "post_commit_pin": 1000,
-                "table_branch": "feature"
+                "table_branch": "{feature_native}"
             }}
         ]
     }}"#
@@ -318,6 +319,7 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
     // A rollback-eligible (deferred) sidecar pinned to feature — shaped
     // so every roll-forward-only pass leaves it on disk.
     let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
+    let feature_native = helpers::graph_native_ref(db.uri(), "feature").await;
     let sidecar_json = format!(
         r#"{{
         "schema_version": 1,
@@ -333,7 +335,7 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
                 "table_path": "{person_uri}",
                 "expected_version": 999,
                 "post_commit_pin": 1000,
-                "table_branch": "feature"
+                "table_branch": "{feature_native}"
             }}
         ]
     }}"#

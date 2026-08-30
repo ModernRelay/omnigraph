@@ -1035,7 +1035,36 @@ impl Omnigraph {
             // same named branch and numeric table version. Blob reads need a
             // coherent physical-incarnation witness; bypass the held handle for
             // named-native-branch tables and prove the graph ref again below.
-            entry.open(self.uri(), None).await?
+            match entry.open(self.uri(), None).await {
+                Ok(dataset) => dataset,
+                Err(OmniError::HistoricalVersionReclaimed { .. }) => {
+                    // Incarnation-suffixed refs put a recreated branch on a new
+                    // path, so a live-branch capture racing delete/recreate
+                    // finds its fork gone rather than replaced. A fork whose
+                    // tree is gone was reclaimed with its deleted branch: that
+                    // is the incarnation refusal, not a retention gap. Only a
+                    // still-present fork with a reclaimed version is a gap.
+                    let native = entry
+                        .native_dataset_branch
+                        .as_deref()
+                        .expect("named-fork arm checked above");
+                    let table_uri = self.storage().dataset_uri(&entry.dataset_path);
+                    return match self
+                        .storage()
+                        .open_dataset_head(&table_uri, Some(native))
+                        .await
+                    {
+                        Ok(_) => Err(OmniError::HistoricalVersionReclaimed {
+                            published_dataset_version: entry.published_dataset_version,
+                        }),
+                        Err(_) => Err(OmniError::manifest(format!(
+                            "Blob property '{}.{}' has no persisted native-branch incarnation witness at the selected target",
+                            cell.type_name, cell.property
+                        ))),
+                    };
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             resolved_target
                 .snapshot

@@ -1101,6 +1101,30 @@ impl Omnigraph {
         &self.root_uri
     }
 
+    /// The native Lance ref a logical branch currently resolves to.
+    ///
+    /// Served from the bound coordinator when it is on that branch; otherwise
+    /// one branch-scoped open resolves it through the manifest ref registry.
+    pub(crate) async fn native_branch_for(&self, branch: &str) -> Result<String> {
+        {
+            let coordinator = self.coordinator.read().await;
+            if coordinator.current_branch() == Some(branch) {
+                if let Some(native) = coordinator.native_branch() {
+                    return Ok(native.to_string());
+                }
+            }
+        }
+        let coordinator = self.open_coordinator_for_branch(Some(branch)).await?;
+        coordinator
+            .native_branch()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "branch '{branch}' resolved without a native ref"
+                ))
+            })
+    }
+
     pub(crate) async fn open_coordinator_for_branch(
         &self,
         branch: Option<&str>,
@@ -2905,7 +2929,13 @@ impl Omnigraph {
         control: &GraphCoordinator,
         branch: &str,
         branches: &[String],
+        natives: &[String],
     ) -> Result<()> {
+        // Surviving branches inherit forks by native ref, so dependency
+        // detection compares against the delete target's native name.
+        let delete_target_native = control.native_branch().ok_or_else(|| {
+            OmniError::manifest_internal(format!("branch '{branch}' resolved without a native ref"))
+        })?;
         let path_prefix = format!("{branch}/");
         if let Some(child) = branches
             .iter()
@@ -2941,10 +2971,22 @@ impl Omnigraph {
             .filter(|candidate| candidate.as_str() != branch)
         {
             let candidate_branch = Self::normalize_branch_name(other_branch)?;
+            let candidate_native = match candidate_branch.as_deref() {
+                None => None,
+                Some(logical) => Some(
+                    crate::branch_names::resolve_native_branch(
+                        natives.iter().map(String::as_str),
+                        logical,
+                    )?
+                    .ok_or_else(|| OmniError::BranchNotFound {
+                        branch: logical.to_string(),
+                    })?,
+                ),
+            };
             if crate::db::manifest::ManifestCoordinator::branch_depends_on_delete_target_under_control_gates(
                 self.uri(),
-                candidate_branch.as_deref(),
-                branch,
+                candidate_native.as_deref(),
+                delete_target_native,
                 &self.control_session(),
             )
             .await?
@@ -3017,10 +3059,13 @@ impl Omnigraph {
             )));
         }
 
+        let native = target.native_branch().map(str::to_string).ok_or_else(|| {
+            OmniError::manifest_internal(format!("branch '{branch}' resolved without a native ref"))
+        })?;
         let branch_snapshot = target.snapshot();
         let owned_tables = branch_snapshot
             .datasets()
-            .filter(|entry| entry.native_dataset_branch.as_deref() == Some(branch))
+            .filter(|entry| entry.native_dataset_branch.as_deref() == Some(native.as_str()))
             .map(|entry| (entry.type_key.clone(), entry.dataset_path.clone()))
             .collect::<Vec<_>>();
         let expected_identifier = target.branch_identifier().await?;
@@ -3037,8 +3082,10 @@ impl Omnigraph {
         // old branch-incarnation handles/topology can never leak into a later
         // recreation, while a failed control leaves warm state untouched.
         self.invalidate_read_caches().await;
-        // Best-effort per-table fork reclaim; cleanup reconciles any leftover.
-        self.cleanup_deleted_branch_tables(branch, &owned_tables)
+        // Best-effort per-table fork reclaim by native ref; cleanup reconciles
+        // any leftover. The name is unique to this incarnation, so a
+        // late-settling delete can only ever touch dead bytes.
+        self.cleanup_deleted_branch_tables(&native, &owned_tables)
             .await;
         Ok(())
     }
@@ -3292,7 +3339,17 @@ impl Omnigraph {
             .open_coordinator_for_branch(Some(branch.as_str()))
             .await?;
         validate_bound_catalog_against_snapshot(&control_catalog, &target_control.snapshot())?;
-        let branches = target_control.branch_list().await?;
+        // One ref listing serves the existence check, the namespace check,
+        // and every candidate's native ref for the dependency probe.
+        let natives = target_control.all_native_branches().await?;
+        let branches: Vec<String> = std::iter::once("main".to_string())
+            .chain(
+                natives
+                    .iter()
+                    .map(|native| crate::branch_names::logical_branch_name(native).to_string())
+                    .filter(|logical| !crate::db::is_internal_system_branch(logical)),
+            )
+            .collect();
         if !branches.iter().any(|candidate| candidate == &branch) {
             return Err(OmniError::manifest_not_found(format!(
                 "branch '{}' not found",
@@ -3300,7 +3357,7 @@ impl Omnigraph {
             )));
         }
 
-        self.ensure_branch_delete_safe(&target_control, &branch, &branches)
+        self.ensure_branch_delete_safe(&target_control, &branch, &branches, &natives)
             .await?;
         self.delete_captured_branch_storage(&branch, &mut target_control)
             .await
@@ -3519,6 +3576,7 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
     if branch == "main" {
         return Ok(None);
     }
+    crate::branch_names::ensure_logical_branch_name(branch)?;
     Ok(Some(branch.to_string()))
 }
 

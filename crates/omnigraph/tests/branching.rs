@@ -209,7 +209,10 @@ async fn branch_create_open_list_and_lazy_branching_work() {
             .join("__manifest")
             .join("_refs")
             .join("branches")
-            .join("feature.json"),
+            .join(format!(
+                "{}.json",
+                graph_native_ref(dir.path().to_str().unwrap(), "feature").await
+            )),
     )
     .unwrap();
     main.branch_create("feature").await.unwrap();
@@ -249,12 +252,12 @@ async fn branch_create_open_list_and_lazy_branching_work() {
         main_person.dataset_path,
         "the first lazy fork must preserve the logical table identity/path"
     );
-    assert_eq!(
+    helpers::assert_native_branch_of(
         snap.dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature")
+        "feature",
     );
     assert_eq!(
         snap.dataset("edge:Knows")
@@ -811,7 +814,7 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
         .unwrap()
         .clone();
     assert_eq!(new_entry.dataset_path, old_entry.dataset_path);
-    assert_eq!(
+    assert_ne!(
         new_entry.native_dataset_branch,
         old_entry.native_dataset_branch
     );
@@ -2482,7 +2485,10 @@ async fn branch_created_from_non_main_inherits_branch_state() {
             .join("__manifest")
             .join("_refs")
             .join("branches")
-            .join("experiment.json"),
+            .join(format!(
+                "{}.json",
+                graph_native_ref(dir.path().to_str().unwrap(), "experiment").await
+            )),
     )
     .unwrap();
     feature
@@ -2543,25 +2549,28 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
 
     let experiment = Omnigraph::open(uri).await.unwrap();
     let experiment_inherited = snapshot_branch(&experiment, "experiment").await.unwrap();
-    assert_eq!(
+    helpers::assert_native_branch_of(
         experiment_inherited
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature")
+        "feature",
     );
 
     experiment.ensure_indices_on("experiment").await.unwrap();
 
     let experiment_snap = snapshot_branch(&experiment, "experiment").await.unwrap();
-    assert_eq!(
-        experiment_snap
-            .dataset("node:Person")
-            .unwrap()
-            .native_dataset_branch
-            .as_deref(),
-        Some("feature"),
+    assert!(
+        is_incarnation_of(
+            experiment_snap
+                .dataset("node:Person")
+                .unwrap()
+                .native_dataset_branch
+                .as_deref()
+                .unwrap_or(""),
+            "feature"
+        ),
         "index reconciliation must not manufacture a ref-only first-touch effect"
     );
     assert_eq!(
@@ -2574,13 +2583,13 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
     );
 
     let feature_snap = snapshot_branch(&feature, "feature").await.unwrap();
-    assert_eq!(
+    helpers::assert_native_branch_of(
         feature_snap
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature")
+        "feature",
     );
     assert_eq!(
         count_rows_branch(&feature, "feature", "node:Person").await,
@@ -2599,13 +2608,13 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
         .await
         .unwrap();
     let grandchild = snapshot_branch(&experiment, "grandchild").await.unwrap();
-    assert_eq!(
+    helpers::assert_native_branch_of(
         grandchild
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature")
+        "feature",
     );
     experiment.branch_delete("grandchild").await.unwrap();
     experiment.branch_delete("experiment").await.unwrap();
@@ -2637,12 +2646,12 @@ async fn branch_edge_only_write_only_branches_edge_table() {
             .as_deref(),
         None
     );
-    assert_eq!(
+    helpers::assert_native_branch_of(
         snap.dataset("edge:Knows")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature")
+        "feature",
     );
     assert_eq!(
         snap.dataset("edge:WorksAt")
@@ -2739,13 +2748,13 @@ async fn branch_merge_into_non_main_target_works() {
     .unwrap();
     assert_eq!(eve.num_rows(), 1);
     let experiment_snap = snapshot_branch(&experiment, "experiment").await.unwrap();
-    assert_eq!(
+    helpers::assert_native_branch_of(
         experiment_snap
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("experiment")
+        "experiment",
     );
 
     let mut reopened_main = Omnigraph::open(uri).await.unwrap();
@@ -3041,10 +3050,21 @@ async fn branch_delete_removes_owned_table_branches_and_allows_recreate() {
     .await
     .unwrap();
 
+    let first_native = graph_native_ref(uri, "feature").await;
+    assert!(
+        is_incarnation_of(&first_native, "feature") && first_native != "feature",
+        "an engine-created branch owns an incarnation-suffixed native ref, got '{first_native}'"
+    );
+
     main.branch_delete("feature").await.unwrap();
     assert_eq!(main.branch_list().await.unwrap(), vec!["main"]);
 
     main.branch_create("feature").await.unwrap();
+    let second_native = graph_native_ref(uri, "feature").await;
+    assert_ne!(
+        first_native, second_native,
+        "a recreated branch mints a new incarnation; it never reuses the dead one's path"
+    );
     mutate_branch(
         &mut main,
         "feature",
@@ -3056,6 +3076,49 @@ async fn branch_delete_removes_owned_table_branches_and_allows_recreate() {
     .unwrap();
 
     assert_eq!(count_rows_branch(&main, "feature", "node:Person").await, 5);
+    let recreated = snapshot_branch(&main, "feature").await.unwrap();
+    assert_eq!(
+        recreated
+            .dataset("node:Person")
+            .unwrap()
+            .native_dataset_branch
+            .as_deref(),
+        Some(second_native.as_str()),
+        "the recreated branch's fork is named by its own incarnation"
+    );
+    assert_eq!(
+        main.branch_list().await.unwrap(),
+        vec!["main", "feature"],
+        "branch listing shows logical names only"
+    );
+}
+
+#[tokio::test]
+async fn branch_names_reject_incarnation_shaped_suffixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    // A native ref is `{logical}.{ULID}`; a logical name that already looks
+    // like one could not be split back, and an inner segment shaped that way
+    // would nest a child tree under a native ref's physical path.
+    for name in [
+        "feature.01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "feature.01ARZ3NDEKTSV4RRFFQ69G5FAV/child",
+    ] {
+        let err = db.branch_create(name).await.unwrap_err();
+        assert!(
+            err.to_string().contains("incarnation-shaped suffix"),
+            "create must refuse '{name}' by its suffix rule; got: {err}"
+        );
+        let err = db.snapshot_of(ReadTarget::branch(name)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("incarnation-shaped suffix"),
+            "native refs are not addressable on reads either; got: {err}"
+        );
+    }
+    // Ordinary dotted names stay legal.
+    db.branch_create("release.1.2").await.unwrap();
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main", "release.1.2"]);
 }
 
 #[tokio::test]
@@ -3075,7 +3138,6 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
             .join("__manifest")
             .join("tree")
             .join("feature")
-            .join("child")
             .exists(),
         "prefix admission must reject before Lance creates the target clone"
     );
@@ -3095,7 +3157,8 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
             .list_branches()
             .await
             .unwrap()
-            .contains_key("feature"),
+            .keys()
+            .any(|name| helpers::is_incarnation_of(name, "feature")),
         "inverse admission refusal must not create an ancestor ref"
     );
 }
@@ -3130,7 +3193,8 @@ async fn branch_delete_refuses_legacy_physical_path_children() {
             .list_branches()
             .await
             .unwrap()
-            .contains_key("feature"),
+            .keys()
+            .any(|name| helpers::is_incarnation_of(name, "feature")),
         "refusal must not remove ancestor authority"
     );
 
