@@ -1037,31 +1037,28 @@ impl Omnigraph {
             // named-native-branch tables and prove the graph ref again below.
             match entry.open(self.uri(), None).await {
                 Ok(dataset) => dataset,
-                Err(OmniError::HistoricalVersionReclaimed { .. }) => {
+                Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
                     // Incarnation-suffixed refs put a recreated branch on a new
                     // path, so a live-branch capture racing delete/recreate
                     // finds its fork gone rather than replaced. A fork whose
-                    // tree is gone was reclaimed with its deleted branch: that
-                    // is the incarnation refusal, not a retention gap. Only a
-                    // still-present fork with a reclaimed version is a gap.
+                    // ref is gone was reclaimed with its deleted branch: that
+                    // is the incarnation refusal, not a retention gap. Absence
+                    // is proven from the ref listing; any other failure keeps
+                    // its own class.
                     let native = entry
                         .native_dataset_branch
                         .as_deref()
                         .expect("named-fork arm checked above");
                     let table_uri = self.storage().dataset_uri(&entry.dataset_path);
-                    return match self
-                        .storage()
-                        .open_dataset_head(&table_uri, Some(native))
-                        .await
-                    {
-                        Ok(_) => Err(OmniError::HistoricalVersionReclaimed {
-                            published_dataset_version: entry.published_dataset_version,
-                        }),
-                        Err(_) => Err(OmniError::manifest(format!(
+                    let root = self.storage().open_dataset_head(&table_uri, None).await?;
+                    let refs = crate::branch_control::list_branch_contents(root.dataset()).await?;
+                    if !refs.contains_key(native) {
+                        return Err(OmniError::manifest(format!(
                             "Blob property '{}.{}' has no persisted native-branch incarnation witness at the selected target",
                             cell.type_name, cell.property
-                        ))),
-                    };
+                        )));
+                    }
+                    return Err(error);
                 }
                 Err(error) => return Err(error),
             }
