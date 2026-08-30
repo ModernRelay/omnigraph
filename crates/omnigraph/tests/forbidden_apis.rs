@@ -268,11 +268,6 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "snapshot_at_graph_manifest_version"),
     ("db/omnigraph.rs", "export_jsonl"),
     ("db/omnigraph.rs", "export_jsonl_to_writer"),
-    // Added by #570 without registration (pre-existing red at 12e23d81):
-    // unordered export delegates to the same export read path; the base-paths
-    // probe is a relocation-audit read of the manifest dataset.
-    ("db/omnigraph.rs", "export_jsonl_unordered_to_writer"),
-    ("db/omnigraph.rs", "manifest_has_external_base_paths"),
     ("db/omnigraph.rs", "graph_index"),
     ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),

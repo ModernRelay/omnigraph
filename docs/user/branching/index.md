@@ -40,6 +40,12 @@ Branch names may contain `/`, but live names must not be path prefixes of one
 another. For example, `review` and `review/alice` cannot coexist. `main` is
 reserved. A branch with descendants must be deleted leaf-first.
 
+The substring `--` is reserved for internal per-life branch identity and is
+rejected in branch names on create, mutate, load, and delete. A branch created
+before this reservation whose name contains `--` stays readable and mergeable,
+but can no longer be written to and cannot be recreated after deletion; migrate
+it by merging or exporting its content into a branch without `--` in the name.
+
 Branch-control operations are safe across handles in one writer process. Do not
 run branch create/delete control concurrently from separate writer processes
 against the same graph.

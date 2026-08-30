@@ -16,7 +16,11 @@
 //! user-named branch can collide with a native ref minted here. Legacy
 //! branches created before this mapping keep their bare ref name (the
 //! registry has no row for them; resolution falls back to the bare name) and
-//! mint their first token on their next rebirth.
+//! mint their first token on their next rebirth. Two accepted residuals for
+//! legacy names containing `--`: they stay readable but lose the write
+//! operations that enforce the reservation, and a name whose suffix happens
+//! to parse as a 26-char ULID would mis-split (astronomically unlikely; it
+//! requires a user having named a branch with a literal ULID suffix).
 
 /// Reserved separator between the logical name and the per-life token in a
 /// native branch ref. Also the substring rejected in public branch names.
