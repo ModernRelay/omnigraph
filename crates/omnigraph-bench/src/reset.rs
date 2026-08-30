@@ -66,6 +66,11 @@ pub struct PhysicalDigest {
 /// mtime, and ctime) and is only compared against a later observation of the
 /// same tree. Access time is deliberately excluded because read-only cache preparation and
 /// metadata traversal may update it.
+///
+/// Equal metadata is not independent proof of equal contents: same-length
+/// writes can share a filesystem timestamp tick. Callers must retain quiescent
+/// ownership; byte identity comes from [`PhysicalDigest`] and the verified
+/// copy or forced-clone contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetadataDigest {
@@ -144,8 +149,9 @@ pub fn verify_physical_tree(
 /// Compute a content-free metadata witness for one tree.
 ///
 /// This traverses and stats the complete tree but never opens a regular file.
-/// The witness is suitable for proving that a quiescent tree did not change
-/// between two points in the benchmark protocol. It is not a replacement for
+/// The witness detects observable stat drift between two points in the
+/// benchmark protocol; it does not independently prove unchanged contents.
+/// Callers must keep the tree quiescent. It is not a replacement for
 /// [`PhysicalDigest`]: clone identity additionally relies on a successful
 /// forced `clonefileat(2)` call for every file.
 pub fn digest_metadata_tree(root: &Path, limits: TraversalLimits) -> io::Result<MetadataDigest> {
@@ -388,12 +394,13 @@ impl ClonefileTemplate {
         &self.physical
     }
 
-    /// Metadata witness for proving that the template remains immutable.
+    /// Metadata drift witness for the caller-quiescent template.
     pub fn metadata_digest(&self) -> &MetadataDigest {
         &self.metadata
     }
 
-    /// Prove without reading file contents that the template is unchanged.
+    /// Require unchanged metadata on the caller-quiescent template.
+    /// This does not independently reverify file contents.
     pub fn verify_unchanged(&self) -> io::Result<MetadataDigest> {
         verify_metadata_tree(&self.template_root, &self.metadata, self.limits)
     }
@@ -435,12 +442,13 @@ impl PlainCopyTemplate {
         &self.physical
     }
 
-    /// Metadata witness for proving that the template remains immutable.
+    /// Metadata drift witness for the caller-quiescent template.
     pub fn metadata_digest(&self) -> &MetadataDigest {
         &self.metadata
     }
 
-    /// Prove without reading file contents that the template is unchanged.
+    /// Require unchanged metadata on the caller-quiescent template.
+    /// Restoration separately verifies every source and destination byte.
     pub fn verify_unchanged(&self) -> io::Result<MetadataDigest> {
         verify_metadata_tree(&self.template_root, &self.metadata, self.limits)
     }
@@ -477,8 +485,9 @@ impl PreparedFixtureTree {
         &self.metadata
     }
 
-    /// Prove without reading contents that open and cache preparation did not mutate the
-    /// measured input before the timer starts.
+    /// Require the pre-open metadata witness to remain unchanged.
+    /// The caller must keep the input quiescent; this is not a byte-integrity
+    /// check or protection against arbitrary concurrent writers.
     pub fn verify_unchanged(&self) -> io::Result<MetadataDigest> {
         verify_metadata_tree(&self.root, &self.metadata, self.limits)
     }
@@ -1576,11 +1585,13 @@ mod tests {
     }
 
     #[test]
-    fn metadata_witness_detects_same_length_changes_without_reading_contents() {
+    fn metadata_witness_detects_same_length_changes_with_distinct_timestamps() {
         let fixture = tempfile::tempdir().unwrap();
         fixture_tree(fixture.path());
         let limits = TraversalLimits::default();
         let frozen = digest_metadata_tree(fixture.path(), limits).unwrap();
+        let file = fixture.path().join("a.txt");
+        let original_modified = fs::metadata(&file).unwrap().modified().unwrap();
 
         assert_eq!(frozen.entries, 4);
         assert_eq!(frozen.files, 2);
@@ -1588,7 +1599,15 @@ mod tests {
         assert_eq!(frozen.bytes, 9);
         verify_metadata_tree(fixture.path(), &frozen, limits).unwrap();
 
-        fs::write(fixture.path().join("a.txt"), b"ALPHA").unwrap();
+        fs::write(&file, b"ALPHA").unwrap();
+        // Back-to-back writes can share a timestamp tick. This test owns
+        // observable metadata drift, not a filesystem clock-resolution claim.
+        File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(original_modified + std::time::Duration::from_secs(2))
+            .unwrap();
         let changed = digest_metadata_tree(fixture.path(), limits).unwrap();
         assert_eq!(changed.shape_sha256, frozen.shape_sha256);
         assert_ne!(changed.state_sha256, frozen.state_sha256);
@@ -1654,7 +1673,7 @@ mod tests {
         prepared.verify_unchanged().unwrap();
 
         fs::write(active.join("a.txt"), b"ALPHA").unwrap();
-        assert!(prepared.verify_unchanged().is_err());
+        assert!(verify_physical_tree(&active, frozen.physical_digest(), limits).is_err());
         assert_eq!(fs::read(template.join("a.txt")).unwrap(), b"alpha");
         frozen.verify_unchanged().unwrap();
 

@@ -158,10 +158,13 @@ execution. Its fixed FinGraph node-and-edge merge adapter supports qualified
 macOS/APFS clonefiles or Linux/XFS directly backed by EC2 instance-store NVMe;
 EBS is refused. The registered source stays quiescent and is never opened as a
 database. Every repetition restores the prepared physical tree at the exact
-same active path. Before freezing, Linux requires free space for one more
-prepared-tree copy plus 1 GiB. Use a dedicated benchmark mount: this path calls
-`syncfs` after freezing and after every restore, outside timing, to finish data
-and directory writeback across that filesystem. It records a distinct
+same active path. Source and scratch ownership must remain exclusive:
+metadata-only checks detect observable stat drift, not every same-length
+rewrite within a filesystem timestamp tick. Byte identity comes from the
+verified copy or forced-clone contract. Before freezing, Linux requires free
+space for one more prepared-tree copy plus 1 GiB. Use a dedicated benchmark
+mount: this path calls `syncfs` after freezing and after every restore, outside
+timing, to finish data and directory writeback across that filesystem. It records a distinct
 `xfs-plain-copy-syncfs-same-active-path` reset, not the durable suite's existing
 plain-copy treatment. Fresh workers attest matching process-effective machine
 identities; copying leaves the OS page cache uncontrolled. Reports remain
