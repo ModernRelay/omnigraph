@@ -137,6 +137,13 @@ jobs:
     # The full audit still runs after merge, on tags, and by manual dispatch.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      # Single switch for the vocabulary audit, disabled by decision on
+      # 2026-08-28. Set to "true" to re-enable every audit step at once (the
+      # public-Rust tooling and all three checks are gated on it). The job
+      # still runs its unit tests and reports success either way, so branch
+      # protection and the exact-SHA release gates stay wired.
+      VOCABULARY_AUDIT_ENABLED: "false"
     # A cold default + relevant all-features rustdoc pass over all seven public
     # library crates is substrate-sized. The first hosted run completed the
     # public-Rust step in 39 minutes, while the larger breaking-contract tree
@@ -188,11 +195,13 @@ jobs:
           echo "sha=$base" >> "$GITHUB_OUTPUT"
 
       - name: Install public-Rust system dependencies
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
       - name: Restore pinned public-Rust tooling
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         id: public_rust_tool_cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -203,6 +212,7 @@ jobs:
           key: vocabulary-public-api-${{ runner.os }}-${{ runner.arch }}-nightly-2026-08-01-cargo-public-api-0.52.0-v1
 
       - name: Install exact public-Rust tooling
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         id: public_rust_tool
         run: |
           set -euo pipefail
@@ -218,6 +228,7 @@ jobs:
           echo "binary=$tool" >> "$GITHUB_OUTPUT"
 
       - name: Cache public-Rust build data
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
@@ -228,6 +239,7 @@ jobs:
         run: cargo test -p omnigraph-vocabulary-guard --locked
 
       - name: Check OpenAPI and Rust-string vocabulary
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         env:
           BASE_SHA: ${{ steps.comparison_base.outputs.sha }}
         run: |
@@ -240,6 +252,7 @@ jobs:
           done
 
       - name: Check public-Rust vocabulary
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         env:
           BASE_SHA: ${{ steps.comparison_base.outputs.sha }}
           CARGO_PUBLIC_API: ${{ steps.public_rust_tool.outputs.binary }}

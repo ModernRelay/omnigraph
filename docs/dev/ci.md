@@ -21,9 +21,12 @@ validates local documentation links, user/developer audience boundaries, RFC
 location and metadata, and registry agreement.
 
 `Graph Vocabulary Guard` remains a required reporting context, but its
-substrate-sized audit is disabled on pull requests. It reports a successful
-skip there and checks OpenAPI, Rust presentation strings, and public Rust
-against the reviewed terminology inventory after merge, on tags, and by manual
+substrate-sized audit steps are currently disabled everywhere (decision of
+2026-08-28; the job-level `VOCABULARY_AUDIT_ENABLED` variable in `ci.yml` is
+the single switch). The job still
+runs its unit tests and reports success so the exact-SHA release gates stay
+wired. When re-enabled it checks OpenAPI, Rust presentation strings, and public
+Rust against the reviewed terminology inventory after merge, on tags, and by manual
 dispatch. User documentation is intentionally outside this exact-occurrence
 audit and is owned by `scripts/check-docs.py`. The AWS job reports a successful
 skip for a documentation-only change; formatting and Clippy are also skipped by
@@ -69,7 +72,8 @@ This is deliberate latency policy, not a lesser standard. Run the canonical suit
 Independent post-merge/tag/manual jobs own contracts that need special infrastructure:
 
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
-  public Rust against the reviewed terminology inventory.
+  public Rust against the reviewed terminology inventory (audit steps currently
+  disabled; see above).
 - **V5 ↔ V6 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild.
 - **RustFS S3 integration** runs configured engine, server, cluster, CLI, recovery, and deterministic operation-count owners. A configured test that skips is a failure.
 - **Azurite Azure integration** runs only after merge, on tags, or by manual

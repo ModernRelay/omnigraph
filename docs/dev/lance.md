@@ -138,7 +138,7 @@ history of dependency bumps.
 | KNN result order | A late payload-hydration plan can lose global ordering metadata, so nearest requests one final output partition. Internal reads remain parallel. | `lance_surface_guards.rs`, `search.rs` |
 | Blob v2 | Null, valid empty, non-empty, selector cardinality, neighboring bytes, and 3→1 compaction are pinned on Lance 10. | `lance_surface_guards.rs`, `maintenance.rs` |
 | Index coverage | Indexes are derived. Rewrites and compaction may leave an uncovered tail; reads must combine indexed and scan paths until explicit reconciliation. | `scalar_indexes.rs`, `search.rs`, `maintenance.rs` |
-| Branches/tags | Native refs are per dataset. OmniGraph validates ref incarnation and coordinates graph-level authority through `__manifest`. | `branching.rs`, `lance_surface_guards.rs` |
+| Branches/tags | Native refs are per dataset. Every graph-branch life is a ref named `{logical}.{ULID}` (bare names are legacy lives), so a recreated branch never shares a `tree/` path or cache key with its predecessor; the `__manifest` ref list is the branch registry. OmniGraph validates ref incarnation and coordinates graph-level authority through `__manifest`. | `branching.rs`, `lance_surface_guards.rs` |
 | Cleanup | Lance protects native refs/tags; OmniGraph additionally computes graph-wide lazy-branch and recovery floors before invoking cleanup. | `maintenance.rs` |
 | MemWAL | Upstream support exists, but OmniGraph's RFC 0018 and RFC 0026 experiments were removed. No stream profile, token ledger, hidden stream column, or `_mem_wal` path is current. | `lifecycle.rs`, cluster removed-field diagnostics |
 

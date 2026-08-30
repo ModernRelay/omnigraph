@@ -9,6 +9,7 @@
 
 pub(crate) mod blob;
 mod branch_control;
+mod branch_names;
 pub mod changes;
 pub mod db;
 #[cfg(feature = "dst")]

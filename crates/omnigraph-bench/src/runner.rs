@@ -36,8 +36,9 @@ use crate::branch_merge::{
     capture_protected_branch_heads, initialize_local_fixture, verify_merged_graph, warm_read_set,
 };
 use crate::case::{
-    Attribution, Backend, CacheCondition, Data, EnginePreparation, FixtureBuilder,
-    MAX_WARMUP_ITERATIONS, PageCacheCondition, ProcessLifecycle, ResetMode, State, WarmupProgram,
+    Attribution, Backend, CacheCondition, Data, EnginePreparation, FixtureBuilder, LocalFilesystem,
+    LocalStorageClass, MAX_WARMUP_ITERATIONS, PageCacheCondition, ProcessLifecycle, ResetMode,
+    State, WarmupProgram,
 };
 use crate::counting::{LogicalCallCounter, LogicalCallCounts};
 use crate::environment::{LocalEnvironmentEvidence, verify_local_environment};
@@ -45,10 +46,13 @@ use crate::fixture_worker::supervise_fixture_build;
 use crate::machine::{MachineIdentityV1, capture_machine_identity};
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
 use crate::reset::{
-    ClonefileTemplate, MetadataDigest, PhysicalDigest, TraversalLimits,
-    accept_clonefile_template_handoff, copy_verified, digest_metadata_tree, digest_physical_tree,
-    freeze_clonefile_template, verify_metadata_shape, verify_metadata_tree,
+    ClonefileTemplate, MetadataDigest, PHYSICAL_TREE_DIGEST_ALGORITHM, PhysicalDigest,
+    PlainCopyTemplate, TraversalLimits, accept_clonefile_template_handoff,
+    accept_plain_copy_template_handoff, freeze_clonefile_template, freeze_plain_copy_template,
+    verify_metadata_shape,
 };
+#[cfg(test)]
+use crate::reset::{digest_metadata_tree, digest_physical_tree, verify_physical_tree};
 use crate::suite::{MAX_REPETITIONS_PER_CASE, MAX_SUITE_RUNS, MAX_TOTAL_REPETITIONS};
 use crate::supervisor::{SupervisionInput, supervise_repetition};
 use crate::worker_protocol::{
@@ -59,7 +63,6 @@ use crate::{ResolvedRun, ResolvedSuite, validate_case};
 pub const RUNNER_OUTPUT_VERSION: u32 = 2;
 pub const FIXTURE_MANIFEST_FORMAT_VERSION: u32 = 1;
 pub const FIXTURE_VALIDATOR_VERSION: u32 = 1;
-pub(crate) const PHYSICAL_TREE_DIGEST_ALGORITHM: &str = "omnigraph-bench-physical-tree-v1";
 const BUILD_PROFILE: &str = env!("OMNIGRAPH_BENCH_BUILD_PROFILE");
 const BUILD_OPT_LEVEL: &str = env!("OMNIGRAPH_BENCH_BUILD_OPT_LEVEL");
 const SOURCE_COMMIT: &str = env!("OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT");
@@ -1429,6 +1432,37 @@ struct ResolvedWorker {
     executable_sha256: String,
 }
 
+fn validate_production_reset(case: &crate::case::CaseV1) -> RunnerResult<()> {
+    let linux_xfs_process_cold = cfg!(target_os = "linux")
+        && matches!(
+            &case.environment.backend,
+            Backend::LocalFs {
+                filesystem: LocalFilesystem::Xfs,
+                storage_class: LocalStorageClass::NvmeSsd,
+            }
+        )
+        && case.environment.cache_condition
+            == (CacheCondition {
+                process: ProcessLifecycle::FreshPerRepetition,
+                engine: EnginePreparation::PreparationOnly,
+                page_cache: PageCacheCondition::Uncontrolled,
+                program: WarmupProgram::None,
+                iterations: 0,
+            });
+    match case.protocol.reset {
+        ResetMode::LocalClonefile => Ok(()),
+        ResetMode::PlainCopy if linux_xfs_process_cold => Ok(()),
+        ResetMode::PlainCopy => Err(RunnerError::new(
+            "unsupported_runner_axis",
+            "plain-copy requires verified Linux XFS instance-store NVMe with the process-fresh, preparation-only, page-cache-uncontrolled cache declaration",
+        )),
+        ResetMode::S3Versioning => Err(RunnerError::new(
+            "unsupported_runner_axis",
+            "runner-v1 does not implement S3 reset",
+        )),
+    }
+}
+
 async fn execute_run_inner(
     run: &ResolvedRun,
     options: &RunOptions,
@@ -1442,11 +1476,8 @@ async fn execute_run_inner(
             "runner-v1 requires protocol.attribution: per-phase so every measured merge carries exact phase evidence",
         ));
     }
-    if run.case.definition.protocol.reset != ResetMode::LocalClonefile && !guards.allow_plain_copy {
-        return Err(RunnerError::new(
-            "unsupported_runner_axis",
-            "runner-v1 wall-clock execution requires protocol.reset: local-clonefile; byte copying would pre-warm file contents",
-        ));
+    if !guards.allow_plain_copy {
+        validate_production_reset(&run.case.definition)?;
     }
 
     let plan = BranchMergePlan::try_from(&run.case)
@@ -1565,27 +1596,39 @@ async fn execute_owned_run(
                 workspace.path(),
                 FIXTURE_BUILD_WATCHDOG,
             )?;
-            let template = accept_clonefile_template_handoff(
-                &active_root,
-                &template_root,
-                handoff.physical.clone(),
-                handoff.template_metadata,
-                limits,
-            )
-            .map_err(|error| {
-                RunnerError::new(
-                    "fixture_handoff_failed",
-                    format!(
-                        "could not accept contained fixture template {}: {error}",
-                        template_root.display()
-                    ),
-                )
-            })?;
-            (
-                handoff.summary,
-                FrozenTemplate::Clonefile(template),
-                handoff.physical,
-            )
+            let template = match run.case.definition.protocol.reset {
+                ResetMode::LocalClonefile => FrozenTemplate::Clonefile(
+                    accept_clonefile_template_handoff(
+                        &active_root,
+                        &template_root,
+                        handoff.physical.clone(),
+                        handoff.template_metadata,
+                        limits,
+                    )
+                    .map_err(|error| {
+                        RunnerError::new("fixture_handoff_failed", error.to_string())
+                    })?,
+                ),
+                ResetMode::PlainCopy => FrozenTemplate::PlainCopy(
+                    accept_plain_copy_template_handoff(
+                        &active_root,
+                        &template_root,
+                        handoff.physical.clone(),
+                        handoff.template_metadata,
+                        limits,
+                    )
+                    .map_err(|error| {
+                        RunnerError::new("fixture_handoff_failed", error.to_string())
+                    })?,
+                ),
+                ResetMode::S3Versioning => {
+                    return Err(RunnerError::new(
+                        "unsupported_runner_axis",
+                        "local runner cannot accept an S3 reset handoff",
+                    ));
+                }
+            };
+            (handoff.summary, template, handoff.physical)
         } else {
             // Owning-layer tests keep their tiny fixtures in-process. Public
             // wall-clock execution always takes the bounded child path above.
@@ -1608,7 +1651,11 @@ async fn execute_owned_run(
                     )?,
                 )
             } else {
-                FrozenTemplate::plain_copy_for_test(&active_root, &template_root, limits)?
+                FrozenTemplate::PlainCopy(
+                    freeze_plain_copy_template(&active_root, &template_root, limits).map_err(
+                        |error| RunnerError::new("fixture_freeze_failed", error.to_string()),
+                    )?,
+                )
             };
             remove_active_tree(&active_root)?;
             let physical = template.physical_digest().clone();
@@ -2092,59 +2139,28 @@ fn stage_bound_worker(source: BoundWorkerSource, workspace: &Path) -> RunnerResu
 
 enum FrozenTemplate {
     Clonefile(ClonefileTemplate),
-    PlainCopyForTest {
-        template_root: PathBuf,
-        active_root: PathBuf,
-        physical: PhysicalDigest,
-        metadata: MetadataDigest,
-        limits: TraversalLimits,
-    },
+    PlainCopy(PlainCopyTemplate),
 }
 
 impl FrozenTemplate {
-    fn plain_copy_for_test(
-        active_root: &Path,
-        template_root: &Path,
-        limits: TraversalLimits,
-    ) -> RunnerResult<Self> {
-        let physical = digest_physical_tree(active_root, limits)
-            .map_err(|error| RunnerError::new("fixture_digest_failed", error.to_string()))?;
-        copy_verified(active_root, template_root, &physical, limits)
-            .map_err(|error| RunnerError::new("fixture_copy_failed", error.to_string()))?;
-        let metadata = digest_metadata_tree(template_root, limits)
-            .map_err(|error| RunnerError::new("fixture_metadata_failed", error.to_string()))?;
-        Ok(Self::PlainCopyForTest {
-            template_root: template_root.to_path_buf(),
-            active_root: active_root.to_path_buf(),
-            physical,
-            metadata,
-            limits,
-        })
-    }
-
     fn physical_digest(&self) -> &PhysicalDigest {
         match self {
             Self::Clonefile(template) => template.physical_digest(),
-            Self::PlainCopyForTest { physical, .. } => physical,
+            Self::PlainCopy(template) => template.physical_digest(),
         }
     }
 
     fn active_root(&self) -> &Path {
         match self {
             Self::Clonefile(template) => template.active_root(),
-            Self::PlainCopyForTest { active_root, .. } => active_root,
+            Self::PlainCopy(template) => template.active_root(),
         }
     }
 
     fn verify_unchanged(&self) -> RunnerResult<()> {
         match self {
             Self::Clonefile(template) => template.verify_unchanged().map(|_| ()),
-            Self::PlainCopyForTest {
-                template_root,
-                metadata,
-                limits,
-                ..
-            } => verify_metadata_tree(template_root, metadata, *limits).map(|_| ()),
+            Self::PlainCopy(template) => template.verify_unchanged().map(|_| ()),
         }
         .map_err(|error| {
             RunnerError::new(
@@ -2159,14 +2175,9 @@ impl FrozenTemplate {
             Self::Clonefile(template) => template
                 .restore_active()
                 .map(|prepared| prepared.metadata_digest().clone()),
-            Self::PlainCopyForTest {
-                template_root,
-                active_root,
-                physical,
-                limits,
-                ..
-            } => copy_verified(template_root, active_root, physical, *limits)
-                .and_then(|_| digest_metadata_tree(active_root, *limits)),
+            Self::PlainCopy(template) => template
+                .restore_active()
+                .map(|prepared| prepared.metadata_digest().clone()),
         }
         .map_err(|error| RunnerError::new("reset_failed", error.to_string()))
     }
@@ -3761,6 +3772,64 @@ mod tests {
         };
         let error = cache_preparation_action(&mismatched).unwrap_err();
         assert_eq!(error.code, "unsupported_cache_condition");
+    }
+
+    #[test]
+    fn production_plain_copy_requires_the_exact_linux_xfs_cold_contract() {
+        let mut definition = checked_catalog_run(1).case.definition;
+        definition.environment.backend = Backend::LocalFs {
+            filesystem: LocalFilesystem::Xfs,
+            storage_class: LocalStorageClass::NvmeSsd,
+        };
+        definition.environment.cache_condition = CacheCondition {
+            process: ProcessLifecycle::FreshPerRepetition,
+            engine: EnginePreparation::PreparationOnly,
+            page_cache: PageCacheCondition::Uncontrolled,
+            program: WarmupProgram::None,
+            iterations: 0,
+        };
+        definition.protocol.reset = ResetMode::PlainCopy;
+        let case = validate_case(definition.clone()).into_result().unwrap();
+        assert_eq!(
+            validate_production_reset(&case.definition).is_ok(),
+            cfg!(target_os = "linux")
+        );
+
+        definition.environment.cache_condition.engine = EnginePreparation::WarmedByProgram;
+        definition.environment.cache_condition.page_cache = PageCacheCondition::ProgramConditioned;
+        definition.environment.cache_condition.program = WarmupProgram::BranchMergeReadSetV1;
+        definition.environment.cache_condition.iterations = 1;
+        let case = validate_case(definition).into_result().unwrap();
+        assert_eq!(
+            validate_production_reset(&case.definition)
+                .unwrap_err()
+                .code,
+            "unsupported_runner_axis"
+        );
+    }
+
+    #[test]
+    fn plain_copy_handoff_accepts_and_restores_checked_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let template_root = workspace.path().join("template");
+        let active_root = workspace.path().join("active");
+        std::fs::create_dir(&template_root).unwrap();
+        std::fs::write(template_root.join("fixture"), b"frozen bytes").unwrap();
+        let limits = TraversalLimits::default();
+        let physical = digest_physical_tree(&template_root, limits).unwrap();
+        let metadata = digest_metadata_tree(&template_root, limits).unwrap();
+        let template = FrozenTemplate::PlainCopy(
+            accept_plain_copy_template_handoff(
+                &active_root,
+                &template_root,
+                physical.clone(),
+                metadata,
+                limits,
+            )
+            .unwrap(),
+        );
+        template.restore_active().unwrap();
+        verify_physical_tree(&active_root, &physical, limits).unwrap();
     }
 
     #[test]

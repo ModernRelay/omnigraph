@@ -28,6 +28,22 @@ pub(crate) fn manifest_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), MANIFEST_DIR)
 }
 
+/// Resolve a logical graph branch to its live native manifest ref.
+///
+/// The manifest dataset's ref list is the branch registry: a logical branch is
+/// live iff exactly one native ref splits back to it (see `branch_names`).
+/// Absence is the typed public miss; more than one incarnation fails loudly.
+pub(super) async fn resolve_native_manifest_branch(
+    dataset: &Dataset,
+    logical: &str,
+) -> Result<String> {
+    let branches = crate::branch_control::list_branch_contents(dataset).await?;
+    crate::branch_names::resolve_native_branch(branches.keys().map(String::as_str), logical)?
+        .ok_or_else(|| OmniError::BranchNotFound {
+            branch: logical.to_string(),
+        })
+}
+
 #[cfg(test)]
 pub(super) async fn open_manifest_dataset(root_uri: &str, branch: Option<&str>) -> Result<Dataset> {
     let control_session = crate::lance_access::control_session();
@@ -48,10 +64,39 @@ pub(super) async fn open_manifest_dataset_with_session(
     )
     .await?;
     match branch {
-        Some(branch) if branch != "main" => dataset
-            .checkout_branch(branch)
-            .await
-            .map_err(OmniError::storage),
+        Some(branch) if branch != "main" => {
+            let native = resolve_native_manifest_branch(&dataset, branch).await?;
+            dataset
+                .checkout_branch(&native)
+                .await
+                .map_err(|error| branch_ref_error(error, branch))
+        }
+        _ => Ok(dataset),
+    }
+}
+
+/// Open one manifest branch by its NATIVE ref name, skipping resolution.
+/// For callers that already hold a fresh listing (branch-delete's per-branch
+/// dependency probe) and must not pay another per-branch listing.
+pub(super) async fn open_manifest_dataset_native_with_session(
+    root_uri: &str,
+    native: Option<&str>,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
+    let uri = manifest_uri(root_uri.trim_end_matches('/'));
+    let dataset = crate::instrumentation::open_dataset(
+        &uri,
+        crate::instrumentation::VersionResolution::Latest,
+        Some(control_session),
+        crate::instrumentation::manifest_wrapper(),
+    )
+    .await?;
+    match native {
+        Some(native) if native != "main" => {
+            dataset.checkout_branch(native).await.map_err(|error| {
+                branch_ref_error(error, crate::branch_names::logical_branch_name(native))
+            })
+        }
         _ => Ok(dataset),
     }
 }
@@ -70,6 +115,18 @@ pub(super) async fn open_manifest_dataset_with_identifier_with_session(
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
 ) -> Result<(Dataset, BranchIdentifier)> {
+    let (dataset, identifier, _native) =
+        open_manifest_branch_with_identifier(root_uri, branch, control_session).await?;
+    Ok((dataset, identifier))
+}
+
+/// [`open_manifest_dataset_with_identifier_with_session`] that also returns
+/// the native ref name the logical branch resolved to (`None` for main).
+pub(super) async fn open_manifest_branch_with_identifier(
+    root_uri: &str,
+    branch: Option<&str>,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<(Dataset, BranchIdentifier, Option<String>)> {
     let uri = manifest_uri(root_uri.trim_end_matches('/'));
     let dataset = crate::instrumentation::open_dataset(
         &uri,
@@ -79,26 +136,27 @@ pub(super) async fn open_manifest_dataset_with_identifier_with_session(
     )
     .await?;
     let Some(branch) = branch.filter(|branch| *branch != "main") else {
-        return Ok((dataset, BranchIdentifier::main()));
+        return Ok((dataset, BranchIdentifier::main(), None));
     };
+    let native = resolve_native_manifest_branch(&dataset, branch).await?;
 
     for _ in 0..BRANCH_IDENTIFIER_CAPTURE_ATTEMPTS {
         let before = dataset
             .branches()
-            .get_identifier(Some(branch))
+            .get_identifier(Some(&native))
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
         let branch_dataset = dataset
-            .checkout_branch(branch)
+            .checkout_branch(&native)
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
         let after = dataset
             .branches()
-            .get_identifier(Some(branch))
+            .get_identifier(Some(&native))
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
         if before == after {
-            return Ok((branch_dataset, before));
+            return Ok((branch_dataset, before, Some(native)));
         }
         tokio::task::yield_now().await;
     }

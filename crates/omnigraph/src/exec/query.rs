@@ -448,6 +448,23 @@ pub async fn execute_query(
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
 ) -> Result<QueryResult> {
+    let mut resolved_params = None;
+    for param in &ir.params {
+        if !params.contains_key(&param.name) {
+            if param.nullable {
+                resolved_params
+                    .get_or_insert_with(|| params.clone())
+                    .insert(param.name.clone(), Literal::Null);
+            } else {
+                return Err(OmniError::manifest(format!(
+                    "parameter '{}' not provided",
+                    param.name
+                )));
+            }
+        }
+    }
+    let params = resolved_params.as_ref().unwrap_or(params);
+
     let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
 
     // RRF requires forked execution

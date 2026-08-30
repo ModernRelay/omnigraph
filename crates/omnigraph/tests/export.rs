@@ -231,6 +231,16 @@ async fn export_jsonl_round_trips_branch_snapshot() {
 
     let main_jsonl = db.export_jsonl("main", &[]).await.unwrap();
     let feature_jsonl = db.export_jsonl("feature", &[]).await.unwrap();
+    let mut feature_unordered = Vec::new();
+    db.export_jsonl_unordered_to_writer("feature", &[], &mut feature_unordered)
+        .await
+        .unwrap();
+    let mut ordered_rows = feature_jsonl.lines().collect::<Vec<_>>();
+    let feature_unordered = String::from_utf8(feature_unordered).unwrap();
+    let mut unordered_rows = feature_unordered.lines().collect::<Vec<_>>();
+    ordered_rows.sort_unstable();
+    unordered_rows.sort_unstable();
+    assert_eq!(unordered_rows, ordered_rows);
 
     let imported_main_dir = tempfile::tempdir().unwrap();
     let imported_feature_dir = tempfile::tempdir().unwrap();
