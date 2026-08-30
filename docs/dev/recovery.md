@@ -139,7 +139,10 @@ Native branch create/delete residue is different from a data-table effect.
 When `BranchContents` proves a ref absent, an unreferenced clone-only tree can
 be reclaimed as derived state. A sidecar owning a real graph-table effect may
 not be discarded merely because its target branch was deleted; the complete
-effect/compensation proof still applies.
+effect/compensation proof still applies. Because every branch life has its own
+native ref, a recreated branch never becomes the target of a stale sidecar's
+fork: the dead life's native name resolves to nothing, and its forks are
+orphans for `cleanup`.
 
 ## Maintenance boundary
 

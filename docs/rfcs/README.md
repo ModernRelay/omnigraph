@@ -38,7 +38,7 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0042**. RFC 0040 is reserved by
+The next available number is **0043**. RFC 0040 is reserved by
 [PR #546](https://github.com/ModernRelay/omnigraph/pull/546); lower gaps are
 historical and must not be reused.
 
@@ -167,3 +167,4 @@ This table is the human index for the canonical RFC corpus.
 | [0038](0038-typed-storage-failures.md) | Typed storage failures | public | accepted | complete |
 | [0039](0039-end-to-end-benchmark.md) | The end-to-end benchmark | public | accepted | in-progress |
 | [0041](0041-inline-stored-queries.md) | Inline and stored queries | maintainer | accepted | partial |
+| [0042](0042-incarnation-suffixed-branch-refs.md) | Incarnation-suffixed native branch refs | maintainer | accepted | complete |

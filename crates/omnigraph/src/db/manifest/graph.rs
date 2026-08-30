@@ -12,8 +12,8 @@ use omnigraph_compiler::catalog::Catalog;
 use crate::error::{OmniError, Result};
 
 use super::layout::{
-    manifest_uri, open_manifest_dataset_with_identifier_with_session,
-    open_manifest_dataset_with_session,
+    manifest_uri, open_manifest_branch_with_identifier,
+    open_manifest_dataset_with_identifier_with_session, open_manifest_dataset_with_session,
 };
 use super::metadata::TableVersionMetadata;
 use super::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, current_stamp_entry, guard_stamp};
@@ -247,15 +247,16 @@ pub(super) async fn open_manifest_graph(
     Dataset,
     ManifestState,
     lance::dataset::refs::BranchIdentifier,
+    Option<String>,
 )> {
-    let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
+    let (dataset, branch_identifier, native_branch) = open_manifest_branch_with_identifier(
         root_uri.trim_end_matches('/'),
         branch,
         control_session,
     )
     .await?;
     let known_state = read_manifest_state(&dataset).await?;
-    Ok((dataset, known_state, branch_identifier))
+    Ok((dataset, known_state, branch_identifier, native_branch))
 }
 
 pub(super) async fn open_manifest_graph_with_lineage(

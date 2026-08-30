@@ -1549,7 +1549,11 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
         let base = ds.version().version;
         ds.create_branch("ghost", base, None).await.unwrap();
         assert!(
-            ds.list_branches().await.unwrap().contains_key("ghost"),
+            ds.list_branches()
+                .await
+                .unwrap()
+                .keys()
+                .any(|name| helpers::is_incarnation_of(name, "ghost")),
             "precondition: orphaned fork staged"
         );
     }
@@ -1565,7 +1569,11 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
     {
         let ds = Dataset::open(&person_uri).await.unwrap();
         assert!(
-            !ds.list_branches().await.unwrap().contains_key("ghost"),
+            !ds.list_branches()
+                .await
+                .unwrap()
+                .keys()
+                .any(|name| helpers::is_incarnation_of(name, "ghost")),
             "cleanup should reconcile the orphaned 'ghost' fork away"
         );
     }
@@ -1595,6 +1603,7 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
     let mut db = init_and_load(&dir).await;
 
     db.branch_create("feature").await.unwrap();
+    let feature_native = helpers::graph_native_ref(db.uri(), "feature").await;
 
     // Legitimately fork Company onto the live `feature` branch (a real write).
     db.load_as(
@@ -1614,9 +1623,13 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
     {
         let mut ds = Dataset::open(&person_uri).await.unwrap();
         let base = ds.version().version;
-        ds.create_branch("feature", base, None).await.unwrap();
+        ds.create_branch(&feature_native, base, None).await.unwrap();
         assert!(
-            ds.list_branches().await.unwrap().contains_key("feature"),
+            ds.list_branches()
+                .await
+                .unwrap()
+                .keys()
+                .any(|name| helpers::is_incarnation_of(name, "feature")),
             "precondition: forged orphan Person fork present on the live branch"
         );
     }
@@ -1636,7 +1649,11 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
     {
         let ds = Dataset::open(&person_uri).await.unwrap();
         assert!(
-            !ds.list_branches().await.unwrap().contains_key("feature"),
+            !ds.list_branches()
+                .await
+                .unwrap()
+                .keys()
+                .any(|name| helpers::is_incarnation_of(name, "feature")),
             "cleanup must reclaim the manifest-unreferenced Person fork on the live branch"
         );
     }
@@ -1644,13 +1661,74 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
     {
         let ds = Dataset::open(&company_uri).await.unwrap();
         assert!(
-            ds.list_branches().await.unwrap().contains_key("feature"),
+            ds.list_branches()
+                .await
+                .unwrap()
+                .keys()
+                .any(|name| helpers::is_incarnation_of(name, "feature")),
             "cleanup must NOT reclaim a legitimately-forked table on a live branch"
         );
     }
     // main is untouched.
     assert_eq!(count_rows(&db, "node:Person").await, main_people);
     assert_eq!(count_rows(&db, "node:Company").await, main_companies);
+}
+
+// A fork named by a dead incarnation of a LIVE logical branch is garbage:
+// the live incarnation's forks are named by its own suffix, so nothing can
+// resolve to the dead one. Cleanup reclaims it and keeps the live fork.
+#[tokio::test]
+async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    db.load_as(
+        "feature",
+        None,
+        r#"{"type":"Company","data":{"name":"Acme"}}"#,
+        LoadMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+    let live_native = helpers::graph_native_ref(db.uri(), "feature").await;
+    let dead_native = "feature.01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
+    assert_ne!(live_native, dead_native);
+    let companies_before = count_rows_branch(&db, "feature", "node:Company").await;
+
+    let company_uri = node_table_uri(&db, "Company").await;
+    {
+        let mut ds = Dataset::open(&company_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch(&dead_native, base, None).await.unwrap();
+    }
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    let branches = Dataset::open(&company_uri)
+        .await
+        .unwrap()
+        .list_branches()
+        .await
+        .unwrap();
+    assert!(
+        !branches.contains_key(&dead_native),
+        "cleanup must reclaim a dead incarnation's fork while the logical branch is live"
+    );
+    assert!(
+        branches.contains_key(&live_native),
+        "cleanup must keep the live incarnation's fork"
+    );
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Company").await,
+        companies_before,
+        "cleanup must not disturb the live branch's rows"
+    );
 }
 
 // Regression (iss-848): a table with rows but NULL vectors (the load-before-
