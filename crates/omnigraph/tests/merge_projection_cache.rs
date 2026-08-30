@@ -160,8 +160,14 @@ fn repeated_merge_refreshes_projection_incrementally() {
             // structural physical-take guard above. The ceiling leaves room
             // for Lance metadata layout changes without allowing a hidden
             // full coordinator reopen to multiply the measured reads.
+            // Issue #562 re-measure: branch-bound opens now read the branch
+            // registry from the root manifest, adding a bounded number of
+            // object reads per open (measured 79 on this fixture, was <=32
+            // pre-registry). Batching resolution per operation is noted
+            // follow-up; the ceiling still forbids an unbounded full-scan
+            // regression.
             assert!(
-                io.manifest_reads <= 32,
+                io.manifest_reads <= 96,
                 "incremental repeated merge used {} manifest object reads; hidden full scans must not ride the measured path",
                 io.manifest_reads,
             );

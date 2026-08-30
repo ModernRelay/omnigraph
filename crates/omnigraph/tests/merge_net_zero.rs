@@ -293,11 +293,17 @@ query set_note($title: String, $note: String) {
         .dataset("node:Document")
         .expect("feature Document entry");
     assert_eq!(source_entry.dataset_path, base_entry.dataset_path);
-    assert_eq!(
-        source_entry.native_dataset_branch.as_deref(),
-        Some("feature")
+    // The fork lives at the feature life's native ref (issue #562); the tree
+    // path below addresses that exact ref.
+    let source_native = source_entry
+        .native_dataset_branch
+        .as_deref()
+        .expect("feature must own the forked Document table");
+    assert!(
+        source_native == "feature" || source_native.starts_with("feature--"),
+        "expected a life of 'feature', got '{source_native}'"
     );
-    let source_table_uri = format!("{base_table_uri}/tree/feature");
+    let source_table_uri = format!("{base_table_uri}/tree/{source_native}");
     let source_dataset = Dataset::open(&source_table_uri).await.unwrap();
     assert_ne!(source_dataset.uri(), base_dataset.uri());
     let mut scanner = source_dataset.scan();

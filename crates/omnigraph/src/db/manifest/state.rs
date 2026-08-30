@@ -917,6 +917,143 @@ pub(crate) async fn read_graph_lineage(
     Ok((graph_commits, graph_heads))
 }
 
+/// One logical branch's registry row (issue #562): the mapping from the
+/// user-facing name to the native ref of its CURRENT life
+/// (`{logical}--{ulid}`, minted per life — see `db/branch_identity`). A
+/// `live: false` row is the state between a delete's authority commit and the
+/// next rebirth: the logical name does not exist for users, and the old
+/// life's stranded native tree is reclaimable garbage for the orphan
+/// reconciler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchRegistration {
+    pub(crate) logical: String,
+    pub(crate) native_ref: String,
+    pub(crate) incarnation: String,
+    pub(crate) live: bool,
+    /// Native ref of the branch this life forked from (`None` = main) and the
+    /// `__manifest` version the fork pinned: enough for forward recovery to
+    /// complete a native ref the create crashed before making (the registry
+    /// commit is the commit point; ref creation follows it).
+    pub(crate) source_ref: Option<String>,
+    pub(crate) source_version: u64,
+}
+
+/// JSON payload of a `branch` row's `metadata` column. The row's `object_id`
+/// is `branch:<logical>`; every other registration field lives here so the
+/// row has exactly one payload owner.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BranchRegistrationMetadata {
+    status: String,
+    native_ref: String,
+    incarnation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_ref: Option<String>,
+    source_version: u64,
+}
+
+const BRANCH_STATUS_LIVE: &str = "live";
+const BRANCH_STATUS_DEAD: &str = "dead";
+
+/// The `object_id` of a logical branch's registry row.
+pub(crate) fn branch_object_id(logical: &str) -> String {
+    format!("{}{logical}", super::BRANCH_OBJECT_ID_PREFIX)
+}
+
+pub(crate) fn encode_branch_registration_metadata(reg: &BranchRegistration) -> Result<String> {
+    serde_json::to_string(&BranchRegistrationMetadata {
+        status: if reg.live {
+            BRANCH_STATUS_LIVE
+        } else {
+            BRANCH_STATUS_DEAD
+        }
+        .to_string(),
+        native_ref: reg.native_ref.clone(),
+        incarnation: reg.incarnation.clone(),
+        source_ref: reg.source_ref.clone(),
+        source_version: reg.source_version,
+    })
+    .map_err(|e| OmniError::manifest_internal(format!("failed to encode branch registration: {e}")))
+}
+
+fn decode_branch_row(
+    object_ids: &StringArray,
+    metadata: &StringArray,
+    row: usize,
+) -> Result<BranchRegistration> {
+    let object_id = object_ids.value(row);
+    let logical = object_id
+        .strip_prefix(super::BRANCH_OBJECT_ID_PREFIX)
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "manifest branch row has object_id '{object_id}' without the '{}' prefix",
+                super::BRANCH_OBJECT_ID_PREFIX
+            ))
+        })?;
+    if metadata.is_null(row) {
+        return Err(OmniError::manifest_internal(format!(
+            "manifest branch row for '{logical}' is missing its metadata payload"
+        )));
+    }
+    let payload: BranchRegistrationMetadata =
+        serde_json::from_str(metadata.value(row)).map_err(|e| {
+            OmniError::manifest_internal(format!(
+                "manifest branch row for '{logical}' has undecodable metadata: {e}"
+            ))
+        })?;
+    let live = match payload.status.as_str() {
+        BRANCH_STATUS_LIVE => true,
+        BRANCH_STATUS_DEAD => false,
+        other => {
+            return Err(OmniError::manifest_internal(format!(
+                "manifest branch row for '{logical}' has unknown status '{other}'"
+            )));
+        }
+    };
+    Ok(BranchRegistration {
+        logical: logical.to_string(),
+        native_ref: payload.native_ref,
+        incarnation: payload.incarnation,
+        live,
+        source_ref: payload.source_ref,
+        source_version: payload.source_version,
+    })
+}
+
+/// Read the branch registry (every `branch` row, live and dead) from one
+/// `__manifest` dataset, keyed by logical name. Callers pass the ROOT (main)
+/// manifest: registry rows inherited into branch clones by the shallow fork
+/// are stale copies and must not be consulted. A dedicated filtered scan,
+/// like `read_graph_lineage`: the table-state hot path never decodes these
+/// rows, and this path never assembles table entries.
+pub(crate) async fn read_branch_registry(
+    dataset: &Dataset,
+) -> Result<HashMap<String, BranchRegistration>> {
+    crate::instrumentation::record_manifest_scan();
+    let mut scan = dataset.scan();
+    scan.filter(&format!("object_type = '{}'", super::OBJECT_TYPE_BRANCH))
+        .map_err(OmniError::storage)?;
+    scan.project(&["object_id", "metadata"])
+        .map_err(OmniError::storage)?;
+    let batches: Vec<RecordBatch> = scan
+        .try_into_stream()
+        .await
+        .map_err(OmniError::storage)?
+        .try_collect()
+        .await
+        .map_err(OmniError::storage)?;
+
+    let mut registry = HashMap::new();
+    for batch in &batches {
+        let object_ids = string_column(batch, "object_id")?;
+        let metadata = string_column(batch, "metadata")?;
+        for row in 0..batch.num_rows() {
+            let registration = decode_branch_row(object_ids, metadata, row)?;
+            registry.insert(registration.logical.clone(), registration);
+        }
+    }
+    Ok(registry)
+}
+
 /// The current head of a branch's lineage: the [`GraphLineageRow`] with the
 /// greatest `(graph_manifest_version, created_at, graph_commit_id)`. This is the same
 /// ordering the commit-graph cache uses to pick its head (`should_replace_head`)

@@ -409,12 +409,7 @@ async fn append_only_fast_forward_merge_uses_bounded_fenced_insert_chain() {
         base_entry.dataset_path.trim_start_matches('/')
     );
     let base_table = Dataset::open(&person_uri).await.unwrap();
-    let source_table = Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("feature")
-        .await
-        .unwrap();
+    let source_table = helpers::open_dataset_head(&person_uri, Some("feature")).await;
     let base_identifier = base_table.branch_identifier().await.unwrap();
     let source_identifier = source_table.branch_identifier().await.unwrap();
     assert_eq!(
@@ -506,12 +501,8 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
         .branch_identifier()
         .await
         .unwrap();
-    let source_identifier = Dataset::open(&person_uri)
+    let source_identifier = helpers::open_dataset_head(&person_uri, Some("experiment"))
         .await
-        .unwrap()
-        .checkout_branch("experiment")
-        .await
-        .unwrap()
         .branch_identifier()
         .await
         .unwrap();
@@ -556,12 +547,7 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         main.uri().trim_end_matches('/'),
         base_entry.dataset_path.trim_start_matches('/')
     );
-    let source = Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("feature")
-        .await
-        .unwrap();
+    let source = helpers::open_dataset_head(&person_uri, Some("feature")).await;
     let missing_version = source
         .version()
         .version
@@ -571,9 +557,16 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         missing_version > base_entry.published_dataset_version,
         "fixture needs at least two source transactions above the merge base"
     );
+    // The fork's tree lives at the feature life's NATIVE ref (issue #562).
+    let feature_fork = {
+        let root = Dataset::open(&person_uri).await.unwrap();
+        helpers::native_ref_for(&root, "feature")
+            .await
+            .expect("feature's table fork exists")
+    };
     let versions_dir = std::path::Path::new(&person_uri)
         .join("tree")
-        .join("feature")
+        .join(&feature_fork)
         .join("_versions");
     let v1_path = versions_dir.join(format!("{missing_version}.manifest"));
     let v2_path = versions_dir.join(format!("{:020}.manifest", u64::MAX - missing_version));

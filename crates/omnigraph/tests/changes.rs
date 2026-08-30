@@ -2881,16 +2881,28 @@ async fn change_feed_cursor_scope_mismatches_are_typed() {
     );
     db.branch_delete("warm-aba").await.unwrap();
     db.branch_create("warm-aba").await.unwrap();
-    assert_rejected(
-        warm_reader
-            .poll_change_feed(feed_request(
-                Some("warm-aba"),
-                ChangeFeedPosition::Cursor(warm_cursor),
-            ))
-            .await
-            .unwrap_err(),
-        "different branch incarnation",
-    );
+    // Post-#562 the stale warm cut usually dies structurally first: its
+    // pinned dataset addresses the dead life's `warm-aba--{ulid}` tree,
+    // which is removed with the life. Either shape is loud, and neither can
+    // serve the replacement life's rows.
+    let warm_err = warm_reader
+        .poll_change_feed(feed_request(
+            Some("warm-aba"),
+            ChangeFeedPosition::Cursor(warm_cursor),
+        ))
+        .await
+        .unwrap_err();
+    match warm_err {
+        omnigraph::error::OmniError::ChangeCursorRejected { reason } => assert!(
+            reason.contains("different branch incarnation"),
+            "reason '{reason}' should mention 'different branch incarnation'"
+        ),
+        other => assert!(
+            other.to_string().contains("warm-aba--"),
+            "expected a typed rejection or structural death on the dead \
+             life's native ref, got: {other:?}"
+        ),
+    }
 
     // Another graph entirely (fresh identity domain and genesis).
     let other_dir = tempfile::tempdir().unwrap();

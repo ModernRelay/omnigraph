@@ -247,8 +247,10 @@ async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
         let reads = last_manifest_reads();
         assert_eq!(reads.len(), 1);
         assert!(
-            reads[0].contains("_refs/branches/feature.json"),
-            "the sole warm named-branch read must be BranchContents, not a manifest body: {reads:#?}"
+            reads[0].contains("_refs/branches/feature--")
+                || reads[0].contains("_refs/branches/feature.json"),
+            "the sole warm named-branch read must be BranchContents of the \
+             branch life's native ref (issue #562), not a manifest body: {reads:#?}"
         );
         assert_eq!(
             io.version_probes, 1,
@@ -300,9 +302,12 @@ async fn cold_other_branch_resolution_uses_one_coherent_manifest_open() {
             io.internal_open_count, 1,
             "cold branch resolution must derive snapshot + lineage from one manifest open"
         );
+        // Issue #562: +1 filtered branch-registry scan resolves the logical
+        // name to its life's native ref before the state scan.
         assert_eq!(
-            io.manifest_scan_count, 1,
-            "cold branch resolution must derive snapshot + lineage in one manifest row scan"
+            io.manifest_scan_count, 2,
+            "cold branch resolution must derive snapshot + lineage in one manifest row scan \
+             plus the one registry-resolution scan (issue #562)"
         );
     })
     .await;
@@ -323,32 +328,50 @@ async fn native_branch_controls_use_one_post_gate_manifest_capture() {
 
         let (created, create_io) = measure(db.branch_create("feature")).await;
         created.unwrap();
+        // Issue #562 re-measure: create = the coherent post-gate source
+        // capture (1 open, 1 state scan) PLUS the registry authority commit
+        // (its own root open + CAS pre-check registry scan + publish-state
+        // loads) PLUS the always-fresh namespace-safety listings.
+        // Measured (5, 5) on this fixture.
         assert_eq!(
             (create_io.internal_open_count, create_io.manifest_scan_count),
-            (1, 1),
-            "branch create must use one coherent post-gate source capture"
+            (5, 5),
+            "branch create = one coherent post-gate source capture + the registry \
+             commit + the always-fresh namespace-safety listings"
         );
 
         let (deleted, delete_io) = measure(db.branch_delete("feature")).await;
         deleted.unwrap();
+        // Issue #562 re-measure: delete adds the registry work on top of the
+        // pre-existing captures — the batch candidate resolution, the
+        // branch-list and descendants authority reads (always-fresh), the
+        // dead-row CAS commit's own open + pre-check scan, and the
+        // with-expected identifier listing. Measured (9, 10) on this
+        // one-survivor fixture; the per-surviving-branch SLOPE is bounded
+        // separately by branch_control_cost.
         assert_eq!(
             (delete_io.internal_open_count, delete_io.manifest_scan_count),
-            (3, 2),
-            "branch delete needs one coherent target capture, one fresh manifest-only \
-             snapshot for surviving main, and one native-ref opener"
+            (9, 10),
+            "branch delete = the coherent captures + the registry authority work \
+             + the always-fresh listings"
         );
 
         db.branch_create("feature").await.unwrap();
         let (created_from, create_from_io) =
             measure(db.branch_create_from("feature", "review")).await;
         created_from.unwrap();
+        // Issue #562 re-measure: create-from = the coherent post-gate source
+        // capture plus the registry authority commit plus the always-fresh
+        // listings; the non-main source adds one resolved open over plain
+        // create. Measured (5, 6).
         assert_eq!(
             (
                 create_from_io.internal_open_count,
                 create_from_io.manifest_scan_count,
             ),
-            (1, 1),
-            "branch create-from must use one coherent post-gate source capture"
+            (5, 6),
+            "branch create-from = the coherent source capture + the registry commit \
+             + the always-fresh listings"
         );
     })
     .await;
@@ -419,10 +442,12 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
         .graph_manifest_version_of(ReadTarget::branch("feature"))
         .await
         .unwrap();
-    assert_eq!(
-        new_version, old_version,
-        "test setup must exercise branch incarnation reuse at one Lance version"
-    );
+    // Pre-#562 this fixture engineered the recreation at the SAME numeric
+    // manifest version (the dangerous collision). The registry authority
+    // commits now advance the version across lives, so the collision is no
+    // longer constructible; the protected claims below (replacement rows,
+    // replaced head, no old-life leakage) hold structurally instead.
+    let _ = (new_version, old_version);
 
     let (new_feature, io) = measure(reader.query_with_head(
         ReadTarget::branch("feature"),
@@ -525,7 +550,7 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
         .dataset("node:Person")
         .unwrap()
         .clone();
-    assert_eq!(old_entry.native_dataset_branch.as_deref(), Some("feature"));
+    helpers::assert_native_branch_of(old_entry.native_dataset_branch.as_deref(), "feature");
 
     writer.branch_delete("feature").await.unwrap();
     writer.branch_create("feature").await.unwrap();
@@ -546,13 +571,13 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
         .unwrap()
         .clone();
     assert_eq!(new_entry.dataset_path, old_entry.dataset_path);
-    assert_eq!(
-        new_entry.native_dataset_branch,
-        old_entry.native_dataset_branch
-    );
-    assert_eq!(
-        new_entry.published_dataset_version, old_entry.published_dataset_version,
-        "test setup must force table handle identity to differ only by e_tag"
+    // Pre-#562 this fixture forced the handle-cache key to differ ONLY by
+    // e_tag (same path, branch name, version) — the documented e_tag-less
+    // hazard. The rotation puts the life's native ref in the key, so the two
+    // lives differ structurally; pin that instead.
+    assert_ne!(
+        new_entry.native_dataset_branch, old_entry.native_dataset_branch,
+        "each branch life must own a distinct native ref (issue #562)"
     );
 
     let (new_person, io) = measure(reader.query(
@@ -646,9 +671,9 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
             .dataset("edge:Knows")
             .unwrap()
             .clone();
-        assert_eq!(
+        helpers::assert_native_branch_of(
             old_edge_entry.native_dataset_branch.as_deref(),
-            Some("feature")
+            "feature",
         );
 
         writer.branch_delete("feature").await.unwrap();
@@ -673,13 +698,13 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
             .unwrap()
             .clone();
         assert_eq!(new_edge_entry.dataset_path, old_edge_entry.dataset_path);
-        assert_eq!(
-            new_edge_entry.native_dataset_branch,
-            old_edge_entry.native_dataset_branch
-        );
-        assert_eq!(
-            new_edge_entry.published_dataset_version, old_edge_entry.published_dataset_version,
-            "test setup must force graph-index identity to differ only by snapshot incarnation"
+        // Pre-#562 this fixture forced the graph-index cache key to collide
+        // across lives (same path, branch name, version). The rotation keys
+        // the fork by the life's native ref, so the lives differ
+        // structurally; pin that instead.
+        assert_ne!(
+            new_edge_entry.native_dataset_branch, old_edge_entry.native_dataset_branch,
+            "each branch life must own a distinct native ref (issue #562)"
         );
 
         let (new_friends, io) = measure(reader.query(

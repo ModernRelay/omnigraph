@@ -2001,11 +2001,16 @@ fn validate_ensure_indices_v8_shape(sidecar_uri: &str, sidecar: &RecoverySidecar
             )));
         }
         let is_first_touch = effect.source_fork_version.is_some();
+        // `pin.table_branch` carries the fork's NATIVE ref (issue #562);
+        // `sidecar_branch` stays LOGICAL. Compare at the logical level —
+        // legacy (v8-written) pins carry the bare name and split to
+        // themselves.
         if (is_first_touch
-            && !pin
-                .table_branch
-                .as_deref()
-                .is_some_and(|branch| branch != "main" && Some(branch) == sidecar_branch))
+            && !pin.table_branch.as_deref().is_some_and(|branch| {
+                branch != "main"
+                    && Some(crate::db::branch_identity::split_native_branch_ref(branch).0)
+                        == sidecar_branch
+            }))
             || effect
                 .source_fork_version
                 .is_some_and(|version| version != pin.expected_version)
@@ -3077,7 +3082,19 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
         let queue_keys: Vec<crate::db::write_queue::TableQueueKey> = sidecar
             .tables
             .iter()
-            .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
+            .map(|pin| {
+                // Queue keys stay LOGICAL (issue #562): every other holder —
+                // staging, ensure_indices, merge, the reconciler — keys by the
+                // logical name, and mutual exclusion needs one vocabulary.
+                // `pin.table_branch` carries the life's native ref on v9 pins;
+                // legacy bare pins split to themselves.
+                let logical = pin.table_branch.as_deref().map(|native| {
+                    crate::db::branch_identity::split_native_branch_ref(native)
+                        .0
+                        .to_string()
+                });
+                (pin.table_key.clone(), logical)
+            })
             .collect();
         let is_schema_apply = matches!(sidecar.writer_kind, SidecarKind::SchemaApply);
         let _table_guards = write_queue.acquire_many(&queue_keys).await;
@@ -3332,7 +3349,15 @@ pub(crate) async fn recover_manifest_drift(
         let table_keys = sidecar
             .tables
             .iter()
-            .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
+            .map(|pin| {
+                // Same LOGICAL queue-key rule as the Full-recovery sweep above.
+                let logical = pin.table_branch.as_deref().map(|native| {
+                    crate::db::branch_identity::split_native_branch_ref(native)
+                        .0
+                        .to_string()
+                });
+                (pin.table_key.clone(), logical)
+            })
             .collect::<Vec<_>>();
         let _table_guards = write_queue.acquire_many(&table_keys).await;
 
@@ -3484,16 +3509,46 @@ async fn classify_sidecar_tables(
                 .table_branch
                 .as_deref()
                 .is_some_and(|branch| branch != "main")
-            && sidecar.branch.as_deref() == pin.table_branch.as_deref()
+            // `pin.table_branch` is the fork's NATIVE ref (issue #562) while
+            // `sidecar.branch` stays LOGICAL, so the own-branch check compares
+            // at the logical level; legacy pins carry the bare name and split
+            // to themselves.
+            && pin
+                .table_branch
+                .as_deref()
+                .map(|native| crate::db::branch_identity::split_native_branch_ref(native).0)
+                == sidecar.branch.as_deref()
             && manifest_entry
                 .map(|entry| entry.native_dataset_branch != pin.table_branch)
                 .unwrap_or(true);
-        let allow_missing_target_ref = unpublished_fork
-            && (matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
-                || sidecar
-                    .protocol_v3
-                    .as_ref()
-                    .is_some_and(|protocol| protocol.effect_phase == RecoveryEffectPhase::Armed));
+        // A pure legacy (pre-protocol) pin with no confirmed effect addresses
+        // a bare-name life. After a #562 rebirth the logical name lives on
+        // under a NEW `{name}--{ulid}` ref while the pinned bare ref is gone,
+        // so an absent ref observes nothing rather than erroring — there is
+        // no confirmed effect to protect, and classification then defers or
+        // orphan-discards exactly as when the whole branch is gone. Confirmed
+        // effects keep the loud-error contract, and so does a MANIFEST
+        // placement: a table the manifest places on the pinned ref is a
+        // confirmed effect in everything but the pin field, so its ref going
+        // missing is corruption and must stay loud.
+        let legacy_pin_without_confirmed_effect = sidecar.protocol_v3.is_none()
+            && sidecar.protocol_v4.is_none()
+            && sidecar.protocol_v7.is_none()
+            && sidecar.protocol_v8.is_none()
+            && pin.confirmed_version.is_none()
+            && pin
+                .table_branch
+                .as_deref()
+                .is_some_and(|branch| branch != "main")
+            && manifest_entry
+                .map(|entry| entry.native_dataset_branch != pin.table_branch)
+                .unwrap_or(true);
+        let allow_missing_target_ref = legacy_pin_without_confirmed_effect
+            || (unpublished_fork
+                && (matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
+                    || sidecar.protocol_v3.as_ref().is_some_and(|protocol| {
+                        protocol.effect_phase == RecoveryEffectPhase::Armed
+                    })));
         let planned_effect = sidecar.protocol_v3.as_ref().and_then(|protocol| {
             protocol
                 .effects

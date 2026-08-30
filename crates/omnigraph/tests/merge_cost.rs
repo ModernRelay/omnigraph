@@ -125,8 +125,20 @@ fn merge_validation_is_delta_scoped() {
              Pre-#5 it opened every catalog table (~6) via a whole-graph validation scan.",
             io.data_open_count
         );
-        const COMMON_MERGE_MANIFEST_OPEN_CEILING: u64 = 3;
-        const COMMON_MERGE_MANIFEST_SCAN_CEILING: u64 = 3;
+        // Issue #562 re-measure: branch listings are authority reads now
+        // (always-fresh root open + registry scan; a pinned listing serves
+        // ghost branches on long-lived handles — caught by parity), and the
+        // merge's commit resolutions hit the listing fallback. Measured 11.
+        // Batching the per-merge listings is noted follow-up; the ceiling
+        // still forbids O(catalog)/O(history) open regressions.
+        const COMMON_MERGE_MANIFEST_OPEN_CEILING: u64 = 12;
+        // Issue #562 re-measure: every branch-bound `__manifest` open now
+        // performs one small filtered registry scan (object_type='branch') to
+        // resolve the logical name to its life's native ref. Measured 12 on
+        // this fixture (was <=3); the scan count stays FLAT across history
+        // depth, so the ceiling still forbids O(history) scan regressions.
+        // Batching resolution per merge is noted follow-up.
+        const COMMON_MERGE_MANIFEST_SCAN_CEILING: u64 = 13;
         assert!(
             io.internal_open_count <= COMMON_MERGE_MANIFEST_OPEN_CEILING,
             "common one-table fast-forward merge opened internal tables {} times; expected <= \
@@ -245,8 +257,13 @@ fn merge_manifest_cost_grows_with_history() {
             // each of the fixed-count coherent scans folds the uncompacted
             // append-only journal.
             assert_grows(&curve, |c| c.manifest_reads, 1, "merge __manifest scan");
-            const DIVERGED_MERGE_MANIFEST_OPEN_CEILING: u64 = 4;
-            const DIVERGED_MERGE_MANIFEST_SCAN_CEILING: u64 = 4;
+            // Issue #562: same always-fresh listing cost as the common-merge
+            // ceiling above (measured 12, flat across depth).
+            const DIVERGED_MERGE_MANIFEST_OPEN_CEILING: u64 = 13;
+            // Issue #562: one filtered registry-resolution scan per
+            // branch-bound open (measured 13 at every depth — flat, so the
+            // O(history) guard this ceiling exists for still holds).
+            const DIVERGED_MERGE_MANIFEST_SCAN_CEILING: u64 = 14;
             for (depth, io) in &curve {
                 assert!(
                     io.internal_open_count <= DIVERGED_MERGE_MANIFEST_OPEN_CEILING,

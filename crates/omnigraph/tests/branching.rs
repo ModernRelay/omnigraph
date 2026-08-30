@@ -187,6 +187,18 @@ async fn assert_exact_id_primary_key_on_branch(db: &Omnigraph, branch: &str, tab
     );
 }
 
+/// Assert a persisted `native_dataset_branch` names a life of `logical`
+/// (issue #562): the ULID-suffixed native ref `{logical}--{ulid}`, or the
+/// bare name for a legacy fork.
+#[track_caller]
+fn assert_native_branch_of(native: Option<&str>, logical: &str) {
+    let native = native.unwrap_or_else(|| panic!("expected a fork of '{logical}', got None"));
+    assert!(
+        native == logical || native.starts_with(&format!("{logical}--")),
+        "expected a life of '{logical}', got '{native}'"
+    );
+}
+
 #[tokio::test]
 async fn branch_create_open_list_and_lazy_branching_work() {
     let dir = tempfile::tempdir().unwrap();
@@ -200,19 +212,29 @@ async fn branch_create_open_list_and_lazy_branching_work() {
         .clone();
 
     main.branch_create("feature").await.unwrap();
-    // Reproduce Lance's phase-1-only crash state: keep the shallow-cloned
-    // `tree/feature` dataset but remove BranchContents, its sole logical
-    // authority. A same-name graph create must reclaim the zombie and retry,
-    // rather than surfacing DatasetAlreadyExists forever.
-    std::fs::remove_file(
-        dir.path()
-            .join("__manifest")
-            .join("_refs")
-            .join("branches")
-            .join("feature.json"),
-    )
-    .unwrap();
-    main.branch_create("feature").await.unwrap();
+    // Reproduce the create crash window under the #562 registry: keep the
+    // shallow-cloned tree dataset but remove the life's native ref file. The
+    // registry row on the root `__manifest` is the existence authority, so
+    // the logical name stays taken — a same-name create must CONFLICT (not
+    // reclaim), and the next resolution of the name completes the missing
+    // native ref (forward recovery) instead.
+    let branches_dir = dir.path().join("__manifest").join("_refs").join("branches");
+    let native_ref_file = std::fs::read_dir(&branches_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("feature--"))
+        })
+        .expect("the feature branch must own a ULID-suffixed native ref file");
+    std::fs::remove_file(native_ref_file).unwrap();
+    let err = main.branch_create("feature").await.unwrap_err();
+    assert!(
+        err.to_string().contains("already exists"),
+        "the registry row is the existence authority; a same-name create over \
+         a refless live row must conflict, got: {err}"
+    );
     assert_eq!(main.branch_list().await.unwrap(), vec!["main", "feature"]);
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -249,12 +271,15 @@ async fn branch_create_open_list_and_lazy_branching_work() {
         main_person.dataset_path,
         "the first lazy fork must preserve the logical table identity/path"
     );
-    assert_eq!(
-        snap.dataset("node:Person")
-            .unwrap()
-            .native_dataset_branch
-            .as_deref(),
-        Some("feature")
+    let person_fork_branch = snap
+        .dataset("node:Person")
+        .unwrap()
+        .native_dataset_branch
+        .clone()
+        .expect("first write must fork node:Person onto the branch");
+    assert!(
+        person_fork_branch.starts_with("feature--"),
+        "the fork must land on the life's native ref: {person_fork_branch}"
     );
     assert_eq!(
         snap.dataset("edge:Knows")
@@ -811,13 +836,25 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
         .unwrap()
         .clone();
     assert_eq!(new_entry.dataset_path, old_entry.dataset_path);
-    assert_eq!(
-        new_entry.native_dataset_branch,
-        old_entry.native_dataset_branch
-    );
-    assert_eq!(
-        new_entry.published_dataset_version, old_entry.published_dataset_version,
-        "ABA fixture must recreate the same named ref at the same numeric table version"
+    // Pre-#562 this fixture engineered the dangerous collision: same ref
+    // name, same path, same numeric version across the two lives. The
+    // incarnation rotation makes that collision impossible by construction —
+    // each life owns a distinct `feature--{ulid}` native ref — and THAT is
+    // now the pinned structural fact; the behavior claims below (fresh bytes,
+    // distinct strong ETag, loud stale-snapshot refusal) are unchanged.
+    let old_native = old_entry
+        .native_dataset_branch
+        .as_deref()
+        .expect("old life must own the forked Blob table");
+    let new_native = new_entry
+        .native_dataset_branch
+        .as_deref()
+        .expect("new life must own the forked Blob table");
+    assert_native_branch_of(Some(old_native), "feature");
+    assert_native_branch_of(Some(new_native), "feature");
+    assert_ne!(
+        old_native, new_native,
+        "each branch life must own a distinct native ref (issue #562)"
     );
     // Reuse the same main-bound handle that cached the old feature table. On a
     // local filesystem the cache key has no manifest e-tag, so the Blob facade
@@ -850,21 +887,23 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
         )
         .await
         .expect_err("an old snapshot must never reopen the recreated branch's bytes");
+    // Two refusal shapes are loud and correct: the typed incarnation-witness
+    // BadRequest (commit resolution's structural re-prove), or — since the
+    // #562 rotation gives each life its own `feature--{ulid}` ref — a
+    // structural death of the stale pin: the old life's tree is deleted with
+    // its ref, so the read dies NotFound on the dead native ref and can never
+    // reach the replacement life's bytes.
+    let refused_typed = matches!(
+        stale_snapshot_error,
+        OmniError::Manifest(ref error)
+            if error.kind == ManifestErrorKind::BadRequest
+                && error
+                    .message
+                    .contains("has no persisted native-branch incarnation witness")
+    );
+    let died_structurally = stale_snapshot_error.to_string().contains("feature--");
     assert!(
-        matches!(
-            stale_snapshot_error,
-            OmniError::Manifest(ref error)
-                if error.kind == ManifestErrorKind::BadRequest
-                    // The commit-level snapshot resolution now performs the
-                    // structural head re-prove first, so this scenario is
-                    // refused there; the Blob-level witness remains for the
-                    // windows commit resolution cannot see (post-capture
-                    // table-open ABA, pinned by the failpoint cells). Either
-                    // refusal carries the shared incarnation-witness phrase.
-                    && error
-                        .message
-                        .contains("has no persisted native-branch incarnation witness")
-        ),
+        refused_typed || died_structurally,
         "named-branch ABA must fail loudly instead of retargeting; got {stale_snapshot_error:?}"
     );
 }
@@ -961,13 +1000,12 @@ node Marker {
     .unwrap();
     db.branch_create("feature").await.unwrap();
 
-    assert_eq!(
-        db.graph_manifest_version_of(ReadTarget::branch("feature"))
-            .await
-            .unwrap(),
-        old_feature_version,
-        "the replacement ref must reuse the old manifest version for this ABA regression"
-    );
+    // Pre-#562 this fixture engineered the replacement ref onto the SAME
+    // numeric manifest version, which is what made the stale snapshot look
+    // current. The incarnation rotation forks each life onto its own native
+    // ref, so the version collision is no longer constructible — the loud
+    // refusal below is the protected behavior and must hold regardless.
+    let _ = old_feature_version;
     let replacement_entry = db
         .snapshot_of(ReadTarget::branch("feature"))
         .await
@@ -993,21 +1031,20 @@ node Marker {
         )
         .await
         .expect_err("an inherited-main table must not bypass named graph-ref ABA fencing");
+    // Same two loud refusal shapes as the owned-table ABA test above: the
+    // typed incarnation-witness BadRequest, or the stale pin dying NotFound
+    // on the deleted life's `feature--{ulid}` native ref (issue #562).
+    let refused_typed = matches!(
+        stale_snapshot_error,
+        OmniError::Manifest(ref error)
+            if error.kind == ManifestErrorKind::BadRequest
+                && error
+                    .message
+                    .contains("has no persisted native-branch incarnation witness")
+    );
+    let died_structurally = stale_snapshot_error.to_string().contains("feature--");
     assert!(
-        matches!(
-            stale_snapshot_error,
-            OmniError::Manifest(ref error)
-                if error.kind == ManifestErrorKind::BadRequest
-                    // The commit-level snapshot resolution now performs the
-                    // structural head re-prove first, so this scenario is
-                    // refused there; the Blob-level witness remains for the
-                    // windows commit resolution cannot see (post-capture
-                    // table-open ABA, pinned by the failpoint cells). Either
-                    // refusal carries the shared incarnation-witness phrase.
-                    && error
-                        .message
-                        .contains("has no persisted native-branch incarnation witness")
-        ),
+        refused_typed || died_structurally,
         "named graph-ref ABA must fail loudly even when the Blob table is inherited from main; got {stale_snapshot_error:?}"
     );
 }
@@ -2477,18 +2514,29 @@ async fn branch_created_from_non_main_inherits_branch_state() {
         .branch_create_from(ReadTarget::branch("feature"), "experiment")
         .await
         .unwrap();
-    std::fs::remove_file(
-        dir.path()
-            .join("__manifest")
-            .join("_refs")
-            .join("branches")
-            .join("experiment.json"),
-    )
-    .unwrap();
-    feature
+    // Create crash window under the #562 registry (non-main source): the
+    // registry row is the existence authority, so a same-name create must
+    // conflict, and the next resolution completes the missing native ref.
+    let branches_dir = dir.path().join("__manifest").join("_refs").join("branches");
+    let native_ref_file = std::fs::read_dir(&branches_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("experiment--"))
+        })
+        .expect("the experiment branch must own a ULID-suffixed native ref file");
+    std::fs::remove_file(native_ref_file).unwrap();
+    let err = feature
         .branch_create_from(ReadTarget::branch("feature"), "experiment")
         .await
-        .expect("non-main create must also reclaim a clone-only target");
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already exists"),
+        "the registry row is the existence authority; a same-name create over \
+         a refless live row must conflict, got: {err}"
+    );
 
     assert_eq!(
         feature.branch_list().await.unwrap(),
@@ -2543,26 +2591,27 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
 
     let experiment = Omnigraph::open(uri).await.unwrap();
     let experiment_inherited = snapshot_branch(&experiment, "experiment").await.unwrap();
-    assert_eq!(
+    assert_native_branch_of(
         experiment_inherited
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature")
+        "feature",
     );
 
     experiment.ensure_indices_on("experiment").await.unwrap();
 
     let experiment_snap = snapshot_branch(&experiment, "experiment").await.unwrap();
-    assert_eq!(
+    // Index reconciliation must not manufacture a ref-only first-touch
+    // effect: the table stays on the inherited feature-life fork.
+    assert_native_branch_of(
         experiment_snap
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature"),
-        "index reconciliation must not manufacture a ref-only first-touch effect"
+        "feature",
     );
     assert_eq!(
         experiment_snap
@@ -2574,13 +2623,13 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
     );
 
     let feature_snap = snapshot_branch(&feature, "feature").await.unwrap();
-    assert_eq!(
+    assert_native_branch_of(
         feature_snap
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature")
+        "feature",
     );
     assert_eq!(
         count_rows_branch(&feature, "feature", "node:Person").await,
@@ -2599,13 +2648,13 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
         .await
         .unwrap();
     let grandchild = snapshot_branch(&experiment, "grandchild").await.unwrap();
-    assert_eq!(
+    assert_native_branch_of(
         grandchild
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature")
+        "feature",
     );
     experiment.branch_delete("grandchild").await.unwrap();
     experiment.branch_delete("experiment").await.unwrap();
@@ -2637,12 +2686,12 @@ async fn branch_edge_only_write_only_branches_edge_table() {
             .as_deref(),
         None
     );
-    assert_eq!(
+    assert_native_branch_of(
         snap.dataset("edge:Knows")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature")
+        "feature",
     );
     assert_eq!(
         snap.dataset("edge:WorksAt")
@@ -2739,13 +2788,13 @@ async fn branch_merge_into_non_main_target_works() {
     .unwrap();
     assert_eq!(eve.num_rows(), 1);
     let experiment_snap = snapshot_branch(&experiment, "experiment").await.unwrap();
-    assert_eq!(
+    assert_native_branch_of(
         experiment_snap
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("experiment")
+        "experiment",
     );
 
     let mut reopened_main = Omnigraph::open(uri).await.unwrap();
@@ -3020,7 +3069,10 @@ async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
     db.branch_create("feature").await.unwrap();
     db.sync_branch("feature").await.unwrap();
     let err = db.branch_delete("feature").await.unwrap_err();
-    assert!(err.to_string().contains("currently active branch"));
+    assert!(
+        err.to_string().contains("currently active branch"),
+        "expected active-branch rejection, got: {err}"
+    );
 }
 
 #[tokio::test]

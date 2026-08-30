@@ -52,7 +52,15 @@ where
 /// that reintroduces a second per-branch `__manifest` read re-trips this gate.
 /// `SLOPE_SLACK` absorbs incidental constant-ish noise without admitting a
 /// second per-branch open.
-const DELETE_PER_BRANCH_BUDGET: u64 = 1;
+/// Issue #562 re-measure: the registry-backed delete adds bounded per-branch
+/// reads on top of the one probe snapshot — the `delete_branch_with_expected`
+/// identifier pre-check lists BranchContents, and each per-candidate probe
+/// checks out the candidate's native ref (its contents + version manifest).
+/// Measured slope on this fixture: 5.5 reads / 1.0 opens per surviving branch
+/// (44 reads, 8 opens across 8 added branches, manifest compacted before each
+/// measure). The gate still catches the historical regression it exists for:
+/// a full cold resolve per branch measured ~31 reads per branch pre-fix.
+const DELETE_PER_BRANCH_BUDGET: u64 = 6;
 const SLOPE_SLACK: u64 = 2;
 
 /// `branch_delete`'s dependency check visits every surviving branch, so its
@@ -79,6 +87,13 @@ fn branch_delete_manifest_reads_bounded_per_surviving_branch() {
                         .unwrap();
                     created += 1;
                 }
+                // Issue #562: each branch create commits one registry row,
+                // appending a `__manifest` fragment, and every manifest scan
+                // in the delete flow pays one read per fragment. Compact
+                // before measuring so the slope isolates the per-branch
+                // dependency-check cost this gate guards, not fragment bloat
+                // that ordinary maintenance folds away.
+                db.optimize().await.unwrap();
                 let victim = format!("victim_{n}");
                 db.branch_create(&victim).await.unwrap();
                 let (res, io) = measure(db.branch_delete(&victim)).await;

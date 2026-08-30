@@ -1,3 +1,4 @@
+pub(crate) mod branch_identity;
 pub mod commit_graph;
 mod graph_coordinator;
 pub mod manifest;

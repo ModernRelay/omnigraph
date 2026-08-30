@@ -163,6 +163,19 @@ pub(crate) struct WriteTxn {
     pub(crate) manifest_probe: crate::db::manifest::CapturedManifestProbe,
 }
 
+impl WriteTxn {
+    /// The Lance ref of the captured branch life (issue #562): native
+    /// `{logical}--{ulid}` for registered branches, the bare name for legacy
+    /// ones, `None` for main. Rides in `manifest_probe`, which was captured
+    /// from the same `ManifestCoordinator` as `base` and `authority`.
+    /// Lance-facing table opens, forks, and persisted `native_dataset_branch`
+    /// values use this; `branch` stays the logical name for heads, lineage,
+    /// Cedar, and errors.
+    pub(crate) fn native_branch(&self) -> Option<&str> {
+        self.manifest_probe.native_branch_ref()
+    }
+}
+
 /// One coherent handle-local projection of the durable schema contract.
 /// Source and catalog move through one ArcSwap publication so readers never
 /// combine an old source with a new identity-bearing catalog (or vice versa).
@@ -2356,7 +2369,15 @@ impl Omnigraph {
                     return coord.resolve_target(target).await;
                 }
                 let held = coord.manifest_incarnation();
-                if coord.probe_latest_incarnation().await?.matches(&held) {
+                // A probe on a deleted life's native ref dies with NotFound
+                // (issue #562). For a warm READER bound to the logical name
+                // that is definitive staleness, not an error: fall through to
+                // the refresh, which re-resolves the name to its current life.
+                if coord
+                    .probe_latest_incarnation()
+                    .await
+                    .is_ok_and(|latest| latest.matches(&held))
+                {
                     return warm_resolved_target(&coord, target).await;
                 }
                 // Stale: refresh under the write lock below.
@@ -2367,7 +2388,11 @@ impl Omnigraph {
                 // refreshed (tokio RwLock has no read->write upgrade).
                 let held = coord.manifest_incarnation();
                 let mut refreshed = false;
-                if !coord.probe_latest_incarnation().await?.matches(&held) {
+                let probe_current = coord
+                    .probe_latest_incarnation()
+                    .await
+                    .is_ok_and(|latest| latest.matches(&held));
+                if !probe_current {
                     // An exact head row keeps this state-only; a fresh/recreated
                     // branch atomically refreshes its inherited lineage too.
                     // No fallible second phase can leave replacement rows
@@ -2936,15 +2961,34 @@ impl Omnigraph {
         // proof and must not add two discarded BranchContents reads per branch.
         // General coordinator/OCC/feed opens retain the coherent incarnation
         // capture required by RFC-030.
-        for other_branch in branches
+        // Surviving branches record inherited forks by NATIVE ref (issue
+        // #562), so the dependency probe matches against the deleted life's
+        // native ref, not the logical name. Candidates resolve to their
+        // native refs with ONE registry read here; the per-branch probe then
+        // opens each native ref directly (the resolver passes ULID-suffixed
+        // names through without another registry scan), keeping the probe at
+        // one manifest open + state read per surviving branch.
+        let delete_target_native = control.native_branch().unwrap_or(branch);
+        let candidate_logicals: Vec<String> = branches
             .iter()
             .filter(|candidate| candidate.as_str() != branch)
-        {
+            .cloned()
+            .collect();
+        let candidate_natives = control
+            .resolve_native_branch_refs(&candidate_logicals)
+            .await?;
+        for other_branch in &candidate_logicals {
             let candidate_branch = Self::normalize_branch_name(other_branch)?;
+            let candidate_native = candidate_branch.as_deref().map(|logical| {
+                candidate_natives
+                    .get(logical)
+                    .map(String::as_str)
+                    .unwrap_or(logical)
+            });
             if crate::db::manifest::ManifestCoordinator::branch_depends_on_delete_target_under_control_gates(
                 self.uri(),
-                candidate_branch.as_deref(),
-                branch,
+                candidate_native,
+                delete_target_native,
                 &self.control_session(),
             )
             .await?
@@ -3018,9 +3062,13 @@ impl Omnigraph {
         }
 
         let branch_snapshot = target.snapshot();
+        // The captured coordinator is pinned at the life being deleted, so its
+        // native ref (issue #562) is what per-table forks and manifest rows
+        // name; legacy lives carry the bare name and behave as before.
+        let native_branch = target.native_branch().unwrap_or(branch).to_string();
         let owned_tables = branch_snapshot
             .datasets()
-            .filter(|entry| entry.native_dataset_branch.as_deref() == Some(branch))
+            .filter(|entry| entry.native_dataset_branch.as_deref() == Some(native_branch.as_str()))
             .map(|entry| (entry.type_key.clone(), entry.dataset_path.clone()))
             .collect::<Vec<_>>();
         let expected_identifier = target.branch_identifier().await?;
@@ -3038,7 +3086,8 @@ impl Omnigraph {
         // recreation, while a failed control leaves warm state untouched.
         self.invalidate_read_caches().await;
         // Best-effort per-table fork reclaim; cleanup reconciles any leftover.
-        self.cleanup_deleted_branch_tables(branch, &owned_tables)
+        // Per-table forks were created under the life's NATIVE ref.
+        self.cleanup_deleted_branch_tables(&native_branch, &owned_tables)
             .await;
         Ok(())
     }
@@ -3363,12 +3412,13 @@ impl Omnigraph {
         table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind, txn).await
     }
 
-    /// Fork `table_key` onto `active_branch` from the given source state,
-    /// self-healing a manifest-unreferenced leftover fork if one is in the
-    /// way. Callers that reach this MUST already hold the per-`(table_key,
-    /// active_branch)` write queue (so the reclaim cannot race an in-process
-    /// fork) and must have confirmed via the live manifest that the table is
-    /// not yet on `active_branch`. Both the first-write fork path
+    /// Fork `table_key` onto the NATIVE branch ref `native_branch` (issue
+    /// #562) from the given source state, self-healing a
+    /// manifest-unreferenced leftover fork if one is in the way. Callers that
+    /// reach this MUST already hold the per-`(table_key, logical-branch)`
+    /// write queue (so the reclaim cannot race an in-process fork) and must
+    /// have confirmed via the live manifest that the table is not yet on
+    /// `native_branch`. Both the first-write fork path
     /// (`open_owned_dataset_for_branch_write`) and `branch_merge` satisfy this.
     pub(crate) async fn fork_dataset_from_entry_state(
         &self,
@@ -3377,7 +3427,7 @@ impl Omnigraph {
         full_path: &str,
         source_branch: Option<&str>,
         source_version: u64,
-        active_branch: &str,
+        native_branch: &str,
     ) -> Result<SnapshotHandle> {
         self.fork_dataset_from_entry_state_under_intent(
             table_key,
@@ -3385,7 +3435,7 @@ impl Omnigraph {
             full_path,
             source_branch,
             source_version,
-            active_branch,
+            native_branch,
             None,
         )
         .await
@@ -3398,7 +3448,7 @@ impl Omnigraph {
         full_path: &str,
         source_branch: Option<&str>,
         source_version: u64,
-        active_branch: &str,
+        native_branch: &str,
         operation_id: Option<&str>,
     ) -> Result<SnapshotHandle> {
         match table_ops::fork_dataset_from_entry_state(
@@ -3407,7 +3457,7 @@ impl Omnigraph {
             full_path,
             source_branch,
             source_version,
-            active_branch,
+            native_branch,
         )
         .await?
         {
@@ -3420,7 +3470,7 @@ impl Omnigraph {
                     full_path,
                     source_branch,
                     source_version,
-                    active_branch,
+                    native_branch,
                     operation_id,
                 )
                 .await
@@ -3549,6 +3599,15 @@ pub(crate) fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<
         return Err(OmniError::manifest(format!(
             "{} does not allow internal system ref '{}'",
             operation, branch
+        )));
+    }
+    if crate::db::branch_identity::public_name_reserves_separator(branch) {
+        return Err(OmniError::manifest(format!(
+            "{} does not allow '{}' in branch names: '{}' is reserved for internal \
+             per-life branch refs",
+            operation,
+            crate::db::branch_identity::BRANCH_INCARNATION_SEPARATOR,
+            branch
         )));
     }
     Ok(())

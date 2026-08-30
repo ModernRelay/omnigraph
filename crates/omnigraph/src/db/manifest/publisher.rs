@@ -176,6 +176,17 @@ pub(super) struct GraphNamespacePublisher {
     control_session: Arc<lance::session::Session>,
 }
 
+/// Expected prior registry state for one logical name, checked inside the
+/// registry commit's CAS loop (issue #562).
+#[derive(Debug, Clone)]
+pub(super) enum BranchRegistryExpectation {
+    /// The logical name must have no registry row, or a dead one: a create or
+    /// a rebirth.
+    AbsentOrDead,
+    /// The logical name must be live at exactly this native ref: a delete.
+    LiveWithNativeRef(String),
+}
+
 #[derive(Debug)]
 struct PendingVersionRow {
     object_id: String,
@@ -954,6 +965,88 @@ impl GraphNamespacePublisher {
             .await
             .map_err(map_lance_publish_error)?;
         Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
+    }
+
+    /// Commit one branch-registry row to the ROOT `__manifest` (issue #562).
+    ///
+    /// This commit is the branch lifecycle's commit point: the native ref is
+    /// created (or deleted) only AFTER the row lands, and forward recovery
+    /// completes a ref the crash window left missing. The merge-insert's
+    /// row-level CAS on `object_id` serializes racing lifecycle operations on
+    /// one logical name — the loser observes typed contention, retries, and
+    /// re-runs the expectation check against fresh registry state, so exactly
+    /// one racer's registration wins and the other surfaces a typed conflict.
+    pub(super) async fn commit_branch_registration(
+        &self,
+        registration: &super::state::BranchRegistration,
+        expectation: &BranchRegistryExpectation,
+    ) -> Result<()> {
+        debug_assert!(
+            self.branch.is_none(),
+            "branch registry commits target the root manifest"
+        );
+        for attempt in 0..=PUBLISHER_RETRY_BUDGET {
+            let dataset = self.dataset().await?;
+            guard_stamp(&dataset)?;
+            let registry = super::state::read_branch_registry(&dataset).await?;
+            match expectation {
+                BranchRegistryExpectation::AbsentOrDead => {
+                    if let Some(row) = registry.get(&registration.logical) {
+                        if row.live {
+                            return Err(OmniError::manifest_conflict(format!(
+                                "branch '{}' already exists",
+                                registration.logical
+                            )));
+                        }
+                    }
+                }
+                BranchRegistryExpectation::LiveWithNativeRef(expected_native) => {
+                    match registry.get(&registration.logical) {
+                        Some(row) if row.live && row.native_ref == *expected_native => {}
+                        Some(row) => {
+                            return Err(OmniError::manifest_read_set_changed(
+                                format!("branch_registration:{}", registration.logical),
+                                Some(expected_native.clone()),
+                                Some(if row.live {
+                                    row.native_ref.clone()
+                                } else {
+                                    format!("dead:{}", row.native_ref)
+                                }),
+                            ));
+                        }
+                        None => {
+                            return Err(OmniError::manifest_not_found(format!(
+                                "branch '{}' not found",
+                                registration.logical
+                            )));
+                        }
+                    }
+                }
+            }
+            let row = PendingVersionRow {
+                object_id: super::state::branch_object_id(&registration.logical),
+                object_type: super::OBJECT_TYPE_BRANCH.to_string(),
+                location: None,
+                metadata: Some(super::state::encode_branch_registration_metadata(
+                    registration,
+                )?),
+                table_key: String::new(),
+                identity: None,
+                table_version: None,
+                table_branch: None,
+                row_count: None,
+            };
+            match self.merge_rows(dataset, vec![row]).await {
+                Ok(_) => return Ok(()),
+                Err(err)
+                    if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("branch registry CAS loop returns from every attempt")
     }
 
     #[cfg(test)]

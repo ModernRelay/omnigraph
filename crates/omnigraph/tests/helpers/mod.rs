@@ -117,9 +117,64 @@ pub async fn open_dataset_head(uri: &str, branch: Option<&str>) -> lance::Datase
         .await
         .unwrap();
     match branch {
-        Some(branch) if branch != "main" => ds.checkout_branch(branch).await.unwrap(),
+        Some(branch) if branch != "main" => {
+            // Callers name branches LOGICALLY; the on-disk ref is the current
+            // life's `{logical}--{ulid}` native ref (issue #562), or the bare
+            // name for legacy/hand-forged fixtures.
+            let native = native_ref_for(&ds, branch)
+                .await
+                .unwrap_or_else(|| branch.to_string());
+            ds.checkout_branch(&native).await.unwrap()
+        }
         _ => ds,
     }
+}
+
+/// The Lance ref on `ds` that is a life of the LOGICAL branch name (issue
+/// #562): the ULID-suffixed native ref when one exists, else the bare name if
+/// present, else `None`. More than one listed life is a fixture bug — fail
+/// loudly rather than pick one.
+pub async fn native_ref_for(ds: &lance::Dataset, logical: &str) -> Option<String> {
+    let branches = ds.list_branches().await.unwrap();
+    let prefix = format!("{logical}--");
+    let mut lives: Vec<String> = branches
+        .keys()
+        .filter(|name| name.as_str() == logical || name.starts_with(&prefix))
+        .cloned()
+        .collect();
+    assert!(
+        lives.len() <= 1,
+        "ambiguous lives for logical branch '{logical}': {lives:?}"
+    );
+    lives.pop()
+}
+
+/// Assert a persisted `native_dataset_branch` names a life of `logical`
+/// (issue #562): the ULID-suffixed native ref `{logical}--{ulid}`, or the
+/// bare name for a legacy fork.
+#[track_caller]
+pub fn assert_native_branch_of(native: Option<&str>, logical: &str) {
+    let native = native.unwrap_or_else(|| panic!("expected a fork of '{logical}', got None"));
+    assert!(
+        native == logical || native.starts_with(&format!("{logical}--")),
+        "expected a life of '{logical}', got '{native}'"
+    );
+}
+
+/// The current life's native ref of a LOGICAL graph branch, read from the
+/// `__manifest` dataset's live refs (issue #562). Fixtures that forge or
+/// inspect per-table state colliding with the engine's own fork targets must
+/// address this name, not the logical one.
+pub async fn graph_native_ref(root_uri: &str, logical: &str) -> String {
+    let manifest_uri = format!("{}/__manifest", root_uri.trim_end_matches('/'));
+    let ds = lance::dataset::builder::DatasetBuilder::from_uri(&manifest_uri)
+        .with_session(test_session())
+        .load()
+        .await
+        .unwrap();
+    native_ref_for(&ds, logical)
+        .await
+        .unwrap_or_else(|| panic!("no live ref for logical branch '{logical}'"))
 }
 
 /// Init a graph and load the standard test data.

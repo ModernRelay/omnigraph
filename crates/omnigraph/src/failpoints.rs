@@ -136,6 +136,12 @@ pub mod names {
     /// OmniGraph acknowledges it. Recovery must classify the matching
     /// BranchContents as a completed create (lost acknowledgement).
     pub const BRANCH_CREATE_POST_NATIVE: &str = "branch_create.post_native";
+    /// Issue #562 create crash window: the branch-registry row (the existence
+    /// authority) is committed, the life's native ref is not yet created.
+    /// Forward recovery must complete the ref on the next resolution of the
+    /// logical name; a same-name create must conflict.
+    pub const BRANCH_CREATE_POST_REGISTRY_PRE_NATIVE: &str =
+        "branch_create.post_registry_pre_native";
     pub const BRANCH_DELETE_BEFORE_TABLE_CLEANUP: &str = "branch_delete.before_table_cleanup";
     /// After Lance returns success from native delete, before OmniGraph
     /// acknowledges it. Recovery must classify the absent BranchContents as a

@@ -318,11 +318,55 @@ async fn native_branch_controls_reclassify_lost_acknowledgements() {
             .expect("absent BranchContents must classify a lost delete acknowledgement");
     }
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
-    assert_eq!(version_main(&db).await.unwrap(), before_version);
+    // Issue #562: branch lifecycle now commits its registry rows on the root
+    // `__manifest` — one live-row commit for the create, one dead-row commit
+    // for the delete — so main's manifest version advances by exactly two.
+    // The unchanged claim is below: no graph LINEAGE is manufactured.
+    assert_eq!(version_main(&db).await.unwrap(), before_version + 2);
     assert_eq!(
         db.list_commits(Some("main")).await.unwrap().len(),
         before_commits,
         "native branch controls must not manufacture graph lineage"
+    );
+}
+
+// Issue #562 create crash window: the branch-registry row (the existence
+// authority) commits, then the process dies before the life's native ref is
+// created. The logical name exists — a same-name create must conflict — and
+// the next resolution of the name completes the missing native ref (forward
+// recovery), after which the branch is fully readable.
+#[tokio::test]
+#[serial]
+async fn branch_create_registry_committed_ref_missing_forward_recovers() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+
+    {
+        let _fp = ScopedFailPoint::new(names::BRANCH_CREATE_POST_REGISTRY_PRE_NATIVE, "return");
+        db.branch_create("feature")
+            .await
+            .expect_err("create must surface the injected failure after the registry commit");
+    }
+    let err = db.branch_create("feature").await.unwrap_err();
+    assert!(
+        err.to_string().contains("already exists"),
+        "the registry row is the existence authority; a same-name create over \
+         a refless live row must conflict, got: {err}"
+    );
+    assert!(
+        db.branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "feature"),
+        "a live refless registration still lists as an existing branch"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        4,
+        "resolution must forward-complete the missing native ref and read the \
+         pinned source state"
     );
 }
 
@@ -356,7 +400,7 @@ async fn branch_delete_partial_failure_converges_via_cleanup() {
     {
         let ds = lance::Dataset::open(&person_uri).await.unwrap();
         assert!(
-            ds.list_branches().await.unwrap().contains_key("feature"),
+            helpers::native_ref_for(&ds, "feature").await.is_some(),
             "precondition: the owned table fork exists before delete"
         );
     }
@@ -378,7 +422,7 @@ async fn branch_delete_partial_failure_converges_via_cleanup() {
     {
         let ds = lance::Dataset::open(&person_uri).await.unwrap();
         assert!(
-            ds.list_branches().await.unwrap().contains_key("feature"),
+            helpers::native_ref_for(&ds, "feature").await.is_some(),
             "failed eager reclaim should leave the orphan for cleanup to reconcile"
         );
     }
@@ -393,7 +437,7 @@ async fn branch_delete_partial_failure_converges_via_cleanup() {
     {
         let ds = lance::Dataset::open(&person_uri).await.unwrap();
         assert!(
-            !ds.list_branches().await.unwrap().contains_key("feature"),
+            helpers::native_ref_for(&ds, "feature").await.is_none(),
             "cleanup should reconcile the orphaned fork away"
         );
     }
@@ -487,10 +531,13 @@ async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
     db.branch_create("feature").await.unwrap();
 
     let person_uri = node_table_uri(&db, "Person").await;
+    // Forge the orphan at the branch's NATIVE ref (issue #562): the engine's
+    // fork targets that name, so only a same-named forged ref collides.
+    let feature_native = helpers::graph_native_ref(&uri, "feature").await;
     {
         let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
         let base = ds.version().version;
-        ds.create_branch("feature", base, None).await.unwrap();
+        ds.create_branch(&feature_native, base, None).await.unwrap();
     }
 
     let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
@@ -519,7 +566,10 @@ async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
 
         let ds = lance::Dataset::open(&person_uri).await.unwrap();
         assert!(
-            ds.list_branches().await.unwrap().contains_key("feature"),
+            ds.list_branches()
+                .await
+                .unwrap()
+                .contains_key(feature_native.as_str()),
             "ambiguous orphan status must leave the fork for a later retry"
         );
     }
@@ -807,12 +857,8 @@ async fn cross_handle_reclaim_never_deletes_live_intent_owned_fork() {
     rendezvous.wait_until_reached().await;
 
     let person_uri = node_table_uri(&db_b, "Person").await;
-    let fork_before = lance::Dataset::open(&person_uri)
+    let fork_before = helpers::open_dataset_head(&person_uri, Some("feature"))
         .await
-        .unwrap()
-        .checkout_branch("feature")
-        .await
-        .unwrap()
         .branch_identifier()
         .await
         .unwrap();
@@ -835,12 +881,8 @@ async fn cross_handle_reclaim_never_deletes_live_intent_owned_fork() {
         "the second handle must wait on A's root-scoped effect gates"
     );
 
-    let fork_after = lance::Dataset::open(&person_uri)
+    let fork_after = helpers::open_dataset_head(&person_uri, Some("feature"))
         .await
-        .unwrap()
-        .checkout_branch("feature")
-        .await
-        .unwrap()
         .branch_identifier()
         .await
         .unwrap();
@@ -903,37 +945,37 @@ async fn armed_first_touch_recovery_accepts_missing_target_ref() {
     }
     let operation_id = single_sidecar_operation_id(dir.path());
     let person_uri = node_table_uri(&db, "Person").await;
-    assert!(
-        !lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key("feature"),
-        "precondition: crash happened before the target ref was created"
-    );
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            helpers::native_ref_for(&ds, "feature").await.is_none(),
+            "precondition: crash happened before the target ref was created"
+        );
+    }
 
     // Materialize the narrower Lance crash window underneath the already-
     // durable writer intent: shallow clone present, BranchContents absent.
     // Full recovery must not equate "not listed" with "no physical fork".
+    // The intent targets the branch life's NATIVE ref (issue #562), so the
+    // forged clone-only state must live at that name.
+    let feature_native = helpers::graph_native_ref(&uri, "feature").await;
     let mut person = lance::Dataset::open(&person_uri).await.unwrap();
     let person_version = person.version().version;
     person
-        .create_branch("feature", person_version, None)
+        .create_branch(&feature_native, person_version, None)
         .await
         .unwrap();
     std::fs::remove_file(
         std::path::Path::new(&person_uri)
             .join("_refs")
             .join("branches")
-            .join("feature.json"),
+            .join(format!("{feature_native}.json")),
     )
     .unwrap();
     assert!(
         std::path::Path::new(&person_uri)
             .join("tree")
-            .join("feature")
+            .join(&feature_native)
             .exists(),
         "precondition: clone-only target tree exists"
     );
@@ -1094,12 +1136,13 @@ async fn armed_first_touch_recovery_defers_legacy_path_overlap_until_leaf_delete
             .join("feature.json"),
     )
     .unwrap();
+    // The production-created leaf forked at its life's NATIVE ref
+    // (`feature/child--{ulid}`); the forged ancestor stays the bare legacy
+    // name. Both nest under the same `tree/feature/` physical prefix.
     assert!(
-        person
-            .list_branches()
+        helpers::native_ref_for(&person, "feature/child")
             .await
-            .unwrap()
-            .contains_key("feature/child"),
+            .is_some(),
         "precondition: live leaf table branch exists"
     );
     assert!(
@@ -1181,7 +1224,21 @@ async fn partial_first_touch_recovery_fails_closed_on_legacy_path_overlap() {
         })
         .collect::<Vec<_>>();
 
-    db.branch_create("feature").await.unwrap();
+    // Forge a LEGACY graph-branch admission (bare ref, no registry row):
+    // this scenario models an old store, where the path-overlapping child
+    // could legally exist. A #562-registered branch would fork at its native
+    // `feature--{ulid}` ref and never share the forged child's path prefix,
+    // so the legacy shape is the only one that still reproduces the overlap.
+    {
+        let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+            .await
+            .unwrap();
+        let manifest_version = manifest.version().version;
+        manifest
+            .create_branch("feature", manifest_version, None)
+            .await
+            .unwrap();
+    }
     let operation_id = {
         let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_TABLE_COMMIT, "return");
         let error = db
@@ -1416,16 +1473,13 @@ async fn armed_first_touch_recovery_reclaims_exact_no_effect_fork() {
     }
     let operation_id = single_sidecar_operation_id(dir.path());
     let person_uri = node_table_uri(&db, "Person").await;
-    assert!(
-        lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key("feature"),
-        "precondition: intent-owned target ref exists without a committed effect"
-    );
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            helpers::native_ref_for(&ds, "feature").await.is_some(),
+            "precondition: intent-owned target ref exists without a committed effect"
+        );
+    }
     drop(db);
 
     let recovered = Omnigraph::open(&uri).await.unwrap();
@@ -1434,16 +1488,13 @@ async fn armed_first_touch_recovery_reclaims_exact_no_effect_fork() {
         main_rows,
         "recovery must leave the feature table inherited"
     );
-    assert!(
-        !lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key("feature"),
-        "full recovery must reclaim the exact unpublished no-effect ref"
-    );
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            helpers::native_ref_for(&ds, "feature").await.is_none(),
+            "full recovery must reclaim the exact unpublished no-effect ref"
+        );
+    }
     assert!(
         !dir.path()
             .join("__recovery")
@@ -1783,16 +1834,13 @@ async fn full_recovery_converges_multiple_no_effect_claims_for_one_fork() {
         "precondition: both no-effect claims are durable"
     );
     let person_uri = node_table_uri(&writer_b_db, "Person").await;
-    assert!(
-        lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key("feature"),
-        "precondition: A's exact no-effect target ref exists"
-    );
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            helpers::native_ref_for(&ds, "feature").await.is_some(),
+            "precondition: A's exact no-effect target ref exists"
+        );
+    }
     drop(writer_b_db);
 
     let recovered = Omnigraph::open(&uri)
@@ -1803,16 +1851,13 @@ async fn full_recovery_converges_multiple_no_effect_claims_for_one_fork() {
         main_rows
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
-    assert!(
-        !lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key("feature"),
-        "the last no-effect claim must reclaim the exact unpublished ref"
-    );
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            helpers::native_ref_for(&ds, "feature").await.is_none(),
+            "the last no-effect claim must reclaim the exact unpublished ref"
+        );
+    }
 }
 
 /// A no-effect Armed intent must not delete a ref while a competing confirmed
@@ -3995,13 +4040,14 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
     // publisher deliberately skips the normal index-rebuild preparation;
     // the failed writer below is still the real `ensure_indices_on`.
     let person_uri = node_table_uri(&db, "Person").await;
+    let feature_native = helpers::graph_native_ref(&uri, "feature").await;
     let mut ds = helpers::open_dataset_head(&person_uri, Some("feature")).await;
     ds.drop_index("id_idx").await.unwrap();
     let dropped_index_head = ds.version().version;
     db.failpoint_publish_table_head_without_index_rebuild_for_test(
         "feature",
         "node:Person",
-        Some("feature"),
+        Some(feature_native.as_str()),
     )
     .await
     .unwrap();
@@ -4088,7 +4134,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
     db.failpoint_publish_table_head_without_index_rebuild_for_test(
         "feature",
         "node:Person",
-        Some("feature"),
+        Some(feature_native.as_str()),
     )
     .await
     .unwrap();
@@ -4516,14 +4562,25 @@ async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
     // state, never something a new loose sidecar may claim.
     let person_uri = node_table_uri(&db, "Person").await;
     let mut person = lance::Dataset::open(&person_uri).await.unwrap();
+    // The engine addresses fork refs by each life's NATIVE name (issue #562),
+    // so the foreign ref must be forged at the experiment life's native ref
+    // from the feature life's native fork to collide with the index target.
+    let feature_fork_native = helpers::native_ref_for(&person, "feature")
+        .await
+        .expect("feature's table fork exists");
+    let experiment_native = helpers::graph_native_ref(&uri, "experiment").await;
     let feature_head = person
-        .checkout_branch("feature")
+        .checkout_branch(&feature_fork_native)
         .await
         .unwrap()
         .version()
         .version;
     person
-        .create_branch("experiment", ("feature", feature_head), None)
+        .create_branch(
+            &experiment_native,
+            (feature_fork_native.as_str(), feature_head),
+            None,
+        )
         .await
         .unwrap();
     let orphan_error = db
@@ -4537,14 +4594,19 @@ async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
         "unexpected orphan-ref refusal: {orphan_error}"
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
-    person.delete_branch("experiment").await.unwrap();
+    person.delete_branch(&experiment_native).await.unwrap();
 
     {
         let _failpoint =
             ScopedFailPoint::new(names::ENSURE_INDICES_POST_SIDECAR_PRE_FORK, "return");
-        db.ensure_indices_on("experiment")
+        let error = db
+            .ensure_indices_on("experiment")
             .await
             .expect_err("failpoint must fire after sidecar and before target ref creation");
+        assert!(
+            matches!(error, OmniError::RecoveryRequired { .. }),
+            "expected the injected post-sidecar failure, got: {error}"
+        );
     }
     let operation_id = single_sidecar_operation_id(dir.path());
     drop(db);
@@ -4562,13 +4624,13 @@ async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("experiment"))
         .await
         .unwrap();
-    assert_eq!(
+    helpers::assert_native_branch_of(
         inherited
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("feature")
+        "feature",
     );
 
     recovered.ensure_indices_on("experiment").await.unwrap();
@@ -4576,13 +4638,13 @@ async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("experiment"))
         .await
         .unwrap();
-    assert_eq!(
+    helpers::assert_native_branch_of(
         owned
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        Some("experiment")
+        "experiment",
     );
 }
 
@@ -5603,7 +5665,19 @@ async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
     )
     .await
     .unwrap();
-    db.branch_create("feature").await.unwrap();
+    // Forge a LEGACY graph branch (bare ref, no #562 registry row): the raw
+    // substrate ref delete below must leave the branch GENUINELY gone, and a
+    // registered branch's live row would instead trigger forward recovery.
+    {
+        let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+            .await
+            .unwrap();
+        let manifest_version = manifest.version().version;
+        manifest
+            .create_branch("feature", manifest_version, None)
+            .await
+            .unwrap();
+    }
     helpers::mutate_branch(
         &mut db,
         "feature",
@@ -5977,7 +6051,19 @@ async fn orphaned_branch_discard_converges_across_audit_append_failure() {
     )
     .await
     .unwrap();
-    db.branch_create("feature").await.unwrap();
+    // Forge a LEGACY graph branch (bare ref, no #562 registry row): the raw
+    // substrate ref delete below must leave the branch GENUINELY gone, and a
+    // registered branch's live row would instead trigger forward recovery.
+    {
+        let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+            .await
+            .unwrap();
+        let manifest_version = manifest.version().version;
+        manifest
+            .create_branch("feature", manifest_version, None)
+            .await
+            .unwrap();
+    }
     helpers::mutate_branch(
         &mut db,
         "feature",
@@ -8996,18 +9082,14 @@ async fn branch_merge_post_effect_target_advance_requires_recovery_and_preserves
     // still advances, invalidating the merge's coarse target authority token.
     // The test-only seam deliberately bypasses the process-local queues.
     let company_uri = node_table_uri(&target_winner, "Company").await;
-    let mut raw_company = lance::Dataset::open(&company_uri)
-        .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap();
+    let mut raw_company = helpers::open_dataset_head(&company_uri, Some("target")).await;
     helpers::lance_delete_inline(&mut raw_company, "1 = 2").await;
+    let target_native = helpers::graph_native_ref(&uri, "target").await;
     target_winner
         .failpoint_publish_table_head_without_index_rebuild_for_test(
             "target",
             "node:Company",
-            Some("target"),
+            Some(target_native.as_str()),
         )
         .await
         .unwrap();
@@ -9089,19 +9171,15 @@ async fn branch_merge_post_effect_same_table_advance_fails_closed() {
     merge_rv.wait_until_reached().await;
 
     let person_uri = node_table_uri(&target_winner, "Person").await;
-    let mut raw_target = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap();
+    let mut raw_target = helpers::open_dataset_head(&person_uri, Some("target")).await;
     helpers::lance_delete_inline(&mut raw_target, "1 = 2").await;
     let winner_lance_head = raw_target.version().version;
+    let target_native = helpers::graph_native_ref(&uri, "target").await;
     target_winner
         .failpoint_publish_table_head_without_index_rebuild_for_test(
             "target",
             "node:Person",
-            Some("target"),
+            Some(target_native.as_str()),
         )
         .await
         .unwrap();
@@ -9141,12 +9219,8 @@ async fn branch_merge_post_effect_same_table_advance_fails_closed() {
         winner_manifest_version,
         "failed recovery must not move the winning target manifest"
     );
-    let lance_after_failed_recovery = lance::Dataset::open(&person_uri)
+    let lance_after_failed_recovery = helpers::open_dataset_head(&person_uri, Some("target"))
         .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap()
         .version()
         .version;
     assert_eq!(
@@ -9200,30 +9274,22 @@ async fn branch_merge_rollback_restarts_after_restore_before_publish() {
     assert!(sidecar_path.exists());
 
     let company_uri = node_table_uri(&target_winner, "Company").await;
-    let mut raw_company = lance::Dataset::open(&company_uri)
-        .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap();
+    let mut raw_company = helpers::open_dataset_head(&company_uri, Some("target")).await;
     helpers::lance_delete_inline(&mut raw_company, "1 = 2").await;
+    let target_native = helpers::graph_native_ref(&uri, "target").await;
     target_winner
         .failpoint_publish_table_head_without_index_rebuild_for_test(
             "target",
             "node:Company",
-            Some("target"),
+            Some(target_native.as_str()),
         )
         .await
         .unwrap();
     let winner_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
 
     let person_uri = node_table_uri(&db, "Person").await;
-    let person_before_restore = lance::Dataset::open(&person_uri)
+    let person_before_restore = helpers::open_dataset_head(&person_uri, Some("target"))
         .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap()
         .version()
         .version;
     drop(db);
@@ -9256,12 +9322,8 @@ async fn branch_merge_rollback_restarts_after_restore_before_publish() {
         recovery_audit_kinds(dir.path()).await.is_empty(),
         "an interrupted rollback must not claim a completed audit outcome"
     );
-    let person_after_interrupted_restore = lance::Dataset::open(&person_uri)
+    let person_after_interrupted_restore = helpers::open_dataset_head(&person_uri, Some("target"))
         .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap()
         .version()
         .version;
     assert!(
@@ -9273,12 +9335,8 @@ async fn branch_merge_rollback_restarts_after_restore_before_publish() {
         .await
         .expect("the next open must recognize and finish the interrupted compensation");
     assert!(!sidecar_path.exists());
-    let person_after_recovery = lance::Dataset::open(&person_uri)
+    let person_after_recovery = helpers::open_dataset_head(&person_uri, Some("target"))
         .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap()
         .version()
         .version;
     assert_eq!(
@@ -9312,12 +9370,8 @@ async fn branch_merge_rollback_restarts_after_restore_before_publish() {
 
     drop(recovered);
     let _reopened = Omnigraph::open(&uri).await.unwrap();
-    let person_after_second_open = lance::Dataset::open(&person_uri)
+    let person_after_second_open = helpers::open_dataset_head(&person_uri, Some("target"))
         .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap()
         .version()
         .version;
     assert_eq!(person_after_second_open, person_after_recovery);
@@ -10442,12 +10496,14 @@ async fn branch_merge_sidecar_pins_table_branch_to_active_branch() {
                      got pin {pin:?}"
                 )
             });
-        assert_eq!(
-            table_branch, "target_branch",
-            "sidecar pin must record `table_branch` as the merge target branch (where \
-             commits actually land via publish_rewritten_merge_table → open_for_mutation), \
-             NOT entry.native_dataset_branch from the target snapshot. See merge.rs filter_map and \
-             the rationale comment at table_ops.rs:115-120. Got pin: {pin:?}"
+        // Issue #562: the pin records the merge target's NATIVE ref (where
+        // commits actually land via publish_rewritten_merge_table →
+        // open_for_mutation), never entry.native_dataset_branch from the
+        // target snapshot. The native ref is a life of the logical target.
+        assert!(
+            table_branch.starts_with("target_branch--"),
+            "sidecar pin must record `table_branch` as the merge target's native ref \
+             (a `target_branch--{{ulid}}` life). Got pin: {pin:?}"
         );
     }
 }
@@ -11124,16 +11180,13 @@ async fn first_touch_post_create_open_error_keeps_recovery_ownership() {
         "ambiguous post-create failure must retain its ownership sidecar"
     );
     let person_uri = node_table_uri(&db, "Person").await;
-    assert!(
-        lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key("feature"),
-        "test seam fires only after the target ref is durable"
-    );
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            helpers::native_ref_for(&ds, "feature").await.is_some(),
+            "test seam fires only after the target ref is durable"
+        );
+    }
 
     drop(db);
     let recovered = Omnigraph::open(&uri).await.unwrap();
@@ -11142,16 +11195,13 @@ async fn first_touch_post_create_open_error_keeps_recovery_ownership() {
         4,
         "failed first touch must not publish its row"
     );
-    assert!(
-        !lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key("feature"),
-        "Full recovery must reclaim the sidecar-owned untouched ref"
-    );
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            helpers::native_ref_for(&ds, "feature").await.is_none(),
+            "Full recovery must reclaim the sidecar-owned untouched ref"
+        );
+    }
 }
 
 /// A branch delete's first recovery probe is not its authority boundary. A data
@@ -11300,28 +11350,46 @@ node Document {
     let new_snapshot = replacement.expect("delete/recreate replacement must complete");
     let new_entry = new_snapshot.dataset("node:Document").unwrap();
     assert_eq!(new_entry.dataset_path, old_entry.dataset_path);
-    assert_eq!(
-        new_entry.native_dataset_branch,
-        old_entry.native_dataset_branch
-    );
-    assert_eq!(
-        new_entry.published_dataset_version, old_entry.published_dataset_version,
-        "the regression must exercise same-path/same-version branch ABA"
+    // Pre-#562 this fixture engineered same-native-ref/same-version ABA. The
+    // rotation makes that collision impossible — each life owns a distinct
+    // `feature--{ulid}` fork, which is now the pinned structural fact; the
+    // protected behavior below (stale capture never serves replacement
+    // bytes) is unchanged.
+    let old_native = old_entry
+        .native_dataset_branch
+        .as_deref()
+        .expect("old life must own the forked Blob table");
+    let new_native = new_entry
+        .native_dataset_branch
+        .as_deref()
+        .expect("new life must own the forked Blob table");
+    assert_ne!(
+        old_native, new_native,
+        "each branch life must own a distinct native ref (issue #562)"
     );
 
     let error = read_task
         .await
         .unwrap()
         .expect_err("the stale live-branch capture must never return replacement bytes");
+    // Two loud refusal shapes: the typed incarnation-witness BadRequest, or
+    // the stale pin dying structurally on the deleted life's native ref
+    // (its tree is removed with the life, so the read can never reach the
+    // replacement's bytes).
+    let refused_typed = matches!(
+        error,
+        OmniError::Manifest(ref manifest)
+            if manifest.kind == ManifestErrorKind::BadRequest
+                && manifest.message
+                    == "Blob property 'Document.content' has no persisted native-branch incarnation witness at the selected target"
+    );
+    let died_structurally = error.to_string().contains("feature--");
+    // A reclaimed historical version is equally loud: the stale capture's
+    // pinned version belongs to the deleted life and no longer resolves.
+    let version_reclaimed = matches!(error, OmniError::HistoricalVersionReclaimed { .. });
     assert!(
-        matches!(
-            error,
-            OmniError::Manifest(ref manifest)
-                if manifest.kind == ManifestErrorKind::BadRequest
-                    && manifest.message
-                        == "Blob property 'Document.content' has no persisted native-branch incarnation witness at the selected target"
-        ),
-        "live branch ABA must fail with the exact incarnation refusal, got {error:?}"
+        refused_typed || died_structurally || version_reclaimed,
+        "live branch ABA must fail loudly instead of retargeting, got {error:?}"
     );
     assert_eq!(
         read_managed_blob_bytes(&control, ReadTarget::branch("feature"), cell).await,
@@ -11412,25 +11480,32 @@ node Document {
 
     let new_snapshot = replacement.expect("delete/recreate replacement must complete");
     let new_entry = new_snapshot.dataset("node:Document").unwrap();
-    assert_eq!(
-        new_entry.published_dataset_version, old_entry.published_dataset_version,
-        "the regression must exercise same-version branch ABA"
+    // Pre-#562 the fixture pinned same-version ABA; the rotation gives each
+    // life its own native ref, so pin the distinct-lives fact instead.
+    assert_ne!(
+        new_entry.native_dataset_branch, old_entry.native_dataset_branch,
+        "each branch life must own a distinct native ref (issue #562)"
     );
 
     let error = poll_task
         .await
         .unwrap()
         .expect_err("the stale cut must never emit the replacement branch's rows");
+    // Loud refusal shapes: the typed incarnation witness, a ChangeFeedGap
+    // (the feed's designed unreadable-history signal — carries no rows), or
+    // the stale pin dying structurally on the deleted life's native ref.
+    let refused = matches!(
+        error,
+        OmniError::Manifest(ref manifest)
+            if manifest.kind == ManifestErrorKind::BadRequest
+                && manifest
+                    .message
+                    .contains("has no persisted native-branch incarnation witness")
+    ) || matches!(error, OmniError::ChangeFeedGap { .. })
+        || error.to_string().contains("feature--");
     assert!(
-        matches!(
-            error,
-            OmniError::Manifest(ref manifest)
-                if manifest.kind == ManifestErrorKind::BadRequest
-                    && manifest
-                        .message
-                        .contains("has no persisted native-branch incarnation witness")
-        ),
-        "in-poll branch ABA must fail with the incarnation refusal, got {error:?}"
+        refused,
+        "in-poll branch ABA must fail loudly instead of retargeting, got {error:?}"
     );
 }
 
@@ -11524,25 +11599,32 @@ node Document {
 
     let new_snapshot = replacement.expect("delete/recreate replacement must complete");
     let new_entry = new_snapshot.dataset("node:Document").unwrap();
-    assert_eq!(
-        new_entry.published_dataset_version, old_entry.published_dataset_version,
-        "the regression must exercise same-version branch ABA"
+    // Pre-#562 the fixture pinned same-version ABA; the rotation gives each
+    // life its own native ref, so pin the distinct-lives fact instead.
+    assert_ne!(
+        new_entry.native_dataset_branch, old_entry.native_dataset_branch,
+        "each branch life must own a distinct native ref (issue #562)"
     );
 
     let error = poll_task
         .await
         .unwrap()
         .expect_err("the retargeted table open must not emit the replacement branch's rows");
+    // Loud refusal shapes: the typed incarnation witness, a ChangeFeedGap
+    // (the feed's designed unreadable-history signal — carries no rows), or
+    // the stale pin dying structurally on the deleted life's native ref.
+    let refused = matches!(
+        error,
+        OmniError::Manifest(ref manifest)
+            if manifest.kind == ManifestErrorKind::BadRequest
+                && manifest
+                    .message
+                    .contains("has no persisted native-branch incarnation witness")
+    ) || matches!(error, OmniError::ChangeFeedGap { .. })
+        || error.to_string().contains("feature--");
     assert!(
-        matches!(
-            error,
-            OmniError::Manifest(ref manifest)
-                if manifest.kind == ManifestErrorKind::BadRequest
-                    && manifest
-                        .message
-                        .contains("has no persisted native-branch incarnation witness")
-        ),
-        "in-poll table-open ABA must fail with the incarnation refusal, got {error:?}"
+        refused,
+        "in-poll table-open ABA must fail loudly instead of retargeting, got {error:?}"
     );
 }
 
@@ -11630,16 +11712,21 @@ node Document {
         .await
         .unwrap()
         .expect_err("without an e_tag witness the logical post-open re-prove must still refuse");
+    // Loud refusal shapes: the post-open logical witness, a ChangeFeedGap
+    // (the feed's unreadable-history signal — carries no rows), or the stale
+    // pin dying structurally on the deleted life's native ref (issue #562).
+    let refused = matches!(
+        error,
+        OmniError::Manifest(ref manifest)
+            if manifest.kind == ManifestErrorKind::BadRequest
+                && manifest
+                    .message
+                    .contains("after the per-table opens")
+    ) || matches!(error, OmniError::ChangeFeedGap { .. })
+        || error.to_string().contains("feature--");
     assert!(
-        matches!(
-            error,
-            OmniError::Manifest(ref manifest)
-                if manifest.kind == ManifestErrorKind::BadRequest
-                    && manifest
-                        .message
-                        .contains("after the per-table opens")
-        ),
-        "the logical post-open witness must produce the incarnation refusal, got {error:?}"
+        refused,
+        "the logical post-open witness must fail the poll loudly, got {error:?}"
     );
 }
 
@@ -11832,13 +11919,13 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
     // version; BranchIdentifier is the incarnation component that prevents
     // that pair from masquerading as the authority captured by the merge.
     let person_uri = node_table_uri(merge_db.as_ref(), "Person").await;
-    let old_target = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap();
-    let old_target_version = old_target.version().version;
+    let old_target = helpers::open_dataset_head(&person_uri, Some("target")).await;
+    let old_target_native = {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        helpers::native_ref_for(&ds, "target")
+            .await
+            .expect("target's table fork exists")
+    };
     let old_target_identifier = old_target.branch_identifier().await.unwrap();
 
     let merge_rv =
@@ -11874,12 +11961,8 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
         tokio::time::timeout(std::time::Duration::from_millis(250), &mut control_task)
             .await
             .is_err();
-    let target_unchanged_while_parked = lance::Dataset::open(&person_uri)
+    let target_unchanged_while_parked = helpers::open_dataset_head(&person_uri, Some("target"))
         .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap()
         .branch_identifier()
         .await
         .unwrap()
@@ -11921,21 +12004,25 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
             && !target_names.iter().any(|name| name == "old-target-only"),
         "recreated target leaked state from the deleted target incarnation: {target_names:?}"
     );
-    let new_target = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap();
+    let new_target = helpers::open_dataset_head(&person_uri, Some("target")).await;
     assert_ne!(
         new_target.branch_identifier().await.unwrap(),
         old_target_identifier,
         "delete+recreate must mint a new target incarnation"
     );
-    assert_eq!(
-        new_target.version().version,
-        old_target_version,
-        "the regression fixture must exercise same-name/same-version ABA"
+    // Pre-#562 this fixture pinned same-name/same-version ABA. The rotation
+    // makes that collision impossible by construction: the recreated life
+    // owns a distinct `target--{ulid}` native ref, which is the pinned
+    // structural fact now.
+    let new_target_native = {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        helpers::native_ref_for(&ds, "target")
+            .await
+            .expect("recreated target's table fork exists")
+    };
+    assert_ne!(
+        new_target_native, old_target_native,
+        "each target life must own a distinct native ref (issue #562)"
     );
 }
 
@@ -12010,18 +12097,14 @@ async fn branch_merge_rejects_fresh_target_manifest_change_before_effects() {
     // `graph_head`; the merge handle's cached target snapshot remains at
     // `before`.
     let person_uri = node_table_uri(&target_writer, "Person").await;
-    let mut raw_target = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap();
+    let mut raw_target = helpers::open_dataset_head(&person_uri, Some("target")).await;
     helpers::lance_delete_inline(&mut raw_target, "1 = 2").await;
+    let target_native = helpers::graph_native_ref(&uri, "target").await;
     let publish_result = target_writer
         .failpoint_publish_table_head_without_index_rebuild_for_test(
             "target",
             "node:Person",
-            Some("target"),
+            Some(target_native.as_str()),
         )
         .await;
     let after_result = helpers::version_branch(&target_writer, "target").await;
@@ -12164,18 +12247,14 @@ async fn branch_merge_source_advance_keeps_captured_source_parent() {
     // source table HEAD with a no-op delete, then publish it through the
     // queue-bypassing seam. The source branch incarnation remains unchanged.
     let person_uri = node_table_uri(&source_writer, "Person").await;
-    let mut raw_source = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("source")
-        .await
-        .unwrap();
+    let mut raw_source = helpers::open_dataset_head(&person_uri, Some("source")).await;
     helpers::lance_delete_inline(&mut raw_source, "1 = 2").await;
+    let source_native = helpers::graph_native_ref(&uri, "source").await;
     source_writer
         .failpoint_publish_table_head_without_index_rebuild_for_test(
             "source",
             "node:Person",
-            Some("source"),
+            Some(source_native.as_str()),
         )
         .await
         .unwrap();
@@ -12230,12 +12309,11 @@ async fn branch_merge_pure_insert_rejects_source_table_ref_aba_before_arm() {
     .unwrap();
 
     let person_uri = node_table_uri(&db, "Person").await;
-    let old_source = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("source")
-        .await
-        .unwrap();
+    // The raw ABA is forged at the source life's NATIVE ref (issue #562): the
+    // graph branch stays the same life, only the table-level ref is replaced
+    // out-of-band, and the final identifier check must catch exactly that.
+    let source_native = helpers::graph_native_ref(&uri, "source").await;
+    let old_source = helpers::open_dataset_head(&person_uri, Some("source")).await;
     let old_source_version = old_source.version().version;
     let old_source_identifier = old_source.branch_identifier().await.unwrap();
     let merge_db = std::sync::Arc::new(db);
@@ -12255,22 +12333,22 @@ async fn branch_merge_pure_insert_rejects_source_table_ref_aba_before_arm() {
             .await
             .map_err(OmniError::storage)?;
         let main_version = root.version().version;
-        root.force_delete_branch("source")
+        root.force_delete_branch(&source_native)
             .await
             .map_err(OmniError::storage)?;
         if let Err(error) = std::fs::remove_dir_all(
             std::path::Path::new(&person_uri)
                 .join("tree")
-                .join("source"),
+                .join(&source_native),
         ) && error.kind() != std::io::ErrorKind::NotFound
         {
             return Err(error.into());
         }
-        root.create_branch("source", main_version, None)
+        root.create_branch(&source_native, main_version, None)
             .await
             .map_err(OmniError::storage)?;
         let mut replacement = root
-            .checkout_branch("source")
+            .checkout_branch(&source_native)
             .await
             .map_err(OmniError::storage)?;
         // The manifest publisher refuses to register the same table version a
@@ -12283,7 +12361,7 @@ async fn branch_merge_pure_insert_rejects_source_table_ref_aba_before_arm() {
             .failpoint_publish_table_head_without_index_rebuild_for_test(
                 "source",
                 "node:Person",
-                Some("source"),
+                Some(source_native.as_str()),
             )
             .await?;
         Ok::<_, OmniError>((
@@ -12380,10 +12458,13 @@ async fn branch_merge_pure_insert_rejects_target_table_ref_aba_before_arm() {
         .await
         .unwrap();
     let target_entry = target_snapshot.dataset("node:Person").unwrap();
-    assert_eq!(
-        target_entry.native_dataset_branch.as_deref(),
-        Some("target"),
-        "fixture requires an already-owned target table ref"
+    let target_native = target_entry
+        .native_dataset_branch
+        .clone()
+        .expect("fixture requires an already-owned target table ref");
+    assert!(
+        target_native.starts_with("target--"),
+        "the owned fork must live at the target life's native ref: {target_native}"
     );
     assert_eq!(target_entry.entity_count, main_rows as u64);
     let expected_target_version = target_entry.published_dataset_version;
@@ -12391,12 +12472,7 @@ async fn branch_merge_pure_insert_rejects_target_table_ref_aba_before_arm() {
     let source_head_before = branch_head_commit_id(dir.path(), "source").await.unwrap();
 
     let person_uri = node_table_uri(&db, "Person").await;
-    let old_target = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap();
+    let old_target = helpers::open_dataset_head(&person_uri, Some("target")).await;
     assert_eq!(old_target.version().version, expected_target_version);
     let old_target_identifier = old_target.branch_identifier().await.unwrap();
 
@@ -12419,7 +12495,7 @@ async fn branch_merge_pure_insert_rejects_target_table_ref_aba_before_arm() {
     let target_ref_path = std::path::Path::new(&person_uri)
         .join("_refs")
         .join("branches")
-        .join("target.json");
+        .join(format!("{target_native}.json"));
     let replacement_result = (|| {
         let bytes = std::fs::read(&target_ref_path)?;
         let mut contents: lance::dataset::refs::BranchContents = serde_json::from_slice(&bytes)
@@ -12447,12 +12523,7 @@ async fn branch_merge_pure_insert_rejects_target_table_ref_aba_before_arm() {
         replacement_identifier, old_target_identifier,
         "raw ref replacement must mint a distinct native target-table incarnation"
     );
-    let replacement_target = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap();
+    let replacement_target = helpers::open_dataset_head(&person_uri, Some("target")).await;
     assert_eq!(
         replacement_target.version().version,
         expected_target_version,
@@ -12516,12 +12587,7 @@ async fn branch_merge_pure_insert_rejects_target_table_ref_aba_before_arm() {
         !target_names.iter().any(|name| name == "source-only"),
         "source-only row leaked into rejected target merge: {target_names:?}"
     );
-    let final_target = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("target")
-        .await
-        .unwrap();
+    let final_target = helpers::open_dataset_head(&person_uri, Some("target")).await;
     assert_eq!(final_target.version().version, expected_target_version);
     assert_eq!(
         final_target.branch_identifier().await.unwrap(),
@@ -12560,7 +12626,7 @@ async fn assert_branch_merge_first_touch_ref_is_recovered(
     let person_uri = node_table_uri(&db, "Person").await;
     let person = lance::Dataset::open(&person_uri).await.unwrap();
     assert!(
-        !person.list_branches().await.unwrap().contains_key("target"),
+        helpers::native_ref_for(&person, "target").await.is_none(),
         "fixture requires the target table ref to be lazy"
     );
 
@@ -12586,7 +12652,7 @@ async fn assert_branch_merge_first_touch_ref_is_recovered(
 
     let person = lance::Dataset::open(&person_uri).await.unwrap();
     assert_eq!(
-        person.list_branches().await.unwrap().contains_key("target"),
+        helpers::native_ref_for(&person, "target").await.is_some(),
         ref_exists_before_recovery,
         "fixture must stop at the intended sidecar/ref boundary"
     );
@@ -12596,7 +12662,7 @@ async fn assert_branch_merge_first_touch_ref_is_recovered(
     assert!(!sidecar_path.exists());
     let person = lance::Dataset::open(&person_uri).await.unwrap();
     assert!(
-        !person.list_branches().await.unwrap().contains_key("target"),
+        helpers::native_ref_for(&person, "target").await.is_none(),
         "Full recovery must reclaim an unpublished first-touch target ref"
     );
     assert_eq!(

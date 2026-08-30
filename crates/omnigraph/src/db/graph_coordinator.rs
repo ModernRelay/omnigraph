@@ -296,6 +296,25 @@ impl GraphCoordinator {
         self.bound_branch.as_deref()
     }
 
+    /// The Lance ref this coordinator's manifest is checked out on (issue
+    /// #562): the current life's `{logical}--{ulid}` native ref, the bare
+    /// name for legacy branches, `None` for main. Lance-facing table opens,
+    /// forks, and persisted `native_dataset_branch` values address this;
+    /// [`Self::current_branch`] stays the logical name for heads, lineage,
+    /// Cedar, and errors.
+    pub(crate) fn native_branch(&self) -> Option<&str> {
+        self.manifest.native_branch_ref()
+    }
+
+    /// Batch logical-to-native resolution with one registry read; see
+    /// `ManifestCoordinator::resolve_native_branch_refs`.
+    pub(crate) async fn resolve_native_branch_refs(
+        &self,
+        logicals: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        self.manifest.resolve_native_branch_refs(logicals).await
+    }
+
     pub async fn refresh(&mut self) -> Result<()> {
         match self.manifest.refresh_with_lineage().await? {
             LineageRefresh::Replace(rows) => self.commit_graph.replace_from_manifest_rows(rows),

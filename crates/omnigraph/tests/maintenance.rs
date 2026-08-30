@@ -1640,11 +1640,13 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
             "cleanup must reclaim the manifest-unreferenced Person fork on the live branch"
         );
     }
-    // ...but the legitimate Company fork on the same live branch is kept.
+    // ...but the legitimate Company fork on the same live branch is kept
+    // (the engine forked it at the feature life's `feature--{ulid}` native
+    // ref, issue #562).
     {
         let ds = Dataset::open(&company_uri).await.unwrap();
         assert!(
-            ds.list_branches().await.unwrap().contains_key("feature"),
+            helpers::native_ref_for(&ds, "feature").await.is_some(),
             "cleanup must NOT reclaim a legitimately-forked table on a live branch"
         );
     }

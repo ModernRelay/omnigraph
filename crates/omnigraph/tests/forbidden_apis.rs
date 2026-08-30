@@ -268,6 +268,11 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "snapshot_at_graph_manifest_version"),
     ("db/omnigraph.rs", "export_jsonl"),
     ("db/omnigraph.rs", "export_jsonl_to_writer"),
+    // Added by #570 without registration (pre-existing red at 12e23d81):
+    // unordered export delegates to the same export read path; the base-paths
+    // probe is a relocation-audit read of the manifest dataset.
+    ("db/omnigraph.rs", "export_jsonl_unordered_to_writer"),
+    ("db/omnigraph.rs", "manifest_has_external_base_paths"),
     ("db/omnigraph.rs", "graph_index"),
     ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),
@@ -292,6 +297,18 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "open_exact_genesis_with_storage",
+    ),
+    // Issue #562: batch logical-to-native resolution — one registry READ from
+    // a fresh root open; commits nothing.
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "resolve_native_branch_refs",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "resolve_native_branch_refs",
     ),
     ("db/graph_coordinator.rs", "GraphCoordinator", "open"),
     (
@@ -652,6 +669,12 @@ gateway_surfaces! {
     "db/manifest/publisher.rs" => "GraphNamespacePublisher" => GatewayDisposition::ReadOrPure => [
         "new_with_session",
     ],
+    // Issue #562: the branch-registry row commit is the branch lifecycle's
+    // existence authority; row-level CAS on `object_id` via the same
+    // merge-insert gateway the version publisher uses.
+    "db/manifest/publisher.rs" => "GraphNamespacePublisher" => GatewayDisposition::Durable(WriteProtocol::Composed("branch registry CAS commit")) => [
+        "commit_branch_registration",
+    ],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -681,7 +704,7 @@ durable_calls! {
     // (A `table_version_management` config key is deliberately not written:
     // neither the pinned Lance substrate nor this crate reads it.)
     ("db/manifest/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
-    ("db/manifest/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    ("db/manifest/publisher.rs", ".dataset()", 3, WriteProtocol::ReadOnlyAccess),
     ("db/manifest/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
     ("db/manifest/publisher.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest/publisher.rs", ".execute_reader(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),

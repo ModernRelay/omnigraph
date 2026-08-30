@@ -1379,24 +1379,34 @@ async fn reconcile_orphaned_branches_with_catalog(
             if branch == "main" || crate::db::is_internal_system_branch(&branch) {
                 continue;
             }
-            let is_orphan = if !live_branches.contains(&branch) {
-                true // origin 1: whole branch gone from the manifest
+            // `branch` is the Lance ref name — native `{logical}--{ulid}` for
+            // registered lives, bare for legacy forks (issue #562). Liveness
+            // and snapshot resolution speak the LOGICAL name; the placement
+            // compare keeps the native ref, so a dead life's ULID-suffixed
+            // ref (registry row dead/absent → origin 1, or the logical name
+            // reborn onto a different native ref → origin 2) classifies as an
+            // orphan while the current life's ref stays legitimate.
+            let logical = crate::db::branch_identity::split_native_branch_ref(&branch)
+                .0
+                .to_string();
+            let is_orphan = if !live_branches.contains(&logical) {
+                true // origin 1: whole logical branch gone from the manifest
             } else {
                 // origin 2: live branch, but does the manifest place THIS
                 // table on it? Resolve (and cache) the branch's snapshot.
-                if failed_branch_snapshots.contains(&branch) {
+                if failed_branch_snapshots.contains(&logical) {
                     continue;
                 }
-                if !branch_snapshots.contains_key(&branch) {
+                if !branch_snapshots.contains_key(&logical) {
                     let branch_snapshot = match crate::failpoints::maybe_fail(
                         crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
                     ) {
-                        Ok(()) => db.snapshot_for_branch(Some(&branch)).await,
+                        Ok(()) => db.snapshot_for_branch(Some(&logical)).await,
                         Err(injected) => Err(injected),
                     };
                     match branch_snapshot {
                         Ok(snap) => {
-                            branch_snapshots.insert(branch.clone(), snap);
+                            branch_snapshots.insert(logical.clone(), snap);
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -1407,12 +1417,12 @@ async fn reconcile_orphaned_branches_with_catalog(
                                 "resolving branch snapshot failed during reconcile; skipping",
                             );
                             stats.failures.push((table_key.clone(), err.to_string()));
-                            failed_branch_snapshots.insert(branch.clone());
+                            failed_branch_snapshots.insert(logical.clone());
                             continue;
                         }
                     }
                 }
-                branch_snapshots[&branch]
+                branch_snapshots[&logical]
                     .datasets()
                     .find(|entry| entry.identity == identity)
                     .map(|e| e.native_dataset_branch.as_deref() != Some(branch.as_str()))
@@ -1437,9 +1447,14 @@ async fn reconcile_orphaned_branches_with_catalog(
             // it is no longer an orphan — skip it. (Cross-process writers remain
             // the documented one-winner-CAS gap.) One key held at a time → no
             // lock-order inversion against multi-table `acquire_many` writers.
+            // Per-(table, branch) queues key by the LOGICAL name (shared
+            // vocabulary with every writer); the ref under reclaim is native.
+            let logical = crate::db::branch_identity::split_native_branch_ref(&branch)
+                .0
+                .to_string();
             let _guard = db
                 .write_queue()
-                .acquire(&(table_key.clone(), Some(branch.clone())))
+                .acquire(&(table_key.clone(), Some(logical)))
                 .await;
             // Decide under the queue from FRESH authority via the shared
             // classifier (same decision the write-path reclaim uses) — never

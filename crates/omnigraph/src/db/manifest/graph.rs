@@ -163,7 +163,7 @@ pub(super) async fn open_exact_genesis_manifest(
     control_session: &Arc<lance::session::Session>,
 ) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_MANIFEST_CREATE_PROBE)?;
-    let (dataset, known_state, lineage_rows, _) =
+    let (dataset, known_state, lineage_rows, _, _) =
         open_manifest_graph_with_lineage(root_uri, None, control_session).await?;
 
     // `read_manifest_state_and_lineage` intentionally folds head rows into a
@@ -247,15 +247,17 @@ pub(super) async fn open_manifest_graph(
     Dataset,
     ManifestState,
     lance::dataset::refs::BranchIdentifier,
+    Option<String>,
 )> {
-    let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
-        root_uri.trim_end_matches('/'),
-        branch,
-        control_session,
-    )
-    .await?;
+    let (dataset, branch_identifier, native_branch_ref) =
+        open_manifest_dataset_with_identifier_with_session(
+            root_uri.trim_end_matches('/'),
+            branch,
+            control_session,
+        )
+        .await?;
     let known_state = read_manifest_state(&dataset).await?;
-    Ok((dataset, known_state, branch_identifier))
+    Ok((dataset, known_state, branch_identifier, native_branch_ref))
 }
 
 pub(super) async fn open_manifest_graph_with_lineage(
@@ -267,15 +269,23 @@ pub(super) async fn open_manifest_graph_with_lineage(
     ManifestState,
     Vec<GraphLineageRow>,
     lance::dataset::refs::BranchIdentifier,
+    Option<String>,
 )> {
-    let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
-        root_uri.trim_end_matches('/'),
-        branch,
-        control_session,
-    )
-    .await?;
+    let (dataset, branch_identifier, native_branch_ref) =
+        open_manifest_dataset_with_identifier_with_session(
+            root_uri.trim_end_matches('/'),
+            branch,
+            control_session,
+        )
+        .await?;
     let (known_state, lineage_rows) = read_manifest_state_and_lineage(&dataset).await?;
-    Ok((dataset, known_state, lineage_rows, branch_identifier))
+    Ok((
+        dataset,
+        known_state,
+        lineage_rows,
+        branch_identifier,
+        native_branch_ref,
+    ))
 }
 
 pub(super) async fn snapshot_state_at(

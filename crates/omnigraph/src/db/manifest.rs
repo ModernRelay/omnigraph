@@ -52,8 +52,10 @@ use metadata::{
 };
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
+use publisher::{
+    BranchRegistryExpectation, GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome,
+};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
-use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 #[cfg(test)]
 pub(crate) use recovery::MAX_EFFECT_IDENTITY_SCAN_VERSIONS;
 pub(crate) use recovery::{
@@ -72,11 +74,11 @@ pub(crate) use recovery::{
 pub use state::DatasetEntry;
 #[cfg(test)]
 use state::string_column;
-pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 use state::{
-    ManifestState, ProjectionAccumulator, fold_projection_delta, read_manifest_projection,
-    read_manifest_state, read_object_identities_at_offsets,
+    BranchRegistration, ManifestState, ProjectionAccumulator, fold_projection_delta,
+    read_manifest_projection, read_manifest_state, read_object_identities_at_offsets,
 };
+pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
 /// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
@@ -98,6 +100,17 @@ const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
 /// `object_id` prefix of the head rows — one constant for row minting, row
 /// decode, and the incremental fold's dead-row classification.
 pub(super) const GRAPH_HEAD_OBJECT_ID_PREFIX: &str = "graph_head:";
+/// Mutable per-logical-branch registry row (issue #562): maps the user-facing
+/// logical branch name to the native ref carrying its current life's
+/// incarnation token (`{logical}--{ulid}`, see `db/branch_identity`).
+/// `object_id` is `branch:<logical>`; the merge-insert row-level CAS on
+/// `object_id` is what serializes racing creates/deletes of one logical name.
+/// Lives ONLY in the root (main) `__manifest`; rows inherited into branch
+/// clones by the shallow fork are ignored there (resolution always reads the
+/// root manifest). Absent row + live bare ref = a legacy pre-registry branch.
+const OBJECT_TYPE_BRANCH: &str = "branch";
+/// `object_id` prefix of branch-registry rows.
+pub(super) const BRANCH_OBJECT_ID_PREFIX: &str = "branch:";
 
 /// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
 /// `table_branch`/`manifest_branch` encode main as null, but `object_id` must be
@@ -539,10 +552,19 @@ impl ManifestIncarnation {
 pub(crate) struct CapturedManifestProbe {
     dataset: Dataset,
     active_branch: Option<String>,
+    /// The Lance ref `dataset` is checked out on (issue #562): the captured
+    /// life's `{logical}--{ulid}` native ref, the bare name for legacy
+    /// branches, `None` for main. Identity of the capture, not authority —
+    /// Lance-facing table writes prepared from this capture address it.
+    native_branch_ref: Option<String>,
     captured: ManifestIncarnation,
 }
 
 impl CapturedManifestProbe {
+    pub(crate) fn native_branch_ref(&self) -> Option<&str> {
+        self.native_branch_ref.as_deref()
+    }
+
     pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
         crate::instrumentation::record_probe();
         probe_dataset_latest_incarnation(&self.dataset, self.active_branch.as_deref()).await
@@ -799,6 +821,11 @@ pub(crate) struct ManifestCoordinator {
     /// `known_state`. A named ref keeps this value across ordinary commits and
     /// receives a new value after delete/recreate.
     branch_identifier: lance::dataset::refs::BranchIdentifier,
+    /// The Lance ref `dataset` is actually checked out on: the current life's
+    /// `{logical}--{ulid}` native ref for registered branches, the bare name
+    /// for legacy branches, `None` for main. `active_branch` stays LOGICAL —
+    /// head keys, lineage, and errors all speak the logical name.
+    native_branch_ref: Option<String>,
     publisher: Arc<dyn ManifestBatchPublisher>,
     /// Retained fold accumulators of the projection, tagged with the manifest
     /// version they describe; `refresh_with_lineage` folds only the catalog
@@ -839,6 +866,7 @@ impl ManifestCoordinator {
         known_state: ManifestState,
         active_branch: Option<String>,
         branch_identifier: lance::dataset::refs::BranchIdentifier,
+        native_branch_ref: Option<String>,
         publisher: Arc<dyn ManifestBatchPublisher>,
     ) -> Self {
         Self {
@@ -847,6 +875,7 @@ impl ManifestCoordinator {
             known_state,
             active_branch,
             branch_identifier,
+            native_branch_ref,
             publisher,
             projection: None,
         }
@@ -858,6 +887,7 @@ impl ManifestCoordinator {
         known_state: ManifestState,
         active_branch: Option<String>,
         branch_identifier: lance::dataset::refs::BranchIdentifier,
+        native_branch_ref: Option<String>,
     ) -> Self {
         let publisher =
             Self::default_batch_publisher(root_uri, active_branch.as_deref(), dataset.session());
@@ -867,6 +897,7 @@ impl ManifestCoordinator {
             known_state,
             active_branch,
             branch_identifier,
+            native_branch_ref,
             publisher,
         )
     }
@@ -950,6 +981,7 @@ impl ManifestCoordinator {
                 known_state,
                 None,
                 lance::dataset::refs::BranchIdentifier::main(),
+                None,
             ),
             lineage_rows,
         ))
@@ -971,6 +1003,7 @@ impl ManifestCoordinator {
                 known_state,
                 None,
                 lance::dataset::refs::BranchIdentifier::main(),
+                None,
             ),
             lineage_rows,
         ))
@@ -987,7 +1020,7 @@ impl ManifestCoordinator {
         control_session: &Arc<lance::session::Session>,
     ) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state, branch_identifier) =
+        let (dataset, known_state, branch_identifier, native_branch_ref) =
             open_manifest_graph(root, None, control_session).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
@@ -995,6 +1028,7 @@ impl ManifestCoordinator {
             known_state,
             None,
             branch_identifier,
+            native_branch_ref,
         ))
     }
 
@@ -1014,7 +1048,7 @@ impl ManifestCoordinator {
         }
 
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state, branch_identifier) =
+        let (dataset, known_state, branch_identifier, native_branch_ref) =
             open_manifest_graph(root, Some(branch), control_session).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
@@ -1022,6 +1056,7 @@ impl ManifestCoordinator {
             known_state,
             Some(branch.to_string()),
             branch_identifier,
+            native_branch_ref,
         ))
     }
 
@@ -1052,7 +1087,7 @@ impl ManifestCoordinator {
         // Retain the fold accumulators alongside the state (the incremental merge-authority projection): the
         // scan this open pays anyway becomes the base a later refresh folds
         // deltas into, instead of a sunk cost repeated per refresh.
-        let (dataset, branch_identifier) =
+        let (dataset, branch_identifier, native_branch_ref) =
             open_manifest_dataset_with_identifier_with_session(root, branch, control_session)
                 .await?;
         let (known_state, projection, lineage_rows) = read_manifest_projection(&dataset).await?;
@@ -1063,6 +1098,7 @@ impl ManifestCoordinator {
             known_state,
             branch.map(str::to_string),
             branch_identifier,
+            native_branch_ref,
         );
         coordinator.projection = Some((projection_version, projection));
         Ok((coordinator, lineage_rows))
@@ -1105,7 +1141,17 @@ impl ManifestCoordinator {
     ) -> Result<bool> {
         let root = root_uri.trim_end_matches('/');
         let dataset =
-            open_manifest_dataset_with_session(root, candidate_branch, control_session).await?;
+            match open_manifest_dataset_with_session(root, candidate_branch, control_session).await
+            {
+                Ok(dataset) => dataset,
+                // A registered candidate in the create crash window (live
+                // row, native ref unmade) has no `__manifest` clone and
+                // therefore no `table_branch` entries: no dependency. Forward
+                // recovery completes its ref on the candidate's next
+                // resolution by logical name.
+                Err(OmniError::BranchNotFound { .. }) => return Ok(false),
+                Err(error) => return Err(error),
+            };
         let snapshot = Self::snapshot_from_state(root, read_manifest_state(&dataset).await?);
         Ok(snapshot
             .datasets()
@@ -1125,6 +1171,7 @@ impl ManifestCoordinator {
         CapturedManifestProbe {
             dataset: self.dataset.clone(),
             active_branch: self.active_branch.clone(),
+            native_branch_ref: self.native_branch_ref.clone(),
             captured: self.incarnation(),
         }
     }
@@ -1147,17 +1194,19 @@ impl ManifestCoordinator {
         }
         crate::instrumentation::record_projection_full_refresh();
         let control_session = self.dataset.session();
-        let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
-            &self.root_uri,
-            self.active_branch.as_deref(),
-            &control_session,
-        )
-        .await?;
+        let (dataset, branch_identifier, native_branch_ref) =
+            open_manifest_dataset_with_identifier_with_session(
+                &self.root_uri,
+                self.active_branch.as_deref(),
+                &control_session,
+            )
+            .await?;
         let (known_state, projection, lineage_rows) = read_manifest_projection(&dataset).await?;
         let projection_version = dataset.version().version;
         self.dataset = dataset;
         self.known_state = known_state;
         self.branch_identifier = branch_identifier;
+        self.native_branch_ref = native_branch_ref;
         self.projection = Some((projection_version, projection));
         Ok(LineageRefresh::Replace(lineage_rows))
     }
@@ -1188,7 +1237,10 @@ impl ManifestCoordinator {
             return Ok(None);
         }
         let control_session = self.dataset.session();
-        let (new_dataset, new_identifier) = open_manifest_dataset_with_identifier_with_session(
+        // The identifier equality check below proves the same branch life, and
+        // a life never changes its native ref — so the re-resolved ref is
+        // discarded rather than installed.
+        let (new_dataset, new_identifier, _) = open_manifest_dataset_with_identifier_with_session(
             &self.root_uri,
             self.active_branch.as_deref(),
             &control_session,
@@ -1331,12 +1383,13 @@ impl ManifestCoordinator {
         projection_has_head: impl FnOnce(&str) -> bool,
     ) -> Result<Option<Vec<GraphLineageRow>>> {
         let control_session = self.dataset.session();
-        let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
-            &self.root_uri,
-            self.active_branch.as_deref(),
-            &control_session,
-        )
-        .await?;
+        let (dataset, branch_identifier, native_branch_ref) =
+            open_manifest_dataset_with_identifier_with_session(
+                &self.root_uri,
+                self.active_branch.as_deref(),
+                &control_session,
+            )
+            .await?;
         let known_state = read_manifest_state(&dataset).await?;
         let branch_key = self
             .active_branch
@@ -1355,6 +1408,7 @@ impl ManifestCoordinator {
         self.dataset = dataset;
         self.known_state = known_state;
         self.branch_identifier = branch_identifier;
+        self.native_branch_ref = native_branch_ref;
         // Same staleness rule as the post-publish fold: this refresh advances
         // `dataset` without folding the projection accumulators, so they must
         // not survive it.
@@ -1516,6 +1570,14 @@ impl ManifestCoordinator {
         Ok(self.branch_identifier.clone())
     }
 
+    /// The Lance ref this coordinator's manifest dataset is checked out on:
+    /// the current life's native ref for registered branches, the bare name
+    /// for legacy branches, `None` for main. Lance-facing lifecycle callers
+    /// address this; everything user-facing keeps `active_branch` (logical).
+    pub(crate) fn native_branch_ref(&self) -> Option<&str> {
+        self.native_branch_ref.as_deref()
+    }
+
     /// Exact materialized `graph_head:<active-branch>` from the same pinned
     /// manifest version as [`Self::snapshot`]. This is write authority, not a
     /// lineage-cache query: a read may refresh only the manifest, so consulting
@@ -1546,40 +1608,171 @@ impl ManifestCoordinator {
         probe_dataset_latest_incarnation(&self.dataset, self.active_branch.as_deref()).await
     }
 
+    /// Create one new life of the logical branch `name` (issue #562).
+    ///
+    /// Create order: the registry row on the ROOT `__manifest` is the
+    /// existence authority and commits FIRST (`AbsentOrDead` fences a racing
+    /// create of the same logical name); the per-life native ref is created
+    /// after it. If the native create below fails, the row stays live with no
+    /// ref — that is the documented crash window, and forward recovery
+    /// (`complete_registered_branch_ref`) completes the ref on the next
+    /// resolution of this logical name. The error is still returned.
     pub(crate) async fn create_branch(&mut self, name: &str) -> Result<()> {
+        if crate::db::is_internal_system_branch(name) {
+            // Internal system refs (e.g. the schema-apply lock) stay
+            // un-namespaced and unregistered (issue #562): resolution passes
+            // them through bare, and their lifecycle must not commit registry
+            // rows on the root manifest.
+            let mut ds = self.dataset.clone();
+            return match crate::branch_control::create_branch_recoverably(
+                &mut ds,
+                name,
+                self.version(),
+            )
+            .await?
+            {
+                crate::branch_control::BranchCreateOutcome::Created(_) => Ok(()),
+                crate::branch_control::BranchCreateOutcome::RefAlreadyExists => Err(
+                    OmniError::manifest_conflict(format!("branch '{}' already exists", name)),
+                ),
+            };
+        }
+        let incarnation = crate::db::branch_identity::mint_branch_incarnation();
+        let native = crate::db::branch_identity::native_branch_ref(name, &incarnation);
+        // Validate the native ref name BEFORE the registry commit: the commit
+        // is the existence authority, and a name Lance would reject must fail
+        // here with no durable effect — otherwise an invalid name leaves a
+        // poison live-refless row that forward recovery can never complete.
+        lance::dataset::refs::check_valid_branch(&native).map_err(OmniError::storage)?;
+        let registration = BranchRegistration {
+            logical: name.to_string(),
+            native_ref: native.clone(),
+            incarnation,
+            live: true,
+            source_ref: self.native_branch_ref.clone(),
+            source_version: self.version(),
+        };
+        GraphNamespacePublisher::new_with_session(&self.root_uri, None, self.dataset.session())
+            .commit_branch_registration(&registration, &BranchRegistryExpectation::AbsentOrDead)
+            .await?;
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::BRANCH_CREATE_POST_REGISTRY_PRE_NATIVE,
+        )?;
         let mut ds = self.dataset.clone();
-        match crate::branch_control::create_branch_recoverably(&mut ds, name, self.version())
+        match crate::branch_control::create_branch_recoverably(&mut ds, &native, self.version())
             .await?
         {
             crate::branch_control::BranchCreateOutcome::Created(_) => Ok(()),
-            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => Err(
-                OmniError::manifest_conflict(format!("branch '{}' already exists", name)),
-            ),
+            // The native ref carries a freshly minted per-life ULID, so it can
+            // already exist only because forward recovery completed this same
+            // registration concurrently — that is success, not a name clash.
+            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => Ok(()),
         }
+    }
+
+    /// Map each LOGICAL branch name to its current life's native ref with ONE
+    /// root-manifest registry read (issue #562): live row → the native ref,
+    /// no row → the bare name (legacy), dead row → omitted. For callers that
+    /// probe many branches and must not pay a registry scan per branch.
+    pub(crate) async fn resolve_native_branch_refs(
+        &self,
+        logicals: &[String],
+    ) -> Result<HashMap<String, String>> {
+        let ds = self.open_branch_control_dataset().await?;
+        let registry = state::read_branch_registry(&ds).await?;
+        Ok(logicals
+            .iter()
+            .filter_map(|logical| match registry.get(logical) {
+                Some(row) if row.live => Some((logical.clone(), row.native_ref.clone())),
+                Some(_) => None,
+                None => Some((logical.clone(), logical.clone())),
+            })
+            .collect())
     }
 
     async fn open_branch_control_dataset(&self) -> Result<Dataset> {
         let uri = manifest_uri(&self.root_uri);
+        // Zero-cache control session, NOT the default session: this open is
+        // an authority read (registry rows, delete dependency probes) and
+        // "Latest" must resolve against storage, never a long-lived handle's
+        // cached version listing — the exact staleness class issue #562
+        // exists to kill.
         crate::instrumentation::open_dataset(
             &uri,
             crate::instrumentation::VersionResolution::Latest,
-            None,
+            Some(&crate::lance_access::control_session()),
             crate::instrumentation::manifest_wrapper(),
         )
         .await
     }
 
+    /// Commit the dead registry row that is a registered branch delete's
+    /// authority change (issue #562). Delete order: this dead-row commit lands
+    /// FIRST (`LiveWithNativeRef` fences a racing delete or rebirth of the
+    /// logical name); the native ref delete follows. A crash between them
+    /// leaves a dead row whose native tree lingers, invisible to users:
+    /// table-level fork garbage is reclaimed by the orphan reconciler, while
+    /// the manifest-level ref itself waits for manual cleanup.
+    async fn commit_branch_dead_row(&self, registration: &BranchRegistration) -> Result<()> {
+        let mut dead = registration.clone();
+        dead.live = false;
+        GraphNamespacePublisher::new_with_session(&self.root_uri, None, self.dataset.session())
+            .commit_branch_registration(
+                &dead,
+                &BranchRegistryExpectation::LiveWithNativeRef(registration.native_ref.clone()),
+            )
+            .await
+    }
+
     pub(crate) async fn delete_branch(&mut self, name: &str) -> Result<()> {
         let mut ds = self.open_branch_control_dataset().await?;
-        let branches = list_branch_contents(&ds).await?;
-        let expected_identifier = branches
-            .get(name)
-            .ok_or_else(|| OmniError::manifest_not_found(format!("branch '{}' not found", name)))?
-            .identifier
-            .clone();
-        crate::branch_control::delete_branch_recoverably(&mut ds, name, &expected_identifier)
-            .await?;
-        Ok(())
+        let registry = state::read_branch_registry(&ds).await?;
+        match registry.get(name) {
+            Some(row) if row.live => {
+                let native = row.native_ref.clone();
+                let expected_identifier = list_branch_contents(&ds)
+                    .await?
+                    .get(&native)
+                    .map(|contents| contents.identifier.clone());
+                self.commit_branch_dead_row(row).await?;
+                match expected_identifier {
+                    Some(expected_identifier) => {
+                        crate::branch_control::delete_branch_recoverably(
+                            &mut ds,
+                            &native,
+                            &expected_identifier,
+                        )
+                        .await
+                    }
+                    // Create's crash window: the row was live but its native
+                    // ref was never made. The dead-row commit above already
+                    // removed the branch; any partial tree is reconciler
+                    // garbage.
+                    None => Ok(()),
+                }
+            }
+            Some(_) => Err(OmniError::manifest_not_found(format!(
+                "branch '{}' not found",
+                name
+            ))),
+            // Legacy branch: bare ref, no registry row, no dead row to write.
+            None => {
+                let branches = list_branch_contents(&ds).await?;
+                let expected_identifier = branches
+                    .get(name)
+                    .ok_or_else(|| {
+                        OmniError::manifest_not_found(format!("branch '{}' not found", name))
+                    })?
+                    .identifier
+                    .clone();
+                crate::branch_control::delete_branch_recoverably(
+                    &mut ds,
+                    name,
+                    &expected_identifier,
+                )
+                .await
+            }
+        }
     }
 
     /// Delete `name` only if its live Lance BranchContents still has the exact
@@ -1596,30 +1789,156 @@ impl ManifestCoordinator {
         expected_identifier: &lance::dataset::refs::BranchIdentifier,
     ) -> Result<()> {
         let mut ds = self.open_branch_control_dataset().await?;
-        crate::branch_control::delete_branch_recoverably(&mut ds, name, expected_identifier).await
+        let registry = state::read_branch_registry(&ds).await?;
+        match registry.get(name) {
+            Some(row) if row.live => {
+                let native = row.native_ref.clone();
+                // The identifier check must precede the dead-row commit: the
+                // commit is the authority change, and a stale caller (captured
+                // against an earlier life) must fail here rather than kill the
+                // current life's row first. `delete_branch_recoverably`
+                // re-checks the same CAS after the commit. An ABSENT ref is
+                // equally a refusal: a captured identifier can never match a
+                // ref that does not exist (the create crash window), so the
+                // caller's claim is stale by construction.
+                match list_branch_contents(&ds).await?.get(&native) {
+                    Some(contents) if contents.identifier == *expected_identifier => {}
+                    Some(contents) => {
+                        return Err(OmniError::manifest_read_set_changed(
+                            format!("branch_identifier:{name}"),
+                            Some(crate::branch_control::encode_identifier(
+                                expected_identifier,
+                            )?),
+                            Some(crate::branch_control::encode_identifier(
+                                &contents.identifier,
+                            )?),
+                        ));
+                    }
+                    None => {
+                        return Err(OmniError::manifest_read_set_changed(
+                            format!("branch_identifier:{name}"),
+                            Some(crate::branch_control::encode_identifier(
+                                expected_identifier,
+                            )?),
+                            None,
+                        ));
+                    }
+                }
+                self.commit_branch_dead_row(row).await?;
+                crate::branch_control::delete_branch_recoverably(
+                    &mut ds,
+                    &native,
+                    expected_identifier,
+                )
+                .await
+            }
+            Some(_) => Err(OmniError::manifest_not_found(format!(
+                "branch '{}' not found",
+                name
+            ))),
+            None => {
+                crate::branch_control::delete_branch_recoverably(&mut ds, name, expected_identifier)
+                    .await
+            }
+        }
     }
 
+    /// The user-visible (logical) branch list (issue #562): live registry rows
+    /// own their logical names; legacy branches surface as bare refs with no
+    /// registry row. Per-life ULID-suffixed native refs never appear — a ref
+    /// carrying an incarnation token is a current life's storage name or a
+    /// dead life's garbage, and a bare ref whose logical name has ANY registry
+    /// row is excluded because the registry, not the ref, is that name's
+    /// existence authority (resolution rejects it the same way). The registry
+    /// MUST come from the ROOT manifest — branch clones inherit stale registry
+    /// rows from their fork point.
     pub async fn list_graph_branches(&self) -> Result<Vec<String>> {
-        let branches = list_branch_contents(&self.dataset).await?;
-        let mut names: Vec<String> = branches.into_keys().filter(|name| name != "main").collect();
-        names.sort();
+        // Registry rows are read from the ROOT at Latest, always: a pinned
+        // view misses rows committed after the pin (including this handle's
+        // OWN create/delete, which commit through a fresh publisher), and a
+        // branch clone inherits stale rows from its fork point. Costs one
+        // root open per listing; the listing itself is not on the hot path.
+        let ds = self.open_branch_control_dataset().await?;
+        let registry = state::read_branch_registry(&ds).await?;
+        let branches = list_branch_contents(&ds).await?;
+        let mut names: std::collections::BTreeSet<String> = registry
+            .values()
+            .filter(|row| row.live)
+            .map(|row| row.logical.clone())
+            .collect();
+        for name in branches.keys() {
+            if name == "main" {
+                continue;
+            }
+            let (logical, _) = crate::db::branch_identity::split_native_branch_ref(name);
+            match registry.get(logical) {
+                // The row is the authority when in view: dead excludes the
+                // name, live already listed it above.
+                Some(_) => {}
+                // No row in view: a legacy bare ref, or a life committed
+                // after this handle pinned its root manifest (refs list
+                // LIVE, registry rows ride the pinned state). List it by
+                // its logical name, matching the pre-#562 live-ref view.
+                None => {
+                    names.insert(logical.to_string());
+                }
+            }
+        }
         let mut all = vec!["main".to_string()];
         all.extend(names);
         Ok(all)
     }
 
+    /// Transitive descendants of the LOGICAL branch `name`, in logical names.
+    /// `BranchContents.parent_branch` records the NATIVE source ref of the
+    /// fork, so both ends map back to logical: a child ref counts only while
+    /// it is a live branch (its live registry row names it, or it is a legacy
+    /// bare ref with no row), and a parent ref reduces to its logical name by
+    /// splitting off the incarnation token — a fork from ANY life of `name`
+    /// descends from `name`.
     pub async fn descendant_branches(&self, name: &str) -> Result<Vec<String>> {
-        let branches = list_branch_contents(&self.dataset).await?;
+        // Same always-fresh open policy as `list_graph_branches`.
+        let ds = self.open_branch_control_dataset().await?;
+        let registry = state::read_branch_registry(&ds).await?;
+        let branches = list_branch_contents(&ds).await?;
+        let mut logical_by_ref: HashMap<&str, &str> = HashMap::new();
+        for ref_name in branches.keys() {
+            let (split_logical, _) = crate::db::branch_identity::split_native_branch_ref(ref_name);
+            match registry.get(split_logical) {
+                // Row in view: it owns the name — only its exact current
+                // native ref counts as a live branch; other lives' refs are
+                // garbage.
+                Some(row) => {
+                    if row.live && row.native_ref == *ref_name {
+                        logical_by_ref.insert(ref_name.as_str(), row.logical.as_str());
+                    }
+                }
+                // No row in view: legacy bare ref, or a life committed after
+                // this handle pinned its root state (refs list LIVE). Treat
+                // it as that logical branch, matching the pre-#562 view.
+                None => {
+                    logical_by_ref.insert(ref_name.as_str(), split_logical);
+                }
+            }
+        }
+
         let mut frontier = vec![name.to_string()];
         let mut descendants = Vec::new();
         let mut seen = HashSet::new();
+        // A rebirth can fork from a stale coordinator still pinned on an older
+        // life of the same logical name; seeding `seen` keeps the queried name
+        // out of its own descendant set.
+        seen.insert(name.to_string());
 
         while let Some(parent) = frontier.pop() {
             let mut children = branches
                 .iter()
-                .filter_map(|(branch, contents)| {
-                    (contents.parent_branch.as_deref() == Some(parent.as_str()))
-                        .then_some(branch.clone())
+                .filter_map(|(ref_name, contents)| {
+                    let child_logical = *logical_by_ref.get(ref_name.as_str())?;
+                    let parent_ref = contents.parent_branch.as_deref()?;
+                    let (parent_logical, _) =
+                        crate::db::branch_identity::split_native_branch_ref(parent_ref);
+                    (parent_logical == parent).then(|| child_logical.to_string())
                 })
                 .collect::<Vec<_>>();
             children.sort();

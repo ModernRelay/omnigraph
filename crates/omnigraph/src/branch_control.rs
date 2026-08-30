@@ -115,7 +115,7 @@ fn path_collision<'a>(
         .min()
 }
 
-fn encode_identifier(identifier: &BranchIdentifier) -> Result<String> {
+pub(crate) fn encode_identifier(identifier: &BranchIdentifier) -> Result<String> {
     serde_json::to_string(identifier).map_err(|error| {
         OmniError::manifest_internal(format!("failed to encode Lance branch identifier: {error}"))
     })
@@ -194,10 +194,34 @@ pub(crate) async fn create_branch_recoverably(
     branch: &str,
     source_version: u64,
 ) -> Result<BranchCreateOutcome> {
+    create_branch_at_version_inner(source, branch, source_version, true).await
+}
+
+/// Forward-recovery completion of a native branch ref (issue #562): the
+/// branch-registry commit landed (the lifecycle's commit point) but the crash
+/// window left the ref unmade. The source has usually moved past the pinned
+/// fork version by now — forking the HISTORICAL version is exactly what the
+/// registration recorded, so the source-at-head guard is skipped. A
+/// `RefAlreadyExists` outcome is success here: another handle completed the
+/// same registration first.
+pub(crate) async fn complete_branch_ref_at_version(
+    source: &mut Dataset,
+    branch: &str,
+    source_version: u64,
+) -> Result<BranchCreateOutcome> {
+    create_branch_at_version_inner(source, branch, source_version, false).await
+}
+
+async fn create_branch_at_version_inner(
+    source: &mut Dataset,
+    branch: &str,
+    source_version: u64,
+    require_source_at_version: bool,
+) -> Result<BranchCreateOutcome> {
     // Lance validates inside phase 2 today. Validate before phase 1 so an
     // invalid name cannot leave a clone-only zombie.
     check_valid_branch(branch).map_err(OmniError::storage)?;
-    if source.version().version != source_version {
+    if require_source_at_version && source.version().version != source_version {
         return Err(OmniError::manifest_conflict(format!(
             "branch source moved before native create: expected version {}, current {}",
             source_version,

@@ -1109,7 +1109,16 @@ impl StagedMutation {
         // manifest on the happy path.
         let mut queue_keys: Vec<(String, Option<String>)> = Vec::with_capacity(staged.len());
         for entry in &staged {
-            queue_keys.push((entry.table_key.clone(), entry.path.table_branch.clone()));
+            // Queue keys stay LOGICAL — branch lifecycle ops gate per-table
+            // work by the logical name, and mutual exclusion needs one shared
+            // vocabulary. `table_branch` carries the life's native ref
+            // (issue #562), so split the incarnation token back off.
+            let logical_branch = entry.path.table_branch.as_deref().map(|native| {
+                crate::db::branch_identity::split_native_branch_ref(native)
+                    .0
+                    .to_string()
+            });
+            queue_keys.push((entry.table_key.clone(), logical_branch));
         }
         // Total order shared with schema apply: schema gate, branch gate, then
         // sorted per-table gates. Hold the full set through manifest publish.

@@ -4656,7 +4656,11 @@ impl Omnigraph {
         ordered_table_keys.sort();
 
         let mut conflicts = Vec::new();
-        let target_active = self.active_branch().await;
+        // The adopt classifiers and publishers compare against persisted
+        // `native_dataset_branch` values and choose fork targets, so they
+        // speak the target life's NATIVE ref (issue #562), captured with the
+        // target txn's authority.
+        let target_active = target_txn.native_branch().map(str::to_string);
         let mut candidates: HashMap<String, CandidateTableState> = HashMap::new();
         let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
         let mut blob_table_keys = HashSet::new();
@@ -4970,7 +4974,10 @@ impl Omnigraph {
         let final_revalidation_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::FinalRevalidation,
         );
+        // Queue keys and the sidecar's own identity stay LOGICAL; per-table
+        // pins and planned output branches carry the target life's NATIVE ref.
         let active_branch_for_keys = target_branch.map(str::to_string);
+        let target_native = target_txn.native_branch().map(str::to_string);
         let merge_branches = [
             source_branch.map(str::to_string),
             active_branch_for_keys.clone(),
@@ -5132,9 +5139,12 @@ impl Omnigraph {
             let planned_output_branch = match candidate {
                 CandidateTableState::RewriteMerged(_)
                 | CandidateTableState::AdoptWithDelta(_)
-                | CandidateTableState::AdoptPureInserts(_) => active_branch_for_keys.clone(),
+                | CandidateTableState::AdoptPureInserts(_) => target_native.clone(),
                 CandidateTableState::AdoptSourceState { .. } => {
-                    match (target_branch, source_entry.native_dataset_branch.as_deref()) {
+                    match (
+                        target_txn.native_branch(),
+                        source_entry.native_dataset_branch.as_deref(),
+                    ) {
                         (Some(target), Some(_)) => Some(target.to_string()),
                         _ => None,
                     }
@@ -5158,7 +5168,8 @@ impl Omnigraph {
                             table_key
                         ))
                     })?;
-                    let source_fork_version = target_branch
+                    let source_fork_version = target_txn
+                        .native_branch()
                         .filter(|target| entry.native_dataset_branch.as_deref() != Some(*target))
                         .map(|_| entry.published_dataset_version);
                     if source_fork_version.is_some()
@@ -5200,7 +5211,7 @@ impl Omnigraph {
                         expected_version,
                         post_commit_pin: expected_version + 1,
                         confirmed_version: None,
-                        table_branch: active_branch_for_keys.clone(),
+                        table_branch: target_native.clone(),
                     });
                     recovery_effects.push(crate::db::manifest::RecoveryBranchMergeEffect {
                         identity,
@@ -5214,7 +5225,7 @@ impl Omnigraph {
                     });
                 }
                 CandidateTableState::AdoptSourceState { .. } => {
-                    let Some(target) = target_branch else {
+                    let Some(target) = target_txn.native_branch() else {
                         continue;
                     };
                     let creates_target_ref = source_entry.native_dataset_branch.is_some()
@@ -5447,7 +5458,7 @@ impl Omnigraph {
                     }
                 };
                 if first_touch_effects.contains(table_key) {
-                    let target = target_branch.ok_or_else(|| {
+                    let target = target_txn.native_branch().ok_or_else(|| {
                         OmniError::manifest_internal(format!(
                             "first-touch merge effect '{}' has no named target branch",
                             table_key
