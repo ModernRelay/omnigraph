@@ -90,9 +90,12 @@ run as an in-process heal while writers may be active.
 Long-lived handles and write-entry barriers use the concurrency-safe
 roll-forward-only sweep. It takes the same ordered gates, re-reads the artifact
 under those gates, and may publish a complete confirmed outcome with the
-manifest CAS. Anything requiring Restore, destructive compensation, or an
-unproven decision remains on disk for the next Full open and blocks only the
-authority it affects.
+manifest CAS. It may also retire a provably effect-free Armed mutation/load
+intent whose exact transaction-identity classification proves no owned effect,
+under the same one-mutation-process boundary destructive full-recovery
+decisions assume (see invariants.md, current support boundaries). Anything
+requiring Restore, destructive compensation, or an unproven decision remains on
+disk for the next Full open and blocks only the authority it affects.
 
 This split lets the common “all table commits landed; final manifest publish
 failed” case heal without a restart while preserving concurrent writers.
@@ -136,7 +139,10 @@ Native branch create/delete residue is different from a data-table effect.
 When `BranchContents` proves a ref absent, an unreferenced clone-only tree can
 be reclaimed as derived state. A sidecar owning a real graph-table effect may
 not be discarded merely because its target branch was deleted; the complete
-effect/compensation proof still applies.
+effect/compensation proof still applies. Because every branch life has its own
+native ref, a recreated branch never becomes the target of a stale sidecar's
+fork: the dead life's native name resolves to nothing, and its forks are
+orphans for `cleanup`.
 
 ## Maintenance boundary
 

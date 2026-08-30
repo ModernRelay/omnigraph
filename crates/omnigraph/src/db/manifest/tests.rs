@@ -2938,3 +2938,66 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
     // The final DAG is a single linear chain of genesis + 8 = 9, no fork.
     assert_linear_chain(uri, N + 1).await;
 }
+
+/// The incremental fold and a clean full reopen must produce the same state
+/// and lineage. This is an explicit correctness oracle, kept out of the
+/// production refresh path so debug cost tests measure the same I/O shape as a
+/// release build.
+#[tokio::test]
+async fn projection_refresh_matches_clean_full_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let _mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    async fn publish_empty_commit(publisher: &GraphNamespacePublisher) -> Result<()> {
+        let intent = LineageIntent {
+            graph_commit_id: ulid::Ulid::new().to_string(),
+            branch: None,
+            actor_id: None,
+            merged_parent_commit_id: None,
+            created_at: lineage_now_micros(),
+        };
+        publisher
+            .publish(&[], &HashMap::new(), Some(&intent))
+            .await
+            .map(|_| ())
+    }
+    let publisher = GraphNamespacePublisher::new(uri, None);
+    let control_session = crate::lance_access::control_session();
+    let (mut reader, mut folded_lineage) =
+        ManifestCoordinator::open_with_lineage(uri, None, &control_session)
+            .await
+            .unwrap();
+    let old_head = reader.known_state.graph_heads[MAIN_BRANCH_HEAD_KEY].clone();
+
+    for _ in 0..8 {
+        publish_empty_commit(&publisher).await.unwrap();
+    }
+    let LineageRefresh::Append(delta) = reader.refresh_with_lineage().await.unwrap() else {
+        panic!("append-only history must take the incremental refresh path");
+    };
+    assert_eq!(delta.len(), 8, "refresh must return only new lineage rows");
+    folded_lineage.extend(delta);
+    assert_ne!(
+        reader.known_state.graph_heads[MAIN_BRANCH_HEAD_KEY], old_head,
+        "the oracle must exercise mutable graph-head replacement, not only appends"
+    );
+
+    let (fresh, mut full_lineage) =
+        ManifestCoordinator::open_with_lineage(uri, None, &control_session)
+            .await
+            .unwrap();
+    assert_eq!(reader.known_state.version, fresh.known_state.version);
+    assert_eq!(
+        format!("{:?}", reader.known_state.entries),
+        format!("{:?}", fresh.known_state.entries)
+    );
+    assert_eq!(
+        reader.known_state.graph_heads,
+        fresh.known_state.graph_heads
+    );
+    folded_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+    full_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+    assert_eq!(folded_lineage, full_lineage);
+}

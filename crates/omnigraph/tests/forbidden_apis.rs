@@ -244,6 +244,7 @@ write_surfaces! {
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "open_read_only_with_storage"),
+    ("db/omnigraph.rs", "manifest_has_external_base_paths"),
     ("db/omnigraph/export.rs", "capture_served_export_cut"),
     (
         "db/omnigraph/export.rs",
@@ -268,9 +269,13 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "snapshot_at_graph_manifest_version"),
     ("db/omnigraph.rs", "export_jsonl"),
     ("db/omnigraph.rs", "export_jsonl_to_writer"),
+    ("db/omnigraph.rs", "export_jsonl_unordered_to_writer"),
     ("db/omnigraph.rs", "graph_index"),
     ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),
+    // Joins already-dispatched branch_delete reclaims; performs no durable
+    // calls itself (the reclaim tasks' call sites are inventoried per-file).
+    ("db/omnigraph.rs", "wait_for_fork_reclaims"),
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
     ("exec/query.rs", "query"),
@@ -336,6 +341,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "all_branches",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "all_native_branches",
     ),
     (
         "db/graph_coordinator.rs",
@@ -428,6 +438,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/manifest.rs",
         "ManifestCoordinator",
         "list_graph_branches",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "list_native_graph_branches",
     ),
     (
         "db/manifest.rs",
@@ -604,7 +619,7 @@ gateway_surfaces! {
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
         "open_at_entry_verified", "open_dataset_head", "list_native_branches",
-        "ensure_expected_version",
+        "named_fork_is_absent", "ensure_expected_version",
         "reopen_for_mutation", "scan_batches", "scan_batches_for_rewrite",
         "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
@@ -810,6 +825,9 @@ durable_calls! {
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    // Blob live-branch recheck: lists the table's refs to prove a vanished
+    // fork before the incarnation refusal; read-only access to the handle.
+    ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // Commit-change enumeration: pinned parent/child handles for the ordered
     // merge's typed row comparison. Read-only by construction — the enumerator
     // stages no transaction and publishes nothing.

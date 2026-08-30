@@ -417,6 +417,9 @@ async fn reprove_named_branch_heads(
     branches: &BTreeSet<String>,
 ) -> Result<()> {
     for branch in branches {
+        // `branches` holds native fork refs; graph heads are keyed by the
+        // logical branch those forks belong to.
+        let branch = crate::branch_names::logical_branch_name(branch);
         let fresh = crate::db::manifest::ManifestCoordinator::snapshot_at(
             store.root_uri(),
             Some(branch),

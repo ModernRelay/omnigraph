@@ -11,13 +11,17 @@ pub mod branch_merge;
 pub mod case;
 pub mod counting;
 pub mod environment;
+pub mod fixture_reference;
 #[doc(hidden)]
 pub mod fixture_worker;
 pub mod machine;
 pub mod model;
 mod preparation;
 pub mod projection;
+pub mod real_graph;
+pub mod real_graph_run;
 pub mod record;
+pub mod registered_fixture;
 pub mod reset;
 pub mod runner;
 #[doc(hidden)]
@@ -30,6 +34,10 @@ pub mod worker;
 pub mod worker_protocol;
 
 pub use case::{CaseV1, PointIdentityV1, ValidatedCase, load_case, parse_case, validate_case};
+pub use fixture_reference::{
+    FixtureReferenceV1, NormalizedFixtureReferenceV1, load_fixture_reference,
+    normalize_fixture_reference, parse_fixture_reference,
+};
 pub use model::{Diagnostic, DiagnosticSeverity, ValidationOutcome};
 pub use runner::{
     BuildEvidence, RUNNER_OUTPUT_VERSION, RunExecution, RunOptions, RunnerError, SuiteExecution,

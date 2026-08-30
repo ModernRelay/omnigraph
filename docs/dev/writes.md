@@ -71,7 +71,10 @@ physical-effect proofs:
 Native graph-branch create/delete is a control exception. `BranchContents` is
 the logical authority; clone/delete residue is derived physical state and is
 reclaimed only when its target is provable from that authority. It does not
-invent an alternate graph-content publisher.
+invent an alternate graph-content publisher. Each branch life owns a native ref
+named `{logical}.{ULID}` (see [RFC 0042](../rfcs/0042-incarnation-suffixed-branch-refs.md));
+a recreated branch therefore never shares a path with its dead predecessor, and
+the predecessor's forks are reclaimed by `cleanup` rather than healed in place.
 
 ## Mutation and Load
 
@@ -80,6 +83,13 @@ in memory. It performs all type, value, uniqueness, endpoint, cardinality, and
 resource validation before staging. `stage_all` produces one exact transaction
 per touched table without moving HEAD; `commit_all` enters the gate and
 recovery sequence above.
+
+Existing-table constructive transactions stage independently with bounded
+concurrency. `OMNIGRAPH_LOAD_CONCURRENCY` selects that width for both Load and
+ordinary insert/update mutations (default 8). Deferred first-touch branch
+effects and delete transactions remain serial. The setting changes only
+fragment preparation: every participant still crosses the same recovery
+boundary and one graph-manifest publication.
 
 The D2 rule keeps one mutation query constructive (insert/update) or
 destructive (delete), never both. Compose mixed work through separate
@@ -112,7 +122,9 @@ A named graph branch may inherit a main-table version without owning a native
 table ref. The first write stages against the inherited snapshot, records the
 intended ref/table ownership in recovery, and creates the physical branch only
 inside the protected effect window. Recovery may delete only a ref or dataset
-whose exact creation it owns.
+whose exact creation it owns. Table forks are named by the branch's native ref;
+sidecar table pins carry that native name while the sidecar's `branch` stays
+logical.
 
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, pointer, or recovery effect belongs to the

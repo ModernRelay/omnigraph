@@ -126,7 +126,12 @@ different:
 - Some Optimize and destructive full-recovery decisions retain a
   one-mutation-process boundary because Lance does not expose the exact
   caller-owned maintenance transaction proof they would need for distributed
-  takeover.
+  takeover. The live write-entry heal's effect-free retirement (issue #554)
+  relies on the same boundary: its proof-then-delete is fenced by
+  process-local gates, so a second mutation process's live Armed intent, or
+  an already-transmitted storage write of a just-dropped in-process writer,
+  is outside what it can observe — the same bounded residual the Full-sweep
+  abandonment of an effect-free intent has always carried.
 - Physical index reconciliation is explicit; there is no background scheduler
   whose queue is a second authority.
 

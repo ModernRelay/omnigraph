@@ -117,9 +117,84 @@ pub async fn open_dataset_head(uri: &str, branch: Option<&str>) -> lance::Datase
         .await
         .unwrap();
     match branch {
-        Some(branch) if branch != "main" => ds.checkout_branch(branch).await.unwrap(),
+        Some(branch) if branch != "main" => {
+            // Callers name branches LOGICALLY; the on-disk ref is the current
+            // incarnation's `{logical}.{ULID}` native ref, or the bare name
+            // for legacy and hand-forged fixtures.
+            let native = native_ref_for(&ds, branch)
+                .await
+                .unwrap_or_else(|| branch.to_string());
+            ds.checkout_branch(&native).await.unwrap()
+        }
         _ => ds,
     }
+}
+
+/// Whether `name` is `{logical}` itself or `{logical}.{ULID}` — one
+/// incarnation of the logical branch.
+pub fn is_incarnation_of(name: &str, logical: &str) -> bool {
+    if name == logical {
+        return true;
+    }
+    let Some(suffix) = name
+        .strip_prefix(logical)
+        .and_then(|rest| rest.strip_prefix('.'))
+    else {
+        return false;
+    };
+    suffix.len() == 26
+        && suffix.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9' | b'A'..=b'H' | b'J' | b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z'
+            )
+        })
+}
+
+/// The Lance ref on `ds` that is an incarnation of the LOGICAL branch name:
+/// the ULID-suffixed native ref when one exists, else the bare (legacy) name
+/// if present, else `None`. More than one listed incarnation is a fixture
+/// bug — fail loudly rather than pick one.
+pub async fn native_ref_for(ds: &lance::Dataset, logical: &str) -> Option<String> {
+    let branches = ds.list_branches().await.unwrap();
+    let mut lives: Vec<String> = branches
+        .keys()
+        .filter(|name| is_incarnation_of(name, logical))
+        .cloned()
+        .collect();
+    assert!(
+        lives.len() <= 1,
+        "ambiguous incarnations for logical branch '{logical}': {lives:?}"
+    );
+    lives.pop()
+}
+
+/// Assert a persisted `native_dataset_branch` names an incarnation of
+/// `logical`: the native ref `{logical}.{ULID}`, or the bare name for a
+/// legacy fork.
+#[track_caller]
+pub fn assert_native_branch_of(native: Option<&str>, logical: &str) {
+    let native = native.unwrap_or_else(|| panic!("expected a fork of '{logical}', got None"));
+    assert!(
+        is_incarnation_of(native, logical),
+        "expected an incarnation of '{logical}', got '{native}'"
+    );
+}
+
+/// The current incarnation's native ref of a LOGICAL graph branch, read from
+/// the `__manifest` dataset's live refs. Fixtures that forge or inspect
+/// per-table state colliding with the engine's own fork targets must address
+/// this name, not the logical one.
+pub async fn graph_native_ref(root_uri: &str, logical: &str) -> String {
+    let manifest_uri = format!("{}/__manifest", root_uri.trim_end_matches('/'));
+    let ds = lance::dataset::builder::DatasetBuilder::from_uri(&manifest_uri)
+        .with_session(test_session())
+        .load()
+        .await
+        .unwrap();
+    native_ref_for(&ds, logical)
+        .await
+        .unwrap_or_else(|| panic!("no live ref for logical branch '{logical}'"))
 }
 
 /// Init a graph and load the standard test data.

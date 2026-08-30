@@ -32,16 +32,18 @@ measurement protocol and identity vocabulary.
 - Runner-v1 builds one already-diverged fixture at a stable `active` path,
   verifies it, closes it, and freezes its complete physical tree by SHA-256.
   Public execution performs construction in a dedicated process group under a
-  bounded watchdog. That child also byte-digests the completed tree, makes the
-  never-opened APFS clonefile template, and removes `active` before returning
-  an identity-checked handoff. The parent accepts it only after the direct child
+  bounded watchdog. That child byte-digests the completed tree, makes a
+  never-opened reset template, and removes `active` before returning an
+  identity-checked handoff. APFS uses forced clonefile; Linux XFS uses a full
+  verified copy only for process-fresh points with an uncontrolled page cache.
+  The parent accepts it only after the direct child
   has been reaped and the process group is gone. Any failed, partial, or
   panicked fixture build quarantines its disposable workspace instead of
-  deleting possibly active state. Every repetition clone-restores the template
+  deleting possibly active state. Every repetition restores the template
   to that same `active` path, so Lance shallow
   branches retain valid absolute base paths and samples do not accumulate
-  branch, manifest, or deletion history. Reset and pre-timer proof traverse
-  metadata but never read file contents or fall back to a byte copy.
+  branch, manifest, or deletion history. Clonefile never falls back to copying;
+  plain-copy reset reads and verifies all bytes outside timing.
 - Every repetition runs in a fresh worker process whose executable SHA-256,
   source commit/dirty state, Cargo's
   release/opt-level observations, compiler-effective debug assertions, the
@@ -108,6 +110,164 @@ measurement protocol and identity vocabulary.
   row on `main`, `bench-source`, and `bench-target`. Its logical-content digest
   is stable across rebuilt Lance ids, timestamps, and encodings; a separate
   physical tree digest pins the exact bytes restored for every repetition.
+
+## Logical references for real graphs
+
+An externally built graph first needs a strict logical declaration. A
+`fixture-reference-v1.yaml` records only rebuild-stable identity:
+
+- the imported-graph builder version, digest-pinned recipe and inputs, and
+  typed parameters;
+- Data as canonical schema shape, non-empty node and edge inventories with
+  exact row counts, payload/column shape, provenance, and topology skew;
+- State as aging, structured index inventory, deletion history, compaction
+  recency, and history depth; and
+- the full logical-content digest that `fixture validate-graph` recomputes
+  against a byte-verified disposable copy.
+
+The checked-in FinGraph declaration is
+`benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml`.
+Its implemented algorithms are `omnigraph-schema-shape-v1`,
+`omnigraph-logical-properties-v1`, and
+`omnigraph-logical-graph-multiset-v1`. The document remains deliberately
+location-free and scalar.
+
+Builder parameters are limited to `null`, booleans, and unsigned integers;
+arbitrary strings cannot store literal paths, URIs, or credentials. Parameter
+names and numeric meanings are still trusted builder-contract input that a
+builder contract must define. Input roles are path-free semantic labels and
+each input's content is pinned by SHA-256. The current validator verifies the
+resulting graph facts; it does not replay the import recipe or resolve its
+inputs.
+
+Validate the declaration with:
+
+```bash
+target/release/omnigraph-bench fixture reference validate \
+  benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  --json
+```
+
+The result reports `reference_sha256`, an audit hash of the complete normalized,
+versioned declaration. It is not a point id. This command validates and
+normalizes the document only; it does not open a store or prove a supplied
+digest. `fixture observe-graph` derives the implemented witnesses, and `fixture
+validate-graph` compares all of them with the declaration while also requiring
+a relocation-self-contained graph. Aging, deletion history, compaction
+recency, unknown raw Lance index metadata, and per-index FTS/ANN freshness
+remain explicitly unverified, so the result is claim-ineligible. See the
+[benchmark catalog](../../benchmarks/README.md#observe-and-validate-a-registered-graph)
+for the exact observation and validation commands.
+
+## Registered fixture byte verification
+
+Large graph snapshots can be registered without putting a machine path, S3
+URI, account, or credentials into their identity. A strict
+`fixture-source.json` describes only a format version, a path-free id, and the
+physical tree identity:
+
+```json
+{
+  "format_version": 1,
+  "fixture_id": "monarch-main-20260829",
+  "physical": {
+    "digest_algorithm": "omnigraph-bench-physical-tree-v1",
+    "tree_sha256": "<64 lowercase hex characters>",
+    "files": 16279,
+    "bytes": 3893489669
+  }
+}
+```
+
+Keep the descriptor beside, not inside, the graph root. The local bundle
+convention is deliberately small:
+
+```text
+BUNDLE/
+  fixture-source.json
+  root/
+```
+
+After an operator has quiesced a local snapshot tree, fingerprint its complete
+bytes into the small descriptor:
+
+```bash
+target/release/omnigraph-bench fixture fingerprint \
+  --id monarch-main-20260829 \
+  --root /mnt/nvme/fixtures/monarch/root \
+  > /mnt/nvme/fixtures/monarch/fixture-source.json
+```
+
+The command only prints JSON; it does not modify the tree or write a registry.
+Bind any later local copy to that descriptor and re-read its complete bytes with:
+
+```bash
+target/release/omnigraph-bench fixture verify fixture-source.json \
+  --root /mnt/nvme/fixtures/monarch/root --json
+```
+
+Success returns the canonical typed `source_descriptor_sha256`, the canonical
+local path, and the observed physical identity. The local path and descriptor
+digest are transport/audit evidence, not the harness's stamped logical fixture
+manifest and, per RFC 0039, must not become `point_id` input.
+
+Exercise the same-invocation binding and copy seam with a repeatable
+`ID=BUNDLE` mapping:
+
+```bash
+target/release/omnigraph-bench fixture preflight-copy \
+  --fixture monarch-main-20260829=/mnt/nvme/fixtures/monarch \
+  --scratch-root /mnt/nvme/omnigraph-bench-scratch \
+  --json
+```
+
+The command resolves the two required direct bundle entries, checks that the
+binding id matches the typed source descriptor, verifies the source while
+copying it into a private disposable workspace, re-digests the copy, and
+explicitly removes the workspace. Duplicate/malformed mappings, symlinked required
+entries, source drift, copy failure or drift, and cleanup failure all fail
+closed. Paths are invocation-only and do not appear in the success result.
+Unrelated bundle siblings are ignored. Bindings are copied and removed one at
+a time, so peak scratch usage is bounded by the largest fixture rather than
+their sum. Because this is a copy preflight, no staged tree remains after
+success.
+
+`fixture preflight-copy` remains physical-only: it has no independent logical
+expectation, so replacing both `fixture-source.json` and `root/` under the same
+id produces a different successful physical receipt. `fixture observe-graph`
+and `fixture validate-graph` build on this seam. They retain the verified
+disposable copy, open only that copy read-only, compute the canonical schema,
+payload, and full node/edge content witnesses, check table/index/history
+observations and relocation safety, recheck its physical bytes, and then clean
+it up. They neither download from S3 nor open or mutate the registered source
+as an OmniGraph database.
+
+`fixture run-graph` is the narrow runnable adapter for the checked-in FinGraph
+reference and strict real-graph run YAML. From a release binary, it validates
+the copied graph, prepares a deterministic disjoint node-and-edge delta on two
+branches, freezes that prepared state, and restores identical inputs at the
+same path for fresh-process merge repetitions. macOS uses forced APFS
+clonefiles. Linux requires XFS on a directly mounted EC2 instance-store NVMe
+namespace and uses complete verified plain copies; it reserves one additional
+prepared-tree copy plus 1 GiB before freezing. On a dedicated benchmark mount,
+it waits for filesystem-wide writeback with `syncfs` after freezing and after
+each restore, outside timing. The result records
+`xfs-plain-copy-syncfs-same-active-path`, backend evidence, and machine evidence
+captured in each measured worker; differing worker identities fail the run.
+
+This path is deliberately diagnostic: its output always records
+`claim_eligible: false` and `durable_record: false`, has no warm-up, leaves the
+OS page cache uncontrolled, and cannot publish through `--archive`. Plain-copy
+reset reads the complete tree outside timing and can warm that cache. The
+command still does not download a fixture, dispatch through AWS, or publish
+durable telemetry. See the
+[FinGraph diagnostic instructions](../../benchmarks/README.md#fingraph-diagnostic-runner)
+for the declarative run shape and exact command.
+
+The local source namespace is a trusted-input boundary: the operator must keep
+it quiescent for the command. Digest/copy verification detects ordinary drift
+and prevents a mismatching copy from succeeding, but this path traversal is
+not a sandbox for an adversary racing file types or path entries.
 
 ## Durable records and archive
 
@@ -249,13 +409,15 @@ total table count is split equally between immutable node endpoint tables and
 uniform-ring edge tables; declared divergence applies to edge tables. It uses
 scalar uniform bulk-loaded data, no indexes or pre-existing deletion history,
 local filesystem storage, same-host embedded execution, one client, distinct-key
-write-heavy divergence, manual scheduling, local-clonefile reset, per-phase
-attribution, and a monotonic timer. Process-cold, warmed-by-program, and
-reopened-after-program engine preparation are supported with their exact
-cross-validated cache declarations.
+write-heavy divergence, manual scheduling, per-phase attribution, and a
+monotonic timer. APFS uses local-clonefile reset and supports process-cold,
+warmed-by-program, and reopened-after-program engine preparation. Linux/XFS
+admits only verified plain-copy reset with the exact process-fresh,
+preparation-only, uncontrolled-page-cache, no-program contract described below.
 
-The host probe currently proves APFS on an internal macOS NVMe or SATA SSD. A
-debug build, S3 or Azure backend, server execution, plain-copy reset, unproved
+The host probe proves APFS on an internal macOS NVMe or SATA SSD, or XFS on a
+direct EC2 instance-store NVMe namespace (and distinguishes EBS). A debug
+build, S3 or Azure backend, server execution, unproved
 host declaration, unsupported scenario axis, deadline breach, reset witness
 mismatch, non-general merge route, or content mismatch is refused instead of
 being approximated. A true OS-page-cache-cold claim is not representable yet;

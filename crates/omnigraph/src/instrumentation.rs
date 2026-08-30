@@ -149,6 +149,16 @@ pub struct QueryIoProbes {
     /// read managed Blob payloads). A continuation sentinel must not increment
     /// this counter.
     pub change_images_materialized: Arc<AtomicU64>,
+    /// Manifest-projection refreshes served by the incremental projection fold
+    /// (only appended catalog fragments read) vs the full O(history) scan.
+    /// Cost tests assert the incremental path engages so a silent
+    /// always-full-scan regression is structurally visible.
+    pub projection_incremental_refreshes: Arc<AtomicU64>,
+    pub projection_full_refreshes: Arc<AtomicU64>,
+    /// Physical manifest rows hydrated to classify deletion-vector deltas.
+    /// This must equal the newly deleted offset count; a fragment scan would
+    /// make it grow with the compacted catalog's history instead.
+    pub projection_identity_rows: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -192,6 +202,119 @@ where
 /// production (no scope installed), so the env var is consulted instead.
 pub(crate) fn traversal_mode_override() -> Option<&'static str> {
     TRAVERSAL_MODE_OVERRIDE.try_with(|m| *m).ok().flatten()
+}
+
+tokio::task_local! {
+    static STAGE_WRITE_CONCURRENCY_OVERRIDE: Option<usize>;
+    static STAGE_WRITE_PROBES: StageWriteProbes;
+}
+
+/// Deterministic probe for the number of table-fragment staging futures that
+/// are inside their storage call at once.
+///
+/// `release_after` is a test rendezvous: the first staged tables wait until
+/// that many participants have entered. A concurrency regression therefore
+/// times out instead of passing from result equivalence alone. Production
+/// leaves this task-local unset, so staging only pays the unset lookup.
+#[derive(Clone)]
+pub struct StageWriteProbes {
+    state: Arc<StageWriteProbeState>,
+}
+
+struct StageWriteProbeState {
+    active: AtomicU64,
+    entered: AtomicU64,
+    peak: AtomicU64,
+    rendezvous: tokio::sync::Barrier,
+}
+
+impl StageWriteProbes {
+    /// Create a probe that releases each group after `release_after` staged
+    /// tables have entered the storage-call boundary.
+    pub fn rendezvous(release_after: usize) -> Self {
+        assert!(release_after > 0, "stage-write rendezvous must be non-zero");
+        Self {
+            state: Arc::new(StageWriteProbeState {
+                active: AtomicU64::new(0),
+                entered: AtomicU64::new(0),
+                peak: AtomicU64::new(0),
+                rendezvous: tokio::sync::Barrier::new(release_after),
+            }),
+        }
+    }
+
+    /// Number of table-storage staging calls that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.state.entered.load(Ordering::Relaxed)
+    }
+
+    /// Maximum table-storage staging calls simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.state.peak.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) struct StageWriteProbeGuard {
+    state: Arc<StageWriteProbeState>,
+}
+
+impl Drop for StageWriteProbeGuard {
+    fn drop(&mut self) {
+        self.state.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Run `fut` with deterministic table-staging probes installed.
+pub async fn with_stage_write_probes<F>(probes: StageWriteProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    STAGE_WRITE_PROBES.scope(probes, fut).await
+}
+
+pub(crate) async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
+    let state = STAGE_WRITE_PROBES
+        .try_with(|probes| probes.state.clone())
+        .ok()?;
+    state.entered.fetch_add(1, Ordering::Relaxed);
+    // Count only after every participant is released. The first staging call
+    // must then remain pending in its real storage future for a second call to
+    // raise the peak above one; parked rendezvous waiters do not count.
+    state.rendezvous.wait().await;
+    let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
+    state.peak.fetch_max(active, Ordering::Relaxed);
+    let guard = StageWriteProbeGuard {
+        state: state.clone(),
+    };
+    Some(guard)
+}
+
+/// Force the fragment-writing stage width for the scope of `fut` WITHOUT
+/// mutating the process-global `OMNIGRAPH_LOAD_CONCURRENCY` env var. Same seam
+/// as [`with_traversal_mode`], for the same reason: a width-forcing test stays
+/// scope-bound and process-safe, so it never perturbs a concurrent test in the
+/// same binary and needs no `#[serial]`. The env var stays the production/ops
+/// escape hatch; this scoped override takes precedence over it
+/// (`exec::staging::stage_write_concurrency`).
+///
+/// `0` is not a concurrency: it is ignored in favour of the default, matching
+/// the env parse rules.
+pub async fn with_stage_write_concurrency<F>(concurrency: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    STAGE_WRITE_CONCURRENCY_OVERRIDE
+        .scope(Some(concurrency), fut)
+        .await
+}
+
+/// The scoped staging-width override active for this task, if any. `None` in
+/// production (no scope installed), so the env var is consulted instead.
+pub(crate) fn stage_write_concurrency_override() -> Option<usize> {
+    STAGE_WRITE_CONCURRENCY_OVERRIDE
+        .try_with(|c| *c)
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
@@ -239,6 +362,32 @@ pub(crate) fn record_open(uri: &str) {
 pub(crate) fn record_manifest_scan() {
     let _ = current(|p| {
         p.manifest_scan_count.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one manifest-projection refresh served by the incremental
+/// fold. No-op unless a cost probe is active.
+pub(crate) fn record_projection_incremental_refresh() {
+    let _ = current(|p| {
+        p.projection_incremental_refreshes
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one manifest-projection refresh that fell back to (or started as)
+/// the full O(history) scan. No-op unless a cost probe is active.
+pub(crate) fn record_projection_full_refresh() {
+    let _ = current(|p| {
+        p.projection_full_refreshes.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record rows returned by the physical-address take used to classify newly
+/// deleted manifest rows. No-op unless a cost probe is active.
+pub(crate) fn record_projection_identity_rows(rows: usize) {
+    let _ = current(|p| {
+        p.projection_identity_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
     });
 }
 

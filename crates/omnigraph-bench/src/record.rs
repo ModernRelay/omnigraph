@@ -24,10 +24,11 @@ use crate::case::{
 use crate::counting::LogicalCallCounts;
 use crate::machine::MachineIdentityV1;
 use crate::model::typed_sha256;
+use crate::reset::PHYSICAL_TREE_DIGEST_ALGORITHM;
 use crate::runner::{
     ControlCallObservation, EffectiveEnvironmentValue, MergePhaseEvidenceForm,
-    MergeRouteObservation, PHYSICAL_TREE_DIGEST_ALGORITHM, PhaseObservation, RepObservation,
-    RunExecution, VerificationObservation, validate_successful_merge_phase_topology,
+    MergeRouteObservation, PhaseObservation, RepObservation, RunExecution, VerificationObservation,
+    validate_successful_merge_phase_topology,
 };
 use crate::suite::MAX_REPETITIONS_PER_CASE;
 use crate::{CASE_FORMAT_VERSION, POINT_IDENTITY_VERSION, ResolvedRun, validate_case};

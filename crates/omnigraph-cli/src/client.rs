@@ -998,6 +998,9 @@ impl GraphClient {
                 let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
                 db.branch_delete_as(name, actor).await?;
+                // The process exits right after this call; join the
+                // background fork reclaim so it is not dropped mid-flight.
+                db.wait_for_fork_reclaims().await;
                 Ok(BranchDeleteOutput {
                     uri: uri.clone(),
                     name: name.to_string(),
@@ -1042,7 +1045,11 @@ impl GraphClient {
                 // composition sites against drift).
                 let (branch_deleted, branch_delete_error) = if delete_branch {
                     match db.branch_delete_as(source, actor).await {
-                        Ok(()) => (Some(true), None),
+                        Ok(()) => {
+                            // Same process-exit reasoning as branch_delete's join.
+                            db.wait_for_fork_reclaims().await;
+                            (Some(true), None)
+                        }
                         Err(err) => (Some(false), Some(err.to_string())),
                     }
                 } else {

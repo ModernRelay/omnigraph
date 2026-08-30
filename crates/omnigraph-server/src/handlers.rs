@@ -890,7 +890,10 @@ pub(crate) async fn server_export(
             (cut, result) = &mut export => {
                 let error = result.err().map(|error| std::io::Error::other(error.to_string()));
                 let _ = tx
-                    .send(export_transport::ExportFrame::Terminal { cut, error })
+                    .send(export_transport::ExportFrame::Terminal {
+                        cut: Box::new(cut),
+                        error,
+                    })
                     .await;
             }
         }
@@ -3104,7 +3107,10 @@ pub(crate) async fn server_changes_baseline(
                     Err(error) => Some(std::io::Error::other(error.to_string())),
                 };
                 let _ = tx
-                    .send(export_transport::ExportFrame::Terminal { cut, error })
+                    .send(export_transport::ExportFrame::Terminal {
+                        cut: Box::new(cut),
+                        error,
+                    })
                     .await;
             }
         }

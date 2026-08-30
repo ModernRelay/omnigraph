@@ -14,6 +14,12 @@ records, fixtures, or result storage.
   resolved relative to the suite file that contains it, and its canonical
   target must remain under the same catalog's `cases/` directory. Suite and
   referenced-case symlinks cannot escape the catalog.
+- `fixtures/*.fixture-reference-v1.yaml` is the path-free logical contract for
+  an imported node-and-edge graph: builder provenance, logical data shape,
+  declared physical state, and expected schema/content digests.
+- `real-graph/*.run-v1.yaml` selects one registered fixture, the fixed
+  real-graph workload, repetition count, and operation deadline. This narrow
+  diagnostic path is separate from CaseV1 suites and durable run records.
 
 The `version` field selects the document schema. Keep identifiers and enum
 values in kebab-case. The scenario and fixture-builder versions identify the
@@ -109,25 +115,113 @@ cargo run --locked -p omnigraph-bench -- \
 
 cargo run --locked -p omnigraph-bench -- \
   suite plan benchmarks/suites/local-smoke.suite-v1.yaml
+
+cargo run --locked -p omnigraph-bench -- \
+  fixture reference validate /path/to/graph.fixture-reference-v1.yaml
 ```
 
 Each command accepts `--json` for machine-readable output. `suite plan` also
 accepts `--case <ID>` to select one case from a suite.
+
+An operator-quiesced external snapshot tree uses a location-free two-entry
+bundle:
+
+```text
+BUNDLE/
+  fixture-source.json
+  root/
+```
+
+Create the physical copy-source descriptor from a quiescent local copy, then
+verify any later copy:
+
+```bash
+target/release/omnigraph-bench fixture fingerprint \
+  --id monarch-main-20260829 --root /mnt/nvme/fixtures/monarch/root \
+  > /path/to/fixture-source.json
+target/release/omnigraph-bench fixture verify /path/to/fixture-source.json \
+  --root /mnt/nvme/fixtures/monarch/root --json
+```
+
+The harness can also resolve `ID=BUNDLE`, copy the source into private
+disposable scratch, verify the copy, and clean it in the same invocation:
+
+```bash
+target/release/omnigraph-bench fixture preflight-copy \
+  --fixture monarch-main-20260829=/mnt/nvme/fixtures/monarch \
+  --scratch-root /mnt/nvme/omnigraph-bench-scratch --json
+```
+
+These commands prove only physical byte identity and copy preflight. Physical
+identity is audit/reset evidence, not `point_id` input. They do not add the
+fixture to a CaseV1 suite or run a benchmark; CaseV1 remains the synthetic
+builder contract. No copied tree remains after preflight success.
+
+### Observe and validate a registered graph
+
+`fixture observe-graph` copies and byte-verifies the bundle into disposable
+scratch, opens only that copy read-only, and computes the implemented logical
+witnesses:
+
+```bash
+target/release/omnigraph-bench fixture observe-graph \
+  --fixture finbench-2026-08-21-sf10-v1=/path/to/finbench-2026-08-21-sf10-v1 \
+  --scratch-root /path/to/existing-apfs-scratch --json
+```
+
+The observation includes accepted schema shape, complete per-type node and
+edge counts, a canonical logical-content digest, logical payload bytes,
+engine-managed index observations, main history depth, branch inventory, and a
+relocation-self-contained witness. The command rechecks the copied physical
+tree after observation and removes it. It never opens the registered source as
+an OmniGraph database and does not mutate that source.
+
+The declarative expectations for the frozen FinGraph fixture live in
+`benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml`.
+Validate the YAML structure first, then recompute its implemented witnesses
+against the registered bytes:
+
+```bash
+target/release/omnigraph-bench fixture reference validate \
+  benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  --json
+
+target/release/omnigraph-bench fixture validate-graph \
+  benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  --fixture finbench-2026-08-21-sf10-v1=/path/to/finbench-2026-08-21-sf10-v1 \
+  --scratch-root /path/to/existing-apfs-scratch --json
+```
+
+`fixture reference validate` parses and normalizes the strict document only;
+it does not inspect a graph or prove a supplied digest. `fixture
+validate-graph` binds that declaration to one byte-verified disposable copy and
+fails when an implemented witness differs. Aging, deletion-history,
+compaction-recency, unknown raw Lance indexes, and per-index FTS/ANN freshness
+still lack exact substrate-owned witnesses and remain explicit in
+`unverified_state_fields`. Accordingly, graph inspection and validation always
+report `claim_eligible: false`.
+
+The logical reference and run file deliberately contain no local path, S3 URI,
+account, or credentials. The `ID=BUNDLE` argument is invocation-local transport
+configuration; replacing both bundle entries changes the observed physical
+receipt and the logical validation must still pass.
 
 Validation loads every referenced case and checks cross-field rules, including
 checked scale budgets, table bounds, cache-condition declarations, and
 reset/backend compatibility. Planning expands the suite into ordered run
 entries; it does not execute a benchmark.
 
-The checked-in smoke point declares APFS on local NVMe storage. Validation is
-host-independent; runner-v1 probes the actual scratch volume on macOS and
-refuses to measure when its APFS and internal-storage evidence does not match
-the declaration. S3-compatible cases likewise carry region, storage class,
+The checked-in smoke point declares APFS on local NVMe storage. The AWS point
+declares XFS on EC2 instance-store NVMe and a fresh process with an uncontrolled
+page cache. Validation is host-independent; runner-v1 probes the actual scratch
+volume and refuses declarations that do not match. S3-compatible cases carry region, storage class,
 implementation/version, bucket-versioning state, and a digest pin for MinIO or
 RustFS images in their point identity, but they are not executable by this
 runner slice.
 
 ## Run locally
+
+### CaseV1 suite runner
 
 Wall-clock execution is available only from a release-profile binary:
 
@@ -135,6 +229,11 @@ Wall-clock execution is available only from a release-profile binary:
 cargo run --release --locked -p omnigraph-bench -- \
   suite run benchmarks/suites/local-smoke.suite-v1.yaml \
   --archive .bench/archive
+
+# On the AWS lab's XFS instance-store mount:
+target/release/omnigraph-bench suite run \
+  benchmarks/suites/aws-xfs-process-cold.suite-v1.yaml \
+  --scratch-root /mnt/nvme --archive /mnt/nvme/omnigraph-bench-archive
 ```
 
 Use `--case <ID>` to select one suite entry, `--scratch-root <EXISTING-DIR>` to
@@ -155,15 +254,12 @@ Runner-v1 constructs and verifies one fixture whose `bench-source` and
 complete directory by physical SHA-256. The fixture is built at a stable
 `active` path because Lance shallow-branch manifests can retain absolute base
 paths. Public execution constructs it in a dedicated process group under a
-bounded watchdog. That child also byte-digests the completed tree, makes the
-never-opened APFS clonefile template, and removes `active` before returning an
-identity-checked handoff. The parent accepts it only after the direct child is
-reaped and the group is gone. A failed, partial, or panicked build quarantines
-the entire disposable workspace. Every repetition clone-restores the template
-to that exact `active` path. Forced clonefile reset has no byte-copy fallback.
-Handoff acceptance, reset, and the pre-timer witness walk metadata but do not
-read file contents, so they do not prewarm the fixture's data pages merely to
-prove identity.
+bounded watchdog. The child freezes a byte-digested template and removes
+`active` before returning an identity-checked handoff. APFS uses forced
+clonefile with no byte-copy fallback. Linux XFS uses verified copies only for
+the process-fresh point: reset reads bytes outside timing, so its page cache is
+truthfully declared uncontrolled. Every repetition restores the exact stable
+`active` path; failed construction quarantines the workspace.
 
 Every repetition uses a fresh worker process and starts from the same frozen
 state. The parent pins and records the worker executable SHA-256 and requires
@@ -238,6 +334,73 @@ protected-head capture still occur and `page_cache: uncontrolled` states the
 OS cache limitation explicitly. A true page-cache-cold point remains refused
 until a named platform/backend eviction control has a post-control witness;
 storage-cold is also unsupported and unrepresentable.
+
+### FinGraph diagnostic runner
+
+The real-graph run is declared independently from the synthetic CaseV1 suite.
+The checked-in run file has this strict shape:
+
+```yaml
+version: 1
+fixture_id: finbench-2026-08-21-sf10-v1
+workload: finbench-disjoint-insert-merge
+repetitions: 5
+operation_deadline_seconds: 600
+```
+
+`repetitions` must be from 1 through 20 and
+`operation_deadline_seconds` from 1 through 3600. Unknown fields are refused.
+The logical reference path and local bundle path stay outside the run file so
+neither a checkout location nor an operator's storage location becomes
+experiment identity.
+
+Build the CLI in release mode and run the checked-in FinGraph declaration and
+logical reference against a local registered bundle:
+
+```bash
+cargo build --release --locked -p omnigraph-bench
+
+target/release/omnigraph-bench fixture run-graph \
+  benchmarks/real-graph/finbench-2026-08-21-sf10-v1.run-v1.yaml \
+  --reference \
+    benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  --fixture finbench-2026-08-21-sf10-v1=/path/to/finbench-2026-08-21-sf10-v1 \
+  --scratch-root /path/to/existing-qualified-scratch --json
+```
+
+`run-graph` refuses a debug build. The harness copies and validates the
+registered graph, prepares two branches whose disjoint changes each contain
+two `Account` nodes and one `AccountTransferAccount` edge, and freezes that
+prepared input. Each repetition restores the same path and runs only the branch
+merge in a fresh worker process. macOS requires qualified local APFS and uses
+forced clonefiles. Linux requires XFS on a directly mounted EC2 instance-store
+NVMe namespace, refuses EBS, and uses a complete verified plain copy outside
+the timer. Use a dedicated benchmark mount: after freezing and after each
+restore, Linux `syncfs` waits for all writeback on that filesystem so reset I/O
+does not overlap the merge. The recorded reset is
+`xfs-plain-copy-syncfs-same-active-path`. Before making that template, the Linux
+path requires free space for one prepared-tree copy plus 1 GiB. The registered
+source is never opened as an OmniGraph database and remains unchanged.
+Before returning either success or failure, the command explicitly attempts to
+remove its disposable workspace. A cleanup failure is reported, and a run plus
+cleanup double failure retains both causes.
+The result includes raw elapsed samples, p50, merge route/phases, the prepared
+physical digest, per-worker machine and backend evidence, and verification evidence for
+the inserted delta, protected heads, and untouched tables. Pre-existing rows
+in the two changed tables are not yet fully re-read and are reported as
+unverified rather than implied to be proved. Machine identity is captured just
+before timing in every worker; differing identities fail the run.
+
+This path deliberately does not make a publishable performance claim. Every
+result says `claim_eligible: false` and `durable_record: false`; it has no
+warm-up program, and although each measurement uses a fresh process, the
+operating-system page cache is uncontrolled; Linux plain-copy reset reads every
+fixture byte outside timing and can warm it. `run-graph` does not accept
+`--archive`, publish durable telemetry, calculate a noise floor, download an
+S3 fixture, or dispatch work through the AWS benchmark infrastructure. AWS may
+hold the source snapshot, but an operator must first provide the verified local
+two-entry bundle used above. AWS orchestration and durable-record integration
+are later connector work, not behavior hidden behind this command.
 
 ## Telemetry and delivery boundary
 

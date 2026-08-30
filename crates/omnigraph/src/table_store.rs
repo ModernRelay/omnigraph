@@ -1034,7 +1034,26 @@ impl TableStore {
         if entry.native_dataset_branch.is_none() {
             return self.open_at_entry(entry).await;
         }
-        let dataset = entry.open(&self.root_uri, None).await?;
+        let dataset = match entry.open(&self.root_uri, None).await {
+            Ok(dataset) => dataset,
+            Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
+                // Cleanup can reclaim a pinned version of a live fork (a
+                // retention gap), but a fork whose ref is gone altogether was
+                // reclaimed with its deleted branch; under incarnation-suffixed
+                // refs the branch may already live on elsewhere. Prove absence
+                // from the ref listing; any other failure keeps its own class.
+                if self.named_fork_is_absent(entry).await? {
+                    return Err(OmniError::manifest(format!(
+                        "change feed table '{}' has no persisted native-branch incarnation \
+                         witness at the reopened dataset; the branch was deleted and \
+                         recreated during the poll",
+                        entry.type_key,
+                    )));
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         // Defense-in-depth only: the e_tag is not a sufficient native-branch
         // incarnation witness (a store may persist none, and equality is a
         // content heuristic, not identity). The load-bearing witness is the
@@ -1056,6 +1075,20 @@ impl TableStore {
             )));
         }
         Ok(dataset)
+    }
+
+    /// Whether a named fork the accepted snapshot places on `entry` no longer
+    /// exists as a ref on its table dataset. Absence is proven from the ref
+    /// listing so a transient or permission failure surfaces as itself rather
+    /// than as a branch-lifecycle conclusion.
+    pub(crate) async fn named_fork_is_absent(&self, entry: &DatasetEntry) -> Result<bool> {
+        let Some(native) = entry.native_dataset_branch.as_deref() else {
+            return Ok(false);
+        };
+        let uri = self.dataset_uri(&entry.dataset_path);
+        let root = self.open_dataset_head(&uri, None).await?;
+        let refs = crate::branch_control::list_branch_contents(&root).await?;
+        Ok(!refs.contains_key(native))
     }
 
     pub async fn open_dataset_head(

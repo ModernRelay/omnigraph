@@ -5,7 +5,7 @@
 //! everything (seed tree): the tokio scheduler's RNG, the identity (ULID)
 //! stream, the logical wall clock, and the workload. Faults are deterministic
 //! crash windows scheduled over the engine's own failpoints. Oracle
-//! highlights (among the census's 21): a differential model,
+//! highlights (among the census's 22): a differential model,
 //! durability-after-crash, OCC commit-id uniqueness, and the rerun
 //! meta-test (same scenario ⇒ equal reports INCLUDING commit ids);
 //! the full verdict/detector census is generated from `detectors.rs`
