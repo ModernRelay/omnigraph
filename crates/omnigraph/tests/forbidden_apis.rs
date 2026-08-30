@@ -244,6 +244,7 @@ write_surfaces! {
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "open_read_only_with_storage"),
+    ("db/omnigraph.rs", "manifest_has_external_base_paths"),
     ("db/omnigraph/export.rs", "capture_served_export_cut"),
     (
         "db/omnigraph/export.rs",
@@ -268,6 +269,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "snapshot_at_graph_manifest_version"),
     ("db/omnigraph.rs", "export_jsonl"),
     ("db/omnigraph.rs", "export_jsonl_to_writer"),
+    ("db/omnigraph.rs", "export_jsonl_unordered_to_writer"),
     ("db/omnigraph.rs", "graph_index"),
     ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),

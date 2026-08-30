@@ -20,8 +20,12 @@ use serde::{Deserialize, Serialize};
 use crate::branch_merge::{BranchMergePlan, FixtureBuildSummary, initialize_local_fixture};
 use crate::case::{CaseV1, ResetMode};
 use crate::reset::{
-    MetadataDigest, PhysicalDigest, TraversalLimits, copy_verified, digest_metadata_tree,
-    digest_physical_tree, freeze_clonefile_template,
+    MetadataDigest, PhysicalDigest, TraversalLimits, freeze_clonefile_template,
+    freeze_plain_copy_template,
+};
+#[cfg(test)]
+use crate::reset::{
+    accept_clonefile_template_handoff, accept_plain_copy_template_handoff, verify_physical_tree,
 };
 #[cfg(unix)]
 use crate::runner::{
@@ -164,23 +168,18 @@ async fn execute_fixture_request(request: FixtureRequestV1) -> FixtureResultV1 {
             )
         }
         ResetMode::PlainCopy => {
-            let physical = match digest_physical_tree(&request.active_root, limits) {
-                Ok(physical) => physical,
-                Err(error) => return failure("fixture_digest_failed", error.to_string()),
-            };
-            if let Err(error) = copy_verified(
+            let frozen = match freeze_plain_copy_template(
                 &request.active_root,
                 &request.template_root,
-                &physical,
                 limits,
             ) {
-                return failure("fixture_copy_failed", error.to_string());
-            }
-            let metadata = match digest_metadata_tree(&request.template_root, limits) {
-                Ok(metadata) => metadata,
-                Err(error) => return failure("fixture_metadata_failed", error.to_string()),
+                Ok(frozen) => frozen,
+                Err(error) => return failure("fixture_freeze_failed", error.to_string()),
             };
-            (physical, metadata)
+            (
+                frozen.physical_digest().clone(),
+                frozen.metadata_digest().clone(),
+            )
         }
         ResetMode::S3Versioning => {
             return failure(
@@ -1077,6 +1076,32 @@ mod tests {
                 assert_eq!(handoff.summary.target_history_depth, 6);
                 assert!(!active.exists());
                 assert!(template.is_dir());
+                let physical = handoff.physical.clone();
+                let restored = match reset {
+                    ResetMode::LocalClonefile => accept_clonefile_template_handoff(
+                        &active,
+                        &template,
+                        handoff.physical,
+                        handoff.template_metadata,
+                        TraversalLimits::default(),
+                    )
+                    .unwrap()
+                    .restore_active()
+                    .unwrap(),
+                    ResetMode::PlainCopy => accept_plain_copy_template_handoff(
+                        &active,
+                        &template,
+                        handoff.physical,
+                        handoff.template_metadata,
+                        TraversalLimits::default(),
+                    )
+                    .unwrap()
+                    .restore_active()
+                    .unwrap(),
+                    ResetMode::S3Versioning => panic!("test helper does not support S3 reset"),
+                };
+                assert_eq!(restored.root(), active);
+                verify_physical_tree(&active, &physical, TraversalLimits::default()).unwrap();
             }
             result => panic!("unexpected fixture result: {result:?}"),
         }

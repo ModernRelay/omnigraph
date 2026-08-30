@@ -153,8 +153,30 @@ cargo run --release --locked -p omnigraph-bench -- \
   suite run benchmarks/suites/local-smoke.suite-v1.yaml
 ```
 
-Do not archive that diagnostic JSON as telemetry. To publish authoritative
-records, first commit the exact source under test, build the release binary from
+The imported-fixture `fixture run-graph` path is separate from durable suite
+execution. Its fixed FinGraph node-and-edge merge adapter supports qualified
+macOS/APFS clonefiles or Linux/XFS directly backed by EC2 instance-store NVMe;
+EBS is refused. The registered source stays quiescent and is never opened as a
+database. Every repetition restores the prepared physical tree at the exact
+same active path. Source and scratch ownership must remain exclusive:
+metadata-only checks detect observable stat drift, not every same-length
+rewrite within a filesystem timestamp tick. Byte identity comes from the
+verified copy or forced-clone contract. Before freezing, Linux requires free
+space for one more prepared-tree copy plus 1 GiB. Use a dedicated benchmark
+mount: this path calls `syncfs` after freezing and after every restore, outside
+timing, to finish data and directory writeback across that filesystem. It records a distinct
+`xfs-plain-copy-syncfs-same-active-path` reset, not the durable suite's existing
+plain-copy treatment. Fresh workers attest matching process-effective machine
+identities; copying leaves the OS page cache uncontrolled. Reports remain
+`claim_eligible: false` and `durable_record: false`, with no archive publication
+or AWS dispatch. Commands live in the
+[FinGraph diagnostic guide](../../benchmarks/README.md#fingraph-diagnostic-runner).
+Within `omnigraph-bench`, `reset.rs` owns copy/path integrity tests,
+`environment.rs` owns backend qualification, and `real_graph_run.rs` owns the
+platform, capacity, writeback, worker-identity, and native merge regressions.
+
+Do not archive diagnostic JSON as telemetry. To publish authoritative
+`suite run` records, first commit the exact source under test, build the release binary from
 that clean tree, and pass `--archive <DIR>`. The commit records source
 provenance; the executable digest and normalized build/engine facts bind the
 exact SUT bytes. Source revalidation compares raw tracked source bytes without
