@@ -366,13 +366,16 @@ async fn branch_delete_partial_failure_converges_via_cleanup() {
     }
 
     // Inject a failure during per-table cleanup, AFTER the manifest authority
-    // flip. branch_delete must still succeed (best-effort reclaim).
+    // flip. branch_delete must still succeed (best-effort reclaim). The
+    // reclaim runs in a background task, so join it while the failpoint is
+    // still armed.
     {
         let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP, "return");
         main.branch_delete("feature").await.expect(
             "branch_delete is best-effort after the manifest flip: a cleanup-step \
              failure must not fail the call",
         );
+        main.wait_for_fork_reclaims().await;
     }
 
     // Authority flipped: the branch is gone.
@@ -452,9 +455,11 @@ async fn recreate_over_orphaned_fork_self_heals_without_cleanup() {
     let first_native = helpers::graph_native_ref(&uri, "feature").await;
 
     // Partial delete: leaves the Person fork orphaned (cleanup not yet run).
+    // Join the background reclaim while the failpoint is still armed.
     {
         let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP, "return");
         main.branch_delete("feature").await.unwrap();
+        main.wait_for_fork_reclaims().await;
     }
 
     // Recreate the name and write to the previously-forked table WITHOUT a
@@ -520,6 +525,155 @@ async fn recreate_over_orphaned_fork_self_heals_without_cleanup() {
         "cleanup reclaims the dead incarnation's fork"
     );
     assert!(branches.contains_key(&second_native));
+}
+
+// branch_delete acknowledges at the manifest authority flip while a rendezvous
+// callback parks the fork reclaim: the owned fork observably survives the
+// response, and releasing the rendezvous + `wait_for_fork_reclaims` converges
+// it. A response that waited for reclaim would deadlock against the callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn branch_delete_acknowledges_before_fork_reclaim_completes() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let main = helpers::init_and_load(&dir).await;
+
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(&uri).await.unwrap();
+    helpers::mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    drop(feature);
+
+    let person_uri = node_table_uri(&main, "Person").await;
+    let feature_native = helpers::graph_native_ref(&uri, "feature").await;
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = std::sync::Mutex::new(entered_tx);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    {
+        let _fp =
+            ScopedFailPoint::with_callback(names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP, move || {
+                let _ = entered_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            });
+
+        main.branch_delete("feature").await.unwrap();
+
+        // The authority flip is visible at return.
+        assert_eq!(main.branch_list().await.unwrap(), vec!["main".to_string()]);
+
+        // The background reclaim reaches the rendezvous and parks there; the
+        // owned fork still exists, so the response did not wait for reclaim.
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("background fork reclaim should reach the rendezvous");
+        {
+            let ds = lance::Dataset::open(&person_uri).await.unwrap();
+            assert!(
+                ds.list_branches()
+                    .await
+                    .unwrap()
+                    .contains_key(&feature_native),
+                "the owned fork must still exist while the reclaim is parked: \
+                 the response precedes physical reclaim"
+            );
+        }
+
+        release_tx.send(()).unwrap();
+        main.wait_for_fork_reclaims().await;
+    }
+
+    let ds = lance::Dataset::open(&person_uri).await.unwrap();
+    assert!(
+        !ds.list_branches()
+            .await
+            .unwrap()
+            .contains_key(&feature_native),
+        "joining the background reclaim must converge the owned fork away"
+    );
+}
+
+// The background fork reclaim holds the request's schema, branch, and table
+// gates until it settles, so a same-name recreate serializes behind it and
+// can never race the fork removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[serial]
+async fn branch_recreate_serializes_behind_background_fork_reclaim() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let main = helpers::init_and_load(&dir).await;
+
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(&uri).await.unwrap();
+    helpers::mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    drop(feature);
+
+    // Open the racing handle before the delete so its open-time recovery
+    // sweep cannot interact with the parked reclaim's gates.
+    let racer = Omnigraph::open(&uri).await.unwrap();
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = std::sync::Mutex::new(entered_tx);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    {
+        let _fp =
+            ScopedFailPoint::with_callback(names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP, move || {
+                let _ = entered_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            });
+
+        main.branch_delete("feature").await.unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("background fork reclaim should reach the rendezvous");
+
+        // While the reclaim is parked with the gates held, a same-name
+        // recreate must wait, not complete.
+        let mut create =
+            tokio::spawn(async move { racer.branch_create("feature").await.map(|()| racer) });
+        let parked = tokio::time::timeout(std::time::Duration::from_millis(300), &mut create).await;
+        assert!(
+            parked.is_err(),
+            "branch_create must serialize behind the in-flight fork reclaim's gates"
+        );
+
+        release_tx.send(()).unwrap();
+        main.wait_for_fork_reclaims().await;
+
+        // With the reclaim settled and its gates released, the recreate
+        // completes against a clean namespace.
+        let racer = create
+            .await
+            .expect("recreate task must not panic")
+            .expect("recreate must succeed after the reclaim settles");
+        assert!(
+            racer
+                .branch_list()
+                .await
+                .unwrap()
+                .contains(&"feature".to_string()),
+            "the recreated branch must be visible"
+        );
+    }
 }
 
 // The write-path orphan reclaim shares the same fresh-authority classifier as

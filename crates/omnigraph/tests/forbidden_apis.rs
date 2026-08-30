@@ -273,6 +273,9 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "graph_index"),
     ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),
+    // Joins already-dispatched branch_delete reclaims; performs no durable
+    // calls itself (the reclaim tasks' call sites are inventoried per-file).
+    ("db/omnigraph.rs", "wait_for_fork_reclaims"),
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
     ("exec/query.rs", "query"),

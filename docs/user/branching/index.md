@@ -46,7 +46,11 @@ names such as `release.1.2` are fine.
 Deleting a branch and creating another with the same name yields a fresh
 branch: it shares no storage with the deleted one, and readers that captured
 the deleted branch fail with a typed error rather than seeing the new data.
-Physical space held by the deleted branch is reclaimed by `omnigraph cleanup`.
+`branch delete` returns once the branch is logically deleted; its per-dataset
+storage is reclaimed in the background (bounded by a 600-second watchdog), and
+branch operations that would conflict with that reclaim wait for it. The CLI
+and server join in-flight reclaims before exit, and `omnigraph cleanup`
+remains the backstop for anything abandoned.
 
 Branch-control operations are safe across handles in one writer process. Do not
 run branch create/delete control concurrently from separate writer processes
