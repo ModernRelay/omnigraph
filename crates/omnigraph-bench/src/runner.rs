@@ -47,10 +47,12 @@ use crate::machine::{MachineIdentityV1, capture_machine_identity};
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
 use crate::reset::{
     ClonefileTemplate, MetadataDigest, PHYSICAL_TREE_DIGEST_ALGORITHM, PhysicalDigest,
-    TraversalLimits, accept_clonefile_template_handoff, copy_verified, digest_metadata_tree,
-    digest_physical_tree, freeze_clonefile_template, verify_metadata_shape, verify_metadata_tree,
-    verify_physical_tree,
+    PlainCopyTemplate, TraversalLimits, accept_clonefile_template_handoff,
+    accept_plain_copy_template_handoff, freeze_clonefile_template, freeze_plain_copy_template,
+    verify_metadata_shape,
 };
+#[cfg(test)]
+use crate::reset::{digest_metadata_tree, digest_physical_tree, verify_physical_tree};
 use crate::suite::{MAX_REPETITIONS_PER_CASE, MAX_SUITE_RUNS, MAX_TOTAL_REPETITIONS};
 use crate::supervisor::{SupervisionInput, supervise_repetition};
 use crate::worker_protocol::{
@@ -1607,13 +1609,18 @@ async fn execute_owned_run(
                         RunnerError::new("fixture_handoff_failed", error.to_string())
                     })?,
                 ),
-                ResetMode::PlainCopy => FrozenTemplate::accept_plain_copy_handoff(
-                    &active_root,
-                    &template_root,
-                    handoff.physical.clone(),
-                    handoff.template_metadata,
-                    limits,
-                )?,
+                ResetMode::PlainCopy => FrozenTemplate::PlainCopy(
+                    accept_plain_copy_template_handoff(
+                        &active_root,
+                        &template_root,
+                        handoff.physical.clone(),
+                        handoff.template_metadata,
+                        limits,
+                    )
+                    .map_err(|error| {
+                        RunnerError::new("fixture_handoff_failed", error.to_string())
+                    })?,
+                ),
                 ResetMode::S3Versioning => {
                     return Err(RunnerError::new(
                         "unsupported_runner_axis",
@@ -1644,7 +1651,11 @@ async fn execute_owned_run(
                     )?,
                 )
             } else {
-                FrozenTemplate::freeze_plain_copy(&active_root, &template_root, limits)?
+                FrozenTemplate::PlainCopy(
+                    freeze_plain_copy_template(&active_root, &template_root, limits).map_err(
+                        |error| RunnerError::new("fixture_freeze_failed", error.to_string()),
+                    )?,
+                )
             };
             remove_active_tree(&active_root)?;
             let physical = template.physical_digest().clone();
@@ -2128,93 +2139,28 @@ fn stage_bound_worker(source: BoundWorkerSource, workspace: &Path) -> RunnerResu
 
 enum FrozenTemplate {
     Clonefile(ClonefileTemplate),
-    PlainCopy {
-        template_root: PathBuf,
-        active_root: PathBuf,
-        physical: PhysicalDigest,
-        metadata: MetadataDigest,
-        limits: TraversalLimits,
-    },
+    PlainCopy(PlainCopyTemplate),
 }
 
 impl FrozenTemplate {
-    fn freeze_plain_copy(
-        active_root: &Path,
-        template_root: &Path,
-        limits: TraversalLimits,
-    ) -> RunnerResult<Self> {
-        let physical = digest_physical_tree(active_root, limits)
-            .map_err(|error| RunnerError::new("fixture_digest_failed", error.to_string()))?;
-        copy_verified(active_root, template_root, &physical, limits)
-            .map_err(|error| RunnerError::new("fixture_copy_failed", error.to_string()))?;
-        let metadata = digest_metadata_tree(template_root, limits)
-            .map_err(|error| RunnerError::new("fixture_metadata_failed", error.to_string()))?;
-        Ok(Self::PlainCopy {
-            template_root: template_root.to_path_buf(),
-            active_root: active_root.to_path_buf(),
-            physical,
-            metadata,
-            limits,
-        })
-    }
-
-    fn accept_plain_copy_handoff(
-        active_root: &Path,
-        template_root: &Path,
-        physical: PhysicalDigest,
-        metadata: MetadataDigest,
-        limits: TraversalLimits,
-    ) -> RunnerResult<Self> {
-        match std::fs::symlink_metadata(active_root) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => {
-                return Err(RunnerError::new(
-                    "fixture_handoff_failed",
-                    "contained fixture worker left the active path behind",
-                ));
-            }
-            Err(error) => {
-                return Err(RunnerError::new(
-                    "fixture_handoff_failed",
-                    format!("could not inspect retired active path: {error}"),
-                ));
-            }
-        }
-        verify_physical_tree(template_root, &physical, limits)
-            .and_then(|_| verify_metadata_tree(template_root, &metadata, limits))
-            .map_err(|error| RunnerError::new("fixture_handoff_failed", error.to_string()))?;
-        Ok(Self::PlainCopy {
-            template_root: template_root.to_path_buf(),
-            active_root: active_root.to_path_buf(),
-            physical,
-            metadata,
-            limits,
-        })
-    }
-
     fn physical_digest(&self) -> &PhysicalDigest {
         match self {
             Self::Clonefile(template) => template.physical_digest(),
-            Self::PlainCopy { physical, .. } => physical,
+            Self::PlainCopy(template) => template.physical_digest(),
         }
     }
 
     fn active_root(&self) -> &Path {
         match self {
             Self::Clonefile(template) => template.active_root(),
-            Self::PlainCopy { active_root, .. } => active_root,
+            Self::PlainCopy(template) => template.active_root(),
         }
     }
 
     fn verify_unchanged(&self) -> RunnerResult<()> {
         match self {
             Self::Clonefile(template) => template.verify_unchanged().map(|_| ()),
-            Self::PlainCopy {
-                template_root,
-                metadata,
-                limits,
-                ..
-            } => verify_metadata_tree(template_root, metadata, *limits).map(|_| ()),
+            Self::PlainCopy(template) => template.verify_unchanged().map(|_| ()),
         }
         .map_err(|error| {
             RunnerError::new(
@@ -2229,14 +2175,9 @@ impl FrozenTemplate {
             Self::Clonefile(template) => template
                 .restore_active()
                 .map(|prepared| prepared.metadata_digest().clone()),
-            Self::PlainCopy {
-                template_root,
-                active_root,
-                physical,
-                limits,
-                ..
-            } => copy_verified(template_root, active_root, physical, *limits)
-                .and_then(|_| digest_metadata_tree(active_root, *limits)),
+            Self::PlainCopy(template) => template
+                .restore_active()
+                .map(|prepared| prepared.metadata_digest().clone()),
         }
         .map_err(|error| RunnerError::new("reset_failed", error.to_string()))
     }
@@ -3877,14 +3818,16 @@ mod tests {
         let limits = TraversalLimits::default();
         let physical = digest_physical_tree(&template_root, limits).unwrap();
         let metadata = digest_metadata_tree(&template_root, limits).unwrap();
-        let template = FrozenTemplate::accept_plain_copy_handoff(
-            &active_root,
-            &template_root,
-            physical.clone(),
-            metadata,
-            limits,
-        )
-        .unwrap();
+        let template = FrozenTemplate::PlainCopy(
+            accept_plain_copy_template_handoff(
+                &active_root,
+                &template_root,
+                physical.clone(),
+                metadata,
+                limits,
+            )
+            .unwrap(),
+        );
         template.restore_active().unwrap();
         verify_physical_tree(&active_root, &physical, limits).unwrap();
     }
