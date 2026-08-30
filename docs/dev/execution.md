@@ -82,6 +82,15 @@ String-built SQL is retained only at explicitly documented compatibility
 seams. The camel-case regression and its two-parser boundary are recorded in
 [the case study](case-studies/camel-case-filtering.md).
 
+Column projection is the second pushdown dimension. `collect_needed_columns`
+derives each binding's needed columns from the whole query (RETURN, `order {}`,
+every filter, recursing into anti-join inner pipelines), and `execute_node_scan`
+prunes its Lance projection to that demand plus an always-keep set: `id` (join,
+fusion, and tie-break key) and the type's key columns. The verdicts fail open,
+never closed: a bare `$var`, a binding absent from the demand map, and any
+search-target scan keep the full non-blob projection. Expand destination
+hydration and edge-property attach are not yet pruned.
+
 ## Search and rank
 
 `nearest`, text search/BM25, and reciprocal-rank fusion are first-class
