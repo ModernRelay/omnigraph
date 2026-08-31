@@ -31,7 +31,7 @@ Tools that support `@` imports include these automatically:
 
 - Version surveyed: 0.10.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
-- Storage substrate: Lance 10.0.0
+- Storage substrate: Lance 11.0.0
 - Workspace: compiler, storage, engine (`omnigraph-engine` package), policy,
   API types, cluster, CLI, server, Azure admission wrapper, benchmark harness,
   and `omnigraph-dst` (deterministic simulation testing; needs

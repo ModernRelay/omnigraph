@@ -624,7 +624,7 @@ async fn nearest_returns_k_closest() {
     assert_eq!(slugs.value(0), "ml-intro", "closest should be ml-intro");
 }
 
-/// Lance 10 still drops KNN ordering metadata when its sorted candidate stream
+/// Lance 11 still drops KNN ordering metadata when its sorted candidate stream
 /// is late-hydrated with ordinary node payload. Above one 8,192-row output
 /// batch, a parallel final coalesce can then put a later partition first. This
 /// engine-level cell proves the temporary one-output-partition fence is wired
@@ -1172,6 +1172,142 @@ async fn mutation_with_deferred_index_coverage_remains_searchable() {
     assert!(
         result_slugs(&result).contains(&"quasar-notes".to_string()),
         "a row outside current index coverage must remain searchable via fallback scan"
+    );
+
+    // Ordinary optimize must preserve certified postings, not silently replace
+    // them with an uncertified incremental fold. Both old and tail rows remain
+    // searchable after data compaction and unrelated index maintenance.
+    db.optimize().await.unwrap();
+    for (term, slug) in [("Quasar", "quasar-notes"), ("Learning", "ml-intro")] {
+        let result = query_main(
+            &mut db,
+            SEARCH_QUERIES,
+            "text_search",
+            &params(&[("$q", term)]),
+        )
+        .await
+        .unwrap();
+        assert!(result_slugs(&result).contains(&slug.to_string()));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads() {
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let old_manifest_version = version_main(&db).await.unwrap();
+    let snapshot = snapshot_main(&db).await.unwrap();
+    let entry = snapshot.dataset("node:Doc").unwrap();
+    let dataset = snapshot.open_dataset("node:Doc").await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    // Simulate absent artifact provenance without changing rows, graph history,
+    // or index coverage. Actual saved-v10 bytes are tested in staged_tests.
+    for index in indices.iter().filter(|index| {
+        index.files.as_ref().is_some_and(|files| {
+            files
+                .iter()
+                .any(|file| file.path == "omnigraph_fts_compat.json")
+        })
+    }) {
+        std::fs::remove_file(
+            dir.path()
+                .join(&entry.dataset_path)
+                .join("_indices")
+                .join(index.uuid.to_string())
+                .join("omnigraph_fts_compat.json"),
+        )
+        .unwrap();
+    }
+    let original_rows = dataset.count_rows(None).await.unwrap();
+    assert!(original_rows > 0);
+    for query in [
+        "text_search",
+        "fuzzy_search",
+        "phrase_search",
+        "bm25_search",
+        "rrf_two_fts",
+    ] {
+        let error = query_main(
+            &mut db,
+            SEARCH_QUERIES,
+            query,
+            &params(&[("$q", "Learning")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, OmniError::FullTextIndexRebuildRequired { .. }),
+            "{query}: {error}"
+        );
+    }
+    let error = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "hybrid_search",
+        &vector_and_string_params("$vq", &[0.1, 0.2, 0.3, 0.4], "$tq", "Learning"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, OmniError::FullTextIndexRebuildRequired { .. }),
+        "{error}"
+    );
+    assert!(
+        query_main(
+            &mut db,
+            SEARCH_QUERIES,
+            "vector_search",
+            &vector_param("$q", &[0.1, 0.2, 0.3, 0.4])
+        )
+        .await
+        .unwrap()
+        .num_rows()
+            > 0
+    );
+
+    let mut scan = dataset.scan();
+    scan.filter("contains_tokens(title, 'Learning')").unwrap();
+    assert!(matches!(
+        scan.try_into_stream().await,
+        Err(OmniError::FullTextIndexRebuildRequired { .. })
+    ));
+    assert!(matches!(
+        dataset
+            .count_rows(Some("contains_tokens(title, 'Learning')".into()))
+            .await,
+        Err(OmniError::FullTextIndexRebuildRequired { .. })
+    ));
+
+    let rebuilt = db.rebuild_full_text_indices_on("main").await.unwrap();
+    assert!(!rebuilt.rebuilt_indexes.is_empty());
+    assert!(
+        query_main(
+            &mut db,
+            SEARCH_QUERIES,
+            "text_search",
+            &params(&[("$q", "Learning")])
+        )
+        .await
+        .unwrap()
+        .num_rows()
+            > 0
+    );
+    assert_eq!(dataset.count_rows(None).await.unwrap(), original_rows);
+    let error = db
+        .run_query_at(
+            old_manifest_version,
+            SEARCH_QUERIES,
+            "text_search",
+            &params(&[("$q", "Learning")]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::FullTextIndexRebuildRequired { .. }),
+        "{error}"
     );
 }
 

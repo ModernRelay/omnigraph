@@ -276,25 +276,20 @@ fn dst_discovery5_stale_sidecar_blocks_maintenance_until_reopen() {
     );
 }
 
-/// SCHEMA-ADD POISONED-READ pin (wide workload, first catch 2026-08-11;
-/// bisected from seed 4040 op[17]): after ANY mutation has touched Person,
-/// `apply_schema` adding one optional property SUCCEEDS but the next
-/// traversal (`all_knows`, which hydrates Person rows) dies with
-/// `Lance("… Arrow … all columns in a record batch must have the same
-/// length")` — while the plain `all_persons` scan still works. Four public
-/// API ops, no maintenance involved (indices/optimize/cleanup all
-/// irrelevant — bisected). The test also records whether a FRESH handle
-/// reproduces it (durable-shape vs live-handle question for the issue).
-/// Flips into a plain schema-evolution test when the engine is fixed.
+/// Regression for the schema-add poisoned traversal originally reduced
+/// from seed 4040 op[17]. Adding an optional property after a mutation must
+/// preserve exact node and edge content on the live, refreshed, and reopened
+/// handles. This focused sequence passes with Lance 11; randomized schema-op
+/// qualification remains separate from the unchanged wide-workload sampler.
 #[test]
 #[serial]
-fn dst_schema_add_property_after_mutation_breaks_traversal() {
+fn dst_schema_add_property_after_mutation_preserves_traversal() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build_local(Default::default())
         .expect("runtime");
     runtime.block_on(async move {
-        let root = "shared-memory://dst-schema-add-poison";
+        let root = "shared-memory://dst-schema-add-traversal";
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let mut db = Omnigraph::init_with_storage(
             root,
@@ -316,6 +311,15 @@ fn dst_schema_add_property_after_mutation_breaks_traversal() {
         .await
         .expect("one mutation before the schema apply is the whole trigger");
 
+        let mut expected_persons = fixture_persons();
+        expected_persons.insert("w3".to_string(), 69);
+        let expected_persons: Vec<_> = expected_persons
+            .into_iter()
+            .map(|(name, age)| (name, age, -1))
+            .collect();
+        let mut expected_knows = fixture_knows();
+        expected_knows.sort();
+
         let evolved = omnigraph_dst::fixtures::schema_with_extras(1);
         Box::pin(db.apply_schema(&evolved))
             .await
@@ -326,48 +330,42 @@ fn dst_schema_add_property_after_mutation_breaks_traversal() {
             .expect("plain node scan works after the apply");
         assert_eq!(persons.num_rows(), 5);
 
-        let knows = query_main(&db, MUTATION_QUERIES, "all_knows", &Default::default()).await;
-        match knows {
-            Err(err) => {
-                let text = format!("{err:?}");
-                assert!(
-                    text.contains("same length"),
-                    "traversal failed for an UNEXPECTED reason: {text}"
-                );
-                println!("SCHEMA-ADD POISON pinned (live handle): {text}");
-            }
-            Ok(r) => panic!(
-                "traversal SUCCEEDED ({} rows) — engine fixed? Flip this into a \
-                 plain schema-evolution test and re-enable schema ops in the \
-                 wide sampler (sample_world_op roll 12) + workload_can_reach.",
-                r.num_rows()
-            ),
-        }
-
-        // Workaround probe: does `refresh()` heal the live handle?
-        Box::pin(db.refresh()).await.expect("refresh");
-        let knows_refreshed =
-            query_main(&db, MUTATION_QUERIES, "all_knows", &Default::default()).await;
-        println!(
-            "SCHEMA-ADD POISON after refresh(): {}",
-            match &knows_refreshed {
-                Ok(r) => format!("traversal OK ({} rows) — refresh heals", r.num_rows()),
-                Err(e) => format!("still failing: {e:?}"),
-            }
+        assert_eq!(
+            person_rows(&db).await,
+            expected_persons,
+            "live handle preserves exact node content after schema apply"
+        );
+        assert_eq!(
+            knows_pairs_on(&db, "main").await,
+            expected_knows,
+            "live handle preserves exact edge content after schema apply"
         );
 
-        // Durability half: does a FRESH handle see the same failure?
+        Box::pin(db.refresh()).await.expect("refresh");
+        assert_eq!(
+            person_rows(&db).await,
+            expected_persons,
+            "refreshed handle preserves exact node content"
+        );
+        assert_eq!(
+            knows_pairs_on(&db, "main").await,
+            expected_knows,
+            "refreshed handle preserves exact edge content"
+        );
+
         drop(db);
         let db2 = Omnigraph::open_with_storage(root, storage)
             .await
             .expect("reopen");
-        let knows2 = query_main(&db2, MUTATION_QUERIES, "all_knows", &Default::default()).await;
-        println!(
-            "SCHEMA-ADD POISON after reopen: {}",
-            match &knows2 {
-                Ok(r) => format!("traversal OK ({} rows) — live-handle-only", r.num_rows()),
-                Err(e) => format!("still failing — durable shape: {e:?}"),
-            }
+        assert_eq!(
+            person_rows(&db2).await,
+            expected_persons,
+            "reopened handle preserves exact node content"
+        );
+        assert_eq!(
+            knows_pairs_on(&db2, "main").await,
+            expected_knows,
+            "reopened handle preserves exact edge content"
         );
     })
 }
@@ -2157,6 +2155,14 @@ fn dst_predict_triage() {
 /// Exact deterministic counts, no wall-clock claims; the counting must
 /// replay identically before the golden is trusted. A diff is a NAMED
 /// cost regression ("Optimize's l.put count moved").
+///
+/// Lance 11's tag checks add one LIST per native branch reclaim, including
+/// absent-tree cleanup before create/first-touch. The fixture's String @keys
+/// implicitly create FTS indexes: RFC 0043 defers their incremental folding.
+/// An optimizer-only ablation removed 21 Optimize PUTs (85 -> 64); the full
+/// path adds two artifact-certificate PUTs (64 -> 66). The lower Optimize,
+/// audit, and verification read counts also replay under that ablation: they
+/// follow the reduced folding/version work, not a general performance win.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {

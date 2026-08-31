@@ -1439,9 +1439,10 @@ enum Op {
     EnsureIndices,
     /// The widened families (sampled only under `Scenario::wide`).
     /// Schema evolution is additive-only (extra optional Person props), so
-    /// it joins the logically-invisible set the model ignores. Currently
-    /// QUARANTINED from the sampler by the schema-add poisoned-read finding (see the roll-12
-    /// note) — dead_code allowed until the fix re-enables it.
+    /// it joins the logically-invisible set the model ignores. The focused
+    /// schema-add regression passes with Lance 11, but randomized schema-op
+    /// requalification is deferred (see the roll-12 note). Keep it out of the
+    /// sampler, with dead_code allowed, until that qualification is complete.
     #[allow(dead_code)]
     SchemaAddProperty {
         count: usize,
@@ -1715,15 +1716,13 @@ fn sample_world_op(
 ) -> WorldOp {
     let die = if wide { rng.below(16) } else { rng.below(12) };
     match die {
-        // Roll 12 is the SchemaAddProperty slot, quarantined by ENGINE
-        // KNOWN ENGINE FINDING (2026-08-11, first sample): apply_schema after
-        // ANY mutation breaks subsequent traversals on the live handle
-        // (Arrow "same length" mismatch; live-handle-only, refresh() does NOT
-        // heal, only reopen; pinned in `dst_schema_add_property_after_mutation_breaks_traversal`). Until the engine
-        // fix lands the slot doubles the load frequency instead (1/16 was
-        // thin: whole 24-op streams sampled zero loads) — then restore
-        // `12 => { *schema_extras += 1; SchemaAddProperty{count} }` and
-        // re-add schema_apply/schema_reload to `workload_can_reach`.
+        // Roll 12 is the quarantined SchemaAddProperty slot. The original
+        // poisoned-traversal sequence now passes with Lance 11, pinned by
+        // `dst_schema_add_property_after_mutation_preserves_traversal`.
+        // Randomized schema-op requalification is deferred: keep the load
+        // frequency and RNG stream unchanged for the substrate cost comparison.
+        // Re-enabling this slot and the schema_apply/schema_reload families in
+        // `workload_can_reach` belong to that separate qualification.
         12 | 13 => {
             let _ = &schema_extras;
             // Loads run on main (`load_jsonl` targets the active branch)
@@ -1993,9 +1992,9 @@ pub fn workload_can_reach(window: &str) -> bool {
             | "optimize"
             | "cleanup"
             | "ensure_indices"
-            // schema_apply/schema_reload: machinery ready (SchemaAddProperty
-            // + window_matches), but the op is quarantined from the sampler
-            // by the schema-add finding — re-add the two families here with the fix.
+            // schema_apply/schema_reload: the focused regression passes with
+            // Lance 11, but randomized schema-op requalification is deferred.
+            // Keep these families absent while the sampler excludes the op.
             | "load"
             | "mutation"
             | "graph_publish"

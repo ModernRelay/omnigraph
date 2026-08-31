@@ -50,6 +50,20 @@ async fn person_manifest_and_head(db: &Omnigraph, root: &str) -> (u64, u64, Stri
     (entry.published_dataset_version, head, full)
 }
 
+fn assert_same_dataset_entry(
+    before: &omnigraph::db::DatasetEntry,
+    after: &omnigraph::db::DatasetEntry,
+) {
+    assert_eq!(after.type_key, before.type_key);
+    assert_eq!(after.dataset_path, before.dataset_path);
+    assert_eq!(
+        after.published_dataset_version,
+        before.published_dataset_version
+    );
+    assert_eq!(after.native_dataset_branch, before.native_dataset_branch);
+    assert_eq!(after.entity_count, before.entity_count);
+}
+
 async fn add_person_fragments(db: &mut Omnigraph) {
     for (name, age) in [("Eve", 40), ("Frank", 41), ("Grace", 42), ("Heidi", 43)] {
         mutate_main(
@@ -391,7 +405,8 @@ async fn optimize_clears_stale_auto_cleanup_on_data_tables_too() {
 // PR3 (Workstream B): an existing scalar index does not cover fragments
 // appended after it was built (build_indices is existence-gated), so those
 // rows are scanned unindexed. `optimize` must fold them back in via Lance's
-// incremental `optimize_indices`, restoring full coverage.
+// incremental `optimize_indices`, restoring BTREE coverage. Full-text coverage
+// is refreshed only by an explicit rebuild (RFC 0043).
 #[tokio::test]
 async fn optimize_reindexes_fragments_appended_after_index_build() {
     const SCHEMA: &str = r#"
@@ -439,18 +454,31 @@ node Doc {
 
     db.optimize().await.unwrap();
 
-    // Postcondition: optimize_indices folded the appended fragment in, so every
-    // index covers every fragment and `rank` reports fully Indexed.
+    // Postcondition: optimize_indices folded the scalar tail in, but preserves
+    // the existing FTS artifact instead of merging uncertified postings.
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("node:Doc").await.unwrap();
     assert!(
-        !ds.has_unindexed_fragments().await.unwrap(),
-        "optimize must extend index coverage to all fragments"
+        ds.has_unindexed_fragments().await.unwrap(),
+        "slug FTS remains partially covered until an explicit full rebuild"
     );
     assert_eq!(
         ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,
         "rank BTREE must cover all fragments after optimize"
+    );
+    let rebuilt = db.rebuild_full_text_indices_on("main").await.unwrap();
+    assert_eq!(rebuilt.rebuilt_indexes.len(), 1);
+    assert_eq!(rebuilt.rebuilt_indexes[0].property, "slug");
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open_dataset("node:Doc").await.unwrap();
+    assert!(
+        !ds.has_unindexed_fragments().await.unwrap(),
+        "explicit FTS rebuilding completes coverage without dropping the scalar index"
+    );
+    assert_eq!(
+        ds.index_coverage("rank").await.unwrap(),
+        IndexCoverage::Indexed
     );
 }
 
@@ -1069,6 +1097,329 @@ async fn ensure_indices_refuses_uncovered_drift_before_arming_recovery() {
     db.ensure_indices()
         .await
         .expect("index reconciliation should succeed once repair establishes ownership");
+}
+
+#[tokio::test]
+async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication() {
+    use lance::index::DatasetIndexExt;
+    use lance::index::scalar::IndexDetails;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+    use omnigraph::db::RebuiltFullTextIndex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.apply_schema(&TEST_SCHEMA.replace("age: I32?", "age: I32?\n    biography: String? @index"))
+        .await
+        .unwrap();
+    load_jsonl(
+        &db,
+        r#"{"type":"Person","data":{"name":"Alice","age":30,"biography":"organism university running"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices().await.unwrap();
+
+    // Model persisted indexes with a different historical name plus a
+    // same-column companion BTREE. Explicit repair adopts these test-only
+    // raw artifacts before the rebuild captures its graph-authoritative plan.
+    let person_uri = node_table_uri(&db, "Person").await;
+    let mut raw = Dataset::open(&person_uri).await.unwrap();
+    raw.create_index_builder(
+        &["name"],
+        IndexType::Inverted,
+        &lance_index::scalar::InvertedIndexParams::default(),
+    )
+    .name("historical_name_fts".to_string())
+    .await
+    .unwrap();
+    raw.create_index_builder(&["name"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("name_equality".to_string())
+        .await
+        .unwrap();
+    db.repair(RepairOptions {
+        confirm: true,
+        force: true,
+    })
+    .await
+    .unwrap();
+
+    let before = snapshot_main(&db).await.unwrap();
+    let before_commits = db.list_commits(None).await.unwrap();
+    let expected = vec![
+        RebuiltFullTextIndex {
+            type_key: "node:Company".to_string(),
+            property: "name".to_string(),
+        },
+        RebuiltFullTextIndex {
+            type_key: "node:Person".to_string(),
+            property: "biography".to_string(),
+        },
+        RebuiltFullTextIndex {
+            type_key: "node:Person".to_string(),
+            property: "name".to_string(),
+        },
+    ];
+    let result = db
+        .rebuild_full_text_indices_on_as("main", Some("index-operator"))
+        .await
+        .unwrap();
+    assert_eq!(result.branch, "main");
+    assert_eq!(result.rebuilt_indexes, expected);
+    let after = snapshot_main(&db).await.unwrap();
+    let after_commits = db.list_commits(None).await.unwrap();
+    assert_eq!(after_commits.len(), before_commits.len() + 1);
+    assert_eq!(
+        result.graph_commit_id.as_deref(),
+        Some(after_commits[0].graph_commit_id.as_str())
+    );
+    assert_eq!(after_commits[0].actor_id.as_deref(), Some("index-operator"));
+    assert_eq!(
+        after_commits[0].parent_commit_id.as_deref(),
+        Some(before_commits[0].graph_commit_id.as_str())
+    );
+    assert_eq!(
+        after.graph_manifest_version(),
+        before.graph_manifest_version() + 1
+    );
+
+    for (table_key, expected_fts) in [("node:Company", 1), ("node:Person", 2)] {
+        let old = before.open_dataset(table_key).await.unwrap();
+        let new = after.open_dataset(table_key).await.unwrap();
+        assert_eq!(
+            new.published_dataset_version(),
+            old.published_dataset_version() + 1
+        );
+        let old_indexes = old.load_indices().await.unwrap();
+        let new_indexes = new.load_indices().await.unwrap();
+        let is_fts = |index: &&lance_table::format::IndexMetadata| {
+            index
+                .index_details
+                .as_ref()
+                .is_some_and(|details| IndexDetails(details.clone()).supports_fts())
+        };
+        assert_eq!(new_indexes.iter().filter(is_fts).count(), expected_fts);
+        for old_index in old_indexes.iter() {
+            if is_fts(&old_index) {
+                assert!(
+                    !new_indexes.iter().any(|index| index.uuid == old_index.uuid),
+                    "every old full-text segment must be replaced, including historical names"
+                );
+            } else {
+                assert!(
+                    new_indexes.iter().any(|index| index.uuid == old_index.uuid),
+                    "unrelated indexes and same-column BTREE must remain unchanged"
+                );
+            }
+        }
+        assert_eq!(
+            old.scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            new.scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            "rebuild must preserve exact graph-visible rows"
+        );
+    }
+    for table_key in ["edge:Knows", "edge:WorksAt"] {
+        assert_same_dataset_entry(
+            before.dataset(table_key).unwrap(),
+            after.dataset(table_key).unwrap(),
+        );
+    }
+    assert_eq!(recovery_sidecar_count(&dir), 0);
+
+    // A force rebuild remains a real operation after coverage is complete.
+    let repeated = db.rebuild_full_text_indices_on("main").await.unwrap();
+    assert_eq!(repeated.rebuilt_indexes, expected);
+    assert_ne!(repeated.graph_commit_id, result.graph_commit_id);
+    assert_eq!(
+        db.list_commits(None).await.unwrap().len(),
+        after_commits.len() + 1
+    );
+}
+
+#[tokio::test]
+async fn full_text_rebuild_first_touches_inherited_main_without_changing_main() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let inherited = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+    db.ensure_indices_on("feature").await.unwrap();
+    assert_same_dataset_entry(
+        inherited.dataset("node:Person").unwrap(),
+        db.snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .dataset("node:Person")
+            .unwrap(),
+    );
+    add_person_fragments(&mut db).await;
+    let main_before = snapshot_main(&db).await.unwrap();
+    let main_commits_before = db.list_commits(None).await.unwrap();
+    let feature_commits_before = db.list_commits(Some("feature")).await.unwrap();
+
+    let result = db.rebuild_full_text_indices_on("feature").await.unwrap();
+    assert_eq!(result.branch, "feature");
+    assert_eq!(result.rebuilt_indexes.len(), 2);
+    let feature = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+    let main_after = snapshot_main(&db).await.unwrap();
+    for table_key in ["node:Person", "node:Company"] {
+        let entry = feature.dataset(table_key).unwrap();
+        helpers::assert_native_branch_of(entry.native_dataset_branch.as_deref(), "feature");
+        assert_eq!(
+            entry.dataset_path,
+            inherited.dataset(table_key).unwrap().dataset_path
+        );
+        assert_same_dataset_entry(
+            main_before.dataset(table_key).unwrap(),
+            main_after.dataset(table_key).unwrap(),
+        );
+        let inherited_indexes = inherited
+            .open_dataset(table_key)
+            .await
+            .unwrap()
+            .load_indices()
+            .await
+            .unwrap();
+        let rebuilt_indexes = feature
+            .open_dataset(table_key)
+            .await
+            .unwrap()
+            .load_indices()
+            .await
+            .unwrap();
+        assert!(
+            inherited_indexes
+                .iter()
+                .any(|old| !rebuilt_indexes.iter().any(|new| new.uuid == old.uuid)),
+            "first touch must publish new full-text artifacts"
+        );
+    }
+    for table_key in ["edge:Knows", "edge:WorksAt"] {
+        assert_same_dataset_entry(
+            inherited.dataset(table_key).unwrap(),
+            feature.dataset(table_key).unwrap(),
+        );
+    }
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Person").await,
+        4,
+        "rebuild reads the inherited pin, never the advanced main HEAD"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, 8);
+    assert_eq!(
+        db.list_commits(None).await.unwrap().len(),
+        main_commits_before.len()
+    );
+    let feature_commits = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(feature_commits.len(), feature_commits_before.len() + 1);
+    assert_eq!(
+        result.graph_commit_id.as_deref(),
+        Some(feature_commits[0].graph_commit_id.as_str())
+    );
+    assert_eq!(recovery_sidecar_count(&dir), 0);
+}
+
+#[tokio::test]
+async fn full_text_rebuild_reports_empty_builds_but_not_no_work() {
+    let no_fts = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(no_fts.path().to_str().unwrap(), "node Doc { n: I64 @key }")
+        .await
+        .unwrap();
+    let before = snapshot_main(&db).await.unwrap();
+    let result = db.rebuild_full_text_indices_on(" main ").await.unwrap();
+    assert_eq!(result.branch, "main");
+    assert_eq!(result.graph_commit_id, None);
+    assert!(result.rebuilt_indexes.is_empty());
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before.graph_manifest_version()
+    );
+    assert_eq!(recovery_sidecar_count(&no_fts), 0);
+
+    let empty = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(empty.path().to_str().unwrap(), TEST_SCHEMA)
+        .await
+        .unwrap();
+    let before = snapshot_main(&db).await.unwrap();
+    let result = db.rebuild_full_text_indices_on("main").await.unwrap();
+    assert_eq!(result.rebuilt_indexes.len(), 2);
+    assert!(result.graph_commit_id.is_some());
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(
+        after.graph_manifest_version(),
+        before.graph_manifest_version() + 1
+    );
+    for table_key in ["node:Person", "node:Company"] {
+        let table = after.open_dataset(table_key).await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 0);
+        assert!(table.has_fts_index("name").await.unwrap());
+        assert_eq!(
+            after.dataset(table_key).unwrap().published_dataset_version,
+            before.dataset(table_key).unwrap().published_dataset_version + 1
+        );
+    }
+    assert_eq!(recovery_sidecar_count(&empty), 0);
+}
+
+#[tokio::test]
+async fn full_text_rebuild_refuses_unsupported_physical_inventory_before_effects() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let mut raw = Dataset::open(&node_table_uri(&db, "Person").await)
+        .await
+        .unwrap();
+    // The internal ID is a physical String but not a graph text property.
+    raw.create_index_builder(
+        &["id"],
+        IndexType::Inverted,
+        &lance_index::scalar::InvertedIndexParams::default(),
+    )
+    .name("unsupported_internal_id_fts".to_string())
+    .await
+    .unwrap();
+    db.repair(RepairOptions {
+        confirm: true,
+        force: true,
+    })
+    .await
+    .unwrap();
+    let before = snapshot_main(&db).await.unwrap();
+    let error = db.rebuild_full_text_indices_on("main").await.unwrap_err();
+    assert!(
+        error.to_string().contains("unsupported_internal_id_fts"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("only single, non-list"),
+        "{error}"
+    );
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before.graph_manifest_version()
+    );
+    for table_key in ["node:Company", "node:Person"] {
+        let entry = before.dataset(table_key).unwrap();
+        let head = Dataset::open(&format!("{}/{}", db.uri(), entry.dataset_path))
+            .await
+            .unwrap();
+        assert_eq!(head.version().version, entry.published_dataset_version);
+    }
+    assert_eq!(recovery_sidecar_count(&dir), 0);
 }
 
 #[tokio::test]

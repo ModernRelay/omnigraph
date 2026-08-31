@@ -1,5 +1,6 @@
 use super::*;
 use crate::error::missing_graph_type_at_snapshot;
+use lance::index::DatasetIndexExt;
 
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
     let (resolved, catalog) = db.capture_current_read_view().await?;
@@ -34,6 +35,62 @@ pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> 
 pub(super) async fn ensure_indices_on(db: &Omnigraph, branch: &str) -> Result<Vec<PendingIndex>> {
     let branch = normalize_branch_name(branch)?;
     ensure_indices_for_branch(db, branch.as_deref()).await
+}
+
+/// The indexes replaced by one successfully published full-text rebuild.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTextIndexRebuildResult {
+    /// The selected logical graph branch, including `main`.
+    pub branch: String,
+    /// The publication made by this operation, or `None` when no index needs rebuilding.
+    pub graph_commit_id: Option<String>,
+    pub rebuilt_indexes: Vec<RebuiltFullTextIndex>,
+}
+
+/// A full-text property rebuilt from the selected branch's current rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuiltFullTextIndex {
+    pub type_key: String,
+    pub property: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexMaintenanceMode {
+    Ensure,
+    RebuildFullText,
+}
+
+struct IndexMaintenanceOutcome {
+    pending: Vec<PendingIndex>,
+    graph_commit_id: Option<String>,
+    rebuilt_indexes: Vec<RebuiltFullTextIndex>,
+}
+
+pub(super) async fn rebuild_full_text_indices_on_as(
+    db: &Omnigraph,
+    branch: &str,
+    actor: Option<&str>,
+) -> Result<FullTextIndexRebuildResult> {
+    let branch = normalize_branch_name(branch)?;
+    let public_branch = branch.as_deref().unwrap_or("main");
+    ensure_public_branch_ref(public_branch, "rebuild_full_text_indices")?;
+    db.enforce(
+        omnigraph_policy::PolicyAction::Change,
+        &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
+        actor,
+    )?;
+    let outcome = maintain_indices_for_branch(
+        db,
+        branch.as_deref(),
+        IndexMaintenanceMode::RebuildFullText,
+        actor,
+    )
+    .await?;
+    Ok(FullTextIndexRebuildResult {
+        branch: public_branch.to_string(),
+        graph_commit_id: outcome.graph_commit_id,
+        rebuilt_indexes: outcome.rebuilt_indexes,
+    })
 }
 
 #[cfg(feature = "failpoints")]
@@ -97,6 +154,19 @@ pub(super) async fn ensure_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,
 ) -> Result<Vec<PendingIndex>> {
+    Ok(
+        maintain_indices_for_branch(db, branch, IndexMaintenanceMode::Ensure, None)
+            .await?
+            .pending,
+    )
+}
+
+async fn maintain_indices_for_branch(
+    db: &Omnigraph,
+    branch: Option<&str>,
+    mode: IndexMaintenanceMode,
+    actor: Option<&str>,
+) -> Result<IndexMaintenanceOutcome> {
     // RFC-022 entry recovery barrier: recovery may advance the manifest, so
     // resolve or refuse every relevant intent before capturing the index
     // plan's base.
@@ -148,13 +218,12 @@ pub(super) async fn ensure_indices_for_branch(
         let Some(entry) = snapshot.dataset(&table_key) else {
             continue;
         };
-        // Match the processing loop's branch filter: when running on a
-        // feature branch, main-branch tables (table_branch = None) are
-        // skipped (`None => continue` at ~line 118). Pinning them here
-        // would force NoMovement on recovery and trigger an all-or-
-        // nothing rollback of legitimately-committed work on the
-        // feature-branch tables.
-        if active_branch.is_some() && entry.native_dataset_branch.is_none() {
+        // Ordinary ensure preserves lazy main inheritance. Explicit rebuilding
+        // must fork inherited tables when their full-text indexes need work.
+        if mode == IndexMaintenanceMode::Ensure
+            && active_branch.is_some()
+            && entry.native_dataset_branch.is_none()
+        {
             continue;
         }
         let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
@@ -170,7 +239,15 @@ pub(super) async fn ensure_indices_for_branch(
                 .open_dataset_head(&full_path, native_active.as_deref())
                 .await?
         };
-        let work = plan_index_work_node(db, &catalog, type_name, &table_key, &ds).await?;
+        let work = match mode {
+            IndexMaintenanceMode::Ensure => {
+                plan_index_work_node(db, &catalog, type_name, &table_key, &ds).await?
+            }
+            IndexMaintenanceMode::RebuildFullText => {
+                let node = &catalog.node_types[type_name];
+                plan_full_text_rebuild(&table_key, &node.properties, &node.indices, &ds).await?
+            }
+        };
         if !work.pending.is_empty() {
             pending_by_table.insert(table_key.clone(), work.pending.clone());
         }
@@ -185,21 +262,6 @@ pub(super) async fn ensure_indices_for_branch(
                 table_branch: native_active.clone(),
             });
             if !first_touch {
-                let staged = db
-                    .storage()
-                    .stage_create_indices(&ds, &work.specs)
-                    .await
-                    .map_err(|error| {
-                        error.with_context(format!(
-                            "stage index batch on {table_key} ({:?})",
-                            work.specs
-                        ))
-                    })?;
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
-                )?;
-                planned_transactions.insert(entry.identity, staged.transaction_identity());
-                existing_staged.insert(table_key.clone(), staged);
                 existing_targets.insert(table_key.clone(), ds);
             } else {
                 planned_transactions.insert(
@@ -219,7 +281,10 @@ pub(super) async fn ensure_indices_for_branch(
         let Some(entry) = snapshot.dataset(&table_key) else {
             continue;
         };
-        if active_branch.is_some() && entry.native_dataset_branch.is_none() {
+        if mode == IndexMaintenanceMode::Ensure
+            && active_branch.is_some()
+            && entry.native_dataset_branch.is_none()
+        {
             continue;
         }
         let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
@@ -232,7 +297,13 @@ pub(super) async fn ensure_indices_for_branch(
                 .open_dataset_head(&full_path, native_active.as_deref())
                 .await?
         };
-        let work = plan_index_work_edge_on_dataset(db, &ds).await?;
+        let work = match mode {
+            IndexMaintenanceMode::Ensure => plan_index_work_edge_on_dataset(db, &ds).await?,
+            IndexMaintenanceMode::RebuildFullText => {
+                let edge = &catalog.edge_types[edge_name];
+                plan_full_text_rebuild(&table_key, &edge.properties, &edge.indices, &ds).await?
+            }
+        };
         if work.needs_commit() {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
                 identity: entry.identity,
@@ -244,21 +315,6 @@ pub(super) async fn ensure_indices_for_branch(
                 table_branch: native_active.clone(),
             });
             if !first_touch {
-                let staged = db
-                    .storage()
-                    .stage_create_indices(&ds, &work.specs)
-                    .await
-                    .map_err(|error| {
-                        error.with_context(format!(
-                            "stage index batch on {table_key} ({:?})",
-                            work.specs
-                        ))
-                    })?;
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
-                )?;
-                planned_transactions.insert(entry.identity, staged.transaction_identity());
-                existing_staged.insert(table_key.clone(), staged);
                 existing_targets.insert(table_key.clone(), ds);
             } else {
                 planned_transactions.insert(
@@ -269,6 +325,31 @@ pub(super) async fn ensure_indices_for_branch(
                 first_touch_sources.insert(table_key.clone(), ds);
             }
             work_by_table.insert(table_key, work);
+        }
+    }
+
+    // Validate the entire inventory before building any artifacts. In rebuild
+    // mode an unsupported physical FTS index must refuse the whole operation,
+    // not leave a subset looking migrated. First-touch artifacts still wait
+    // for the durable sidecar and owned native ref below.
+    for pin in &recovery_pins {
+        if let Some(ds) = existing_targets.get(&pin.table_key) {
+            let work = &work_by_table[&pin.table_key];
+            let staged = db
+                .storage()
+                .stage_create_indices(ds, &work.specs)
+                .await
+                .map_err(|error| {
+                    error.with_context(format!(
+                        "stage index batch on {} ({:?})",
+                        pin.table_key, work.specs
+                    ))
+                })?;
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
+            )?;
+            planned_transactions.insert(pin.identity, staged.transaction_identity());
+            existing_staged.insert(pin.table_key.clone(), staged);
         }
     }
 
@@ -363,12 +444,13 @@ pub(super) async fn ensure_indices_for_branch(
         }
     }
 
-    if recovery_pins.is_empty() {
+    let graph_commit_id = if recovery_pins.is_empty() {
         // Preserve the no-work failpoint contract without manufacturing durable
         // recovery state or graph lineage.
         crate::failpoints::maybe_fail(
             crate::failpoints::names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
         )?;
+        None
     } else {
         let expected_versions = recovery_pins
             .iter()
@@ -383,7 +465,7 @@ pub(super) async fn ensure_indices_for_branch(
             })
             .collect::<crate::db::manifest::ExpectedTableVersions>();
         let lineage = db
-            .new_lineage_intent_for_branch(active_branch.as_deref(), None)
+            .new_lineage_intent_for_branch(active_branch.as_deref(), actor)
             .await?;
         let authority = crate::db::manifest::RecoveryAuthorityToken {
             branch_identifier: txn.authority.branch_identifier.clone(),
@@ -401,7 +483,7 @@ pub(super) async fn ensure_indices_for_branch(
         };
         let mut sidecar = crate::db::manifest::new_ensure_indices_sidecar_v9(
             active_branch.clone(),
-            None,
+            actor.map(str::to_string),
             recovery_pins.clone(),
             authority,
             recovery_lineage,
@@ -547,26 +629,23 @@ pub(super) async fn ensure_indices_for_branch(
             crate::failpoints::maybe_fail(
                 crate::failpoints::names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
             )?;
-            commit_updates_on_branch_with_expected(
+            let published = commit_updates_on_branch_with_expected(
                 db,
                 active_branch.as_deref(),
                 &updates,
                 &expected_versions,
-                None,
+                actor,
                 &txn,
                 lineage,
             )
             .await?;
-            Ok::<(), OmniError>(())
+            Ok::<String, OmniError>(published.graph_commit_id)
         }
         .await;
 
-        if let Err(error) = post_arm_result {
-            return Err(OmniError::recovery_required(
-                recovery_operation_id,
-                error.to_string(),
-            ));
-        }
+        let published = post_arm_result.map_err(|error| {
+            OmniError::recovery_required(recovery_operation_id, error.to_string())
+        })?;
 
         if let Err(err) =
             crate::db::manifest::delete_sidecar(&recovery_handle, db.storage_adapter()).await
@@ -577,7 +656,8 @@ pub(super) async fn ensure_indices_for_branch(
                 "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
             );
         }
-    }
+        Some(published)
+    };
 
     // Preserve the historical, observable catalog order even though planning
     // and physical effects now happen in separate phases.
@@ -589,7 +669,25 @@ pub(super) async fn ensure_indices_for_branch(
             pending.append(&mut table_pending);
         }
     }
-    Ok(pending)
+    let mut rebuilt_indexes = Vec::new();
+    if mode == IndexMaintenanceMode::RebuildFullText && graph_commit_id.is_some() {
+        for pin in &recovery_pins {
+            for spec in &work_by_table[&pin.table_key].specs {
+                if let crate::storage_layer::IndexBuildSpec::FullText { column } = spec {
+                    rebuilt_indexes.push(RebuiltFullTextIndex {
+                        type_key: pin.table_key.clone(),
+                        property: column.clone(),
+                    });
+                }
+            }
+        }
+        rebuilt_indexes.sort_by(|a, b| (&a.type_key, &a.property).cmp(&(&b.type_key, &b.property)));
+    }
+    Ok(IndexMaintenanceOutcome {
+        pending,
+        graph_commit_id,
+        rebuilt_indexes,
+    })
 }
 
 fn pre_minted_index_transaction(
@@ -707,6 +805,97 @@ impl PlannedIndexWork {
             self.specs.push(spec);
         }
     }
+}
+
+/// Full rebuilds use schema declarations plus the actual physical inventory.
+/// An externally named FTS index on a supported property is still replaced;
+/// names and the table writer version are not compatibility evidence.
+async fn plan_full_text_rebuild(
+    table_key: &str,
+    properties: &HashMap<String, PropType>,
+    declarations: &[Vec<String>],
+    ds: &SnapshotHandle,
+) -> Result<PlannedIndexWork> {
+    let mut columns = BTreeSet::new();
+    for declaration in declarations {
+        if let [column] = declaration.as_slice()
+            && properties.get(column).is_some_and(|property| {
+                node_prop_index_kind(property) == Some(NodePropIndexKind::Fts)
+            })
+        {
+            columns.insert(column.clone());
+        }
+    }
+
+    let dataset = ds.dataset();
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    let raw_indexes = lance_table::io::manifest::read_manifest_indexes(
+        &store,
+        dataset.manifest_location(),
+        dataset.manifest(),
+    )
+    .await
+    .map_err(OmniError::storage)?;
+    let indexes = dataset.load_indices().await.map_err(OmniError::storage)?;
+    let supported_ids: HashSet<_> = indexes.iter().map(|index| index.uuid).collect();
+    // load_indices filters unsupported versions and may infer legacy details.
+    // Neither operation proves that the complete physical inventory can be
+    // rebuilt. Validate the unfiltered manifest before accepting that view.
+    for index in &raw_indexes {
+        if index.index_details.is_none() {
+            return Err(OmniError::manifest(format!(
+                "cannot rebuild full-text indexes on {}: index '{}' has no index-kind \
+                 metadata, so its full-text inventory cannot be proven; no indexes were published",
+                dataset_subject(table_key),
+                index.name,
+            )));
+        }
+        if !supported_ids.contains(&index.uuid) {
+            return Err(OmniError::manifest(format!(
+                "cannot rebuild full-text indexes on {}: index '{}' has an unsupported \
+                 physical format; no indexes were published",
+                dataset_subject(table_key),
+                index.name,
+            )));
+        }
+    }
+    for index in indexes.iter() {
+        if !TableStore::is_full_text_index(index) {
+            continue;
+        }
+        let field = index
+            .keyed_field()
+            .filter(|_| index.covering_fields.is_empty())
+            .and_then(|id| dataset.schema().fields.iter().find(|field| field.id == id));
+        let Some(field) = field.filter(|field| {
+            properties.get(&field.name).is_some_and(|property| {
+                node_prop_index_kind(property) == Some(NodePropIndexKind::Fts)
+            })
+        }) else {
+            return Err(OmniError::manifest(format!(
+                "cannot rebuild full-text index '{}' on {}: only single, non-list, \
+                 free-text String properties in the selected graph schema are supported; \
+                 no indexes were published",
+                index.name,
+                dataset_subject(table_key),
+            )));
+        };
+        columns.insert(field.name.clone());
+    }
+
+    // Empty tables are deliberately not skipped: either Lance publishes an
+    // actual empty full build, or its error refuses the operation. Returning
+    // success while retaining an old incompatible index is not a rebuild.
+    Ok(PlannedIndexWork {
+        specs: columns
+            .into_iter()
+            .map(|column| crate::storage_layer::IndexBuildSpec::FullText { column })
+            .collect(),
+        pending: Vec::new(),
+    })
 }
 
 /// Classify index work against one already-selected dataset snapshot and one

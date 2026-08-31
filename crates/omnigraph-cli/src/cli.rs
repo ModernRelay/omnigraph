@@ -17,8 +17,8 @@ COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
 URI): query, mutate, load, blob, branch, snapshot, export, commit, changes, schema show/apply.\n  \
 served — require a server: graphs (registry scope).\n  \
-direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
-schema plan, lint).\n  \
+direct — direct storage access; reject --server (init, optimize, rebuild-full-text-indexes, \
+repair, cleanup, schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
 --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
@@ -66,11 +66,11 @@ pub(crate) struct Cli {
     /// Address a cluster-managed graph's storage for maintenance:
     /// a cluster directory or storage-root URI — named via `clusters:` in
     /// ~/.omnigraph/config.yaml, or a literal `file://`/`s3://`/`az://` root. Pair
-    /// with `--graph <id>` to select the graph. Used by optimize / repair /
-    /// cleanup. Azure is a qualification preview pending adversarial live
-    /// qualification, and its maintenance still requires the cluster-root
-    /// external admission wrapper. Exclusive with a positional URI / `--store` /
-    /// `--server`.
+    /// with `--graph <id>` to select the graph. Used by optimize /
+    /// rebuild-full-text-indexes / repair / cleanup. Azure is a qualification
+    /// preview pending adversarial live qualification, and its maintenance still
+    /// requires the cluster-root external admission wrapper. Exclusive with a
+    /// positional URI / `--store` / `--server`.
     #[arg(long, global = true, value_name = "DIR|URI")]
     pub(crate) cluster: Option<String>,
 
@@ -289,6 +289,16 @@ pub(crate) enum Command {
     Optimize {
         /// Graph URI
         uri: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rebuild all full-text indexes from one branch's current rows
+    RebuildFullTextIndexes {
+        /// Graph storage URI; alternatively use --store or --cluster/--graph
+        uri: Option<String>,
+        /// Branch to rebuild; other branches and historical snapshots are unchanged
+        #[arg(long, default_value = "main")]
+        branch: String,
         #[arg(long)]
         json: bool,
     },

@@ -11,9 +11,43 @@ release line can export it. Upgrade by rebuilding at a new URI:
 5. retire the old graph only after the cutover is proven.
 
 Ordinary patch/minor upgrades that keep the same storage format do not require
-this procedure. Check the [release notes](../../releases/) before upgrading.
+this export/import procedure. Derived indexes may still need rebuilding, as
+below. Check the [release notes](../../releases/) before upgrading.
 
-## What the rebuild preserves
+## Full-text index upgrade
+
+The Lance 11 upgrade keeps graph storage format v6, entities, branches, and
+history. It changes the English stemmer used by full-text search. Old indexes
+cannot safely be searched by the new analyzer, so OmniGraph explicitly refuses
+full-text queries until the selected indexes have been rebuilt.
+
+1. Stop all old readers and writers and preserve a verified backup.
+2. Upgrade the CLI and the entire serving fleet together; do not serve with a
+   mixture of Lance 10 and Lance 11 binaries.
+3. With overlapping writers stopped, rebuild each live branch that needs search:
+
+   ```bash
+   omnigraph rebuild-full-text-indexes ./graph.omni --branch main --json
+   omnigraph rebuild-full-text-indexes ./graph.omni --branch review --json
+   ```
+
+4. Verify representative searches and entity counts before resuming service.
+   Include words affected by stemming, such as `organism` and `university`.
+5. Keep the backup for rollback. An old binary must not serve newly rebuilt
+   indexes; roll back by restoring the old backup with the old fleet.
+
+Ordinary reads, traversal, and vector search remain available without the
+full-text rebuild. Historical snapshots are unchanged and may refuse full-text
+search. To search old content, create a live branch from the desired snapshot
+and rebuild that branch. Restoring an old snapshot may require another rebuild.
+The operation is explicit and can be expensive on large graphs; `optimize` is
+not a replacement for this migration.
+
+## What an export/import rebuild preserves
+
+This table describes rebuilding a graph at a new URI for a graph-format change,
+not the full-text index rebuild above. An index rebuild retains the existing
+graph's entities, branches, and history.
 
 | Preserved | Starts fresh |
 |---|---|
@@ -37,7 +71,7 @@ mapping is:
 | v3 | latest 0.7.x |
 | v4 | latest 0.8.x |
 | v5 | the exact unreleased development build that wrote it |
-| v6 | current 0.9.x–0.10.x line; no rebuild within this generation |
+| v6 | current 0.9.x–0.10.x line; no entity export/import within this generation |
 
 If the graph's generation is newer than the binary, upgrade the binary rather
 than rebuilding with it.

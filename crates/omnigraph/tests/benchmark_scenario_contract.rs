@@ -212,8 +212,16 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
         .expect("exact content verifier boundary")
         .0;
     assert!(exact_verifier.contains(".project(&[\"id\", \"slug\", \"embedding\"])"));
-    assert!(exact_verifier.contains("scanner.batch_size(scan_batch_rows)"));
-    assert!(exact_verifier.contains("scanner.batch_size_bytes(scan_batch_bytes_target)"));
+    for limit in [
+        "scanner.batch_size(scan_batch_rows)",
+        "scanner.batch_size_bytes(scan_batch_bytes_target)",
+    ] {
+        assert_eq!(
+            exact_verifier.matches(limit).count(),
+            2,
+            "both physical and manifest-pinned exact scans need row and byte limits"
+        );
+    }
     assert!(exact_verifier.contains("compact_oversized_verification_slice(batch)"));
     assert_eq!(
         verify
@@ -222,12 +230,9 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
         4,
         "every exact view must use the conservative source-plan byte target"
     );
-    assert_eq!(
-        exact_verifier
-            .matches("scanner.strict_batch_size(true)")
-            .count(),
-        2,
-        "both physical and manifest-pinned exact scans need a hard output-row ceiling"
+    assert!(
+        !source.contains("scanner.strict_batch_size(true)"),
+        "Lance 11 rejects strict row batching combined with a byte target"
     );
     assert!(exact_verifier.contains("duplicate ID in verified content"));
     assert!(exact_verifier.contains("verified ID domain has a missing slot"));

@@ -65,7 +65,7 @@ physical-effect proofs:
 | Mutation / Load | One exact staged keyed, overwrite, or delete transaction per touched table | One graph commit |
 | SchemaApply | Exact existing-table rewrites plus owned first-touch table creation and the complete schema/manifest delta | One main-branch graph commit |
 | BranchMerge | Pointer adoption, a proven insertion chain, or a bounded ordered-diff transaction chain | One target-branch graph commit |
-| EnsureIndices | One exact mixed `CreateIndex` transaction per productive table; untrainable vector work remains pending | One pointer publication when work lands |
+| EnsureIndices / full-text rebuild | One exact `CreateIndex` transaction per productive table; ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
 | Optimize | Bounded compaction and index-fold maintenance over the complete planned table set | At most one monotonic main publication |
 
 Native graph-branch create/delete is a control exception. `BranchContents` is
@@ -115,6 +115,12 @@ shape are proven. Branch merge accepts the shortcut only across a complete,
 contiguous, structurally valid history. The certificate is an optimization
 capability, not an authenticity mechanism; unfamiliar or cleaned history falls
 back to the general merge.
+
+Full-text builds stage an artifact-scoped analyzer certificate before their
+CreateIndex metadata is published. The explicit rebuild uses this same writer,
+including first-touch branch ownership; it does not rewrite retained snapshots
+or add a separate migration publisher. See
+[full-text compatibility](lance.md#full-text-compatibility).
 
 ## First-touch tables and lazy branches
 

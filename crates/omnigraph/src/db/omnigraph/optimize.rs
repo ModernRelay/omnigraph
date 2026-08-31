@@ -656,7 +656,25 @@ async fn apply_optimize_table_effects(
         {
             continue;
         }
-        match ds.optimize_indices(&OptimizeOptions::default()).await {
+        // FTS folding merges existing postings into a new UUID without an
+        // uncommitted proof hook. Keep those immutable artifacts (stable-row-ID
+        // compaction preserves them), and scan uncovered rows until an explicit
+        // full rebuild. Never bless mixed old/new analyzer postings. RFC 0043.
+        let index_names = ds
+            .load_indices()
+            .await
+            .map_err(OmniError::storage)?
+            .iter()
+            .filter(|index| {
+                index.index_details.is_some()
+                    && !crate::table_store::TableStore::is_full_text_index(index)
+            })
+            .map(|index| index.name.clone())
+            .collect();
+        match ds
+            .optimize_indices(&OptimizeOptions::default().index_names(index_names))
+            .await
+        {
             Ok(()) => {}
             Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
                 continue;

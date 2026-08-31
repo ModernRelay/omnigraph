@@ -310,7 +310,9 @@ impl Omnigraph {
             actor_id,
         )?;
         let (requested, base_branch) = Self::normalize_load_scope(branch, base)?;
-        self.load_as_inner(requested, base_branch, data, mode, actor_id, input_shape)
+        // Keep the full load state machine off the stack of every public
+        // wrapper and its callers; policy and scope checks precede allocation.
+        Box::pin(self.load_as_inner(requested, base_branch, data, mode, actor_id, input_shape))
             .await
     }
 

@@ -1208,6 +1208,9 @@ impl ApiError {
             } => Self::internal(format!(
                 "historical published dataset version {published_dataset_version} was reclaimed"
             )),
+            error @ OmniError::FullTextIndexRebuildRequired { .. } => {
+                Self::conflict(error.to_string())
+            }
             // Caller-side continuation fault (decode, checksum, or scope). The
             // "change cursor rejected: " prefix is a stable contract so raw
             // HTTP clients can tell it from a genuine retention gap.
@@ -1393,6 +1396,22 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod api_error_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn incompatible_full_text_index_returns_rebuild_required_conflict() {
+        let response = ApiError::from_omni(OmniError::FullTextIndexRebuildRequired {
+            index: "title_idx".into(),
+            reason: "analyzer certificate is missing".into(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert!(error.error.contains("requires rebuild"));
+        assert!(error.error.contains("rebuild-full-text-indexes"));
+    }
 
     #[test]
     fn merge_summary_uses_type_and_entity_vocabulary() {

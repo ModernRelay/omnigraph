@@ -65,8 +65,16 @@ fn additive_schema() -> String {
 }
 
 fn install_policy(db: Omnigraph, dir_path: &Path) -> (Omnigraph, Arc<PolicyEngine>) {
+    install_policy_source(db, dir_path, POLICY_YAML)
+}
+
+fn install_policy_source(
+    db: Omnigraph,
+    dir_path: &Path,
+    source: &str,
+) -> (Omnigraph, Arc<PolicyEngine>) {
     let policy_path = dir_path.join("policy.yaml");
-    fs::write(&policy_path, POLICY_YAML).unwrap();
+    fs::write(&policy_path, source).unwrap();
     let engine = PolicyEngine::load_graph(&policy_path, dir_path.to_str().unwrap()).unwrap();
     let engine = Arc::new(engine);
     let db = db.with_policy(Arc::clone(&engine) as Arc<dyn PolicyChecker>);
@@ -426,4 +434,93 @@ async fn branch_merge_as_allows_when_policy_permits_actor() {
     db.branch_merge_as("feature", "main", Some("act-allowed"))
         .await
         .expect("act-allowed should be able to BranchMerge");
+}
+
+#[tokio::test]
+async fn full_text_rebuild_enforces_selected_branch_before_effects_and_records_actor() {
+    fn physical_tree(
+        root: &Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            entries: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+        ) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if entry.file_type().unwrap().is_dir() {
+                    entries.insert(relative, None);
+                    visit(root, &path, entries);
+                } else {
+                    entries.insert(relative, Some(fs::read(path).unwrap()));
+                }
+            }
+        }
+        let mut entries = std::collections::BTreeMap::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    // This actor can change unprotected feature, but not protected main.
+    // A hardcoded main scope or a different maintenance action must fail.
+    let policy = POLICY_YAML.replace("      branch_scope: any", "      branch_scope: unprotected");
+    let (db, _engine) = install_policy_source(db, dir.path(), &policy);
+    let main_before = db.list_commits(None).await.unwrap();
+    let feature_before = db.list_commits(Some("feature")).await.unwrap();
+    let files_before = physical_tree(dir.path());
+
+    for (branch, actor) in [("feature", "act-denied"), ("main", "act-allowed")] {
+        assert_denied(
+            db.rebuild_full_text_indices_on_as(branch, Some(actor))
+                .await,
+            "rebuild_full_text_indices_on_as",
+        );
+        assert_eq!(
+            physical_tree(dir.path()),
+            files_before,
+            "policy refusal must not write index artifacts, native refs, sidecars, or publications"
+        );
+    }
+    let error = db
+        .rebuild_full_text_indices_on("feature")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, OmniError::Policy(message) if message.contains("no actor")),
+        "{error}"
+    );
+    assert_eq!(
+        physical_tree(dir.path()),
+        files_before,
+        "the no-actor wrapper must not bypass policy"
+    );
+
+    let result = db
+        .rebuild_full_text_indices_on_as("feature", Some("act-allowed"))
+        .await
+        .expect("Change on the selected unprotected branch must permit a real rebuild");
+    assert_eq!(result.branch, "feature");
+    assert_eq!(result.rebuilt_indexes.len(), 2);
+    let feature_after = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(feature_after.len(), feature_before.len() + 1);
+    assert_eq!(
+        result.graph_commit_id.as_deref(),
+        Some(feature_after[0].graph_commit_id.as_str())
+    );
+    assert_eq!(feature_after[0].actor_id.as_deref(), Some("act-allowed"));
+    assert_eq!(
+        feature_after[0].parent_commit_id.as_deref(),
+        Some(feature_before[0].graph_commit_id.as_str())
+    );
+    let main_after = db.list_commits(None).await.unwrap();
+    assert_eq!(main_after.len(), main_before.len());
+    assert_eq!(
+        main_after[0].graph_commit_id,
+        main_before[0].graph_commit_id
+    );
 }

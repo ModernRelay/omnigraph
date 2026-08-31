@@ -32,7 +32,7 @@ mean an active sidecar uses an old outer schema.
 | Mutation / Load | Exact one-transaction effect identity and confirmation |
 | BranchMerge | Fixed bounded transaction chain, source/target authority, and lineage |
 | SchemaApply | Exact existing/first-touch effects, durable schema staging, and complete catalog delta |
-| EnsureIndices | Exact mixed CreateIndex effects and complete pointer delta |
+| EnsureIndices / full-text rebuild | Exact CreateIndex effects and complete pointer delta; rebuild retains the same fixed actor and lineage |
 | Optimize | Bounded maintenance plan and complete graph-wide pointer outcome |
 
 Pre-v9 identity-less artifacts are never upgraded by guessing from aliases.

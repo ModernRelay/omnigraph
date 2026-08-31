@@ -1347,6 +1347,55 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::RebuildFullTextIndexes { uri, branch, json } => {
+            let uri = resolve_maintenance_uri(
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+                cli.cluster.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                "rebuild-full-text-indexes",
+            )
+            .await?;
+            let actor = resolve_cli_actor(cli.as_actor.as_deref())?;
+            echo_write_target(cli.quiet, "rebuild-full-text-indexes", &uri, false);
+            let db = Omnigraph::open(&uri).await?;
+            let result = db
+                .rebuild_full_text_indices_on_as(&branch, actor.as_deref())
+                .await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "uri": uri,
+                    "branch": result.branch,
+                    "graph_commit_id": result.graph_commit_id,
+                    "rebuilt_indexes": result.rebuilt_indexes.iter().map(|index| {
+                        serde_json::json!({
+                            "type_key": index.type_key,
+                            "property": index.property,
+                        })
+                    }).collect::<Vec<_>>(),
+                }))?;
+            } else {
+                println!(
+                    "rebuild-full-text-indexes {} — branch {}, {} indexes rebuilt",
+                    uri,
+                    result.branch,
+                    result.rebuilt_indexes.len(),
+                );
+                for index in &result.rebuilt_indexes {
+                    println!(
+                        "  {}, property '{}'",
+                        graph_type_subject(&index.type_key),
+                        index.property,
+                    );
+                }
+                if let Some(commit_id) = result.graph_commit_id {
+                    println!("graph commit: {commit_id}");
+                } else {
+                    println!("no-op; no graph commit published");
+                }
+            }
+        }
         Command::Repair {
             uri,
             confirm,

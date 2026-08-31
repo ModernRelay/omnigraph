@@ -44,7 +44,7 @@ or lower it to match v6. See [recovery.md](recovery.md).
 
 ## Lance contract
 
-The workspace resolves the complete Lance package family to **10.0.0** and
+The workspace resolves the complete Lance package family to **11.0.0** and
 explicitly writes stable data storage version **V2_2**. A dependency bump alone
 does not change the OmniGraph manifest format. Adopting a new Lance file format
 or a behavior that changes persisted graph meaning does.
