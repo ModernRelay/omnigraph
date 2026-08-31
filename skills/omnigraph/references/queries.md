@@ -18,7 +18,8 @@ Writing `.gq` query files in Omnigraph.
 
 - One `.gq` file per primary node type (`signals.gq`, `patterns.gq`, `elements.gq`)
 - One `mutations.gq` file for all insert/update/delete queries
-- Put query files in `queries/` — cluster mode discovers `queries/*.gq` automatically
+- Put query files in `queries/`, then declare `graphs.<id>.queries: queries/` in
+  `cluster.yaml`; cluster mode does not scan an undeclared directory.
 
 ## Linting
 
@@ -58,7 +59,7 @@ omnigraph query get_signal --query signals.gq --params '{"slug":"sig-foo"}'
 
 The compiler typechecks parameter values against declared types.
 
-> For one-off/ad-hoc execution, pass the query inline instead of a file with `-e/--query-string` (v0.6.0+): `omnigraph query -e 'query q($slug: String){ match { $s: Signal { slug: $slug } } return { $s.name } }' --params '{"slug":"sig-foo"}'` (and `omnigraph mutate -e '...'`). `-e` is mutually exclusive with `--query <file>` — exactly one of the two is required. (Operator aliases are invoked via the separate `omnigraph alias <name>` subcommand.)
+> For one-off/ad-hoc execution, pass the query inline instead of a file with `-e/--query-string`: `omnigraph query -e 'query q($slug: String){ match { $s: Signal { slug: $slug } } return { $s.name } }' --params '{"slug":"sig-foo"}'` (and `omnigraph mutate -e '...'`). `-e` is mutually exclusive with `--query <file>` — exactly one of the two is required. (Operator aliases are invoked via the separate `omnigraph alias <name>` subcommand.)
 
 ## Query Structure
 
@@ -115,7 +116,7 @@ query employees_of($company: String) {
 }
 ```
 
-### Undirected traversal (omnigraph >= 0.8.1)
+### Undirected traversal
 
 For symmetric relations (same-endpoint-type edges like `IssueRelated: Issue -> Issue`),
 angle brackets match the edge in **either direction**, deduplicated — one
@@ -131,7 +132,7 @@ query related_to($slug: String) {
 }
 ```
 
-### Edge bindings — filtering and projecting edge properties (omnigraph >= 0.9.0)
+### Edge bindings — filtering and projecting edge properties
 
 An optional `$var:` prefix on the edge word binds the matched edge *row*, so
 declared edge properties (confidence, role, provenance, …) become usable
@@ -192,11 +193,11 @@ match {
 ```gq
 match {
     $d: Doc
-    match_text($d.body, $q)    // phrase match
+    match_text($d.body, $q)    // regular full-text match (not phrase search)
 }
 ```
 
-### Vector/ranking (require `limit`)
+### Vector/ranking
 
 ```gq
 query vector_search($q: Vector(3072)) {
@@ -207,7 +208,9 @@ query vector_search($q: Vector(3072)) {
 }
 ```
 
-`nearest`, `bm25`, and `rrf` are ranking operators, not filters. Every query using them **must** end with `limit N` — omitting it is a compile error.
+`nearest`, `bm25`, and `rrf` are ranking operators, not filters. `nearest` and
+`rrf` require `limit N`; BM25 alone does not, though a limit is recommended for
+bounded output.
 
 ### Hybrid (reciprocal rank fusion)
 
@@ -241,13 +244,18 @@ Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggr
 
 ## Filter Operators
 
-`=`, `!=`, `>`, `<`, `>=`, `<=`, `contains`
+`starts_with`, `contains`, `>=`, `<=`, `!=`, `>`, `<`, `=`
+
+Both String predicates are exact and case-sensitive: `contains` matches a
+substring and `starts_with` matches a prefix. Either can use an index when one
+is available and must retain correct scan fallback.
 
 ```gq
 match {
     $p: Person
     $p.age > 30
     $p.name contains "Al"
+    $p.name starts_with "A"
 }
 ```
 
@@ -271,11 +279,17 @@ query add_signal($slug: String, $name: String, $brief: String,
 }
 ```
 
-**Every non-nullable property must be provided.** Lint catches missing ones as:
+**Every non-nullable property must be provided.** Lint normally catches missing
+ones as:
 
 ```
 error: T12: insert for 'Signal' must provide non-nullable property 'brief'
 ```
+
+One v0.10 exception matters: lint permits omission of a non-null Vector target
+annotated with `@embed(source)`, but mutation execution does not auto-embed and
+still rejects the missing vector. Supply that target explicitly; use the
+offline embedding pipeline for generated values.
 
 ### Insert edge
 
@@ -285,7 +299,8 @@ query link_signal_forms_pattern($signal: String, $pattern: String) {
 }
 ```
 
-Edge `data` block is `{}` if the edge has no properties — just specify `from` and `to` slugs.
+A propertyless edge needs only `from` and `to`, which are logical endpoint IDs.
+GQ has no nested `data {}` block.
 
 ### Update
 
@@ -315,24 +330,19 @@ query add_and_link($slug: String, $pattern: String, $createdAt: DateTime, $updat
 
 There's no `upsert` keyword at the query level — use `load --mode merge` for bulk upsert.
 
-> **Insert/update-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`update` in the same query is rejected at parse time. (Deletes stage through the same two-phase publish as inserts/updates since 0.8.0; the D₂ split is a deliberate semantic boundary — one mutation query is constructive XOR destructive, keeping read-your-writes unambiguous — not an implementation gap.) Split a delete-then-insert into two separate mutations.
+> **Insert/update-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`update` in the same query is rejected at parse time. The split is deliberate: one mutation query is constructive XOR destructive. Split a delete-then-insert into two separate mutations.
 
 ### Date and DateTime values
 
-Date format is asymmetric between `mutate` (parameter values) and `load` (JSONL):
+Prefer ISO strings on both paths:
 
 | Path | Date | DateTime |
 |---|---|---|
 | `mutate --params` | ISO string `"2026-04-29"` | ISO string `"2026-04-29T10:00:00Z"` |
-| `load` JSONL | Integer days since epoch `20572` | ISO string `"2026-04-29T10:00:00Z"` |
+| `load` JSONL | ISO string `"2026-04-29"` (integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` |
 
-Compute integer days form for a given date `d`:
-
-```python
-(d - datetime.date(1970, 1, 1)).days   # d is the date you're loading, not today()
-```
-
-This asymmetry is one of the most common silent type errors when bulk-loading data prepared for one path through the other.
+Integer epoch days remain useful for generated Arrow-oriented input, but are
+not required for hand-authored JSONL.
 
 ## Naming Convention
 
