@@ -216,6 +216,7 @@ pub struct SnapshotDataset {
 /// writable handle and bypass graph publication.
 pub struct SnapshotScanner {
     scanner: Scanner,
+    dataset: Dataset,
 }
 
 impl SnapshotScanner {
@@ -237,16 +238,19 @@ impl SnapshotScanner {
         self
     }
 
-    /// Set the requested number of rows returned in one scan batch.
+    /// Set the maximum number of rows returned in one scan batch.
     ///
-    /// Lance's byte-based batch target overrides this setting unless
-    /// [`Self::strict_batch_size`] is also enabled.
+    /// When [`Self::batch_size_bytes`] is also configured, both limits apply;
+    /// whichever is reached first determines the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.scanner.batch_size(batch_size);
         self
     }
 
     /// Set the approximate in-memory byte target for one scan batch.
+    ///
+    /// This composes with [`Self::batch_size`], but cannot be combined with
+    /// [`Self::strict_batch_size`] because merging batches can exceed the target.
     pub fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
         self.scanner.batch_size_bytes(batch_size_bytes);
         self
@@ -254,8 +258,8 @@ impl SnapshotScanner {
 
     /// Require full output batches to contain exactly the requested row count.
     ///
-    /// The final batch may contain fewer rows. This restores a hard output-row
-    /// ceiling when [`Self::batch_size_bytes`] is also configured.
+    /// The final batch may contain fewer rows. Enabling this with a byte target
+    /// (including one inherited from the dataset) fails when the scan executes.
     pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
         self.scanner.strict_batch_size(strict_batch_size);
         self
@@ -283,6 +287,8 @@ impl SnapshotScanner {
 
     /// Execute the configured read without exposing its physical plan.
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
+        crate::table_store::TableStore::validate_full_text_scan(&self.dataset, &self.scanner, None)
+            .await?;
         self.scanner
             .try_into_stream()
             .await
@@ -299,11 +305,18 @@ impl SnapshotDataset {
     pub fn scan(&self) -> SnapshotScanner {
         SnapshotScanner {
             scanner: self.dataset.scan(),
+            dataset: self.dataset.clone(),
         }
     }
 
     /// Count physical rows in this pinned dataset version, optionally with a filter.
     pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        if let Some(filter) = &filter {
+            let mut scanner = self.dataset.scan();
+            scanner.filter(filter).map_err(OmniError::storage)?;
+            crate::table_store::TableStore::validate_full_text_scan(&self.dataset, &scanner, None)
+                .await?;
+        }
         self.dataset
             .count_rows(filter)
             .await

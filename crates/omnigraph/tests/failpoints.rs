@@ -4467,6 +4467,24 @@ async fn ensure_indices_complete_armed_effects_roll_back() {
 #[tokio::test]
 #[serial]
 async fn ensure_indices_entry_barrier_refuses_partial_armed_before_staging() {
+    for full_text_rebuild in [false, true] {
+        ensure_indices_partial_armed_case(full_text_rebuild).await;
+    }
+}
+
+async fn run_index_maintenance(
+    db: &Omnigraph,
+    branch: &str,
+    full_text_rebuild: bool,
+) -> Result<(), OmniError> {
+    if full_text_rebuild {
+        db.rebuild_full_text_indices_on(branch).await.map(|_| ())
+    } else {
+        db.ensure_indices_on(branch).await.map(|_| ())
+    }
+}
+
+async fn ensure_indices_partial_armed_case(full_text_rebuild: bool) {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -4479,12 +4497,16 @@ async fn ensure_indices_entry_barrier_refuses_partial_armed_before_staging() {
     )
     .await
     .unwrap();
+    if full_text_rebuild {
+        // The forced leg replaces existing, fully covered artifacts rather
+        // than relying on the ordinary reconciler's missing-index predicate.
+        db.ensure_indices().await.unwrap();
+    }
 
     let operation_id;
     {
         let _failpoint = ScopedFailPoint::new(names::ENSURE_INDICES_POST_TABLE_EFFECT, "return");
-        let err = db
-            .ensure_indices()
+        let err = run_index_maintenance(&db, "main", full_text_rebuild)
             .await
             .expect_err("failpoint must stop after the first of two table effects");
         assert!(matches!(err, OmniError::RecoveryRequired { .. }));
@@ -4532,7 +4554,7 @@ async fn ensure_indices_entry_barrier_refuses_partial_armed_before_staging() {
     let retry_error = {
         let _failpoint =
             ScopedFailPoint::new(names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE, "return");
-        db.ensure_indices()
+        run_index_maintenance(&db, "main", full_text_rebuild)
             .await
             .expect_err("rollback-only ownership must refuse before remaining index staging")
     };
@@ -4565,10 +4587,96 @@ async fn ensure_indices_entry_barrier_refuses_partial_armed_before_staging() {
     .unwrap();
 
     let recovered = Omnigraph::open(&uri).await.unwrap();
-    recovered
-        .ensure_indices()
+    run_index_maintenance(&recovered, "main", full_text_rebuild)
         .await
         .expect("clean retry must build both compensated and never-committed indexes");
+}
+
+#[tokio::test]
+#[serial]
+async fn full_text_rebuild_confirmed_recovery_preserves_original_actor_and_publication() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    let before = helpers::snapshot_main(&db).await.unwrap();
+    let before_commits = db.list_commits(None).await.unwrap();
+    let parent = before_commits[0].graph_commit_id.clone();
+
+    {
+        let _failpoint = ScopedFailPoint::new(
+            names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        let error = db
+            .rebuild_full_text_indices_on_as("main", Some("index-operator"))
+            .await
+            .expect_err("stop after confirmed index effects but before graph publication");
+        assert!(matches!(error, OmniError::RecoveryRequired { .. }));
+    }
+    let operation_id = single_sidecar_operation_id(dir.path());
+    let sidecar: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            dir.path()
+                .join("__recovery")
+                .join(format!("{operation_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sidecar["protocol_v8"]["effect_phase"], "EffectsConfirmed");
+    assert_eq!(sidecar["actor_id"], "index-operator");
+    assert_eq!(
+        sidecar["protocol_v8"]["lineage"]["actor_id"],
+        "index-operator"
+    );
+    let fixed_commit = sidecar["protocol_v8"]["lineage"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        db.list_commits(None).await.unwrap().len(),
+        before_commits.len(),
+        "confirmed table effects must not be graph-visible before publication"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(uri).await.unwrap();
+    let commits = recovered.list_commits(None).await.unwrap();
+    assert_eq!(commits.len(), before_commits.len() + 1);
+    assert_eq!(commits[0].graph_commit_id, fixed_commit);
+    assert_eq!(commits[0].actor_id.as_deref(), Some("index-operator"));
+    assert_eq!(
+        commits[0].parent_commit_id.as_deref(),
+        Some(parent.as_str())
+    );
+    let after = helpers::snapshot_main(&recovered).await.unwrap();
+    for table_key in ["node:Company", "node:Person"] {
+        assert_eq!(
+            after.dataset(table_key).unwrap().published_dataset_version,
+            before.dataset(table_key).unwrap().published_dataset_version + 1
+        );
+        let table = after.open_dataset(table_key).await.unwrap();
+        assert!(table.has_fts_index("name").await.unwrap());
+        assert_eq!(
+            table.count_rows(None).await.unwrap(),
+            before.dataset(table_key).unwrap().entity_count as usize
+        );
+    }
+    drop(recovered);
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForwardOriginalLineage {
+            tables: vec![
+                TableExpectation::main("node:Company")
+                    .expected_recovery_parent_commit_id(parent.clone()),
+                TableExpectation::main("node:Person").expected_recovery_parent_commit_id(parent),
+            ],
+        },
+    )
+    .await
+    .unwrap();
 }
 
 /// A foreign process can publish a disjoint table after v8 confirmation but
@@ -4731,6 +4839,12 @@ async fn ensure_indices_post_effect_same_table_winner_fails_closed() {
 #[tokio::test]
 #[serial]
 async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
+    for full_text_rebuild in [false, true] {
+        ensure_indices_first_touch_before_ref_case(full_text_rebuild).await;
+    }
+}
+
+async fn ensure_indices_first_touch_before_ref_case(full_text_rebuild: bool) {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     let _scenario = FailScenario::setup();
@@ -4754,6 +4868,9 @@ async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
     )
     .await
     .unwrap();
+    if full_text_rebuild {
+        db.ensure_indices_on("feature").await.unwrap();
+    }
     db.branch_create_from(omnigraph::db::ReadTarget::branch("feature"), "experiment")
         .await
         .unwrap();
@@ -4778,8 +4895,7 @@ async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
         )
         .await
         .unwrap();
-    let orphan_error = db
-        .ensure_indices_on("experiment")
+    let orphan_error = run_index_maintenance(&db, "experiment", full_text_rebuild)
         .await
         .expect_err("pre-existing target ref must be refused before recovery is armed");
     assert!(
@@ -4794,7 +4910,7 @@ async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
     {
         let _failpoint =
             ScopedFailPoint::new(names::ENSURE_INDICES_POST_SIDECAR_PRE_FORK, "return");
-        db.ensure_indices_on("experiment")
+        run_index_maintenance(&db, "experiment", full_text_rebuild)
             .await
             .expect_err("failpoint must fire after sidecar and before target ref creation");
     }
@@ -4823,7 +4939,9 @@ async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
         "feature",
     );
 
-    recovered.ensure_indices_on("experiment").await.unwrap();
+    run_index_maintenance(&recovered, "experiment", full_text_rebuild)
+        .await
+        .unwrap();
     let owned = recovered
         .snapshot_of(omnigraph::db::ReadTarget::branch("experiment"))
         .await
@@ -8056,9 +8174,9 @@ async fn optimize_post_manifest_failure_finalizes_multi_table_v2_sidecar() {
 }
 
 /// Pending-only index intent is status, not a physical effect. An untrainable
-/// vector table beside a productive sibling must be reported but excluded from
-/// the shared Optimize sidecar; otherwise its NoMovement classification would
-/// spuriously roll back the sibling after a crash.
+/// vector table and its deferred full-text tail beside a productive sibling
+/// must be reported but excluded from the shared Optimize sidecar; otherwise
+/// NoMovement would spuriously roll back the sibling's maintenance after a crash.
 #[tokio::test]
 #[serial(optimize)]
 async fn optimize_excludes_pending_only_vector_table_from_v2_sidecar() {
@@ -8092,8 +8210,24 @@ node Embedding {
             .any(|index| { index.type_key == "node:Embedding" && index.property == "vector" }),
         "fixture must leave the null vector index pending"
     );
-    // Fixed productive tail on Work only; Embedding stays a one-fragment table
-    // whose buildable indexes are current and whose vector remains pending-only.
+    load_jsonl(
+        &db,
+        r#"{"type":"Embedding","data":{"name":"e1","vector":null}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.optimize().await.unwrap();
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let embedding = snapshot.open_dataset("node:Embedding").await.unwrap();
+    assert!(embedding.has_unindexed_fragments().await.unwrap());
+    assert_eq!(
+        embedding.index_coverage("id").await.unwrap(),
+        omnigraph::IndexCoverage::Indexed,
+        "only the excluded FTS tail and untrainable vector may remain"
+    );
+    // Fixed productive tail on Work only; Embedding's buildable indexes are
+    // current, while its vector and FTS tail both remain deferred-only.
     for name in ["w1", "w2", "w3", "w4"] {
         load_jsonl(
             &db,
@@ -8136,6 +8270,12 @@ node Embedding {
             .iter()
             .any(|index| index.property == "vector"),
         "pending-only vector status must remain visible"
+    );
+    assert!(
+        embedding.pending_indexes.iter().any(|index| {
+            index.property == "name" && index.reason.contains("rebuild-full-text-indexes")
+        }),
+        "the deferred FTS tail must name its explicit rebuild remedy"
     );
 }
 

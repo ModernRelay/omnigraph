@@ -205,6 +205,7 @@ impl LanceNamespace for BranchManifestNamespace {
         .map_err(|e| namespace_internal_error(e.to_string()))?;
 
         Ok(DescribeTableResponse {
+            context: None,
             table: Some(entry.type_key.clone()),
             namespace: Some(Vec::new()),
             version: Some(entry.published_dataset_version as i64),
@@ -273,6 +274,7 @@ impl LanceNamespace for BranchManifestNamespace {
         }
 
         Ok(ListTableVersionsResponse {
+            context: None,
             versions,
             page_token: None,
         })
@@ -355,6 +357,7 @@ impl LanceNamespace for StagedTableNamespace {
             .table_uri()
             .map_err(|e| namespace_internal_error(e.to_string()))?;
         Ok(DescribeTableResponse {
+            context: None,
             table: Some(self.table_key().to_string()),
             namespace: Some(Vec::new()),
             version: Some(ds.version().version as i64),
@@ -389,6 +392,7 @@ impl LanceNamespace for StagedTableNamespace {
         self.ensure_request_table(request.id.as_ref())?;
         if request.limit == Some(0) {
             return Ok(ListTableVersionsResponse {
+                context: None,
                 versions: Vec::new(),
                 page_token: None,
             });
@@ -424,6 +428,7 @@ impl LanceNamespace for StagedTableNamespace {
             versions.truncate(limit as usize);
         }
         Ok(ListTableVersionsResponse {
+            context: None,
             versions,
             page_token: None,
         })

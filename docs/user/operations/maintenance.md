@@ -1,8 +1,9 @@
 # Maintenance
 
-OmniGraph provides three direct-storage maintenance commands:
+OmniGraph provides four direct-storage maintenance commands:
 
 - `optimize` compacts data and reconciles declared indexes.
+- `rebuild-full-text-indexes` replaces full-text indexes on one branch.
 - `repair` classifies storage drift and can publish an approved repair.
 - `cleanup` permanently removes old versions.
 
@@ -25,9 +26,16 @@ omnigraph optimize ./graph.omni
 omnigraph optimize ./graph.omni --json
 ```
 
-Optimize rewrites small fragments into fewer larger fragments, refreshes index
-coverage, and builds declared indexes that are ready to build. It does not
+Optimize rewrites small fragments into fewer larger fragments, refreshes scalar
+and vector coverage, and builds missing declared indexes that are ready to build. It does not
 delete old versions, so snapshots and retained history remain available.
+
+Existing full-text indexes are preserved rather than incrementally merged.
+Unindexed rows remain searchable, but a growing uncovered tail can cost more to
+scan. Use `rebuild-full-text-indexes` to refresh that coverage or migrate an old
+analyzer generation. Optimize reports uncovered full-text coverage under
+`pending_indexes` with this remedy. Deferred coverage alone creates no graph
+commit or maintenance work.
 
 A vector index whose property has no usable vectors remains pending rather than
 failing the run. Run optimize again after loading or generating vectors.
@@ -35,6 +43,40 @@ failing the run. Run optimize again after loading or generating vectors.
 Optimize refuses unexplained drift or an unresolved interrupted write. Reopen
 the graph read-write (or restart its server) to finish ordinary recovery; use
 `repair` only for drift that remains unexplained.
+
+## Rebuild full-text indexes
+
+```bash
+omnigraph rebuild-full-text-indexes ./graph.omni --branch main
+omnigraph rebuild-full-text-indexes --cluster s3://company/omnigraph \
+  --graph knowledge --branch review --json
+```
+
+The command fully replaces text-search indexes from current entities using the
+engine's default English analyzer, including already indexed entities. It builds
+declared node full-text indexes and replaces existing physical full-text indexes
+on nodes or edges; it does not create edge-property indexes from declarations.
+External custom tokenizer settings are not preserved. Completed rebuilds warn
+on stderr, or in the JSON `warnings` array, that those settings were replaced.
+
+All rebuilt datasets become visible in one graph commit. JSON reports `branch`,
+`graph_commit_id`, and `rebuilt_indexes` with each `type_key` and `property`.
+Success means the selected branch's planned rebuild was published, or an explicit
+no-op with an empty index list, null commit, and empty `warnings` array. The default
+branch is `main`.
+
+`--as` supplies actor attribution for this command. Direct CLI access, including
+`--cluster`, does not load the server's Cedar policy; storage permissions are its
+trust boundary. An embedded host that installs a policy checker also enforces
+the Change permission before rebuilding.
+
+Other branches and historical snapshots are not rewritten. Rebuild every live
+branch that needs full-text search; restoring an older snapshot may require
+rebuilding again. The operation does not regenerate embeddings or alter entity
+values. Stop overlapping writers and preserve a backup before an upgrade; see
+[full-text upgrades](upgrade.md#full-text-index-upgrade).
+Unknown legacy or external index kinds require a controlled migration, not a
+guessed replacement; see [unsupported inventory](upgrade.md#unsupported-index-inventory).
 
 ## Repair
 

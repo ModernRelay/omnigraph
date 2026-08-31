@@ -39,6 +39,10 @@ lance-datafusion = { workspace = true }
 datafusion = { workspace = true }
 lance-file = { workspace = true }
 lance-index = { workspace = true }
+frostem = { workspace = true }
+lance-tokenizer = { workspace = true }
+stop-words = { workspace = true }
+unicode-normalization = { workspace = true }
 lance-linalg = { workspace = true }
 lance-namespace = { workspace = true }
 lance-table = { workspace = true }
@@ -75,7 +79,7 @@ tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,
 # so production builds (which exclude dev-deps) never see it.
-lance-io = { version = "10.0.0", features = ["test-util"] }
+lance-io = { version = "11.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
 syn = { version = "2", features = ["full", "visit"] }

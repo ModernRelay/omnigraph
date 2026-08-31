@@ -47,8 +47,8 @@ pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
-pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
+pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
@@ -2820,6 +2820,34 @@ impl Omnigraph {
 
     pub async fn ensure_indices_on(&self, branch: &str) -> Result<Vec<PendingIndex>> {
         table_ops::ensure_indices_on(self, branch).await
+    }
+
+    /// Fully rebuild all declared or existing supported full-text indexes from
+    /// the selected branch's current rows, publishing all tables together.
+    /// Inherited tables are first-touch forked; other branches and historical
+    /// snapshots retain their original indexes. Scalar/vector indexes are kept.
+    /// Rebuilt full-text indexes use the engine's default analyzer, including
+    /// indexes originally created externally with custom tokenizer settings.
+    ///
+    /// Unlike [`Self::ensure_indices_on`], this replaces existing FTS indexes
+    /// even when their row coverage is complete. It establishes the supported
+    /// analyzer generation after an upgrade; it does not rewrite old history.
+    /// With a policy installed, use the actor-aware counterpart.
+    pub async fn rebuild_full_text_indices_on(
+        &self,
+        branch: &str,
+    ) -> Result<FullTextIndexRebuildResult> {
+        self.rebuild_full_text_indices_on_as(branch, None).await
+    }
+
+    /// Actor-aware full-text rebuilding. Requires `Change` on the selected
+    /// branch before any effects and records the actor in the graph publication.
+    pub async fn rebuild_full_text_indices_on_as(
+        &self,
+        branch: &str,
+        actor: Option<&str>,
+    ) -> Result<FullTextIndexRebuildResult> {
+        table_ops::rebuild_full_text_indices_on_as(self, branch, actor).await
     }
 
     #[cfg(feature = "failpoints")]

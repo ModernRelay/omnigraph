@@ -12,9 +12,9 @@ pub use manifest::{DatasetEntry, DatasetUpdate, Snapshot, SnapshotDataset, Snaps
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
     CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
-    EXPORT_CHUNK_MAX_BYTES, ExportCut, InitOptions, MergeOutcome, Omnigraph, OpenMode,
-    PendingIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
-    SchemaApplyOptions, SchemaApplyResult, SkipReason,
+    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
+    Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction, RepairClassification,
+    RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult, SkipReason,
 };
 pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};

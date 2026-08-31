@@ -592,12 +592,14 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // Step 2: mutate main — insert "Alice2" before any branching. Main
     // diverges from the load baseline by exactly one row.
     // ─────────────────────────────────────────────────────────────────
-    mutate_main(
+    // Keep the six large mutation futures out of this long test driver's
+    // state while its later merges exercise the nested Lance writer.
+    Box::pin(mutate_main(
         &mut db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Alice2")], &[("$age", 31)]),
-    )
+    ))
     .await
     .expect("insert Alice2 on main");
     assert_eq!(count_rows(&db, "node:Person").await, 5);
@@ -613,12 +615,12 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // Step 4: mutate main — insert "Bob2" AFTER feat-a was created. main
     // and feat-a now diverge: main has Bob2, feat-a does not.
     // ─────────────────────────────────────────────────────────────────
-    mutate_main(
+    Box::pin(mutate_main(
         &mut db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Bob2")], &[("$age", 26)]),
-    )
+    ))
     .await
     .expect("insert Bob2 on main");
     assert_eq!(count_rows(&db, "node:Person").await, 6);
@@ -632,13 +634,13 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // Step 5: mutate feat-a — insert "Eve". feat-a now also has 6 rows,
     // but the *sixth* is Eve, not Bob2.
     // ─────────────────────────────────────────────────────────────────
-    mutate_branch(
+    Box::pin(mutate_branch(
         &mut db,
         "feat-a",
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-    )
+    ))
     .await
     .expect("insert Eve on feat-a");
     assert_eq!(count_rows_branch(&db, "feat-a", "node:Person").await, 6);
@@ -690,13 +692,13 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // ─────────────────────────────────────────────────────────────────
     // Step 7: mutate feat-b — insert "Frank".
     // ─────────────────────────────────────────────────────────────────
-    mutate_branch(
+    Box::pin(mutate_branch(
         &mut db,
         "feat-b",
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
-    )
+    ))
     .await
     .expect("insert Frank on feat-b");
     assert_eq!(count_rows_branch(&db, "feat-b", "node:Person").await, 7);
@@ -705,13 +707,13 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // Step 8: mutate feat-a again — insert "Grace" + Knows(Grace → Eve).
     // feat-a now has 7 Persons and 4 Knows edges.
     // ─────────────────────────────────────────────────────────────────
-    mutate_branch(
+    Box::pin(mutate_branch(
         &mut db,
         "feat-a",
         MUTATION_QUERIES,
         "insert_person_and_friend",
         &mixed_params(&[("$name", "Grace"), ("$friend", "Eve")], &[("$age", 28)]),
-    )
+    ))
     .await
     .expect("insert Grace + Knows(Grace → Eve) on feat-a");
     assert_eq!(count_rows_branch(&db, "feat-a", "node:Person").await, 7);
@@ -799,12 +801,12 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // (created in step 6) does not include Eve / Grace / Helen, but
     // main now has all three on top of Bob2.
     // ─────────────────────────────────────────────────────────────────
-    mutate_main(
+    Box::pin(mutate_main(
         &mut db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Helen")], &[("$age", 44)]),
-    )
+    ))
     .await
     .expect("insert Helen on main post-merge");
     assert_eq!(count_rows(&db, "node:Person").await, 9);

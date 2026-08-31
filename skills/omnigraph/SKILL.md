@@ -250,6 +250,7 @@ Notation: `<x>` required · `[x]` optional · `<a|b>` choice · `…` repeatable
 - `init --schema <f.pg> <uri> [--force]`
 - `lint --query <f.gq> [--schema <f.pg>] [<uri>] [--json]` — offline with `--schema`, graph-backed with a URI
 - `optimize [--json]` · `repair [--confirm] [--force] [--json]` · `cleanup (--keep <N> | --older-than <7d>) --confirm [--json]`
+- `rebuild-full-text-indexes [--branch <b>] [--json]` (>= 0.10.0) — replace full-text indexes on one branch with default English analysis; custom tokenizer settings are replaced. Stop overlapping writers and retain a whole-store backup for upgrades. `--as` records attribution; direct access does not load server policy. See [maintenance commands](references/commands.md#rebuild-full-text-indexes--explicit-analyzer-upgrade-v0100).
 - `queries <validate [<uri>] | list> [--json]`
 
 **Control plane** — cluster (`--config <dir>`, default `.`):

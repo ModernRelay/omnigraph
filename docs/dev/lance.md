@@ -1,8 +1,11 @@
 # Lance documentation index
 
-**Pinned dependency:** Lance 10.0.0, complete package family
+**Pinned dependency:** Lance 11.0.0, complete package family
 **Purpose:** required upstream reading and current OmniGraph compatibility
 fences
+
+**Upgrade boundary:** existing full-text indexes require an explicit rebuild
+before search. See [full-text compatibility](#full-text-compatibility).
 
 Lance is OmniGraph's storage substrate. Before changing a Lance-shaped
 behavior, read **every full page in the matching domain below, plus every page
@@ -125,20 +128,47 @@ credentials, or storage fault tests.
 | Distributed indexing | https://lance.org/guide/distributed_indexing/ |
 | DataFusion integration | https://lance.org/integrations/datafusion/ |
 
+## Full-text compatibility
+
+Lance 11's stemmer is not query-compatible with existing Lance 10 postings.
+Every full-text segment used by a query must carry OmniGraph's artifact-scoped
+analyzer certificate. The certificate is bound to the immutable UUID, index
+details, and file inventory, not the current dataset writer or graph head.
+Missing or unrecognized proof produces `FullTextIndexRebuildRequired` before
+execution. Successful immutable proof uses Lance's bounded session metadata
+cache; failures are not cached. Ordinary reads do not inspect these certificates.
+
+The full builder writes proof before the existing CreateIndex publication;
+public object-store/base-path resolution and native garbage collection own the
+bounded JSON file. Directory placement mirrors Lance's private helper and is
+guarded against independently written native index files. Stable-ID
+compaction preserves proof. Ordinary optimize excludes incremental full-text
+folding, which lacks an uncommitted provenance hook; uncovered rows remain
+searchable until an explicit rebuild. Planning and execution share the same
+foldable-index predicate; pending full-text coverage alone is not recovery work.
+Other index maintenance is unchanged.
+
+The audited analyzer dependency set has exact pins and a resolved-lockfile guard.
+Any change needs a compatibility audit before keeping or changing the certificate
+generation. See
+[RFC 0043](../rfcs/0043-full-text-index-compatibility.md) for the decision and
+[the operator procedure](../user/operations/upgrade.md#full-text-index-upgrade).
+
 ## Current compatibility fences
 
-These are the current OmniGraph deltas over stock Lance 10. They are not a
+These are the current OmniGraph deltas over stock Lance 11. They are not a
 history of dependency bumps.
 
 | Surface | Current fence | Test owner |
 |---|---|---|
 | File format | Every production write explicitly selects stable V2_2; experimental V2_3 is not part of the graph contract. | `lifecycle.rs`, write-site source guards |
 | Graph keys | Every v6 node/edge table has exact non-null `id` as its unenforced primary key. Strict insert/upsert uses the sealed filter-bearing adapter; raw keyed Append is forbidden. | `lance_surface_guards.rs`, staged-table tests, `forbidden_apis.rs` |
-| Stable row IDs | Graph tables use stable row IDs; delete/update/index maintenance must retain their mapping. | `lance_surface_guards.rs`, `writes.rs` |
+| Stable row IDs | Graph tables use stable row IDs; delete/update/index maintenance must retain their mapping. Overwrite allocates fresh IDs and restore retains the allocation high-water marks. Staged-view IDs are provisional, not committed identity. | `lance_surface_guards.rs`, staged-table tests, `writes.rs` |
 | KNN result order | A late payload-hydration plan can lose global ordering metadata, so nearest requests one final output partition. Internal reads remain parallel. | `lance_surface_guards.rs`, `search.rs` |
-| Blob v2 | Null, valid empty, non-empty, selector cardinality, neighboring bytes, and 3→1 compaction are pinned on Lance 10. | `lance_surface_guards.rs`, `maintenance.rs` |
+| Full-text analyzer | Every selected FTS segment needs artifact-scoped compatibility proof. Explicit branch rebuilds replace all segments from rows; old snapshots may refuse FTS. | staged-table tests, `search.rs`, `maintenance.rs` |
+| Blob v2 | Null, valid empty, non-empty, selector cardinality, neighboring bytes, and 3→1 compaction are pinned on Lance 11. | `lance_surface_guards.rs`, `maintenance.rs` |
 | Index coverage | Indexes are derived. Rewrites and compaction may leave an uncovered tail; reads must combine indexed and scan paths until explicit reconciliation. | `scalar_indexes.rs`, `search.rs`, `maintenance.rs` |
-| Branches/tags | Native refs are per dataset. Every graph-branch life is a ref named `{logical}.{ULID}` (bare names are legacy lives), so a recreated branch never shares a `tree/` path or cache key with its predecessor; the `__manifest` ref list is the branch registry. OmniGraph validates ref incarnation and coordinates graph-level authority through `__manifest`. | `branching.rs`, `lance_surface_guards.rs` |
+| Branches/tags | Native refs are per dataset. Every graph-branch life is a ref named `{logical}.{ULID}` (bare names are legacy lives), so a recreated branch never shares a `tree/` path or cache key with its predecessor; the `__manifest` ref list is the branch registry. OmniGraph validates ref incarnation and coordinates graph-level authority through `__manifest`. Lance also refuses force deletion while a tag targets that native branch. | `branching.rs`, `lance_surface_guards.rs` |
 | Cleanup | Lance protects native refs/tags; OmniGraph additionally computes graph-wide lazy-branch and recovery floors before invoking cleanup. | `maintenance.rs` |
 | MemWAL | Upstream support exists, but OmniGraph's RFC 0018 and RFC 0026 experiments were removed. No stream profile, token ledger, hidden stream column, or `_mem_wal` path is current. | `lifecycle.rs`, cluster removed-field diagnostics |
 

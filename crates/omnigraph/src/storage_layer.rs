@@ -117,12 +117,12 @@ pub(crate) mod sealed {
 /// outside this storage contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexBuildSpec {
-    /// `name: None` keeps Lance's default index name (`{column}_idx`).
-    /// An explicit name is REQUIRED whenever the column already carries an
-    /// index of another kind under the default name: Lance's `replace(true)`
-    /// removes existing indexes BY NAME, so an unnamed second build would
-    /// silently replace the first index instead of coexisting with it
-    /// (pinned by `lance_surface_guards::second_index_on_column_requires_explicit_distinct_name`).
+    /// `name: None` uses Lance's default name, starting at `{column}_idx` and
+    /// avoiding other index kinds already present in the pinned dataset.
+    /// Same-column companion builds in one staged batch still need an explicit
+    /// name: independent builders cannot see each other's uncommitted names.
+    /// Replacement remains by name, not kind (pinned by
+    /// `lance_surface_guards::index_default_names_distinguish_kinds_and_replacement_is_by_name`).
     BTree {
         column: String,
         name: Option<String>,
