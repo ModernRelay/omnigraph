@@ -1379,7 +1379,9 @@ mod tests {
     use super::*;
 
     const TEST_REPETITION: u32 = 7;
-    const TEST_ELAPSED_US: u64 = 1_000;
+    // Protocol stubs perform no timed merge. Zero is a valid lower bound;
+    // even a complete process round trip need not consume a fixed duration.
+    const TEST_ELAPSED_US: u64 = 0;
     const QUICK_DEADLINE: Duration = Duration::from_millis(250);
     const BOUNDED_AUXILIARY_DEADLINE: Duration = Duration::from_secs(2);
     const GENEROUS_DEADLINE: Duration = Duration::from_secs(10);
@@ -1614,7 +1616,7 @@ mod tests {
             .child_process
             .as_ref()
             .expect("spawned worker failures must carry containment evidence");
-        assert_eq!(evidence.stage, expected_stage, "{evidence:?}");
+        assert_eq!(evidence.stage, expected_stage, "{error:?}");
         assert!(evidence.direct_child_reaped, "{evidence:?}");
         assert!(evidence.peak_rss_bytes.is_some(), "{evidence:?}");
         assert!(evidence.process_group_gone, "{evidence:?}");
