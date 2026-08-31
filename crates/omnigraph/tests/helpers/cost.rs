@@ -644,7 +644,9 @@ pub fn last_manifest_reads() -> Vec<String> {
 /// The only place the `QueryIoProbes` task-local + tracker wiring lives.
 pub async fn measure<F: Future>(op: F) -> (F::Output, IoCounts) {
     let (probes, handles) = OpProbes::install();
-    let out = with_query_io_probes(probes, op).await;
+    // Keep Lance 11's deeper write future out of the enclosing test future's
+    // layout; this helper is compiled by owners using rustc's default limit.
+    let out = with_query_io_probes(probes, Box::pin(op)).await;
     (out, handles.counts())
 }
 
@@ -653,7 +655,8 @@ pub async fn measure<F: Future>(op: F) -> (F::Output, IoCounts) {
 pub async fn measure_with_staged<F: Future>(op: F) -> (F::Output, IoCounts, StagedCounts) {
     let (probes, handles) = OpProbes::install();
     let merge = MergeWriteProbes::default();
-    let out = with_merge_write_probes(merge.clone(), with_query_io_probes(probes, op)).await;
+    let out =
+        with_merge_write_probes(merge.clone(), with_query_io_probes(probes, Box::pin(op))).await;
     let staged = StagedCounts {
         stage_append: merge.stage_append_calls(),
         stage_merge_insert: merge.stage_merge_insert_calls(),

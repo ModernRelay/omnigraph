@@ -739,27 +739,108 @@ fn optimize_json_succeeds_on_local_graph() {
         "{human}"
     );
     assert!(!human.contains("node:Person"), "{human}");
+
+    // Explicit full-text maintenance uses the same storage resolver and
+    // attributes one selected branch's publication, leaving row data intact.
+    output_success(
+        cli()
+            .args(["branch", "create", "search-upgrade", "--uri"])
+            .arg(&graph),
+    );
+    let rows_before = output_success(cli().arg("export").arg(&graph)).stdout;
+    let rebuilt = parse_stdout_json(&output_success(
+        cli().arg("rebuild-full-text-indexes").arg(&graph).args([
+            "--as",
+            "act-cli-rebuild",
+            "--json",
+        ]),
+    ));
+    assert_eq!(rebuilt["branch"], "main");
+    assert_eq!(
+        rebuilt["warnings"],
+        serde_json::json!([
+            "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced."
+        ])
+    );
+    assert_eq!(
+        rebuilt["rebuilt_indexes"],
+        serde_json::json!([
+            {"type_key": "node:Company", "property": "name"},
+            {"type_key": "node:Person", "property": "name"},
+        ])
+    );
+    let commit_id = rebuilt["graph_commit_id"].as_str().unwrap();
+    let commit = parse_stdout_json(&output_success(
+        cli()
+            .args(["commit", "show", commit_id, "--uri"])
+            .arg(&graph)
+            .arg("--json"),
+    ));
+    assert_eq!(commit["actor_id"], "act-cli-rebuild");
+    // Commit history represents the native main branch as null.
+    assert_eq!(commit["graph_branch"], Value::Null);
+    let main_after = resolved_snapshot_id(&graph, "main");
+    assert_eq!(main_after, commit_id);
+    let feature_before = resolved_snapshot_id(&graph, "search-upgrade");
+    let human_output = output_success(
+        cli()
+            .arg("rebuild-full-text-indexes")
+            .arg("--store")
+            .arg(&graph)
+            .args(["--branch", "search-upgrade"]),
+    );
+    let human = stdout_string(&human_output);
+    let stderr = String::from_utf8(human_output.stderr).unwrap();
+    assert!(
+        stderr.contains("warning: Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced."),
+        "{stderr}"
+    );
+    assert!(
+        human.contains("branch search-upgrade, 2 indexes rebuilt"),
+        "{human}"
+    );
+    assert!(
+        human.contains("node type 'Person', property 'name'"),
+        "{human}"
+    );
+    assert!(human.contains("graph commit:"), "{human}");
+    assert!(
+        human.contains("node type 'Company', property 'name'"),
+        "{human}"
+    );
+    assert!(!human.contains("node:Person"), "{human}");
+    assert_eq!(resolved_snapshot_id(&graph, "main"), main_after);
+    assert_ne!(
+        resolved_snapshot_id(&graph, "search-upgrade"),
+        feature_before
+    );
+    assert_eq!(
+        output_success(cli().arg("export").arg(&graph)).stdout,
+        rows_before
+    );
 }
 
 #[test]
 fn optimize_with_server_flag_errors_wrong_plane() {
     // RFC-010 Slice 1: --server is a data-plane addressing flag; on a
     // storage-plane verb the guard rejects it loudly (was: silently ignored).
-    let output = output_failure(cli().arg("optimize").arg("--server").arg("prod"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("`optimize` is a direct (storage-native) command")
-            && stderr.contains("--server addresses a served graph and does not apply")
-            && stderr.contains("Pass a storage URI, or --cluster <dir> --graph <id>."),
-        "wrong-capability guard message not found; got: {stderr}"
-    );
+    for command in ["optimize", "rebuild-full-text-indexes"] {
+        let output = output_failure(cli().arg(command).arg("--server").arg("prod"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("`{command}` is a direct (storage-native) command"))
+                && stderr.contains("--server addresses a served graph and does not apply")
+                && stderr.contains("Pass a storage URI, or --cluster <dir> --graph <id>."),
+            "wrong-capability guard message not found; got: {stderr}"
+        );
+    }
 }
 
 #[test]
 fn optimize_with_as_flag_errors() {
     // `--as` attributes an actor on a direct-engine or actor-bound cluster
-    // operation; the Direct maintenance verbs record no actor, so the flag is
-    // rejected loudly (was: silently ignored).
+    // operation; optimize records no actor, so the flag is rejected loudly
+    // (was: silently ignored). Full-text rebuild attributes its publication.
     let output = output_failure(cli().arg("optimize").arg("--as").arg("act-op"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -850,14 +931,16 @@ fn query_by_name_against_a_store_needs_a_server() {
 fn optimize_with_remote_target_errors_storage_plane() {
     // RFC-010 Slice 1: a maintenance verb pointed at a remote URI fails loudly
     // and declaratively (was: whatever Omnigraph::open said about an https URI).
-    let output = output_failure(cli().arg("optimize").arg("https://graph.example.invalid"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "`optimize` is a direct (storage-native) command and needs direct storage access"
-        ) && stderr.contains("remote server"),
-        "direct remote-target message not found; got: {stderr}"
-    );
+    for command in ["optimize", "rebuild-full-text-indexes"] {
+        let output = output_failure(cli().arg(command).arg("https://graph.example.invalid"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "`{command}` is a direct (storage-native) command and needs direct storage access"
+            )) && stderr.contains("remote server"),
+            "direct remote-target message not found; got: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -885,6 +968,37 @@ fn repair_json_reports_noop_on_clean_graph() {
     assert!(human.contains("preview mode, 4 datasets"), "{human}");
     assert!(human.contains("node type 'Person'"), "{human}");
     assert!(!human.contains("node:Person"), "{human}");
+}
+
+#[test]
+fn rebuild_full_text_indexes_json_noops_without_full_text_properties() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let schema = temp.path().join("scalar.pg");
+    // The ordinary Person fixture has FTS even without @index because its
+    // String @key participates in index intent. A numeric key does not.
+    write_file(&schema, "node Metric { key: I64 @key }");
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
+    let version_before = manifest_dataset_version(&graph);
+    let rebuilt = parse_stdout_json(&output_success(
+        cli()
+            .arg("rebuild-full-text-indexes")
+            .arg(&graph)
+            .arg("--json"),
+    ));
+    assert_eq!(rebuilt["branch"], "main");
+    assert_eq!(rebuilt["graph_commit_id"], Value::Null);
+    assert_eq!(rebuilt["rebuilt_indexes"], serde_json::json!([]));
+    assert_eq!(rebuilt["warnings"], serde_json::json!([]));
+    let human_output = output_success(cli().arg("rebuild-full-text-indexes").arg(&graph));
+    let human = stdout_string(&human_output);
+    let stderr = String::from_utf8(human_output.stderr).unwrap();
+    assert!(!stderr.contains("custom tokenizer settings"), "{stderr}");
+    assert!(
+        human.contains("no-op; no graph commit published"),
+        "{human}"
+    );
+    assert_eq!(manifest_dataset_version(&graph), version_before);
 }
 
 #[test]

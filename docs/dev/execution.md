@@ -99,7 +99,7 @@ operations; traversal or projection must not silently discard them. RRF
 executes its sources independently against the same graph snapshot and fuses
 their ordered results.
 
-Lance 10 still loses final KNN ordering metadata in one late payload-hydration
+Lance 11 still loses final KNN ordering metadata in one late payload-hydration
 shape, so OmniGraph requests one output partition for the affected nearest
 path. The compatibility guard is owned by `lance_surface_guards.rs` and
 `search.rs`; do not remove the fence based only on upstream release notes.

@@ -262,7 +262,7 @@ fn candidate_plan_from_transaction(
 
     // Row-version metadata is correctness-bearing on the pruned path: the
     // candidate scan filters on `_row_last_updated_at_version`, and pinned
-    // Lance 10 silently fills that column with 1 for a fragment whose sequence
+    // Lance 11 silently fills that column with 1 for a fragment whose sequence
     // is missing OR fails to load ("Default to version 1 if sequence not
     // provided" in lance-table's stream reader — a failed `load_sequence()` is
     // swallowed the same way). For any interval with `begin > 1` such rows
@@ -327,7 +327,7 @@ fn find_fragment(fragments: &[Fragment], id: u64) -> (Option<&Fragment>, u64) {
 /// flag and cannot prove a specific fragment's sequence survives loading.
 ///
 /// The Inline bytes are decoded directly rather than through
-/// `load_sequence()`: pinned Lance 10's External arm of that method is
+/// `load_sequence()`: pinned Lance 11's External arm of that method is
 /// `todo!()` (it panics, it does not `Err`), so the variant must be
 /// structurally unreachable here. And a clean decode alone does not prove the
 /// sequence covers the fragment — Lance's single-run fast path stamps its one
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn missing_row_version_metadata_is_not_loadable() {
-        // Pinned Lance 10 fills `_row_last_updated_at_version` with 1 when a
+        // Pinned Lance 11 fills `_row_last_updated_at_version` with 1 when a
         // fragment's sequence is missing or fails to load, which would silently
         // empty the candidate window for begin > 1. A fragment without the
         // metadata (Lance's `Fragment::new` default) must therefore fail the
@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     fn external_row_version_metadata_is_not_loadable() {
-        // Pinned Lance 10's `RowDatasetVersionMeta::External` arm of
+        // Pinned Lance 11's `RowDatasetVersionMeta::External` arm of
         // `load_sequence()` is `todo!()` — it panics rather than returning
         // `Err`. The gate must classify the variant structurally instead of
         // probing it, so an externally-stored sequence routes the interval to
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn short_row_version_sequence_is_not_loadable() {
         // A sequence can decode cleanly yet cover fewer rows than the fragment
-        // holds; pinned Lance 10's single-run fast path then stamps that run's
+        // holds; pinned Lance 11's single-run fast path then stamps that run's
         // version across every requested row without consulting the encoded
         // length. Loadable therefore means decodable AND exactly
         // `physical_rows` long — anything shorter (or a fragment that does not

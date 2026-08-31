@@ -173,8 +173,9 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // The actor rides direct-engine writes (`any` via --store) and cluster
         // writes; Blob get/stat are reads and never consume it. Served writes
         // resolve the actor from the bearer token
-        // (rejected downstream with its own message), and `direct`
-        // maintenance verbs record no actor. `control` refines per command:
+        // (rejected downstream with its own message). On `direct`, full-text
+        // rebuild attributes its graph publication; other maintenance verbs
+        // record no actor. `control` refines per command:
         // `cluster apply`/`approve` attribute an actor — the other read-only
         // control verbs (status/plan/validate, policy, queries) never read it.
         ScopeFlag::As => match capability {
@@ -195,7 +196,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     command: ClusterCommand::Apply { .. } | ClusterCommand::Approve { .. },
                 }
             ),
-            Served | Direct | Local => false,
+            Direct => matches!(cmd, Command::RebuildFullTextIndexes { .. }),
+            Served | Local => false,
         },
         // A profile is consumed wherever scope resolution runs: the data/
         // served resolvers, the maintenance-URI resolver, and the policy/
@@ -263,6 +265,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         Command::Policy { .. } => Plane::Control,
         Command::Init { .. }
         | Command::Optimize { .. }
+        | Command::RebuildFullTextIndexes { .. }
         | Command::Repair { .. }
         | Command::Cleanup { .. }
         | Command::Lint { .. } => Plane::Storage,
@@ -315,6 +318,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Alias { .. } => "alias",
         Command::Policy { .. } => "policy",
         Command::Optimize { .. } => "optimize",
+        Command::RebuildFullTextIndexes { .. } => "rebuild-full-text-indexes",
         Command::Repair { .. } => "repair",
         Command::Cleanup { .. } => "cleanup",
         Command::Cluster { .. } => "cluster",
@@ -335,6 +339,7 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
     matches!(
         cmd,
         Command::Optimize { .. }
+            | Command::RebuildFullTextIndexes { .. }
             | Command::Repair { .. }
             | Command::Cleanup { .. }
             // `lint` can type-check a `.gq` against a cluster graph's schema
@@ -413,9 +418,10 @@ fn remediation(capability: Capability, cmd: &Command) -> &'static str {
     match capability {
         Capability::Direct => match cmd {
             Command::Init { .. } => " Pass a storage URI.",
-            Command::Optimize { .. } | Command::Repair { .. } | Command::Cleanup { .. } => {
-                " Pass a storage URI, or --cluster <dir> --graph <id>."
-            }
+            Command::Optimize { .. }
+            | Command::RebuildFullTextIndexes { .. }
+            | Command::Repair { .. }
+            | Command::Cleanup { .. } => " Pass a storage URI, or --cluster <dir> --graph <id>.",
             _ => " Pass a storage URI.",
         },
         Capability::Control => match cmd {
@@ -488,6 +494,10 @@ mod tests {
                 parse(&["omnigraph", "optimize", "g.omni"]),
                 [false, true, true, true, false, true],
             ),
+            (
+                parse(&["omnigraph", "rebuild-full-text-indexes", "g.omni"]),
+                [false, true, true, true, true, true],
+            ),
             // `init` addresses its target positionally and never resolves a
             // scope — --store and --profile are rejected, not silently
             // ignored (unlike the other direct verbs).
@@ -548,6 +558,10 @@ mod tests {
         assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
         assert_eq!(
             cap(&["omnigraph", "optimize", "graph.omni"]),
+            Capability::Direct
+        );
+        assert_eq!(
+            cap(&["omnigraph", "rebuild-full-text-indexes", "graph.omni"]),
             Capability::Direct
         );
         assert_eq!(

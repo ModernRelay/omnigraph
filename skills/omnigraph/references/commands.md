@@ -6,7 +6,7 @@
 - Schema · lint · embed · init
 - Load (bulk JSONL)
 - Query / mutate
-- Maintenance (optimize, cleanup)
+- Maintenance (optimize, full-text rebuild, cleanup)
 - Stored queries
 - Operator config & credentials
 - Config resolution order
@@ -138,7 +138,7 @@ omnigraph alias add-signal sig-foo "Name" "Brief" 2026-04-14T00:00:00Z 2026-04-1
 
 > `query` and `mutate` also accept inline source via `-e/--query-string '<gq>'` instead of `--query <file>`.
 
-## Maintenance: Optimize & Cleanup (v0.6.1)
+## Maintenance
 
 ### `optimize` — non-destructive Lance compaction
 
@@ -147,6 +147,21 @@ omnigraph optimize $REPO --json
 ```
 
 Compacts fragments and reclaims deleted-row space. Non-destructive — safe to run any time. **Skips tables with a `Blob` property** (Lance blob-v2 compaction decode bug); skipped tables are reported in the `skipped` field of `--json` output and in logs. Non-blob tables compact normally. Blob-table fragment count won't shrink until the upstream Lance fix lands — reads/writes are unaffected.
+
+### `rebuild-full-text-indexes` — explicit analyzer upgrade (v0.10.0)
+
+```bash
+omnigraph rebuild-full-text-indexes "$REPO" --branch main --json
+```
+
+Direct storage only; `--cluster <root> --graph <id>` also works. Stop overlapping
+writers, preserve a verified whole-store backup, and rebuild every live branch
+that needs search after a Lance 11 upgrade. Do not mix old and new serving
+binaries. Rebuilds use default English analysis, replacing custom tokenizer
+settings; JSON `warnings` reports this for actual work. Check the selected
+`branch`, `graph_commit_id`, and `rebuilt_indexes`; an empty list/null commit is
+a no-op, not a migration of other branches or historical snapshots. `--as` is
+actor attribution and does not install server policy on direct access.
 
 ### `cleanup` — destructive version GC
 

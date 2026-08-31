@@ -2771,7 +2771,7 @@ async fn execute_node_scan(
                     scanner
                         .nearest(prop, &query_arr, k)
                         .map_err(|error| OmniError::storage_context("nearest", error))?;
-                    // Lance 10's late payload `LanceRead` drops the sorted
+                    // Lance 11's late payload `LanceRead` drops the sorted
                     // candidate stream's ordering metadata. With more than
                     // one output partition, execute_plan may therefore use a
                     // scheduling-ordered coalescer and scramble large-k ANN

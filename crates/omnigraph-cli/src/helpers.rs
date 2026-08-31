@@ -477,6 +477,7 @@ pub(crate) fn precondition_failed_cli(
             }),
             change_feed_gap: None,
             change_diff_refusal: None,
+            full_text_index_rebuild_required: None,
         },
     }
 }

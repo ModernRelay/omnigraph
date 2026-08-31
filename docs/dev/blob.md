@@ -74,7 +74,7 @@ There is currently no HTTP or CLI Blob put/clear surface.
 
 Export emits managed values as base64 and external values as URI descriptors. Its scratch space is bounded at the row level.
 
-`optimize` compacts Blob-bearing tables. Lance 10.0.0 is required because the substrate guard proves null, empty, non-empty, neighboring payloads, stable row IDs, and range reads survive fragment compaction. `cleanup` can reclaim old managed bytes with their dataset versions; callers must quiesce long-lived readers before destructive GC.
+`optimize` compacts Blob-bearing tables. The pinned Lance release must pass the substrate guard proving null, empty, non-empty, neighboring payloads, stable row IDs, and range reads survive fragment compaction. `cleanup` can reclaim old managed bytes with their dataset versions; callers must quiesce long-lived readers before destructive GC.
 
 ## Test owners
 

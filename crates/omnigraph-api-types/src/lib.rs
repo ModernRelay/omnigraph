@@ -1200,6 +1200,18 @@ pub struct ChangeDiffRefusalOutput {
     pub type_name: Option<String>,
 }
 
+/// A selected full-text index cannot safely serve the current analyzer (HTTP 409).
+/// This is not a retryable write conflict: an operator must rebuild the live
+/// branch's indexes. Historical snapshots stay unchanged; branch old content
+/// and rebuild that branch to search it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FullTextIndexRebuildRequiredOutput {
+    pub index: String,
+    /// Human-readable diagnosis; branch on the enclosing detail's presence,
+    /// not this text, to distinguish the operator-action-required condition.
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
@@ -1251,6 +1263,12 @@ pub struct ErrorOutput {
     /// commit or an unprovable schema boundary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
+    /// Set with HTTP 409 when a selected full-text index requires an explicit
+    /// rebuild before search can succeed. Unlike a write-authority conflict,
+    /// this condition is not cleared by retrying. This additive discriminator
+    /// preserves the closed [`ErrorCode`] contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text_index_rebuild_required: Option<FullTextIndexRebuildRequiredOutput>,
 }
 
 pub fn snapshot_payload(

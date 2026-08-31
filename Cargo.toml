@@ -37,25 +37,29 @@ datafusion-common = "54"
 datafusion-expr = "54"
 datafusion-functions-aggregate = "54"
 
-# Lance 10.0.0 (crates.io). This closes the stable-row-id delete/index,
-# stale-index-coverage, and Blob null/empty correctness gaps carried by the
-# 9.0.0 pin. Its ordered-coalesce fix remains locally fenced for late payload
-# hydration; see docs/dev/lance.md.
-lance = { version = "10.0.0", default-features = false, features = ["aws", "azure"] }
-lance-core = "10.0.0"
+# Lance 11.0.0 (crates.io), kept in lockstep. Explicit V2_2 writes and the
+# late-payload KNN ordering fence remain required; see docs/dev/lance.md.
+lance = { version = "=11.0.0", default-features = false, features = ["aws", "azure"] }
+lance-core = "=11.0.0"
 # lance-io + rand: consumed only by omnigraph-dst (fault injection at the
 # Lance IO seam; the harness PRNG seeds).
-lance-io = { version = "10.0.0", default-features = false }
+lance-io = { version = "=11.0.0", default-features = false }
 rand = "0.9"
 # RowAddrTreeMap moved from lance-core::utils::mask to the new lance-select crate in 9.x.
-lance-select = "10.0.0"
-lance-datafusion = "10.0.0"
-lance-file = "10.0.0"
-lance-index = "10.0.0"
-lance-linalg = "10.0.0"
-lance-namespace = "10.0.0"
-lance-namespace-impls = "10.0.0"
-lance-table = "10.0.0"
+lance-select = "=11.0.0"
+lance-datafusion = "=11.0.0"
+lance-file = "=11.0.0"
+lance-index = "=11.0.0"
+lance-linalg = "=11.0.0"
+lance-namespace = "=11.0.0"
+lance-namespace-impls = "=11.0.0"
+lance-table = "=11.0.0"
+# Persistent FTS certificates identify this analyzer generation. A change needs
+# the RFC 0043 compatibility audit, not just a transitive lockfile refresh.
+lance-tokenizer = "=11.0.0"
+frostem = { version = "=1.20260821.3", default-features = false }
+stop-words = { version = "=0.10.0", default-features = false }
+unicode-normalization = "=0.1.25"
 
 ulid = "1"
 futures = "0.3"

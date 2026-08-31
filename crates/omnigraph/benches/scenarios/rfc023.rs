@@ -1086,9 +1086,8 @@ async fn verify_id_content(
                 .expect("project exact physical-row verification scan");
             scanner.batch_size(scan_batch_rows);
             scanner.batch_size_bytes(scan_batch_bytes_target);
-            // Lance's byte target overrides its row target. Strict final
-            // batching restores the verifier's hard output-row ceiling.
-            scanner.strict_batch_size(true);
+            // Lance 11 applies both limits; strict coalescing cannot be used
+            // with a byte target.
             scanner
                 .try_into_stream()
                 .await
@@ -1101,9 +1100,6 @@ async fn verify_id_content(
                 .expect("project exact snapshot-row verification scan");
             scanner.batch_size(scan_batch_rows);
             scanner.batch_size_bytes(scan_batch_bytes_target);
-            // Keep graph-visible verification on the manifest-pinned handle;
-            // strict batching is forwarded without exposing raw Lance state.
-            scanner.strict_batch_size(true);
             scanner
                 .try_into_stream()
                 .await
@@ -1762,7 +1758,6 @@ async fn verify_fixture_row(
         .expect("limit representative merge-verification row");
     scanner.batch_size(2);
     scanner.batch_size_bytes(rfc023_limits::KEYED_WRITE_MAX_BYTES);
-    scanner.strict_batch_size(true);
     let mut stream = scanner
         .try_into_stream()
         .await

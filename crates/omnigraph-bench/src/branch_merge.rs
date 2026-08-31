@@ -1181,8 +1181,7 @@ pub async fn warm_read_set(
                 scanner
                     .project(projection)?
                     .batch_size(batch_rows)
-                    .batch_size_bytes(WARM_SCAN_TARGET_BYTES)
-                    .strict_batch_size(true);
+                    .batch_size_bytes(WARM_SCAN_TARGET_BYTES);
                 let mut stream = scanner.try_into_stream().await?;
                 while let Some(batch) = stream.try_next().await? {
                     branch_rows = branch_rows

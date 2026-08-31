@@ -2853,7 +2853,7 @@
             }
           },
           "409": {
-            "description": "Stored mutation write-authority conflict",
+            "description": "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
             "content": {
               "application/json": {
                 "schema": {
@@ -3171,6 +3171,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3242,6 +3252,16 @@
           },
           "403": {
             "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
             "content": {
               "application/json": {
                 "schema": {
@@ -4316,6 +4336,17 @@
               }
             ]
           },
+          "full_text_index_rebuild_required": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FullTextIndexRebuildRequiredOutput",
+                "description": "Set with HTTP 409 when a selected full-text index requires an explicit\nrebuild before search can succeed. Unlike a write-authority conflict,\nthis condition is not cleared by retrying. This additive discriminator\npreserves the closed [`ErrorCode`] contract."
+              }
+            ]
+          },
           "key_conflict": {
             "oneOf": [
               {
@@ -4425,6 +4456,23 @@
           "uri": {
             "type": "string",
             "description": "Normalized, credential-free URI spelling (or a redacted placeholder)."
+          }
+        }
+      },
+      "FullTextIndexRebuildRequiredOutput": {
+        "type": "object",
+        "description": "A selected full-text index cannot safely serve the current analyzer (HTTP 409).\nThis is not a retryable write conflict: an operator must rebuild the live\nbranch's indexes. Historical snapshots stay unchanged; branch old content\nand rebuild that branch to search it.",
+        "required": [
+          "index",
+          "reason"
+        ],
+        "properties": {
+          "index": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Human-readable diagnosis; branch on the enclosing detail's presence,\nnot this text, to distinguish the operator-action-required condition."
           }
         }
       },

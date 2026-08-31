@@ -4456,7 +4456,10 @@ impl Omnigraph {
             actor_id,
         )?;
         self.ensure_schema_apply_idle("branch_merge").await?;
-        self.branch_merge_impl(source, target, actor_id).await
+        // Keep the recovery/planning future out of the public API's callers;
+        // deeply composed loads and merges otherwise retain large debug
+        // construction frames throughout execution. Poll it in the same task.
+        Box::pin(self.branch_merge_impl(source, target, actor_id)).await
     }
 
     async fn branch_merge_impl(
