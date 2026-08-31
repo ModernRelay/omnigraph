@@ -381,7 +381,12 @@ mod tests {
     async fn certificate_file_is_bounded_and_follows_shallow_clone_ownership() {
         use arrow_array::{RecordBatch, StringArray};
         use arrow_schema::{DataType, Field, Schema};
-        use lance::index::DatasetIndexExt;
+        use lance::{
+            dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE},
+            index::DatasetIndexExt,
+            io::ObjectStoreRegistry,
+            session::Session,
+        };
         use object_store::ObjectStoreExt;
 
         use crate::{storage_layer::IndexBuildSpec, table_store::TableStore};
@@ -402,10 +407,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let uri = directory.path().join("source.lance");
         let uri = uri.to_str().unwrap();
-        let store = TableStore::new(
-            uri,
-            crate::lance_access::LanceAccessContext::new().data_session(),
-        );
+        // Local-file clients (and their counters) are pooled by registry, not
+        // dataset path. Isolate I/O accounting while retaining normal caches.
+        let session = Arc::new(Session::new(
+            DEFAULT_INDEX_CACHE_SIZE,
+            DEFAULT_METADATA_CACHE_SIZE,
+            Arc::new(ObjectStoreRegistry::default()),
+        ));
+        let store = TableStore::new(uri, session);
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)])),
             vec![Arc::new(StringArray::from(vec!["organism"]))],
@@ -434,10 +443,23 @@ mod tests {
         // wrong mirror must not pass just because our writer and reader agree.
         assert_native_siblings(&dataset, &index).await;
         let object_store = dataset.object_store(None).await.unwrap();
+        let path = certificate_path(&dataset, &index).unwrap();
+        let pooled_reader = TableStore::new(
+            uri,
+            crate::lance_access::LanceAccessContext::new().data_session(),
+        )
+        .open_dataset_head(uri, None)
+        .await
+        .unwrap();
+        let pooled_store = pooled_reader.object_store(None).await.unwrap();
+        assert!(!Arc::ptr_eq(&object_store, &pooled_store));
         object_store.io_stats_incremental();
         verify_index(&dataset, &index).await.unwrap();
         assert!(object_store.io_stats_incremental().read_iops > 0);
         verify_index(&dataset, &index).await.unwrap();
+        // Another graph's pooled client must not contaminate these counters.
+        // Keep this deterministic instead of relying on parallel test timing.
+        pooled_store.read_one_all(&path).await.unwrap();
         let warm = object_store.io_stats_incremental();
         assert_eq!((warm.read_iops, warm.write_iops), (0, 0));
 
@@ -481,7 +503,6 @@ mod tests {
             ));
         }
 
-        let path = certificate_path(&dataset, &index).unwrap();
         let original = object_store.read_one_all(&path).await.unwrap();
 
         let clone_uri = directory.path().join("clone.lance");
