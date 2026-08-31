@@ -1203,6 +1203,72 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
     let entry = snapshot.dataset("node:Doc").unwrap();
     let dataset = snapshot.open_dataset("node:Doc").await.unwrap();
     let indices = dataset.load_indices().await.unwrap();
+    // Certify one RRF leg while the other has no proof. Deleting every proof
+    // alone cannot detect a gate that checks only the first full-text arm.
+    for (uncertified_column, healthy_query) in [("body", "text_search"), ("title", "phrase_search")]
+    {
+        let field = dataset.schema().field(uncertified_column).unwrap().id;
+        let index = indices
+            .iter()
+            .find(|index| {
+                index.fields.contains(&field)
+                    && index.files.as_ref().is_some_and(|files| {
+                        files
+                            .iter()
+                            .any(|file| file.path == "omnigraph_fts_compat.json")
+                    })
+            })
+            .unwrap();
+        let path = dir
+            .path()
+            .join(&entry.dataset_path)
+            .join("_indices")
+            .join(index.uuid.to_string())
+            .join("omnigraph_fts_compat.json");
+        let certificate = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // A fresh session must observe this deliberate out-of-band removal;
+        // immutable proofs already verified by a session may remain cached.
+        db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+        assert!(
+            query_main(
+                &mut db,
+                SEARCH_QUERIES,
+                healthy_query,
+                &params(&[("$q", "Learning")])
+            )
+            .await
+            .unwrap()
+            .num_rows()
+                > 0
+        );
+        let error = query_main(
+            &mut db,
+            SEARCH_QUERIES,
+            "rrf_two_fts",
+            &params(&[("$q", "Learning")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, OmniError::FullTextIndexRebuildRequired { index: ref name, .. } if name == &index.name),
+            "{uncertified_column}: {error}"
+        );
+        std::fs::write(path, certificate).unwrap();
+        assert!(
+            query_main(
+                &mut db,
+                SEARCH_QUERIES,
+                "rrf_two_fts",
+                &params(&[("$q", "Learning")])
+            )
+            .await
+            .unwrap()
+            .num_rows()
+                > 0,
+            "failed verification must not be cached"
+        );
+    }
     // Simulate absent artifact provenance without changing rows, graph history,
     // or index coverage. Actual saved-v10 bytes are tested in staged_tests.
     for index in indices.iter().filter(|index| {
@@ -1221,6 +1287,7 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
         )
         .unwrap();
     }
+    db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     let original_rows = dataset.count_rows(None).await.unwrap();
     assert!(original_rows > 0);
     for query in [

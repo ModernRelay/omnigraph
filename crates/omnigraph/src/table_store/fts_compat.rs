@@ -5,9 +5,10 @@
 //! stemmer built an index. This certificate is derived index state, not a
 //! graph migration flag or protection against an out-of-band malicious writer.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use lance::{Dataset, index::scalar::IndexDetails};
+use lance_core::cache::CacheKey;
 use lance_table::format::{IndexFile, IndexMetadata};
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,22 @@ struct Certificate {
     index_uuid: String,
     analyzer_generation: String,
     artifact_digest: String,
+}
+
+/// Positive evidence only. No codec: proof never outlives the Lance session's
+/// bounded in-memory metadata cache, even with a persistent cache backend.
+struct VerifiedCertificateKey(String);
+
+impl CacheKey for VerifiedCertificateKey {
+    type ValueType = bool;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.0)
+    }
+
+    fn type_name() -> &'static str {
+        "omnigraph.verified-fts-certificate.v1"
+    }
 }
 
 /// Certify a newly completed, unpublished full FTS build from source rows.
@@ -104,6 +121,19 @@ pub(crate) async fn verify_index(dataset: &Dataset, index: &IndexMetadata) -> Re
         .object_store(index.base_id)
         .await
         .map_err(OmniError::storage)?;
+    let key = verification_key(
+        dataset.uri(),
+        &store.store_prefix,
+        &path,
+        index,
+        certificate_file.size_bytes,
+        &digest,
+    );
+    let session = dataset.session();
+    let cache = session.file_metadata_cache();
+    if cache.get_with_key(&key).await.is_some() {
+        return Ok(());
+    }
     // Do not use Lance's index-file parser or open_with_size: malformed Lance
     // footers can allocate before validation, and its cached-size SmallReader
     // downloads the whole object even if the inventory understates its size.
@@ -142,7 +172,36 @@ pub(crate) async fn verify_index(dataset: &Dataset, index: &IndexMetadata) -> Re
     }
     let payload = std::str::from_utf8(&payload)
         .map_err(|_| rebuild_required(index, "analyzer certificate is not UTF-8"))?;
-    verify_payload(index, payload, &digest)
+    verify_payload(index, payload, &digest)?;
+    cache.insert_with_key(&key, Arc::new(true)).await;
+    Ok(())
+}
+
+fn verification_key(
+    dataset_uri: &str,
+    store_prefix: &str,
+    path: &Path,
+    index: &IndexMetadata,
+    certificate_size: u64,
+    artifact_digest: &str,
+) -> VerifiedCertificateKey {
+    let mut digest = Sha256::new();
+    // A copied dataset may retain every UUID but have different certificate
+    // bytes. Base-path changes and certificate-inventory changes also require
+    // fresh evidence. Coverage and names remain outside immutable identity.
+    for field in [
+        dataset_uri,
+        store_prefix,
+        path.as_ref(),
+        &index.uuid.to_string(),
+        ANALYZER_GENERATION,
+        artifact_digest,
+    ] {
+        hash_bytes(&mut digest, field.as_bytes());
+    }
+    digest.update(FORMAT_VERSION.to_le_bytes());
+    digest.update(certificate_size.to_le_bytes());
+    VerifiedCertificateKey(format!("{:x}", digest.finalize()))
 }
 
 fn certificate_path(dataset: &Dataset, index: &IndexMetadata) -> Result<Path> {
@@ -269,6 +328,55 @@ fn rebuild_required(index: &IndexMetadata, reason: &str) -> OmniError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn analyzer_generation_requires_the_audited_resolved_dependency_set() {
+        // An audited, behavior-compatible dependency change may keep this
+        // generation. Updating this association requires the RFC 0043 audit;
+        // neither a manifest edit nor a lockfile refresh grants that approval.
+        const AUDITED_GENERATION: &str = "lance11.0.0-frostem1.20260821.3-v1";
+        const AUDITED_VERSIONS: &[(&str, &str)] = &[
+            ("lance", "11.0.0"),
+            ("lance-index", "11.0.0"),
+            ("lance-tokenizer", "11.0.0"),
+            ("frostem", "1.20260821.3"),
+            ("stop-words", "0.10.0"),
+            ("unicode-normalization", "0.1.25"),
+        ];
+        let workspace: toml::Value =
+            toml::from_str(include_str!("../../../../Cargo.toml")).unwrap();
+        let engine: toml::Value = toml::from_str(include_str!("../../Cargo.toml")).unwrap();
+        let lock: toml::Value = toml::from_str(include_str!("../../../../Cargo.lock")).unwrap();
+        assert_eq!(ANALYZER_GENERATION, AUDITED_GENERATION);
+        for &(name, version) in AUDITED_VERSIONS {
+            let dependency = &workspace["workspace"]["dependencies"][name];
+            let pin = dependency
+                .as_str()
+                .or_else(|| dependency.get("version").and_then(toml::Value::as_str));
+            assert_eq!(
+                pin,
+                Some(format!("={version}").as_str()),
+                "{name} pin needs an analyzer audit"
+            );
+            assert_eq!(
+                engine["dependencies"][name]["workspace"].as_bool(),
+                Some(true),
+                "{name} must remain a direct inherited dependency"
+            );
+            let resolved: Vec<_> = lock["package"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|package| package["name"].as_str() == Some(name))
+                .map(|package| package["version"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                resolved,
+                vec![version],
+                "{name} resolved versions need an analyzer audit"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn certificate_file_is_bounded_and_follows_shallow_clone_ownership() {
         use arrow_array::{RecordBatch, StringArray};
@@ -278,16 +386,36 @@ mod tests {
 
         use crate::{storage_layer::IndexBuildSpec, table_store::TableStore};
 
+        async fn assert_native_siblings(dataset: &Dataset, index: &IndexMetadata) {
+            let parent = certificate_path(dataset, index).unwrap().parent().unwrap();
+            let store = dataset.object_store(index.base_id).await.unwrap();
+            for file in index.files.as_ref().unwrap() {
+                let meta = store
+                    .inner
+                    .head(&parent.clone().join(file.path.as_str()))
+                    .await
+                    .unwrap();
+                assert_eq!(meta.size, file.size_bytes, "native sibling {}", file.path);
+            }
+        }
+
         let directory = tempfile::tempdir().unwrap();
         let uri = directory.path().join("source.lance");
         let uri = uri.to_str().unwrap();
-        let store = TableStore::new(uri, Arc::new(lance::session::Session::default()));
+        let store = TableStore::new(
+            uri,
+            crate::lance_access::LanceAccessContext::new().data_session(),
+        );
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)])),
             vec![Arc::new(StringArray::from(vec!["organism"]))],
         )
         .unwrap();
-        let dataset = TableStore::write_dataset(uri, batch).await.unwrap();
+        TableStore::write_dataset(uri, batch).await.unwrap();
+        // The low-level bootstrap writer intentionally returns a zero-cache
+        // control session. Read through the engine's normal data-table opener
+        // and graph-scoped data session before testing warm query behavior.
+        let dataset = store.open_dataset_head(uri, None).await.unwrap();
         let staged = store
             .stage_create_indices(
                 &dataset,
@@ -302,16 +430,76 @@ mod tests {
             .await
             .unwrap();
         let index = dataset.load_indices().await.unwrap()[0].clone();
+        // Lance wrote the native files independently of certificate_path. A
+        // wrong mirror must not pass just because our writer and reader agree.
+        assert_native_siblings(&dataset, &index).await;
+        let object_store = dataset.object_store(None).await.unwrap();
+        object_store.io_stats_incremental();
         verify_index(&dataset, &index).await.unwrap();
+        assert!(object_store.io_stats_incremental().read_iops > 0);
+        verify_index(&dataset, &index).await.unwrap();
+        let warm = object_store.io_stats_incremental();
+        assert_eq!((warm.read_iops, warm.write_iops), (0, 0));
+
+        // Native local read_iops excludes file metadata/open calls. Lance's
+        // test scheme uses CloudObjectReader over the same files, exposing
+        // both the HEAD and payload GET through its existing object-store tracker.
+        let file_uri = url::Url::from_file_path(uri).unwrap().to_string();
+        // forbidden-api-allow: test-only native reader seam to count certificate HEAD and GET separately.
+        let cloud_reader = Dataset::open(&file_uri.replacen("file:", "file-object-store:", 1))
+            .await
+            .unwrap();
+        let tracked_store = cloud_reader.object_store(None).await.unwrap();
+        assert!(!tracked_store.has_direct_local_paths());
+        tracked_store.io_stats_incremental();
+        verify_index(&cloud_reader, &index).await.unwrap();
+        let cold = tracked_store.io_stats_incremental();
+        let methods: Vec<_> = cold.requests.iter().map(|request| request.method).collect();
+        assert_eq!(
+            methods,
+            vec!["get_opts", "get_ranges"],
+            "HEAD then payload GET"
+        );
+        verify_index(&cloud_reader, &index).await.unwrap();
+        assert!(tracked_store.io_stats_incremental().requests.is_empty());
+
+        // A changed certificate inventory or artifact cannot borrow the warm
+        // proof even when its immutable UUID is unchanged.
+        for changed_certificate in [false, true] {
+            let mut changed = index.clone();
+            changed
+                .files
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|file| (file.path == CERTIFICATE_FILE) == changed_certificate)
+                .unwrap()
+                .size_bytes += 1;
+            assert!(matches!(
+                verify_index(&dataset, &changed).await,
+                Err(OmniError::FullTextIndexRebuildRequired { .. })
+            ));
+        }
+
+        let path = certificate_path(&dataset, &index).unwrap();
+        let original = object_store.read_one_all(&path).await.unwrap();
 
         let clone_uri = directory.path().join("clone.lance");
         let version = dataset.version().version;
-        let mut cloned = dataset
+        dataset
             .shallow_clone(clone_uri.to_str().unwrap(), version, None)
             .await
             .unwrap();
+        let mut cloned =
+            // forbidden-api-allow: test-only same-session clone proves certificate ownership cannot alias by UUID.
+            lance::dataset::builder::DatasetBuilder::from_uri(clone_uri.to_str().unwrap())
+                .with_session(dataset.session())
+                .load()
+                .await
+                .unwrap();
         let clone_index = cloned.load_indices().await.unwrap()[0].clone();
         assert_eq!(clone_index.uuid, index.uuid);
+        assert!(Arc::ptr_eq(&cloned.session(), &dataset.session()));
         let base_id = clone_index
             .base_id
             .expect("shallow clone must reference its source base");
@@ -322,7 +510,16 @@ mod tests {
                 .join(CERTIFICATE_FILE)
                 .exists()
         );
+        // A different dataset URI sharing the same session and index UUID
+        // must acquire its own proof. Failures must not be cached either.
+        object_store.inner.delete(&path).await.unwrap();
+        assert!(matches!(
+            verify_index(&cloned, &clone_index).await,
+            Err(OmniError::FullTextIndexRebuildRequired { .. })
+        ));
+        object_store.put(&path, &original).await.unwrap();
         verify_index(&cloned, &clone_index).await.unwrap();
+        assert_native_siblings(&cloned, &clone_index).await;
         // Both public BasePath shapes must resolve the same immutable file.
         let base = Arc::make_mut(&mut cloned.manifest)
             .base_paths
@@ -332,10 +529,8 @@ mod tests {
         base.path.push_str("/_indices");
         base.is_dataset_root = false;
         verify_index(&cloned, &clone_index).await.unwrap();
+        assert_native_siblings(&cloned, &clone_index).await;
 
-        let object_store = dataset.object_store(None).await.unwrap();
-        let path = certificate_path(&dataset, &index).unwrap();
-        let original = object_store.read_one_all(&path).await.unwrap();
         for (case, payload) in [
             ("truncated", original[..original.len() - 1].to_vec()),
             (
@@ -352,13 +547,19 @@ mod tests {
             ),
         ] {
             object_store.put(&path, &payload).await.unwrap();
+            // These deliberate out-of-band rewrites violate immutable-file
+            // ownership. Reopening models their first observation by a reader.
+            // forbidden-api-allow: test-only cold reader must revalidate deliberately corrupted certificate bytes.
+            let cold = Dataset::open(uri).await.unwrap();
             assert!(
                 matches!(
-                    verify_index(&dataset, &index).await,
+                    verify_index(&cold, &index).await,
                     Err(OmniError::FullTextIndexRebuildRequired { .. })
                 ),
                 "accepted {case}"
             );
+            object_store.put(&path, &original).await.unwrap();
+            verify_index(&cold, &index).await.unwrap();
         }
         object_store.put(&path, &original).await.unwrap();
         verify_index(&dataset, &index).await.unwrap();
@@ -374,12 +575,16 @@ mod tests {
             Err(OmniError::FullTextIndexRebuildRequired { .. })
         ));
         object_store.inner.delete(&path).await.unwrap();
+        // forbidden-api-allow: test-only cold reader must observe deliberate certificate deletion.
+        let cold = Dataset::open(uri).await.unwrap();
         assert!(matches!(
-            verify_index(&dataset, &index).await,
+            verify_index(&cold, &index).await,
             Err(OmniError::FullTextIndexRebuildRequired { .. })
         ));
+        // forbidden-api-allow: test-only cold clone must observe deletion at its source-owned certificate path.
+        let cold_clone = Dataset::open(clone_uri.to_str().unwrap()).await.unwrap();
         assert!(matches!(
-            verify_index(&cloned, &clone_index).await,
+            verify_index(&cold_clone, &clone_index).await,
             Err(OmniError::FullTextIndexRebuildRequired { .. })
         ));
     }
@@ -421,6 +626,32 @@ mod tests {
     fn artifact_proof_tracks_immutable_details_not_coverage_or_location() {
         let original = index();
         let expected = digest(&original);
+        let path = Path::from("source/_indices/certificate.json");
+        let key = verification_key("source", "store-a", &path, &original, 512, &expected).0;
+        for (uri, store, path, certificate_size, artifact) in [
+            ("copy", "store-a", path.clone(), 512, expected.as_str()),
+            ("source", "store-b", path.clone(), 512, expected.as_str()),
+            (
+                "source",
+                "store-a",
+                Path::from("other-base/certificate.json"),
+                512,
+                expected.as_str(),
+            ),
+            ("source", "store-a", path.clone(), 513, expected.as_str()),
+            ("source", "store-a", path.clone(), 512, "changed-artifact"),
+        ] {
+            assert_ne!(
+                verification_key(uri, store, &path, &original, certificate_size, artifact).0,
+                key
+            );
+        }
+        let mut other_uuid = original.clone();
+        other_uuid.uuid = "22222222-2222-4222-8222-222222222222".parse().unwrap();
+        assert_ne!(
+            verification_key("source", "store-a", &path, &other_uuid, 512, &expected).0,
+            key
+        );
         let mut changed = original.clone();
         changed.name = "renamed".into();
         changed.dataset_version = 20;

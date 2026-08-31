@@ -293,6 +293,8 @@ pub(crate) enum Command {
         json: bool,
     },
     /// Rebuild all full-text indexes from one branch's current rows
+    ///
+    /// Uses the default English analyzer; replaces any custom tokenizer settings.
     RebuildFullTextIndexes {
         /// Graph storage URI; alternatively use --store or --cluster/--graph
         uri: Option<String>,

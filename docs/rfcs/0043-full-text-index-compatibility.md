@@ -48,8 +48,9 @@ dependency is not a safe compatibility strategy.
 indexes from the selected branch's current rows. The engine exposes the same
 operation, including an actor-aware entry point. The command uses direct graph
 storage, not a new HTTP maintenance endpoint. It reports the exact published
-graph commit and rebuilt type/property pairs. No work is reported as rebuilt
-without successful publication.
+graph commit and rebuilt type/property pairs. Completed rebuilds also warn that
+default English analysis replaced any custom tokenizer settings; no-op output
+has no such warning. No work is reported as rebuilt without successful publication.
 
 Operators stop the old serving/writing fleet, preserve a recoverable backup,
 upgrade all readers and writers, rebuild each branch that needs full-text search,
@@ -57,6 +58,9 @@ and verify representative searches before resuming service. Ordinary row,
 traversal, scalar, and vector reads do not require this rebuild. Full-text
 queries against an uncertified index return a rebuild-required diagnostic;
 they never fall through to a silently incomplete indexed result.
+The HTTP error keeps `409` and `code: conflict`, with a structured
+`full_text_index_rebuild_required` detail containing the index and reason. Its
+presence identifies an operator-action-required condition, not a retryable conflict.
 
 Historical snapshots retain their original indexes. Branching or restoring an
 old snapshot may therefore require another rebuild on the resulting live branch.
@@ -70,7 +74,10 @@ claim to migrate another branch.
 A completed full build writes one small compatibility certificate inside its
 new index UUID directory before the existing staged CreateIndex transaction is
 published. The certificate is bounded JSON, using Lance's public object-store
-and base-path resolution APIs and native index file inventory. Shallow clones
+and base-path resolution APIs and native index file inventory. Its directory
+mirrors the private `Dataset::indice_files_dir` layout; tests independently
+check that native Lance inventory files occupy that directory on source and
+shallow-clone datasets, including both base-path forms. Shallow clones
 and garbage collection keep their existing ownership rules. The reader checks
 the actual object size before a bounded read, without parsing a Lance footer.
 It contains a versioned analyzer generation, the
@@ -78,10 +85,20 @@ exact index UUID, and a digest of the immutable index details and file inventory
 Mutable table version, coverage, name, and branch location are not provenance.
 The certificate is not an authenticity mechanism against a malicious writer.
 
-The supported Lance/analyzer dependencies are pinned explicitly. Changing them
-requires a compatibility audit and either evidence that the generation remains
-valid or a new generation. Missing, malformed, mismatched, or unknown proof
-refuses full-text use. Storage failures remain storage failures.
+The supported Lance/analyzer dependencies are pinned explicitly. A guard binds
+the audited generation to both manifest pins and resolved Lance, lance-index,
+lance-tokenizer, frostem, stop-words, and unicode-normalization versions. Changing
+them requires a compatibility audit and either evidence that the generation
+remains valid or a new generation. Missing, malformed, mismatched, or unknown
+proof refuses full-text use. Storage failures remain storage failures.
+
+Successful verification is cached in Lance's existing bounded, session-local
+file metadata cache, without a persistent codec. Its key binds the storage
+prefix, dataset URI, resolved certificate path, UUID, generation, artifact digest,
+and declared certificate size. Snapshot inventory checks still run before the
+lookup. Failures are never cached; a cold read still validates actual object size
+and bounded payload bytes. This relies on the same immutable index-file ownership
+as Lance, not on detecting out-of-band rewrites of already verified artifacts.
 
 Search checks the actual snapshot-selected index segments for the requested
 columns, including full-text predicates through the read-only SDK. Ordinary
@@ -95,14 +112,24 @@ ordered gates, exact recovery identity, and one graph publication. It replaces
 all full-text segments for each rebuilt column, including historical index names,
 while preserving unrelated indexes. Rebuilding always uses engine-default
 English analysis; external custom tokenizer settings are not retained.
-Policy is enforced before effects and actor
-attribution travels with the same publication. Unsupported physical full-text
-inventory must not be silently reported as migrated.
+Declared full-text indexes are node-only; existing physical edge full-text
+indexes are replaced, but edge-property declarations do not create new ones.
+Policy is enforced before effects when the embedded host installs a checker,
+and actor attribution travels with the same publication. Direct CLI access,
+including `--cluster`, does not install server policy; storage permissions govern
+that operator access. Unknown physical index kinds are refused before publication,
+not guessed. Automatic migration supports engine-created v6/Lance 9–10 inventory
+with kind metadata; unsupported legacy/external inventory requires a controlled
+export/import or trusted backup, as the operator guide explains.
 
 Append/delete and stable-row-ID compaction preserve the immutable index proof.
 Incremental full-text index folding is excluded from ordinary optimize in this
 first slice: it can create a new UUID by merging old postings and has no
-pre-publication compatibility hook. Other index optimization and compaction
+pre-publication compatibility hook. Planning uses the same foldable-index
+predicate as execution and native per-name aggregate scalar coverage, so deferred
+full-text tails cannot create phantom recovery participants. Vector per-segment
+eligibility is retained because full coverage does not rule out rebalancing. Such coverage is
+reported as pending with the explicit rebuild remedy. Other index optimization and compaction
 remain available. New unindexed rows remain queryable through Lance's tail
 scan; operators use the explicit full rebuild to refresh full-text coverage.
 This avoids an inline full-text rebuild or a second provenance/recovery system.
@@ -125,9 +152,10 @@ bump. Uncertified indexes are conservatively refused even if an external builder
 happened to use a compatible analyzer. A full rebuild establishes proof from
 rows. Old binaries do not enforce this contract and must not read rebuilt
 indexes; downgrades require restoring the pre-upgrade backup and old fleet.
-Deleting a certificate removes search availability, not rows. The practical
-cost is rebuilding each branch that needs search and retaining backups for
-rollback.
+Deleting a certificate removes search availability on cold verification, not
+rows; a session may retain already verified immutable proof until eviction.
+The practical cost is rebuilding each branch that needs search and retaining
+backups for rollback.
 
 ## Alternatives
 
@@ -150,6 +178,10 @@ replacement; inherited-branch isolation; retained historical refusal; empty data
 policy denial before effects; one publication and recovery after partial effects;
 and full-text correctness after ordinary writes and optimize. Certificate tests
 cover wrong UUID/generation/artifact inventory and absent or malformed proof.
+Mixed healthy/uncertified compound-search legs must name the incompatible index;
+placement and cache tests pin native ownership, identity isolation, warm zero-I/O
+verification, and repair after an uncached failure. Maintenance recovery includes
+a full-text-tail-only sibling that must not enter the planned write set.
 
 The audit used final Lance 11.0.0 source and complete upstream full-text format,
 tokenizer, index, maintenance, versioning, branch, and migration documentation.

@@ -291,26 +291,31 @@ struct OpenedGraph {
     handle: Arc<GraphHandle>,
 }
 
-/// The structured-detail payloads are boxed to keep `Result<_, ApiError>` cheap
-/// to move: every handler returns one, and at most one detail is ever `Some`.
-/// The boxing is an in-memory representation only; [`api::ErrorOutput`] is what
-/// serializes.
+/// One boxed detail keeps `Result<_, ApiError>` cheap to move as new error
+/// variants are added. The mutually exclusive representation is memory-only;
+/// [`api::ErrorOutput`] remains the wire contract.
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     code: Option<ErrorCode>,
     message: Box<str>,
-    merge_conflicts: Box<[api::MergeConflictOutput]>,
-    published_dataset_version_conflict: Option<Box<api::PublishedDatasetVersionConflictOutput>>,
-    read_set_conflict: Option<Box<api::ReadSetConflictOutput>>,
-    key_conflict: Option<Box<api::KeyConflictOutput>>,
-    resource_limit: Option<Box<api::ResourceLimitOutput>>,
-    blob_range: Option<Box<api::BlobRangeOutput>>,
-    external_blob_source: Option<Box<api::ExternalBlobSourceOutput>>,
-    recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
-    precondition_failure: Option<Box<api::PreconditionFailureOutput>>,
-    change_feed_gap: Option<Box<api::ChangeFeedGapOutput>>,
-    change_diff_refusal: Option<Box<api::ChangeDiffRefusalOutput>>,
+    details: Option<Box<ApiErrorDetails>>,
+}
+
+#[derive(Debug)]
+enum ApiErrorDetails {
+    MergeConflicts(Vec<api::MergeConflictOutput>),
+    PublishedDatasetVersionConflict(api::PublishedDatasetVersionConflictOutput),
+    ReadSetConflict(api::ReadSetConflictOutput),
+    KeyConflict(api::KeyConflictOutput),
+    ResourceLimit(api::ResourceLimitOutput),
+    BlobRange(api::BlobRangeOutput),
+    ExternalBlobSource(api::ExternalBlobSourceOutput),
+    RecoveryRequired(api::RecoveryRequiredOutput),
+    PreconditionFailure(api::PreconditionFailureOutput),
+    ChangeFeedGap(api::ChangeFeedGapOutput),
+    ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
+    FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
 }
 
 impl AppState {
@@ -642,17 +647,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             code: Some(ErrorCode::Unauthorized),
             message: message.into().into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: None,
         }
     }
 
@@ -661,17 +656,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             code: Some(ErrorCode::Forbidden),
             message: message.into().into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: None,
         }
     }
 
@@ -680,17 +665,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code: Some(ErrorCode::BadRequest),
             message: message.into().into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: None,
         }
     }
 
@@ -714,17 +689,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: Some(ErrorCode::NotFound),
             message: message.into().into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: None,
         }
     }
 
@@ -737,17 +702,7 @@ impl ApiError {
             status: StatusCode::METHOD_NOT_ALLOWED,
             code: Some(ErrorCode::MethodNotAllowed),
             message: message.into().into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: None,
         }
     }
 
@@ -756,17 +711,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: None,
         }
     }
 
@@ -775,17 +720,7 @@ impl ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             code: Some(ErrorCode::BadRequest),
             message: message.into().into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: None,
         }
     }
 
@@ -799,17 +734,11 @@ impl ApiError {
                 "blob range [{start}, {end}) is not satisfiable for a value of length {length}"
             )
             .into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: Some(Box::new(api::BlobRangeOutput { start, end, length })),
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: Some(Box::new(ApiErrorDetails::BlobRange(api::BlobRangeOutput {
+                start,
+                end,
+                length,
+            }))),
         }
     }
 
@@ -822,17 +751,7 @@ impl ApiError {
             status: StatusCode::PRECONDITION_FAILED,
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: None,
         }
     }
 
@@ -841,17 +760,7 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: Some(ErrorCode::Internal),
             message: message.into().into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: None,
         }
     }
 
@@ -879,17 +788,9 @@ impl ApiError {
             status: StatusCode::FAILED_DEPENDENCY,
             code: None,
             message: message.into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: Some(Box::new(api::ExternalBlobSourceOutput { uri, reason })),
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: Some(Box::new(ApiErrorDetails::ExternalBlobSource(
+                api::ExternalBlobSourceOutput { uri, reason },
+            ))),
         }
     }
 
@@ -902,17 +803,7 @@ impl ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             code: Some(ErrorCode::TooManyRequests),
             message: message.into().into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: None,
         }
     }
 
@@ -932,17 +823,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: summarize_merge_conflicts(&conflicts).into_boxed_str(),
-            merge_conflicts: conflicts.into_boxed_slice(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: Some(Box::new(ApiErrorDetails::MergeConflicts(conflicts))),
         }
     }
 
@@ -954,17 +835,9 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: Some(Box::new(details)),
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: Some(Box::new(ApiErrorDetails::PublishedDatasetVersionConflict(
+                details,
+            ))),
         }
     }
 
@@ -973,17 +846,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: Some(Box::new(details)),
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: Some(Box::new(ApiErrorDetails::ReadSetConflict(details))),
         }
     }
 
@@ -992,17 +855,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: Some(Box::new(details)),
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: Some(Box::new(ApiErrorDetails::KeyConflict(details))),
         }
     }
 
@@ -1011,17 +864,7 @@ impl ApiError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code: Some(ErrorCode::BadRequest),
             message: message.into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: Some(Box::new(details)),
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: Some(Box::new(ApiErrorDetails::ResourceLimit(details))),
         }
     }
 
@@ -1033,17 +876,9 @@ impl ApiError {
             // clients continue to deserialize the otherwise familiar body.
             code: None,
             message: message.into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: Some(Box::new(ApiErrorDetails::RecoveryRequired(
+                api::RecoveryRequiredOutput { operation_id },
+            ))),
         }
     }
 
@@ -1056,17 +891,7 @@ impl ApiError {
             status: StatusCode::PRECONDITION_FAILED,
             code: None,
             message: message.into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: Some(Box::new(details)),
-            change_feed_gap: None,
-            change_diff_refusal: None,
+            details: Some(Box::new(ApiErrorDetails::PreconditionFailure(details))),
         }
     }
 
@@ -1080,20 +905,12 @@ impl ApiError {
             code: None,
             message: format!("change feed gap at commit '{first_unreadable_commit_id}'")
                 .into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: Some(Box::new(api::ChangeFeedGapOutput {
-                cursor,
-                first_unreadable_commit_id,
-            })),
-            change_diff_refusal: None,
+            details: Some(Box::new(ApiErrorDetails::ChangeFeedGap(
+                api::ChangeFeedGapOutput {
+                    cursor,
+                    first_unreadable_commit_id,
+                },
+            ))),
         }
     }
 
@@ -1104,17 +921,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
-            merge_conflicts: Box::default(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: Some(Box::new(details)),
+            details: Some(Box::new(ApiErrorDetails::ChangeDiffRefusal(details))),
         }
     }
 
@@ -1209,7 +1016,14 @@ impl ApiError {
                 "historical published dataset version {published_dataset_version} was reclaimed"
             )),
             error @ OmniError::FullTextIndexRebuildRequired { .. } => {
-                Self::conflict(error.to_string())
+                let mut response = Self::conflict(error.to_string());
+                let OmniError::FullTextIndexRebuildRequired { index, reason } = error else {
+                    unreachable!()
+                };
+                response.details = Some(Box::new(ApiErrorDetails::FullTextIndexRebuildRequired(
+                    api::FullTextIndexRebuildRequiredOutput { index, reason },
+                )));
+                response
             }
             // Caller-side continuation fault (decode, checksum, or scope). The
             // "change cursor rejected: " prefix is a stable contract so raw
@@ -1368,28 +1182,49 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
         }
-        (
-            self.status,
-            headers,
-            Json(ErrorOutput {
-                error: self.message.into(),
-                code: self.code,
-                merge_conflicts: self.merge_conflicts.into_vec(),
-                published_dataset_version_conflict: self
-                    .published_dataset_version_conflict
-                    .map(|d| *d),
-                read_set_conflict: self.read_set_conflict.map(|d| *d),
-                key_conflict: self.key_conflict.map(|d| *d),
-                resource_limit: self.resource_limit.map(|d| *d),
-                blob_range: self.blob_range.map(|d| *d),
-                external_blob_source: self.external_blob_source.map(|d| *d),
-                recovery_required: self.recovery_required.map(|d| *d),
-                precondition_failure: self.precondition_failure.map(|d| *d),
-                change_feed_gap: self.change_feed_gap.map(|d| *d),
-                change_diff_refusal: self.change_diff_refusal.map(|d| *d),
-            }),
-        )
-            .into_response()
+        let mut output = ErrorOutput {
+            error: self.message.into(),
+            code: self.code,
+            merge_conflicts: Vec::new(),
+            published_dataset_version_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
+            full_text_index_rebuild_required: None,
+        };
+        if let Some(details) = self.details {
+            match *details {
+                ApiErrorDetails::MergeConflicts(value) => output.merge_conflicts = value,
+                ApiErrorDetails::PublishedDatasetVersionConflict(value) => {
+                    output.published_dataset_version_conflict = Some(value)
+                }
+                ApiErrorDetails::ReadSetConflict(value) => output.read_set_conflict = Some(value),
+                ApiErrorDetails::KeyConflict(value) => output.key_conflict = Some(value),
+                ApiErrorDetails::ResourceLimit(value) => output.resource_limit = Some(value),
+                ApiErrorDetails::BlobRange(value) => output.blob_range = Some(value),
+                ApiErrorDetails::ExternalBlobSource(value) => {
+                    output.external_blob_source = Some(value)
+                }
+                ApiErrorDetails::RecoveryRequired(value) => output.recovery_required = Some(value),
+                ApiErrorDetails::PreconditionFailure(value) => {
+                    output.precondition_failure = Some(value)
+                }
+                ApiErrorDetails::ChangeFeedGap(value) => output.change_feed_gap = Some(value),
+                ApiErrorDetails::ChangeDiffRefusal(value) => {
+                    output.change_diff_refusal = Some(value)
+                }
+                ApiErrorDetails::FullTextIndexRebuildRequired(value) => {
+                    output.full_text_index_rebuild_required = Some(value)
+                }
+            }
+        }
+        (self.status, headers, Json(output)).into_response()
     }
 }
 
@@ -1399,6 +1234,10 @@ mod api_error_tests {
 
     #[tokio::test]
     async fn incompatible_full_text_index_returns_rebuild_required_conflict() {
+        assert!(
+            std::mem::size_of::<ApiError>() <= 4 * std::mem::size_of::<usize>(),
+            "new detail variants must not grow every handler's Result frame"
+        );
         let response = ApiError::from_omni(OmniError::FullTextIndexRebuildRequired {
             index: "title_idx".into(),
             reason: "analyzer certificate is missing".into(),
@@ -1409,8 +1248,28 @@ mod api_error_tests {
             .await
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
         assert!(error.error.contains("requires rebuild"));
         assert!(error.error.contains("rebuild-full-text-indexes"));
+        let details = error.full_text_index_rebuild_required.unwrap();
+        assert_eq!(details.index, "title_idx");
+        assert_eq!(details.reason, "analyzer certificate is missing");
+
+        // The discriminator must be absent, not null, for ordinary conflicts;
+        // older error envelopes without it remain deserializable as well.
+        let response = ApiError::from_omni(OmniError::RetryableCommitConflict(
+            "retry with fresh authority".into(),
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("full_text_index_rebuild_required").is_none());
+        let ordinary: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ordinary.code, Some(ErrorCode::Conflict));
+        assert!(ordinary.full_text_index_rebuild_required.is_none());
     }
 
     #[test]

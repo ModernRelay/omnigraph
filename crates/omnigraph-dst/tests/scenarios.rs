@@ -2163,6 +2163,13 @@ fn dst_predict_triage() {
 /// path adds two artifact-certificate PUTs (64 -> 66). The lower Optimize,
 /// audit, and verification read counts also replay under that ablation: they
 /// follow the reduced folding/version work, not a general performance win.
+///
+/// Fold-eligible planning also skips one FTS-only no-op in this universe:
+/// Optimize adapter PUT/DELETE each fall 3 -> 2 (no empty recovery cycle).
+/// Skipping its apply-phase fresh snapshot removes two schema EXISTS and
+/// three schema GETs, plus the unnecessary manifest/index reads (Lance GET
+/// 642 -> 622, LIST 72 -> 71). Lance PUT stays 66 and every other op's counts
+/// stay identical: useful maintenance work and verification are unchanged.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {

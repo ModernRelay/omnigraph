@@ -33,7 +33,7 @@ use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
 use lance::dataset::optimize::{
     CompactionMetrics, CompactionOptions, compact_files, plan_compaction,
 };
-use lance::index::DatasetIndexExt;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_index::optimize::OptimizeOptions;
 
 use super::*;
@@ -124,11 +124,9 @@ pub struct DatasetOptimizeStats {
     /// Lance HEAD version observed by optimize for drift skips. `None` for
     /// normal compaction/no-op outcomes.
     pub lance_head_version: Option<u64>,
-    /// Declared indexed properties on this type the reconciler could not build
-    /// this run, each with the `reason` (today: a vector property with no
-    /// trainable vectors yet). Empty on the common path. Reported, not fatal — a
-    /// later `optimize` retries; the `list_indices`/`indisvalid` analog so
-    /// operators can see which index is pending and why.
+    /// Index work deferred this run, with the reason and remedy: a vector
+    /// property without trainable vectors, or full-text coverage requiring an
+    /// explicit rebuild. Deferred work alone does not arm recovery or publish.
     pub pending_indexes: Vec<super::PendingIndex>,
 }
 
@@ -479,7 +477,7 @@ async fn prepare_optimize_table(
         .map_err(OmniError::storage)?
         .num_tasks()
         > 0;
-    let needs_reindex = TableStore::has_unindexed_fragments(snapshot.dataset()).await?;
+    let needs_reindex = TableStore::has_foldable_unindexed_fragments(snapshot.dataset()).await?;
     let index_work = super::table_ops::index_work_status_on_dataset_for_catalog(
         db,
         catalog,
@@ -491,6 +489,8 @@ async fn prepare_optimize_table(
         let mut stat =
             DatasetOptimizeStats::compacted(task.table_key, &CompactionMetrics::default(), false);
         stat.pending_indexes = index_work.pending;
+        append_deferred_full_text_indexes(&snapshot, &stat.type_key, &mut stat.pending_indexes)
+            .await?;
         return Ok(OptimizePreparation::Stat(stat));
     }
 
@@ -501,6 +501,52 @@ async fn prepare_optimize_table(
         expected_version: task.expected_version,
         initial_snapshot: snapshot,
     }))
+}
+
+/// Deferred full-text coverage is observable status, never a promise that
+/// ordinary optimize will advance this table. Recheck after physical work too:
+/// stable-ID compaction can change coverage while preserving index artifacts.
+async fn append_deferred_full_text_indexes(
+    snapshot: &crate::storage_layer::SnapshotHandle,
+    table_key: &str,
+    pending: &mut Vec<super::PendingIndex>,
+) -> Result<()> {
+    let ds = snapshot.dataset();
+    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+    let full_text: std::collections::BTreeMap<_, _> = indices
+        .iter()
+        .filter(|index| TableStore::is_full_text_index(index))
+        .map(|index| (index.name.as_str(), index))
+        .collect();
+    for (name, index) in full_text {
+        let coverage_unknown = indices
+            .iter()
+            .any(|segment| segment.name == name && segment.fragment_bitmap.is_none());
+        if !coverage_unknown
+            && ds
+                .unindexed_fragments(name)
+                .await
+                .map_err(OmniError::storage)?
+                .is_empty()
+        {
+            continue;
+        }
+        for field in index
+            .keyed_fields()
+            .iter()
+            .filter_map(|id| ds.schema().field_by_id(*id))
+        {
+            pending.push(super::PendingIndex {
+                type_key: table_key.to_string(),
+                property: field.name.clone(),
+                reason: format!(
+                    "full-text index '{name}' has incomplete or unknown coverage; \
+                     run omnigraph rebuild-full-text-indexes <URI> --branch main"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Apply one productive dataset's physical maintenance work. This helper owns no
@@ -580,7 +626,8 @@ async fn apply_optimize_table_effects(
         // Any of the three enters the publish path. If NONE, this is a no-op and must
         // NOT be pinned in a sidecar (a zero-commit pin classifies NoMovement on
         // recovery and rolls back siblings).
-        let needs_reindex = TableStore::has_unindexed_fragments(selected.dataset()).await?;
+        let needs_reindex =
+            TableStore::has_foldable_unindexed_fragments(selected.dataset()).await?;
         let index_work = super::table_ops::index_work_status_on_dataset_for_catalog(
             db, catalog, &table_key, &selected,
         )
@@ -605,6 +652,8 @@ async fn apply_optimize_table_effects(
                 false,
             );
             stat.pending_indexes = index_work.pending;
+            append_deferred_full_text_indexes(&selected, &stat.type_key, &mut stat.pending_indexes)
+                .await?;
             return Ok(OptimizeEffectOutcome { stat, update: None });
         }
 
@@ -665,10 +714,7 @@ async fn apply_optimize_table_effects(
             .await
             .map_err(OmniError::storage)?
             .iter()
-            .filter(|index| {
-                index.index_details.is_some()
-                    && !crate::table_store::TableStore::is_full_text_index(index)
-            })
+            .filter(|index| TableStore::can_fold_index(index))
             .map(|index| index.name.clone())
             .collect();
         match ds
@@ -706,6 +752,7 @@ async fn apply_optimize_table_effects(
 
     let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, committed);
     stat.pending_indexes = pending_indexes;
+    append_deferred_full_text_indexes(&snapshot, &stat.type_key, &mut stat.pending_indexes).await?;
     let update = if committed {
         let state = db.storage().table_state(&full_path, &snapshot).await?;
         Some(crate::db::DatasetUpdate {

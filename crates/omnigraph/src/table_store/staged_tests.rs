@@ -2492,6 +2492,56 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
         "the explicitly-named companion BTREE must land beside the FTS index"
     );
     assert!(store.has_vector_index(&new_ds, "embedding").await.unwrap());
+
+    // Metadata-only coverage cases, reusing this fixture's typed index
+    // inventory. The synthetic empty segment borrows another index UUID;
+    // no posting files are opened and these snapshots are never searched.
+    // A scalar's full union is a no-op, but vector segments may still need
+    // partition rebalancing, so preserve their previous per-segment candidacy.
+    use lance::index::DatasetIndexExt;
+    let inventory = new_ds.load_indices().await.unwrap();
+    let mut coverage_ds = new_ds;
+    for (column, expected_work) in [("id", false), ("embedding", true)] {
+        let field_id = coverage_ds.schema().field(column).unwrap().id;
+        let complete = inventory
+            .iter()
+            .find(|index| index.fields == [field_id])
+            .unwrap()
+            .clone();
+        let mut empty = complete.clone();
+        empty.uuid = inventory
+            .iter()
+            .find(|index| index.uuid != complete.uuid)
+            .unwrap()
+            .uuid;
+        empty.fragment_bitmap.as_mut().unwrap().clear();
+        let current = coverage_ds.load_indices().await.unwrap();
+        let transaction = lance::dataset::transaction::Transaction::new(
+            coverage_ds.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![complete, empty],
+                removed_indices: current.as_ref().clone(),
+            },
+            None,
+        );
+        coverage_ds = lance::dataset::CommitBuilder::new(Arc::new(coverage_ds))
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert!(
+            TableStore::has_unindexed_fragments(&coverage_ds)
+                .await
+                .unwrap(),
+            "fixture must expose per-segment partial coverage for {column}"
+        );
+        assert_eq!(
+            TableStore::has_foldable_unindexed_fragments(&coverage_ds)
+                .await
+                .unwrap(),
+            expected_work,
+            "scalar union coverage must not suppress vector rebalance candidacy on {column}"
+        );
+    }
 }
 
 /// Saved v10 postings demonstrate the real cross-version false-negative bug;

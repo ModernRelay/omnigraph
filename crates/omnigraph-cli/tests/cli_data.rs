@@ -757,6 +757,12 @@ fn optimize_json_succeeds_on_local_graph() {
     ));
     assert_eq!(rebuilt["branch"], "main");
     assert_eq!(
+        rebuilt["warnings"],
+        serde_json::json!([
+            "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced."
+        ])
+    );
+    assert_eq!(
         rebuilt["rebuilt_indexes"],
         serde_json::json!([
             {"type_key": "node:Company", "property": "name"},
@@ -776,13 +782,19 @@ fn optimize_json_succeeds_on_local_graph() {
     let main_after = resolved_snapshot_id(&graph, "main");
     assert_eq!(main_after, commit_id);
     let feature_before = resolved_snapshot_id(&graph, "search-upgrade");
-    let human = stdout_string(&output_success(
+    let human_output = output_success(
         cli()
             .arg("rebuild-full-text-indexes")
             .arg("--store")
             .arg(&graph)
             .args(["--branch", "search-upgrade"]),
-    ));
+    );
+    let human = stdout_string(&human_output);
+    let stderr = String::from_utf8(human_output.stderr).unwrap();
+    assert!(
+        stderr.contains("warning: Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced."),
+        "{stderr}"
+    );
     assert!(
         human.contains("branch search-upgrade, 2 indexes rebuilt"),
         "{human}"
@@ -977,9 +989,11 @@ fn rebuild_full_text_indexes_json_noops_without_full_text_properties() {
     assert_eq!(rebuilt["branch"], "main");
     assert_eq!(rebuilt["graph_commit_id"], Value::Null);
     assert_eq!(rebuilt["rebuilt_indexes"], serde_json::json!([]));
-    let human = stdout_string(&output_success(
-        cli().arg("rebuild-full-text-indexes").arg(&graph),
-    ));
+    assert_eq!(rebuilt["warnings"], serde_json::json!([]));
+    let human_output = output_success(cli().arg("rebuild-full-text-indexes").arg(&graph));
+    let human = stdout_string(&human_output);
+    let stderr = String::from_utf8(human_output.stderr).unwrap();
+    assert!(!stderr.contains("custom tokenizer settings"), "{stderr}");
     assert!(
         human.contains("no-op; no graph commit published"),
         "{human}"

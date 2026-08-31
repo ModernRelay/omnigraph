@@ -1363,11 +1363,19 @@ async fn main() -> Result<()> {
             let result = db
                 .rebuild_full_text_indices_on_as(&branch, actor.as_deref())
                 .await?;
+            let warnings = if result.rebuilt_indexes.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.",
+                ]
+            };
             if json {
                 print_json(&serde_json::json!({
                     "uri": uri,
                     "branch": result.branch,
                     "graph_commit_id": result.graph_commit_id,
+                    "warnings": warnings,
                     "rebuilt_indexes": result.rebuilt_indexes.iter().map(|index| {
                         serde_json::json!({
                             "type_key": index.type_key,
@@ -1376,6 +1384,9 @@ async fn main() -> Result<()> {
                     }).collect::<Vec<_>>(),
                 }))?;
             } else {
+                for warning in &warnings {
+                    eprintln!("warning: {warning}");
+                }
                 println!(
                     "rebuild-full-text-indexes {} — branch {}, {} indexes rebuilt",
                     uri,

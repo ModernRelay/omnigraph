@@ -301,7 +301,10 @@ async fn maintain_indices_for_branch(
             IndexMaintenanceMode::Ensure => plan_index_work_edge_on_dataset(db, &ds).await?,
             IndexMaintenanceMode::RebuildFullText => {
                 let edge = &catalog.edge_types[edge_name];
-                plan_full_text_rebuild(&table_key, &edge.properties, &edge.indices, &ds).await?
+                // Ensure only builds edge id/src/dst BTREEs; edge declarations
+                // must not introduce FTS during migration. Existing physical
+                // edge FTS inventory is still replaced for SDK reads.
+                plan_full_text_rebuild(&table_key, &edge.properties, &[], &ds).await?
             }
         };
         if work.needs_commit() {
@@ -846,9 +849,15 @@ async fn plan_full_text_rebuild(
     // rebuilt. Validate the unfiltered manifest before accepting that view.
     for index in &raw_indexes {
         if index.index_details.is_none() {
+            // Supported engine-created v6 indexes (Lance 9/10) carry kind
+            // metadata. Older/external unknown-kind artifacts are outside this
+            // automatic rebuild: guessing from a text declaration could drop a
+            // BTREE companion instead of replacing full-text postings.
             return Err(OmniError::manifest(format!(
                 "cannot rebuild full-text indexes on {}: index '{}' has no index-kind \
-                 metadata, so its full-text inventory cannot be proven; no indexes were published",
+                 metadata, outside the supported automatic upgrade; see \
+                 docs/user/operations/upgrade.md#unsupported-index-inventory for a controlled \
+                 export/import rebuild; no indexes were published",
                 dataset_subject(table_key),
                 index.name,
             )));
@@ -1640,13 +1649,10 @@ pub(super) async fn reopen_for_mutation(
     }
 }
 
-/// A declared index the builder could not materialize on this pass. Today the
-/// only such case is a vector (IVF) property with no trainable vectors yet
-/// (KMeans needs >=1 vector), e.g. the load-before-embed window. Reported, not
-/// fatal: a later `ensure_indices`/`optimize` retries once the property is
-/// buildable, and reads stay correct via brute-force meanwhile. Surfacing
-/// pending index *status* rather than failing the operation is the database
-/// norm (Postgres `indisvalid`, LanceDB `list_indices`).
+/// Index work deferred on this pass. A vector property without trainable
+/// vectors can be retried once populated; an existing full-text index with
+/// incomplete coverage requires explicit rebuilding. `reason` names the remedy.
+/// Reads retain their unindexed fallback; this status alone is not a write.
 #[derive(Debug, Clone)]
 pub struct PendingIndex {
     pub type_key: String,

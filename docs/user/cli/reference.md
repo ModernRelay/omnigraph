@@ -55,6 +55,7 @@ token.
 | `schema plan` | Preview a schema migration | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
 | `optimize` | Compact data and reconcile declared indexes | direct |
+| `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
 | `repair` | Preview or publish classified storage drift | direct |
 | `cleanup` | Delete old versions under an explicit retention policy | direct |
 | `graphs list` | List graphs on a server | served |
@@ -69,6 +70,9 @@ token.
 
 The [CLI guide](index.md) gives end-to-end examples. Maintenance safety is
 covered in [Maintenance](../operations/maintenance.md).
+`rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
+`--as` for actor attribution. Direct maintenance does not load server policy;
+see the [rebuild procedure](../operations/maintenance.md#rebuild-full-text-indexes).
 
 ## Query inputs and output
 

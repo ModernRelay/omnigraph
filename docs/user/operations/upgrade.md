@@ -21,20 +21,41 @@ history. It changes the English stemmer used by full-text search. Old indexes
 cannot safely be searched by the new analyzer, so OmniGraph explicitly refuses
 full-text queries until the selected indexes have been rebuilt.
 
-1. Stop all old readers and writers and preserve a verified backup.
-2. Upgrade the CLI and the entire serving fleet together; do not serve with a
-   mixture of Lance 10 and Lance 11 binaries.
-3. With overlapping writers stopped, rebuild each live branch that needs search:
+1. Stop application readers and writers. Using the old CLI, inventory the live
+   branches and record which need full-text search, including `main`:
 
    ```bash
-   omnigraph rebuild-full-text-indexes ./graph.omni --branch main --json
-   omnigraph rebuild-full-text-indexes ./graph.omni --branch review --json
+   old-omnigraph branch list --store ./graph.omni --json
    ```
 
-4. Verify representative searches and entity counts before resuming service.
+2. Preserve and verify a backup of the **entire graph root**: metadata, branch
+   references, history, data, and indexes. A single branch's JSONL export is not
+   a rollback backup. For a cluster-managed graph, the root is
+   `<cluster-root>/graphs/<graph-id>.omni`; retain the deployment bundle and
+   configuration too. Keep any externally referenced storage available.
+3. Upgrade the CLI and the entire serving fleet together, leaving application
+   traffic stopped. Do not mix Lance 10 and Lance 11 readers or writers.
+4. Use the new operator CLI to rebuild each branch on the inventory checklist:
+
+   ```bash
+   omnigraph rebuild-full-text-indexes ./graph.omni --branch main --as operator --json
+   omnigraph rebuild-full-text-indexes ./graph.omni --branch review --as operator --json
+   ```
+
+   `--as` is optional actor attribution, not server-policy authorization. Inspect
+   `branch`, `graph_commit_id`, `rebuilt_indexes`, and `warnings`. A successful
+   non-empty rebuild publishes all planned indexes on that branch in one graph
+   commit. An empty index list with a null commit means no work was needed; it
+   does not mean other branches or historical snapshots were migrated.
+
+   Rebuilding replaces custom tokenizer settings with the default English
+   analyzer and reports that warning. See [maintenance](maintenance.md#rebuild-full-text-indexes).
+
+5. Verify representative searches and entity counts before resuming service.
    Include words affected by stemming, such as `organism` and `university`.
-5. Keep the backup for rollback. An old binary must not serve newly rebuilt
-   indexes; roll back by restoring the old backup with the old fleet.
+6. Keep the backup for rollback. Old binaries can silently miss matches in newly
+   rebuilt indexes; roll back by restoring the whole pre-upgrade backup with
+   the old fleet, not by pointing an old binary at the upgraded store.
 
 Ordinary reads, traversal, and vector search remain available without the
 full-text rebuild. Historical snapshots are unchanged and may refuse full-text
@@ -42,6 +63,20 @@ search. To search old content, create a live branch from the desired snapshot
 and rebuild that branch. Restoring an old snapshot may require another rebuild.
 The operation is explicit and can be expensive on large graphs; `optimize` is
 not a replacement for this migration.
+
+### Unsupported index inventory
+
+Automatic full-text rebuilding supports engine-created v6 indexes from Lance
+9/10 with recorded index-kind metadata. If legacy or externally created
+inventory does not identify its physical index kind, the command refuses before
+publishing any index changes. It cannot safely guess whether an unknown index
+is full-text, scalar, or vector; repeating the command does not fix this.
+
+Use compatible old tooling for a controlled export/import into a new graph root,
+or restore a trusted backup with supported inventory. Export/import preserves
+entities but not shared branch ancestry or history, as described below. Keep the
+source intact until verification and cutover; do not drop unknown indexes or
+edit their metadata to bypass the refusal.
 
 ## What an export/import rebuild preserves
 
@@ -71,7 +106,7 @@ mapping is:
 | v3 | latest 0.7.x |
 | v4 | latest 0.8.x |
 | v5 | the exact unreleased development build that wrote it |
-| v6 | current 0.9.x–0.10.x line; no entity export/import within this generation |
+| v6 | current 0.9.x–0.10.x line; entity export/import normally not required within this generation |
 
 If the graph's generation is newer than the binary, upgrade the binary rather
 than rebuilding with it.

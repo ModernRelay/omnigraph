@@ -932,6 +932,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "CommitOutput",
     "ErrorCode",
     "ErrorOutput",
+    "FullTextIndexRebuildRequiredOutput",
     "EntityKindOutput",
     "ChangeFeedGapOutput",
     "ChangeOpOutput",
@@ -1218,6 +1219,44 @@ fn error_output_schema_has_expected_fields() {
     assert!(props.contains_key("external_blob_source"));
     assert!(props.contains_key("recovery_required"));
     assert!(props.contains_key("precondition_failure"));
+    let full_text = &props["full_text_index_rebuild_required"];
+    assert!(full_text["oneOf"].as_array().unwrap().iter().any(|schema| {
+        schema["$ref"] == "#/components/schemas/FullTextIndexRebuildRequiredOutput"
+    }));
+    assert!(
+        !schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "full_text_index_rebuild_required")
+    );
+    let details = &doc["components"]["schemas"]["FullTextIndexRebuildRequiredOutput"];
+    let required: HashSet<&str> = details["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap())
+        .collect();
+    assert_eq!(required, HashSet::from(["index", "reason"]));
+    for path in [
+        "/graphs/{graph_id}/query",
+        "/graphs/{graph_id}/read",
+        "/graphs/{graph_id}/queries/{name}",
+    ] {
+        let response = &doc["paths"][path]["post"]["responses"]["409"];
+        assert_eq!(
+            response["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "{path} must declare the full-text rebuild refusal"
+        );
+        assert!(
+            response["description"]
+                .as_str()
+                .unwrap()
+                .contains("full_text_index_rebuild_required"),
+            "{path} must identify the nonretryable full-text condition"
+        );
+    }
 }
 
 #[test]

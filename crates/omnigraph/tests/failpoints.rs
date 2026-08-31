@@ -8174,9 +8174,9 @@ async fn optimize_post_manifest_failure_finalizes_multi_table_v2_sidecar() {
 }
 
 /// Pending-only index intent is status, not a physical effect. An untrainable
-/// vector table beside a productive sibling must be reported but excluded from
-/// the shared Optimize sidecar; otherwise its NoMovement classification would
-/// spuriously roll back the sibling after a crash.
+/// vector table and its deferred full-text tail beside a productive sibling
+/// must be reported but excluded from the shared Optimize sidecar; otherwise
+/// NoMovement would spuriously roll back the sibling's maintenance after a crash.
 #[tokio::test]
 #[serial(optimize)]
 async fn optimize_excludes_pending_only_vector_table_from_v2_sidecar() {
@@ -8210,8 +8210,24 @@ node Embedding {
             .any(|index| { index.type_key == "node:Embedding" && index.property == "vector" }),
         "fixture must leave the null vector index pending"
     );
-    // Fixed productive tail on Work only; Embedding stays a one-fragment table
-    // whose buildable indexes are current and whose vector remains pending-only.
+    load_jsonl(
+        &db,
+        r#"{"type":"Embedding","data":{"name":"e1","vector":null}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.optimize().await.unwrap();
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let embedding = snapshot.open_dataset("node:Embedding").await.unwrap();
+    assert!(embedding.has_unindexed_fragments().await.unwrap());
+    assert_eq!(
+        embedding.index_coverage("id").await.unwrap(),
+        omnigraph::IndexCoverage::Indexed,
+        "only the excluded FTS tail and untrainable vector may remain"
+    );
+    // Fixed productive tail on Work only; Embedding's buildable indexes are
+    // current, while its vector and FTS tail both remain deferred-only.
     for name in ["w1", "w2", "w3", "w4"] {
         load_jsonl(
             &db,
@@ -8254,6 +8270,12 @@ node Embedding {
             .iter()
             .any(|index| index.property == "vector"),
         "pending-only vector status must remain visible"
+    );
+    assert!(
+        embedding.pending_indexes.iter().any(|index| {
+            index.property == "name" && index.reason.contains("rebuild-full-text-indexes")
+        }),
+        "the deferred FTS tail must name its explicit rebuild remedy"
     );
 }
 

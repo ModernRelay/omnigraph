@@ -34,8 +34,8 @@ use lance::dataset::{
     WriteMode, WriteParams,
 };
 use lance::datatypes::Schema as LanceSchema;
-use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::{
     datatypes::BlobHandling,
     utils::{
@@ -2223,14 +2223,13 @@ impl TableStore {
     /// True if any non-system index on `ds` leaves at least one current
     /// fragment uncovered, i.e. rows that the index does not yet account for
     /// (appended after the index was built, or rewritten by compaction). Such
-    /// fragments are scanned unindexed until a reindex (`optimize_indices`)
-    /// folds them in. Returns false when every index covers every fragment, or
+    /// fragments are scanned unindexed until index maintenance covers them
+    /// (full-text requires explicit rebuilding). Returns false when every index covers every fragment, or
     /// when the table has no (non-system) indices to optimize. A `None`
     /// `fragment_bitmap` means Lance cannot report coverage for that index, so
     /// we do not treat it as uncovered (mirrors `key_column_index_coverage`).
     ///
-    /// Used by `optimize` to decide whether an otherwise-already-compacted
-    /// table still has index work to do.
+    /// This reports physical coverage, not whether ordinary optimize can fix it.
     pub async fn has_unindexed_fragments(ds: &Dataset) -> Result<bool> {
         let indices = ds.load_indices().await.map_err(OmniError::storage)?;
         let frag_ids: Vec<u32> = ds.fragments().iter().map(|f| f.id as u32).collect();
@@ -2242,6 +2241,57 @@ impl TableStore {
                 if frag_ids.iter().any(|id| !bitmap.contains(*id)) {
                     return Ok(true);
                 }
+            }
+        }
+        Ok(false)
+    }
+
+    /// One eligibility rule for optimize planning and execution. Full-text
+    /// folding cannot establish analyzer proof; unknown kinds cannot be planned.
+    pub(crate) fn can_fold_index(index: &IndexMetadata) -> bool {
+        !is_system_index(index) && index.index_details.is_some() && !Self::is_full_text_index(index)
+    }
+
+    /// Coverage candidates for ordinary optimize. Scalar segments use Lance's
+    /// per-name union: collectively complete coverage is a scalar no-op.
+    /// Vectors retain per-segment candidacy because default optimize can
+    /// rebalance a partition even when the segment union covers every fragment.
+    pub(crate) async fn has_foldable_unindexed_fragments(ds: &Dataset) -> Result<bool> {
+        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+        let mut names = std::collections::BTreeSet::new();
+        for index in indices.iter().filter(|index| Self::can_fold_index(index)) {
+            if index
+                .index_details
+                .as_ref()
+                .is_some_and(|details| IndexDetails(details.clone()).is_vector())
+            {
+                if index.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                    ds.fragments()
+                        .iter()
+                        .any(|fragment| !bitmap.contains(fragment.id as u32))
+                }) {
+                    return Ok(true);
+                }
+            } else {
+                names.insert(index.name.as_str());
+            }
+        }
+        for name in names {
+            // As on the public coverage surface, unknown coverage is not
+            // evidence of work. Such legacy inventory needs explicit handling.
+            if indices
+                .iter()
+                .any(|index| index.name == name && index.fragment_bitmap.is_none())
+            {
+                continue;
+            }
+            if !ds
+                .unindexed_fragments(name)
+                .await
+                .map_err(OmniError::storage)?
+                .is_empty()
+            {
+                return Ok(true);
             }
         }
         Ok(false)

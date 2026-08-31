@@ -135,17 +135,22 @@ Every full-text segment used by a query must carry OmniGraph's artifact-scoped
 analyzer certificate. The certificate is bound to the immutable UUID, index
 details, and file inventory, not the current dataset writer or graph head.
 Missing or unrecognized proof produces `FullTextIndexRebuildRequired` before
-execution. Ordinary reads do not inspect these certificates.
+execution. Successful immutable proof uses Lance's bounded session metadata
+cache; failures are not cached. Ordinary reads do not inspect these certificates.
 
 The full builder writes proof before the existing CreateIndex publication;
 public object-store/base-path resolution and native garbage collection own the
-bounded JSON file. Stable-ID
+bounded JSON file. Directory placement mirrors Lance's private helper and is
+guarded against independently written native index files. Stable-ID
 compaction preserves proof. Ordinary optimize excludes incremental full-text
 folding, which lacks an uncommitted provenance hook; uncovered rows remain
-searchable until an explicit rebuild. Other index maintenance is unchanged.
+searchable until an explicit rebuild. Planning and execution share the same
+foldable-index predicate; pending full-text coverage alone is not recovery work.
+Other index maintenance is unchanged.
 
-Lance and frostem versions are exact pins. Any change needs a compatibility
-audit before keeping or changing the certificate generation. See
+The audited analyzer dependency set has exact pins and a resolved-lockfile guard.
+Any change needs a compatibility audit before keeping or changing the certificate
+generation. See
 [RFC 0043](../rfcs/0043-full-text-index-compatibility.md) for the decision and
 [the operator procedure](../user/operations/upgrade.md#full-text-index-upgrade).
 

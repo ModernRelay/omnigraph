@@ -642,6 +642,7 @@ gateway_surfaces! {
         "predicted_materialized_blob_batch_bytes",
         "materialize_blob_batch_bounded_with_preflight_cache",
         "validate_full_text_scan", "is_full_text_index",
+        "can_fold_index", "has_foldable_unindexed_fragments",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
@@ -847,7 +848,9 @@ durable_calls! {
     ("changes/mod.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
-    ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),
+    // The sixth accessor reports deferred FTS coverage from an immutable
+    // snapshot; it only reads index metadata and never stages or publishes.
+    ("db/omnigraph/optimize.rs", ".dataset()", 6, WriteProtocol::Composed("Optimize v9 planning + read-only coverage status + physical cleanup")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
