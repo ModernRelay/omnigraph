@@ -213,20 +213,53 @@ return { $p.name }
 #[test]
 fn test_t3_undeclared_variable_in_match_is_rejected() {
     let catalog = setup();
-    let qf = parse_query(
-        r#"
+    for (query, variable) in [
+        (
+            r#"
 query q() {
 match { $p: Person { age: $missing } }
 return { $p.name }
 }
 "#,
-    )
-    .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("match variable `$missing` must be a declared query parameter")
-    );
+            "missing",
+        ),
+        (
+            r#"
+query q() {
+match {
+    $p: Person
+    not {
+        $p knows $friend
+        $friend: Person { age: $missing }
+    }
+}
+return { $p.name }
+}
+"#,
+            "missing",
+        ),
+        (
+            r#"
+query q() {
+match {
+    $other: Person
+    $p: Person { name: $other }
+}
+return { $p.name }
+}
+"#,
+            "other",
+        ),
+    ] {
+        let qf = parse_query(query).unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "match variable `${variable}` must be a declared query parameter"
+            )),
+            "unexpected error for {query}: {err}"
+        );
+    }
 }
 
 #[test]
