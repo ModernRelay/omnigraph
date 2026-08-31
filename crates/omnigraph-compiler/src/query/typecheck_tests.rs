@@ -211,6 +211,25 @@ return { $p.name }
 }
 
 #[test]
+fn test_t3_undeclared_variable_in_match_is_rejected() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match { $p: Person { age: $missing } }
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("match variable `$missing` must be a declared query parameter")
+    );
+}
+
+#[test]
 fn test_list_membership_match_accepts_scalar_literal() {
     let catalog = setup_list();
     let qf = parse_query(
