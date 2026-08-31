@@ -14,6 +14,8 @@
 //! `OMNIGRAPH_V5_BIN` (built from the final internal-v5 commit) and proves both
 //! directions of the v5/v6 format fence. Each case skips only when its variable
 //! is unset; a set but invalid path fails loudly.
+//! `OMNIGRAPH_V09_BIN` selects the released v0.9 CLI for the in-place v6
+//! upgrade journey, including full-text rebuilding and current HTTP serving.
 
 mod support;
 
@@ -588,4 +590,476 @@ fn current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6() {
             || reverse_stderr.contains("expects v5"),
         "unexpected v5→v6 reverse-refusal message: {reverse_stderr}",
     );
+}
+
+#[test]
+fn current_v010_upgrades_genuine_v09_graph_end_to_end() {
+    use reqwest::blocking::Client;
+    use serde_json::{Value, json};
+    use std::fs;
+    use support::{copy_dir, parse_stdout_json, resolved_snapshot_id, spawn_server_with_cluster};
+
+    let Some(old) = std::env::var_os("OMNIGRAPH_V09_BIN").map(PathBuf::from) else {
+        eprintln!("skipping v0.9 upgrade e2e: OMNIGRAPH_V09_BIN is unset");
+        return;
+    };
+    let version = run_old(&old, &["version"]);
+    assert_ok("version", &version);
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).lines().next(),
+        Some("omnigraph 0.9.0"),
+        "the predecessor must be the released v0.9.0 binary"
+    );
+
+    // Extend the existing search fixture, retaining its vector values, with
+    // real edges and a Blob. All persisted state is minted by the old CLI.
+    let temp = tempdir().unwrap();
+    let cluster = temp.path().join("cluster");
+    fs::create_dir(&cluster).unwrap();
+    let schema = cluster.join("graph.pg");
+    fs::write(
+        &schema,
+        format!(
+            "{}\nedge Cites: Doc -> Doc {{ note: String }}\n\
+             node BinaryAsset {{ name: String @key payload: Blob }}\n",
+            fs::read_to_string(fixture("search.pg")).unwrap()
+        ),
+    )
+    .unwrap();
+    let queries = cluster.join("queries.gq");
+    let query_source = r#"
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.body, $d.embedding }
+    order { $d.slug }
+}
+query edges() {
+    match { $a: Doc $a $c:cites $b }
+    return { $a.slug, $b.slug, $c.note }
+}
+query terms($term: String) {
+    match { $d: Doc search($d.title, $term) }
+    return { $d.slug }
+    order { $d.slug }
+}
+query ranked($term: String) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { bm25($d.title, $term) }
+    limit 10
+}
+query vectors($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 1
+}
+query retitle($title: String) { update Doc set { title: $title } where slug = "ml-intro" }
+query revise($body: String) { update Doc set { body: $body } where slug = "dl-basics" }
+"#;
+    fs::write(&queries, query_source).unwrap();
+    fs::write(
+        cluster.join("cluster.yaml"),
+        "version: 1\nstate: { backend: cluster, lock: true }\ngraphs:\n  knowledge:\n    schema: graph.pg\n    queries: [queries.gq]\n",
+    )
+    .unwrap();
+    let seed = temp.path().join("seed.jsonl");
+    fs::write(
+        &seed,
+        format!(
+            "{}\n{}\n{}\n",
+            fs::read_to_string(fixture("search.jsonl")).unwrap().trim_end(),
+            r#"{"edge":"Cites","from":"ml-intro","to":"dl-basics","data":{"id":"citation-1","note":"organism citation"}}"#,
+            r#"{"type":"BinaryAsset","data":{"name":"blob-sentinel","payload":"base64:AAECA/8="}}"#,
+        ),
+    )
+    .unwrap();
+    let graph = cluster.join("graphs/knowledge.omni");
+    let uri = graph.to_str().unwrap();
+    let query_path = queries.to_str().unwrap();
+    assert_ok(
+        "lint",
+        &run_old(
+            &old,
+            &[
+                "lint",
+                "--schema",
+                schema.to_str().unwrap(),
+                "--query",
+                query_path,
+            ],
+        ),
+    );
+    for operation in ["import", "plan", "apply"] {
+        assert_ok(
+            operation,
+            &run_old(
+                &old,
+                &["cluster", operation, "--config", cluster.to_str().unwrap()],
+            ),
+        );
+    }
+    assert_ok(
+        "load",
+        &run_old(
+            &old,
+            &[
+                "load",
+                "--mode",
+                "overwrite",
+                "--data",
+                seed.to_str().unwrap(),
+                uri,
+            ],
+        ),
+    );
+    assert_ok(
+        "retitle",
+        &run_old(
+            &old,
+            &[
+                "mutate",
+                "retitle",
+                "--query",
+                query_path,
+                "--store",
+                uri,
+                "--params",
+                r#"{"title":"organism baseline"}"#,
+            ],
+        ),
+    );
+    assert_ok("optimize", &run_old(&old, &["optimize", uri]));
+    assert_ok(
+        "branch create",
+        &run_old(&old, &["branch", "create", "review", "--uri", uri]),
+    );
+    assert_ok(
+        "branch retitle",
+        &run_old(
+            &old,
+            &[
+                "mutate",
+                "retitle",
+                "--query",
+                query_path,
+                "--store",
+                uri,
+                "--branch",
+                "review",
+                "--params",
+                r#"{"title":"organism branch"}"#,
+            ],
+        ),
+    );
+
+    let exports: Vec<_> = ["main", "review"]
+        .into_iter()
+        .map(|branch| {
+            let out = run_old(&old, &["export", uri, "--branch", branch]);
+            assert_ok("export", &out);
+            // Five documents, one edge, and one Blob-bearing node.
+            assert_eq!(nonblank_lines(&out.stdout), 7);
+            let search = run_old(
+                &old,
+                &[
+                    "query",
+                    "terms",
+                    "--query",
+                    query_path,
+                    "--store",
+                    uri,
+                    "--branch",
+                    branch,
+                    "--params",
+                    r#"{"term":"organism"}"#,
+                    "--json",
+                ],
+            );
+            assert_ok("old full-text search", &search);
+            assert_eq!(
+                parse_stdout_json(&search)["rows"],
+                json!([{ "d.slug": "ml-intro" }])
+            );
+            out.stdout
+        })
+        .collect();
+    let backup = temp.path().join("backup");
+    copy_dir(&cluster, &backup);
+    let original_heads: Vec<_> = ["main", "review"]
+        .into_iter()
+        .map(|branch| {
+            let commits = run_old(&old, &["commit", "list", uri, "--branch", branch, "--json"]);
+            assert_ok("old commit history", &commits);
+            parse_stdout_json(&commits)["commits"][0]["graph_commit_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+
+    // The current binary opens v6 directly: no export/import or schema migration.
+    output_success(
+        cli()
+            .args(["lint", "--schema"])
+            .arg(&schema)
+            .arg("--query")
+            .arg(&queries),
+    );
+    for (i, branch) in ["main", "review"].into_iter().enumerate() {
+        assert_eq!(resolved_snapshot_id(&graph, branch), original_heads[i]);
+    }
+    let query_command = |target: &[&str], branch: &str, name: &str, params: &str| {
+        let mut command = cli();
+        command
+            .args([
+                "query", name, "--query", query_path, "--branch", branch, "--params", params,
+                "--json",
+            ])
+            .args(target);
+        command
+    };
+    let direct = ["--store", uri];
+    let vector_params = r#"{"q":[0.1,0.2,0.3,0.4]}"#;
+    let term_params = r#"{"term":"organism"}"#;
+    for (i, branch) in ["main", "review"].into_iter().enumerate() {
+        let exported = output_success(cli().args(["export", uri, "--branch", branch]));
+        assert_eq!(
+            canonical_export_rows(&exported.stdout),
+            canonical_export_rows(&exports[i])
+        );
+        let docs = parse_stdout_json(&output_success(&mut query_command(
+            &direct, branch, "docs", "{}",
+        )));
+        assert_eq!(docs["row_count"], 5);
+        let edges = parse_stdout_json(&output_success(&mut query_command(
+            &direct, branch, "edges", "{}",
+        )));
+        assert_eq!(
+            edges["rows"],
+            json!([{ "a.slug":"ml-intro", "b.slug":"dl-basics", "c.note":"organism citation" }])
+        );
+        let nearest = parse_stdout_json(&output_success(&mut query_command(
+            &direct,
+            branch,
+            "vectors",
+            vector_params,
+        )));
+        assert_eq!(nearest["rows"], json!([{ "d.slug":"ml-intro" }]));
+        for name in ["terms", "ranked"] {
+            let failure = output_failure(&mut query_command(&direct, branch, name, term_params));
+            assert!(String::from_utf8_lossy(&failure.stderr).contains("rebuild-full-text-indexes"));
+        }
+        assert_eq!(resolved_snapshot_id(&graph, branch), original_heads[i]);
+    }
+
+    // Boot the new server on the old cluster catalog. A refusal is a typed
+    // 409, not a plausible empty result, and must leave both heads unchanged.
+    let client = Client::new();
+    let server = spawn_server_with_cluster(&cluster);
+    for branch in ["main", "review"] {
+        let response = client.post(format!("{}/graphs/knowledge/query", server.base_url))
+            .json(&json!({"query":query_source,"name":"terms","params":{"term":"organism"},"branch":branch})).send().unwrap();
+        assert_eq!(response.status(), 409);
+        let error: Value = response.json().unwrap();
+        assert!(
+            error["full_text_index_rebuild_required"].is_object(),
+            "{error}"
+        );
+    }
+    drop(server);
+    for (i, branch) in ["main", "review"].into_iter().enumerate() {
+        assert_eq!(resolved_snapshot_id(&graph, branch), original_heads[i]);
+    }
+
+    // Maintenance runs with serving stopped. Rebuilding main cannot certify
+    // its old snapshot or the independently written branch's old segments.
+    for (i, branch) in ["main", "review"].into_iter().enumerate() {
+        let rebuilt = parse_stdout_json(&output_success(cli().args([
+            "rebuild-full-text-indexes",
+            uri,
+            "--branch",
+            branch,
+            "--json",
+        ])));
+        assert_eq!(
+            rebuilt["rebuilt_indexes"],
+            json!([
+                {"type_key":"node:BinaryAsset", "property":"name"},
+                {"type_key":"node:Doc", "property":"body"},
+                {"type_key":"node:Doc", "property":"slug"},
+                {"type_key":"node:Doc", "property":"title"},
+            ])
+        );
+        assert_eq!(rebuilt["branch"], branch);
+        assert_eq!(
+            rebuilt["graph_commit_id"],
+            resolved_snapshot_id(&graph, branch)
+        );
+        assert_ne!(rebuilt["graph_commit_id"], original_heads[i]);
+        assert_eq!(
+            canonical_export_rows(
+                &output_success(cli().args(["export", uri, "--branch", branch])).stdout
+            ),
+            canonical_export_rows(&exports[i])
+        );
+        if branch == "main" {
+            assert_eq!(resolved_snapshot_id(&graph, "review"), original_heads[1]);
+            output_failure(&mut query_command(&direct, "review", "terms", term_params));
+        }
+        let old_search = output_failure(cli().args([
+            "query",
+            "terms",
+            "--query",
+            query_path,
+            "--store",
+            uri,
+            "--snapshot",
+            &original_heads[i],
+            "--params",
+            term_params,
+        ]));
+        assert!(String::from_utf8_lossy(&old_search.stderr).contains("rebuild-full-text-indexes"));
+    }
+
+    let server = spawn_server_with_cluster(&cluster);
+    let remote = ["--server", server.base_url.as_str(), "--graph", "knowledge"];
+    for branch in ["main", "review"] {
+        for (name, params) in [
+            ("docs", "{}"),
+            ("edges", "{}"),
+            ("terms", term_params),
+            ("ranked", term_params),
+            ("vectors", vector_params),
+        ] {
+            let local = parse_stdout_json(&output_success(&mut query_command(
+                &direct, branch, name, params,
+            )));
+            let served = parse_stdout_json(&output_success(&mut query_command(
+                &remote, branch, name, params,
+            )));
+            assert_eq!(served["rows"], local["rows"], "{branch}/{name}");
+            if matches!(name, "terms" | "ranked" | "vectors") {
+                assert_eq!(served["rows"], json!([{ "d.slug":"ml-intro" }]));
+            }
+        }
+        for target in [&direct[..], &remote[..]] {
+            let blob = output_success(
+                cli()
+                    .args([
+                        "blob",
+                        "get",
+                        "node",
+                        "BinaryAsset",
+                        "blob-sentinel",
+                        "payload",
+                        "--branch",
+                        branch,
+                    ])
+                    .args(target),
+            );
+            assert_eq!(blob.stdout, [0, 1, 2, 3, 255]);
+        }
+    }
+    // Exercise new writes and graph merge through HTTP, then reopen the server.
+    let before = resolved_snapshot_id(&graph, "review");
+    let change = parse_stdout_json(&output_success(
+        cli()
+            .args([
+                "mutate",
+                "revise",
+                "--query",
+                query_path,
+                "--branch",
+                "review",
+                "--params",
+                r#"{"body":"verified after upgrade"}"#,
+                "--json",
+            ])
+            .args(remote),
+    ));
+    assert_eq!(change["affected_nodes"], 1);
+    assert_ne!(resolved_snapshot_id(&graph, "review"), before);
+    output_success(
+        cli()
+            .args(["branch", "merge", "review", "--into", "main", "--json"])
+            .args(remote),
+    );
+    let expected = parse_stdout_json(&output_success(&mut query_command(
+        &remote, "main", "docs", "{}",
+    )))["rows"]
+        .clone();
+    assert!(
+        expected
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["d.slug"] == "dl-basics" && row["d.body"] == "verified after upgrade")
+    );
+    assert!(
+        expected
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["d.slug"] == "ml-intro" && row["d.title"] == "organism branch")
+    );
+    drop(server);
+    let reopened = spawn_server_with_cluster(&cluster);
+    let remote = [
+        "--server",
+        reopened.base_url.as_str(),
+        "--graph",
+        "knowledge",
+    ];
+    assert_eq!(
+        parse_stdout_json(&output_success(&mut query_command(
+            &remote, "main", "docs", "{}"
+        )))["rows"],
+        expected
+    );
+    assert_eq!(
+        parse_stdout_json(&output_success(&mut query_command(
+            &remote,
+            "main",
+            "terms",
+            term_params
+        )))["rows"],
+        json!([{ "d.slug":"ml-intro" }])
+    );
+    drop(reopened);
+
+    // Rollback means restoring the quiescent backup at its original path,
+    // never asking the old binary to interpret newly rebuilt postings.
+    fs::rename(&cluster, temp.path().join("upgraded")).unwrap();
+    copy_dir(&backup, &cluster);
+    for (i, branch) in ["main", "review"].into_iter().enumerate() {
+        let restored = run_old(&old, &["export", uri, "--branch", branch]);
+        assert_ok("restored old export", &restored);
+        assert_eq!(
+            canonical_export_rows(&restored.stdout),
+            canonical_export_rows(&exports[i])
+        );
+        let search = run_old(
+            &old,
+            &[
+                "query",
+                "terms",
+                "--query",
+                query_path,
+                "--store",
+                uri,
+                "--branch",
+                branch,
+                "--params",
+                term_params,
+                "--json",
+            ],
+        );
+        assert_ok("restored old search", &search);
+        assert_eq!(
+            parse_stdout_json(&search)["rows"],
+            json!([{ "d.slug":"ml-intro" }])
+        );
+    }
+    eprintln!("v0.9 -> v0.10 upgrade e2e completed");
 }

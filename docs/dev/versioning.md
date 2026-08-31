@@ -9,7 +9,7 @@ version axes. Never derive one axis from another.
 | Axis | Policy | Guard |
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
-| CLI ↔ server wire | Additive and rolling-safe; no global version handshake. | Shared optional DTO fields and OpenAPI drift tests. |
+| CLI ↔ server wire | Prefer additive changes; documented breaking release boundaries require coordinated upgrades. No global version handshake. | Shared DTOs, OpenAPI drift tests, and release-specific migration guidance. |
 | Graph storage | Strict single version; rebuild across an incompatible change. | Main-manifest stamp with `MIN_SUPPORTED == CURRENT`. |
 | Recovery sidecar | Independently versioned persisted protocol. | Sidecar grammar/version refusal before classification. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
@@ -65,8 +65,8 @@ The operator procedure is documented in
 
 ## Wire compatibility
 
-CLI and server deployments may roll independently. Wire changes therefore stay
-additive:
+Prefer additive wire changes so compatible CLI and server releases can roll
+independently:
 
 - new request fields are optional or have a server-side default;
 - new response fields do not change existing field meaning;
@@ -74,7 +74,17 @@ additive:
   closed switches;
 - intentional API changes regenerate and commit `openapi.json`.
 
-Storage strictness is not a reason to add a wire-version gate.
+Do not infer wire compatibility from a shared graph-storage version. The
+v0.9/v0.10 boundary deliberately removes legacy graph-facing field names and
+public aliases; it is **not rolling-safe**. Upgrade CLI, server, and client
+integrations together according to the [v0.10 release notes](../releases/v0.10.0.md).
+The Lance 9/10 to 11 analyzer transition separately requires a quiesced fleet
+and explicit full-text rebuilds; see [the upgrade procedure](../user/operations/upgrade.md#full-text-index-upgrade).
+
+Future incompatible wire changes must identify the affected release boundary,
+document the consumer migration, and test fail-closed behavior where an older
+server could otherwise ignore a new write precondition. There is no global
+wire-version handshake; storage strictness is not a reason to add one.
 
 ## Registry publication status
 

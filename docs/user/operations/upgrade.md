@@ -1,4 +1,4 @@
-# Upgrade across a storage-format change
+# Upgrading OmniGraph
 
 OmniGraph intentionally supports one storage format per binary. When a release
 changes that format, the new binary refuses the old graph and tells you which
@@ -12,7 +12,21 @@ release line can export it. Upgrade by rebuilding at a new URI:
 
 Ordinary patch/minor upgrades that keep the same storage format do not require
 this export/import procedure. Derived indexes may still need rebuilding, as
-below. Check the [release notes](../../releases/) before upgrading.
+below, and CLI/API compatibility is independent of graph storage. Check the
+[release notes](../../releases/) before upgrading.
+
+## v0.9 to v0.10
+
+Released v0.9.0 uses Lance 9; v0.10.0 uses Lance 11. Both use graph storage
+format v6, so existing entities, branches, and retained history do not need an
+export/import migration. Development builds using Lance 10 follow the same
+full-text upgrade procedure below.
+
+The CLI/API vocabulary changes are not rolling-compatible. Update the CLI,
+server, and client integrations together, with application traffic stopped.
+Even without full-text indexes, do not run an old and new fleet against the
+same graph. Keep the old executables and a verified whole-root backup until the
+upgrade is proven. See the [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility).
 
 ## Full-text index upgrade
 
@@ -33,8 +47,10 @@ full-text queries until the selected indexes have been rebuilt.
    a rollback backup. For a cluster-managed graph, the root is
    `<cluster-root>/graphs/<graph-id>.omni`; retain the deployment bundle and
    configuration too. Keep any externally referenced storage available.
-3. Upgrade the CLI and the entire serving fleet together, leaving application
-   traffic stopped. Do not mix Lance 10 and Lance 11 readers or writers.
+3. Stop every old server, embedded writer, and maintenance process. Upgrade the
+   CLI and entire serving fleet together, leaving application traffic stopped.
+   Do not mix Lance 9/10 and Lance 11 readers or writers. Keep the server stopped
+   while the new direct-storage maintenance CLI rebuilds indexes.
 4. Use the new operator CLI to rebuild each branch on the inventory checklist:
 
    ```bash
@@ -51,16 +67,18 @@ full-text queries until the selected indexes have been rebuilt.
    Rebuilding replaces custom tokenizer settings with the default English
    analyzer and reports that warning. See [maintenance](maintenance.md#rebuild-full-text-indexes).
 
-5. Verify representative searches and entity counts before resuming service.
+5. Verify representative searches and entity counts on **every rebuilt branch**.
    Include words affected by stemming, such as `organism` and `university`.
+   Start only the new fleet, keeping application traffic stopped, and verify
+   CLI/API integrations against the new response fields before resuming traffic.
 6. Keep the backup for rollback. Old binaries can silently miss matches in newly
    rebuilt indexes; roll back by restoring the whole pre-upgrade backup with
    the old fleet, not by pointing an old binary at the upgraded store.
 
 Ordinary reads, traversal, and vector search remain available without the
 full-text rebuild. Historical snapshots are unchanged and may refuse full-text
-search. To search old content, create a live branch from the desired snapshot
-and rebuild that branch. Restoring an old snapshot may require another rebuild.
+search; rebuilding a live branch does not upgrade its earlier snapshots.
+Branch creation from a pinned historical snapshot is not supported.
 The operation is explicit and can be expensive on large graphs; `optimize` is
 not a replacement for this migration.
 
@@ -77,6 +95,24 @@ or restore a trusted backup with supported inventory. Export/import preserves
 entities but not shared branch ancestry or history, as described below. Keep the
 source intact until verification and cutover; do not drop unknown indexes or
 edit their metadata to bypass the refusal.
+
+### Cluster state and rollback
+
+Keep the pre-upgrade cluster deployment bundle, configuration, and state backup
+alongside the graph-root backups. A rollback restores that consistent set with
+the old executables; it does not point an old server at upgraded index files.
+
+If v0.10 applied an `external_blobs` policy and the cluster state itself is not
+being restored, v0.9 cannot read that new optional state field. While every
+writer is stopped, remove `external_blobs` from each graph's configuration,
+review `cluster plan`, and use the v0.10 `cluster apply` to converge the removal
+before starting v0.9. Editing only the YAML is insufficient; do not hand-edit
+the state ledger. This state-shape step does **not** replace restoring the
+pre-upgrade graph backup after full-text rebuilding.
+
+A downgrade also removes v0.10's default-deny external-URI enforcement: v0.9
+writers admitted arbitrary supported sources, including `file://`. Do not roll
+back to v0.9 if that ingress boundary is required.
 
 ## What an export/import rebuild preserves
 
