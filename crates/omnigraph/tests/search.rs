@@ -208,6 +208,52 @@ fn underfill_seed_data() -> String {
     rows.join("\n")
 }
 
+const STARVATION_RRF_QUERY: &str = r#"
+query recall_two_terms($q1: String, $q2: String) {
+    match {
+        $c: Chunk
+        $c chunkOfArtifact $a
+        search($c.text, $q1)
+    }
+    return { $c.slug }
+    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    limit 1
+}
+"#;
+
+/// Seven chunks with (alpha, beta) term frequencies, padded to 20 tokens each;
+/// only x, y, n carry an edge. Alpha ranks the four edge-less decoys above
+/// every eligible chunk; beta ranks n first. Fusing the COMPLETE rankings
+/// makes x the winner (strong in both arms: 1/61 + 1/62 beats n's
+/// 1/63 + 1/61 at k = 60); losing the alpha arm makes n win on beta alone.
+fn starvation_seed_data() -> String {
+    let mut rows = vec![r#"{"type":"Artifact","data":{"slug":"art-0"}}"#.to_string()];
+    let chunks: [(&str, usize, usize); 7] = [
+        ("decoy-1", 7, 1),
+        ("decoy-2", 6, 2),
+        ("decoy-3", 5, 3),
+        ("decoy-4", 4, 4),
+        ("x", 3, 6),
+        ("y", 2, 5),
+        ("n", 1, 7),
+    ];
+    for (slug, alpha, beta) in chunks {
+        let mut words = vec!["alpha"; alpha];
+        words.extend(vec!["beta"; beta]);
+        words.extend(vec!["filler"; 20 - alpha - beta]);
+        rows.push(format!(
+            r#"{{"type":"Chunk","data":{{"slug":"{slug}","text":"{}"}}}}"#,
+            words.join(" ")
+        ));
+    }
+    for slug in ["x", "y", "n"] {
+        rows.push(format!(
+            r#"{{"edge":"ChunkOfArtifact","from":"{slug}","to":"art-0","data":{{"id":"e-{slug}","label":"of"}}}}"#
+        ));
+    }
+    rows.join("\n")
+}
+
 async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
     let db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
@@ -1245,12 +1291,12 @@ async fn bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan() {
     );
 }
 
-/// The RRF twin of the under-fill test: both bm25 arms are capped at 8 rows,
-/// every capped row is join-dropped, and the count-based retry must rerun the
-/// fusion uncapped so the limit is filled from the edge-bearing band.
+/// The rrf arms are never capped (PR #574 review; the starvation mechanism
+/// is documented on `extract_sub_search_mode`). Pins: one uncapped pass per
+/// arm, zero retries; a reintroduced cap moves the scan-row count.
 #[tokio::test]
 #[serial]
-async fn rrf_join_fills_limit_when_capped_arms_underfill() {
+async fn rrf_arms_scan_uncapped_in_one_pass() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
@@ -1274,23 +1320,21 @@ async fn rrf_join_fills_limit_when_capped_arms_underfill() {
     .await
     .unwrap();
 
-    // Same cap-engagement proof as the non-RRF twin: the fused retry fires
-    // exactly once for the whole query (both arms rerun in one retry pass).
+    // No cap, no retry machinery on the rrf path.
     assert_eq!(
         probes
             .bm25_uncapped_retries
             .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "the rrf under-fill retry must fire exactly once"
+        0,
+        "rrf arms are uncapped, so no under-fill retry may arise"
     );
-    // Cap magnitude, rrf shape: two capped arms (8 each), then both arms
-    // uncapped on the retry (20 each).
+    // Each arm scans the full matched corpus exactly once (2 × 20).
     assert_eq!(
         probes
             .bm25_scan_rows
             .load(std::sync::atomic::Ordering::Relaxed),
-        56,
-        "scan rows must be two capped arms plus two uncapped retry arms"
+        40,
+        "both rrf arms must scan every matching document in one pass"
     );
 
     // Both arms rank identically (same bm25 expression), so fusion preserves
@@ -1298,7 +1342,60 @@ async fn rrf_join_fills_limit_when_capped_arms_underfill() {
     assert_eq!(
         result_slugs(&result),
         vec!["chunk-08".to_string(), "chunk-09".to_string()],
-        "the fused limit must be filled, in rank order, from the edge-bearing chunks outside both arm caps"
+        "the fused limit must be filled, in rank order, from the edge-bearing chunks"
+    );
+}
+
+/// The #574 review fixture: the four best alpha scorers carry no edge. Were
+/// the alpha arm capped at limit × BM25_SCAN_OVERFETCH_FACTOR (4), the
+/// traversal would evict its entire window, fusion would rank on beta alone,
+/// and the winner would silently flip from x to n with the row count still
+/// full. Red against the capped rrf implementation; green on uncapped arms.
+#[tokio::test]
+#[serial]
+async fn rrf_decoy_flood_does_not_flip_the_fused_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
+    load_jsonl(&db, &starvation_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    let mut db = db;
+
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            STARVATION_RRF_QUERY,
+            "recall_two_terms",
+            &params(&[("$q1", "alpha"), ("$q2", "beta")]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result_slugs(&result),
+        vec!["x".to_string()],
+        "x wins the fused ranking; n wins only if the alpha arm is starved"
+    );
+    // Both arms scan all seven chunks, one pass, no retry.
+    assert_eq!(
+        probes
+            .bm25_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        14,
+        "both rrf arms must scan the full seven-chunk corpus in one pass"
+    );
+    assert_eq!(
+        probes
+            .bm25_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "rrf arms are uncapped, so no under-fill retry may arise"
     );
 }
 

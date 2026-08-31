@@ -165,9 +165,10 @@ struct SearchMode {
 }
 
 impl SearchMode {
-    /// This mode with the BM25 scan cap cleared (a nested `rrf`'s arms are
-    /// cleared by `execute_rrf_query` itself, never through here). Any future
-    /// scan cap must be cleared here too.
+    /// This mode with the BM25 scan cap cleared (only a standalone `bm25()`
+    /// ordering ever carries one — `rrf()` arms are never capped, see
+    /// `extract_sub_search_mode`). Any future scan cap must be cleared here
+    /// too.
     fn to_uncapped(&self) -> Self {
         Self {
             bm25_scan_limit: None,
@@ -191,7 +192,8 @@ const BM25_SCAN_OVERFETCH_FACTOR: usize = 4;
 /// Row cap for the BM25 scan, or `None` to scan every matching document.
 /// `None` for a limitless query, and for any aggregate return: an aggregate's
 /// value is computed over the scanned rows, so a capped scan would change the
-/// answer, not just the cost.
+/// answer, not just the cost. Standalone `bm25()` orderings only — `rrf()`
+/// arms never call this (see `extract_sub_search_mode`).
 fn bm25_scan_limit(ir: &QueryIR) -> Option<usize> {
     if projections_have_aggregates(&ir.return_exprs) {
         return None;
@@ -330,9 +332,14 @@ async fn extract_sub_search_mode(
             let text = resolve_to_string(query, params).ok_or_else(|| {
                 OmniError::manifest("bm25 query must resolve to a string".to_string())
             })?;
+            // Never capped: an arm's cap window would be filled by text score
+            // before traversals run, so join-ineligible rows can starve the
+            // arm out of the fusion while the fused row count stays full — no
+            // count-based retry can detect it, and the missing contributions
+            // shift fused ranks (PR #574 review). Fusion needs the arm's
+            // complete ranking.
             Ok(SearchMode {
                 bm25: Some((var, prop, text)),
-                bm25_scan_limit: bm25_scan_limit(ir),
                 ..Default::default()
             })
         }
@@ -492,9 +499,10 @@ pub async fn execute_query(
 ) -> Result<QueryResult> {
     let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
 
-    // RRF requires forked execution
+    // RRF requires forked execution. Its bm25 arms are never capped (see
+    // `extract_sub_search_mode`), so no under-fill retry arises for it.
     if let Some(ref rrf) = search_mode.rrf {
-        return execute_rrf_query(ir, params, snapshot, graph_index, catalog, rrf).await;
+        return execute_rrf_fusion(ir, params, snapshot, graph_index, catalog, rrf).await;
     }
 
     let result_batch =
@@ -578,43 +586,10 @@ fn is_search_ordered(search_mode: &SearchMode) -> bool {
     search_mode.nearest.is_some() || search_mode.bm25.is_some()
 }
 
-/// Execute a query with RRF (Reciprocal Rank Fusion) ordering, retrying with
-/// uncapped arms if the capped ones under-fill (see `execute_query`).
-async fn execute_rrf_query(
-    ir: &QueryIR,
-    params: &ParamMap,
-    snapshot: &Snapshot,
-    graph_index: &GraphIndexHandle<'_>,
-    catalog: &Catalog,
-    rrf: &RrfMode,
-) -> Result<QueryResult> {
-    let fused = execute_rrf_fusion(ir, params, snapshot, graph_index, catalog, rrf).await?;
-    let capped = rrf.primary.bm25_scan_limit.is_some() || rrf.secondary.bm25_scan_limit.is_some();
-    if capped && fused.num_rows() < rrf.limit {
-        tracing::debug!(
-            limit = rrf.limit,
-            fused_rows = fused.num_rows(),
-            "rrf capped arms under-filled; retrying uncapped"
-        );
-        crate::instrumentation::record_bm25_uncapped_retry();
-        let uncapped = RrfMode {
-            primary: Box::new(rrf.primary.to_uncapped()),
-            secondary: Box::new(rrf.secondary.to_uncapped()),
-            k: rrf.k,
-            limit: rrf.limit,
-        };
-        return execute_rrf_fusion(ir, params, snapshot, graph_index, catalog, &uncapped).await;
-    }
-    Ok(fused)
-}
-
 /// One RRF pass: run both arms, fuse their ranks, reconstruct and limit.
 ///
-/// INPUT CONTRACT: a capped arm holds a top-(limit × BM25_SCAN_OVERFETCH_FACTOR)
-/// rank list, not a complete one. Entities beyond an arm's cap lose that arm's
-/// fusion contribution, and the count-based retry in `execute_rrf_query`
-/// catches under-fill, never rank shifts. (The `nearest` arm was always
-/// truncated at `k`.)
+/// INPUT CONTRACT: bm25 arms are complete rankings, never capped — see
+/// `extract_sub_search_mode`. (The `nearest` arm was always truncated at `k`.)
 async fn execute_rrf_fusion(
     ir: &QueryIR,
     params: &ParamMap,
@@ -623,6 +598,10 @@ async fn execute_rrf_fusion(
     catalog: &Catalog,
     rrf: &RrfMode,
 ) -> Result<QueryResult> {
+    debug_assert!(
+        rrf.primary.bm25_scan_limit.is_none() && rrf.secondary.bm25_scan_limit.is_none(),
+        "rrf arms must be complete rankings (see extract_sub_search_mode)"
+    );
     // Execute primary search
     let mut primary_wide: Option<RecordBatch> = None;
     execute_pipeline(

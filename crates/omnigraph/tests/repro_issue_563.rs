@@ -13,8 +13,9 @@
 //   cargo test -p omnigraph-engine --test repro_issue_563 -- --ignored --nocapture
 //
 // This is the SYMPTOM tier: proof at overflow scale, run at explicit
-// checkpoints. The always-on MECHANISM tier lives in tests/search.rs
-// (the three *_issue_563 / capped-scan tests over a 20-row corpus).
+// checkpoints. The always-on MECHANISM tier lives in tests/search.rs: the
+// capped-scan tests (bm25 under-fill + aggregate exemption, 20-row corpus)
+// and the rrf uncapped-arm pins (20- and 7-row corpora).
 //
 // A second #[ignore]d test below times the join-free ranked read over the
 // same corpus geometry: the scan cap's cost is hydration count, so the

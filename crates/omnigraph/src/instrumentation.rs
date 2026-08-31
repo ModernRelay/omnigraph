@@ -159,10 +159,11 @@ pub struct QueryIoProbes {
     /// This must equal the newly deleted offset count; a fragment scan would
     /// make it grow with the compacted catalog's history instead.
     pub projection_identity_rows: Arc<AtomicU64>,
-    /// Uncapped retries taken after a capped BM25 scan under-filled. For a
-    /// plain `bm25()` ordering, capped and uncapped runs are result-identical
-    /// (the capped scan is the uncapped scan's score prefix; `rrf()`'s arm
-    /// truncation is disclosed on `execute_rrf_fusion`), so result assertions
+    /// Uncapped retries taken after a capped BM25 scan under-filled. Only a
+    /// standalone `bm25()` ordering carries a cap (`rrf()` arms are never
+    /// capped — see `execute_rrf_fusion`); its capped and uncapped runs are
+    /// result-identical up to score ties at the cap boundary (the capped
+    /// scan is the uncapped scan's score prefix), so result assertions
     /// cannot see the cap; this counter and `bm25_scan_rows` below are how
     /// tests assert it actually engaged.
     pub bm25_uncapped_retries: Arc<AtomicU64>,
