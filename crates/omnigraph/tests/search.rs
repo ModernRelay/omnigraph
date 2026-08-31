@@ -1432,17 +1432,25 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
     db.ensure_indices().await.unwrap();
     let mut db = db;
 
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+    // This test pins the POSTFILTER plan's invariants (uncapped one-pass
+    // corpus-wide arms). Force that plan: un-forced, the assertion couples
+    // to the prefilter gate's threshold (4/20 eligible merely happens to
+    // exceed the default ratio), and a retune or ambient OMNIGRAPH_RRF_PLAN
+    // would flip it with a misleading cap-regression message.
     let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(probes.clone(), async {
-        query_main(
-            &mut db,
-            UNDERFILL_RRF_QUERY,
-            "recall_rrf",
-            &params(&[("$q", "needle")]),
-        )
-        .await
-    })
+    let result = with_query_io_probes(
+        probes.clone(),
+        with_rrf_plan("force_postfilter", async {
+            query_main(
+                &mut db,
+                UNDERFILL_RRF_QUERY,
+                "recall_rrf",
+                &params(&[("$q", "needle")]),
+            )
+            .await
+        }),
+    )
     .await
     .unwrap();
 
@@ -1489,17 +1497,23 @@ async fn rrf_decoy_flood_does_not_flip_the_fused_winner() {
     db.ensure_indices().await.unwrap();
     let mut db = db;
 
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+    // Pins the POSTFILTER plan (see rrf_arms_scan_uncapped_in_one_pass for
+    // why the plan is forced); the gate's decoy-flood acceptance under BOTH
+    // plans lives in tests/rrf_prefilter_gate.rs.
     let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(probes.clone(), async {
-        query_main(
-            &mut db,
-            STARVATION_RRF_QUERY,
-            "recall_two_terms",
-            &params(&[("$q1", "alpha"), ("$q2", "beta")]),
-        )
-        .await
-    })
+    let result = with_query_io_probes(
+        probes.clone(),
+        with_rrf_plan("force_postfilter", async {
+            query_main(
+                &mut db,
+                STARVATION_RRF_QUERY,
+                "recall_two_terms",
+                &params(&[("$q1", "alpha"), ("$q2", "beta")]),
+            )
+            .await
+        }),
+    )
     .await
     .unwrap();
 
@@ -1522,6 +1536,103 @@ async fn rrf_decoy_flood_does_not_flip_the_fused_winner() {
             .load(std::sync::atomic::Ordering::Relaxed),
         0,
         "rrf arms are uncapped, so no under-fill retry may arise"
+    );
+}
+
+/// The capped scan's prefix claim ("the capped rows are the uncapped scan's
+/// leading rows") on a PARTIALLY covered FTS index — rows appended after the
+/// index build are scored by a batch-derived scorer rather than the
+/// index-global statistics, and every other cap test runs fully covered.
+/// The appended chunks carry the highest term frequency, so they must win
+/// both runs: agreement here pins that the capped `FullTextSearchQuery`
+/// limit still yields the global top-k when covered and uncovered fragments
+/// mix. Join-free on purpose: no traversal means no under-fill retry, so
+/// the capped pass itself is what answers.
+#[tokio::test]
+#[serial]
+async fn capped_bm25_matches_uncapped_prefix_on_partially_covered_index() {
+    const PREFIX_QUERIES: &str = r#"
+query capped($q: String) {
+    match {
+        $c: Chunk
+        search($c.text, $q)
+    }
+    return { $c.slug }
+    order { bm25($c.text, $q) }
+    limit 2
+}
+
+query uncapped_all($q: String) {
+    match {
+        $c: Chunk
+        search($c.text, $q)
+    }
+    return { $c.slug }
+    order { bm25($c.text, $q) }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
+    load_jsonl(&db, &underfill_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    // Appended AFTER the index build: their fragment is uncovered, and their
+    // term frequency (40 > the seed's max 20) puts them at the top of any
+    // correct ranking.
+    let appended = (0..3)
+        .map(|extra| {
+            let needle = vec!["needle"; 40 - extra].join(" ");
+            format!(
+                r#"{{"type":"Chunk","data":{{"slug":"late-{extra}","text":"{needle} filler"}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    load_jsonl(&db, &appended, LoadMode::Append).await.unwrap();
+    let mut db = db;
+
+    let capped = query_main(
+        &mut db,
+        PREFIX_QUERIES,
+        "capped",
+        &params(&[("$q", "needle")]),
+    )
+    .await
+    .unwrap();
+    let uncapped = query_main(
+        &mut db,
+        PREFIX_QUERIES,
+        "uncapped_all",
+        &params(&[("$q", "needle")]),
+    )
+    .await
+    .unwrap();
+
+    let capped_slugs = result_slugs(&capped);
+    let uncapped_slugs = result_slugs(&uncapped);
+    assert_eq!(
+        uncapped_slugs.len(),
+        23,
+        "the uncapped scan must rank every matching chunk, appended included"
+    );
+    assert_eq!(
+        capped_slugs,
+        uncapped_slugs[..2].to_vec(),
+        "the capped run must return the uncapped ranking's prefix even when \
+         covered and uncovered fragments mix"
+    );
+    // Observed (and deliberately NOT pinned as a golden): the uncovered
+    // rows' batch-derived scores rank BELOW the index-scored rows here
+    // despite double the term frequency — the two scorers are not on one
+    // scale. That cross-domain incomparability is exactly why the rrf
+    // prefilter gate refuses its selective plan on partial coverage; this
+    // test only pins that capped and uncapped runs agree on whatever the
+    // mixed scoring produces.
+    assert!(
+        uncapped_slugs.iter().any(|slug| slug.starts_with("late-")),
+        "the appended uncovered-fragment chunks must still match and rank somewhere"
     );
 }
 

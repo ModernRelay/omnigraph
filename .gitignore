@@ -21,6 +21,7 @@ demo/*.omni/
 # Local-only working files (not for the public repo)
 /archived/
 .claude/
+.idea/
 .worktrees/
 /CLAUDE.md
 /omnigraph.yaml

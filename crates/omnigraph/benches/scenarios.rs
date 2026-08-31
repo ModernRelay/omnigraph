@@ -76,10 +76,17 @@ struct Args {
     dims: usize,
     seed: u64,
     runs: usize,
-    /// Selectivity for nearest-prefilter: fraction of rows matching the filter.
+    /// Selectivity for nearest-prefilter (fraction of rows matching the
+    /// filter) and for rrf-gate (fraction of ranked rows carrying an edge —
+    /// the gate's eligibility ratio).
     selectivity: f64,
-    /// ANN k (the query's `limit`) for nearest-prefilter.
+    /// ANN k (the query's `limit`) for nearest-prefilter; the rrf `limit`
+    /// for rrf-gate.
     k: usize,
+    /// Per-row text payload for rrf-gate: 200 KiB reproduces the issue-#563
+    /// overflow-scale corpus, ~2 KiB the wide variant, and a tiny value turns
+    /// the same scenario into the in-list build + BTREE probe microbench.
+    text_bytes: usize,
     /// How many already-committed rows the source branch MODIFIES, for
     /// `general-merge-updates`. This is the branch delta; `--rows` is the
     /// target size. Holding this small while `--rows` grows is the whole
@@ -120,6 +127,7 @@ impl Args {
             runs: 1,
             selectivity: 0.05,
             k: 10,
+            text_bytes: 2048,
             delta_rows: 50,
             source_mode: "update".to_string(),
             memory_cap_mb: None,
@@ -145,6 +153,9 @@ impl Args {
                     args.selectivity = take("--selectivity").parse().expect("--selectivity")
                 }
                 "--k" => args.k = take("--k").parse().expect("--k"),
+                "--text-bytes" => {
+                    args.text_bytes = take("--text-bytes").parse().expect("--text-bytes")
+                }
                 "--delta-rows" => {
                     args.delta_rows = take("--delta-rows").parse().expect("--delta-rows")
                 }
@@ -179,6 +190,8 @@ impl Args {
             self.selectivity.to_string(),
             "--k".into(),
             self.k.to_string(),
+            "--text-bytes".into(),
+            self.text_bytes.to_string(),
             "--delta-rows".into(),
             self.delta_rows.to_string(),
             "--source-mode".into(),
@@ -219,8 +232,8 @@ fn main() {
     if args.scenario.is_empty() {
         eprintln!(
             "usage: --scenario <merge-all-changed|nearest-prefilter|fenced-small-upsert|\
-             fenced-adopt-all-new|general-merge-updates> [--rows N] [--dims D] \
-             [--seed S] [--runs K] [--selectivity F] [--k K] [--delta-rows N] \
+             fenced-adopt-all-new|general-merge-updates|rrf-gate> [--rows N] [--dims D] \
+             [--seed S] [--runs K] [--selectivity F] [--k K] [--text-bytes B] [--delta-rows N] \
              [--source-mode update|insert] [--memory-cap-mb M]"
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
@@ -459,6 +472,7 @@ fn run_once(args: &Args, run: usize) -> serde_json::Value {
             "seed": args.seed,
             "selectivity": args.selectivity,
             "k": args.k,
+            "text_bytes": args.text_bytes,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
         },
@@ -742,6 +756,7 @@ fn run_child(args: &Args) {
             }
             ("merge-all-changed", None) => merge_all_changed(args).await,
             ("nearest-prefilter", None) => nearest_prefilter(args).await,
+            ("rrf-gate", None) => rrf_gate(args).await,
             ("fenced-small-upsert", None) => rfc023_scenarios::fenced_small_upsert(args).await,
             (other, phase) => panic!("unknown scenario/phase '{other}/{phase:?}'"),
         }
@@ -1137,4 +1152,256 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
         "query_iters": QUERY_ITERS,
         "mean_query_ms": total_ms as f64 / QUERY_ITERS as f64,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: rrf-gate
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+/// One cell of the rrf prefilter-gate matrix: a bm25+bm25 `rrf()` read
+/// joined through an edge traversal, where `--selectivity` of the ranked rows
+/// carry edges (fanout 2 — the issue-#563 repro shape; `--text-bytes 204800`
+/// reproduces its overflow-scale corpus, ~2048 the wide variant, and a tiny
+/// value turns the cell into the in-list BTREE-probe microbench).
+///
+/// `--baseline` forces the postfilter plan (v0.9 rrf semantics: uncapped
+/// corpus-wide arms); the default forces the prefilter plan, so the
+/// wall-clock crossover stays measurable ABOVE the natural threshold too.
+/// Query iteration 0 runs against a cold `RuntimeCache` (the gate's
+/// forced-CSR-build case); later iterations are warm. Per-iteration
+/// object-store reads come from one persistent `IOTracker` pair installed
+/// before the graph opens (the `cost_harness` pattern), the gate's verdict
+/// from the `rrf_gate_verdicts` probe, and the in-list `Expr` build over the
+/// eligible ids is timed separately (the predicate-build half). A query
+/// error — e.g. the #563 Offset overflow under the postfilter plan at
+/// 200 KiB text — is recorded as that iteration's `error`, not a crash: an
+/// overflow under the baseline is a data point.
+async fn rrf_gate(args: &Args) -> serde_json::Value {
+    use lance::io::WrappingObjectStore;
+    use lance_io::utils::tracking_store::IOTracker;
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+
+    const ARTIFACTS: usize = 750;
+    const FANOUT: usize = 2;
+    const QUERY_ITERS: usize = 3;
+    const EDGE_BATCH_ROWS: usize = 4_000;
+
+    let table_tracker = IOTracker::default();
+    let manifest_tracker = IOTracker::default();
+    let probes = QueryIoProbes {
+        table_wrapper: Some(
+            std::sync::Arc::new(table_tracker.clone()) as std::sync::Arc<dyn WrappingObjectStore>
+        ),
+        manifest_wrapper: Some(std::sync::Arc::new(manifest_tracker.clone())
+            as std::sync::Arc<dyn WrappingObjectStore>),
+        ..Default::default()
+    };
+    let verdicts = std::sync::Arc::clone(&probes.rrf_gate_verdicts);
+    let args = args.clone();
+    let table = table_tracker.clone();
+    let manifest = manifest_tracker.clone();
+
+    // The whole cell runs under ONE probe scope so every dataset handle —
+    // including cached ones reused by warm iterations — carries the trackers.
+    with_query_io_probes(
+        probes,
+        Box::pin(async move {
+            let schema = "node Chunk {\n    slug: String @key\n    text: String @index\n}\n\n\
+                          node Artifact {\n    slug: String @key\n}\n\n\
+                          edge ChunkOfArtifact: Chunk -> Artifact {\n    label: String\n}\n";
+            let dir = tempfile::tempdir().expect("tempdir");
+            let uri = dir.path().to_str().unwrap();
+            let db = Omnigraph::init(uri, schema).await.expect("init");
+
+            // Both query terms in every row (rank ties are irrelevant here —
+            // this is a cost instrument, not the equality oracle), padded to
+            // `--text-bytes` with a tiny vocabulary of long tokens so the
+            // stored column carries full byte weight while the FTS term
+            // dictionary stays small.
+            let mut text = String::with_capacity(args.text_bytes + 64);
+            text.push_str("needle563 sharp563 ");
+            let filler_unit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+                               cccccccccccccccccccccccccccccccc dddddddddddddddddddddddddddddddd ";
+            while text.len() < args.text_bytes {
+                text.push_str(filler_unit);
+            }
+
+            let seed_start = Instant::now();
+            let mut head = String::new();
+            for a in 0..ARTIFACTS {
+                let _ = writeln!(head, r#"{{"type":"Artifact","data":{{"slug":"art-{a:04}"}}}}"#);
+            }
+            db.load("main", &head, LoadMode::Merge).await.expect("load artifacts");
+
+            let chunk_batch_rows = (24 * 1024 * 1024 / args.text_bytes.max(1)).clamp(1, 4_000);
+            let mut chunk_batch = String::new();
+            for c in 0..args.rows {
+                let _ = writeln!(
+                    chunk_batch,
+                    r#"{{"type":"Chunk","data":{{"slug":"chunk-{c:06}","text":"{text}"}}}}"#
+                );
+                if (c + 1) % chunk_batch_rows == 0 || c + 1 == args.rows {
+                    db.load("main", &chunk_batch, LoadMode::Merge)
+                        .await
+                        .expect("load chunks");
+                    chunk_batch.clear();
+                }
+            }
+
+            // Every stride-th chunk is eligible (carries FANOUT edges).
+            let stride = (1.0 / args.selectivity).round().max(1.0) as usize;
+            let mut eligible_slugs: Vec<String> = Vec::new();
+            let mut edges = String::new();
+            let mut edge_rows = 0usize;
+            for c in (0..args.rows).step_by(stride) {
+                eligible_slugs.push(format!("chunk-{c:06}"));
+                for f in 0..FANOUT {
+                    let a = (c * FANOUT + f) % ARTIFACTS;
+                    let _ = writeln!(
+                        edges,
+                        r#"{{"edge":"ChunkOfArtifact","from":"chunk-{c:06}","to":"art-{a:04}","data":{{"id":"e-{c:06}-{f}","label":"of"}}}}"#
+                    );
+                    edge_rows += 1;
+                    if edge_rows == EDGE_BATCH_ROWS {
+                        db.load("main", &edges, LoadMode::Merge).await.expect("load edges");
+                        edges.clear();
+                        edge_rows = 0;
+                    }
+                }
+            }
+            if edge_rows > 0 {
+                db.load("main", &edges, LoadMode::Merge).await.expect("load edges");
+            }
+            let seed_ms = seed_start.elapsed().as_millis() as u64;
+
+            // FTS + BTREE indices built AFTER the last write: full fragment
+            // coverage, so the gate's coverage fence admits the prefilter plan.
+            let index_start = Instant::now();
+            db.ensure_indices().await.expect("ensure_indices");
+            let index_ms = index_start.elapsed().as_millis() as u64;
+
+            // Query on a FRESH handle: the seeding handle's dataset cache
+            // would otherwise serve the scans through unwrapped stores (the
+            // IO trackers attach at open) and mask the cold-cache cost the
+            // matrix wants — iteration 0 must pay real data opens and the
+            // gate's cold CSR build.
+            drop(db);
+            let db = Omnigraph::open(uri).await.expect("reopen");
+
+            // Constructing one `lit()` per eligible id plus the `IN`-list
+            // `Expr` — the per-id predicate-BUILD cost, which prior
+            // indexed-eval measurements never covered.
+            let inlist_build_start = Instant::now();
+            let id_list: Vec<datafusion::prelude::Expr> = eligible_slugs
+                .iter()
+                .map(|slug| datafusion::prelude::lit(slug.clone()))
+                .collect();
+            let in_list_expr = datafusion::prelude::col("id").in_list(id_list, false);
+            let inlist_build_ms = inlist_build_start.elapsed().as_micros() as f64 / 1000.0;
+            std::hint::black_box(&in_list_expr);
+
+            let query_src = format!(
+                "query recall_rrf($q1: String, $q2: String) {{\n    match {{\n        $c: Chunk\n        $c chunkOfArtifact $a\n    }}\n    return {{ $c.slug, $a.slug }}\n    order {{ rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }}\n    limit {}\n}}\n",
+                args.k
+            );
+            let query_params = helpers::params(&[("$q1", "needle563"), ("$q2", "sharp563")]);
+            let plan_mode: &'static str = if args.baseline {
+                "force_postfilter"
+            } else {
+                "force_prefilter"
+            };
+
+            // Drop the seed/index reads so per-iteration stats start clean.
+            let _ = table.incremental_stats();
+            let _ = manifest.incremental_stats();
+
+            let mut iterations: Vec<serde_json::Value> = Vec::new();
+            for iter in 0..QUERY_ITERS {
+                let started = Instant::now();
+                let outcome = with_rrf_plan(
+                    plan_mode,
+                    db.query(
+                        ReadTarget::branch("main"),
+                        &query_src,
+                        "recall_rrf",
+                        &query_params,
+                    ),
+                )
+                .await;
+                let wall_ms = started.elapsed().as_millis() as u64;
+                let table_stats = table.incremental_stats();
+                let manifest_stats = manifest.incremental_stats();
+                let verdict = verdicts
+                    .lock()
+                    .ok()
+                    .and_then(|v| v.last().cloned())
+                    .map(|v| {
+                        serde_json::json!({
+                            "plan": format!("{:?}", v.plan),
+                            "fallback": v.fallback.map(|f| format!("{f:?}")),
+                            "forced": v.forced,
+                            "eligible": v.eligible,
+                            "corpus": v.corpus,
+                        })
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+                match outcome {
+                    Ok(result) => {
+                        let rows: usize = result.batches().iter().map(|b| b.num_rows()).sum();
+                        iterations.push(serde_json::json!({
+                            "iter": iter,
+                            "wall_ms": wall_ms,
+                            "rows_returned": rows,
+                            "table_read_iops": table_stats.read_iops,
+                            "table_read_bytes": table_stats.read_bytes,
+                            "manifest_read_iops": manifest_stats.read_iops,
+                            "verdict": verdict,
+                            "error": serde_json::Value::Null,
+                        }));
+                    }
+                    Err(error) => {
+                        iterations.push(serde_json::json!({
+                            "iter": iter,
+                            "wall_ms": wall_ms,
+                            "rows_returned": serde_json::Value::Null,
+                            "table_read_iops": table_stats.read_iops,
+                            "table_read_bytes": table_stats.read_bytes,
+                            "manifest_read_iops": manifest_stats.read_iops,
+                            "verdict": verdict,
+                            "error": error.to_string(),
+                        }));
+                        // Later iterations would fail identically; the error
+                        // itself is the cell's result.
+                        break;
+                    }
+                }
+            }
+
+            let warm: Vec<u64> = iterations
+                .iter()
+                .skip(1)
+                .filter(|it| it.get("error") == Some(&serde_json::Value::Null))
+                .filter_map(|it| it.get("wall_ms").and_then(serde_json::Value::as_u64))
+                .collect();
+            serde_json::json!({
+                "plan_mode": plan_mode,
+                "seed_ms": seed_ms,
+                "index_ms": index_ms,
+                "corpus_rows": args.rows,
+                "text_bytes": args.text_bytes,
+                "eligible_rows": eligible_slugs.len(),
+                "fanout": FANOUT,
+                "inlist_build_ms": inlist_build_ms,
+                "cold_wall_ms": iterations.first().and_then(|it| it.get("wall_ms").cloned()),
+                "warm_mean_wall_ms": if warm.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(warm.iter().sum::<u64>() as f64 / warm.len() as f64)
+                },
+                "iterations": iterations,
+            })
+        }),
+    )
+    .await
 }
