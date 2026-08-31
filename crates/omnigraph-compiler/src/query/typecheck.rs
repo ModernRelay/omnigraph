@@ -692,9 +692,13 @@ fn typecheck_binding(
                 check_binding_literal_type(lit, prop, &pm.prop_name)?;
             }
             MatchValue::Variable(v) => {
-                if let Some(actual) = params.get(v) {
-                    check_binding_variable_type(actual, prop, &pm.prop_name)?;
-                }
+                let Some(actual) = params.get(v) else {
+                    return Err(CompilerError::Type(format!(
+                        "T3: match variable `${}` must be a declared query parameter",
+                        v
+                    )));
+                };
+                check_binding_variable_type(actual, prop, &pm.prop_name)?;
             }
             MatchValue::Now => check_now_match_value_type(prop, &pm.prop_name)?,
         }
