@@ -10,7 +10,6 @@ for nearest-neighbor ordering.
 |---|---|
 | `nearest($d.embedding, $q)` | Rank vectors by L2 distance. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
 | `search($d.body, $q)` | Full-text token search. |
-| `fuzzy($d.body, $q [, max_edits])` | Full-text search with edit-distance tolerance. |
 | `match_text($d.body, $q)` | Match a full-text query in a `match` block. |
 | `bm25($d.body, $q)` | BM25 relevance score. |
 | `rrf(rank_a, rank_b [, k])` | Fuse two rankings with Reciprocal Rank Fusion. The default `k` is 60. |
@@ -52,7 +51,9 @@ queries and provider configuration.
 
 ## Full-text search
 
-Use full-text functions for token search, fuzzy terms, and relevance. Use the
+Use full-text functions for token search and relevance. (`fuzzy()` is retired:
+it never matched under the supported tokenizer, so every use now fails compile
+with the stable `T25` diagnostic instead of silently returning nothing.) Use the
 query language's exact `contains` and `starts_with` predicates for literal,
 case-sensitive substring and prefix matching.
 

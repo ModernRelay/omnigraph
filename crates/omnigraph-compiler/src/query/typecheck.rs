@@ -1295,75 +1295,13 @@ fn resolve_expr_type(
                 false,
             )))
         }
-        Expr::Fuzzy {
-            field,
-            query,
-            max_edits,
-        } => {
-            reject_edge_binding_search_field(ctx, field, "fuzzy")?;
-            let field_type = resolve_expr_type(catalog, field, ctx, params)?;
-            match field_type {
-                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
-                ResolvedType::Scalar(s) => {
-                    return Err(CompilerError::Type(format!(
-                        "T19: fuzzy field must be String, got {}",
-                        s.display_name()
-                    )));
-                }
-                _ => {
-                    return Err(CompilerError::Type(
-                        "T19: fuzzy field must be a scalar String expression".to_string(),
-                    ));
-                }
-            }
-
-            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
-            match query_type {
-                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
-                ResolvedType::Scalar(s) => {
-                    return Err(CompilerError::Type(format!(
-                        "T19: fuzzy query must be String, got {}",
-                        s.display_name()
-                    )));
-                }
-                _ => {
-                    return Err(CompilerError::Type(
-                        "T19: fuzzy query must be a scalar String expression".to_string(),
-                    ));
-                }
-            }
-
-            if let Some(max_edits_expr) = max_edits {
-                let max_edits_type = resolve_expr_type(catalog, max_edits_expr, ctx, params)?;
-                match max_edits_type {
-                    ResolvedType::Scalar(s)
-                        if !s.list
-                            && matches!(
-                                s.scalar,
-                                ScalarType::I32
-                                    | ScalarType::I64
-                                    | ScalarType::U32
-                                    | ScalarType::U64
-                            ) => {}
-                    ResolvedType::Scalar(s) => {
-                        return Err(CompilerError::Type(format!(
-                            "T19: fuzzy max_edits must be an integer scalar, got {}",
-                            s.display_name()
-                        )));
-                    }
-                    _ => {
-                        return Err(CompilerError::Type(
-                            "T19: fuzzy max_edits must be an integer scalar expression".to_string(),
-                        ));
-                    }
-                }
-            }
-
-            Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::Bool,
-                false,
-            )))
-        }
+        Expr::Fuzzy { .. } => Err(CompilerError::Type(
+            "T25: fuzzy() is retired: fuzzy term queries never match under the supported \
+             tokenizer, so accepting the form would silently return nothing. Use search() or \
+             match_text() for token search; edit-distance search returns as a new form once a \
+             certified successor exists"
+                .to_string(),
+        )),
         Expr::MatchText { field, query } => {
             reject_edge_binding_search_field(ctx, field, "match_text")?;
             let field_type = resolve_expr_type(catalog, field, ctx, params)?;

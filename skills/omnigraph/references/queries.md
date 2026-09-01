@@ -186,7 +186,6 @@ match {
 ```gq
 match {
     $d: Doc
-    fuzzy($d.title, $q, 2)     // fuzzy match, max 2 edits
 }
 ```
 

@@ -69,8 +69,8 @@ Comparison operators are `=`, `!=`, `<`, `<=`, `>`, and `>=`.
 not wildcards. The predicates remain correct without an index; do not assume a
 free-text String index accelerates exact prefix or substring filters.
 
-Use [full-text search](../search/index.md) for tokenization, fuzzy matching, and
-relevance ranking.
+Use [full-text search](../search/index.md) for tokenization and relevance
+ranking.
 
 ## Return, order, and limit
 

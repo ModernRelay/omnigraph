@@ -3908,21 +3908,8 @@ fn build_fts_query(
                 .with_column(prop)
                 .ok()
         }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-        } => {
-            let prop = extract_property(field)?;
-            let q = resolve_to_string(query, params)?;
-            let edits = max_edits
-                .as_ref()
-                .and_then(|e| resolve_to_int(e, params))
-                .unwrap_or(2) as u32;
-            lance_index::scalar::FullTextSearchQuery::new_fuzzy(q, Some(edits))
-                .with_column(prop)
-                .ok()
-        }
+        // IRExpr::Fuzzy never reaches execution: fuzzy() is rejected at
+        // typecheck with the stable T25 retirement diagnostic.
         IRExpr::MatchText { field, query } => {
             // Use regular text search (phrase search not available in Lance 3.0 Rust API)
             let prop = extract_property(field)?;

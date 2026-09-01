@@ -97,7 +97,6 @@ query hybrid($vq: Vector(1536), $tq: String) {
 match {
     $d: Doc
     search($d.title, $q)          // full-text filter
-    fuzzy($d.title, $q, 2)        // fuzzy filter, max 2 edits
     match_text($d.body, $q)       // regular full-text filter (not phrase search)
 }
 ```

@@ -536,28 +536,37 @@ async fn text_search_no_results() {
     assert_eq!(result.num_rows(), 0);
 }
 
-// ─── Fuzzy search (match_tokens with fuzzy_max_edits) ───────────────────────
+// ─── Fuzzy search (retired — T25) ───────────────────────────────────────────
 
+// fuzzy() is retired: it was provably inert (a one-edit typo matched nothing
+// under the supported tokenizer), so accepting the form silently returned
+// confident empty results. Every use now fails compile with the stable T25
+// diagnostic — through the public engine API too, which is what this pins.
 #[tokio::test]
 #[serial]
-async fn fuzzy_search_tolerates_typos() {
+async fn fuzzy_query_fails_compile_with_t25() {
+    use omnigraph::error::OmniError;
+
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
 
-    // "Introductio" (missing 'n') should fuzzy-match "Introduction" with max_edits=2
-    let result = query_main(
+    let error = query_main(
         &mut db,
         SEARCH_QUERIES,
         "fuzzy_search",
         &params(&[("$q", "Introductio")]),
     )
     .await
-    .unwrap();
-
-    // Fuzzy matching may not work with the default tokenizer on all terms;
-    // at minimum verify it doesn't error
-    // If it returns results, great — it matched despite the typo
-    let _ = result.num_rows();
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        matches!(error, OmniError::Compiler(_)),
+        "fuzzy must die at typecheck, not execution: {error}"
+    );
+    assert!(
+        message.contains("T25"),
+        "expected the stable T25 retirement diagnostic, got: {message}"
+    );
 }
 
 // ─── Phrase search (match_phrase) ───────────────────────────────────────────
@@ -1636,32 +1645,6 @@ query uncapped_all($q: String) {
     );
 }
 
-// Characterization: fuzzy() does NOT match under the default tokenizer/index in
-// this setup — a one-edit typo ("Introductio" for "Introduction") returns no
-// rows. (`search`/`match_text` DO work, so FTS itself is fine; fuzzy term
-// queries specifically are inert here.) This pins that documented limitation
-// instead of leaving fuzzy silently unasserted: if a Lance/tokenizer change
-// makes fuzzy match, this turns red and should be promoted to a real
-// matched-set + exclusion golden.
-#[tokio::test]
-#[serial]
-async fn fuzzy_does_not_match_under_default_tokenizer() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
-    let r = query_main(
-        &mut db,
-        SEARCH_QUERIES,
-        "fuzzy_search",
-        &params(&[("$q", "Introductio")]),
-    )
-    .await
-    .unwrap();
-    assert!(
-        result_slugs(&r).is_empty(),
-        "fuzzy now matches — promote this to a real matched-set/exclusion golden"
-    );
-}
-
 // match_text is a FILTER on the body: assert the exact matched set, not contains.
 #[tokio::test]
 #[serial]
@@ -1882,13 +1865,9 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
     db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     let original_rows = dataset.count_rows(None).await.unwrap();
     assert!(original_rows > 0);
-    for query in [
-        "text_search",
-        "fuzzy_search",
-        "phrase_search",
-        "bm25_search",
-        "rrf_two_fts",
-    ] {
+    // (fuzzy_search is absent: it dies at typecheck with T25 before the
+    // certification gate can fire.)
+    for query in ["text_search", "phrase_search", "bm25_search", "rrf_two_fts"] {
         let error = query_main(
             &mut db,
             SEARCH_QUERIES,

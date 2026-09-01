@@ -682,9 +682,20 @@ return { $p.name }
 }
 
 #[test]
-fn test_fuzzy_max_edits_param_ok() {
+fn test_fuzzy_rejected_with_t25() {
+    // fuzzy() is retired: it parses (so the diagnostic is T25, not a parse
+    // error) and every use — with or without max_edits — fails typecheck.
     let catalog = setup();
-    let qf = parse_query(
+    for source in [
+        r#"
+query q($q: String) {
+match {
+    $p: Person
+    fuzzy($p.name, $q)
+}
+return { $p.name }
+}
+"#,
         r#"
 query q($q: String, $m: I64) {
 match {
@@ -694,29 +705,16 @@ match {
 return { $p.name }
 }
 "#,
-    )
-    .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    assert!(ctx.bindings.contains_key("p"));
-}
-
-#[test]
-fn test_fuzzy_rejects_non_integer_max_edits() {
-    let catalog = setup();
-    let qf = parse_query(
-        r#"
-query q($q: String, $m: F64) {
-match {
-    $p: Person
-    fuzzy($p.name, $q, $m)
-}
-return { $p.name }
-}
-"#,
-    )
-    .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
-    assert!(err.to_string().contains("T19"));
+    ] {
+        let qf = parse_query(source).unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("T25"), "expected a T25 diagnostic, got: {msg}");
+        assert!(
+            msg.contains("retired"),
+            "the diagnostic must say the form is retired, got: {msg}"
+        );
+    }
 }
 
 #[test]
