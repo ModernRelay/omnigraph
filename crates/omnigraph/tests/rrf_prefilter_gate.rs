@@ -399,6 +399,85 @@ async fn oracle_admission_sweep_prefilter_equals_postfilter() {
     assert_plans_equivalent(&mut db, "bm25_secondary_position", &hybrid_params).await;
 }
 
+/// Stats-sensitive corpus for `stats_sensitive_corpus_plans_agree`: s-00..s-03
+/// are eligible (`ChunkOfArtifact` → art-0), s-04..s-11 only shape the corpus
+/// statistics. Per-row (alpha, beta, gamma, delta, pad) term counts; the pad
+/// tokens are unique per doc, so they vary document length without touching
+/// the query terms' document frequencies. df(alpha) = df(gamma) = 9
+/// corpus-wide but 1 inside the eligible subset; df(beta) = df(delta) = 3
+/// both corpus-wide and inside it — the alpha/beta (and gamma/delta) IDF
+/// order flips between the two stats sources.
+fn stats_seed_data() -> String {
+    let profiles: [(usize, usize, usize, usize, usize); 12] = [
+        (3, 0, 0, 1, 4),  // s-00: the subset's only alpha carrier
+        (0, 2, 0, 2, 9),  // s-01
+        (0, 3, 2, 0, 1),  // s-02: the subset's only gamma carrier
+        (0, 1, 0, 2, 14), // s-03
+        (1, 0, 1, 0, 3),  // s-04..s-11: alpha+gamma common outside the subset
+        (1, 0, 1, 0, 4),
+        (1, 0, 1, 0, 5),
+        (1, 0, 1, 0, 6),
+        (1, 0, 1, 0, 7),
+        (1, 0, 1, 0, 8),
+        (1, 0, 1, 0, 9),
+        (1, 0, 1, 0, 10),
+    ];
+    let mut rows = vec![r#"{"type":"Artifact","data":{"slug":"art-0"}}"#.to_string()];
+    for (i, &(alpha, beta, gamma, delta, pad)) in profiles.iter().enumerate() {
+        let mut words: Vec<String> = Vec::new();
+        words.extend(std::iter::repeat_n("alpha".to_string(), alpha));
+        words.extend(std::iter::repeat_n("beta".to_string(), beta));
+        words.extend(std::iter::repeat_n("gamma".to_string(), gamma));
+        words.extend(std::iter::repeat_n("delta".to_string(), delta));
+        words.extend((0..pad).map(|j| format!("pad{i:02}x{j}")));
+        rows.push(format!(
+            r#"{{"type":"Chunk","data":{{"slug":"s-{i:02}","text":"{}","embedding":[{i}.0,0.0,0.0,0.0]}}}}"#,
+            words.join(" ")
+        ));
+    }
+    for chunk in 0..4 {
+        rows.push(format!(
+            r#"{{"edge":"ChunkOfArtifact","from":"s-{chunk:02}","to":"art-0","data":{{"id":"soa-{chunk:02}","label":"of"}}}}"#
+        ));
+    }
+    rows.join("\n")
+}
+
+async fn init_stats_db(dir: &tempfile::TempDir) -> Omnigraph {
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, GATE_SCHEMA).await.unwrap();
+    load_jsonl(&db, &stats_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    db
+}
+
+/// Ragnor's stats-sensitive oracle case (PR #587 review r1). The main
+/// fixture's single-term constant-length docs make arm rank order invariant
+/// to the BM25 stats source — every score is one shared IDF/avgdl factor
+/// times a per-doc term frequency — so those oracle pairs would stay green
+/// even if a future Lance regression derived IDF/avgdl from the prefiltered
+/// subset (the filter-dependent-scoring regression the gate's equivalence
+/// claim cannot survive). This corpus makes rank order stats-DEPENDENT:
+/// multi-term arms whose terms' document frequencies flip between corpus and
+/// eligible subset (`stats_seed_data`) and varying doc lengths, so
+/// subset-derived stats would reorder the surviving docs and turn this pair
+/// red. Tie-freedom under index-wide stats: same-term competitors are
+/// strictly dominance-ordered (higher tf AND shorter doc, or equal tf and
+/// shorter doc); cross-term pairs differ in tf, IDF, and doc length at once,
+/// so an exact BM25 float tie would require a designed coincidence — and the
+/// fixture is deterministic, so any such tie would fail identically on every
+/// run, never flake.
+#[tokio::test]
+#[serial]
+async fn stats_sensitive_corpus_plans_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_stats_db(&dir).await;
+    let stats_params = params(&[("$q1", "alpha beta"), ("$q2", "gamma delta")]);
+    assert_plans_equivalent(&mut db, "single_hop_both_bm25", &stats_params).await;
+}
+
 /// Red control (b), the superset fence's consumer-side observable: dropping
 /// ONE surviving id from the eligible set must break the equivalence
 /// relation. If this passes with the relation intact, the oracle cannot

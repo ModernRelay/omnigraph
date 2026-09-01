@@ -3351,6 +3351,15 @@ async fn expand_hydrate_and_align(
 /// index (index-search → take) rather than evaluating a string filter via
 /// DataFusion `InListEval`, which is O(N×M) and was measured at 72× the
 /// indexed cost on a 100k-node hop.
+///
+/// Likely future mechanism: Lance 11 grew
+/// `Scanner::with_row_addr_prefilter(RowAddrMask)` — the caller hands the
+/// scanner a precomputed row-address set directly, composing with FTS and
+/// ANN, instead of an expression Lance must evaluate (BTREE probe per id,
+/// re-done every query). Worth revisiting if the id→row-addr probe or the
+/// gate's id-count cap (`DEFAULT_RRF_GATE_MAX_IDS`, set where in-list
+/// evaluation starts losing) ever shows up as the bottleneck: a mask built
+/// from a cached id→addr mapping would lift both.
 fn id_in_list_expr(ids: &[String]) -> datafusion::prelude::Expr {
     use datafusion::prelude::{col, lit};
     let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
