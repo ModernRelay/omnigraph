@@ -18,6 +18,18 @@ for nearest-neighbor ordering.
 Filters in the `match` block are applied before ranking, so `limit 10` means the
 top ten matches that satisfy the graph and property filters.
 
+A `bm25()` ordering with a `limit` reads only the top-scoring matches (a small
+multiple of the limit) instead of every matching entity; when traversals or
+filters leave the limit unfilled, the query automatically rescans without the
+bound, so results are never truncated. Full-text rankings inside `rrf()` are
+never bounded this way: each full-text arm scans every matching entity, and
+fusion ranks the entities that satisfy the graph and property filters, so
+bounding an arm could silently drop an entity's contribution and shift fused
+results. A `nearest()` ranking inside `rrf()` is inherently top-k, as vector
+search always is: an entity outside its window adds no vector contribution
+to its fused score, so a traversal that drops the window's top matches can
+shift fused ranks.
+
 ## Vector search
 
 ```gq

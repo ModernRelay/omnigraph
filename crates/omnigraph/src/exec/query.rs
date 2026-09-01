@@ -1,6 +1,8 @@
 use super::*;
 
-use super::projection::{apply_filter, apply_ordering, project_return};
+use super::projection::{
+    apply_filter, apply_ordering, project_return, projections_have_aggregates,
+};
 
 /// Bundles the per-handle embedding client cell with the optional injected
 /// config (RFC-012 Phase 5) so the lazy init uses the injected config when
@@ -149,22 +151,58 @@ impl Omnigraph {
 // ─── Search mode ─────────────────────────────────────────────────────────────
 
 /// Describes how the query's ordering changes the scan mode.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct SearchMode {
     /// Vector ANN search: (variable, property, query_vector, k).
     nearest: Option<(String, String, Vec<f32>, usize)>,
     /// BM25 full-text search: (variable, property, query_text).
     bm25: Option<(String, String, String)>,
+    /// Row cap for the BM25 scan, the counterpart of `nearest`'s `k`; see
+    /// `bm25_scan_limit` for the semantics.
+    bm25_scan_limit: Option<usize>,
     /// RRF fusion: (primary, secondary, k_constant, limit).
     rrf: Option<RrfMode>,
 }
 
-#[derive(Debug)]
+impl SearchMode {
+    /// This mode with the BM25 scan cap cleared (only a standalone `bm25()`
+    /// ordering ever carries one — `rrf()` arms are never capped, see
+    /// `extract_sub_search_mode`). Any future scan cap must be cleared here
+    /// too.
+    fn to_uncapped(&self) -> Self {
+        Self {
+            bm25_scan_limit: None,
+            ..self.clone()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct RrfMode {
     primary: Box<SearchMode>,
     secondary: Box<SearchMode>,
     k: u32,
     limit: usize,
+}
+
+/// Multiplier on the query's limit for a capped BM25 scan; trades scan width
+/// against how often the uncapped retry is needed (see `execute_query`).
+const BM25_SCAN_OVERFETCH_FACTOR: usize = 4;
+
+/// Row cap for the BM25 scan, or `None` to scan every matching document.
+/// `None` for a limitless query, and for any aggregate return: an aggregate's
+/// value is computed over the scanned rows, so a capped scan would change the
+/// answer, not just the cost. Standalone `bm25()` orderings only — `rrf()`
+/// arms never call this (see `extract_sub_search_mode`).
+fn bm25_scan_limit(ir: &QueryIR) -> Option<usize> {
+    if projections_have_aggregates(&ir.return_exprs) {
+        return None;
+    }
+    ir.limit.map(|rows| {
+        usize::try_from(rows)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(BM25_SCAN_OVERFETCH_FACTOR)
+    })
 }
 
 /// Extract search ordering mode from the IR.
@@ -188,9 +226,10 @@ async fn extract_search_mode(
                 ir, catalog, variable, property, query, params, embedding,
             )
             .await?;
-            let k = ir.limit.ok_or_else(|| {
+            let k = usize::try_from(ir.limit.ok_or_else(|| {
                 OmniError::manifest("nearest() ordering requires a limit clause".to_string())
-            })? as usize;
+            })?)
+            .unwrap_or(usize::MAX);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
                 ..Default::default()
@@ -213,6 +252,7 @@ async fn extract_search_mode(
             })?;
             Ok(SearchMode {
                 bm25: Some((var, prop, text)),
+                bm25_scan_limit: bm25_scan_limit(ir),
                 ..Default::default()
             })
         }
@@ -221,19 +261,20 @@ async fn extract_search_mode(
             secondary,
             k,
         } => {
-            let limit = ir.limit.ok_or_else(|| {
+            let limit = usize::try_from(ir.limit.ok_or_else(|| {
                 OmniError::manifest("rrf() ordering requires a limit clause".to_string())
-            })? as usize;
+            })?)
+            .unwrap_or(usize::MAX);
             let k_val = k
                 .as_ref()
                 .and_then(|e| resolve_to_int(e, params))
-                .unwrap_or(60) as u32;
+                .map(|k| u32::try_from(k).unwrap_or(u32::MAX))
+                .unwrap_or(60);
 
             let primary_mode =
-                extract_sub_search_mode(ir, primary, params, catalog, ir.limit, embedding).await?;
+                extract_sub_search_mode(ir, primary, params, catalog, embedding).await?;
             let secondary_mode =
-                extract_sub_search_mode(ir, secondary, params, catalog, ir.limit, embedding)
-                    .await?;
+                extract_sub_search_mode(ir, secondary, params, catalog, embedding).await?;
 
             Ok(SearchMode {
                 rrf: Some(RrfMode {
@@ -255,7 +296,6 @@ async fn extract_sub_search_mode(
     expr: &IRExpr,
     params: &ParamMap,
     catalog: &Catalog,
-    limit: Option<u64>,
     embedding: &EmbeddingResolver<'_>,
 ) -> Result<SearchMode> {
     match expr {
@@ -268,7 +308,10 @@ async fn extract_sub_search_mode(
                 ir, catalog, variable, property, query, params, embedding,
             )
             .await?;
-            let k = limit.unwrap_or(100) as usize;
+            let k = ir
+                .limit
+                .map(|rows| usize::try_from(rows).unwrap_or(usize::MAX))
+                .unwrap_or(100);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
                 ..Default::default()
@@ -289,6 +332,12 @@ async fn extract_sub_search_mode(
             let text = resolve_to_string(query, params).ok_or_else(|| {
                 OmniError::manifest("bm25 query must resolve to a string".to_string())
             })?;
+            // Never capped: an arm's cap window would be filled by text score
+            // before traversals run, so join-ineligible rows can starve the
+            // arm out of the fusion while the fused row count stays full — no
+            // count-based retry can detect it, and the missing contributions
+            // shift fused ranks (PR #574 review). Fusion needs the arm's
+            // complete ranking.
             Ok(SearchMode {
                 bm25: Some((var, prop, text)),
                 ..Default::default()
@@ -467,11 +516,53 @@ pub async fn execute_query(
 
     let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
 
-    // RRF requires forked execution
+    // RRF requires forked execution. Its bm25 arms are never capped (see
+    // `extract_sub_search_mode`), so no under-fill retry arises for it.
     if let Some(ref rrf) = search_mode.rrf {
-        return execute_rrf_query(ir, params, snapshot, graph_index, catalog, rrf).await;
+        return execute_rrf_fusion(ir, params, snapshot, graph_index, catalog, rrf).await;
     }
 
+    let result_batch =
+        execute_query_once(ir, params, snapshot, graph_index, catalog, &search_mode).await?;
+
+    // A capped BM25 scan can under-fill: rows that survive the scan are then
+    // dropped by a traversal with no matching edge or by a filter that could
+    // not be pushed into it. Retry uncapped so a short answer is never served
+    // in place of a complete one. The row count cannot distinguish cap
+    // starvation from a corpus with fewer matches than `limit`, so such
+    // queries pay the double run on every execution. (Aggregate returns are
+    // never capped — see `bm25_scan_limit` — so no retry arises for them.)
+    if search_mode.bm25_scan_limit.is_some()
+        && ir
+            .limit
+            .is_some_and(|limit| (result_batch.num_rows() as u64) < limit)
+    {
+        tracing::debug!(
+            limit = ir.limit,
+            capped_rows = result_batch.num_rows(),
+            "bm25 scan cap under-filled; retrying uncapped"
+        );
+        crate::instrumentation::record_bm25_uncapped_retry();
+        let uncapped = search_mode.to_uncapped();
+        let retried =
+            execute_query_once(ir, params, snapshot, graph_index, catalog, &uncapped).await?;
+        return Ok(QueryResult::new(retried.schema(), vec![retried]));
+    }
+
+    Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
+}
+
+/// One pass of a non-RRF query: pipeline, projection, ordering, limit.
+/// Separate from `execute_query` so the under-fill retry can rerun it with a
+/// different `search_mode`.
+async fn execute_query_once(
+    ir: &QueryIR,
+    params: &ParamMap,
+    snapshot: &Snapshot,
+    graph_index: &GraphIndexHandle<'_>,
+    catalog: &Catalog,
+    search_mode: &SearchMode,
+) -> Result<RecordBatch> {
     let needed_columns = collect_needed_columns(ir);
     let mut wide: Option<RecordBatch> = None;
     execute_pipeline(
@@ -481,21 +572,18 @@ pub async fn execute_query(
         graph_index,
         catalog,
         &mut wide,
-        &search_mode,
+        search_mode,
         &needed_columns,
     )
     .await?;
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
 
     // Project return expressions
-    let has_aggregates = ir
-        .return_exprs
-        .iter()
-        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
+    let has_aggregates = projections_have_aggregates(&ir.return_exprs);
     let mut result_batch = project_return(&wide_batch, &ir.return_exprs, params)?;
 
     // Apply ordering (skip if search mode already ordered the results)
-    if !ir.order_by.is_empty() && !is_search_ordered(&search_mode) {
+    if !ir.order_by.is_empty() && !is_search_ordered(search_mode) {
         result_batch = if has_aggregates {
             apply_ordering(result_batch.clone(), &ir.order_by, &result_batch, params)?
         } else {
@@ -509,7 +597,7 @@ pub async fn execute_query(
         result_batch = result_batch.slice(0, len);
     }
 
-    Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
+    Ok(result_batch)
 }
 
 /// Check if the search mode already returns results in the correct order.
@@ -517,8 +605,11 @@ fn is_search_ordered(search_mode: &SearchMode) -> bool {
     search_mode.nearest.is_some() || search_mode.bm25.is_some()
 }
 
-/// Execute a query with RRF (Reciprocal Rank Fusion) ordering.
-async fn execute_rrf_query(
+/// One RRF pass: run both arms, fuse their ranks, reconstruct and limit.
+///
+/// INPUT CONTRACT: bm25 arms are complete rankings, never capped — see
+/// `extract_sub_search_mode`. (The `nearest` arm was always truncated at `k`.)
+async fn execute_rrf_fusion(
     ir: &QueryIR,
     params: &ParamMap,
     snapshot: &Snapshot,
@@ -526,6 +617,10 @@ async fn execute_rrf_query(
     catalog: &Catalog,
     rrf: &RrfMode,
 ) -> Result<QueryResult> {
+    debug_assert!(
+        rrf.primary.bm25_scan_limit.is_none() && rrf.secondary.bm25_scan_limit.is_none(),
+        "rrf arms must be complete rankings (see extract_sub_search_mode)"
+    );
     let mut needed_columns = collect_needed_columns(ir);
     fail_open_rrf_leg_targets(&mut needed_columns, rrf);
 
@@ -2806,12 +2901,30 @@ async fn execute_node_scan(
             // Apply BM25 full-text search if this variable is the target
             if let Some((ref var, ref prop, ref text)) = search_mode.bm25 {
                 if var == variable {
-                    let fts_query = lance_index::scalar::FullTextSearchQuery::new(text.clone())
+                    let mut fts_query = lance_index::scalar::FullTextSearchQuery::new(text.clone())
                         .with_column(prop.clone())
                         .map_err(|error| OmniError::storage_context("fts with_column", error))?;
+                    // Cap the ranked FTS scan (issue #563): unbounded, Lance
+                    // hydrates every matching document, and a `limit`ed ranked
+                    // read materializes the whole matched corpus past Arrow's
+                    // 2 GiB i32 string-offset ceiling. Lance returns rows
+                    // score-descending (the IR's declared order direction is
+                    // ignored engine-wide), so up to score ties the capped
+                    // rows are the uncapped scan's prefix. This runs after the
+                    // search()-filter loop above and Lance's full_text_search
+                    // REPLACES the scanner's query, so the capped one wins; a
+                    // search() filter without bm25 ordering stays unbounded.
+                    if let Some(rows) = search_mode.bm25_scan_limit {
+                        // A negative limit would mean unlimited to Lance
+                        // (it casts `as usize`); saturate instead.
+                        fts_query = fts_query.limit(Some(i64::try_from(rows).unwrap_or(i64::MAX)));
+                    }
                     scanner
                         .full_text_search(fts_query)
                         .map_err(|error| OmniError::storage_context("full_text_search", error))?;
+                    // No target_parallelism(1) pin needed here, unlike the
+                    // nearest arm above: the FTS plan sorts globally with a
+                    // fetch and emits a single partition.
                 }
             }
             Ok(())
@@ -2821,6 +2934,16 @@ async fn execute_node_scan(
     .try_collect::<Vec<RecordBatch>>()
     .await
     .map_err(OmniError::storage)?;
+
+    if search_mode
+        .bm25
+        .as_ref()
+        .is_some_and(|(var, ..)| var == variable)
+    {
+        crate::instrumentation::record_bm25_scan_rows(
+            batches.iter().map(|b| b.num_rows() as u64).sum(),
+        );
+    }
 
     let scan_result = if batches.is_empty() {
         // Build the schema the scan would have produced (the pruned
