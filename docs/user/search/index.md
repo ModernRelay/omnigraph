@@ -48,7 +48,10 @@ queries and provider configuration.
 
 IVF vector searches use 20 probes by default. Set `OMNIGRAPH_ANN_NPROBES` to a
 positive integer to tune the probe budget for a deployment; larger values can
-improve recall at the cost of latency.
+improve recall at the cost of latency. A filtered nearest query that still
+returns fewer than its requested limit after the bounded pass retries once
+without a maximum probe cap, so filtering cannot silently turn the limit into
+a lower row budget.
 
 ## Full-text search
 

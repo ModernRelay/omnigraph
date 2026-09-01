@@ -724,6 +724,106 @@ async fn filtered_nearest_clause_spelling_prefilters_like_inline() {
     assert_filtered_nearest_returns_hits("filtered_nearest_clause_range").await;
 }
 
+/// A bounded IVF search may exhaust its probe cap before Lance's late search
+/// reaches partitions containing filtered rows. The graph-level optimize path
+/// creates the multi-partition shape here (one initial IVF partition, a range
+/// delete, then optimize), so this covers the real engine scanner rather than
+/// only the Lance API surface.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn filtered_nearest_retries_after_optimized_ivf_underfill() {
+    const ROWS: usize = 20_000;
+
+    fn rows() -> String {
+        (0..ROWS)
+            .map(|row| {
+                let keep = row >= 19_000;
+                let drop = (16_000..19_000).contains(&row);
+                format!(
+                    r#"{{"type":"Doc","data":{{"slug":"n{row:05}","keep":{keep},"drop":{drop},"embedding":[{row}.0,0.0,0.0,0.0]}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    let schema = r#"
+node Doc {
+    slug: String @key
+    keep: Bool @index
+    drop: Bool @index
+    embedding: Vector(4) @index
+}
+"#;
+    let queries = r#"
+query filtered_nearest($q: Vector(4)) {
+    match { $d: Doc { keep: true } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+"#;
+    let delete_query = r#"
+query delete_middle() {
+    delete Doc where drop = true
+}
+"#;
+
+    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, &rows(), LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+    let deleted = mutate_main(&mut db, delete_query, "delete_middle", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(deleted.affected_nodes, 3_000);
+    db.optimize().await.unwrap();
+
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "filtered_nearest",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.num_rows(), 10);
+    assert_eq!(
+        probes
+            .ann_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a short bounded IVF pass must retry without a maximum probe cap"
+    );
+    assert_eq!(
+        probes
+            .ann_min_nprobes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        probes
+            .ann_max_nprobes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the effective retry budget must record maximum_nprobes=None"
+    );
+    assert_eq!(
+        result_slugs(&result),
+        (19_000..19_010)
+            .map(|row| format!("n{row:05}"))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn nearest_returns_k_closest() {

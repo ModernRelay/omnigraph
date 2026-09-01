@@ -155,6 +155,11 @@ impl Omnigraph {
 struct SearchMode {
     /// Vector ANN search: (variable, property, query_vector, k).
     nearest: Option<(String, String, Vec<f32>, usize)>,
+    /// Probe budget for the nearest scan. `maximum = None` is the completeness
+    /// retry: Lance may search every partition when the minimum pass is short.
+    ann_probe_budget: Option<AnnProbeBudget>,
+    /// Whether a scalar filter is pushed into the nearest scan's prefilter.
+    ann_prefiltered: bool,
     /// BM25 full-text search: (variable, property, query_text).
     bm25: Option<(String, String, String)>,
     /// Row cap for the BM25 scan, the counterpart of `nearest`'s `k`; see
@@ -162,6 +167,21 @@ struct SearchMode {
     bm25_scan_limit: Option<usize>,
     /// RRF fusion: (primary, secondary, k_constant, limit).
     rrf: Option<RrfMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnnProbeBudget {
+    minimum: usize,
+    maximum: Option<usize>,
+}
+
+impl AnnProbeBudget {
+    fn bounded(n: usize) -> Self {
+        Self {
+            minimum: n,
+            maximum: Some(n),
+        }
+    }
 }
 
 impl SearchMode {
@@ -172,6 +192,10 @@ impl SearchMode {
     fn to_uncapped(&self) -> Self {
         Self {
             bm25_scan_limit: None,
+            ann_probe_budget: self.ann_probe_budget.map(|budget| AnnProbeBudget {
+                maximum: None,
+                ..budget
+            }),
             ..self.clone()
         }
     }
@@ -232,6 +256,8 @@ async fn extract_search_mode(
             .unwrap_or(usize::MAX);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
+                ann_probe_budget: Some(AnnProbeBudget::bounded(ann_nprobes())),
+                ann_prefiltered: has_scalar_filter_for_variable(&ir.pipeline, variable),
                 ..Default::default()
             })
         }
@@ -314,6 +340,7 @@ async fn extract_sub_search_mode(
                 .unwrap_or(100);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
+                ann_probe_budget: Some(AnnProbeBudget::bounded(ann_nprobes())),
                 ..Default::default()
             })
         }
@@ -549,6 +576,33 @@ pub async fn execute_query(
         return Ok(QueryResult::new(retried.schema(), vec![retried]));
     }
 
+    // A bounded ANN scan can under-fill after prefiltering: Lance's late
+    // search is allowed to stop at maximum_nprobes even when fewer than k
+    // matching rows were found. Retry once with the same minimum budget and
+    // no maximum so a filtered nearest query preserves the limit contract.
+    // The row count cannot distinguish cap starvation from a corpus with
+    // fewer matches than `limit`, so short nearest queries pay the second
+    // scan just like capped BM25 queries do.
+    if search_mode
+        .ann_probe_budget
+        .is_some_and(|budget| budget.maximum.is_some())
+        && search_mode.ann_prefiltered
+        && ir
+            .limit
+            .is_some_and(|limit| (result_batch.num_rows() as u64) < limit)
+    {
+        tracing::debug!(
+            limit = ir.limit,
+            capped_rows = result_batch.num_rows(),
+            "ANN scan cap under-filled; retrying without a maximum probe cap"
+        );
+        crate::instrumentation::record_ann_uncapped_retry();
+        let uncapped = search_mode.to_uncapped();
+        let retried =
+            execute_query_once(ir, params, snapshot, graph_index, catalog, &uncapped).await?;
+        return Ok(QueryResult::new(retried.schema(), vec![retried]));
+    }
+
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
 }
 
@@ -603,6 +657,22 @@ async fn execute_query_once(
 /// Check if the search mode already returns results in the correct order.
 fn is_search_ordered(search_mode: &SearchMode) -> bool {
     search_mode.nearest.is_some() || search_mode.bm25.is_some()
+}
+
+fn has_scalar_filter_for_variable(pipeline: &[IROp], variable: &str) -> bool {
+    pipeline.iter().any(|op| match op {
+        IROp::NodeScan {
+            variable: bound,
+            filters,
+            ..
+        } if bound == variable => filters.iter().any(|filter| !is_search_filter(filter)),
+        IROp::Filter(filter) if !is_search_filter(filter) => {
+            let variables = filter_variables(filter);
+            variables.len() == 1 && variables.contains(variable)
+        }
+        IROp::AntiJoin { inner, .. } => has_scalar_filter_for_variable(inner, variable),
+        _ => false,
+    })
 }
 
 /// One RRF pass: run both arms, fuse their ranks, reconstruct and limit.
@@ -2886,7 +2956,14 @@ async fn execute_node_scan(
                     // Lance's Rust scanner has no maximum probe default on
                     // this revision, so without an explicit budget ANN can
                     // probe every IVF partition and become a full scan.
-                    scanner.nprobes(ann_nprobes());
+                    let budget = search_mode
+                        .ann_probe_budget
+                        .unwrap_or_else(|| AnnProbeBudget::bounded(ann_nprobes()));
+                    scanner.minimum_nprobes(budget.minimum);
+                    if let Some(maximum) = budget.maximum {
+                        scanner.maximum_nprobes(maximum);
+                    }
+                    crate::instrumentation::record_ann_probe_budget(budget.minimum, budget.maximum);
                     // Lance 11's late payload `LanceRead` drops the sorted
                     // candidate stream's ordering metadata. With more than
                     // one output partition, execute_plan may therefore use a
@@ -3399,7 +3476,7 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch>
 
 #[cfg(test)]
 mod ann_probe_budget_tests {
-    use super::{DEFAULT_ANN_NPROBES, ann_nprobes_from};
+    use super::{AnnProbeBudget, DEFAULT_ANN_NPROBES, SearchMode, ann_nprobes_from};
 
     #[test]
     fn missing_value_uses_pylance_aligned_default() {
@@ -3416,6 +3493,24 @@ mod ann_probe_budget_tests {
         for value in [Some("0"), Some("not-a-number"), Some("")] {
             assert_eq!(ann_nprobes_from(value), DEFAULT_ANN_NPROBES);
         }
+    }
+
+    #[test]
+    fn uncapped_retry_preserves_minimum_and_clears_only_maximum() {
+        let mode = SearchMode {
+            nearest: Some(("d".into(), "embedding".into(), vec![0.0], 10)),
+            ann_probe_budget: Some(AnnProbeBudget::bounded(7)),
+            ..Default::default()
+        };
+
+        let retry = mode.to_uncapped();
+        assert_eq!(
+            retry.ann_probe_budget,
+            Some(AnnProbeBudget {
+                minimum: 7,
+                maximum: None,
+            })
+        );
     }
 }
 

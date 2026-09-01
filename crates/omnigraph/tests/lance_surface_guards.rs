@@ -2245,6 +2245,31 @@ async fn vector_optimize_after_delete_keeps_stable_ids_and_addresses_aligned() {
         "the guard must exercise the split/reshuffle path fixed by lance#7704; stats: {stats}"
     );
 
+    // `nprobes` is a hard cap, while a minimum-only budget permits Lance's
+    // late search to continue when a prefilter leaves the initial probes short.
+    // Pin both plan shapes because the engine uses the former for its bounded
+    // pass and the latter for its completeness retry.
+    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+    let mut bounded = dataset.scan();
+    bounded.nearest("vector", &query, 10).unwrap();
+    bounded.minimum_nprobes(1).maximum_nprobes(1);
+    let bounded_plan = bounded.create_plan().await.unwrap();
+    let bounded_plan = format!("{}", displayable(bounded_plan.as_ref()).indent(true));
+    assert!(
+        bounded_plan.contains("minimum_nprobes=1, maximum_nprobes=Some(1)"),
+        "bounded ANN scans must carry an explicit maximum probe cap; plan:\n{bounded_plan}"
+    );
+
+    let mut late = dataset.scan();
+    late.nearest("vector", &query, 10).unwrap();
+    late.minimum_nprobes(1);
+    let late_plan = late.create_plan().await.unwrap();
+    let late_plan = format!("{}", displayable(late_plan.as_ref()).indent(true));
+    assert!(
+        late_plan.contains("minimum_nprobes=1, maximum_nprobes=None"),
+        "minimum-only ANN retries must leave late search uncapped; plan:\n{late_plan}"
+    );
+
     let expected_ids = (0..ROWS as i32)
         .filter(|id| id % 5 != 0)
         .collect::<Vec<_>>();

@@ -169,8 +169,13 @@ impl ScanTuning<'_> {
         Ok(self)
     }
 
-    pub(crate) fn nprobes(&mut self, n: usize) -> &mut Self {
-        self.scanner.nprobes(n);
+    pub(crate) fn minimum_nprobes(&mut self, n: usize) -> &mut Self {
+        self.scanner.minimum_nprobes(n);
+        self
+    }
+
+    pub(crate) fn maximum_nprobes(&mut self, n: usize) -> &mut Self {
+        self.scanner.maximum_nprobes(n);
         self
     }
 
