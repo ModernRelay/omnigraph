@@ -15,9 +15,17 @@ contains a comma could smuggle the waiver token; creating labels needs the
 same triage rights as applying the real one. Run from the repository root:
 AGENTS.md and git are resolved relative to the working directory.
 
-A closed issue N is satisfied by an addition under `crates/*/tests/**`:
-an added file whose path contains `issue_N`, or an added line containing
-`issue_N` or `issue: N`, where N is followed by a non-digit or the end.
+A closed issue N is satisfied only by an EXECUTABLE addition under
+`crates/*/tests/**`: an added `.gqt` case in the logic-test corpus whose
+file name carries `issue_N` (the harness executes it and enforces the
+name-to-header agreement), an added `# issue: N` header line in a corpus
+`.gqt`, or an added Rust function definition whose name carries `issue_N`
+(the `_issue_NNN` convention; workspace clippy refuses a dead fn).
+Comments, strings, and fixture lines mentioning the issue do not count.
+N is always followed by a non-digit or the end. Named residue: a
+definition inside an added block comment or raw string still matches
+(line-based parsing cannot see multi-line context); that evasion, like a
+test that asserts nothing, is deliberate and stays with review.
 
 Exit 0 exactly when every keyword-closed issue has its match or the PR
 carries `no-repro`, and AGENTS.md still names the logic-test corpus path.
@@ -26,6 +34,8 @@ Usage:
   check-fix-regression.py --body-file F --labels "a,b" --range BASE...HEAD
   check-fix-regression.py --self-test
 """
+
+from __future__ import annotations
 
 import argparse
 import re
@@ -50,13 +60,26 @@ def issue_token(n: str) -> re.Pattern[str]:
     return re.compile(rf"issue_{n}(?!\d)")
 
 
-def issue_line_patterns(n: str) -> list[re.Pattern[str]]:
-    return [issue_token(n), re.compile(rf"issue: {n}(?!\d)")]
+CORPUS_DIR_PREFIX = "crates/omnigraph/tests/gq_logic_tests/"
+RUST_FN_DEF = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
+    r'(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z0-9_]+)'
+)
 
 
 def added_files(range_: str) -> list[str]:
     out = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=A", range_, "--", TEST_PATHSPEC],
+        [
+            "git",
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--name-only",
+            "--diff-filter=A",
+            range_,
+            "--",
+            TEST_PATHSPEC,
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -64,26 +87,77 @@ def added_files(range_: str) -> list[str]:
     return [line for line in out.stdout.splitlines() if line]
 
 
-def added_lines(range_: str) -> list[str]:
+def parse_diff(diff_text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Splits a -U0 diff into path-attributed added lines and bare removed
+    lines. A `+++ b/` marker counts as a file header only directly after a
+    `--- ` line: an added CONTENT line `++ b/x` also renders as `+++ b/x`,
+    and honoring it would let a diff spoof its own file attribution."""
+    current: str | None = None
+    previous = ""
+    added: list[tuple[str, str]] = []
+    removed: list[str] = []
+    for line in diff_text.splitlines():
+        if line.startswith("+++") and previous.startswith("--- "):
+            current = line[len("+++ b/") :] if line.startswith("+++ b/") else None
+        elif line.startswith("+") and not line.startswith("+++") and current is not None:
+            added.append((current, line[1:]))
+        elif line.startswith("-") and not line.startswith("---"):
+            removed.append(line[1:])
+        previous = line
+    return added, removed
+
+
+def diff_changes(range_: str) -> tuple[list[tuple[str, str]], list[str]]:
     out = subprocess.run(
-        ["git", "diff", "-U0", range_, "--", TEST_PATHSPEC],
+        ["git", "-c", "core.quotePath=false", "diff", "-U0", range_, "--", TEST_PATHSPEC],
         check=True,
         capture_output=True,
         text=True,
     )
-    return [
-        line[1:]
-        for line in out.stdout.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    ]
+    return parse_diff(out.stdout)
 
 
-def issue_satisfied(n: str, files: list[str], lines: list[str]) -> bool:
+def removed_fn_names(removed: list[str]) -> set[str]:
+    names = set()
+    for text in removed:
+        m = RUST_FN_DEF.match(text)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def issue_satisfied(
+    n: str,
+    files: list[str],
+    lines: list[tuple[str, str]],
+    removed_fns: frozenset[str] | set[str] = frozenset(),
+) -> bool:
     token = issue_token(n)
-    if any(token.search(path) for path in files):
-        return True
-    patterns = issue_line_patterns(n)
-    return any(p.search(line) for line in lines for p in patterns)
+    for path in files:
+        if corpus_case(path) and Path(path).name.startswith(f"issue_{n}_"):
+            return True
+    header = re.compile(rf"^\s*#\s*issue:\s*{n}(?!\d)\s*$")
+    test_target = re.compile(r"^crates/[^/]+/tests/[^/]+\.rs$")
+    for path, text in lines:
+        if corpus_case(path):
+            if header.match(text):
+                return True
+        elif test_target.match(path):
+            m = RUST_FN_DEF.match(text)
+            if (
+                m
+                and token.search(m.group(1))
+                and not m.group(1).startswith("_")
+                and m.group(1) not in removed_fns
+                and not text.rstrip().endswith(";")
+            ):
+                return True
+    return False
+
+
+def corpus_case(path: str) -> bool:
+    rest = path[len(CORPUS_DIR_PREFIX) :] if path.startswith(CORPUS_DIR_PREFIX) else ""
+    return bool(rest) and "/" not in rest and rest.endswith(".gqt")
 
 
 def check_agents_md() -> bool:
@@ -108,13 +182,14 @@ def run_gate(body: str, labels: list[str], range_: str) -> int:
         return 0 if ok else 1
     try:
         files = added_files(range_)
-        lines = added_lines(range_)
+        lines, removed = diff_changes(range_)
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or "").strip()
         print(f"FAIL: git diff {range_} failed: {stderr or e}")
         return 1
+    removed_fns = removed_fn_names(removed)
     for n in issues:
-        if issue_satisfied(n, files, lines):
+        if issue_satisfied(n, files, lines, removed_fns):
             print(f"ok: issue #{n} has a matching regression addition")
         else:
             print(
@@ -149,12 +224,77 @@ def self_test() -> int:
     for body, expected in cases:
         got = closed_issues(body)
         assert got == expected, f"closed_issues({body!r}) = {got}, expected {expected}"
-    assert issue_satisfied("563", ["crates/omnigraph/tests/gq_logic_tests/issue_563_x.gqt"], [])
-    assert not issue_satisfied("563", ["crates/omnigraph/tests/issue_5630_x.rs"], [])
-    assert issue_satisfied("563", [], ["fn t_issue_563_case() {"])
-    assert issue_satisfied("563", [], ["# issue: 563"])
-    assert not issue_satisfied("563", [], ["# issue: 5630"])
-    assert not issue_satisfied("563", [], ["# issue:563"])
+    corpus = "crates/omnigraph/tests/gq_logic_tests/issue_563_x.gqt"
+    rust = "crates/omnigraph/tests/search.rs"
+    assert issue_satisfied("563", [corpus], [])
+    assert not issue_satisfied("563", ["crates/omnigraph/tests/fixtures/issue_563_x.gqt"], [])
+    assert not issue_satisfied("563", ["crates/omnigraph/tests/repro_issue_563.rs"], [])
+    assert issue_satisfied("563", [], [(rust, "fn t_issue_563_case() {")])
+    assert issue_satisfied("563", [], [(rust, "    async fn repro_issue_563() {")])
+    assert not issue_satisfied("563", [], [(rust, "// see issue_563")])
+    assert not issue_satisfied("563", [], [(rust, "let s = \"issue_563\";")])
+    assert not issue_satisfied("563", [], [(rust, "fn t_issue_5630() {")])
+    assert issue_satisfied("563", [], [(corpus, "# issue: 563")])
+    assert not issue_satisfied("563", [], [(corpus, "# issue: 0563")])
+    assert not issue_satisfied("563", [], [(corpus, "# issue: 5630")])
+    assert not issue_satisfied("563", [], [(corpus, "issue: 563 in prose")])
+    assert not issue_satisfied(
+        "563", ["crates/omnigraph-cli/tests/gq_logic_tests/issue_563_x.gqt"], []
+    )
+    assert not issue_satisfied(
+        "563", ["crates/omnigraph/tests/gq_logic_tests/nested/issue_563_x.gqt"], []
+    )
+    assert not issue_satisfied(
+        "563", ["crates/omnigraph/tests/gq_logic_tests/regression_issue_563.gqt"], []
+    )
+    assert not issue_satisfied(
+        "563", [], [("crates/omnigraph/tests/fixtures/issue_563_gen.rs", "fn t_issue_563() {}")]
+    )
+    assert not issue_satisfied(
+        "563", [], [("crates/omnigraph/tests/helpers/mod.rs", "fn t_issue_563() {}")]
+    )
+    assert not issue_satisfied("563", [], [(rust, "fn _issue_563() {}")])
+    assert issue_satisfied("563", [], [(rust, "const fn check_issue_563() {}")])
+    assert not issue_satisfied("563", [], [(rust, "fn t_issue_563(&self);")])
+    assert not issue_satisfied(
+        "563", [], [(rust, "fn t_issue_563_case() {")], removed_fns={"t_issue_563_case"}
+    )
+
+    spoof_diff = "\n".join(
+        [
+            "diff --git a/crates/omnigraph/tests/search.rs b/crates/omnigraph/tests/search.rs",
+            "--- a/crates/omnigraph/tests/search.rs",
+            "+++ b/crates/omnigraph/tests/search.rs",
+            "@@ -0,0 +1,3 @@",
+            "+/*",
+            "+++ b/crates/omnigraph/tests/gq_logic_tests/fake.gqt",
+            "+# issue: 999",
+            "+*/",
+        ]
+    )
+    added, removed = parse_diff(spoof_diff)
+    assert all(path == "crates/omnigraph/tests/search.rs" for path, _ in added), added
+    assert not issue_satisfied("999", [], added)
+
+    multi_diff = "\n".join(
+        [
+            "diff --git a/a.gqt b/a.gqt",
+            "--- a/crates/omnigraph/tests/gq_logic_tests/a.gqt",
+            "+++ b/crates/omnigraph/tests/gq_logic_tests/a.gqt",
+            "@@ -0,0 +1 @@",
+            "+# issue: 7",
+            "diff --git a/old.rs b/old.rs",
+            "--- a/crates/omnigraph/tests/old.rs",
+            "+++ /dev/null",
+            "@@ -1,2 +0,0 @@",
+            "-fn t_issue_8_gone() {}",
+            "-fn keep() {}",
+        ]
+    )
+    added, removed = parse_diff(multi_diff)
+    assert added == [("crates/omnigraph/tests/gq_logic_tests/a.gqt", "# issue: 7")], added
+    assert removed_fn_names(removed) == {"t_issue_8_gone", "keep"}, removed
+
     print("self-test ok")
     return 0
 

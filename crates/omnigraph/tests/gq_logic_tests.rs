@@ -162,6 +162,12 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
                     let n = value.parse::<u64>().map_err(|_| {
                         format!("line {}: `# issue:` takes a number or `none`", idx + 1)
                     })?;
+                    if value != n.to_string() {
+                        return Err(format!(
+                            "line {}: `# issue:` number carries no sign or leading zeros",
+                            idx + 1
+                        ));
+                    }
                     IssueRef::Num(n)
                 });
             }
@@ -1918,6 +1924,14 @@ fn refuses_duplicate_issue_header() {
 fn refuses_empty_red_on_value() {
     let text = format!("# issue: 7\n# red_on:\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
     assert!(refusal("issue_7_x", &text).contains("needs a value"));
+}
+
+#[test]
+fn refuses_noncanonical_issue_header_number() {
+    let text = format!("# issue: 0563\n# red_on: 2026-01-01, red.\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    assert!(refusal("issue_563_x", &text).contains("no sign or leading zeros"));
+    let text = format!("# issue: +563\n# red_on: 2026-01-01, red.\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    assert!(refusal("issue_563_x", &text).contains("no sign or leading zeros"));
 }
 
 #[test]
