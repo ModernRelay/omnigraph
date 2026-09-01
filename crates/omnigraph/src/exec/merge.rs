@@ -397,11 +397,39 @@ async fn cursor_rows_equal(a: Option<&CursorRow>, b: Option<&CursorRow>) -> Resu
     }
 }
 
+/// Per-chunk decoded-byte target when hydrating sorted keys back into
+/// complete logical rows. Row widths are unknowable before the take, so chunk
+/// sizing is adaptive: seeded small, then steered by the measured bytes of
+/// the previous chunk. A single indivisible row wider than the target still
+/// hydrates alone — that is the point of the two-phase cursor; the staging
+/// writer's per-row envelope remains the authority for what a merge may
+/// actually write.
+const HYDRATION_CHUNK_TARGET_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
+/// First-chunk row count before any width measurement exists. Bounds the
+/// worst-case transient allocation to a few rows of the table's widest
+/// payload.
+const HYDRATION_CHUNK_SEED_ROWS: usize = 4;
+
+/// An id-ordered stream of one snapshot's complete rows, produced in two
+/// phases so no payload column ever reaches a SortExec input:
+///
+/// 1. a narrow bounded ordered scan sorts only `id` + `_rowid` + `_rowaddr`
+///    (a few dozen bytes per row, far below the ordered-scan single-row hard
+///    cap that a wide logical row can otherwise trip), then
+/// 2. sorted keys are hydrated back into complete rows via bounded
+///    `TakeBuilder` chunks against the same pinned dataset. Take preserves
+///    request order and refuses deleted rows when row addresses are
+///    requested, so hydrated rows stay aligned with the sorted keys.
 struct OrderedTableCursor {
-    stream: Option<std::pin::Pin<Box<DatasetRecordBatchStream>>>,
+    key_stream: Option<std::pin::Pin<Box<DatasetRecordBatchStream>>>,
     dataset: Option<Dataset>,
-    current_batch: Option<RecordBatch>,
-    current_row: usize,
+    table_key: String,
+    role: &'static str,
+    key_batch: Option<RecordBatch>,
+    key_row: usize,
+    hydrated: Option<RecordBatch>,
+    hydrated_row: usize,
+    next_chunk_rows: usize,
     peeked: Option<CursorRow>,
     /// When false, the adopt path builds the typed comparison unit only for
     /// common rows. New/deleted rows therefore avoid comparison work, while
@@ -410,41 +438,57 @@ struct OrderedTableCursor {
 }
 
 impl OrderedTableCursor {
-    async fn from_snapshot(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
-        Self::open(snapshot, table_key, true).await
+    async fn from_snapshot(
+        snapshot: &Snapshot,
+        table_key: &str,
+        role: &'static str,
+    ) -> Result<Self> {
+        Self::open(snapshot, table_key, role, true).await
     }
 
     /// Like `from_snapshot` but builds typed rows lazily for adopt-only
     /// equality. See `eager_signatures`.
-    async fn from_snapshot_lazy(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
-        Self::open(snapshot, table_key, false).await
+    async fn from_snapshot_lazy(
+        snapshot: &Snapshot,
+        table_key: &str,
+        role: &'static str,
+    ) -> Result<Self> {
+        Self::open(snapshot, table_key, role, false).await
     }
 
-    async fn open(snapshot: &Snapshot, table_key: &str, eager_signatures: bool) -> Result<Self> {
+    async fn open(
+        snapshot: &Snapshot,
+        table_key: &str,
+        role: &'static str,
+        eager_signatures: bool,
+    ) -> Result<Self> {
         let dataset = match snapshot.dataset(table_key) {
             Some(_) => Some(snapshot.open_lance_dataset(table_key).await?),
             None => None,
         };
-        Self::from_dataset(dataset, eager_signatures).await
-    }
-
-    async fn from_dataset(dataset: Option<Dataset>, eager_signatures: bool) -> Result<Self> {
-        Self::from_dataset_with(dataset, eager_signatures, None).await
+        Self::from_dataset_with(dataset, eager_signatures, None, table_key, role).await
     }
 
     /// An ordered cursor restricted to candidate row keys via an exact
     /// `id IN (...)` filter, so the three-way classification loop touches only
     /// rows whose fragments changed between the pinned versions.
-    async fn from_dataset_filtered(dataset: Option<Dataset>, filter: &str) -> Result<Self> {
-        Self::from_dataset_with(dataset, true, Some(filter)).await
+    async fn from_dataset_filtered(
+        dataset: Option<Dataset>,
+        filter: &str,
+        table_key: &str,
+        role: &'static str,
+    ) -> Result<Self> {
+        Self::from_dataset_with(dataset, true, Some(filter), table_key, role).await
     }
 
     async fn from_dataset_with(
         dataset: Option<Dataset>,
         eager_signatures: bool,
         filter: Option<&str>,
+        table_key: &str,
+        role: &'static str,
     ) -> Result<Self> {
-        let stream = if let Some(ds) = &dataset {
+        let key_stream = if let Some(ds) = &dataset {
             // A filtered scan is not a full-table scan; record no cursor-scan
             // probe, so probe-count assertions keep counting full walks only.
             if filter.is_none() {
@@ -456,18 +500,16 @@ impl OrderedTableCursor {
             Some(Box::pin(
                 crate::table_store::TableStore::scan_stream_with(
                     ds,
-                    None,
+                    Some(&["id"]),
                     filter,
                     Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
                     true,
                     |scanner| {
                         scanner.batch_size(KEYED_WRITE_MAX_ROWS);
                         scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
-                        // Blob columns must yield DESCRIPTORS (not payloads) for
-                        // the shared typed comparator's data-file identity, and
-                        // `_rowaddr` gives the owning fragment.
-                        scanner
-                            .blob_handling(lance_core::datatypes::BlobHandling::BlobsDescriptions);
+                        // `_rowaddr` addresses the hydration take against the
+                        // same pinned version; payload columns (including Blob
+                        // descriptors) arrive only through that take.
                         scanner.with_row_address();
                         Ok(())
                     },
@@ -479,10 +521,15 @@ impl OrderedTableCursor {
         };
 
         Ok(Self {
-            stream,
+            key_stream,
             dataset,
-            current_batch: None,
-            current_row: 0,
+            table_key: table_key.to_string(),
+            role,
+            key_batch: None,
+            key_row: 0,
+            hydrated: None,
+            hydrated_row: 0,
+            next_chunk_rows: HYDRATION_CHUNK_SEED_ROWS,
             peeked: None,
             eager_signatures,
         })
@@ -502,12 +549,50 @@ impl OrderedTableCursor {
         self.next_row().await
     }
 
+    /// Attach the table and snapshot role this cursor serves to a typed
+    /// resource failure. The generic bounded ordered-scan executor cannot know
+    /// which merge snapshot it was reading; this layer is the one that does.
+    fn with_scan_context(&self, error: OmniError) -> OmniError {
+        match error {
+            OmniError::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => OmniError::ResourceLimitExceeded {
+                resource: format!("{resource} for {} ({} snapshot)", self.table_key, self.role),
+                limit,
+                actual,
+            },
+            other => other,
+        }
+    }
+
+    /// Like [`Self::with_scan_context`], additionally naming the sorted-key id
+    /// range of the failing hydration chunk.
+    fn with_hydration_context(&self, error: OmniError, first_id: &str, last_id: &str) -> OmniError {
+        match error {
+            OmniError::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => OmniError::ResourceLimitExceeded {
+                resource: format!(
+                    "{resource} for {} ({} snapshot, rows '{first_id}'..='{last_id}')",
+                    self.table_key, self.role
+                ),
+                limit,
+                actual,
+            },
+            other => other,
+        }
+    }
+
     async fn next_row(&mut self) -> Result<Option<CursorRow>> {
         loop {
-            if let Some(batch) = &self.current_batch {
-                if self.current_row < batch.num_rows() {
-                    let row_index = self.current_row;
-                    self.current_row += 1;
+            if let Some(batch) = &self.hydrated {
+                if self.hydrated_row < batch.num_rows() {
+                    let row_index = self.hydrated_row;
+                    self.hydrated_row += 1;
                     let dataset = self.dataset.clone().ok_or_else(|| {
                         OmniError::manifest("cursor row missing source dataset".to_string())
                     })?;
@@ -524,26 +609,136 @@ impl OrderedTableCursor {
                         row_index,
                     }));
                 }
+                self.hydrated = None;
+                self.hydrated_row = 0;
             }
 
-            let Some(stream) = self.stream.as_mut() else {
+            if let Some(keys) = &self.key_batch {
+                if self.key_row < keys.num_rows() {
+                    self.hydrate_next_chunk().await?;
+                    continue;
+                }
+                self.key_batch = None;
+                self.key_row = 0;
+            }
+
+            let Some(stream) = self.key_stream.as_mut() else {
                 return Ok(None);
             };
             match stream.try_next().await {
                 Ok(Some(batch)) => {
-                    self.current_batch = Some(batch);
-                    self.current_row = 0;
+                    self.key_batch = Some(batch);
+                    self.key_row = 0;
                 }
                 Ok(None) => {
-                    self.stream = None;
-                    self.current_batch = None;
+                    self.key_stream = None;
                     return Ok(None);
                 }
                 Err(err) => {
-                    return Err(crate::table_store::TableStore::ordered_scan_error(err));
+                    return Err(self.with_scan_context(
+                        crate::table_store::TableStore::ordered_scan_error(err),
+                    ));
                 }
             }
         }
+    }
+
+    /// Hydrate the next bounded chunk of sorted keys into complete rows via a
+    /// row-address take against the pinned dataset. Blob columns come back as
+    /// descriptors (the typed comparator's identity unit); `_rowid` and
+    /// `_rowaddr` ride along for the comparator's Blob tie-break and
+    /// fragment-identity mapping.
+    async fn hydrate_next_chunk(&mut self) -> Result<()> {
+        let dataset = self
+            .dataset
+            .clone()
+            .ok_or_else(|| OmniError::manifest("cursor keys missing source dataset".to_string()))?;
+        let keys = self
+            .key_batch
+            .as_ref()
+            .ok_or_else(|| OmniError::manifest_internal("hydration without a key batch"))?;
+        let start = self.key_row;
+        let len = self
+            .next_chunk_rows
+            .clamp(1, keys.num_rows().saturating_sub(start).max(1));
+        let addresses_column = keys
+            .column_by_name(lance_core::ROW_ADDR)
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::manifest_internal("ordered cursor key batch is missing row addresses")
+            })?;
+        let addresses: Vec<u64> = (start..start + len)
+            .map(|row| addresses_column.value(row))
+            .collect();
+
+        let shared = Arc::new(dataset.clone());
+        let mut plan = lance::dataset::ProjectionRequest::from_schema(shared.schema().clone())
+            .into_projection_plan(Arc::clone(&shared))
+            .map_err(OmniError::storage)?;
+        // The comparator's Blob payload tie-break reads `_rowid` from the row
+        // slice; request it as an output column exactly like the take path
+        // itself does for `_rowaddr`.
+        plan.physical_projection.with_row_id = true;
+        plan.physical_projection.blob_handling =
+            lance_core::datatypes::BlobHandling::BlobsDescriptions;
+        plan.requested_output_expr
+            .push(lance_datafusion::projection::OutputColumn {
+                expr: datafusion::prelude::Expr::Column(datafusion::common::Column::from_name(
+                    lance_core::ROW_ID,
+                )),
+                name: lance_core::ROW_ID.to_string(),
+            });
+        // The failing chunk's sorted key range is the only stable row identity
+        // safely available at this layer; carry it so an operator can find the
+        // offending rows without replaying the merge.
+        let first_id = row_id_at(keys, start)?;
+        let last_id = row_id_at(keys, start + len - 1)?;
+        let hydrated =
+            lance::dataset::TakeBuilder::try_new_from_addresses(shared, addresses, Arc::new(plan))
+                .map_err(OmniError::storage)?
+                .with_row_address(true)
+                .execute()
+                .await
+                .map_err(|error| {
+                    self.with_hydration_context(OmniError::storage(error), &first_id, &last_id)
+                })?;
+
+        // `with_row_address` already makes Lance refuse a take that lost rows;
+        // re-check key identity so a misaligned hydration can never feed the
+        // classification loop silently.
+        if hydrated.num_rows() != len {
+            return Err(OmniError::manifest_internal(format!(
+                "ordered cursor hydration for {} ({} snapshot) returned {} rows for {} keys",
+                self.table_key,
+                self.role,
+                hydrated.num_rows(),
+                len
+            )));
+        }
+        for row in 0..len {
+            if row_id_at(&hydrated, row)? != row_id_at(keys, start + row)? {
+                return Err(OmniError::manifest_internal(format!(
+                    "ordered cursor hydration for {} ({} snapshot) returned a row out of key \
+                     order",
+                    self.table_key, self.role
+                )));
+            }
+        }
+
+        let bytes = u64::try_from(hydrated.get_array_memory_size()).unwrap_or(u64::MAX);
+        crate::instrumentation::record_ordered_cursor_hydration(len, bytes);
+        // Steer the next chunk toward the byte target with the measured
+        // average width. A wide row shrinks the next chunk (down to a single
+        // indivisible row); cheap rows grow it back toward the row ceiling.
+        let average = (bytes / len as u64).max(1);
+        self.next_chunk_rows = usize::try_from(HYDRATION_CHUNK_TARGET_BYTES / average)
+            .unwrap_or(KEYED_WRITE_MAX_ROWS)
+            .clamp(1, KEYED_WRITE_MAX_ROWS);
+
+        self.key_row = start + len;
+        self.hydrated = Some(hydrated);
+        self.hydrated_row = 0;
+        Ok(())
     }
 }
 
@@ -1310,8 +1505,9 @@ async fn compute_adopt_delta(
         StagedTableWriter::new(&format!("{}_adopt_append", table_key), schema.clone())?;
     let mut upsert_writer = StagedTableWriter::new(&format!("{}_adopt_upsert", table_key), schema)?;
     let mut deleted_ids = DeleteIdChunks::default();
-    let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key).await?;
-    let mut source = OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key).await?;
+    let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key, "base").await?;
+    let mut source =
+        OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key, "source").await?;
 
     let mut needs_update = false;
 
@@ -1400,8 +1596,9 @@ async fn collect_adopt_blob_selection(
     source_snapshot: &Snapshot,
     blob_selection: &mut crate::table_store::PersistedBlobSelection,
 ) -> Result<()> {
-    let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key).await?;
-    let mut source = OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key).await?;
+    let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key, "base").await?;
+    let mut source =
+        OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key, "source").await?;
 
     loop {
         let base_row = base.peek_cloned().await?;
@@ -1583,9 +1780,11 @@ async fn stage_streaming_table_merge_walk(
     let materializer = target_db.blob_materializer();
     let mut delta_writer = StagedTableWriter::new(&format!("{}_delta", table_key), schema)?;
     let mut deleted_ids = DeleteIdChunks::default();
-    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
-    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
-    let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key).await?;
+    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key, "base").await?;
+    let mut source =
+        OrderedTableCursor::from_snapshot(source_snapshot, table_key, "source").await?;
+    let mut target =
+        OrderedTableCursor::from_snapshot(target_snapshot, table_key, "target").await?;
 
     let mut needs_update = false;
     run_three_way_classification(
@@ -2240,12 +2439,27 @@ async fn stage_lineage_table_merge(
 
     for chunk in &plan.candidate_chunks.chunks {
         let filter = chunk.filter()?;
-        let mut base =
-            OrderedTableCursor::from_dataset_filtered(plan.base.clone(), &filter).await?;
-        let mut source =
-            OrderedTableCursor::from_dataset_filtered(plan.source.clone(), &filter).await?;
-        let mut target =
-            OrderedTableCursor::from_dataset_filtered(plan.target.clone(), &filter).await?;
+        let mut base = OrderedTableCursor::from_dataset_filtered(
+            plan.base.clone(),
+            &filter,
+            table_key,
+            "base",
+        )
+        .await?;
+        let mut source = OrderedTableCursor::from_dataset_filtered(
+            plan.source.clone(),
+            &filter,
+            table_key,
+            "source",
+        )
+        .await?;
+        let mut target = OrderedTableCursor::from_dataset_filtered(
+            plan.target.clone(),
+            &filter,
+            table_key,
+            "target",
+        )
+        .await?;
         run_three_way_classification(
             &mut base,
             &mut source,
@@ -2493,9 +2707,11 @@ async fn collect_three_way_blob_selection(
     blob_selection: &mut crate::table_store::PersistedBlobSelection,
 ) -> Result<()> {
     let prior_conflict_count = conflicts.len();
-    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
-    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
-    let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key).await?;
+    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key, "base").await?;
+    let mut source =
+        OrderedTableCursor::from_snapshot(source_snapshot, table_key, "source").await?;
+    let mut target =
+        OrderedTableCursor::from_snapshot(target_snapshot, table_key, "target").await?;
 
     loop {
         let base_row = base.peek_cloned().await?;

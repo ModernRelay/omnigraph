@@ -645,6 +645,13 @@ pub struct MergeWriteProbes {
     pub ordered_cursor_scan_calls: Arc<AtomicU64>,
     pub ordered_cursor_batch_rows: Arc<AtomicU64>,
     pub ordered_cursor_batch_bytes: Arc<AtomicU64>,
+    /// Bounded row hydrations the two-phase ordered merge cursor performs
+    /// after its narrow key sort: take calls, hydrated rows, and measured
+    /// hydrated bytes. Cost tests use these to prove payload bytes flow
+    /// through bounded takes, never through a SortExec input.
+    pub ordered_cursor_hydration_calls: Arc<AtomicU64>,
+    pub ordered_cursor_hydration_rows: Arc<AtomicU64>,
+    pub ordered_cursor_hydration_bytes: Arc<AtomicU64>,
     /// Projected scalar batches fetched by merge validation before the shared
     /// aggregate-retention budget decides whether each one may be kept.
     pub validation_scan_batches: Arc<AtomicU64>,
@@ -717,6 +724,15 @@ impl MergeWriteProbes {
     }
     pub fn ordered_cursor_batch_bytes(&self) -> u64 {
         self.ordered_cursor_batch_bytes.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_calls(&self) -> u64 {
+        self.ordered_cursor_hydration_calls.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_rows(&self) -> u64 {
+        self.ordered_cursor_hydration_rows.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_bytes(&self) -> u64 {
+        self.ordered_cursor_hydration_bytes.load(Ordering::Relaxed)
     }
     pub fn validation_scan_batches(&self) -> u64 {
         self.validation_scan_batches.load(Ordering::Relaxed)
@@ -931,6 +947,20 @@ pub(crate) fn record_ordered_cursor_scan(batch_rows: usize, batch_bytes: u64) {
             .store(batch_rows as u64, Ordering::Relaxed);
         p.ordered_cursor_batch_bytes
             .store(batch_bytes, Ordering::Relaxed);
+    });
+}
+
+/// Record one bounded hydration take performed by the two-phase ordered merge
+/// cursor, with the measured decoded size of the hydrated chunk. No-op when no
+/// test probe is installed.
+pub(crate) fn record_ordered_cursor_hydration(rows: usize, bytes: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.ordered_cursor_hydration_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.ordered_cursor_hydration_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+        p.ordered_cursor_hydration_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     });
 }
 
