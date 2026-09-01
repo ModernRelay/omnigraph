@@ -1,5 +1,5 @@
 ---
-rfc: "0042"
+rfc: "0046"
 title: "Read-only index status"
 track: maintainer
 status: draft
@@ -7,14 +7,14 @@ implementation: not-started
 authors:
   - Azim Afroozeh
 created: 2026-08-25
-updated: 2026-08-26
-discussion: "https://github.com/ModernRelay/omnigraph/issues/550"
+updated: 2026-09-01
+discussion: https://github.com/ModernRelay/omnigraph/issues/550
 supersedes: []
 superseded_by: []
 blocked_on: []
 ---
 
-# RFC 0042: Read-only index status
+# RFC 0046: Read-only index status
 
 > A term set in ***bold italics*** is being defined at that exact spot;
 > it is used in plain text everywhere after.
@@ -34,8 +34,11 @@ The unchanged boundary: this surface observes, never builds.
 that compares index intent against the indexes actually
 present and builds or maintains what closes the gap; no background
 scheduler, no new authority, no stored work list. One owned
-exception rides along: `optimize` gains a repair for indexes
-carrying no coverage record (Compatibility owns it).
+exception rides along: `optimize` gains a repair for `btree` and
+`vector` indexes carrying no coverage record (Compatibility owns
+it); full-text conditions route to
+[RFC 0043](0043-full-text-index-compatibility.md)'s explicit
+rebuild command instead.
 
 ## Motivation
 
@@ -127,7 +130,12 @@ Field notes, identity:
   composite `@index(a, b)` lists both (composites classify
   `unbuildable`, per the Design cascade). Sourced from the declared
   intent when no physical index exists, from the Lance index
-  metadata otherwise.
+  metadata otherwise. Values carry the graph's own column
+  spellings for its vintage: the fixed BTREEs read `id`/`src`/`dst`
+  today, and a graph on
+  [RFC 0040](0040-system-column-namespace.md)'s namespace reports
+  that vintage's spellings, mirroring its rule that API payloads
+  carry each graph's own column names.
 - (`table_key`, `kind`, `fields`) identifies an index across
   reports and states (rule 10); `name` never identifies, null
   until the first build.
@@ -158,18 +166,20 @@ The states:
 | `ready` | built, covers every current fragment | none |
 | `unbuildable` | declared, cannot be built or rebuilt as things stand; the reason says why | per reason (below) |
 | `missing` | declared (schema `@index`/`@key`, or a fixed node/edge BTREE), never built | `optimize` |
-| `degraded` | built, below full quality; the reason says why | `optimize` |
+| `degraded` | built, below full quality; the reason says why | per reason (below) |
 
 The reasons (the owning list of today's token vocabulary; open set
 per rule 4):
 
 | reason | state | meaning | operator response |
 |---|---|---|---|
-| `uncovered_fragments` | `degraded` | rows appended or rewritten after the build, scanned until reindex | `optimize` |
-| `coverage_unknown` | `degraded` | no coverage record (`fragment_bitmap: None`); see Semantics | `optimize` (the Repair procedure) |
+| `uncovered_fragments` | `degraded` | rows appended or rewritten after the build, scanned until reindex | `optimize` (`btree`/`vector`); `omnigraph rebuild-full-text-indexes` (`fts`: ordinary `optimize` never folds full-text, [RFC 0043](0043-full-text-index-compatibility.md)) |
+| `coverage_unknown` | `degraded` | no coverage record (`fragment_bitmap: None`); see Semantics | `optimize` (the Repair procedure; `btree`/`vector`); `rebuild-full-text-indexes` (`fts`) |
+| `full_text_index_rebuild_required` | `degraded` | built `fts` index without RFC 0043's verified compatibility certificate; search refuses it (HTTP 409, the same token) until rebuilt | `rebuild-full-text-indexes` |
 | `no_trainable_vectors` | `unbuildable` | the property has no non-null vectors to train on yet | load data, then `optimize` |
+| `kind_unknown` | `unbuildable` | a physical index matched to the declaration carries no `index_details`; kind and coverage are unknowable, and no omnigraph command rebuilds an index it cannot type | replace the foreign index out of band, or amend the schema |
 | `composite_unsupported` | `unbuildable` | multi-column `@index`; the reconciler builds single-column indexes only | amend the schema |
-| `edge_index_unsupported` | `unbuildable` | property `@index` on an edge type; edge datasets receive only the fixed `id`/`src`/`dst` BTREEs | amend the schema |
+| `edge_index_unsupported` | `unbuildable` | property `@index`, or a scalar `@key` member ([RFC 0044](0044-edge-keys.md)), on an edge type; edge datasets receive only the fixed `id`/`src`/`dst` BTREEs | amend the schema |
 | `type_unindexable` | `unbuildable` | property type with no index kind (a list, or `Blob`) | amend the schema |
 
 Per-row shape, the value rules for every case (counts are the four
@@ -181,16 +191,23 @@ Lance recorded a timestamp, null for older metadata):
 | `ready` | set | null | set | per `created_at` |
 | `missing` | null | null | indexed 0; unindexed = the dataset's logical totals (the rows that full-scan today) | null |
 | never-built `unbuildable` | null | set | indexed 0; unindexed = the dataset's logical totals | null |
-| built `unbuildable` (an untrainable `None`-bitmap vector index) | set | set | all null (the `None`-bitmap rule) | per `created_at` |
+| built `unbuildable` (an untrainable `None`-bitmap vector index, or `kind_unknown`) | set | set | all null (the `None`-bitmap rule) | per `created_at` |
 | `degraded` / `coverage_unknown` | set | set | all null | per `created_at` |
+| `degraded` / `full_text_index_rebuild_required` | set | set | set (coverage is real; the certificate is what is missing) | per `created_at` |
 | `degraded` / `uncovered_fragments` | set | set | set | per `created_at` |
 
-The `no_trainable_vectors` reason corresponds to `optimize
---json`'s `pending_indexes` field; the other `unbuildable` reasons
-have no reconciler counterpart, which is part of why this surface
-exists. The word `pending` is deliberately unused
-on this surface, reserved for a true in-progress meaning should a
-background builder ever exist. When #486 lands its detection, a
+`optimize --json`'s `pending_indexes` field carries two
+populations, and each maps here: the reconciler's
+untrainable-vector entries (`no_trainable_vectors`), and the
+deferred full-text coverage entries RFC 0043 added
+(`append_deferred_full_text_indexes`), which this surface reports
+as `degraded` / `uncovered_fragments` or `coverage_unknown` with
+the rebuild command as the operator response. The other
+`unbuildable` reasons have no reconciler counterpart, which is
+part of why this surface exists. `pending` is not a state here:
+`pending_indexes` rows are deferred or unbuildable work, never
+work in progress, and the word stays reserved for a true
+in-progress meaning should a background builder ever exist. When #486 lands its detection, a
 degenerate vector index reports `degraded` / `mono_partition` with
 no schema change.
 
@@ -208,7 +225,9 @@ omnigraph index await [<uri>] [--branch <b>] [--timeout <dur>] [--json]
 ```
 
 Blocks until no declared index is in a gating state, then exits 0.
-`missing` and `degraded` gate (`optimize` can clear them);
+`missing` and `degraded` gate; each reason's operator response
+names the command that clears it (`optimize`, or
+`rebuild-full-text-indexes` for full-text conditions);
 `unbuildable` never gates (waiting cannot build it, only more data
 or a schema change can, and blocking on it would hang the pipeline
 this command serves), and a `declared: false` row never blocks
@@ -226,9 +245,11 @@ failure family and owned by the same CLI-reference exit-code
 section, printing the last report to stderr, in the `status`
 envelope when `--json` is set and human rows otherwise.
 
-`await` complements `optimize`, never replaces it (the observe-only
-boundary above): the pipeline is load, `optimize`, `await`. With
-nothing building, `await` runs out its timeout and fails.
+`await` complements the maintenance commands, never replaces them
+(the observe-only boundary above): the pipeline is load,
+`optimize`, `await`, adding `rebuild-full-text-indexes` when the
+report names a full-text condition. With nothing building, `await`
+runs out its timeout and fails.
 
 ### Server
 
@@ -287,14 +308,22 @@ from metadata. Such an index classifies `degraded` /
 an untrainable vector column, per the Design cascade), the default-deny
 reading again: absent evidence never reads as coverage, and all
 four count fields are null (partial per-segment bitmaps would
-claim precision the metadata lacks). `optimize` repairs it
-(Design, the Repair procedure).
+claim precision the metadata lacks). `optimize` repairs a `btree`
+or `vector` index in this condition (Design, the Repair
+procedure); a full-text index is healed by
+`rebuild-full-text-indexes` alone, since RFC 0043 excludes
+full-text folding from ordinary `optimize`.
 
 `ready` asserts coverage, not planner use: Lance disables scalar
 indexes for an entire scan when any fragment lacks
 `physical_rows` metadata, so a `ready` index can still be bypassed
 per query. That condition is planner-side observability, #533's
-territory, not a coverage state.
+territory, not a coverage state. Analyzer compatibility is
+likewise not coverage, and unlike planner choice it is
+operator-action-required: a covered full-text index without RFC
+0043's verified certificate classifies `degraded` /
+`full_text_index_rebuild_required` (the Design cascade), never
+`ready`.
 
 ### Contract rules
 
@@ -346,9 +375,12 @@ coordinated by `__manifest`. Per report:
       `edge_index_unsupported`, or `type_unindexable` (the reasons
       table).
    b. A column-matched physical index whose `index_details` is
-      absent: `degraded` / `coverage_unknown` (present, kind and
-      coverage unknowable), never `missing`, so no duplicate is
-      built beside it; the Repair procedure (below) skips it.
+      absent: `unbuildable` / `kind_unknown` (present, kind and
+      coverage unknowable; no omnigraph command rebuilds an index
+      it cannot type), never `missing`, so no duplicate is built
+      beside it; the Repair procedure (below) skips it, and per
+      rule 6 it never gates `await` (gating would wait on a state
+      no command clears).
    c. A zero-row dataset short-circuits: its remaining declared
       indexes report `ready` with zero counts (per Semantics).
    d. Listed in the reconciler's `PendingIndex` set per
@@ -361,26 +393,35 @@ coordinated by `__manifest`. Per report:
       for a vector index whose column is currently untrainable,
       `unbuildable` / `no_trainable_vectors` instead (the repair
       cannot run until data arrives).
-   g. Every current fragment id in the union of its segments'
+   g. A full-text index without RFC 0043's verified compatibility
+      certificate (the same bounded certificate check search
+      performs): `degraded` / `full_text_index_rebuild_required`;
+      coverage alone never proves it servable, and search refuses
+      it until the explicit rebuild publishes.
+   h. Every current fragment id in the union of its segments'
       bitmaps: `ready`.
-   h. Uncovered fragments (`TableStore::has_unindexed_fragments` /
+   i. Uncovered fragments (`TableStore::has_unindexed_fragments` /
       `IndexCoverage::Degraded`): `degraded` /
       `uncovered_fragments`.
 
    Outside the declared set: system indexes are omitted (rule 8); a
    present-but-undeclared index reports `declared: false`, state
-   from coverage alone. The reconciler's top-up pass still maintains
-   undeclared indexes, because its trigger and Lance's
-   `optimize_indices` filter only system indexes, never declaration;
-   creation, deliberate retrain, and the `None`-bitmap repair are
-   declared-only (the Repair procedure below). Reporting undeclared
-   indexes keeps that drift visible.
+   from coverage alone. The reconciler's folding pass still
+   maintains undeclared indexes of foldable kinds: its
+   `can_fold_index` filter excludes system, kind-unknown, and
+   full-text indexes, never declaration; creation, deliberate
+   retrain, and the `None`-bitmap repair are declared-only (the
+   Repair procedure below). Reporting undeclared indexes keeps
+   that drift visible.
 4. Counts: fragments from bitmap containment; rows by summing
    logical fragment row counts, the `index_statistics` arithmetic
    (null for `None`-bitmap rows, per Semantics). No column
-   data, one bounded exception: `unbuildable` classification reuses the
-   reconciler's trainability probe, a filtered null count over the
-   vector column. The per-segment plugin statistics path (which can
+   data, two bounded exceptions: `unbuildable` classification
+   reuses the reconciler's trainability probe, a filtered null
+   count over the vector column; and the full-text compatibility
+   verdict reads RFC 0043's bounded certificate object through
+   its session-cached verification, never an index-file parse.
+   The per-segment plugin statistics path (which can
    open index files) is not used.
 
 Lance owns the index metadata, bitmaps, and statistics; OmniGraph
@@ -399,17 +440,26 @@ keep endpoint and reconciler aligned; the widened shapes are new
 code, covered by the truth-table tests.
 
 One reconciler change rides along: the ***Repair procedure***, the
-path that heals a `None` bitmap. Today
-`has_unindexed_fragments` skips a `None` `fragment_bitmap`, so
-a coverage-unknown index neither reports as work nor gets
-repaired. This RFC specifies:
+path that heals a `None` bitmap on a `btree` or `vector` index.
+Today the fold planner (`has_foldable_unindexed_fragments` over
+the `can_fold_index` predicate, landed with RFC 0043) skips a
+`None` `fragment_bitmap`, so a coverage-unknown `btree` or
+`vector` index neither reports as work nor gets repaired. A
+full-text index in that condition needs no new mechanism: it
+already reports (RFC 0043's deferred entries in
+`pending_indexes`) and already owns its remedy, the explicit
+rebuild that replaces every full-text segment under the
+historical names and writes the compatibility certificate;
+`optimize` must never duplicate that path. This RFC specifies:
 
-1. Trigger: `has_unindexed_fragments` widens so a `None` bitmap
-   counts as uncovered, for kinds omnigraph builds (`btree`,
-   `fts`, `vector`) only, decidable from `index_details` alone.
-   The pre-existing uncovered-fragments arm stays kind- and
-   declaration-blind, so top-up maintenance of `other`-kind and
-   undeclared indexes continues.
+1. Trigger: the fold planning behind
+   `has_foldable_unindexed_fragments` widens so a `None` bitmap
+   counts as uncovered, for `btree` and `vector` indexes only,
+   decidable from `index_details` alone; full-text stays excluded
+   by `can_fold_index`. The pre-existing uncovered-fragments arm
+   stays declaration-blind, so top-up maintenance of undeclared
+   foldable indexes continues (kind-unknown and full-text indexes
+   sit outside folding by the landed predicate, not by this RFC).
 2. Scope gates, applied at `optimize`'s call sites (catalog,
    storage handle, and snapshot in hand; a call-site skip treats
    the index as quiesced): declared indexes only (omnigraph does
@@ -427,37 +477,48 @@ repaired. This RFC specifies:
    an index by name in one commit, so the broken segments are
    swapped out atomically and the new segments carry real
    bitmaps.
-4. Exclusion: the top-up runs with an explicit
-   `OptimizeOptions::index_names` include-list naming every index
-   except the `None`-bitmap ones. The excluded rest (undeclared,
-   `other` or unknown kind, or untrainable) is deliberately left,
-   keeping `optimize` green, their rows persisting
-   `coverage_unknown` (or `unbuildable`), never gating.
+4. Exclusion: the top-up's `OptimizeOptions::index_names`
+   include-list already exists, built from `can_fold_index` (it
+   omits system, kind-unknown, and full-text indexes); the repair
+   extends the omission to the `None`-bitmap `btree`/`vector`
+   indexes being fully rebuilt. The excluded rest (undeclared,
+   kind-unknown, untrainable, or full-text) is deliberately left,
+   keeping `optimize` green, their rows persisting their states,
+   gating only where the operator response names a clearing
+   command (rule 6 and the reasons table).
 5. Ordering: the rebuild commits after compaction and the top-up,
    so its bitmap covers the final fragment set.
-6. Outcome: for declared, buildable, trainable indexes,
+6. Outcome: for declared `btree` and `vector` indexes (trainable
+   where vector),
    `coverage_unknown` is self-clearing: report, `optimize`, next
-   report `ready` with proof.
+   report `ready` with proof. A full-text index reaches the same
+   end through `rebuild-full-text-indexes`.
 
 The two sides must move together:
 reporting `degraded` against today's reconciler would gate `await`
-on a state `optimize` can never clear, and keeping the covered
+on a state no command clears, and keeping the covered
 reading would have the report claim proof the metadata cannot
 give. A third reader of the bitmap, `key_column_index_coverage`
 (scan pricing and full-scan warnings), keeps its covered reading:
 its consumer is per-query cost estimation, the mispricing is
-transient, and the first `optimize` heals the state for all three
+transient, and the first repair (`optimize`, or the explicit
+full-text rebuild) heals the state for all three
 readers. The rebuild cost is one-time, paid only by indexes whose
 metadata predates coverage tracking (imported or legacy datasets;
 every index built at the pinned Lance version writes its bitmap).
 
-Caching: physical coverage is cacheable per `(table_key,
-table_branch, table_version)`, because index builds become visible
+Caching: physical coverage is cacheable per `(table_key, native
+branch ref, table_version)`, because index builds become visible
 through the same single atomic `__manifest` publication (the
 publication door) as data, so coverage cannot change without the
-version moving. Declared intent is not covered by that key, because
+version moving. The branch component is the incarnation-suffixed
+native ref ([RFC 0042](0042-incarnation-suffixed-branch-refs.md)'s
+`native_dataset_branch`), never the logical branch name: versions
+restart when a logical name is deleted and recreated, and a
+logical-name key would alias a dead life's coverage onto its
+successor. Declared intent is not covered by that key, because
 an index-only schema change (an `@index` addition applies as pure
-metadata, touching no table data) bumps no table version. Full key: `(table_key, table_branch, table_version,
+metadata, touching no table data) bumps no table version. Full key: `(table_key, native branch ref, table_version,
 accepted-schema fingerprint)`, where the fingerprint is a content
 hash of the accepted SchemaIR (no monotonic schema version exists
 to cite). Warm poll: one `__manifest` read plus
@@ -505,9 +566,11 @@ queue is a second authority" is unchanged.
 Additive but for one owned exception: one CLI verb pair, one GET
 route, new `omnigraph-api-types` response types; no storage or
 wire format change. The exception: `optimize`
-gains the `None`-bitmap repair, so its first run over an imported
-legacy dataset rebuilds indexes it previously skipped (one-time,
-priced in Design). The JSON field set and state vocabulary are the compatibility
+gains the `None`-bitmap repair for `btree` and `vector` indexes,
+so its first run over an imported legacy dataset rebuilds indexes
+it previously skipped (one-time, priced in Design); legacy
+full-text indexes follow RFC 0043's migration and explicit
+rebuild instead. The JSON field set and state vocabulary are the compatibility
 surface, governed by rules 3 to 5. Reverting is technically cheap but
 breaks gating scripts, so removal means deprecation, not deletion:
 the reversible end of the evidence-demand scale (evidence
@@ -548,17 +611,27 @@ Out of scope, compatible later (deliberately not `blocked_on`):
   rows are reachable in the table), including the fixed node
   `id` and edge `id`/`src`/`dst` BTREEs, zero-row datasets (`ready`,
   zero counts), `declared: false`, `None` `fragment_bitmap`
-  (`degraded` / `coverage_unknown`, null counts), an `other`-kind
-  `None`-bitmap index (`coverage_unknown` persists, excluded from
-  the repair, never gates), a multi-column declaration, an
-  edge-property `@index`, and a list/`Blob` `@index` (`unbuildable`
+  (`degraded` / `coverage_unknown`, null counts), an undeclared
+  `other`-kind `None`-bitmap index (`coverage_unknown` persists,
+  excluded from the repair, never gates), a declared index whose
+  physical match carries no `index_details` (`unbuildable` /
+  `kind_unknown`, never gates), a declared full-text `None`-bitmap
+  index (`degraded` / `coverage_unknown`, excluded from the
+  `optimize` repair, cleared only by the explicit rebuild), a
+  covered full-text index without a verified certificate
+  (`degraded` / `full_text_index_rebuild_required`), a multi-column
+  declaration, an edge-property `@index`, a scalar edge `@key`
+  member, and a list/`Blob` `@index` (`unbuildable`
   with their reason tokens, at zero rows too), and two declared FTS indexes on different
   properties of one type (rows distinguished by `fields`).
 - Integration, extending the existing CLI test owner: fresh load
   reports `missing`; post-`optimize`, `ready`; post-append,
-  `degraded`/`uncovered_fragments`; a legacy `None`-bitmap index
+  `degraded`/`uncovered_fragments`; a legacy `None`-bitmap `btree`
+  or `vector` index
   reports `degraded`/`coverage_unknown`, then `ready` with counts
-  after `optimize` repairs it; `await` returns after the
+  after `optimize` repairs it; a full-text condition clears to
+  `ready` only after `rebuild-full-text-indexes` publishes;
+  `await` returns after the
   publish, ignores an `unbuildable` vector index, times out nonzero when
   nothing builds.
 - Legacy `None`-bitmap fixtures cannot come from the production
@@ -568,24 +641,29 @@ Out of scope, compatible later (deliberately not `blocked_on`):
   fixture dataset.
 - Consistency: a concurrent publish never tears a report (one pinned
   snapshot).
-- Cost: "metadata and deletion sidecars only, no column data except
+- Cost: "metadata, deletion sidecars, and bounded certificate
+  objects only, no column data except
   the trainability probe" is backed by a checked-in IO-probe
   instrument, per invariant 13.
-- Lance survey, per the Lance reading protocol, at the pinned Lance
-  10.0.0 (workspace `Cargo.toml`), read at lance `d644e7a6`
-  (2026-08-03): `IndexMetadata` (`fragment_bitmap`, typed
+- Lance survey, per the Lance reading protocol: first read at
+  Lance 10.0.0 (lance `d644e7a6`, 2026-08-03), re-verified at the
+  pinned Lance 11.0.0 (workspace `Cargo.toml`, crate source):
+  `IndexMetadata` (`fragment_bitmap`, typed
   `index_details`, delta segments, millisecond `created_at`),
-  `index_statistics` arithmetic, logical-row fragment counts.
+  `index_statistics` arithmetic, logical-row fragment counts, and
+  the fold path's error on a `None` `fragment_bitmap`.
 
 ## Rollout
 
 1. Engine: one read-only entry point over the derivation (today
    internal to the engine crate) plus the Repair procedure in
    `optimize` (Design; its widened trigger, scope gates, rebuild,
-   which widens `IndexBuildSpec::FullText`/`Vector` with
+   which widens `IndexBuildSpec::Vector` with
    `name: Option<String>` so the repair replaces under the legacy
-   name, and the `OptimizeOptions::index_names` include-list omitting
-   every `None`-bitmap index); the new `omnigraph-api-types`
+   name (`BTree` already carries one; full-text is outside the
+   repair's scope), and the extension of the landed
+   `can_fold_index` include-list to omit
+   every `None`-bitmap `btree`/`vector` index); the new `omnigraph-api-types`
    response types (embedded and served share the envelope by
    construction); embedded CLI `index status`, whose served path
    rejects with a typed not-yet-served error in the `status`
@@ -606,7 +684,7 @@ None.
 - 2026-08-25: drafted from the #550 request (read-only index readiness
   status plus a blocking wait command) and the #486 monitoring gap.
 - 2026-08-25: PR review: clarified undeclared-index maintenance (the
-  top-up pass is declaration-blind, filtering only system indexes;
+  folding pass is declaration-blind, never reading declaration;
   creation and retrain are declared-only).
 - 2026-08-26: PR review: rows gained `fields` and the (`table_key`,
   `kind`, `fields`) identity (unbuilt rows on different properties
@@ -625,8 +703,8 @@ None.
   `edge_index_unsupported`, `type_unindexable`), decided at zero
   rows (structural verdicts precede the empty-table
   short-circuit); kind-unknown metadata reads as `other`, and
-  column-matched intent with absent `index_details` as
-  `coverage_unknown`, never `missing` (no duplicate build);
+  column-matched intent with absent `index_details` classifies
+  without a duplicate build, never `missing`;
   gating restricted to declared indexes, with `await`'s exit-0
   guarantee stated explicitly (every declared index `ready` or
   `unbuildable`, never all `ready`); the served route nests
@@ -635,3 +713,14 @@ None.
   currently accepted schema (snapshot addressing pins physical
   state only); envelope types and the exit-code section assigned
   to phase 1.
+- 2026-09-01: aligned with landed RFC 0043 and the Lance 11
+  upgrade: full-text conditions route to
+  `rebuild-full-text-indexes` (ordinary `optimize` never folds
+  full-text), the Repair procedure narrowed to `btree`/`vector`
+  over the landed `can_fold_index` fold predicate, a covered but
+  uncertified full-text index classifies `degraded` /
+  `full_text_index_rebuild_required`, and a declared index whose
+  physical match carries no `index_details` reclassifies
+  `unbuildable` / `kind_unknown` (`await` never waits on a state
+  no command clears); the coverage cache keys on RFC 0042's
+  incarnation-suffixed native ref, never the logical branch name.
