@@ -15,6 +15,11 @@ Branch protection currently requires these reporting contexts:
 - `Test omnigraph-server --features aws`
 - `Format (rustfmt)`
 - `Lint (clippy)`
+- `GQ Logic Tests`
+
+`GQ Logic Tests` (`gq-logic-tests.yml`) runs the `.gqt` logic-test corpus on
+every pull request; `Test Workspace` still picks the same target up post-merge
+inside the full workspace suite.
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC

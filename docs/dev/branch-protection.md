@@ -15,6 +15,7 @@ protection.
 - `Test omnigraph-server --features aws`
 - `Format (rustfmt)`
 - `Lint (clippy)`
+- `GQ Logic Tests`
 
 Checks are strict, so a PR must be current with `main`. `Graph Vocabulary
 Guard` remains as an always-reporting context but reports a successful skip on
