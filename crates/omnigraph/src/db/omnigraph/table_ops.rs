@@ -11,7 +11,9 @@ pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index
         .iter()
         .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
         .collect();
-    db.runtime_cache.graph_index(&resolved, &edge_types).await
+    db.runtime_cache
+        .graph_index(&resolved, &edge_types, db.storage_adapter())
+        .await
 }
 
 pub(super) async fn graph_index_for_resolved(
@@ -19,7 +21,9 @@ pub(super) async fn graph_index_for_resolved(
     resolved: &ResolvedTarget,
     edge_types: &std::collections::HashMap<String, (String, String)>,
 ) -> Result<Arc<crate::graph_index::GraphIndex>> {
-    db.runtime_cache.graph_index(resolved, edge_types).await
+    db.runtime_cache
+        .graph_index(resolved, edge_types, db.storage_adapter())
+        .await
 }
 
 pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> {

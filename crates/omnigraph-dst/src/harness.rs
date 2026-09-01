@@ -2858,6 +2858,21 @@ impl StorageAdapter for FailingStorage {
             .await?;
         Ok(out.map(|text| self.maybe_corrupt("read_text_if_exists_bounded", uri, text)))
     }
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> OmniResult<Option<Vec<u8>>> {
+        self.read_fault("read_bytes_if_exists_bounded", uri).await?;
+        self.latent_fault("read_bytes_if_exists_bounded", uri)?;
+        self.note_persisted_read("read_bytes_if_exists_bounded", uri);
+        // Stale-read replay and `maybe_corrupt` stay text-only: `key_history`
+        // and the corruption helpers are `String`-typed, and a binary body has
+        // no lossless representation there. Every other read fault applies.
+        self.inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await
+    }
     async fn write_text(&self, uri: &str, contents: &str) -> OmniResult<()> {
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
         if let WriteFate::Lost = self.write_fault("write_text", uri, true).await? {
@@ -2879,6 +2894,24 @@ impl StorageAdapter for FailingStorage {
             self.staleness_record(&target, Some(stored.clone()), None);
         }
         self.lose_ack("write_text", uri, out).await
+    }
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> OmniResult<()> {
+        let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
+        if let WriteFate::Lost = self.write_fault("write_bytes", uri, true).await? {
+            return Ok(());
+        }
+        let target = match self.maybe_misdirect("write_bytes", uri) {
+            Some(t) => t,
+            None => uri.to_string(),
+        };
+        // Write corruption and the staleness history stay text-only (see
+        // `read_bytes_if_exists_bounded`): both are `String`-typed. Kill,
+        // write faults, misdirection, completion counting and ack loss apply.
+        let out = self.inner.write_bytes(&target, contents).await;
+        if out.is_ok() {
+            self.count_completion("write_bytes", uri);
+        }
+        self.lose_ack("write_bytes", uri, out).await
     }
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> OmniResult<bool> {
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
