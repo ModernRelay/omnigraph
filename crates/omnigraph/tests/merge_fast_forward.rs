@@ -1027,54 +1027,23 @@ async fn divergent_merge_succeeds_despite_unrelated_wide_row() {
     assert_eq!(count_rows(&main, "node:Doc").await, 4);
 }
 
-/// A narrow prefix must not let the hydration plan ramp up and then
-/// materialize a run of wide rows in one oversized take: chunk sizing is
-/// probe-guarded, so the transient per take stays near the 32 MiB chunk
-/// target (bounded by the probe rows times the widest row) instead of
-/// scaling with the planned row count. Without the spread probe, the chunk
-/// crossing into the wide run below would take ~2,000 narrow plus all 24
-/// wide rows at once (~100 MiB); adversarially wide tables previously meant
-/// an unbounded allocation where the pre-hydration cursor failed typed.
-#[tokio::test]
-async fn hydration_chunks_stay_bounded_when_row_widths_step_up() {
-    const NARROW_ROWS: usize = 2_000;
-    const NARROW_PAYLOAD_BYTES: usize = 2 * 1024;
-    const WIDE_ROWS: usize = 24;
-    const WIDE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
-    // max(2x chunk target, probe rows x widest row) plus margin; the pre-probe
-    // sizing produced a single ~100 MiB take on this fixture.
+/// The per-chunk hydration memory bound holds by construction — every
+/// retained batch is hard-charged and an over-budget chunk aborts and
+/// retries with half the rows — so it must survive any row-width shape:
+/// a contiguous run of wide rows after a narrow prefix (which lets the plan
+/// ramp to thousands of rows first), and wide rows sparsely interleaved
+/// among narrow ones (which no width sample taken before the scan could
+/// have predicted). Without the hard charge, both fixtures retain the whole
+/// planned chunk (~100 MiB and ~70 MiB here; unbounded in general) where the
+/// pre-hydration cursor failed typed.
+async fn run_bounded_hydration_case(rows: String, expected_rows: usize, edited_key: &str) -> u64 {
+    // Hard hydration ceiling (2x the 32 MiB chunk target) plus one in-flight
+    // scanner batch of margin.
     const MAX_CHUNK_BYTES: u64 = 80 * 1024 * 1024;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = Omnigraph::init(uri, WIDE_ROW_SCHEMA).await.unwrap();
-    let mut rows = String::new();
-    for index in 0..NARROW_ROWS {
-        rows.push_str(
-            &serde_json::json!({
-                "type": "Doc",
-                "data": {
-                    "key": format!("a-{index:05}"),
-                    "payload": "n".repeat(NARROW_PAYLOAD_BYTES),
-                },
-            })
-            .to_string(),
-        );
-        rows.push('\n');
-    }
-    for index in 0..WIDE_ROWS {
-        rows.push_str(
-            &serde_json::json!({
-                "type": "Doc",
-                "data": {
-                    "key": format!("z-wide-{index:02}"),
-                    "payload": "x".repeat(WIDE_PAYLOAD_BYTES),
-                },
-            })
-            .to_string(),
-        );
-        rows.push('\n');
-    }
     main.load("main", &rows, LoadMode::Overwrite).await.unwrap();
 
     main.branch_create("feature").await.unwrap();
@@ -1084,7 +1053,7 @@ async fn hydration_chunks_stay_bounded_when_row_widths_step_up() {
             "feature",
             WIDE_ROW_SET_PAYLOAD,
             "set_payload",
-            &mixed_params(&[("$key", "a-00000"), ("$payload", "edited")], &[]),
+            &mixed_params(&[("$key", edited_key), ("$payload", "edited")], &[]),
         )
         .await
         .unwrap();
@@ -1097,18 +1066,71 @@ async fn hydration_chunks_stay_bounded_when_row_widths_step_up() {
     let max_chunk = probes.ordered_cursor_hydration_max_chunk_bytes();
     assert!(
         max_chunk <= MAX_CHUNK_BYTES,
-        "one hydration take materialized {max_chunk} bytes; the probe-guarded plan must keep \
-         takes near the chunk target instead of scaling with planned rows"
+        "one hydration chunk retained {max_chunk} bytes; the hard-charged scan must abort and \
+         halve instead of scaling with planned rows or row widths"
     );
     assert!(
-        probes.ordered_cursor_hydration_rows() >= ((NARROW_ROWS + WIDE_ROWS) * 2) as u64,
+        probes.ordered_cursor_hydration_rows() >= (expected_rows * 2) as u64,
         "both adopt cursors must still hydrate every row"
     );
     assert_eq!(
-        node_string_value(&main, "Doc", "a-00000", "payload").await,
+        node_string_value(&main, "Doc", edited_key, "payload").await,
         Some(Some("edited".to_string()))
     );
-    assert_eq!(count_rows(&main, "node:Doc").await, NARROW_ROWS + WIDE_ROWS);
+    assert_eq!(count_rows(&main, "node:Doc").await, expected_rows);
+    max_chunk
+}
+
+fn doc_row(key: &str, payload_bytes: usize, fill: char) -> String {
+    let mut row = serde_json::json!({
+        "type": "Doc",
+        "data": { "key": key, "payload": fill.to_string().repeat(payload_bytes) },
+    })
+    .to_string();
+    row.push('\n');
+    row
+}
+
+#[tokio::test]
+async fn hydration_chunks_stay_bounded_when_row_widths_step_up() {
+    // Enough narrow rows that the plan ramps to cover the whole wide run in
+    // one chunk when unguarded (~104 MiB retained without the hard charge).
+    const NARROW_ROWS: usize = 4_000;
+    const WIDE_ROWS: usize = 24;
+
+    let mut rows = String::new();
+    for index in 0..NARROW_ROWS {
+        rows.push_str(&doc_row(&format!("a-{index:05}"), 2 * 1024, 'n'));
+    }
+    for index in 0..WIDE_ROWS {
+        rows.push_str(&doc_row(
+            &format!("z-wide-{index:02}"),
+            4 * 1024 * 1024,
+            'x',
+        ));
+    }
+    run_bounded_hydration_case(rows, NARROW_ROWS + WIDE_ROWS, "a-00000").await;
+}
+
+#[tokio::test]
+async fn hydration_chunks_stay_bounded_when_wide_rows_interleave() {
+    const ROWS: usize = 6_000;
+
+    let mut rows = String::new();
+    for index in 0..ROWS {
+        // A narrow prefix lets the plan ramp with no width history, then a
+        // mixed region interleaves one wide row among every 40 narrow ones —
+        // ~30 wides that an unguarded full-width planned chunk would retain
+        // at once (~120 MiB), in a shape no pre-scan width sample of the
+        // narrow history could have predicted.
+        let wide = (4_000..5_200).contains(&index) && index % 40 == 0;
+        if wide {
+            rows.push_str(&doc_row(&format!("k-{index:05}"), 4 * 1024 * 1024, 'x'));
+        } else {
+            rows.push_str(&doc_row(&format!("k-{index:05}"), 2 * 1024, 'n'));
+        }
+    }
+    run_bounded_hydration_case(rows, ROWS, "k-00001").await;
 }
 
 /// Functional correctness: a fast-forward merge of an append-only branch leaves

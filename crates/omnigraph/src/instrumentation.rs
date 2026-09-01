@@ -781,10 +781,10 @@ pub struct MergeWriteProbes {
     pub ordered_cursor_hydration_calls: Arc<AtomicU64>,
     pub ordered_cursor_hydration_rows: Arc<AtomicU64>,
     pub ordered_cursor_hydration_bytes: Arc<AtomicU64>,
-    /// Largest single hydration take observed, in measured decoded bytes.
-    /// This is the cursor's per-take transient memory contract: bounded-chunk
-    /// tests assert it stays near the chunk byte target instead of scaling
-    /// with a table's planned row count.
+    /// Largest retained hydration chunk observed, in measured decoded bytes.
+    /// This is the cursor's per-chunk resident-memory contract: bounded-chunk
+    /// tests assert it stays under the hard hydration ceiling instead of
+    /// scaling with a table's planned row count or row widths.
     pub ordered_cursor_hydration_max_chunk_bytes: Arc<AtomicU64>,
     /// Projected scalar batches fetched by merge validation before the shared
     /// aggregate-retention budget decides whether each one may be kept.

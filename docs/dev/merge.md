@@ -64,13 +64,15 @@ a SortExec input:
 
 - a narrow ordered scan sorts only `id` + `_rowid` + `_rowaddr` (8,192 rows
   and 32 MiB per decoded batch as targets — a few dozen bytes per sorted row);
-- sorted keys are hydrated back into complete rows via bounded row-address
-  takes against the same pinned dataset, chunk-sized toward a 32 MiB decoded
-  target from a pessimistic, geometrically decayed width estimate; any larger
-  planned chunk first takes a small probe spread across its key range so a
-  run of wide rows resizes the chunk before the bulk take materializes. The
-  per-take transient is bounded by `max(2 x target, probe rows x widest
-  row)`, and a single indivisible row wider than the target hydrates alone;
+- sorted keys are hydrated back into complete rows in bounded chunks through
+  an unordered, fragment-scoped scan filtered to the chunk's exact `_rowaddr`
+  set against the same pinned dataset. Every retained batch is compacted and
+  hard-charged as it streams; a chunk that crosses the 64 MiB retained
+  ceiling is dropped mid-stream and retried with half the rows, so peak
+  hydration memory is the ceiling plus one in-flight scanner batch for any
+  row-width shape — the width estimate that plans chunk sizes only reduces
+  retries, it is never load-bearing for the bound. A single indivisible row
+  wider than the ceiling still hydrates alone;
 - Blob columns hydrate as descriptors; Blob-bearing rows are materialized
   under the same operation budget;
 - all selected constructive rows stage as upserts and removals as deletes;
