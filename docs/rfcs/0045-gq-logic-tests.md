@@ -151,17 +151,23 @@ reads the PR body for GitHub's closing keywords (close, closes, closed,
 fix, fixes, fixed, resolve, resolves, resolved), matched the way GitHub's
 own parser matches them: case-insensitive, a word boundary before the
 keyword (so "hotfix #563" never fires on `fix`), an optional colon, then
-whitespace and `#N`. Every issue so closed needs a matching addition in
-the diff under `crates/*/tests/**`, checked independently per issue: an
-added file whose path contains `issue_N`, or an added line containing
-`issue_N` or `issue: N`, where `N` must be followed by a non-digit or by
-the end of the line or path (`issue_5630` never matches issue 563;
-`issue_563_underfill` does). The path form is what a new `.gqt` logic
-test satisfies; the line form is what a `_issue_N` Rust test function
-added to an existing file satisfies. The gate reads only that form in the
-PR body: closings by full URL, `owner/repo#N` reference, commit-message
-keyword, or manual close after merge pass unexamined; that residue is
-accepted and belongs to review under the AGENTS.md regression sentence.
+whitespace (optional when the colon is present) and `#N`, with leading
+zeros in `N` normalized away. Every issue so closed needs a matching
+executable addition in the diff under `crates/*/tests/**`, checked
+independently per issue: an added `.gqt` case in the logic test corpus
+whose file name carries `issue_N`, an added `# issue: N` header line in a
+corpus case, or an added Rust line defining a function whose name carries
+`issue_N`, where `N` must be followed by a non-digit or by the end of the
+line or path (`issue_5630` never matches issue 563; `issue_563_underfill`
+does). A comment, string, or fixture line mentioning the issue never
+satisfies the gate. Each accepted shape executes: the corpus walker runs
+every case and refuses a malformed one, and the workspace clippy gate
+refuses a dead test function; whether the test asserts the right thing
+stays with review. The gate reads only that form in the PR body: closings
+by full URL, `owner/repo#N` reference, a bare no-space `fixes#N`,
+commit-message keyword, or manual close after merge pass unexamined; that
+residue is accepted and belongs to review under the AGENTS.md regression
+sentence.
 The escape hatch is the `no-repro` label, applied to the PR by a
 maintainer (label rights sit with triage and the label is visible on the
 PR, so waiving is a reviewed maintainer act, not a silent skip). The
