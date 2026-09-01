@@ -569,11 +569,7 @@ async fn shape_fence_covers_all_fallback_rows() {
     let mut db = init_gate_db(&dir).await;
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
 
-    for query_name in [
-        "different_var_arms",
-        "ranked_var_is_expand_dst",
-        "no_traversal",
-    ] {
+    for query_name in ["different_var_arms", "no_traversal"] {
         let (_, verdicts, _) =
             run_forced(&mut db, "force_prefilter", query_name, &text_params).await;
         assert_eq!(verdicts.len(), 1, "{query_name}: one verdict per rrf run");
@@ -589,6 +585,24 @@ async fn shape_fence_covers_all_fallback_rows() {
             verdicts[0]
         );
     }
+
+    // Ranking an Expand-introduced variable was the third Shape-fallback
+    // case; T26 now rejects it at typecheck (the bm25 never actually ran on
+    // that shape — the fallback merely preserved the silent no-rank). The
+    // gate's own expand-dst check stays as the engine backstop for
+    // hand-built IR.
+    let error = query_main(
+        &mut db,
+        GATE_QUERIES,
+        "ranked_var_is_expand_dst",
+        &text_params,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("T26"),
+        "expected the T26 rejection, got: {error}"
+    );
 }
 
 /// Threshold boundary: 2 eligible of 20 is EXACTLY the default 0.10 ratio.
