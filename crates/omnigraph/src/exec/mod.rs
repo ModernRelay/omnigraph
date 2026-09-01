@@ -27,7 +27,7 @@ use omnigraph_compiler::lower_mutation_query;
 use omnigraph_compiler::lower_query;
 use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal, NOW_PARAM_NAME};
 use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
-use omnigraph_compiler::result::{MutationResult, QueryResult};
+use omnigraph_compiler::result::{MutationResult, QueryNotice, QueryResult};
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::types::ScalarType;
 use time::OffsetDateTime;

@@ -1436,6 +1436,79 @@ async fn query_endpoint_runs_inline_read() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn query_carries_unindexed_text_warning_and_legacy_read_drops_it() {
+    // Inline graph with an un-@indexed String column: text search serves via
+    // Lance's flat fallback, and the canonical envelope carries the advisory
+    // `full_text_search_unindexed` warning. The byte-stable legacy `/read`
+    // envelope deliberately cannot grow the additive field.
+    let temp = init_graph_with_schema_and_data(
+        "node Note {\n    slug: String @key\n    summary: String\n}\n",
+        "{\"type\":\"Note\",\"data\":{\"slug\":\"n1\",\"summary\":\"Anthropic works on safety\"}}",
+    )
+    .await;
+    let graph = graph_path(temp.path());
+    let state = omnigraph_server::AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let app = omnigraph_server::build_app(state);
+
+    const NOTE_QUERY: &str = "query note_search($q: String) {\n    match {\n        $n: Note\n        search($n.summary, $q)\n    }\n    return { $n.slug }\n}\n";
+
+    let request = QueryRequest {
+        query: NOTE_QUERY.to_string(),
+        name: Some("note_search".to_string()),
+        params: Some(json!({ "q": "Anthropic" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/query"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&request).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["row_count"], 1);
+    let warnings = body["warnings"]
+        .as_array()
+        .expect("canonical /query must carry the warnings array when populated");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "full_text_search_unindexed"),
+        "expected the unindexed-column warning, got: {warnings:?}"
+    );
+
+    let legacy = ReadRequest {
+        query_source: NOTE_QUERY.to_string(),
+        query_name: Some("note_search".to_string()),
+        params: Some(json!({ "q": "Anthropic" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/read"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&legacy).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["row_count"], 1);
+    assert!(
+        body.get("warnings").is_none(),
+        "legacy /read must not grow the additive field: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn query_endpoint_rejects_mutation_with_400() {
     let (_temp, app) = app_for_loaded_graph().await;
 

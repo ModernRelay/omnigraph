@@ -14,15 +14,44 @@ pub struct MutationExecResult {
     pub affected_edges: usize,
 }
 
+/// A non-fatal, machine-readable advisory attached to a successful read.
+///
+/// Notices never change rows, membership, or order — they surface a condition
+/// the caller would otherwise learn about only from wrong-looking results
+/// (e.g. text search running unanalyzed on a column with no full-text index).
+/// `code` is a stable snake_case identifier; `message` is human-readable and
+/// may change wording between releases.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct QueryNotice {
+    pub code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    notices: Vec<QueryNotice>,
 }
 
 impl QueryResult {
     pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
-        Self { schema, batches }
+        Self {
+            schema,
+            batches,
+            notices: Vec::new(),
+        }
+    }
+
+    /// Attach advisory notices to this result.
+    pub fn with_notices(mut self, notices: Vec<QueryNotice>) -> Self {
+        self.notices = notices;
+        self
+    }
+
+    /// Advisory notices attached to this result (possibly empty).
+    pub fn notices(&self) -> &[QueryNotice] {
+        &self.notices
     }
 
     pub fn schema(&self) -> &SchemaRef {

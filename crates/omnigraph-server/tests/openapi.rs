@@ -965,6 +965,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ReadRequest",
     "ReadSetConflictOutput",
     "ReadTargetOutput",
+    "ReadWarningOutput",
     "PreconditionFailureOutput",
     "RecoveryRequiredOutput",
     "ResourceLimitOutput",
@@ -1057,6 +1058,18 @@ fn read_output_schema_has_expected_fields() {
     assert!(props.contains_key("target"));
     assert!(props.contains_key("row_count"));
     assert!(props.contains_key("rows"));
+    // `warnings` is additive-optional: present in the schema, never required,
+    // and absent from the byte-stable legacy `/read` envelope.
+    assert!(props.contains_key("warnings"));
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
+        .unwrap_or_default();
+    assert!(!required.contains(&"warnings"));
+    let legacy = &doc["components"]["schemas"]["LegacyReadOutput"];
+    let legacy_props = legacy["properties"].as_object().unwrap();
+    assert!(!legacy_props.contains_key("warnings"));
+    assert!(!legacy_props.contains_key("graph_commit_id"));
 }
 
 #[test]

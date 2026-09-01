@@ -267,6 +267,16 @@ pub struct ReadTargetOutput {
     pub snapshot: Option<String>,
 }
 
+/// A non-fatal advisory attached to a successful read. `code` is a stable
+/// snake_case identifier (e.g. `full_text_search_unindexed`); `message` is
+/// human-readable and may reword between releases. Warnings never change
+/// rows, membership, or order.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReadWarningOutput {
+    pub code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadOutput {
     pub query_name: String,
@@ -282,6 +292,10 @@ pub struct ReadOutput {
     /// come from one pinned version, so no separate id fetch is needed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_commit_id: Option<String>,
+    /// Additive advisory warnings (empty on most reads). The deprecated
+    /// `POST /read` envelope deliberately drops them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ReadWarningOutput>,
 }
 
 /// Indefinitely byte-stable response shape for the deprecated `POST /read`
@@ -1474,6 +1488,14 @@ pub fn read_output(
         .iter()
         .map(|field| field.name().clone())
         .collect();
+    let warnings = result
+        .notices()
+        .iter()
+        .map(|notice| ReadWarningOutput {
+            code: notice.code.clone(),
+            message: notice.message.clone(),
+        })
+        .collect();
     ReadOutput {
         query_name,
         target: read_target_output(target),
@@ -1481,6 +1503,7 @@ pub fn read_output(
         columns,
         rows: result.to_rust_json(),
         graph_commit_id,
+        warnings,
     }
 }
 

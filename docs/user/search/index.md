@@ -17,6 +17,14 @@ for nearest-neighbor ordering.
 Filters in the `match` block are applied before ranking, so `limit 10` means the
 top ten matches that satisfy the graph and property filters.
 
+Full-text functions on a column with **no** FTS index still serve results
+through a flat scan, but that fallback tokenizes case-sensitively — an exact
+token matches, `"anthropic"` does not find a stored `"Anthropic"`. Such reads
+now carry a `full_text_search_unindexed` warning (the `warnings` array on the
+canonical `/query` response; stderr for human CLI formats) so an empty result
+cannot be mistaken for "no such entity". Declare `@index` on the property and
+run `ensure_indices` to get analyzed, case-insensitive matching.
+
 A `bm25()` ordering with a `limit` reads only the top-scoring matches (a small
 multiple of the limit) instead of every matching entity; when traversals or
 filters leave the limit unfilled, the query automatically rescans without the

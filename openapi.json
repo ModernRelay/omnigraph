@@ -5093,6 +5093,13 @@
           "rows": {},
           "target": {
             "$ref": "#/components/schemas/ReadTargetOutput"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReadWarningOutput"
+            },
+            "description": "Additive advisory warnings (empty on most reads). The deprecated\n`POST /read` envelope deliberately drops them."
           }
         }
       },
@@ -5171,6 +5178,22 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "ReadWarningOutput": {
+        "type": "object",
+        "description": "A non-fatal advisory attached to a successful read. `code` is a stable\nsnake_case identifier (e.g. `full_text_search_unindexed`); `message` is\nhuman-readable and may reword between releases. Warnings never change\nrows, membership, or order.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
           }
         }
       },

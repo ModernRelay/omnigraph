@@ -536,6 +536,131 @@ async fn text_search_no_results() {
     assert_eq!(result.num_rows(), 0);
 }
 
+// ─── Unindexed text search: served, but loudly (P0 of the search RFC) ───────
+
+const UNINDEXED_TEXT_SCHEMA: &str = r#"
+node Note {
+    slug: String @key
+    summary: String
+}
+"#;
+
+const UNINDEXED_TEXT_QUERIES: &str = r#"
+query note_search($q: String) {
+    match {
+        $n: Note
+        search($n.summary, $q)
+    }
+    return { $n.slug }
+}
+
+query note_bm25($q: String) {
+    match { $n: Note }
+    return { $n.slug }
+    order { bm25($n.summary, $q) }
+    limit 5
+}
+"#;
+
+async fn init_unindexed_text_db(dir: &tempfile::TempDir) -> Omnigraph {
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), UNINDEXED_TEXT_SCHEMA)
+        .await
+        .unwrap();
+    load_jsonl(
+        &db,
+        "{\"type\":\"Note\",\"data\":{\"slug\":\"n1\",\"summary\":\"Anthropic works on safety\"}}\n\
+         {\"type\":\"Note\",\"data\":{\"slug\":\"n2\",\"summary\":\"poolside builds databases\"}}",
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices().await.unwrap();
+    db
+}
+
+// Pins the flat-fallback contract: a full-text function on a column with NO
+// FTS index still serves rows (Lance plans a flat scan), but the result now
+// carries the `full_text_search_unindexed` notice — the fallback tokenizes
+// case-sensitively, so silent service here produced the motivating
+// confident-false-negative bug (dev graph: iss-match-text-case-sensitive).
+#[tokio::test]
+#[serial]
+async fn text_search_on_unindexed_column_warns_and_still_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_unindexed_text_db(&dir).await;
+
+    let result = query_main(
+        &mut db,
+        UNINDEXED_TEXT_QUERIES,
+        "note_search",
+        &params(&[("$q", "Anthropic")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result_slugs(&result),
+        vec!["n1"],
+        "the unindexed flat fallback must still serve exact-case matches"
+    );
+    assert!(
+        result
+            .notices()
+            .iter()
+            .any(|notice| notice.code == "full_text_search_unindexed"
+                && notice.message.contains("Note.summary")),
+        "expected the unindexed-column notice, got: {:?}",
+        result.notices()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn bm25_on_unindexed_column_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_unindexed_text_db(&dir).await;
+
+    let result = query_main(
+        &mut db,
+        UNINDEXED_TEXT_QUERIES,
+        "note_bm25",
+        &params(&[("$q", "databases")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result_slugs(&result), vec!["n2"]);
+    assert!(
+        result
+            .notices()
+            .iter()
+            .any(|notice| notice.code == "full_text_search_unindexed"),
+        "bm25 on an unindexed column must carry the notice, got: {:?}",
+        result.notices()
+    );
+}
+
+// Negative control: the standard fixture's indexed column emits no notice.
+#[tokio::test]
+#[serial]
+async fn indexed_text_search_emits_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "text_search",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
+    assert!(result.num_rows() > 0);
+    assert!(
+        result.notices().is_empty(),
+        "indexed text search must not warn, got: {:?}",
+        result.notices()
+    );
+}
+
 // ─── Fuzzy search (retired — T25) ───────────────────────────────────────────
 
 // fuzzy() is retired: it was provably inert (a one-edit typo matched nothing

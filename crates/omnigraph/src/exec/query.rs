@@ -215,6 +215,41 @@ struct RrfMode {
     limit: usize,
 }
 
+/// Collects advisory [`QueryNotice`]s during execution.
+///
+/// Threaded explicitly through the executor — like `search_mode` and
+/// `final_expand_cap` — so every pass writes into one sink and the bm25
+/// uncapped retry cannot duplicate a notice: `emit` drops exact repeats,
+/// which also keeps RRF's two forked arms from double-reporting a shared
+/// condition. Notices never change rows, membership, or order.
+#[derive(Default)]
+struct NoticeSink(Vec<QueryNotice>);
+
+impl NoticeSink {
+    fn emit(&mut self, code: &'static str, message: String) {
+        if self
+            .0
+            .iter()
+            .any(|notice| notice.code == code && notice.message == message)
+        {
+            return;
+        }
+        self.0.push(QueryNotice {
+            code: code.to_string(),
+            message,
+        });
+    }
+
+    fn into_notices(self) -> Vec<QueryNotice> {
+        self.0
+    }
+}
+
+/// Stable notice code: a full-text function targeted a column with no FTS
+/// index, so Lance's flat fallback ran with its bare, case-sensitive
+/// tokenizer instead of the indexed analyzer.
+const NOTICE_FULL_TEXT_SEARCH_UNINDEXED: &str = "full_text_search_unindexed";
+
 /// Multiplier on the query's limit for a capped BM25 scan; trades scan width
 /// against how often the uncapped retry is needed (see `execute_query`).
 const BM25_SCAN_OVERFETCH_FACTOR: usize = 4;
@@ -552,15 +587,34 @@ pub async fn execute_query(
     let params = resolved_params.as_ref().unwrap_or(params);
 
     let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
+    let mut notices = NoticeSink::default();
 
     // RRF requires forked execution. Its bm25 arms are never capped (see
     // `extract_sub_search_mode`), so no under-fill retry arises for it.
     if let Some(ref rrf) = search_mode.rrf {
-        return execute_rrf_fusion(ir, params, snapshot, graph_index, catalog, rrf).await;
+        let result = execute_rrf_fusion(
+            ir,
+            params,
+            snapshot,
+            graph_index,
+            catalog,
+            rrf,
+            &mut notices,
+        )
+        .await?;
+        return Ok(result.with_notices(notices.into_notices()));
     }
 
-    let result_batch =
-        execute_query_once(ir, params, snapshot, graph_index, catalog, &search_mode).await?;
+    let result_batch = execute_query_once(
+        ir,
+        params,
+        snapshot,
+        graph_index,
+        catalog,
+        &search_mode,
+        &mut notices,
+    )
+    .await?;
 
     // A capped BM25 scan can under-fill: rows that survive the scan are then
     // dropped by a traversal with no matching edge or by a filter that could
@@ -581,12 +635,23 @@ pub async fn execute_query(
         );
         crate::instrumentation::record_bm25_uncapped_retry();
         let uncapped = search_mode.to_uncapped();
-        let retried =
-            execute_query_once(ir, params, snapshot, graph_index, catalog, &uncapped).await?;
-        return Ok(QueryResult::new(retried.schema(), vec![retried]));
+        let retried = execute_query_once(
+            ir,
+            params,
+            snapshot,
+            graph_index,
+            catalog,
+            &uncapped,
+            &mut notices,
+        )
+        .await?;
+        return Ok(
+            QueryResult::new(retried.schema(), vec![retried]).with_notices(notices.into_notices())
+        );
     }
 
-    Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
+    Ok(QueryResult::new(result_batch.schema(), vec![result_batch])
+        .with_notices(notices.into_notices()))
 }
 
 /// One pass of a non-RRF query: pipeline, projection, ordering, limit.
@@ -599,6 +664,7 @@ async fn execute_query_once(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     search_mode: &SearchMode,
+    notices: &mut NoticeSink,
 ) -> Result<RecordBatch> {
     let has_aggregates = projections_have_aggregates(&ir.return_exprs);
 
@@ -628,6 +694,7 @@ async fn execute_query_once(
         search_mode,
         final_expand_cap,
         &needed_columns,
+        notices,
     )
     .await?;
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
@@ -1163,6 +1230,7 @@ async fn execute_rrf_fusion(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     rrf: &RrfMode,
+    notices: &mut NoticeSink,
 ) -> Result<QueryResult> {
     debug_assert!(
         rrf.primary.bm25_scan_limit.is_none() && rrf.secondary.bm25_scan_limit.is_none(),
@@ -1203,6 +1271,7 @@ async fn execute_rrf_fusion(
         primary_mode,
         None,
         &needed_columns,
+        notices,
     )
     .await?;
 
@@ -1218,6 +1287,7 @@ async fn execute_rrf_fusion(
         secondary_mode,
         None,
         &needed_columns,
+        notices,
     )
     .await?;
 
@@ -1662,6 +1732,7 @@ fn execute_pipeline<'a>(
     // always pass `None`.
     final_expand_cap: Option<usize>,
     needed_columns: &'a HashMap<String, NeededColumns>,
+    notices: &'a mut NoticeSink,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         // Pre-pass: hoist filters onto the op that introduces their binding.
@@ -1766,6 +1837,7 @@ fn execute_pipeline<'a>(
                         catalog,
                         search_mode,
                         needed_columns.get(variable.as_str()),
+                        notices,
                     )
                     .await?;
                     let prefixed = prefix_batch(&batch, variable)?;
@@ -1843,6 +1915,7 @@ fn execute_pipeline<'a>(
                             catalog,
                             outer_var,
                             needed_columns,
+                            notices,
                         )
                         .await?;
                     }
@@ -3534,6 +3607,7 @@ async fn execute_anti_join(
     catalog: &Catalog,
     outer_var: &str,
     needed_columns: &HashMap<String, NeededColumns>,
+    notices: &mut NoticeSink,
 ) -> Result<()> {
     // Only the bulk fast path consumes the CSR; the slow path's inner Expand
     // chooses its own access path. Realize the O(|E|) graph index ONLY when the
@@ -3605,6 +3679,7 @@ async fn execute_anti_join(
         &no_search,
         None,
         needed_columns,
+        notices,
     )
     .await?;
 
@@ -3651,6 +3726,7 @@ async fn execute_node_scan(
     catalog: &Catalog,
     search_mode: &SearchMode,
     binding_columns: Option<&NeededColumns>,
+    notices: &mut NoticeSink,
 ) -> Result<RecordBatch> {
     let table_key = format!("node:{}", type_name);
     let ds = snapshot.open_lance_dataset(&table_key).await?;
@@ -3682,6 +3758,55 @@ async fn execute_node_scan(
             Some(expr) => expr.and(in_list),
             None => in_list,
         });
+    }
+
+    // Advisory (never a result change): a full-text function on a column with
+    // no FTS index still serves — Lance plans a flat scan — but that fallback
+    // tokenizes with a bare, case-sensitive analyzer, so `match_text($x.name,
+    // "anthropic")` misses a stored "Anthropic" with no signal. Surface the
+    // condition as a warning + notice so a caller cannot read "no rows" as
+    // "no entity". The indexed path is unaffected.
+    {
+        let mut fts_columns: Vec<String> = Vec::new();
+        for filter in filters {
+            if !is_search_filter(filter) {
+                continue;
+            }
+            if let Some(prop) = match &filter.left {
+                IRExpr::Search { field, .. } | IRExpr::MatchText { field, .. } => {
+                    extract_property(field)
+                }
+                _ => None,
+            } {
+                fts_columns.push(prop);
+            }
+        }
+        if let Some((var, prop, _)) = search_mode.bm25.as_ref() {
+            if var == variable {
+                fts_columns.push(prop.clone());
+            }
+        }
+        fts_columns.sort();
+        fts_columns.dedup();
+        for column in fts_columns {
+            if !crate::table_store::TableStore::has_fts_index_on(&ds, &column).await? {
+                tracing::warn!(
+                    type_name,
+                    column = column.as_str(),
+                    "full-text search on a column with no FTS index falls back to a flat \
+                     scan with a bare case-sensitive tokenizer"
+                );
+                notices.emit(
+                    NOTICE_FULL_TEXT_SEARCH_UNINDEXED,
+                    format!(
+                        "full-text search on {type_name}.{column} ran without an FTS index: \
+                         the flat fallback tokenizes case-sensitively, so matches that an \
+                         indexed column would find can be missed. Declare @index on the \
+                         property and run ensure_indices to index it."
+                    ),
+                );
+            }
+        }
     }
 
     // Blob columns must be excluded from scan when a filter is present
