@@ -27,6 +27,25 @@ use super::schema_shape::{
 
 pub const SCHEMA_IR_VERSION: u32 = 2;
 
+/// Minted only when a schema declares an edge `@key` (RFC 0044); unkeyed
+/// schemas keep stamping [`SCHEMA_IR_VERSION`].
+pub const SCHEMA_IR_VERSION_EDGE_KEYS: u32 = 3;
+
+/// The `ir_version` an accepted schema is stamped with: the highest version
+/// its declared features require.
+pub fn required_ir_version(ir: &SchemaIR) -> u32 {
+    let has_edge_key = ir.edges.iter().any(|edge| {
+        edge.constraints
+            .iter()
+            .any(|constraint| matches!(constraint, ConstraintIR::Key { .. }))
+    });
+    if has_edge_key {
+        SCHEMA_IR_VERSION_EDGE_KEYS
+    } else {
+        SCHEMA_IR_VERSION
+    }
+}
+
 /// Opaque namespace for every numeric identity in one graph root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -648,7 +667,7 @@ fn resolve(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let schema_ir = SchemaIR {
+    let mut schema_ir = SchemaIR {
         ir_version: SCHEMA_IR_VERSION,
         schema_identity_domain: domain,
         next_identity_id: allocator.next,
@@ -656,6 +675,7 @@ fn resolve(
         nodes,
         edges,
     };
+    schema_ir.ir_version = required_ir_version(&schema_ir);
     validate_schema_ir(&schema_ir)?;
     Ok(SchemaResolution {
         schema_ir,
@@ -1064,9 +1084,16 @@ pub(crate) fn constraint_from_ir(constraint: &ConstraintIR) -> Constraint {
 
 /// Fail closed on malformed or hand-authored identity authority.
 pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
-    if ir.ir_version != SCHEMA_IR_VERSION {
+    if ir.ir_version != SCHEMA_IR_VERSION && ir.ir_version != SCHEMA_IR_VERSION_EDGE_KEYS {
         return invalid_ir(format!(
-            "unsupported ir_version {} (expected {SCHEMA_IR_VERSION})",
+            "unsupported ir_version {} (supported {SCHEMA_IR_VERSION} and {SCHEMA_IR_VERSION_EDGE_KEYS})",
+            ir.ir_version
+        ));
+    }
+    let required = required_ir_version(ir);
+    if ir.ir_version != required {
+        return invalid_ir(format!(
+            "ir_version {} does not match the declared features (expected {required})",
             ir.ir_version
         ));
     }
@@ -1417,6 +1444,66 @@ fn validate_constraints(
     properties: &HashMap<StablePropertyId, (AcceptedType<'_>, &PropertyIR)>,
 ) -> Result<()> {
     for constraint in constraints {
+        // Edge keys are identity authority: refuse malformed shapes here, not
+        // only at catalog build, so a hand-authored IR fails closed before
+        // acceptance can commit it.
+        if kind == TypeKind::Edge
+            && let ConstraintIR::Key { fields } = constraint
+        {
+            let owner_name = &types[&owner_id].name;
+            let mut src_seen = false;
+            let mut dst_seen = false;
+            let mut property_ids = HashSet::new();
+            for field in fields {
+                match field {
+                    FieldRefIR::System(reference) => {
+                        let seen = match reference.role {
+                            SystemFieldRole::Src => &mut src_seen,
+                            SystemFieldRole::Dst => &mut dst_seen,
+                            SystemFieldRole::Id => {
+                                return invalid_ir(format!(
+                                    "edge '{owner_name}' @key cannot reference the id"
+                                ));
+                            }
+                        };
+                        if *seen {
+                            return invalid_ir(format!(
+                                "edge '{owner_name}' @key repeats an endpoint"
+                            ));
+                        }
+                        *seen = true;
+                    }
+                    FieldRefIR::Property(reference) => {
+                        if !property_ids.insert(reference.property_id) {
+                            return invalid_ir(format!(
+                                "edge '{owner_name}' @key repeats a property identity"
+                            ));
+                        }
+                        if let Some((_, property)) = properties.get(&reference.property_id) {
+                            let prop_type = &property.prop_type;
+                            if prop_type.nullable
+                                || prop_type.list
+                                || matches!(
+                                    prop_type.scalar,
+                                    crate::types::ScalarType::Vector(_)
+                                        | crate::types::ScalarType::Blob
+                                )
+                            {
+                                return invalid_ir(format!(
+                                    "edge '{owner_name}' @key member '{}' must be a non-null scalar",
+                                    reference.property_name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if !src_seen || !dst_seen {
+                return invalid_ir(format!(
+                    "edge '{owner_name}' @key must include both endpoints"
+                ));
+            }
+        }
         let fields: Vec<&FieldRefIR> = match constraint {
             ConstraintIR::Key { fields }
             | ConstraintIR::Unique { fields }
@@ -1744,6 +1831,58 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(src, dst) }
         let mut v1 = ir;
         v1.ir_version = 1;
         assert!(validate_schema_ir(&v1).is_err());
+    }
+
+    #[test]
+    fn ir_version_stamps_the_highest_declared_feature() {
+        let unkeyed = initialize("node P { n: String } edge E: P -> P { s: String }");
+        assert_eq!(unkeyed.ir_version, SCHEMA_IR_VERSION);
+        let keyed =
+            initialize("node P { n: String } edge E: P -> P { s: String @key(src, dst, s) }");
+        assert_eq!(keyed.ir_version, SCHEMA_IR_VERSION_EDGE_KEYS);
+    }
+
+    #[test]
+    fn ir_version_restamps_the_base_number_when_the_last_edge_key_drops() {
+        let keyed = initialize("node P { n: String } edge E: P -> P { @key(src, dst) }");
+        assert_eq!(keyed.ir_version, SCHEMA_IR_VERSION_EDGE_KEYS);
+        let unkeyed_shape =
+            compile_schema_shape(&parse_schema("node P { n: String }").unwrap()).unwrap();
+        let resolved = resolve_schema_ir(&keyed, &unkeyed_shape).unwrap().schema_ir;
+        assert_eq!(resolved.ir_version, SCHEMA_IR_VERSION);
+    }
+
+    #[test]
+    fn validation_rejects_ir_version_feature_mismatch() {
+        let keyed = initialize("node P { n: String } edge E: P -> P { @key(src, dst) }");
+        let mut spoofed_low = keyed;
+        spoofed_low.ir_version = SCHEMA_IR_VERSION;
+        assert!(validate_schema_ir(&spoofed_low).is_err());
+
+        let unkeyed = initialize("node P { n: String }");
+        let mut spoofed_high = unkeyed;
+        spoofed_high.ir_version = SCHEMA_IR_VERSION_EDGE_KEYS;
+        assert!(validate_schema_ir(&spoofed_high).is_err());
+    }
+
+    #[test]
+    fn edge_key_catalog_orders_endpoints_first_then_stable_property_ids() {
+        let ir = initialize(
+            "node P { n: String } edge E: P -> P { a: String b: String @key(b, dst, src, a) }",
+        );
+        let catalog = build_catalog_from_ir(&ir).unwrap();
+        assert_eq!(
+            catalog.edge_types["E"].key.as_deref(),
+            Some(
+                &[
+                    "src".to_string(),
+                    "dst".to_string(),
+                    "a".to_string(),
+                    "b".to_string()
+                ][..]
+            ),
+            "endpoints lead, composite members follow preserved property identity"
+        );
     }
 
     #[test]

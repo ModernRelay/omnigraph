@@ -3417,3 +3417,255 @@ async fn merge_delta_only_bumps_changed_rows() {
         unique_versions
     );
 }
+
+// ─── Edge @key: born-on-both convergence and divergence (issue #583) ─────────
+
+const EDGE_KEY_MERGE_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: String?
+    @key(src, dst)
+}
+"#;
+
+// The unkeyed control: identical fixture without the key declaration.
+const EDGE_UNKEYED_MERGE_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: String?
+}
+"#;
+
+const EDGE_KEY_MERGE_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"type":"Person","data":{"name":"Carol"}}
+{"type":"Person","data":{"name":"Dave"}}
+{"type":"Person","data":{"name":"Eve"}}
+{"edge":"Knows","from":"Alice","to":"Carol"}
+{"edge":"Knows","from":"Alice","to":"Dave"}
+{"edge":"Knows","from":"Alice","to":"Eve"}"#;
+
+const EDGE_KEY_MERGE_MUTATIONS: &str = r#"
+query add_knows($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+
+query add_knows_since($from: String, $to: String, $since: String) {
+    insert Knows { from: $from, to: $to, since: $since }
+}
+"#;
+
+const EDGE_KEY_MERGE_QUERIES: &str = r#"
+query friends() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows $f
+    }
+    return { $f.name }
+}
+
+query friend_edges() {
+    match {
+        $p: Person { name: "Alice" }
+        $p $w:knows $f
+    }
+    return { $f.name }
+}
+"#;
+
+/// Issue #583's repro with `@key(src, dst)` declared: the same keyed edge
+/// inserted on both sides of a fork derives the same id, so the merge
+/// converges with no conflict and both the plain and the bound-edge
+/// traversal return 4 rows.
+#[tokio::test]
+async fn branch_merge_converges_born_on_both_keyed_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main =
+        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    main.branch_merge("feature", "main")
+        .await
+        .expect("identical born-on-both keyed edges converge without conflict");
+
+    assert_eq!(count_rows(&main, "edge:Knows").await, 4);
+    let plain = query_main(&mut main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&plain).len(), 4);
+    let bound = query_main(
+        &mut main,
+        EDGE_KEY_MERGE_QUERIES,
+        "friend_edges",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_column_sorted(&bound).len(), 4);
+}
+
+/// The unkeyed control pins the documented multiset outcome the RFC's
+/// acceptance threshold names: the merge keeps both rows (5 edges), the
+/// plain traversal's visited gate suppresses the duplicate (4), and the
+/// bound-edge traversal reports every row (5).
+#[tokio::test]
+async fn branch_merge_keeps_both_born_on_both_unkeyed_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main =
+        init_db_from_schema_and_data(&dir, EDGE_UNKEYED_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    main.branch_merge("feature", "main")
+        .await
+        .expect("unkeyed born-on-both edges keep the documented multiset outcome");
+
+    assert_eq!(count_rows(&main, "edge:Knows").await, 5);
+    let plain = query_main(&mut main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&plain).len(), 4);
+    let bound = query_main(
+        &mut main,
+        EDGE_KEY_MERGE_QUERIES,
+        "friend_edges",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_column_sorted(&bound).len(), 5);
+}
+
+/// Distinct keyed pairs inserted one per side derive distinct ids and merge
+/// cleanly: no conflict, both rows land.
+#[tokio::test]
+async fn branch_merge_keeps_distinct_keyed_pairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main =
+        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Bob"), ("$to", "Alice")]),
+    )
+    .await
+    .unwrap();
+
+    main.branch_merge("feature", "main")
+        .await
+        .expect("distinct keyed pairs must merge cleanly");
+    // Three fixture edges plus the two distinct new pairs.
+    assert_eq!(count_rows(&main, "edge:Knows").await, 5);
+}
+
+/// Two branches inserting the same key with DIFFERENT non-key properties
+/// surface `DivergentInsert`, with the derived id as the conflict entity id.
+#[tokio::test]
+async fn branch_merge_reports_divergent_insert_for_keyed_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main =
+        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows_since",
+        &params(&[("$from", "Alice"), ("$to", "Bob"), ("$since", "2020")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows_since",
+        &params(&[("$from", "Alice"), ("$to", "Bob"), ("$since", "2021")]),
+    )
+    .await
+    .unwrap();
+
+    let err = main.branch_merge("feature", "main").await.unwrap_err();
+    match err {
+        OmniError::MergeConflicts(conflicts) => {
+            assert!(
+                conflicts.iter().any(|conflict| {
+                    conflict.type_key == "edge:Knows"
+                        && conflict.kind == MergeConflictKind::DivergentInsert
+                        && conflict.entity_id.as_deref() == Some(r#"["Alice","Bob"]"#)
+                }),
+                "expected DivergentInsert on the derived edge id, got {conflicts:?}"
+            );
+        }
+        other => panic!("expected merge conflicts, got {other:?}"),
+    }
+}

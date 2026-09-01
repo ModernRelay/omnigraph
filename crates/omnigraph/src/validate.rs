@@ -219,8 +219,34 @@ pub(crate) fn constraints_for(catalog: &Catalog) -> Vec<Constraint> {
     __dst_ve.sort_by(|a, b| a.0.cmp(b.0));
     for (name, edge_type) in __dst_ve {
         let table_key = format!("edge:{name}");
-        // Edges have no `@key`; every `@unique` group needs the committed lookup.
+        // `@key` is id-backed: cross-version duplication is impossible (the key
+        // IS the identity), so it needs only intra-delta dedup — `is_key: true`
+        // tells the evaluator to skip the committed lookup. Sound only because
+        // a key exists from type creation on: schema_plan refuses adding or
+        // removing constraints on an existing type, so committed rows always
+        // carry derived ids.
+        if let Some(key) = &edge_type.key {
+            out.push(Constraint::Unique {
+                table_key: table_key.clone(),
+                columns: key.clone(),
+                is_key: true,
+            });
+        }
+        // `@unique` (non-key) groups CAN collide cross-version → committed lookup.
+        // Subsumption compares column SETS: uniqueness is order-free, and the
+        // catalog stores the key endpoint-first while shape normalization
+        // stores `@unique` groups lexically, so tuple equality can never hold.
+        let sorted_key = edge_type.key.as_ref().map(|key| {
+            let mut key = key.clone();
+            key.sort();
+            key
+        });
         for columns in &edge_type.unique_constraints {
+            let mut sorted_columns = columns.clone();
+            sorted_columns.sort();
+            if Some(&sorted_columns) == sorted_key.as_ref() {
+                continue; // same column set as @key — already covered above.
+            }
             out.push(Constraint::Unique {
                 table_key: table_key.clone(),
                 columns: columns.clone(),

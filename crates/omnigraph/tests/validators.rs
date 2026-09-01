@@ -711,3 +711,226 @@ async fn cardinality_rejected_on_jsonl_load() {
         err
     );
 }
+
+// ─── Edge @key: derivation, upsert convergence, subsumption, load refusal ────
+
+const EDGE_KEY_SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    since: String?
+    @key(src, dst)
+}
+"#;
+
+const EDGE_KEY_SEED: &str = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}"#;
+
+const EDGE_KEY_MUTATIONS: &str = r#"
+query add_knows($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+
+query add_knows_since($from: String, $to: String, $since: String) {
+    insert Knows { from: $from, to: $to, since: $since }
+}
+"#;
+
+/// Two separate mutations inserting the same keyed (src, dst) pair converge to
+/// one row: the derived id makes the second insert an upsert of the first.
+#[tokio::test]
+async fn keyed_edge_reinsert_converges_to_one_row() {
+    let (_dir, mut db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    for _ in 0..2 {
+        mutate_main(
+            &mut db,
+            EDGE_KEY_MUTATIONS,
+            "add_knows",
+            &params(&[("$from", "Alice"), ("$to", "Bob")]),
+        )
+        .await
+        .expect("re-inserting an existing keyed edge upserts");
+    }
+    assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+}
+
+/// Distinct endpoint pairs derive distinct ids and stay distinct rows.
+#[tokio::test]
+async fn keyed_edge_distinct_pairs_stay_distinct() {
+    let (_dir, mut db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    for (from, to) in [("Alice", "Bob"), ("Bob", "Alice")] {
+        mutate_main(
+            &mut db,
+            EDGE_KEY_MUTATIONS,
+            "add_knows",
+            &params(&[("$from", from), ("$to", to)]),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(count_rows(&db, "edge:Knows").await, 2);
+}
+
+/// A re-insert with a different non-key property updates the row in place
+/// (last write wins on the derived id), matching the keyed-node contract.
+#[tokio::test]
+async fn keyed_edge_reinsert_updates_non_key_properties() {
+    let (_dir, mut db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    for since in ["2020", "2021"] {
+        mutate_main(
+            &mut db,
+            EDGE_KEY_MUTATIONS,
+            "add_knows_since",
+            &params(&[("$from", "Alice"), ("$to", "Bob"), ("$since", since)]),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+}
+
+const EDGE_KEY_UNIQUE_SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    @key(src, dst)
+    @unique(src, dst)
+}
+"#;
+
+/// A `@unique` group over the key's column set must not turn a keyed
+/// re-insert into a unique violation. (This pins the outcome, not the
+/// subsumption skip itself: the evaluator's same-id exclusion alone would
+/// also pass it — the skip's observable effect is only the saved probe.)
+#[tokio::test]
+async fn keyed_edge_unique_group_equal_to_key_is_subsumed() {
+    let (_dir, mut db) = init_with(EDGE_KEY_UNIQUE_SCHEMA, EDGE_KEY_SEED).await;
+    for _ in 0..2 {
+        mutate_main(
+            &mut db,
+            EDGE_KEY_MUTATIONS,
+            "add_knows",
+            &params(&[("$from", "Alice"), ("$to", "Bob")]),
+        )
+        .await
+        .expect("@unique equal to the key tuple is subsumed by identity");
+    }
+    assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+}
+
+/// A loaded keyed edge derives its id; a supplied id is refused unless it
+/// exactly equals the derivation (the append surface has its own pin below).
+#[tokio::test]
+async fn keyed_edge_load_refuses_mismatched_explicit_id() {
+    let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    let err = load_jsonl(
+        &db,
+        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"wrong"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("does not match its canonical @key id"),
+        "got: {}",
+        err
+    );
+}
+
+/// A supplied id exactly equal to the derivation is accepted (round-tripping
+/// an export), and a repeated merge-load of the same pair converges.
+#[tokio::test]
+async fn keyed_edge_load_derives_and_converges_on_merge() {
+    let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    let row = r#"{"edge":"Knows","from":"Alice","to":"Bob"}"#;
+    load_jsonl(&db, row, LoadMode::Merge).await.unwrap();
+    load_jsonl(&db, row, LoadMode::Merge)
+        .await
+        .expect("merge-load re-upserting an existing keyed edge converges");
+    assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+
+    // The derived id for @key(src, dst) is the composite JSON array; supplying
+    // it verbatim round-trips.
+    let explicit =
+        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"[\"Alice\",\"Bob\"]"}}"#;
+    load_jsonl(&db, explicit, LoadMode::Merge)
+        .await
+        .expect("an explicit id equal to the derivation is accepted");
+    assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+}
+
+/// The explicit-id refusal holds on the append surface too.
+#[tokio::test]
+async fn keyed_edge_append_load_refuses_mismatched_explicit_id() {
+    let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    let err = load_jsonl(
+        &db,
+        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"wrong"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("does not match its canonical @key id"),
+        "got: {}",
+        err
+    );
+}
+
+/// Append (strict insert) of an already-committed key reports a conflict
+/// instead of a silent duplicate.
+#[tokio::test]
+async fn keyed_edge_append_load_conflicts_on_committed_key() {
+    let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    let row = r#"{"edge":"Knows","from":"Alice","to":"Bob"}"#;
+    load_jsonl(&db, row, LoadMode::Append).await.unwrap();
+    let err = load_jsonl(&db, row, LoadMode::Append).await.unwrap_err();
+    assert!(
+        err.to_string().contains("already has this id"),
+        "got: {}",
+        err
+    );
+    assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+}
+
+const EDGE_COMPOSITE_KEY_SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    since: String
+    @key(src, dst, since)
+}
+"#;
+
+/// A scalar key member rides the derivation end to end: identical triples
+/// converge, a distinct `since` is a distinct identity.
+#[tokio::test]
+async fn keyed_edge_scalar_member_derives_end_to_end() {
+    let (_dir, mut db) = init_with(EDGE_COMPOSITE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    for since in ["2020", "2020", "2021"] {
+        mutate_main(
+            &mut db,
+            EDGE_KEY_MUTATIONS,
+            "add_knows_since",
+            &params(&[("$from", "Alice"), ("$to", "Bob"), ("$since", since)]),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(count_rows(&db, "edge:Knows").await, 2);
+}
+
+/// A null value in a key column is refused on the load surface. The column
+/// is declared non-nullable, so the column builder refuses before the
+/// derivation's own null arm (which stays as defense-in-depth behind it).
+#[tokio::test]
+async fn keyed_edge_null_key_member_rejected_on_load() {
+    let (_dir, db) = init_with(EDGE_COMPOSITE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    let err = load_jsonl(
+        &db,
+        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"since":null}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("since"), "got: {}", err);
+}

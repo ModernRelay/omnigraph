@@ -55,6 +55,9 @@ letter (`worksAt` for `WorksAt`); lookup is otherwise case-insensitive.
 
 The names `_rowid`, `_rowaddr`, `_rowoffset`,
 `_row_created_at_version`, and `_row_last_updated_at_version` are reserved.
+On edge types the names `id`, `src`, `dst`, `from`, and `to` are also
+reserved: they name the physical id, the endpoint columns, and the insert
+parameters.
 
 ## Constraints
 
@@ -63,7 +66,7 @@ also have a single-property shorthand.
 
 | Constraint | Applies to | Meaning |
 |---|---|---|
-| `@key(p, ...)` | node | The ordered property tuple identifies the node. Key properties must be non-null scalar values. |
+| `@key(p, ...)` | node or edge | The property tuple identifies the entity; its id is derived from it. Key properties must be non-null scalar values. An edge key must include both `src` and `dst`, and a key may be declared only when the type is created. |
 | `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `src` and `dst`. |
 | `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness. |
 | `@range(p, min..max)` | node | Restricts a numeric property; either bound may be omitted. |
@@ -87,11 +90,15 @@ Every node and edge has a String `id` in load and export data.
 - A node with `@key` derives its id from the complete typed key tuple. Renaming a
   key property with `@rename_from` does not change existing ids.
 - A node without a key receives a generated id unless input supplies one.
-- Edges use generated or supplied ids and store their endpoints as `src` and
-  `dst`.
+- An edge with `@key` derives its id the same way, in the catalog's key
+  order: `src`, then `dst`, then any scalar members. A composite id encodes
+  as a JSON array of the member values, for example `["Alice","Bob"]`.
+- An edge without a key uses generated or supplied ids. Edges store their
+  endpoints as `src` and `dst`.
 
-For hand-authored load data, omit a keyed node's `data.id` and let OmniGraph
-derive it. Export includes ids so a graph can be rebuilt without losing edge
+For hand-authored load data, omit a keyed node's or keyed edge's `data.id`
+and let OmniGraph derive it; a supplied id on a keyed edge must equal the
+derived id exactly. Export includes ids so a graph can be rebuilt without losing edge
 references.
 
 ## Annotations

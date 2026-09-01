@@ -106,6 +106,13 @@ pub struct EdgeType {
     pub to_type: String,
     pub cardinality: Cardinality,
     pub properties: HashMap<String, PropType>,
+    /// Key column names (from `@key(src, dst, ...)`), always including both
+    /// endpoints. IR-bound catalogs order endpoints first (src, dst), then
+    /// composite members in stable property-ID order so renames cannot
+    /// change physical tuple identity. The parse-path catalog
+    /// (`build_catalog`) keeps declared order and never feeds id
+    /// derivation; only IR-bound catalogs do.
+    pub key: Option<Vec<String>>,
     /// Uniqueness constraints on edge fields, including endpoint fields
     /// (e.g. `@unique(src, dst)`).
     pub unique_constraints: Vec<Vec<String>>,
@@ -450,13 +457,20 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             }
 
             // Extract edge constraints
+            let mut key: Option<Vec<String>> = None;
             let mut unique_constraints = Vec::new();
             let mut edge_indices = Vec::new();
             for constraint in &edge.constraints {
                 match constraint {
+                    Constraint::Key(cols) => {
+                        // No implied index: edge keys are always composite and
+                        // index maintenance builds single-column indices only;
+                        // the fixed id/src/dst BTREEs already cover endpoints.
+                        key = Some(cols.clone());
+                    }
                     Constraint::Unique(cols) => unique_constraints.push(cols.clone()),
                     Constraint::Index(cols) => edge_indices.push(cols.clone()),
-                    _ => {} // Key/Range/Check validated at parse time to not appear on edges
+                    _ => {} // Range/Check validated at parse time to not appear on edges
                 }
             }
 
@@ -479,6 +493,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     to_type: edge.to_type.clone(),
                     cardinality: edge.cardinality.clone(),
                     properties,
+                    key,
                     unique_constraints,
                     indices: edge_indices,
                     blob_properties,
@@ -649,10 +664,75 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
             .filter(|property| matches!(property.prop_type.scalar, ScalarType::Blob))
             .map(|property| property.name.clone())
             .collect();
+        let mut key = None;
         let mut unique_constraints = Vec::new();
         let mut indices = Vec::new();
         for constraint in &edge.constraints {
+            if let schema_ir::ConstraintIR::Key { fields } = constraint {
+                let mut has_src = false;
+                let mut has_dst = false;
+                let mut stable_fields = Vec::new();
+                for field in fields {
+                    match field {
+                        schema_ir::FieldRefIR::System(reference) => match reference.role {
+                            schema_ir::SystemFieldRole::Src => {
+                                if has_src {
+                                    return Err(CompilerError::Catalog(format!(
+                                        "edge '{}' @key repeats an endpoint",
+                                        edge.name
+                                    )));
+                                }
+                                has_src = true;
+                            }
+                            schema_ir::SystemFieldRole::Dst => {
+                                if has_dst {
+                                    return Err(CompilerError::Catalog(format!(
+                                        "edge '{}' @key repeats an endpoint",
+                                        edge.name
+                                    )));
+                                }
+                                has_dst = true;
+                            }
+                            schema_ir::SystemFieldRole::Id => {
+                                return Err(CompilerError::Catalog(format!(
+                                    "edge '{}' @key cannot reference the id",
+                                    edge.name
+                                )));
+                            }
+                        },
+                        schema_ir::FieldRefIR::Property(reference) => {
+                            stable_fields
+                                .push((reference.property_id, reference.property_name.clone()));
+                        }
+                    }
+                }
+                if !has_src || !has_dst {
+                    return Err(CompilerError::Catalog(format!(
+                        "edge '{}' @key must include both endpoints",
+                        edge.name
+                    )));
+                }
+                stable_fields.sort_by_key(|(property_id, _)| *property_id);
+                if stable_fields.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                    return Err(CompilerError::Catalog(format!(
+                        "edge '{}' @key repeats a property identity",
+                        edge.name
+                    )));
+                }
+                let mut columns = vec!["src".to_string(), "dst".to_string()];
+                columns.extend(
+                    stable_fields
+                        .into_iter()
+                        .map(|(_, property_name)| property_name),
+                );
+                // No implied index: edge keys are always composite and index
+                // maintenance builds single-column indices only; the fixed
+                // id/src/dst BTREEs already cover endpoints.
+                key = Some(columns);
+                continue;
+            }
             match schema_ir::constraint_from_ir(constraint) {
+                Constraint::Key(_) => unreachable!("@key handled in stable property-id order"),
                 Constraint::Unique(columns) => unique_constraints.push(columns),
                 Constraint::Index(columns) => indices.push(columns),
                 _ => {}
@@ -688,6 +768,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 to_type: edge.to_type.type_name.clone(),
                 cardinality: edge.cardinality.clone(),
                 properties,
+                key,
                 unique_constraints,
                 indices,
                 blob_properties,

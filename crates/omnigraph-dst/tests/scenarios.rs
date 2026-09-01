@@ -2102,9 +2102,9 @@ fn census_setup(window: &'static str) -> Option<(&'static str, usize)> {
 /// milestone-constructed merges made `predict_merge` say REJECT while the
 /// engine ACCEPTED. Rerun exactly those census cells with the prediction
 /// reason log on (`DST_PREDICT_LOG`), so every disagreement names its
-/// rejecting rule (H-A born-on-both / both-changed-differently / H-B
-/// referential) and its evidence — engine bug XOR wrong model
-/// belief, and the reason decides which.
+/// rejecting rule (both-changed-differently / H-B referential; the H-A
+/// born-on-both rule is retired, RFC 0044) and its evidence — engine bug
+/// XOR wrong model belief, and the reason decides which.
 #[test]
 #[serial]
 #[ignore = "instrument: law-8 predict_merge disagreement triage — run explicitly"]
@@ -2803,8 +2803,8 @@ fn dst_reborn_branch_cache_poison_minimal_shape_probe() {
 /// PHYSICAL rows through the raw snapshot scan. Two rows = the born-on-both duplication
 /// (edge duplication) widened to node rows under a declared `@key` —
 /// engine wrong-accept. One row = the engine resolves equal-content
-/// born-on-both and the model's H-A is too strict for the equal case —
-/// model fix.
+/// born-on-both exactly as the plain three-way arms predict (the H-A edge
+/// rule, since retired entirely by RFC 0044, never applied to persons).
 #[test]
 #[serial]
 #[ignore = "instrument: law-8 deciding probe — run explicitly"]
@@ -3650,16 +3650,15 @@ fn dst_merge_version_collision_diverged_edge_table() {
     })
 }
 
-/// BORN-ON-BOTH FINDING pin (localized 2026-08-12 from seed 10228's op
-/// transcript): the SAME logical edge added independently on BOTH sides
-/// of a fork, then merged. `predict_merge`'s H-A treats a key born on both
-/// sides as a uniqueness conflict; the engine ACCEPTS — and the three-way
-/// merge keys rows on ULID `id`, so the rows never collide and the merge
-/// SILENTLY DUPLICATES the edge (bound raw = 2, gated traversal = 1 — the
-/// visited gate hides the duplicate; Knows row_count 3 → 5 for one logical
-/// add). The pin asserts the bug AS IT STANDS; when the engine fix lands
-/// it goes red with instructions (the version-collision pattern). The
-/// fleet's accept-assert trips are this shape.
+/// MULTISET-DEFAULT CONTRACT pin (localized 2026-08-12 from seed 10228's
+/// op transcript; reclassified from bug pin to contract pin by RFC 0044):
+/// the SAME logical unkeyed edge added independently on BOTH sides of a
+/// fork, then merged. The three-way merge keys rows on the generated `id`,
+/// so the rows never collide and the merge keeps both (bound raw = 2,
+/// gated traversal = 1 — the visited gate dedupes membership). This is the
+/// documented multiset default for edge types without `@key`; declaring
+/// `@key(src, dst)` opts into convergence instead, pinned by the keyed
+/// twin `dst_keyed_born_on_both_edge_converges` below.
 #[test]
 #[serial]
 fn dst_merge_duplicates_born_on_both_edge() {
@@ -3765,17 +3764,148 @@ fn dst_merge_duplicates_born_on_both_edge() {
                 );
                 assert_eq!(
                     bound_dup, 2,
-                    "BORN-ON-BOTH pinned as-is: the merge duplicates the \
-                     born-on-both edge (bound raw = 2 rows). If this is now 1, \
-                     the engine fix landed — flip this pin to assert 1, drop \
-                     the model's H-A-edge carve-out plan, and \
-                     un-classify the fleet's born-on-both class."
+                    "multiset default: an unkeyed born-on-both edge merges \
+                     into two physical rows. If this is 1, unkeyed edges \
+                     started converging — a contract change beyond RFC 0044 \
+                     (which scopes convergence to @key(src, dst) types)."
                 );
                 println!(
                     "BORN-ON-BOTH pinned: the edge merged into {bound_dup} \
                      physical rows (logical 1)"
                 );
             }
+        }
+
+        omnigraph::dst_clock::uninstall_logical_clock();
+        omnigraph::dst_ids::uninstall_seeded_ulids();
+    })
+}
+
+/// Keyed twin of the multiset-default pin: the same born-on-both shape with
+/// `@key(src, dst)` declared on `Knows`. Both sides derive the same id, so
+/// the merge converges the edge to ONE physical row with no conflict
+/// (RFC 0044 opt-in). Bound raw and gated traversal agree at 1.
+#[test]
+#[serial]
+fn dst_keyed_born_on_both_edge_converges() {
+    // Mirrors fixtures/test.pg plus the one `@key(src, dst)` line; a
+    // TEST_SCHEMA edit must be carried here by hand.
+    const KEYED_TEST_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+    age: I32?
+    ver: I64?
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+    @key(src, dst)
+}
+
+edge WorksAt: Person -> Company
+"#;
+    let mut seeds = SplitMix64(9203);
+    let runtime_seed = seeds.next_u64();
+    let ulid_seed = seeds.next_u64();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .rng_seed(tokio::runtime::RngSeed::from_bytes(
+            &runtime_seed.to_le_bytes(),
+        ))
+        .build_local(Default::default())
+        .expect("seeded runtime");
+    runtime.block_on(async move {
+        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
+        omnigraph::dst_clock::install_logical_clock();
+        let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
+        let db = Omnigraph::init_with_storage(
+            "shared-memory://dst-keyed-born-on-both",
+            KEYED_TEST_SCHEMA,
+            storage.clone(),
+            InitOptions::default(),
+        )
+        .await
+        .expect("init");
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            .await
+            .expect("load");
+
+        db.branch_create("b0").await.expect("branch create");
+        db.mutate(
+            "b0",
+            MUTATION_QUERIES,
+            "add_friend",
+            &mixed_params(&[("$from", "Diana"), ("$to", "Alice")], &[]),
+        )
+        .await
+        .expect("b0 add edge");
+        db.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "add_friend",
+            &mixed_params(&[("$from", "Diana"), ("$to", "Alice")], &[]),
+        )
+        .await
+        .expect("main add edge");
+
+        Box::pin(db.branch_merge("b0", "main"))
+            .await
+            .expect("identical born-on-both keyed edges converge without conflict");
+
+        let gated = knows_pairs_on(&db, "main").await;
+        let gated_dup = gated
+            .iter()
+            .filter(|(f, t)| f == "Diana" && t == "Alice")
+            .count();
+        use arrow_array::{Array, StringArray};
+        let qr = query_target(
+            &db,
+            omnigraph::db::ReadTarget::branch("main"),
+            MUTATION_QUERIES,
+            "all_knows_bound",
+            &omnigraph_compiler::ir::ParamMap::new(),
+        )
+        .await
+        .expect("bound read");
+        let mut bound_dup = 0usize;
+        for batch in qr.batches() {
+            let froms = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("bound col 0");
+            let tos = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("bound col 1");
+            for i in 0..froms.len() {
+                if froms.is_valid(i)
+                    && tos.is_valid(i)
+                    && froms.value(i) == "Diana"
+                    && tos.value(i) == "Alice"
+                {
+                    bound_dup += 1;
+                }
+            }
+        }
+        assert_eq!(gated_dup, 1, "gated traversal sees one (Diana, Alice) pair");
+        assert_eq!(
+            bound_dup, 1,
+            "keyed born-on-both must converge to one physical row"
+        );
+        // Convergence must not cost unrelated rows: every fixture edge
+        // survives the merge.
+        for (from, to) in omnigraph_dst::fixtures::fixture_knows() {
+            assert!(
+                gated.contains(&(from.clone(), to.clone())),
+                "fixture edge {from}->{to} lost through the keyed merge: {gated:?}"
+            );
         }
 
         omnigraph::dst_clock::uninstall_logical_clock();

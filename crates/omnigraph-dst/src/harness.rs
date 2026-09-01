@@ -1315,21 +1315,28 @@ impl WorldModel {
 /// equal passes; both-changed-differently is a `MergeConflict` and the WHOLE
 /// merge is rejected (state untouched). `None` = rejection predicted.
 ///
-/// Two hypotheses layered on top (dual-hypothesis method, as with
+/// One hypothesis layered on top (dual-hypothesis method, as with
 /// recorded engine discoveries — if the engine disagrees, an assert fails loudly and
 /// the real semantics get recorded with evidence):
-///   H-A (EDGES ONLY since the 2026-08-14 predict-triage): an edge BORN on
-///        both sides since the fork — the engine merges edges keyed on
-///        ULID row id, never sees the two rows as one logical edge, and
-///        ACCEPTS a duplicate (the born-on-both signature); the model keeps
-///        predicting reject so the illegal state stays flagged. PERSON
-///        rows are `@key`-keyed and the engine's measured semantics are
-///        content-based: equal-content born-on-both CONVERGES to one row,
-///        divergent inserts are typed `MergeConflict{DivergentInsert}` —
-///        exactly the plain three-way arms, so persons skip H-A (probed
-///        both cells, `dst_predict_born_on_both_person_probe`).
 ///   H-B: the merged state is RI-validated — an edge surviving the cursor
 ///        walk whose endpoint the other side deleted rejects the merge.
+///
+/// H-A (reject edges born on both sides) is RETIRED: unkeyed born-on-both
+/// is the DOCUMENTED multiset default (the merge keeps both physical rows;
+/// `@key(src, dst)` opts a type into convergence instead). The model's
+/// edge reads are visited-gated membership, and the set model predicts the
+/// merged MEMBERSHIP for the multiset default in every sampled shape so
+/// far. Known gap: hidden multiplicity can split a delete-vs-readd fork —
+/// one side removes every row of a pair the other side has also re-added
+/// as a fresh second row; the set model sees an unchanged side and
+/// predicts absence while the engine keeps the fresh row. A pair-count
+/// edge model is the fix if the fleet ever trips it. Physical row counts
+/// are pinned by the targeted scenario
+/// `dst_merge_duplicates_born_on_both_edge` and its keyed twin. PERSON
+/// rows are `@key`-keyed: equal-content born-on-both CONVERGES to one row
+/// and divergent inserts are typed `MergeConflict{DivergentInsert}` —
+/// exactly the plain three-way arms (probed both cells,
+/// `dst_predict_born_on_both_person_probe`).
 fn predict_merge(base: &Model, source: &Model, target: &Model) -> Option<Model> {
     // Predict-triage aid (env-gated): DST_PREDICT_LOG=1
     // prints WHICH rule rejected and on what evidence, so a
@@ -1346,8 +1353,6 @@ fn predict_merge(base: &Model, source: &Model, target: &Model) -> Option<Model> 
         base: &BTreeMap<K, V>,
         source: &BTreeMap<K, V>,
         target: &BTreeMap<K, V>,
-        // H-A applies to EDGES only — rationale in the fn doc's H-A entry.
-        reject_born_on_both: bool,
     ) -> Option<BTreeMap<K, V>> {
         let mut keys: BTreeSet<&K> = BTreeSet::new();
         keys.extend(base.keys());
@@ -1358,10 +1363,6 @@ fn predict_merge(base: &Model, source: &Model, target: &Model) -> Option<Model> 
             let b = base.get(key);
             let s = source.get(key);
             let t = target.get(key);
-            if reject_born_on_both && b.is_none() && s.is_some() && t.is_some() {
-                reject_log("H-A born-on-both", format!("key={key:?} s={s:?} t={t:?}"));
-                return None; // H-A: two distinct fresh rows under one key
-            }
             let pick = if s == b {
                 t
             } else if t == b || s == t {
@@ -1380,12 +1381,12 @@ fn predict_merge(base: &Model, source: &Model, target: &Model) -> Option<Model> 
         Some(merged)
     }
 
-    let persons = three_way(&base.persons, &source.persons, &target.persons, false)?;
+    let persons = three_way(&base.persons, &source.persons, &target.persons)?;
     let to_map = |m: &Model| -> BTreeMap<(String, String), ()> {
         m.edges.iter().cloned().map(|p| (p, ())).collect()
     };
     let edges: BTreeSet<(String, String)> =
-        three_way(&to_map(base), &to_map(source), &to_map(target), true)?
+        three_way(&to_map(base), &to_map(source), &to_map(target))?
             .into_keys()
             .collect();
     for (from, to) in &edges {
@@ -5383,7 +5384,7 @@ pub fn run_universe_caught(
                 match exec_result {
                     Ok(()) => {
                         // A merge the model predicted as conflicting MUST NOT
-                        // succeed — dual-hypothesis assert (H-A/H-B live
+                        // succeed — dual-hypothesis assert (H-B lives
                         // here). Scope-out with a watch active: the flag was
                         // captured from a model the deferred op's roll-forward
                         // may have outrun, and the true prediction epoch is

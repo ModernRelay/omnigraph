@@ -1186,7 +1186,7 @@ impl Omnigraph {
                         1,
                     )?);
                 }
-                crate::loader::canonical_node_id(&typed_keys, 0)?.ok_or_else(|| {
+                crate::loader::canonical_key_id(&typed_keys, 0)?.ok_or_else(|| {
                     let key_description = match key_properties.as_slice() {
                         [key] => format!("@key property '{key}'"),
                         _ => format!("@key properties ({})", key_properties.join(", ")),
@@ -1232,30 +1232,80 @@ impl Omnigraph {
             let edge_type = &catalog.edge_types[type_name];
             let schema = edge_type.arrow_schema.clone();
             let blob_props = edge_type.blob_properties.clone();
-            let id = crate::dst_ids::new_ulid().to_string();
+            let id = if let Some(key_columns) = edge_type.key.as_ref() {
+                let mut typed_keys = Vec::with_capacity(key_columns.len());
+                for key_col in key_columns {
+                    // Endpoint key columns arrive under the insert's from/to
+                    // parameters, aliased to src/dst by build_insert_batch.
+                    let assignment = match key_col.as_str() {
+                        "src" => "from",
+                        "dst" => "to",
+                        other => other,
+                    };
+                    let key_literal = resolved.get(assignment).ok_or_else(|| {
+                        if key_col == "src" || key_col == "dst" {
+                            OmniError::manifest(format!(
+                                "missing required edge endpoint '{}'",
+                                assignment
+                            ))
+                        } else {
+                            OmniError::manifest(format!(
+                                "insert missing @key property '{}'",
+                                assignment
+                            ))
+                        }
+                    })?;
+                    let key_field = schema.field_with_name(key_col).map_err(|_| {
+                        OmniError::manifest_internal(format!(
+                            "@key property '{}' is missing from edge {} Arrow schema",
+                            key_col, edge_type.name
+                        ))
+                    })?;
+                    typed_keys.push(literal_to_typed_array(
+                        key_literal,
+                        key_field.data_type(),
+                        1,
+                    )?);
+                }
+                crate::loader::canonical_key_id(&typed_keys, 0)?.ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "insert @key properties ({}) cannot contain null",
+                        key_columns.join(", ")
+                    ))
+                })?
+            } else {
+                crate::dst_ids::new_ulid().to_string()
+            };
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             // Validation (edge-RI, enum, unique, @card against the live
             // manifest-visible branch snapshot) runs
             // end-of-query via the evaluator.
+            let has_key = edge_type.key.is_some();
             let table_key = format!("edge:{}", type_name);
+            let insert_kind = if has_key {
+                crate::db::MutationOpKind::Merge
+            } else {
+                crate::db::MutationOpKind::Insert
+            };
             // Capture pre-write metadata on first touch (ensure_path). Edge
             // inserts are non-strict, so with a `WriteTxn` this opens NOTHING
             // (collapse #1) and the handle is discarded — validation, including
             // `@card` against the live committed branch snapshot, runs
             // end-of-query via the evaluator.
-            let (_handle, _full_path, _table_branch) = open_table_for_mutation(
-                self,
-                staging,
-                branch,
-                &table_key,
-                crate::db::MutationOpKind::Insert,
-                Some(txn),
-            )
-            .await?;
-            // Accumulate the new edge row. Edge IDs are ULID-generated so
-            // Append mode is correct (no key-based dedup needed).
-            staging.append_batch(&table_key, schema, PendingMode::StrictInsert, batch)?;
+            let (_handle, _full_path, _table_branch) =
+                open_table_for_mutation(self, staging, branch, &table_key, insert_kind, Some(txn))
+                    .await?;
+            // Accumulate. @key inserts go into the Merge stream (so a
+            // later update on the same derived id coalesces correctly);
+            // no-key inserts keep ULID-generated ids, where Append mode is
+            // correct (no key-based dedup needed).
+            let mode = if has_key {
+                PendingMode::Upsert
+            } else {
+                PendingMode::StrictInsert
+            };
+            staging.append_batch(&table_key, schema, mode, batch)?;
 
             self.invalidate_graph_index().await;
 

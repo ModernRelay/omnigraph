@@ -49,11 +49,15 @@ visible on the target in one atomic step. See
 
 ## Insert and update identity
 
-- Inserting a node with `@key` is an upsert by its derived id.
+- Inserting a node or edge with `@key` is an upsert by its derived id.
+  Inserting the same key again updates the existing row.
 - Inserting a node without a key is a strict insert with a generated or supplied
   id.
-- Edge inserts are strict inserts with a generated or supplied id.
-- Key properties cannot be changed by an update.
+- Inserting an edge without a key is a strict insert with a generated or
+  supplied id; the same pair inserted twice is two edges.
+- Key properties cannot be changed by an update. Edge types do not support
+  update at all: change a keyed edge by inserting its key again with the new
+  values (an upsert), and an unkeyed edge by delete and re-insert.
 
 All declared value, uniqueness, endpoint, and cardinality constraints are
 checked before publication.
@@ -80,6 +84,10 @@ Choose the mode explicitly:
 | `append` | Fails with `key_conflict` | Add entities without replacing anything. |
 | `merge` | Updates the existing entity | Upsert a batch. |
 | `overwrite` | Replaces every node or edge type represented in the batch; types absent from the batch remain unchanged | Rebuild from a complete export or seed. |
+
+For a keyed edge the existing-id column applies to its derived id: `append`
+reports `key_conflict` on an already-committed pair, `merge` upserts it, and
+a supplied `data.id` must equal the derivation exactly.
 
 ```bash
 omnigraph load --data batch.jsonl --mode merge graph.omni

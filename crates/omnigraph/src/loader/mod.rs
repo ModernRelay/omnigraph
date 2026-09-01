@@ -12,7 +12,7 @@ use arrow_array::{
         UInt32Builder, UInt64Builder,
     },
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, SchemaRef};
 use base64::Engine;
 use lance::blob::BlobArrayBuilder;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
@@ -1469,7 +1469,7 @@ fn build_node_batch(
                     [key] => format!("@key property '{key}'"),
                     _ => format!("@key properties ({})", key_properties.join(", ")),
                 };
-                let key_value = canonical_node_id(key_columns, row_index)?.ok_or_else(|| {
+                let key_value = canonical_key_id(key_columns, row_index)?.ok_or_else(|| {
                     OmniError::manifest(format!(
                         "node {} missing {key_description}",
                         node_type.name
@@ -1518,15 +1518,6 @@ fn build_edge_batch(
         &row_refs,
     )?;
 
-    let ids: Vec<String> = rows
-        .iter()
-        .map(|(_, _, data)| {
-            data.get("id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(generate_id)
-        })
-        .collect();
     let srcs: Vec<String> = rows
         .iter()
         .map(|(from, _, _)| {
@@ -1545,18 +1536,17 @@ fn build_edge_batch(
                 .to_string()
         })
         .collect();
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    columns.push(Arc::new(StringArray::from(ids)));
-    columns.push(Arc::new(StringArray::from(srcs)));
-    columns.push(Arc::new(StringArray::from(dsts)));
+    let src_column: ArrayRef = Arc::new(StringArray::from(srcs));
+    let dst_column: ArrayRef = Arc::new(StringArray::from(dsts));
 
     // Build edge property columns (skip id, src, dst at indices 0-2)
     let data_values: Vec<JsonValue> = rows.iter().map(|(_, _, data)| data.clone()).collect();
+    let mut property_columns: Vec<ArrayRef> =
+        Vec::with_capacity(schema.fields().len().saturating_sub(3));
     for field in schema.fields().iter().skip(3) {
         if edge_type.blob_properties.contains(field.name()) {
             let col = build_blob_column(field.name(), field.is_nullable(), &data_values)?;
-            columns.push(col);
+            property_columns.push(col);
         } else {
             let col = build_column_from_json(
                 field.name(),
@@ -1565,11 +1555,108 @@ fn build_edge_batch(
                 &data_values,
                 JsonConversionMode::LoaderCompat,
             )?;
-            columns.push(col);
+            property_columns.push(col);
         }
     }
 
+    // Keyed edge types derive the id from the (remapped) key columns; an
+    // explicit id must equal the derivation exactly. Unkeyed types keep the
+    // explicit-or-generated behavior.
+    let key_columns = edge_key_columns(
+        edge_type,
+        &schema,
+        &src_column,
+        &dst_column,
+        &property_columns,
+    )?;
+    let ids = rows
+        .iter()
+        .enumerate()
+        .map(|(row_index, (_, _, data))| {
+            if let Some(key_columns) = &key_columns {
+                let canonical = canonical_key_id(key_columns, row_index)?.ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "edge {} is missing a non-null @key value",
+                        edge_type.name
+                    ))
+                })?;
+                match data.get("id") {
+                    None => {}
+                    Some(JsonValue::String(explicit_id)) => {
+                        if *explicit_id != canonical {
+                            return Err(OmniError::manifest(format!(
+                                "edge {} explicit id '{}' does not match its canonical @key id '{}'",
+                                edge_type.name, explicit_id, canonical
+                            )));
+                        }
+                    }
+                    Some(value) => {
+                        return Err(OmniError::manifest(format!(
+                            "edge {} explicit id must be a string, got {}",
+                            edge_type.name, value
+                        )));
+                    }
+                }
+                Ok(canonical)
+            } else {
+                Ok(data
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(generate_id))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    columns.push(Arc::new(StringArray::from(ids)));
+    columns.push(src_column);
+    columns.push(dst_column);
+    columns.extend(property_columns);
+
     RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
+}
+
+/// Resolve a keyed edge type's key columns to their built arrays: endpoints
+/// from the src/dst columns, composite members from the property columns
+/// (schema positions 3+). `Ok(None)` for unkeyed edge types.
+fn edge_key_columns(
+    edge_type: &omnigraph_compiler::catalog::EdgeType,
+    schema: &SchemaRef,
+    src_column: &ArrayRef,
+    dst_column: &ArrayRef,
+    property_columns: &[ArrayRef],
+) -> Result<Option<Vec<ArrayRef>>> {
+    edge_type
+        .key
+        .as_ref()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|column| match column.as_str() {
+                    "src" => Ok(src_column.clone()),
+                    "dst" => Ok(dst_column.clone()),
+                    property => {
+                        let schema_index = schema.index_of(property).map_err(|_| {
+                            OmniError::manifest_internal(format!(
+                                "@key property '{property}' is missing from edge {} Arrow schema",
+                                edge_type.name
+                            ))
+                        })?;
+                        schema_index
+                            .checked_sub(3)
+                            .and_then(|property_index| property_columns.get(property_index))
+                            .cloned()
+                            .ok_or_else(|| {
+                                OmniError::manifest_internal(format!(
+                                    "@key property '{property}' has an invalid schema position"
+                                ))
+                            })
+                    }
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()
 }
 
 /// Normalize a bounded group of caller-shaped rows into one dense logical
@@ -1673,7 +1760,7 @@ fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Resul
         .map(|(row_index, object)| {
             let explicit_id = optional_row_id(&node_type.name, object)?;
             if let Some(key_columns) = &key_columns {
-                let canonical = canonical_node_id(key_columns, row_index)?.ok_or_else(|| {
+                let canonical = canonical_key_id(key_columns, row_index)?.ok_or_else(|| {
                     OmniError::manifest(format!(
                         "node {} is missing a non-null @key value",
                         node_type.name
@@ -1723,13 +1810,6 @@ fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Resul
         &rows.iter().collect::<Vec<_>>(),
     )?;
 
-    let ids = objects
-        .iter()
-        .map(|object| {
-            optional_row_id(&edge_type.name, object)
-                .map(|id| id.map(str::to_string).unwrap_or_else(generate_id))
-        })
-        .collect::<Result<Vec<_>>>()?;
     let srcs = objects
         .iter()
         .map(|object| validate_required_row_string(&edge_type.name, "src", object))
@@ -1738,11 +1818,10 @@ fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Resul
         .iter()
         .map(|object| validate_required_row_string(&edge_type.name, "dst", object))
         .collect::<Result<Vec<_>>>()?;
+    let src_column: ArrayRef = Arc::new(StringArray::from(srcs));
+    let dst_column: ArrayRef = Arc::new(StringArray::from(dsts));
 
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
-    columns.push(Arc::new(StringArray::from(srcs)) as ArrayRef);
-    columns.push(Arc::new(StringArray::from(dsts)) as ArrayRef);
+    let mut property_columns = Vec::with_capacity(schema.fields().len().saturating_sub(3));
     for field in schema.fields().iter().skip(3) {
         let column = if edge_type.blob_properties.contains(field.name()) {
             build_blob_column(field.name(), field.is_nullable(), rows)?
@@ -1755,8 +1834,51 @@ fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Resul
                 JsonConversionMode::Strict,
             )?
         };
-        columns.push(column);
+        property_columns.push(column);
     }
+
+    // Keyed edge types derive the id from the key columns; an explicit id
+    // must equal the derivation exactly. Unkeyed types keep the
+    // explicit-or-generated behavior.
+    let key_columns = edge_key_columns(
+        edge_type,
+        &schema,
+        &src_column,
+        &dst_column,
+        &property_columns,
+    )?;
+    let ids = objects
+        .iter()
+        .enumerate()
+        .map(|(row_index, object)| {
+            let explicit_id = optional_row_id(&edge_type.name, object)?;
+            if let Some(key_columns) = &key_columns {
+                let canonical = canonical_key_id(key_columns, row_index)?.ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "edge {} is missing a non-null @key value",
+                        edge_type.name
+                    ))
+                })?;
+                if let Some(explicit_id) = explicit_id
+                    && explicit_id != canonical
+                {
+                    return Err(OmniError::manifest(format!(
+                        "edge {} explicit id '{}' does not match its canonical @key id '{}'",
+                        edge_type.name, explicit_id, canonical
+                    )));
+                }
+                Ok(canonical)
+            } else {
+                Ok(explicit_id.map(str::to_string).unwrap_or_else(generate_id))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
+    columns.push(src_column);
+    columns.push(dst_column);
+    columns.extend(property_columns);
     RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }
 
@@ -2859,19 +2981,19 @@ pub(crate) fn composite_unique_key(
     Ok(Some(parts))
 }
 
-/// Derive the exact physical node id for a typed `@key` tuple.
+/// Derive the exact physical row id for a typed `@key` tuple (node or edge).
 ///
 /// A one-column key retains the historical scalar spelling. Composite keys use
 /// a JSON array of the per-column canonical strings: JSON escaping makes the
 /// encoding deterministic and unambiguous without inventing a delimiter that
 /// user data could forge.
-pub(crate) fn canonical_node_id(key_columns: &[ArrayRef], row: usize) -> Result<Option<String>> {
+pub(crate) fn canonical_key_id(key_columns: &[ArrayRef], row: usize) -> Result<Option<String>> {
     let Some(parts) = composite_unique_key(key_columns, row)? else {
         return Ok(None);
     };
     match parts.as_slice() {
         [] => Err(OmniError::manifest_internal(
-            "cannot derive a physical node id from an empty @key tuple",
+            "cannot derive an id from an empty @key tuple",
         )),
         [scalar] => Ok(Some(scalar.clone())),
         _ => serde_json::to_string(&parts)
@@ -3988,7 +4110,7 @@ node Doc {
     fn composite_node_id_is_deterministic_and_unambiguous() {
         let scalar: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["a,b"]))];
         assert_eq!(
-            canonical_node_id(&scalar, 0).unwrap().as_deref(),
+            canonical_key_id(&scalar, 0).unwrap().as_deref(),
             Some("a,b"),
             "one-column keys retain their historical scalar id"
         );
@@ -3999,7 +4121,7 @@ node Doc {
             Arc::new(StringArray::from(vec!["quote\"and\\slash"])),
         ];
         assert_eq!(
-            canonical_node_id(&composite, 0).unwrap().as_deref(),
+            canonical_key_id(&composite, 0).unwrap().as_deref(),
             Some(r#"["a,b","7","quote\"and\\slash"]"#)
         );
     }

@@ -52,6 +52,26 @@ Each conflict identifies the affected type and, when applicable, entity id. The
 HTTP server returns conflicts with status `409`. Reconcile the data on one or
 both branches, then run the merge again.
 
+### Edges inserted on both sides
+
+Whether the same edge added on both branches converges depends on the edge
+type's declared identity:
+
+- No declaration: edge ids are generated, so each side's insert is its own
+  row and the merge keeps both. This is the documented multiset default;
+  parallel edges are legitimate data.
+- `@unique(src, dst)`: each branch's write succeeds on its own, and the
+  merge reports `unique_violation`. This is the available guard on
+  releases that predate edge keys.
+- `@key(src, dst)`: both sides derive the same id, so identical inserts
+  converge to one row with no conflict. If the sides disagree on a non-key
+  property, the merge reports `divergent_insert` on the edge type with the
+  derived id as the entity id (for `@key(src, dst)` a JSON array such as
+  `["Alice","Bob"]`; the elements are the endpoint node ids, so they are
+  generated ids when the endpoint type declares no key). Reconcile it like any divergent insert: align the
+  property on one branch (insert the same key again with the agreed
+  values; the insert upserts), then merge again.
+
 ## Merge classification mode
 
 `OMNIGRAPH_MERGE_LINEAGE` selects how a branch merge finds what changed. `on`
