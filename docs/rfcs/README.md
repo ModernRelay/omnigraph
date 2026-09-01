@@ -38,14 +38,8 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-<<<<<<< HEAD
-The next available number is **0045**. RFC 0040 is reserved by
-[PR #546](https://github.com/ModernRelay/omnigraph/pull/546); lower gaps are
-historical and must not be reused.
-=======
 The next available number is **0045**; lower gaps are historical and must
 not be reused.
->>>>>>> 463fd70e (review)
 
 ## Required frontmatter
 
