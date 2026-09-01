@@ -1223,3 +1223,231 @@ fn test_reject_lance_virtual_system_column_property_names() {
     parse_schema("node N { _row_id: String _rowid2: String _ROWID: String }")
         .expect("only the five exact, case-sensitive Lance names are reserved");
 }
+
+#[test]
+fn test_parse_edge_body_constraint_key() {
+    let input = r#"
+node Person { name: String }
+edge Knows: Person -> Person {
+since: Date
+@key(src, dst, since)
+}
+"#;
+    let schema = parse_schema(input).unwrap();
+    match &schema.declarations[1] {
+        SchemaDecl::Edge(e) => {
+            assert!(
+                e.constraints
+                    .iter()
+                    .any(|c| matches!(c, Constraint::Key(v) if v == &["src", "dst", "since"]))
+            );
+        }
+        _ => panic!("expected Edge"),
+    }
+}
+
+#[test]
+fn test_parse_edge_key_endpoints_only() {
+    let input = r#"
+node Person { name: String }
+edge Knows: Person -> Person {
+@key(src, dst)
+}
+"#;
+    let schema = parse_schema(input).unwrap();
+    match &schema.declarations[1] {
+        SchemaDecl::Edge(e) => {
+            assert!(
+                e.constraints
+                    .iter()
+                    .any(|c| matches!(c, Constraint::Key(v) if v == &["src", "dst"]))
+            );
+        }
+        _ => panic!("expected Edge"),
+    }
+}
+
+#[test]
+fn test_reject_edge_key_missing_endpoint() {
+    let cases = [
+        (
+            "missing dst",
+            "@key(src)",
+            "@key on edge Knows must include both endpoints (missing 'dst')",
+        ),
+        (
+            "missing src",
+            "@key(dst)",
+            "@key on edge Knows must include both endpoints (missing 'src')",
+        ),
+        (
+            "missing both",
+            "@key(since)",
+            "@key on edge Knows must include both endpoints (missing 'src')",
+        ),
+    ];
+    for (case, constraint, expected) in cases {
+        let input = format!(
+            "node Person {{ name: String }}\nedge Knows: Person -> Person {{\nsince: Date\n{constraint}\n}}\n"
+        );
+        let error = parse_schema_diagnostic(&input).expect_err(case);
+        assert_eq!(
+            error.to_string(),
+            format!("parse error: {expected}"),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn test_reject_multiple_edge_keys() {
+    let input = r#"
+node Person { name: String }
+edge Knows: Person -> Person {
+since: Date
+@key(src, dst)
+@key(src, dst, since)
+}
+"#;
+    let error = parse_schema_diagnostic(input).expect_err("two @key groups");
+    assert_eq!(
+        error.to_string(),
+        "parse error: edge type Knows has multiple @key constraints; only one is supported"
+    );
+}
+
+#[test]
+fn test_edge_key_body_group_is_the_only_accepted_spelling() {
+    // The parenthesized form in type-annotation position is a grammar error.
+    let type_level_group = r#"
+node Person { name: String }
+edge Knows: Person -> Person @key(src, dst) {
+since: Date
+}
+"#;
+    let error = parse_schema_diagnostic(type_level_group).expect_err("type-level @key(...)");
+    assert!(
+        error.to_string().contains("unexpected constraint_name"),
+        "got: {error}"
+    );
+
+    // A bare type-level @key annotation stays refused, matching nodes.
+    let type_level_bare = r#"
+node Person { name: String }
+edge Knows: Person -> Person @key {
+since: Date
+}
+"#;
+    let error = parse_schema_diagnostic(type_level_bare).expect_err("type-level bare @key");
+    assert_eq!(
+        error.to_string(),
+        "parse error: @key is not supported on edges (edge Knows)"
+    );
+
+    // Property-level @key stays refused: a single-property key can never
+    // include both endpoints.
+    let property_level = r#"
+node Person { name: String }
+edge Knows: Person -> Person {
+since: Date @key
+}
+"#;
+    let error = parse_schema_diagnostic(property_level).expect_err("property-level @key");
+    assert_eq!(
+        error.to_string(),
+        "parse error: @key is not supported on edge properties (edge Knows.since)"
+    );
+}
+
+#[test]
+fn test_reject_reserved_logical_property_names() {
+    for name in ["id", "src", "dst", "from", "to"] {
+        let input = format!(
+            "node Person {{ name: String }}\nedge Knows: Person -> Person {{\n{name}: String\n}}\n"
+        );
+        let error = parse_schema_diagnostic(&input).expect_err(name);
+        assert_eq!(
+            error.to_string(),
+            format!("parse error: property name '{name}' is reserved on edge types (Knows.{name})"),
+            "{name}"
+        );
+    }
+    // Node types keep today's latitude (test_parse_annotation pins a node
+    // property named `id`); the reservation is edge-scoped.
+    parse_schema("node Person { from: String to: String src: String dst: String }")
+        .expect("nothing is reserved on node types");
+}
+
+#[test]
+fn test_reject_repeated_key_column() {
+    let edge = r#"
+node Person { name: String }
+edge Knows: Person -> Person {
+since: Date
+@key(src, dst, since, since)
+}
+"#;
+    let error = parse_schema_diagnostic(edge).expect_err("repeated edge member");
+    assert_eq!(
+        error.to_string(),
+        "parse error: @key on Knows repeats member 'since'"
+    );
+    let node = r#"
+node Person {
+name: String
+@key(name, name)
+}
+"#;
+    let error = parse_schema_diagnostic(node).expect_err("repeated node member");
+    assert_eq!(
+        error.to_string(),
+        "parse error: @key on Person repeats member 'name'"
+    );
+}
+
+#[test]
+fn test_reject_edge_key_column_rules() {
+    let cases = [
+        (
+            "nullable member",
+            "since: Date?",
+            "@key(src, dst, since)",
+            "@key property Knows.since cannot be nullable",
+        ),
+        (
+            "list member",
+            "tags: [String]",
+            "@key(src, dst, tags)",
+            "@key is not supported on list property Knows.tags",
+        ),
+        (
+            "vector member",
+            "embedding: Vector(3)",
+            "@key(src, dst, embedding)",
+            "@key is not supported on vector property Knows.embedding",
+        ),
+        (
+            "blob member",
+            "payload: Blob",
+            "@key(src, dst, payload)",
+            "@key is not supported on blob property Knows.payload",
+        ),
+        (
+            "unknown member",
+            "since: Date",
+            "@key(src, dst, weight)",
+            "@key on Knows references unknown property 'weight'",
+        ),
+    ];
+    for (case, property, constraint, expected) in cases {
+        let input = format!(
+            "node Person {{ name: String }}\nedge Knows: Person -> Person {{\n{property}\n{constraint}\n}}\n"
+        );
+        let error = parse_schema_diagnostic(&input).expect_err(case);
+        assert_eq!(
+            error.to_string(),
+            format!("parse error: {expected}"),
+            "{case}"
+        );
+    }
+}

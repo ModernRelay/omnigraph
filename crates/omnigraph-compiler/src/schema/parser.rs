@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pest::Parser;
 use pest::error::InputLocation;
@@ -768,6 +768,17 @@ fn validate_property_annotations(
     all_properties: &[PropDecl],
     is_edge: bool,
 ) -> Result<()> {
+    // Logical system-column and endpoint-parameter names on edges: a property
+    // with one of these names would shadow the physical column (the Arrow
+    // schema gains a duplicate field) or collide with the insert's from/to
+    // parameter namespace, splitting identity between write doors.
+    if is_edge && matches!(prop.name.as_str(), "id" | "src" | "dst" | "from" | "to") {
+        return Err(CompilerError::Parse(format!(
+            "property name '{}' is reserved on edge types ({}.{})",
+            prop.name, type_name, prop.name
+        )));
+    }
+
     let is_vector = matches!(prop.prop_type.scalar, ScalarType::Vector(_));
     let is_blob = matches!(prop.prop_type.scalar, ScalarType::Blob);
 
@@ -985,20 +996,37 @@ fn validate_type_constraints(
     for constraint in constraints {
         match constraint {
             Constraint::Key(cols) => {
-                if is_edge {
-                    return Err(CompilerError::Parse(format!(
-                        "@key constraint is not supported on edges (edge {})",
-                        type_name
-                    )));
-                }
                 key_count += 1;
                 if key_count > 1 {
                     return Err(CompilerError::Parse(format!(
-                        "node type {} has multiple @key constraints; only one is supported",
+                        "{} type {} has multiple @key constraints; only one is supported",
+                        if is_edge { "edge" } else { "node" },
                         type_name
                     )));
                 }
+                let mut seen_columns = HashSet::new();
                 for col in cols {
+                    if !seen_columns.insert(col.as_str()) {
+                        return Err(CompilerError::Parse(format!(
+                            "@key on {} repeats member '{}'",
+                            type_name, col
+                        )));
+                    }
+                }
+                if is_edge {
+                    for endpoint in ["src", "dst"] {
+                        if !cols.iter().any(|col| col == endpoint) {
+                            return Err(CompilerError::Parse(format!(
+                                "@key on edge {} must include both endpoints (missing '{}')",
+                                type_name, endpoint
+                            )));
+                        }
+                    }
+                }
+                for col in cols {
+                    if is_edge && (col == "src" || col == "dst") {
+                        continue;
+                    }
                     let prop = prop_names.get(col.as_str()).ok_or_else(|| {
                         CompilerError::Parse(format!(
                             "@key on {} references unknown property '{}'",
