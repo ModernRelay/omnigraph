@@ -20,16 +20,16 @@ edits.
 | Task | Command | Why |
 |------|---------|-----|
 | Add/update a single entity | `mutate` with a named mutation | typechecked, parameterized, auditable |
-| Bulk upsert by `@key` | `load --mode merge` | preserves rows not in the file |
+| Bulk upsert by logical entity ID | `load --mode merge` | preserves rows not in the file; keyed node IDs derive from `@key` |
 | Additive-only bulk | `load --mode append` | fails on key collision |
-| Clean-slate reseed | `load --mode overwrite` | **destructive** — wipes the branch |
+| Replace complete batches by type | `load --mode overwrite` | **destructive for represented types**; absent types remain |
 | Bulk load onto a fresh review branch | `load --from main --mode merge --branch <name>` | forks `<name>` from `main`, loads onto it, leaves it for review |
 
 > **`--mode` is required** — there is no default. Overwrite is destructive, so
 > the CLI never picks a mode for you.
 
-> **Per-load bounds (omnigraph >= 0.9.0).** One keyed load (`append`/`merge`)
-> stages at most **8,192 rows and 32 MiB of Arrow memory per table**; a larger
+> **Per-load bounds.** One keyed load (`append`/`merge`)
+> stages at most **8,192 entities and 32 MiB of Arrow memory per touched type**; a larger
 > batch is refused up front (HTTP 413, typed `resource_limit`) with no durable
 > effect — split it into chunks, each an atomic graph commit. `overwrite`
 > escapes the row ceiling but not the 32 MiB strict-input Arrow preflight
@@ -38,15 +38,15 @@ edits.
 > target, `--mode overwrite` (like `cleanup` and `branch delete`) requires
 > explicit `--yes` consent in non-interactive runs.
 >
-> **Local and remote are one command.** `load` works against a local repo URI
-> (writing storage directly) *and* a remote `omnigraph-server` endpoint (the
+> **Direct and served are one command.** `load` works against a graph store
+> (writing storage directly) *and* an `omnigraph-server` endpoint (the
 > server orchestrates the write and publishes one atomic commit). See
 > [`references/remote-ops.md`](remote-ops.md) for remote-specific concerns
 > (504 handling, write-verification ritual).
 
 ## `mutate` — Single Edits
 
-Goes through the running server (the configured default graph, or an alias):
+Runs either directly (`--store`) or through a server (`--server`/profile):
 
 ```bash
 omnigraph mutate add_signal \
@@ -54,10 +54,11 @@ omnigraph mutate add_signal \
   --params '{"slug":"sig-foo","name":"Foo","brief":"...","stagingTimestamp":"2026-04-14T00:00:00Z","createdAt":"2026-04-14T00:00:00Z","updatedAt":"2026-04-14T00:00:00Z"}'
 ```
 
-Or via an alias:
+Or invoke a served stored mutation by name:
 
 ```bash
-omnigraph alias add-signal sig-foo "Foo" "..." 2026-04-14T00:00:00Z 2026-04-14T00:00:00Z 2026-04-14T00:00:00Z
+omnigraph mutate add_signal --server intel-dev --graph spike \
+  --params '{"slug":"sig-foo","name":"Foo","brief":"...","stagingTimestamp":"2026-04-14T00:00:00Z","createdAt":"2026-04-14T00:00:00Z","updatedAt":"2026-04-14T00:00:00Z"}'
 ```
 
 Prefer `mutate` for interactive edits, mutations called from agents, and anything you want typechecked at call time.
@@ -67,12 +68,15 @@ Prefer `mutate` for interactive edits, mutations called from agents, and anythin
 JSONL format:
 
 ```jsonl
-{"type":"Signal","data":{"id":"sig-foo","slug":"sig-foo","name":"Foo","brief":"...","stagingTimestamp":"2026-04-14T00:00:00Z","createdAt":"2026-04-14T00:00:00Z","updatedAt":"2026-04-14T00:00:00Z"}}
+{"type":"Signal","data":{"slug":"sig-foo","name":"Foo","brief":"...","stagingTimestamp":"2026-04-14T00:00:00Z","createdAt":"2026-04-14T00:00:00Z","updatedAt":"2026-04-14T00:00:00Z"}}
 {"edge":"FormsPattern","from":"sig-foo","to":"pat-bar","data":{}}
 ```
 
-- Nodes: `{"type":"<NodeType>","data":{...props...}}` — `id` equals `slug`
-- Edges: `{"edge":"<EdgeType>","from":"<src_slug>","to":"<dst_slug>","data":{...edge_props...}}`
+- Nodes: `{"type":"<NodeType>","data":{...props...}}`. A keyed node derives
+  `id` from its complete typed key tuple; omit `id` in hand-authored keyed
+  input. An unkeyed node gets a generated id unless one is supplied.
+- Edges: `{"edge":"<EdgeType>","from":"<src_id>","to":"<dst_id>","data":{...edge_props...}}`.
+  Edges also use generated or supplied ids.
 
 Load command:
 
@@ -86,24 +90,31 @@ one-shot review-branch flow below). Without `--from`, the target `--branch`
 
 ### `--mode` semantics
 
-- **`overwrite`** (destructive) — replaces every node/edge table on the branch with the file's contents. **Staged**: the loader validates node/edge constraints, referential integrity, and edge cardinality *before* any data moves, so a bad file fails before touching the branch. Safe on a **first** load; risky afterward. Don't run it against `main` in production without a branch backup path.
-- **`merge`** (upsert) — for each row, insert if `@key` is new, update if it exists. Rows not in the file are preserved. The safe default for incremental bulk updates.
-- **`append`** (strict insert) — fails on key collision. Use when you're certain every row is new.
+- **`overwrite`** (destructive by represented type) — replaces each node or
+  edge type present in the batch; types absent from the batch stay unchanged.
+  The loader validates constraints and referential integrity before publication.
+  Use a review branch for an established graph.
+- **`merge`** (upsert) — inserts or updates each row by logical entity `id`
+  (derived from the typed `@key` tuple for keyed nodes). Rows not in the file
+  are preserved. The safe default for incremental bulk updates.
+- **`append`** (strict insert) — fails on entity-ID collision. Use when you're
+  certain every row is new.
 
-### `merge` does NOT recompute embeddings
+With `--json`, an effectful `mutate` or `load` returns the exact published
+`commit`; a no-op mutation returns `commit: null`. For compare-and-swap writes,
+feeds, and diff inspection, see [`changes.md`](changes.md).
 
-If you change seed rows that feed into `@embed("source")` via `load --mode merge`, the source field updates but the embedding stays stale.
+### Embeddings are explicit input
 
-**Fix:** run `omnigraph embed --reembed_all` after, or use `load --mode overwrite` once (which re-triggers embedding on load).
+`@embed` does not populate vectors during `merge` or `overwrite`. Supply
+vectors in the JSONL, or run the offline `omnigraph embed` file transformation
+and load its output. See [`search.md`](search.md).
 
-### `overwrite` is destructive
+### `overwrite` is scoped but destructive
 
-Wipes the entire branch's data for every node and edge type. Use only for:
-- First-time seed
-- Intentional full reseed on a feature branch
-- Recovery scenarios
-
-Never on `main` without a branch backup.
+It removes existing entities of every type represented in the batch. Use it
+for a complete type replacement, preferably on a review branch. Do not assume
+that it clears unrelated types or the whole branch.
 
 ## Branches: Review Before Merge
 
@@ -123,11 +134,8 @@ omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode merge $REPO
 # 3. Verify on the branch (reads can target --branch or --snapshot)
 omnigraph query recent_signals --query queries/signals.gq --branch staging-2026-04-14 --store $REPO
 
-# 4. Merge to main when happy
-omnigraph branch merge staging-2026-04-14 --into main --store $REPO
-
-# 5. Optionally delete the branch
-omnigraph branch delete staging-2026-04-14 --store $REPO
+# 4. Merge to main and delete the source only after publication
+omnigraph branch merge staging-2026-04-14 --into main --delete-branch --store $REPO
 ```
 
 ### Fork a branch in one shot with `--from`
@@ -139,7 +147,9 @@ Use `--from` for anything you want reviewed before it touches `main`.
 
 ### Keep branches short-lived
 
-Long-lived branches compound merge risk. The usual flow is: create → load → verify → merge → delete, all in the same session. A week-old feature branch is a yellow flag.
+Long-lived branches compound merge risk. The usual flow is: create → load →
+verify → `merge --delete-branch`, all in the same session. Source deletion only
+happens after a successful merge publication.
 
 ### Schema apply blocks non-main branches
 
@@ -147,13 +157,15 @@ Long-lived branches compound merge risk. The usual flow is: create → load → 
 
 ## Destructive Ops Go Through a Branch
 
-For any bulk load that could disrupt downstream queries (overwriting a heavily-referenced node type, removing edges en masse, reseeding a core table), use a feature branch:
+For any bulk load that could disrupt downstream queries (overwriting a
+heavily-referenced node type, removing edges en masse, or reseeding a core
+type), use a feature branch:
 
 ```bash
 omnigraph load --data risky.jsonl --branch recovery-2026-04-14 \
   --from main --mode overwrite $REPO
 # inspect, diff, verify reads
-omnigraph branch merge recovery-2026-04-14 --into main --store $REPO
+omnigraph branch merge recovery-2026-04-14 --into main --delete-branch --store $REPO
 ```
 
 ## Branch Commands (quick reference)
@@ -161,17 +173,18 @@ omnigraph branch merge recovery-2026-04-14 --into main --store $REPO
 ```bash
 omnigraph branch create --from main <branch-name> --store $REPO
 omnigraph branch list --store $REPO
-omnigraph branch merge <branch-name> --into main --store $REPO
+omnigraph branch merge <branch-name> --into main --delete-branch --store $REPO
 omnigraph branch delete <branch-name> --store $REPO
 ```
 
 All support `--json` for automation-friendly output. Address the graph with a
-positional `file://`/`s3://` URI (shown), `--store <uri>`, or `--server <name>`.
+positional `file://`/`s3://`/preview `az://` URI (shown), `--store <uri>`, or
+`--server <name>`.
 
 ## Inspecting State After Changes
 
 ```bash
-omnigraph snapshot $REPO --branch main --json           # tables + row counts
+omnigraph snapshot $REPO --branch main --json           # node/edge entity counts
 omnigraph export $REPO --branch main > graph.jsonl      # full JSONL dump
 omnigraph commit list $REPO --branch main --json        # history
 ```

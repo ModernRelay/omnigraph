@@ -14,6 +14,8 @@ from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parent.parent
 RFC_DIR = ROOT / "docs" / "rfcs"
+SKILL_DIR = ROOT / "skills" / "omnigraph"
+SKILL_PATH = SKILL_DIR / "SKILL.md"
 
 RFC_KEYS = (
     "rfc",
@@ -408,6 +410,44 @@ def check_user_boundary(files: list[Path], errors: list[str]) -> None:
                 errors.append(f"docs/user/{relative}:{line}: {reason}")
 
 
+def check_skill_version(errors: list[str]) -> None:
+    if not SKILL_PATH.exists():
+        errors.append("skills/omnigraph/SKILL.md: missing OmniGraph skill entrypoint")
+        return
+
+    text = SKILL_PATH.read_text(encoding="utf-8")
+    if not text.startswith("---\n") or (end := text.find("\n---\n", 4)) < 0:
+        errors.append("skills/omnigraph/SKILL.md: malformed YAML frontmatter")
+        return
+    metadata = re.search(
+        r"(?ms)^metadata:\s*\n(?P<body>(?:^[ \t]+.*(?:\n|$))+)", text[4:end]
+    )
+    version = (
+        re.search(r'(?m)^\s+version:\s*["\']?([^"\'\s]+)', metadata.group("body"))
+        if metadata
+        else None
+    )
+    if version is None:
+        errors.append("skills/omnigraph/SKILL.md: metadata.version is required")
+        return
+
+    cli_manifest = ROOT / "crates" / "omnigraph-cli" / "Cargo.toml"
+    cli_text = cli_manifest.read_text(encoding="utf-8")
+    package = re.search(r"(?ms)^\[package\]\s*(.*?)(?=^\[|\Z)", cli_text)
+    cli_version = (
+        re.search(r'(?m)^version\s*=\s*["\']([^"\']+)["\']', package.group(1))
+        if package
+        else None
+    )
+    if cli_version is None:
+        errors.append(f"{cli_manifest.relative_to(ROOT)}: package.version is required")
+    elif version.group(1) != cli_version.group(1):
+        errors.append(
+            "skills/omnigraph/SKILL.md: metadata.version "
+            f"{version.group(1)!r} != omnigraph-cli {cli_version.group(1)!r}"
+        )
+
+
 def main() -> int:
     errors: list[str] = []
     files = tracked_markdown()
@@ -416,11 +456,13 @@ def main() -> int:
         path
         for path in files
         if path.is_relative_to(ROOT / "docs")
+        or path.is_relative_to(SKILL_DIR)
         or path in {ROOT / "AGENTS.md", ROOT / "README.md"}
     ]
     check_links(link_files, errors)
     check_rfcs(errors)
     check_user_boundary(files, errors)
+    check_skill_version(errors)
 
     if errors:
         for error in errors:
