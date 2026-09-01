@@ -845,9 +845,10 @@ pub(crate) fn print_blob_stat_human(output: &BlobStatOutput) {
 }
 
 pub(crate) fn print_read_output(output: &ReadOutput, format: ReadOutputFormat) -> Result<()> {
-    // Human formats cannot carry structured warnings in the rendered rows, so
-    // surface them on stderr; JSON/JSONL callers read `warnings` in-band.
-    if !matches!(format, ReadOutputFormat::Json | ReadOutputFormat::Jsonl) {
+    // Only the full-JSON format carries `warnings` in-band (`render_jsonl`
+    // emits a slim metadata record without them); every other format gets
+    // the advisories on stderr so they cannot silently vanish.
+    if !matches!(format, ReadOutputFormat::Json) {
         for warning in &output.warnings {
             eprintln!("warning [{}]: {}", warning.code, warning.message);
         }

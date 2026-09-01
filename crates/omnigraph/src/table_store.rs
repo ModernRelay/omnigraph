@@ -4409,16 +4409,19 @@ impl TableStore {
     /// one bounded one-column filtered scan; the embedding-coverage reporter
     /// runs it only for `@embed`-backed vector retrievals.
     pub(crate) async fn count_rows_matching(ds: &Dataset, filter: Expr) -> Result<u64> {
-        let stream = Self::scan_stream_with(ds, Some(&["id"]), None, None, false, |scanner| {
+        let mut stream = Self::scan_stream_with(ds, Some(&["id"]), None, None, false, |scanner| {
             scanner.filter_expr(filter.clone());
             Ok(())
         })
         .await?;
-        let batches = stream
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .map_err(OmniError::storage)?;
-        Ok(batches.iter().map(|batch| batch.num_rows() as u64).sum())
+        // Fold incrementally: only the scalar count is needed, so no batch is
+        // retained — a large matching population must not accumulate O(rows)
+        // of ids in memory for a count.
+        let mut rows = 0u64;
+        while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+            rows += batch.num_rows() as u64;
+        }
+        Ok(rows)
     }
 
     pub(crate) async fn has_vector_index_on(ds: &Dataset, column: &str) -> Result<bool> {

@@ -579,6 +579,20 @@ query rrf_trailing_search($q1: Vector(4), $q2: Vector(4)) {
     limit 5
 }
 
+query nearest_mismatched($q1: Vector(4), $q2: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $q2) as distance }
+    order { nearest($d.embedding, $q1) }
+    limit 5
+}
+
+query rrf_aggregated($q1: Vector(4), $q2: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug, count($d) as n }
+    order { rrf(nearest($d.embedding, $q1), nearest($d.embedding, $q2)), $d.slug desc }
+    limit 10
+}
+
 query agg_search_ordered($q: String) {
     match { $d: Doc }
     return { $d.slug, count($d) as n }
@@ -674,7 +688,7 @@ async fn metric_projection_without_matching_retrieval_errors() {
     assert!(
         error
             .to_string()
-            .contains("requires the matching bm25() or rrf() retrieval"),
+            .contains("requires the matching bm25() retrieval"),
         "got: {error}"
     );
 }
@@ -725,6 +739,90 @@ async fn rrf_honors_secondary_order_key() {
     assert_eq!(
         result_slugs(&result),
         vec!["rl-intro", "ml-intro", "dl-basics"]
+    );
+}
+
+// A projected rank expression must BE the executed retrieval — a different
+// query argument (or property) on the same binding maps to the same
+// synthesized column, so name-matching alone would silently project the
+// executed retrieval's values under the un-executed one's metadata.
+#[tokio::test]
+#[serial]
+async fn metric_projection_mismatched_retrieval_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let error = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "nearest_mismatched",
+        &two_vector_params("$q1", &[0.1, 0.2, 0.3, 0.4], "$q2", &[0.5, 0.6, 0.7, 0.8]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("structurally identical to the executed retrieval"),
+        "got: {error}"
+    );
+}
+
+// The winner cut lands INSIDE a fused-score tie: each arm crowns a
+// different entity (`a` exactly matches $q1, `b` exactly matches $q2), so
+// both fuse to 1/(k+2) and the boundary at limit 1 splits the tie. The
+// boundary-tied entity must stay in the candidate set so the trailing slug
+// DESC can pick `b` — a cut by entity id alone would pre-decide the tie
+// before the user's key ever ran.
+#[tokio::test]
+#[serial]
+async fn rrf_boundary_tie_honors_secondary_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), TIE_SCHEMA)
+        .await
+        .unwrap();
+    load_jsonl(&db, TIE_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let mut db = db;
+    let result = query_main(
+        &mut db,
+        TIE_QUERIES,
+        "tie_rrf_boundary",
+        &two_vector_params("$q1", &[1.0, 0.0, 0.0, 0.0], "$q2", &[2.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result_slugs(&result), vec!["b"]);
+}
+
+// Aggregated rrf: group rows no longer align with fused rows, so the fused
+// score cannot order them — trailing keys apply against the aggregate
+// result and the rank is loudly ignored (previously this shape could
+// misalign the sort take).
+#[tokio::test]
+#[serial]
+async fn rrf_aggregated_orders_tail_and_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "rrf_aggregated",
+        &two_vector_params("$q1", &[0.1, 0.2, 0.3, 0.4], "$q2", &[0.5, 0.6, 0.7, 0.8]),
+    )
+    .await
+    .unwrap();
+    let slugs = result_slugs(&result);
+    let mut expected = slugs.clone();
+    expected.sort_by(|a, b| b.cmp(a));
+    assert_eq!(slugs, expected, "trailing slug DESC must order the groups");
+    assert!(
+        result
+            .notices()
+            .iter()
+            .any(|notice| notice.code == "search_order_ignored_by_aggregation"),
+        "expected the aggregation notice, got: {:?}",
+        result.notices()
     );
 }
 
@@ -785,28 +883,28 @@ const EMBED_COVERAGE_SCHEMA: &str = r#"
 node EDoc {
     slug: String @key
     flag: Bool
-    body: String?
-    embedding: Vector(4)? @embed("body")
+    bodyText: String?
+    embeddingVec: Vector(4)? @embed("bodyText")
 }
 "#;
 
-const EMBED_COVERAGE_DATA: &str = r#"{"type":"EDoc","data":{"slug":"e1","flag":true,"body":"alpha","embedding":[1.0,0.0,0.0,0.0]}}
-{"type":"EDoc","data":{"slug":"e2","flag":true,"body":"beta","embedding":[2.0,0.0,0.0,0.0]}}
-{"type":"EDoc","data":{"slug":"e3","flag":false,"body":"gamma"}}
+const EMBED_COVERAGE_DATA: &str = r#"{"type":"EDoc","data":{"slug":"e1","flag":true,"bodyText":"alpha","embeddingVec":[1.0,0.0,0.0,0.0]}}
+{"type":"EDoc","data":{"slug":"e2","flag":true,"bodyText":"beta","embeddingVec":[2.0,0.0,0.0,0.0]}}
+{"type":"EDoc","data":{"slug":"e3","flag":false,"bodyText":"gamma"}}
 {"type":"EDoc","data":{"slug":"e4","flag":false}}"#;
 
 const EMBED_COVERAGE_QUERIES: &str = r#"
 query cover_all($q: Vector(4)) {
     match { $e: EDoc }
     return { $e.slug }
-    order { nearest($e.embedding, $q) }
+    order { nearest($e.embeddingVec, $q) }
     limit 4
 }
 
 query cover_flagged($q: Vector(4)) {
     match { $e: EDoc { flag: true } }
     return { $e.slug }
-    order { nearest($e.embedding, $q) }
+    order { nearest($e.embeddingVec, $q) }
     limit 4
 }
 "#;
@@ -1030,6 +1128,13 @@ query tie_nearest($q: Vector(4)) {
     return { $t.slug }
     order { nearest($t.vec, $q), $t.slug desc }
     limit 4
+}
+
+query tie_rrf_boundary($q1: Vector(4), $q2: Vector(4)) {
+    match { $t: TieDoc }
+    return { $t.slug }
+    order { rrf(nearest($t.vec, $q1), nearest($t.vec, $q2)), $t.slug desc }
+    limit 1
 }
 "#;
 

@@ -589,6 +589,7 @@ pub async fn execute_query(
              unranked (compile-time owner: T26)"
         )));
     }
+    validate_metric_projections(ir)?;
     let mut notices = NoticeSink::default();
 
     // RRF requires forked execution. Its bm25 arms are never capped (see
@@ -663,6 +664,90 @@ pub async fn execute_query(
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch])
         .with_notices(emitted)
         .with_retrieval_metadata(metrics, retrievals))
+}
+
+/// Structural fingerprint of a rank expression / retrieval leaf: the
+/// projected metric must BE the executed retrieval. Matching the synthesized
+/// column name alone would let `return { nearest($d.other, $q2) }` silently
+/// observe `order { nearest($d.embedding, $q1) }`'s distances while the
+/// metadata describes the un-executed one.
+fn rank_expr_fingerprint(expr: &IRExpr) -> Option<String> {
+    match expr {
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => Some(format!("nearest:{variable}.{property}:{query:?}")),
+        IRExpr::Bm25 { field, query } => match field.as_ref() {
+            IRExpr::PropAccess { variable, property } => {
+                Some(format!("bm25:{variable}.{property}:{query:?}"))
+            }
+            _ => None,
+        },
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            let primary = rank_expr_fingerprint(primary)?;
+            let secondary = rank_expr_fingerprint(secondary)?;
+            Some(format!("rrf:[{primary}][{secondary}]:{k:?}"))
+        }
+        _ => None,
+    }
+}
+
+fn retrieval_fingerprint(retrieval: &RetrievalIR) -> String {
+    match retrieval {
+        RetrievalIR::Nearest {
+            variable,
+            property,
+            query,
+            ..
+        } => format!("nearest:{variable}.{property}:{query:?}"),
+        RetrievalIR::Bm25 {
+            variable,
+            property,
+            query,
+            ..
+        } => format!("bm25:{variable}.{property}:{query:?}"),
+        RetrievalIR::FuseRrf {
+            primary,
+            secondary,
+            k,
+            ..
+        } => format!(
+            "rrf:[{}][{}]:{k:?}",
+            retrieval_fingerprint(primary),
+            retrieval_fingerprint(secondary)
+        ),
+    }
+}
+
+/// Every rank expression in RETURN must structurally equal the executed
+/// retrieval — same source kind, target, and query argument. (Arm-level
+/// projection inside an rrf query is deliberately deferred; see the release
+/// note.)
+fn validate_metric_projections(ir: &QueryIR) -> Result<()> {
+    let executed = ir.retrieval.as_ref().map(retrieval_fingerprint);
+    for projection in &ir.return_exprs {
+        let Some(projected) = rank_expr_fingerprint(&projection.expr) else {
+            continue;
+        };
+        if executed.as_deref() != Some(projected.as_str()) {
+            let func = match &projection.expr {
+                IRExpr::Nearest { .. } => "nearest",
+                IRExpr::Bm25 { .. } => "bm25",
+                _ => "rrf",
+            };
+            return Err(OmniError::manifest(format!(
+                "{func}() in return requires the matching {func}() retrieval in the order \
+                 clause: the projected rank expression must be structurally identical to \
+                 the executed retrieval"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Metric descriptors for the projected rank columns, resolved from the
@@ -1510,7 +1595,20 @@ async fn execute_rrf_fusion(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
-    scored.truncate(rrf.limit);
+    // Keep every entity tied with the boundary winner: trailing order keys
+    // decide INSIDE score ties, so the winner cut must not pre-decide (by
+    // entity id) a tie the user's keys would order differently. The final
+    // row slice still enforces `limit`; the extension is bounded by the
+    // boundary tie plateau's width. (Tied fused scores are bit-identical —
+    // same rank arithmetic — so `==` is exact.)
+    if scored.len() > rrf.limit && rrf.limit > 0 {
+        let boundary = scored[rrf.limit - 1].1;
+        let keep = scored
+            .iter()
+            .position(|(_, score)| *score < boundary)
+            .unwrap_or(scored.len());
+        scored.truncate(keep.max(rrf.limit));
+    }
 
     // Collect winning entity IDs in order. Every downstream row belonging to
     // a winner survives; fusion ranks entities, not arbitrary fanout rows.
@@ -1577,21 +1675,46 @@ async fn execute_rrf_fusion(
             ));
         }
     }
-    let mut orderings = vec![IROrdering {
-        expr: IRExpr::PropAccess {
-            variable: primary_var.to_string(),
-            property: "_score".to_string(),
-        },
-        descending: true,
-    }];
-    orderings.extend(ir.order_by.iter().skip(1).cloned());
-    result_batch = apply_ordering(
-        result_batch,
-        &orderings,
-        &fused_batch,
-        params,
-        Some(rrf.limit),
-    )?;
+    if projections_have_aggregates(&ir.return_exprs) {
+        // Aggregated rrf: group rows no longer align with fused rows and the
+        // fused score does not survive aggregation — same contract as the
+        // single-search aggregated arm: trailing keys order the groups
+        // (against the aggregate result itself) and the rank is loudly
+        // ignored, never a misaligned sort or a silent one.
+        let trailing: Vec<IROrdering> = ir.order_by.iter().skip(1).cloned().collect();
+        if !trailing.is_empty() {
+            result_batch = apply_ordering(
+                result_batch.clone(),
+                &trailing,
+                &result_batch,
+                params,
+                Some(rrf.limit),
+            )?;
+        }
+        notices.emit(
+            NOTICE_SEARCH_ORDER_IGNORED_BY_AGGREGATION,
+            "the leading search ordering cannot rank aggregated rows (its score column \
+             does not survive aggregation); trailing order keys were applied, the rank \
+             was not"
+                .to_string(),
+        );
+    } else {
+        let mut orderings = vec![IROrdering {
+            expr: IRExpr::PropAccess {
+                variable: primary_var.to_string(),
+                property: "_score".to_string(),
+            },
+            descending: true,
+        }];
+        orderings.extend(ir.order_by.iter().skip(1).cloned());
+        result_batch = apply_ordering(
+            result_batch,
+            &orderings,
+            &fused_batch,
+            params,
+            Some(rrf.limit),
+        )?;
+    }
     // `rrf.limit` is the query's row limit. A winning entity can own more
     // than one row after traversal, so enforce the limit after ordering.
     let len = result_batch.num_rows().min(rrf.limit);
@@ -4039,22 +4162,25 @@ async fn execute_node_scan(
                 MetricRecall::Exact
             };
             let embedding = if let Some(embed) = node_type.embed_sources.get(prop) {
-                use datafusion::prelude::col;
+                // `ident`, not `col`: `col` normalizes unquoted identifiers
+                // to lowercase, so a camelCase property would filter a
+                // nonexistent column (#283 precedent).
+                use datafusion::prelude::ident;
                 let and_base = |extra: datafusion::prelude::Expr| match &filter_expr {
                     Some(base) => base.clone().and(extra),
                     None => extra,
                 };
                 let ready = crate::table_store::TableStore::count_rows_matching(
                     &ds,
-                    and_base(col(prop.as_str()).is_not_null()),
+                    and_base(ident(prop.as_str()).is_not_null()),
                 )
                 .await?;
                 let pending = crate::table_store::TableStore::count_rows_matching(
                     &ds,
                     and_base(
-                        col(embed.source.as_str())
+                        ident(embed.source.as_str())
                             .is_not_null()
-                            .and(col(prop.as_str()).is_null()),
+                            .and(ident(prop.as_str()).is_null()),
                     ),
                 )
                 .await?;
