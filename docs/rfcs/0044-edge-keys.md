@@ -1,5 +1,5 @@
 ---
-rfc: "0043"
+rfc: "0044"
 title: "Edge keys: derived edge identity"
 track: maintainer
 status: draft
@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on: []
 ---
 
-# RFC 0043: Edge keys: derived edge identity
+# RFC 0044: Edge keys: derived edge identity
 
 > A term set in ***bold italics*** is being defined at that exact spot.
 
@@ -366,14 +366,18 @@ Owners to extend, per the testing map:
 - `tests/merge_truth_table.rs`: the `(AddEdge, AddEdge)` cell gains a keyed
   twin asserting convergence; the unkeyed cell stays, its comment updated
   from "tracked separately" to naming this RFC as the resolution.
-- `omnigraph-dst`: `predict_merge` becomes schema-aware (conflict or converge
-  for keyed types, keep-both for unkeyed). Modeling keep-both requires the
-  model's edge state to carry multiplicity: the current set representation
-  (`Model.edges` as `BTreeSet<(String, String)>`, mapped in the walk to a
-  map keyed on the endpoint pair, `harness.rs:1384`) cannot express two
-  rows on one endpoint pair. The pin
-  `dst_merge_duplicates_born_on_both_edge` flips per its flip instructions;
-  the model's born-on-both carve-outs retire.
+- `omnigraph-dst`: the model's H-A born-on-both carve-out retires, since
+  unkeyed keep-both is documented contract rather than an illegal state.
+  The model's edge reads are visited-gated membership, so the set
+  representation (`Model.edges` as `BTreeSet<(String, String)>`) predicts
+  the merged MEMBERSHIP correctly for keyed and unkeyed types alike;
+  physical row counts, which membership cannot see, are pinned by the
+  targeted scenarios: `dst_merge_duplicates_born_on_both_edge`
+  (reclassified from bug pin to multiset-contract pin, still asserting two
+  physical rows) and its keyed twin
+  `dst_keyed_born_on_both_edge_converges` (one row). Count-level fleet
+  modeling for unkeyed edges (a multiset `Model.edges`) is deliberately
+  out of scope.
 - The `ir_version` acceptance and refusal owner is the compiler's schema-IR
   validation tests beside `validate_schema_ir` (`schema_ir.rs`); the CLI
   cross-version harness
@@ -400,25 +404,18 @@ own fixture: row count 3 to 5, gated 1 vs bound 2).
 
 ## Rollout
 
-1. **Phase 1: keyed edges for new types.** All six design changes: grammar
-   and IR, id derivation, write mode, validation subsumption, the load-path
-   derivation and refusal, and the version-acceptance change carrying the
-   `ir_version` bump. Ships usable
-   keyed-edge support; existing graphs and unkeyed types are bit-for-bit
-   unaffected. `implementation` advances to `in-progress`.
-2. **Phase 2: contract closure.** Truth-table and DST model updates, user
-   docs (schema page: the declaration and the derived-id encoding; branching
-   guide: the multiset default, the released-versions workaround, a
-   keyed-edge conflict example; mutations guide: the insert-identity bullets
-   and the load-mode table), issue #583 closes. `implementation` advances to
-   `complete`.
-3. **Out of scope, later work:** migrating an existing populated edge type to
+1. **One implementation PR.** All six design changes (grammar and IR, id
+   derivation, write mode, validation subsumption, the load-path derivation
+   and refusal, and the version-acceptance change carrying the `ir_version`
+   bump), the truth-table and DST updates, and the user docs (schema page:
+   the declaration and the derived-id encoding; branching guide: the
+   multiset default, the released-versions workaround, a keyed-edge
+   conflict example; mutations guide: the insert-identity bullets and the
+   load-mode table). Existing graphs and unkeyed types are bit-for-bit
+   unaffected. Issue #583 closes with it; `implementation` advances to
+   `complete` on merge.
+2. **Out of scope, later work:** migrating an existing populated edge type to
    a key (id rewrite), and any revisit of the unkeyed default.
-
-Of phase 2's documentation, only the released-behavior half (the multiset
-default and the `@unique(src, dst)` workaround) has no dependency on phase 1
-and may land first as an independent PR; the keyed-edge docs describe
-phase-1 behavior and land with or after it.
 
 ## Unresolved questions
 
