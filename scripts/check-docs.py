@@ -44,9 +44,9 @@ RFC_IMPLEMENTATION = {
 
 # Leftover merge-conflict markers at line start. git always labels them; the
 # `\s|$` arm also catches hand-mangled label-less leftovers. A lone `=======`
-# is excluded (legal setext heading underline). Twin pattern: the marker step
-# in .github/workflows/ci.yml — keep the two in sync. A doc quoting a
-# conflict block indents the markers one space; there is no exemption.
+# is excluded (legal setext heading underline). CI's diff-scoped companion
+# (the marker step in .github/workflows/ci.yml) uses `git diff --check`. A
+# doc quoting a conflict block indents the markers one space; no exemption.
 CONFLICT_MARKER = re.compile(r"^(?:<{7,}|>{7,}|\|{7,})(?:\s|$)")
 
 USER_FORBIDDEN = {

@@ -19,11 +19,12 @@ Branch protection currently requires these reporting contexts:
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC
 location and metadata, registry agreement, and the absence of committed
-merge-conflict markers in Markdown. The same context greps every tracked
-text file for conflict-marker lines before the documentation checks run,
-annotating each offending file and line in the pull request. There is no
-exemption; a document that must quote a conflict block indents the markers
-one space.
+merge-conflict markers in Markdown. Before the documentation checks run,
+the same context also rejects any pull request whose own diff adds a
+conflict-marker line in any file type, annotating each offending file and
+line; markers already on the base branch never fail an unrelated pull
+request. There is no exemption; a document that must quote a conflict block
+indents the markers one space.
 
 `Graph Vocabulary Guard` remains a required reporting context, but its
 substrate-sized audit steps are currently disabled everywhere (decision of
