@@ -536,6 +536,92 @@ async fn text_search_no_results() {
     assert_eq!(result.num_rows(), 0);
 }
 
+// ─── Characterization goldens (equivalence baseline for the retrieval IR) ───
+
+const TIE_SCHEMA: &str = r#"
+node TieDoc {
+    slug: String @key
+    vec: Vector(4)
+}
+"#;
+
+// Two docs share an identical vector so the nearest distance genuinely ties;
+// the explicit secondary key must decide, deterministically.
+const TIE_DATA: &str = r#"{"type":"TieDoc","data":{"slug":"a","vec":[1.0,0.0,0.0,0.0]}}
+{"type":"TieDoc","data":{"slug":"b","vec":[2.0,0.0,0.0,0.0]}}
+{"type":"TieDoc","data":{"slug":"c","vec":[2.0,0.0,0.0,0.0]}}
+{"type":"TieDoc","data":{"slug":"d","vec":[9.0,0.0,0.0,0.0]}}"#;
+
+const TIE_QUERIES: &str = r#"
+query tie_nearest($q: Vector(4)) {
+    match { $t: TieDoc }
+    return { $t.slug }
+    order { nearest($t.vec, $q), $t.slug desc }
+    limit 4
+}
+"#;
+
+// Golden: a nearest ordering with a trailing secondary key sorts rank-first,
+// then the user key inside distance ties (the #544 `.skip(1)` tail path, in
+// its nearest form — the bm25 form is `search_order_secondary_keys_are
+// _honored`). Must survive the retrieval-IR refactor byte-identically.
+#[tokio::test]
+#[serial]
+async fn nearest_tie_broken_by_secondary_order_key_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), TIE_SCHEMA)
+        .await
+        .unwrap();
+    load_jsonl(&db, TIE_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let mut db = db;
+
+    let result = query_main(
+        &mut db,
+        TIE_QUERIES,
+        "tie_nearest",
+        &vector_param("q", &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+    // Distances: a=1, b=4, c=4, d=81 — the b/c tie resolves slug-descending.
+    assert_eq!(result_slugs(&result), vec!["a", "c", "b", "d"]);
+}
+
+// Golden: a search-ordered traversal query with a limit returns the RANK
+// prefix, never "any n valid rows" — limit pushdown into the final Expand is
+// disqualified when a search orders the query. The row-level proof is
+// `nearest_rank_survives_bound_edge_fanout`; this pins the instrument so a
+// refactor cannot re-enable the cap while the golden happens to survive.
+#[tokio::test]
+#[serial]
+async fn search_ordered_limit_pushdown_stays_disqualified() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_ranked_edge_db(&dir).await;
+
+    let probes = omnigraph::instrumentation::QueryIoProbes::default();
+    let result = omnigraph::instrumentation::with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            RANKED_EDGE_QUERIES,
+            "nearest_edges",
+            &vector_param("q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.num_rows(), 4);
+    assert_eq!(
+        probes
+            .expand_cap_stops
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a search-ordered traversal must not stop the Expand at the limit"
+    );
+}
+
 // ─── Unindexed text search: served, but loudly (P0 of the search RFC) ───────
 
 const UNINDEXED_TEXT_SCHEMA: &str = r#"
