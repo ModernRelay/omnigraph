@@ -536,6 +536,249 @@ async fn text_search_no_results() {
     assert_eq!(result.num_rows(), 0);
 }
 
+// ─── Metric projection + deterministic ties (search-contracts RFC P1) ──────
+
+const METRIC_QUERIES: &str = r#"
+query bm25_projected($q: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.body, $q) as score }
+    order { bm25($d.body, $q) }
+    limit 5
+}
+
+query nearest_projected($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $q) as distance }
+    order { nearest($d.embedding, $q) }
+    limit 5
+}
+
+query bm25_projected_without_retrieval($q: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.body, $q) as score }
+}
+
+query rrf_projected($q1: Vector(4), $q2: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug, rrf(nearest($d.embedding, $q1), nearest($d.embedding, $q2)) as fusion }
+    order { rrf(nearest($d.embedding, $q1), nearest($d.embedding, $q2)) }
+    limit 5
+}
+
+query rrf_secondary_key($q1: Vector(4), $q2: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q1), nearest($d.embedding, $q2)), $d.slug desc }
+    limit 3
+}
+
+query rrf_trailing_search($q1: Vector(4), $q2: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q1), nearest($d.embedding, $q2)), nearest($d.embedding, $q1) }
+    limit 5
+}
+
+query agg_search_ordered($q: String) {
+    match { $d: Doc }
+    return { $d.slug, count($d) as n }
+    order { bm25($d.body, $q), $d.slug desc }
+    limit 10
+}
+"#;
+
+fn float_column(result: &QueryResult, name: &str) -> Vec<f64> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float32Type, Float64Type};
+    let batch = result.concat_batches().unwrap();
+    let col = batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("column '{name}' missing: {:?}", batch.schema()));
+    match col.data_type() {
+        arrow_schema::DataType::Float32 => col
+            .as_primitive::<Float32Type>()
+            .iter()
+            .map(|v| v.unwrap() as f64)
+            .collect(),
+        arrow_schema::DataType::Float64 => col
+            .as_primitive::<Float64Type>()
+            .iter()
+            .map(|v| v.unwrap())
+            .collect(),
+        other => panic!("column '{name}' is not float: {other}"),
+    }
+}
+
+// A projected metric observes the SAME value the ordering used: monotone in
+// the rank direction, one column, no second execution.
+#[tokio::test]
+#[serial]
+async fn bm25_score_projects_as_aliased_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "bm25_projected",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
+    assert!(result.num_rows() > 0);
+    let scores = float_column(&result, "score");
+    for pair in scores.windows(2) {
+        assert!(
+            pair[0] >= pair[1],
+            "projected bm25 scores must be rank-descending: {scores:?}"
+        );
+    }
+    assert!(scores.iter().all(|score| *score > 0.0));
+}
+
+#[tokio::test]
+#[serial]
+async fn nearest_distance_projects_and_matches_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "nearest_projected",
+        &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
+    )
+    .await
+    .unwrap();
+    assert!(result.num_rows() > 0);
+    let distances = float_column(&result, "distance");
+    for pair in distances.windows(2) {
+        assert!(
+            pair[0] <= pair[1],
+            "projected distances must be rank-ascending: {distances:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn metric_projection_without_matching_retrieval_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let error = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "bm25_projected_without_retrieval",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires the matching bm25() or rrf() retrieval"),
+        "got: {error}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn rrf_fused_score_projects_and_is_monotone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "rrf_projected",
+        &two_vector_params("$q1", &[0.1, 0.2, 0.3, 0.4], "$q2", &[0.5, 0.6, 0.7, 0.8]),
+    )
+    .await
+    .unwrap();
+    assert!(result.num_rows() > 0);
+    let scores = float_column(&result, "fusion");
+    for pair in scores.windows(2) {
+        assert!(
+            pair[0] >= pair[1],
+            "the projected fused score must be the executed fusion order: {scores:?}"
+        );
+    }
+    assert!(scores.iter().all(|score| *score > 0.0));
+}
+
+// Trailing user keys now apply WITHIN fused-score ties (previously order_by
+// tails were silently ignored on the rrf path): ml-intro and dl-basics tie,
+// and slug DESC flips them relative to the id-ascending default.
+#[tokio::test]
+#[serial]
+async fn rrf_honors_secondary_order_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "rrf_secondary_key",
+        &two_vector_params("$q1", &[0.1, 0.2, 0.3, 0.4], "$q2", &[0.5, 0.6, 0.7, 0.8]),
+    )
+    .await
+    .unwrap();
+    // At limit 3 the arms' candidate windows (k = limit) tie ml-intro and
+    // dl-basics exactly; slug DESC must flip them relative to the
+    // id-ascending default the plain-rrf golden pins.
+    assert_eq!(
+        result_slugs(&result),
+        vec!["rl-intro", "ml-intro", "dl-basics"]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn rrf_rejects_trailing_search_function_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let error = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "rrf_trailing_search",
+        &two_vector_params("$q1", &[0.1, 0.2, 0.3, 0.4], "$q2", &[0.5, 0.6, 0.7, 0.8]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("search functions must lead the order clause"),
+        "got: {error}"
+    );
+}
+
+// Aggregated search-ordered queries historically ignored the ENTIRE order
+// clause silently. Now: trailing keys apply, and the result says the rank
+// itself was ignored.
+#[tokio::test]
+#[serial]
+async fn aggregated_search_ordered_sorts_tail_and_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "agg_search_ordered",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
+    let slugs = result_slugs(&result);
+    let mut expected = slugs.clone();
+    expected.sort_by(|a, b| b.cmp(a));
+    assert_eq!(slugs, expected, "trailing slug DESC must order the groups");
+    assert!(
+        result
+            .notices()
+            .iter()
+            .any(|notice| notice.code == "search_order_ignored_by_aggregation"),
+        "expected the aggregation notice, got: {:?}",
+        result.notices()
+    );
+}
+
 // ─── T26 through the public engine API ──────────────────────────────────────
 
 // The dev-graph reproduction (iss-nearest-dropped-by-traversal, restated):
@@ -1957,7 +2200,11 @@ async fn rrf_fuses_two_vector_queries() {
     )
     .await
     .unwrap();
-    assert_eq!(result_slugs(&r), vec!["rl-intro", "ml-intro", "dl-basics"]);
+    // ml-intro and dl-basics hold mirrored ranks across the two arms, so
+    // their fused scores tie exactly. The tie resolves entity-id ascending —
+    // the deterministic fusion order — not by arm arrival order (which this
+    // golden previously encoded).
+    assert_eq!(result_slugs(&r), vec!["rl-intro", "dl-basics", "ml-intro"]);
 }
 
 #[tokio::test]

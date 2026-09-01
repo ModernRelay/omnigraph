@@ -17,6 +17,13 @@ for nearest-neighbor ordering.
 Filters in the `match` block are applied before ranking, so `limit 10` means the
 top ten matches that satisfy the graph and property filters.
 
+A rank function in the `return` clause projects the score the ordering used:
+`bm25($d.body, $q) as score`, `nearest($d.embedding, $q) as distance`,
+`rrf(...) as fusion`. The projection observes the executed retrieval — the
+matching rank function must lead the `order` clause, or the query fails
+loudly. Every ranked result has a total, deterministic order: score first,
+then your trailing `order` keys, then a stable entity-id tie-break.
+
 Search and rank functions must target a *scan-rooted* binding — the
 first-declared binding of its match component. A traversal-introduced target
 (`$d knows $t` then `nearest($t.…)`) fails compile with `T26`: the search has

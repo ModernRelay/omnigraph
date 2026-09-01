@@ -250,6 +250,10 @@ impl NoticeSink {
 /// tokenizer instead of the indexed analyzer.
 const NOTICE_FULL_TEXT_SEARCH_UNINDEXED: &str = "full_text_search_unindexed";
 
+/// Stable notice code: a search-ordered aggregation ran — the rank cannot
+/// order grouped rows, only the trailing keys applied.
+const NOTICE_SEARCH_ORDER_IGNORED_BY_AGGREGATION: &str = "search_order_ignored_by_aggregation";
+
 /// The first retrieval target variable (including rrf arms) that no
 /// top-level `NodeScan` introduces, if any. Anti-join inner pipelines never
 /// carry the query's retrieval, so only the outer pipeline is consulted.
@@ -678,9 +682,10 @@ async fn execute_query_once(
 
     // Apply ordering. Search-ordered plans sort on the appended score column
     // (mechanism and contract: `search_score_orderings`). Aggregated
-    // search-ordered queries keep the historical no-sort behavior: the score
-    // column does not survive aggregation. `fetch` is safe to pass on every
-    // path here because the only step after ordering is the limit slice.
+    // search-ordered queries sort by their trailing keys and say the rank
+    // was ignored (the score column does not survive aggregation). `fetch`
+    // is safe to pass on every path here because the only step after
+    // ordering is the limit slice.
     let fetch = ir.limit.and_then(|limit| usize::try_from(limit).ok());
     if !ir.order_by.is_empty() && !is_search_ordered(search_mode) {
         result_batch = if has_aggregates {
@@ -732,6 +737,41 @@ async fn execute_query_once(
                 )));
             }
         }
+    } else if is_search_ordered(search_mode) {
+        // Aggregated search-ordered: the leading search function cannot rank
+        // grouped rows (its score column does not survive aggregation), and
+        // silently ignoring the WHOLE order clause was the historical
+        // behavior. Apply the trailing keys against the aggregate result
+        // (same arm as plain aggregate ordering) and say what was ignored.
+        for extra in ir.order_by.iter().skip(1) {
+            if matches!(
+                extra.expr,
+                IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Rrf { .. }
+            ) {
+                return Err(OmniError::manifest(
+                    "search functions must lead the order clause; keys after the \
+                     search function must be plain expressions"
+                        .to_string(),
+                ));
+            }
+        }
+        let trailing: Vec<IROrdering> = ir.order_by.iter().skip(1).cloned().collect();
+        if !trailing.is_empty() {
+            result_batch = apply_ordering(
+                result_batch.clone(),
+                &trailing,
+                &result_batch,
+                params,
+                fetch,
+            )?;
+        }
+        notices.emit(
+            NOTICE_SEARCH_ORDER_IGNORED_BY_AGGREGATION,
+            "the leading search ordering cannot rank aggregated rows (its score column \
+             does not survive aggregation); trailing order keys were applied, the rank \
+             was not"
+                .to_string(),
+        );
     }
 
     // Apply limit
@@ -1354,7 +1394,13 @@ async fn execute_rrf_fusion(
             (id.clone(), p + s)
         })
         .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Deterministic fusion order: score descending, then entity id ascending
+    // — equal-score winners must never depend on arrival order.
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     scored.truncate(rrf.limit);
 
     // Collect winning entity IDs in order. Every downstream row belonging to
@@ -1383,15 +1429,86 @@ async fn execute_rrf_fusion(
         &secondary_rows,
     )?;
 
+    // Materialize the fused score as `{primary_var}._score` on the fused rows
+    // (replacing any arm-raw score column): `return` and `order` observe the
+    // executed fusion calculation, never a recomputation. Per-entity scores
+    // repeat on each of the entity's fanout rows. (Arm-level metric
+    // projection inside an rrf query stays deferred — see the release note.)
+    let score_by_id: HashMap<&str, f64> = scored
+        .iter()
+        .map(|(id, score)| (id.as_str(), *score))
+        .collect();
+    let fused_entity_ids = extract_id_column_by_name(&fused_batch, &id_col_name)?;
+    let fused_scores = arrow_array::Float64Array::from(
+        fused_entity_ids
+            .iter()
+            .map(|id| score_by_id.get(id.as_str()).copied())
+            .collect::<Vec<Option<f64>>>(),
+    );
+    let score_col_name = format!("{primary_var}._score");
+    let fused_batch =
+        replace_or_append_column(&fused_batch, &score_col_name, Arc::new(fused_scores))?;
+
     // Project directly from fused batch
     let mut result_batch = project_return(&fused_batch, &ir.return_exprs, params)?;
-    // `rrf.limit` is the query's row limit. A winning entity can now own more
-    // than one row after traversal, so enforce the limit after reconstruction.
+
+    // Deterministic total order: fused score descending, then the user's
+    // trailing keys, then `apply_ordering`'s id tie-breaks — construction
+    // order is never load-bearing. Trailing rank functions are refused with
+    // the single-search path's exact message.
+    for extra in ir.order_by.iter().skip(1) {
+        if matches!(
+            extra.expr,
+            IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Rrf { .. }
+        ) {
+            return Err(OmniError::manifest(
+                "search functions must lead the order clause; keys after the \
+                 search function must be plain expressions"
+                    .to_string(),
+            ));
+        }
+    }
+    let mut orderings = vec![IROrdering {
+        expr: IRExpr::PropAccess {
+            variable: primary_var.to_string(),
+            property: "_score".to_string(),
+        },
+        descending: true,
+    }];
+    orderings.extend(ir.order_by.iter().skip(1).cloned());
+    result_batch = apply_ordering(
+        result_batch,
+        &orderings,
+        &fused_batch,
+        params,
+        Some(rrf.limit),
+    )?;
+    // `rrf.limit` is the query's row limit. A winning entity can own more
+    // than one row after traversal, so enforce the limit after ordering.
     let len = result_batch.num_rows().min(rrf.limit);
     result_batch = result_batch.slice(0, len);
 
-    // Already ordered by RRF score + already limited
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
+}
+
+/// Rebuild `batch` with `column` under `name`, replacing an existing column
+/// of that name (the fused score overwrites any arm-raw `_score`).
+fn replace_or_append_column(
+    batch: &RecordBatch,
+    name: &str,
+    column: ArrayRef,
+) -> Result<RecordBatch> {
+    let mut fields: Vec<Field> = Vec::new();
+    let mut columns: Vec<ArrayRef> = Vec::new();
+    for (field, col) in batch.schema().fields().iter().zip(batch.columns()) {
+        if field.name() != name {
+            fields.push(field.as_ref().clone());
+            columns.push(col.clone());
+        }
+    }
+    fields.push(Field::new(name, column.data_type().clone(), true));
+    columns.push(column);
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(OmniError::arrow_internal)
 }
 
 fn extract_id_column_by_name(batch: &RecordBatch, col_name: &str) -> Result<Vec<String>> {

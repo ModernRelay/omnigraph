@@ -412,10 +412,66 @@ fn evaluate_projection(
             })?;
             Ok((name.clone(), col.clone()))
         }
+        // Metric projections (search-contracts RFC P1): a rank expression in
+        // RETURN observes the retrieval's synthesized score column — it never
+        // executes a second search. The column exists only when the matching
+        // retrieval ran (Lance emits `_distance`/`_score` on search scans;
+        // fusion materializes its fused score), so a mismatch is a loud
+        // error, never a NULL column.
+        IRExpr::Nearest { variable, .. } => {
+            let col_name = format!("{variable}._distance");
+            let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "nearest() in return requires the matching nearest() retrieval in the \
+                     order clause (column '{col_name}' was not produced)"
+                ))
+            })?;
+            Ok((col_name, col.clone()))
+        }
+        IRExpr::Bm25 { field, .. } => {
+            let variable = rank_expr_variable(expr).ok_or_else(|| {
+                OmniError::manifest("bm25 field must be a property access".to_string())
+            })?;
+            let col_name = format!("{variable}._score");
+            let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "bm25() in return requires the matching bm25() or rrf() retrieval in \
+                     the order clause (column '{col_name}' was not produced)"
+                ))
+            })?;
+            Ok((col_name, col.clone()))
+        }
+        IRExpr::Rrf { primary, .. } => {
+            // The fused score is materialized under the primary arm's binding.
+            let variable = rank_expr_variable(primary).ok_or_else(|| {
+                OmniError::manifest("rrf() arms must target a property access".to_string())
+            })?;
+            let col_name = format!("{variable}._score");
+            let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "rrf() in return requires the matching rrf() retrieval in the order \
+                     clause (column '{col_name}' was not produced)"
+                ))
+            })?;
+            Ok((col_name, col.clone()))
+        }
         _ => Err(OmniError::manifest(format!(
             "unsupported projection expression: {:?}",
             expr
         ))),
+    }
+}
+
+/// The binding variable a rank expression targets, when its field shape
+/// allows one (`nearest($v.prop, …)` / `bm25($v.prop, …)`).
+fn rank_expr_variable(expr: &IRExpr) -> Option<&str> {
+    match expr {
+        IRExpr::Nearest { variable, .. } => Some(variable.as_str()),
+        IRExpr::Bm25 { field, .. } => match field.as_ref() {
+            IRExpr::PropAccess { variable, .. } => Some(variable.as_str()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -487,6 +543,18 @@ pub(super) fn apply_ordering(
         .map(|f| f.name().to_string())
         .filter(|name| name.ends_with(".id"))
         .collect();
+    if tiebreak_cols.is_empty() {
+        // Aggregate sources carry no `.id` columns, but their rows are
+        // distinct tuples of group keys and aggregate values — appending
+        // every source column (canonical name order) makes the order total
+        // there too, instead of leaving equal user-keys run-dependent.
+        tiebreak_cols = source
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+    }
     tiebreak_cols.sort();
     for name in &tiebreak_cols {
         if let Some(col) = source.column_by_name(name) {

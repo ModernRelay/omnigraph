@@ -188,3 +188,30 @@ query q() {
     // DESC: nulls last -> 30, 25, then Bob(null).
     assert_eq!(got_desc, vec!["Alice", "Charlie", "Bob"]);
 }
+
+/// Aggregate sources have no `.id` columns; the tie-break now appends every
+/// source column, so equal user keys (here: every count is 1) come out in a
+/// total, reproducible order instead of a run-dependent one.
+#[tokio::test]
+async fn aggregate_order_ties_are_deterministic() {
+    const QUERY: &str = r#"
+query agg_ties() {
+    match { $p: Person }
+    return { $p.name, count($p) as c }
+    order { c desc }
+    limit 10
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_people(
+        &dir,
+        r#"{"type": "Person", "data": {"name": "Cara", "age": 1}}
+{"type": "Person", "data": {"name": "Abe", "age": 2}}
+{"type": "Person", "data": {"name": "Bea", "age": 3}}"#,
+    )
+    .await;
+    let result = query_main(&mut db, QUERY, "agg_ties", &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(names_in_order(&result), vec!["Abe", "Bea", "Cara"]);
+}
