@@ -2002,10 +2002,12 @@ fn validate_ensure_indices_v8_shape(sidecar_uri: &str, sidecar: &RecoverySidecar
         }
         let is_first_touch = effect.source_fork_version.is_some();
         if (is_first_touch
-            && !pin
-                .table_branch
-                .as_deref()
-                .is_some_and(|branch| branch != "main" && Some(branch) == sidecar_branch))
+            && !pin.table_branch.as_deref().is_some_and(|branch| {
+                // Pins name the native fork ref; the sidecar names the
+                // logical branch it belongs to.
+                branch != "main"
+                    && Some(crate::branch_names::logical_branch_name(branch)) == sidecar_branch
+            }))
             || effect
                 .source_fork_version
                 .is_some_and(|version| version != pin.expected_version)
@@ -3484,7 +3486,11 @@ async fn classify_sidecar_tables(
                 .table_branch
                 .as_deref()
                 .is_some_and(|branch| branch != "main")
-            && sidecar.branch.as_deref() == pin.table_branch.as_deref()
+            && sidecar.branch.as_deref()
+                == pin
+                    .table_branch
+                    .as_deref()
+                    .map(crate::branch_names::logical_branch_name)
             && manifest_entry
                 .map(|entry| entry.native_dataset_branch != pin.table_branch)
                 .unwrap_or(true);

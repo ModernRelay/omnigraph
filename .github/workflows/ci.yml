@@ -497,6 +497,19 @@ jobs:
           workspaces: |
             . -> target
 
+      - name: Install genuine v0.9 release for upgrade regression
+        run: |
+          set -euo pipefail
+          v09_dir="$RUNNER_TEMP/omnigraph-v09"
+          # The installer downloads the official archive and verifies its
+          # SHA256 before extraction. An exact VERSION never falls back to edge.
+          REPO_SLUG=ModernRelay/omnigraph VERSION=v0.9.0 INSTALL_DIR="$v09_dir" \
+            bash scripts/install.sh
+          test -x "$v09_dir/omnigraph"
+          [[ "$("$v09_dir/omnigraph" --version)" == "omnigraph 0.9.0" ]] \
+            || { echo "::error::upgrade regression requires the genuine v0.9.0 CLI"; exit 1; }
+          echo "OMNIGRAPH_V09_BIN=$v09_dir/omnigraph" >> "$GITHUB_ENV"
+
       - name: Run workspace and failpoint tests once
         run: |
           set -euo pipefail
@@ -508,6 +521,14 @@ jobs:
           cargo test --workspace --locked --no-fail-fast \
             --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
             -- --nocapture 2>&1 | tee "$test_log"
+          if grep -Fq "skipping v0.9 upgrade e2e:" "$test_log"; then
+            echo "::error::v0.9 upgrade regression skipped despite a configured release binary"
+            exit 1
+          fi
+          grep -Fq "v0.9 -> v0.10 upgrade e2e completed" "$test_log" \
+            || { echo "::error::v0.9 upgrade regression did not complete"; exit 1; }
+          grep -Eq "test current_v010_upgrades_genuine_v09_graph_end_to_end \\.\\.\\. ok" "$test_log" \
+            || { echo "::error::exact v0.9 upgrade regression did not pass"; exit 1; }
 
 
   v5_v6_format_fence:

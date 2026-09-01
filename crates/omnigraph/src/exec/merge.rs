@@ -4456,7 +4456,10 @@ impl Omnigraph {
             actor_id,
         )?;
         self.ensure_schema_apply_idle("branch_merge").await?;
-        self.branch_merge_impl(source, target, actor_id).await
+        // Keep the recovery/planning future out of the public API's callers;
+        // deeply composed loads and merges otherwise retain large debug
+        // construction frames throughout execution. Poll it in the same task.
+        Box::pin(self.branch_merge_impl(source, target, actor_id)).await
     }
 
     async fn branch_merge_impl(
@@ -4656,7 +4659,16 @@ impl Omnigraph {
         ordered_table_keys.sort();
 
         let mut conflicts = Vec::new();
-        let target_active = self.active_branch().await;
+        // Adopt planning, sidecar pins, and first-touch opens name the
+        // target's forks by native ref; queue keys, gates, and lineage keep
+        // the logical branch name.
+        let target_active: Option<String> = match target_branch {
+            None => None,
+            Some(target) => Some(match target_snapshot.native_branch() {
+                Some(native) => native.to_string(),
+                None => self.native_branch_for(target).await?,
+            }),
+        };
         let mut candidates: HashMap<String, CandidateTableState> = HashMap::new();
         let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
         let mut blob_table_keys = HashSet::new();
@@ -5132,9 +5144,12 @@ impl Omnigraph {
             let planned_output_branch = match candidate {
                 CandidateTableState::RewriteMerged(_)
                 | CandidateTableState::AdoptWithDelta(_)
-                | CandidateTableState::AdoptPureInserts(_) => active_branch_for_keys.clone(),
+                | CandidateTableState::AdoptPureInserts(_) => target_active.clone(),
                 CandidateTableState::AdoptSourceState { .. } => {
-                    match (target_branch, source_entry.native_dataset_branch.as_deref()) {
+                    match (
+                        target_active.as_deref(),
+                        source_entry.native_dataset_branch.as_deref(),
+                    ) {
                         (Some(target), Some(_)) => Some(target.to_string()),
                         _ => None,
                     }
@@ -5158,7 +5173,8 @@ impl Omnigraph {
                             table_key
                         ))
                     })?;
-                    let source_fork_version = target_branch
+                    let source_fork_version = target_active
+                        .as_deref()
                         .filter(|target| entry.native_dataset_branch.as_deref() != Some(*target))
                         .map(|_| entry.published_dataset_version);
                     if source_fork_version.is_some()
@@ -5200,7 +5216,7 @@ impl Omnigraph {
                         expected_version,
                         post_commit_pin: expected_version + 1,
                         confirmed_version: None,
-                        table_branch: active_branch_for_keys.clone(),
+                        table_branch: target_active.clone(),
                     });
                     recovery_effects.push(crate::db::manifest::RecoveryBranchMergeEffect {
                         identity,
@@ -5214,7 +5230,7 @@ impl Omnigraph {
                     });
                 }
                 CandidateTableState::AdoptSourceState { .. } => {
-                    let Some(target) = target_branch else {
+                    let Some(target) = target_active.as_deref() else {
                         continue;
                     };
                     let creates_target_ref = source_entry.native_dataset_branch.is_some()
@@ -5447,7 +5463,7 @@ impl Omnigraph {
                     }
                 };
                 if first_touch_effects.contains(table_key) {
-                    let target = target_branch.ok_or_else(|| {
+                    let target = target_active.as_deref().ok_or_else(|| {
                         OmniError::manifest_internal(format!(
                             "first-touch merge effect '{}' has no named target branch",
                             table_key

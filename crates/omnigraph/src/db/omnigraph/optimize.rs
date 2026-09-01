@@ -33,7 +33,7 @@ use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
 use lance::dataset::optimize::{
     CompactionMetrics, CompactionOptions, compact_files, plan_compaction,
 };
-use lance::index::DatasetIndexExt;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_index::optimize::OptimizeOptions;
 
 use super::*;
@@ -124,11 +124,9 @@ pub struct DatasetOptimizeStats {
     /// Lance HEAD version observed by optimize for drift skips. `None` for
     /// normal compaction/no-op outcomes.
     pub lance_head_version: Option<u64>,
-    /// Declared indexed properties on this type the reconciler could not build
-    /// this run, each with the `reason` (today: a vector property with no
-    /// trainable vectors yet). Empty on the common path. Reported, not fatal — a
-    /// later `optimize` retries; the `list_indices`/`indisvalid` analog so
-    /// operators can see which index is pending and why.
+    /// Index work deferred this run, with the reason and remedy: a vector
+    /// property without trainable vectors, or full-text coverage requiring an
+    /// explicit rebuild. Deferred work alone does not arm recovery or publish.
     pub pending_indexes: Vec<super::PendingIndex>,
 }
 
@@ -479,7 +477,7 @@ async fn prepare_optimize_table(
         .map_err(OmniError::storage)?
         .num_tasks()
         > 0;
-    let needs_reindex = TableStore::has_unindexed_fragments(snapshot.dataset()).await?;
+    let needs_reindex = TableStore::has_foldable_unindexed_fragments(snapshot.dataset()).await?;
     let index_work = super::table_ops::index_work_status_on_dataset_for_catalog(
         db,
         catalog,
@@ -491,6 +489,8 @@ async fn prepare_optimize_table(
         let mut stat =
             DatasetOptimizeStats::compacted(task.table_key, &CompactionMetrics::default(), false);
         stat.pending_indexes = index_work.pending;
+        append_deferred_full_text_indexes(&snapshot, &stat.type_key, &mut stat.pending_indexes)
+            .await?;
         return Ok(OptimizePreparation::Stat(stat));
     }
 
@@ -501,6 +501,52 @@ async fn prepare_optimize_table(
         expected_version: task.expected_version,
         initial_snapshot: snapshot,
     }))
+}
+
+/// Deferred full-text coverage is observable status, never a promise that
+/// ordinary optimize will advance this table. Recheck after physical work too:
+/// stable-ID compaction can change coverage while preserving index artifacts.
+async fn append_deferred_full_text_indexes(
+    snapshot: &crate::storage_layer::SnapshotHandle,
+    table_key: &str,
+    pending: &mut Vec<super::PendingIndex>,
+) -> Result<()> {
+    let ds = snapshot.dataset();
+    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+    let full_text: std::collections::BTreeMap<_, _> = indices
+        .iter()
+        .filter(|index| TableStore::is_full_text_index(index))
+        .map(|index| (index.name.as_str(), index))
+        .collect();
+    for (name, index) in full_text {
+        let coverage_unknown = indices
+            .iter()
+            .any(|segment| segment.name == name && segment.fragment_bitmap.is_none());
+        if !coverage_unknown
+            && ds
+                .unindexed_fragments(name)
+                .await
+                .map_err(OmniError::storage)?
+                .is_empty()
+        {
+            continue;
+        }
+        for field in index
+            .keyed_fields()
+            .iter()
+            .filter_map(|id| ds.schema().field_by_id(*id))
+        {
+            pending.push(super::PendingIndex {
+                type_key: table_key.to_string(),
+                property: field.name.clone(),
+                reason: format!(
+                    "full-text index '{name}' has incomplete or unknown coverage; \
+                     run omnigraph rebuild-full-text-indexes <URI> --branch main"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Apply one productive dataset's physical maintenance work. This helper owns no
@@ -580,7 +626,8 @@ async fn apply_optimize_table_effects(
         // Any of the three enters the publish path. If NONE, this is a no-op and must
         // NOT be pinned in a sidecar (a zero-commit pin classifies NoMovement on
         // recovery and rolls back siblings).
-        let needs_reindex = TableStore::has_unindexed_fragments(selected.dataset()).await?;
+        let needs_reindex =
+            TableStore::has_foldable_unindexed_fragments(selected.dataset()).await?;
         let index_work = super::table_ops::index_work_status_on_dataset_for_catalog(
             db, catalog, &table_key, &selected,
         )
@@ -605,6 +652,8 @@ async fn apply_optimize_table_effects(
                 false,
             );
             stat.pending_indexes = index_work.pending;
+            append_deferred_full_text_indexes(&selected, &stat.type_key, &mut stat.pending_indexes)
+                .await?;
             return Ok(OptimizeEffectOutcome { stat, update: None });
         }
 
@@ -656,7 +705,22 @@ async fn apply_optimize_table_effects(
         {
             continue;
         }
-        match ds.optimize_indices(&OptimizeOptions::default()).await {
+        // FTS folding merges existing postings into a new UUID without an
+        // uncommitted proof hook. Keep those immutable artifacts (stable-row-ID
+        // compaction preserves them), and scan uncovered rows until an explicit
+        // full rebuild. Never bless mixed old/new analyzer postings. RFC 0043.
+        let index_names = ds
+            .load_indices()
+            .await
+            .map_err(OmniError::storage)?
+            .iter()
+            .filter(|index| TableStore::can_fold_index(index))
+            .map(|index| index.name.clone())
+            .collect();
+        match ds
+            .optimize_indices(&OptimizeOptions::default().index_names(index_names))
+            .await
+        {
             Ok(()) => {}
             Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
                 continue;
@@ -688,6 +752,7 @@ async fn apply_optimize_table_effects(
 
     let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, committed);
     stat.pending_indexes = pending_indexes;
+    append_deferred_full_text_indexes(&snapshot, &stat.type_key, &mut stat.pending_indexes).await?;
     let update = if committed {
         let state = db.storage().table_state(&full_path, &snapshot).await?;
         Some(crate::db::DatasetUpdate {
@@ -1324,11 +1389,13 @@ async fn reconcile_orphaned_branches_with_catalog(
 
     // Live manifest branches: the set whose per-table placements are
     // authoritative. A branch absent here is a whole-branch (origin-1) orphan.
+    // Native refs: a fork of a dead incarnation is an orphan even while the
+    // same logical branch lives on under a fresh incarnation.
     let live_branches: HashSet<String> = db
         .coordinator
         .read()
         .await
-        .all_branches()
+        .all_native_branches()
         .await?
         .into_iter()
         .collect();
@@ -1376,7 +1443,8 @@ async fn reconcile_orphaned_branches_with_catalog(
         for branch in listed {
             // `main` is not a named Lance branch; system/internal branches
             // (e.g. the schema-apply lock) own legitimate forks — never touch.
-            if branch == "main" || crate::db::is_internal_system_branch(&branch) {
+            let logical = crate::branch_names::logical_branch_name(&branch).to_string();
+            if branch == "main" || crate::db::is_internal_system_branch(&logical) {
                 continue;
             }
             let is_orphan = if !live_branches.contains(&branch) {
@@ -1391,7 +1459,7 @@ async fn reconcile_orphaned_branches_with_catalog(
                     let branch_snapshot = match crate::failpoints::maybe_fail(
                         crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
                     ) {
-                        Ok(()) => db.snapshot_for_branch(Some(&branch)).await,
+                        Ok(()) => db.snapshot_for_branch(Some(&logical)).await,
                         Err(injected) => Err(injected),
                     };
                     match branch_snapshot {
@@ -1439,7 +1507,10 @@ async fn reconcile_orphaned_branches_with_catalog(
             // lock-order inversion against multi-table `acquire_many` writers.
             let _guard = db
                 .write_queue()
-                .acquire(&(table_key.clone(), Some(branch.clone())))
+                .acquire(&(
+                    table_key.clone(),
+                    Some(crate::branch_names::logical_branch_name(&branch).to_string()),
+                ))
                 .await;
             // Decide under the queue from FRESH authority via the shared
             // classifier (same decision the write-path reclaim uses) — never
@@ -1572,13 +1643,14 @@ mod tests {
         .await
         .unwrap();
         db.branch_create("feature").await.unwrap();
+        let feature_native = db.native_branch_for("feature").await.unwrap();
 
         for type_name in ["Person", "Company"] {
             let table_uri = node_table_uri(&db, type_name).await;
             // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
             let mut ds = lance::Dataset::open(&table_uri).await.unwrap();
             let base = ds.version().version;
-            ds.create_branch("feature", base, None).await.unwrap();
+            ds.create_branch(&feature_native, base, None).await.unwrap();
         }
 
         let _fp = ScopedFailPoint::new(

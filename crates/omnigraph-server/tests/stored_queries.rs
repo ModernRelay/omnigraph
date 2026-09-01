@@ -323,6 +323,20 @@ async fn invoke_stored_query_bad_param_is_400() {
         body["error"].as_str().unwrap_or_default().contains("name"),
         "400 should name the offending param; body: {body}"
     );
+
+    for params in [json!({}), json!({ "nmae": "Alice" })] {
+        let (status, body) = json_response(
+            &app,
+            invoke_request("find_person", "t-invoke", json!({ "params": params })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["code"], "bad_request", "body: {body}");
+        assert_eq!(
+            body["error"], "parameter 'name' not provided",
+            "body: {body}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

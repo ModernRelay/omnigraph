@@ -29,9 +29,11 @@ omnigraph query engineers --query queries.gq \
 query <name>($required: String, $optional: I32?) { ... }
 ```
 
-Parameter types use the schema scalar types. A trailing `?` accepts `null` or an
-omitted value. `@description("...")` and `@instruction("...")` attach metadata
-for clients that expose stored queries as tools.
+Parameter types use the schema scalar types. Every non-nullable declared
+parameter must be supplied; omission fails before query execution. A trailing
+`?` accepts `null` or an omitted value. `@description("...")` and
+`@instruction("...")` attach metadata for clients that expose stored queries
+as tools.
 
 ## Match patterns
 

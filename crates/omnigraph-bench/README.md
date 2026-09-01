@@ -32,16 +32,18 @@ measurement protocol and identity vocabulary.
 - Runner-v1 builds one already-diverged fixture at a stable `active` path,
   verifies it, closes it, and freezes its complete physical tree by SHA-256.
   Public execution performs construction in a dedicated process group under a
-  bounded watchdog. That child also byte-digests the completed tree, makes the
-  never-opened APFS clonefile template, and removes `active` before returning
-  an identity-checked handoff. The parent accepts it only after the direct child
+  bounded watchdog. That child byte-digests the completed tree, makes a
+  never-opened reset template, and removes `active` before returning an
+  identity-checked handoff. APFS uses forced clonefile; Linux XFS uses a full
+  verified copy only for process-fresh points with an uncontrolled page cache.
+  The parent accepts it only after the direct child
   has been reaped and the process group is gone. Any failed, partial, or
   panicked fixture build quarantines its disposable workspace instead of
-  deleting possibly active state. Every repetition clone-restores the template
+  deleting possibly active state. Every repetition restores the template
   to that same `active` path, so Lance shallow
   branches retain valid absolute base paths and samples do not accumulate
-  branch, manifest, or deletion history. Reset and pre-timer proof traverse
-  metadata but never read file contents or fall back to a byte copy.
+  branch, manifest, or deletion history. Clonefile never falls back to copying;
+  plain-copy reset reads and verifies all bytes outside timing.
 - Every repetition runs in a fresh worker process whose executable SHA-256,
   source commit/dirty state, Cargo's
   release/opt-level observations, compiler-effective debug assertions, the
@@ -241,14 +243,24 @@ it up. They neither download from S3 nor open or mutate the registered source
 as an OmniGraph database.
 
 `fixture run-graph` is the narrow runnable adapter for the checked-in FinGraph
-reference and strict real-graph run YAML. From a release binary on local APFS,
-it validates the copied graph, prepares a deterministic disjoint node-and-edge
-delta on two branches, freezes that prepared state, and restores identical
-clonefile inputs for fresh-process merge repetitions. This path is deliberately
-diagnostic: its output always records `claim_eligible: false` and
-`durable_record: false`, has no warm-up, leaves the OS page cache uncontrolled,
-and cannot publish through `--archive`. It also does not dispatch through the
-AWS benchmark infrastructure or publish durable telemetry. See the
+reference and strict real-graph run YAML. From a release binary, it validates
+the copied graph, prepares a deterministic disjoint node-and-edge delta on two
+branches, freezes that prepared state, and restores identical inputs at the
+same path for fresh-process merge repetitions. macOS uses forced APFS
+clonefiles. Linux requires XFS on a directly mounted EC2 instance-store NVMe
+namespace and uses complete verified plain copies; it reserves one additional
+prepared-tree copy plus 1 GiB before freezing. On a dedicated benchmark mount,
+it waits for filesystem-wide writeback with `syncfs` after freezing and after
+each restore, outside timing. The result records
+`xfs-plain-copy-syncfs-same-active-path`, backend evidence, and machine evidence
+captured in each measured worker; differing worker identities fail the run.
+
+This path is deliberately diagnostic: its output always records
+`claim_eligible: false` and `durable_record: false`, has no warm-up, leaves the
+OS page cache uncontrolled, and cannot publish through `--archive`. Plain-copy
+reset reads the complete tree outside timing and can warm that cache. The
+command still does not download a fixture, dispatch through AWS, or publish
+durable telemetry. See the
 [FinGraph diagnostic instructions](../../benchmarks/README.md#fingraph-diagnostic-runner)
 for the declarative run shape and exact command.
 
@@ -397,13 +409,15 @@ total table count is split equally between immutable node endpoint tables and
 uniform-ring edge tables; declared divergence applies to edge tables. It uses
 scalar uniform bulk-loaded data, no indexes or pre-existing deletion history,
 local filesystem storage, same-host embedded execution, one client, distinct-key
-write-heavy divergence, manual scheduling, local-clonefile reset, per-phase
-attribution, and a monotonic timer. Process-cold, warmed-by-program, and
-reopened-after-program engine preparation are supported with their exact
-cross-validated cache declarations.
+write-heavy divergence, manual scheduling, per-phase attribution, and a
+monotonic timer. APFS uses local-clonefile reset and supports process-cold,
+warmed-by-program, and reopened-after-program engine preparation. Linux/XFS
+admits only verified plain-copy reset with the exact process-fresh,
+preparation-only, uncontrolled-page-cache, no-program contract described below.
 
-The host probe currently proves APFS on an internal macOS NVMe or SATA SSD. A
-debug build, S3 or Azure backend, server execution, plain-copy reset, unproved
+The host probe proves APFS on an internal macOS NVMe or SATA SSD, or XFS on a
+direct EC2 instance-store NVMe namespace (and distinguishes EBS). A debug
+build, S3 or Azure backend, server execution, unproved
 host declaration, unsupported scenario axis, deadline breach, reset witness
 mismatch, non-general merge route, or content mismatch is refused instead of
 being approximated. A true OS-page-cache-cold claim is not representable yet;

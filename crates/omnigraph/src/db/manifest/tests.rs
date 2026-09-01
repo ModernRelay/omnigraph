@@ -514,17 +514,18 @@ async fn snapshot_dataset_proves_index_inventory_from_raw_manifest_section() {
 }
 
 #[tokio::test]
-async fn snapshot_scanner_strict_rows_survive_byte_target_override() {
+async fn snapshot_scanner_row_and_byte_limits_are_composed() {
     const ROWS: usize = 10_000;
     const BATCH_ROWS: usize = 8_192;
 
     let dir = tempfile::tempdir().unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+    let expected_ids = (0..ROWS)
+        .map(|row| format!("row-{row:05}"))
+        .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
-        vec![Arc::new(StringArray::from_iter_values(
-            (0..ROWS).map(|row| format!("row-{row:05}")),
-        ))],
+        vec![Arc::new(StringArray::from_iter_values(&expected_ids))],
     )
     .unwrap();
     let reader = RecordBatchIterator::new([Ok(batch)], Arc::clone(&schema));
@@ -532,9 +533,69 @@ async fn snapshot_scanner_strict_rows_survive_byte_target_override() {
         .await
         .unwrap();
     let table = SnapshotDataset::new(dataset);
+    let assert_contents = |batches: &[RecordBatch]| {
+        let actual_ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_ids.len(), ROWS);
+        assert_eq!(
+            actual_ids,
+            expected_ids
+                .iter()
+                .map(|id| Some(id.as_str()))
+                .collect::<Vec<_>>()
+        );
+    };
+
+    // A large byte target must retain the row ceiling; a small one must
+    // constrain the batches further. Neither setting may lose or alter rows.
+    for (byte_target, byte_limited) in [(32 * 1024 * 1024, false), (4 * 1024, true)] {
+        let mut scanner = table.scan();
+        scanner.batch_size(BATCH_ROWS);
+        scanner.batch_size_bytes(byte_target);
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_contents(&batches);
+        assert!(
+            batches
+                .iter()
+                .all(|batch| (1..=BATCH_ROWS).contains(&batch.num_rows()))
+        );
+        let largest_batch = batches.iter().map(RecordBatch::num_rows).max().unwrap();
+        if byte_limited {
+            assert!(largest_batch < BATCH_ROWS);
+        } else {
+            assert_eq!(largest_batch, BATCH_ROWS);
+        }
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            // Count this fixture's logical bytes, not retained Arrow buffers.
+            let logical_bytes = std::mem::size_of_val(ids.value_offsets())
+                + (ids.value_offsets().last().unwrap() - ids.value_offsets()[0]) as usize;
+            assert!(logical_bytes <= byte_target as usize);
+        }
+    }
+
+    // Strict batching still guarantees exact row counts when used alone.
     let mut scanner = table.scan();
     scanner.batch_size(BATCH_ROWS);
-    scanner.batch_size_bytes(32 * 1024 * 1024);
     scanner.strict_batch_size(true);
 
     let batches = scanner
@@ -544,12 +605,29 @@ async fn snapshot_scanner_strict_rows_survive_byte_target_override() {
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
+    assert_contents(&batches);
     assert_eq!(
         batches
             .iter()
             .map(RecordBatch::num_rows)
             .collect::<Vec<_>>(),
         vec![BATCH_ROWS, ROWS - BATCH_ROWS]
+    );
+
+    scanner.batch_size_bytes(32 * 1024 * 1024);
+    let error = scanner
+        .try_into_stream()
+        .await
+        .err()
+        .expect("strict row batching and a byte target must be rejected");
+    assert_eq!(
+        error.storage_failure().map(|failure| failure.kind),
+        Some(StorageFailureKind::Configuration)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("strict_batch_size=true cannot be combined with batch_size_bytes=")
     );
 }
 

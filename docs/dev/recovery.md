@@ -32,7 +32,7 @@ mean an active sidecar uses an old outer schema.
 | Mutation / Load | Exact one-transaction effect identity and confirmation |
 | BranchMerge | Fixed bounded transaction chain, source/target authority, and lineage |
 | SchemaApply | Exact existing/first-touch effects, durable schema staging, and complete catalog delta |
-| EnsureIndices | Exact mixed CreateIndex effects and complete pointer delta |
+| EnsureIndices / full-text rebuild | Exact CreateIndex effects and complete pointer delta; rebuild retains the same fixed actor and lineage |
 | Optimize | Bounded maintenance plan and complete graph-wide pointer outcome |
 
 Pre-v9 identity-less artifacts are never upgraded by guessing from aliases.
@@ -139,7 +139,10 @@ Native branch create/delete residue is different from a data-table effect.
 When `BranchContents` proves a ref absent, an unreferenced clone-only tree can
 be reclaimed as derived state. A sidecar owning a real graph-table effect may
 not be discarded merely because its target branch was deleted; the complete
-effect/compensation proof still applies.
+effect/compensation proof still applies. Because every branch life has its own
+native ref, a recreated branch never becomes the target of a stale sidecar's
+fork: the dead life's native name resolves to nothing, and its forks are
+orphans for `cleanup`.
 
 ## Maintenance boundary
 

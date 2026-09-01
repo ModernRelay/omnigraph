@@ -1946,6 +1946,7 @@ async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
+    let feature_native = helpers::graph_native_ref(db.uri(), "feature").await;
 
     // Forge the manifest-unreferenced fork directly at the Lance layer.
     let main = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
@@ -1958,9 +1959,13 @@ async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
     {
         let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
         let base = ds.version().version;
-        ds.create_branch("feature", base, None).await.unwrap();
+        ds.create_branch(&feature_native, base, None).await.unwrap();
         assert!(
-            ds.list_branches().await.unwrap().contains_key("feature"),
+            ds.list_branches()
+                .await
+                .unwrap()
+                .keys()
+                .any(|name| helpers::is_incarnation_of(name, "feature")),
             "precondition: forged orphan fork present on Person"
         );
     }

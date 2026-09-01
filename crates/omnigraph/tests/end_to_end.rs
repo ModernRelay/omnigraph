@@ -370,6 +370,48 @@ async fn query_get_person_by_name() {
 }
 
 #[tokio::test]
+async fn query_rejects_missing_required_param() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let error = query_main(&mut db, TEST_QUERIES, "get_person", &ParamMap::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+                    && manifest.message == "parameter 'name' not provided"
+        ),
+        "missing required parameters must be a typed bad request, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn query_treats_missing_nullable_param_as_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let query = r#"
+        query optional_name($name: String?) {
+            match { $p: Person { name: $name } }
+            return { $p.name }
+        }
+    "#;
+
+    let result = query_main(&mut db, query, "optional_name", &ParamMap::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.num_rows(),
+        0,
+        "an omitted nullable parameter must filter as null, not widen the scan"
+    );
+}
+
+#[tokio::test]
 async fn query_get_person_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;

@@ -65,13 +65,16 @@ physical-effect proofs:
 | Mutation / Load | One exact staged keyed, overwrite, or delete transaction per touched table | One graph commit |
 | SchemaApply | Exact existing-table rewrites plus owned first-touch table creation and the complete schema/manifest delta | One main-branch graph commit |
 | BranchMerge | Pointer adoption, a proven insertion chain, or a bounded ordered-diff transaction chain | One target-branch graph commit |
-| EnsureIndices | One exact mixed `CreateIndex` transaction per productive table; untrainable vector work remains pending | One pointer publication when work lands |
+| EnsureIndices / full-text rebuild | One exact `CreateIndex` transaction per productive table; ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
 | Optimize | Bounded compaction and index-fold maintenance over the complete planned table set | At most one monotonic main publication |
 
 Native graph-branch create/delete is a control exception. `BranchContents` is
 the logical authority; clone/delete residue is derived physical state and is
 reclaimed only when its target is provable from that authority. It does not
-invent an alternate graph-content publisher.
+invent an alternate graph-content publisher. Each branch life owns a native ref
+named `{logical}.{ULID}` (see [RFC 0042](../rfcs/0042-incarnation-suffixed-branch-refs.md));
+a recreated branch therefore never shares a path with its dead predecessor, and
+the predecessor's forks are reclaimed by `cleanup` rather than healed in place.
 
 ## Mutation and Load
 
@@ -113,13 +116,21 @@ contiguous, structurally valid history. The certificate is an optimization
 capability, not an authenticity mechanism; unfamiliar or cleaned history falls
 back to the general merge.
 
+Full-text builds stage an artifact-scoped analyzer certificate before their
+CreateIndex metadata is published. The explicit rebuild uses this same writer,
+including first-touch branch ownership; it does not rewrite retained snapshots
+or add a separate migration publisher. See
+[full-text compatibility](lance.md#full-text-compatibility).
+
 ## First-touch tables and lazy branches
 
 A named graph branch may inherit a main-table version without owning a native
 table ref. The first write stages against the inherited snapshot, records the
 intended ref/table ownership in recovery, and creates the physical branch only
 inside the protected effect window. Recovery may delete only a ref or dataset
-whose exact creation it owns.
+whose exact creation it owns. Table forks are named by the branch's native ref;
+sidecar table pins carry that native name while the sidecar's `branch` stays
+logical.
 
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, pointer, or recovery effect belongs to the

@@ -342,7 +342,8 @@ async fn assert_lazy_external_blob_rejection_is_effect_free(
             .list_branches()
             .await
             .unwrap()
-            .contains_key("feature"),
+            .keys()
+            .any(|name| helpers::is_incarnation_of(name, "feature")),
         "{case}: rejected first touch created the native feature ref"
     );
     assert_eq!(count_rows_branch(db, "feature", table_key).await, 0);
@@ -432,7 +433,8 @@ node Attachment {
             .list_branches()
             .await
             .unwrap()
-            .contains_key("feature"),
+            .keys()
+            .any(|name| helpers::is_incarnation_of(name, "feature")),
         "precondition: feature has no native table ref before first touch"
     );
     let external_uri = url::Url::from_file_path(&external_path)
@@ -1104,7 +1106,8 @@ node Thing {
                 .list_branches()
                 .await
                 .unwrap()
-                .contains_key("feature"),
+                .keys()
+                .any(|name| helpers::is_incarnation_of(name, "feature")),
             "precondition: feature has no native table ref before first touch"
         );
 
@@ -1147,7 +1150,8 @@ node Thing {
                 .list_branches()
                 .await
                 .unwrap()
-                .contains_key("feature"),
+                .keys()
+                .any(|name| helpers::is_incarnation_of(name, "feature")),
             "load mode {mode:?} must fail before creating the native feature ref"
         );
         assert_eq!(count_rows_branch(&db, "feature", "node:Thing").await, 0);

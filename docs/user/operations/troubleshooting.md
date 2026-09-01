@@ -17,7 +17,7 @@ Do not parse human-readable error text when a structured field is present.
 | 401 | Missing or invalid bearer token | Supply a token configured by the server |
 | 403 | The resolved actor is not authorized | Change policy or use an authorized identity |
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
-| 409 | Concurrent change, duplicate ID, merge conflict, or existing resource | Inspect structured conflict details and re-read before retrying |
+| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, or incompatible full-text index | Inspect structured details; not every conflict is retryable |
 | 410 | Required change-feed history was reclaimed | Capture and durably install a new baseline, then resume from its terminal cursor |
 | 412 | Blob entity-tag or graph-commit precondition failed | Refresh the Blob ETag, or re-read the branch and retry the mutation with its current graph commit |
 | 413 | Request or operation exceeded a bounded resource limit | Split or reduce the operation using the reported limit |
@@ -41,6 +41,11 @@ A `409` is not one universal retry signal:
   use merge/upsert semantics; repeating the strict insert is not useful.
 - A merge conflict requires an explicit resolution on one branch before
   merging again.
+- A full-text incompatibility includes
+  `full_text_index_rebuild_required: { "index": "…", "reason": "…" }` with
+  `code: "conflict"`. This condition persists until an operator rebuilds the
+  affected branch's indexes; do not automatically retry the same query. Follow
+  the [full-text upgrade procedure](upgrade.md#full-text-index-upgrade).
 - “Already initialized” means the target already contains a graph. Choose a new
   root or deliberately use the command's destructive option when appropriate.
 

@@ -211,10 +211,10 @@ checked scale budgets, table bounds, cache-condition declarations, and
 reset/backend compatibility. Planning expands the suite into ordered run
 entries; it does not execute a benchmark.
 
-The checked-in smoke point declares APFS on local NVMe storage. Validation is
-host-independent; runner-v1 probes the actual scratch volume on macOS and
-refuses to measure when its APFS and internal-storage evidence does not match
-the declaration. S3-compatible cases likewise carry region, storage class,
+The checked-in smoke point declares APFS on local NVMe storage. The AWS point
+declares XFS on EC2 instance-store NVMe and a fresh process with an uncontrolled
+page cache. Validation is host-independent; runner-v1 probes the actual scratch
+volume and refuses declarations that do not match. S3-compatible cases carry region, storage class,
 implementation/version, bucket-versioning state, and a digest pin for MinIO or
 RustFS images in their point identity, but they are not executable by this
 runner slice.
@@ -229,6 +229,11 @@ Wall-clock execution is available only from a release-profile binary:
 cargo run --release --locked -p omnigraph-bench -- \
   suite run benchmarks/suites/local-smoke.suite-v1.yaml \
   --archive .bench/archive
+
+# On the AWS lab's XFS instance-store mount:
+target/release/omnigraph-bench suite run \
+  benchmarks/suites/aws-xfs-process-cold.suite-v1.yaml \
+  --scratch-root /mnt/nvme --archive /mnt/nvme/omnigraph-bench-archive
 ```
 
 Use `--case <ID>` to select one suite entry, `--scratch-root <EXISTING-DIR>` to
@@ -249,15 +254,12 @@ Runner-v1 constructs and verifies one fixture whose `bench-source` and
 complete directory by physical SHA-256. The fixture is built at a stable
 `active` path because Lance shallow-branch manifests can retain absolute base
 paths. Public execution constructs it in a dedicated process group under a
-bounded watchdog. That child also byte-digests the completed tree, makes the
-never-opened APFS clonefile template, and removes `active` before returning an
-identity-checked handoff. The parent accepts it only after the direct child is
-reaped and the group is gone. A failed, partial, or panicked build quarantines
-the entire disposable workspace. Every repetition clone-restores the template
-to that exact `active` path. Forced clonefile reset has no byte-copy fallback.
-Handoff acceptance, reset, and the pre-timer witness walk metadata but do not
-read file contents, so they do not prewarm the fixture's data pages merely to
-prove identity.
+bounded watchdog. The child freezes a byte-digested template and removes
+`active` before returning an identity-checked handoff. APFS uses forced
+clonefile with no byte-copy fallback. Linux XFS uses verified copies only for
+the process-fresh point: reset reads bytes outside timing, so its page cache is
+truthfully declared uncontrolled. Every repetition restores the exact stable
+`active` path; failed construction quarantines the workspace.
 
 Every repetition uses a fresh worker process and starts from the same frozen
 state. The parent pins and records the worker executable SHA-256 and requires
@@ -363,29 +365,37 @@ target/release/omnigraph-bench fixture run-graph \
   --reference \
     benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
   --fixture finbench-2026-08-21-sf10-v1=/path/to/finbench-2026-08-21-sf10-v1 \
-  --scratch-root /path/to/existing-apfs-scratch --json
+  --scratch-root /path/to/existing-qualified-scratch --json
 ```
 
-`run-graph` refuses a debug build. It is currently a local APFS diagnostic:
-the harness copies and validates the registered graph, prepares two branches
-whose disjoint changes each contain two `Account` nodes and one
-`AccountTransferAccount` edge, and freezes that prepared input. Each repetition
-restores the same path with APFS clonefiles and runs only the branch merge in a
-fresh worker process. The registered source is never opened as an OmniGraph
-database and remains unchanged.
+`run-graph` refuses a debug build. The harness copies and validates the
+registered graph, prepares two branches whose disjoint changes each contain
+two `Account` nodes and one `AccountTransferAccount` edge, and freezes that
+prepared input. Each repetition restores the same path and runs only the branch
+merge in a fresh worker process. macOS requires qualified local APFS and uses
+forced clonefiles. Linux requires XFS on a directly mounted EC2 instance-store
+NVMe namespace, refuses EBS, and uses a complete verified plain copy outside
+the timer. Use a dedicated benchmark mount: after freezing and after each
+restore, Linux `syncfs` waits for all writeback on that filesystem so reset I/O
+does not overlap the merge. The recorded reset is
+`xfs-plain-copy-syncfs-same-active-path`. Before making that template, the Linux
+path requires free space for one prepared-tree copy plus 1 GiB. The registered
+source is never opened as an OmniGraph database and remains unchanged.
 Before returning either success or failure, the command explicitly attempts to
 remove its disposable workspace. A cleanup failure is reported, and a run plus
 cleanup double failure retains both causes.
 The result includes raw elapsed samples, p50, merge route/phases, the prepared
-physical digest, and verification evidence for the inserted delta, protected
-heads, and untouched tables. Pre-existing rows in the two changed tables are
-not yet fully re-read and are reported as unverified rather than implied to be
-proved.
+physical digest, per-worker machine and backend evidence, and verification evidence for
+the inserted delta, protected heads, and untouched tables. Pre-existing rows
+in the two changed tables are not yet fully re-read and are reported as
+unverified rather than implied to be proved. Machine identity is captured just
+before timing in every worker; differing identities fail the run.
 
 This path deliberately does not make a publishable performance claim. Every
 result says `claim_eligible: false` and `durable_record: false`; it has no
 warm-up program, and although each measurement uses a fresh process, the
-operating-system page cache is uncontrolled. `run-graph` does not accept
+operating-system page cache is uncontrolled; Linux plain-copy reset reads every
+fixture byte outside timing and can warm it. `run-graph` does not accept
 `--archive`, publish durable telemetry, calculate a noise floor, download an
 S3 fixture, or dispatch work through the AWS benchmark infrastructure. AWS may
 hold the source snapshot, but an operator must first provide the verified local

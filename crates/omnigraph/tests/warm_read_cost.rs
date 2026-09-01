@@ -247,7 +247,7 @@ async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
         let reads = last_manifest_reads();
         assert_eq!(reads.len(), 1);
         assert!(
-            reads[0].contains("_refs/branches/feature.json"),
+            reads[0].contains("_refs/branches/feature") && reads[0].ends_with(".json"),
             "the sole warm named-branch read must be BranchContents, not a manifest body: {reads:#?}"
         );
         assert_eq!(
@@ -525,7 +525,7 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
         .dataset("node:Person")
         .unwrap()
         .clone();
-    assert_eq!(old_entry.native_dataset_branch.as_deref(), Some("feature"));
+    helpers::assert_native_branch_of(old_entry.native_dataset_branch.as_deref(), "feature");
 
     writer.branch_delete("feature").await.unwrap();
     writer.branch_create("feature").await.unwrap();
@@ -546,9 +546,9 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
         .unwrap()
         .clone();
     assert_eq!(new_entry.dataset_path, old_entry.dataset_path);
-    assert_eq!(
-        new_entry.native_dataset_branch,
-        old_entry.native_dataset_branch
+    assert_ne!(
+        new_entry.native_dataset_branch, old_entry.native_dataset_branch,
+        "a recreated branch owns a new incarnation-suffixed fork ref"
     );
     assert_eq!(
         new_entry.published_dataset_version, old_entry.published_dataset_version,
@@ -646,9 +646,9 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
             .dataset("edge:Knows")
             .unwrap()
             .clone();
-        assert_eq!(
+        helpers::assert_native_branch_of(
             old_edge_entry.native_dataset_branch.as_deref(),
-            Some("feature")
+            "feature",
         );
 
         writer.branch_delete("feature").await.unwrap();
@@ -673,9 +673,9 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
             .unwrap()
             .clone();
         assert_eq!(new_edge_entry.dataset_path, old_edge_entry.dataset_path);
-        assert_eq!(
-            new_edge_entry.native_dataset_branch,
-            old_edge_entry.native_dataset_branch
+        assert_ne!(
+            new_edge_entry.native_dataset_branch, old_edge_entry.native_dataset_branch,
+            "a recreated branch owns a new incarnation-suffixed fork ref"
         );
         assert_eq!(
             new_edge_entry.published_dataset_version, old_edge_entry.published_dataset_version,
