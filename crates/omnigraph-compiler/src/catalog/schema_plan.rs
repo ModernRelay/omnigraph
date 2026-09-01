@@ -1177,6 +1177,34 @@ node Ticket {
     }
 
     #[test]
+    fn plan_refuses_adding_edge_key_to_existing_type() {
+        // The `is_key` committed-lookup skip is sound only because a key
+        // exists from type creation on; this pin makes a future Key
+        // special-case in plan_constraints a deliberate decision.
+        let accepted = ir(r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    since: String?
+}
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    since: String?
+    @key(src, dst)
+}
+"#,
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(
+            !plan.supported,
+            "adding @key to an existing edge type must be unsupported: {plan:?}"
+        );
+    }
+
+    #[test]
     fn plan_orders_rename_before_widening_and_names_the_new_property() {
         // A property renamed AND widened in one migration emits both steps:
         // RenameProperty first, then ExtendEnum carrying the post-rename name
