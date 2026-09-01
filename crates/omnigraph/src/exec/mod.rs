@@ -21,7 +21,7 @@ use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{
     IRAssignment, IRExpr, IRFilter, IRMutationPredicate, IROp, IROrdering, IRProjection,
-    MutationOpIR, ParamMap, QueryIR,
+    MutationOpIR, ParamMap, QueryIR, RetrievalIR,
 };
 use omnigraph_compiler::lower_mutation_query;
 use omnigraph_compiler::lower_query;

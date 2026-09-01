@@ -13,6 +13,53 @@ pub struct QueryIR {
     pub return_exprs: Vec<IRProjection>,
     pub order_by: Vec<IROrdering>,
     pub limit: Option<u64>,
+    /// The query's retrieval plan, stated by lowering instead of rediscovered
+    /// from `order_by[0]` at execution (search-contracts RFC, plan-truth
+    /// phase). `order_by` still carries the rank expression for ordering
+    /// semantics — score direction, secondary keys — while this field is the
+    /// single authority for WHAT retrieval runs and under which bounds.
+    /// Parameter and embedding resolution stay execution-time (`query` inside
+    /// is an unresolved expression), so one lowered plan serves every
+    /// parameterization.
+    pub retrieval: Option<RetrievalIR>,
+}
+
+/// A lowered retrieval source or fusion. Leaves are `Nearest`/`Bm25`;
+/// `FuseRrf` holds exactly two leaf arms (the grammar and T21 enforce that
+/// shape today — a future N-arm fusion widens this enum, not `order_by`
+/// inference).
+#[derive(Debug, Clone)]
+pub enum RetrievalIR {
+    /// Vector top-k on `variable.property`. `k` is the effective candidate
+    /// count, fixed at lowering: the query limit at the root (T17 guarantees
+    /// one), the fusion limit — default 100 — inside an rrf arm.
+    Nearest {
+        variable: String,
+        property: String,
+        query: Box<IRExpr>,
+        k: Option<u64>,
+    },
+    /// Ranked lexical retrieval on `variable.property`. `scan_cap` is the
+    /// lowering-decided bounded-scan policy (issue #563): `limit ×
+    /// BM25_SCAN_OVERFETCH_FACTOR` when the query has a limit, no aggregate
+    /// return, and no secondary order keys; `None` scans every match.
+    /// Always `None` inside an rrf arm — fusion needs the arm's complete
+    /// ranking (a capped arm silently shifts fused ranks; see PR #574).
+    Bm25 {
+        variable: String,
+        property: String,
+        query: Box<IRExpr>,
+        scan_cap: Option<u64>,
+    },
+    /// Reciprocal-rank fusion of two leaf arms. `k` is the rank-constant
+    /// expression (engine default 60); `limit` is the query limit (T21
+    /// guarantees one).
+    FuseRrf {
+        primary: Box<RetrievalIR>,
+        secondary: Box<RetrievalIR>,
+        k: Option<Box<IRExpr>>,
+        limit: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone)]

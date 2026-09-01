@@ -811,3 +811,164 @@ return { $p.name }
     assert!(matches!(&inner[1], IROp::Expand { .. }));
     assert!(matches!(&inner[2], IROp::Filter(_)));
 }
+
+// ─── Retrieval lowering (search-contracts RFC: plan truth) ──────────────────
+
+fn vector_setup() -> Catalog {
+    let schema = parse_schema(
+        r#"
+node Doc { title: String  body: String?  embedding: Vector(4) }
+"#,
+    )
+    .unwrap();
+    build_catalog(&schema).unwrap()
+}
+
+fn lower_source(catalog: &Catalog, source: &str) -> QueryIR {
+    let qf = parse_query(source).unwrap();
+    let tc = typecheck_query(catalog, &qf.queries[0]).unwrap();
+    lower_query(catalog, &qf.queries[0], &tc).unwrap()
+}
+
+#[test]
+fn lowers_nearest_ordering_into_retrieval() {
+    let catalog = vector_setup();
+    let ir = lower_source(
+        &catalog,
+        r#"
+query q($q: Vector(4)) {
+match { $d: Doc }
+return { $d.title }
+order { nearest($d.embedding, $q) }
+limit 3
+}
+"#,
+    );
+    let Some(RetrievalIR::Nearest {
+        variable,
+        property,
+        k,
+        ..
+    }) = &ir.retrieval
+    else {
+        panic!("expected a Nearest retrieval, got {:?}", ir.retrieval);
+    };
+    assert_eq!(variable, "d");
+    assert_eq!(property, "embedding");
+    assert_eq!(*k, Some(3));
+}
+
+#[test]
+fn lowers_bm25_with_overfetch_cap() {
+    let catalog = vector_setup();
+    let ir = lower_source(
+        &catalog,
+        r#"
+query q($q: String) {
+match { $d: Doc }
+return { $d.title }
+order { bm25($d.title, $q) }
+limit 5
+}
+"#,
+    );
+    let Some(RetrievalIR::Bm25 { scan_cap, .. }) = &ir.retrieval else {
+        panic!("expected a Bm25 retrieval, got {:?}", ir.retrieval);
+    };
+    assert_eq!(*scan_cap, Some(5 * BM25_SCAN_OVERFETCH_FACTOR));
+}
+
+#[test]
+fn bm25_cap_disqualified_by_secondary_order_key() {
+    let catalog = vector_setup();
+    let ir = lower_source(
+        &catalog,
+        r#"
+query q($q: String) {
+match { $d: Doc }
+return { $d.title }
+order { bm25($d.title, $q), $d.title desc }
+limit 5
+}
+"#,
+    );
+    let Some(RetrievalIR::Bm25 { scan_cap, .. }) = &ir.retrieval else {
+        panic!("expected a Bm25 retrieval, got {:?}", ir.retrieval);
+    };
+    assert_eq!(*scan_cap, None, "secondary keys must disqualify the cap");
+}
+
+#[test]
+fn bm25_cap_disqualified_by_aggregate_return() {
+    let catalog = vector_setup();
+    let ir = lower_source(
+        &catalog,
+        r#"
+query q($q: String) {
+match { $d: Doc }
+return { count($d) as n }
+order { bm25($d.title, $q) }
+limit 5
+}
+"#,
+    );
+    let Some(RetrievalIR::Bm25 { scan_cap, .. }) = &ir.retrieval else {
+        panic!("expected a Bm25 retrieval, got {:?}", ir.retrieval);
+    };
+    assert_eq!(*scan_cap, None, "aggregates must disqualify the cap");
+}
+
+#[test]
+fn rrf_arms_lower_uncapped_with_fusion_limit() {
+    let catalog = vector_setup();
+    let ir = lower_source(
+        &catalog,
+        r#"
+query q($q: String, $v: Vector(4)) {
+match { $d: Doc }
+return { $d.title }
+order { rrf(nearest($d.embedding, $v), bm25($d.title, $q)) }
+limit 4
+}
+"#,
+    );
+    let Some(RetrievalIR::FuseRrf {
+        primary,
+        secondary,
+        limit,
+        ..
+    }) = &ir.retrieval
+    else {
+        panic!("expected a FuseRrf retrieval, got {:?}", ir.retrieval);
+    };
+    assert_eq!(*limit, Some(4));
+    let RetrievalIR::Nearest { k, .. } = primary.as_ref() else {
+        panic!("expected a Nearest primary arm");
+    };
+    assert_eq!(*k, Some(4), "the nearest arm's k follows the fusion limit");
+    let RetrievalIR::Bm25 { scan_cap, .. } = secondary.as_ref() else {
+        panic!("expected a Bm25 secondary arm");
+    };
+    assert_eq!(*scan_cap, None, "fusion arms must never be capped");
+}
+
+#[test]
+fn non_rank_ordering_lowers_no_retrieval() {
+    let catalog = vector_setup();
+    let ir = lower_source(
+        &catalog,
+        r#"
+query q() {
+match { $d: Doc }
+return { $d.title }
+order { $d.title desc }
+limit 5
+}
+"#,
+    );
+    assert!(
+        ir.retrieval.is_none(),
+        "a plain ordering must lower no retrieval, got {:?}",
+        ir.retrieval
+    );
+}

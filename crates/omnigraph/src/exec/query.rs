@@ -250,90 +250,33 @@ impl NoticeSink {
 /// tokenizer instead of the indexed analyzer.
 const NOTICE_FULL_TEXT_SEARCH_UNINDEXED: &str = "full_text_search_unindexed";
 
-/// Multiplier on the query's limit for a capped BM25 scan; trades scan width
-/// against how often the uncapped retry is needed (see `execute_query`).
-const BM25_SCAN_OVERFETCH_FACTOR: usize = 4;
-
-/// Row cap for the BM25 scan, or `None` to scan every matching document.
-/// `None` for a limitless query, and for any aggregate return: an aggregate's
-/// value is computed over the scanned rows, so a capped scan would change the
-/// answer, not just the cost. Standalone `bm25()` orderings only — `rrf()`
-/// arms never call this (see `extract_sub_search_mode`).
-fn bm25_scan_limit(ir: &QueryIR) -> Option<usize> {
-    if projections_have_aggregates(&ir.return_exprs) {
-        return None;
-    }
-    // Secondary order keys disqualify the cap: they rank WITHIN score ties,
-    // and a bounded scan chooses which tied rows exist at all — the secondary
-    // sort over a cap-arbitrary subset would be a silently wrong answer the
-    // under-fill retry cannot see (exactly `limit` rows still come back).
-    if ir.order_by.len() > 1 {
-        return None;
-    }
-    ir.limit.map(|rows| {
-        usize::try_from(rows)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(BM25_SCAN_OVERFETCH_FACTOR)
-    })
-}
-
-/// Extract search ordering mode from the IR.
-async fn extract_search_mode(
+/// Resolve the lowered retrieval plan into the executable `SearchMode`.
+///
+/// The retrieval SHAPE — which source, which variable/property, the bm25
+/// scan-cap policy, each arm's candidate count — was fixed at lowering
+/// (`QueryIR::retrieval`); this resolves the per-execution facts: parameter
+/// values and String-query embedding. The executor no longer inspects
+/// `order_by[0]` to discover retrieval.
+async fn resolve_retrieval(
     ir: &QueryIR,
     params: &ParamMap,
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
 ) -> Result<SearchMode> {
-    if ir.order_by.is_empty() {
+    let Some(retrieval) = ir.retrieval.as_ref() else {
         return Ok(SearchMode::default());
-    }
-    let ordering = &ir.order_by[0];
-    match &ordering.expr {
-        IRExpr::Nearest {
-            variable,
-            property,
-            query,
-        } => {
-            let vec = resolve_nearest_query_vec(
-                ir, catalog, variable, property, query, params, embedding,
-            )
-            .await?;
-            let k = usize::try_from(ir.limit.ok_or_else(|| {
-                OmniError::manifest("nearest() ordering requires a limit clause".to_string())
-            })?)
-            .unwrap_or(usize::MAX);
-            Ok(SearchMode {
-                nearest: Some((variable.clone(), property.clone(), vec, k)),
-                ..Default::default()
-            })
+    };
+    match retrieval {
+        RetrievalIR::Nearest { .. } | RetrievalIR::Bm25 { .. } => {
+            resolve_retrieval_leaf(ir, retrieval, params, catalog, embedding).await
         }
-        IRExpr::Bm25 { field, query } => {
-            let var = match field.as_ref() {
-                IRExpr::PropAccess { variable, .. } => variable.clone(),
-                _ => {
-                    return Err(OmniError::manifest(
-                        "bm25 field must be a property access".to_string(),
-                    ));
-                }
-            };
-            let prop = extract_property(field).ok_or_else(|| {
-                OmniError::manifest("bm25 field must be a property access".to_string())
-            })?;
-            let text = resolve_to_string(query, params).ok_or_else(|| {
-                OmniError::manifest("bm25 query must resolve to a string".to_string())
-            })?;
-            Ok(SearchMode {
-                bm25: Some((var, prop, text)),
-                bm25_scan_limit: bm25_scan_limit(ir),
-                ..Default::default()
-            })
-        }
-        IRExpr::Rrf {
+        RetrievalIR::FuseRrf {
             primary,
             secondary,
             k,
+            limit,
         } => {
-            let limit = usize::try_from(ir.limit.ok_or_else(|| {
+            let limit = usize::try_from(limit.ok_or_else(|| {
                 OmniError::manifest("rrf() ordering requires a limit clause".to_string())
             })?)
             .unwrap_or(usize::MAX);
@@ -344,9 +287,9 @@ async fn extract_search_mode(
                 .unwrap_or(60);
 
             let primary_mode =
-                extract_sub_search_mode(ir, primary, params, catalog, embedding).await?;
+                resolve_retrieval_leaf(ir, primary, params, catalog, embedding).await?;
             let secondary_mode =
-                extract_sub_search_mode(ir, secondary, params, catalog, embedding).await?;
+                resolve_retrieval_leaf(ir, secondary, params, catalog, embedding).await?;
 
             Ok(SearchMode {
                 rrf: Some(RrfMode {
@@ -358,64 +301,57 @@ async fn extract_search_mode(
                 ..Default::default()
             })
         }
-        _ => Ok(SearchMode::default()),
     }
 }
 
-/// Extract a sub-search mode from a nested RRF expression (nearest or bm25).
-async fn extract_sub_search_mode(
+/// Resolve one retrieval leaf (a standalone source or an rrf arm) into a
+/// `SearchMode`. Candidate counts and scan caps arrive pre-decided from
+/// lowering, so the root and the arms resolve identically here.
+async fn resolve_retrieval_leaf(
     ir: &QueryIR,
-    expr: &IRExpr,
+    leaf: &RetrievalIR,
     params: &ParamMap,
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
 ) -> Result<SearchMode> {
-    match expr {
-        IRExpr::Nearest {
+    match leaf {
+        RetrievalIR::Nearest {
             variable,
             property,
             query,
+            k,
         } => {
             let vec = resolve_nearest_query_vec(
                 ir, catalog, variable, property, query, params, embedding,
             )
             .await?;
-            let k = ir
-                .limit
-                .map(|rows| usize::try_from(rows).unwrap_or(usize::MAX))
-                .unwrap_or(100);
+            let k = usize::try_from(k.ok_or_else(|| {
+                OmniError::manifest("nearest() ordering requires a limit clause".to_string())
+            })?)
+            .unwrap_or(usize::MAX);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
                 ..Default::default()
             })
         }
-        IRExpr::Bm25 { field, query } => {
-            let var = match field.as_ref() {
-                IRExpr::PropAccess { variable, .. } => variable.clone(),
-                _ => {
-                    return Err(OmniError::manifest(
-                        "bm25 field must be a property access".to_string(),
-                    ));
-                }
-            };
-            let prop = extract_property(field).ok_or_else(|| {
-                OmniError::manifest("bm25 field must be a property access".to_string())
-            })?;
+        RetrievalIR::Bm25 {
+            variable,
+            property,
+            query,
+            scan_cap,
+        } => {
             let text = resolve_to_string(query, params).ok_or_else(|| {
                 OmniError::manifest("bm25 query must resolve to a string".to_string())
             })?;
-            // Never capped: an arm's cap window would be filled by text score
-            // before traversals run, so join-ineligible rows can starve the
-            // arm out of the fusion while the fused row count stays full — no
-            // count-based retry can detect it, and the missing contributions
-            // shift fused ranks (PR #574 review). Fusion needs the arm's
-            // complete ranking.
             Ok(SearchMode {
-                bm25: Some((var, prop, text)),
+                bm25: Some((variable.clone(), property.clone(), text)),
+                bm25_scan_limit: scan_cap.map(|cap| usize::try_from(cap).unwrap_or(usize::MAX)),
                 ..Default::default()
             })
         }
-        _ => Ok(SearchMode::default()),
+        RetrievalIR::FuseRrf { .. } => Err(OmniError::manifest(
+            "nested rrf() is not supported".to_string(),
+        )),
     }
 }
 
@@ -586,11 +522,11 @@ pub async fn execute_query(
     }
     let params = resolved_params.as_ref().unwrap_or(params);
 
-    let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
+    let search_mode = resolve_retrieval(ir, params, catalog, embedding).await?;
     let mut notices = NoticeSink::default();
 
     // RRF requires forked execution. Its bm25 arms are never capped (see
-    // `extract_sub_search_mode`), so no under-fill retry arises for it.
+    // `RetrievalIR::Bm25::scan_cap`), so no under-fill retry arises for it.
     if let Some(ref rrf) = search_mode.rrf {
         let result = execute_rrf_fusion(
             ir,
@@ -622,7 +558,7 @@ pub async fn execute_query(
     // in place of a complete one. The row count cannot distinguish cap
     // starvation from a corpus with fewer matches than `limit`, so such
     // queries pay the double run on every execution. (Aggregate returns are
-    // never capped — see `bm25_scan_limit` — so no retry arises for them.)
+    // never capped — see `RetrievalIR::Bm25::scan_cap` — so no retry arises for them.)
     if search_mode.bm25_scan_limit.is_some()
         && ir
             .limit
@@ -1222,7 +1158,7 @@ fn arm_with_bm25_prefilter(arm: &SearchMode, ids: &EligibleIds) -> SearchMode {
 /// One RRF pass: run both arms, fuse their ranks, reconstruct and limit.
 ///
 /// INPUT CONTRACT: bm25 arms are complete rankings, never capped — see
-/// `extract_sub_search_mode`. (The `nearest` arm was always truncated at `k`.)
+/// `RetrievalIR::Bm25::scan_cap`. (The `nearest` arm was always truncated at `k`.)
 async fn execute_rrf_fusion(
     ir: &QueryIR,
     params: &ParamMap,
@@ -1234,7 +1170,7 @@ async fn execute_rrf_fusion(
 ) -> Result<QueryResult> {
     debug_assert!(
         rrf.primary.bm25_scan_limit.is_none() && rrf.secondary.bm25_scan_limit.is_none(),
-        "rrf arms must be complete rankings (see extract_sub_search_mode)"
+        "rrf arms must be complete rankings (see RetrievalIR::Bm25::scan_cap)"
     );
     let mut needed_columns = collect_needed_columns(ir);
     fail_open_rrf_leg_targets(&mut needed_columns, rrf);
@@ -1572,6 +1508,9 @@ fn collect_needed_columns(ir: &QueryIR) -> HashMap<String, NeededColumns> {
         return_exprs,
         order_by,
         limit: _,
+        // Lowered FROM `order_by[0]`, whose expression is walked below — the
+        // retrieval plan references no columns the order clause does not.
+        retrieval: _,
     } = ir;
     let mut needed = HashMap::new();
     collect_pipeline_columns(pipeline, &mut needed);
@@ -5022,6 +4961,7 @@ mod needed_columns_tests {
                 })
                 .collect(),
             limit: None,
+            retrieval: None,
         }
     }
 

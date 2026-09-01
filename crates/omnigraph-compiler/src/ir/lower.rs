@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::catalog::Catalog;
-use crate::error::Result;
+use crate::error::{CompilerError, Result};
 use crate::query::ast::*;
 use crate::query::typecheck::{BoundVariable, TypeContext};
 use crate::types::{Direction, PropType, ScalarType};
@@ -60,6 +60,8 @@ pub fn lower_query(
         })
         .collect();
 
+    let retrieval = lower_retrieval(&order_by, &return_exprs, query.limit)?;
+
     Ok(QueryIR {
         name: query.name.clone(),
         params: query.params.clone(),
@@ -67,6 +69,116 @@ pub fn lower_query(
         return_exprs,
         order_by,
         limit: query.limit,
+        retrieval,
+    })
+}
+
+/// Multiplier on the query's limit for a capped BM25 scan; trades scan width
+/// against how often the engine's uncapped under-fill retry is needed
+/// (issue #563 — an unbounded ranked scan hydrates the whole matched corpus).
+pub const BM25_SCAN_OVERFETCH_FACTOR: u64 = 4;
+
+/// Row cap for a standalone `bm25()` scan, or `None` to scan every matching
+/// document. `None` for a limitless query and for any aggregate return: an
+/// aggregate's value is computed over the scanned rows, so a capped scan
+/// would change the answer, not just the cost. Secondary order keys also
+/// disqualify the cap: they rank WITHIN score ties, and a bounded scan
+/// chooses which tied rows exist at all — the secondary sort over a
+/// cap-arbitrary subset would be a silently wrong answer the engine's
+/// under-fill retry cannot see (exactly `limit` rows still come back).
+fn bm25_scan_cap(
+    limit: Option<u64>,
+    order_key_count: usize,
+    return_exprs: &[IRProjection],
+) -> Option<u64> {
+    if return_exprs
+        .iter()
+        .any(|projection| matches!(&projection.expr, IRExpr::Aggregate { .. }))
+    {
+        return None;
+    }
+    if order_key_count > 1 {
+        return None;
+    }
+    limit.map(|rows| rows.saturating_mul(BM25_SCAN_OVERFETCH_FACTOR))
+}
+
+/// Lower `order_by[0]` into the query's retrieval plan. A non-rank first
+/// ordering (or no ordering) lowers no retrieval; the engine then runs a
+/// plain scan-and-sort. Malformed rank shapes that typecheck already forbids
+/// surface as `Plan` errors rather than silent plain modes.
+fn lower_retrieval(
+    order_by: &[IROrdering],
+    return_exprs: &[IRProjection],
+    limit: Option<u64>,
+) -> Result<Option<RetrievalIR>> {
+    let Some(first) = order_by.first() else {
+        return Ok(None);
+    };
+    match &first.expr {
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => Ok(Some(RetrievalIR::Nearest {
+            variable: variable.clone(),
+            property: property.clone(),
+            query: query.clone(),
+            k: limit,
+        })),
+        IRExpr::Bm25 { field, query } => Ok(Some(lower_bm25_leaf(
+            field,
+            query,
+            bm25_scan_cap(limit, order_by.len(), return_exprs),
+        )?)),
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => Ok(Some(RetrievalIR::FuseRrf {
+            primary: Box::new(lower_rrf_arm(primary, limit)?),
+            secondary: Box::new(lower_rrf_arm(secondary, limit)?),
+            k: k.clone(),
+            limit,
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn lower_rrf_arm(expr: &IRExpr, limit: Option<u64>) -> Result<RetrievalIR> {
+    match expr {
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => Ok(RetrievalIR::Nearest {
+            variable: variable.clone(),
+            property: property.clone(),
+            query: query.clone(),
+            // An arm's candidate count follows the fusion limit; 100 is the
+            // long-standing fallback for the (typecheck-unreachable) case of
+            // an rrf without a limit.
+            k: Some(limit.unwrap_or(100)),
+        }),
+        // Never capped inside fusion — see `RetrievalIR::Bm25::scan_cap`.
+        IRExpr::Bm25 { field, query } => lower_bm25_leaf(field, query, None),
+        other => Err(CompilerError::Plan(format!(
+            "rrf() arm must be nearest(...) or bm25(...), got {other:?}"
+        ))),
+    }
+}
+
+fn lower_bm25_leaf(field: &IRExpr, query: &IRExpr, scan_cap: Option<u64>) -> Result<RetrievalIR> {
+    let IRExpr::PropAccess { variable, property } = field else {
+        return Err(CompilerError::Plan(
+            "bm25 field must be a property access".to_string(),
+        ));
+    };
+    Ok(RetrievalIR::Bm25 {
+        variable: variable.clone(),
+        property: property.clone(),
+        query: Box::new(query.clone()),
+        scan_cap,
     })
 }
 
