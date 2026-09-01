@@ -16,10 +16,14 @@ Branch protection currently requires these reporting contexts:
 - `Format (rustfmt)`
 - `Lint (clippy)`
 - `GQ Logic Tests`
+- `Fix Regression Gate`
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) runs the `.gqt` logic-test corpus on
 every pull request; `Test Workspace` still picks the same target up post-merge
-inside the full workspace suite.
+inside the full workspace suite. `Fix Regression Gate` (same workflow, PR
+events only) holds every issue the PR body closes by keyword to a matching
+`issue_N` test or `.gqt` case in the diff, waivable per PR with the `no-repro`
+label; `scripts/check-fix-regression.py` is the check.
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC

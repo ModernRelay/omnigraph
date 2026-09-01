@@ -2,6 +2,16 @@ name: GQ Logic Tests
 
 on:
   pull_request:
+    # `edited`, `labeled`, and `unlabeled` re-run the gate job when a body
+    # edit or the `no-repro` label changes its answer; the types list is
+    # workflow-level, so the test job re-runs on them too (accepted cost).
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+      - labeled
+      - unlabeled
   push:
     branches:
       - main
@@ -49,3 +59,33 @@ jobs:
 
       - name: Run GQ logic tests
         run: cargo test -p omnigraph-engine --test gq_logic_tests --locked -- --nocapture
+
+  fix_regression_gate:
+    name: Fix Regression Gate
+    # A push or dispatch run has no PR body to read; a skipped context does
+    # not block.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check closed issues carry regressions
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/check-fix-regression.py --self-test
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
+          python3 scripts/check-fix-regression.py \
+            --body-file "$RUNNER_TEMP/pr-body.txt" \
+            --labels "$PR_LABELS" \
+            --range "$BASE_SHA...$HEAD_SHA"

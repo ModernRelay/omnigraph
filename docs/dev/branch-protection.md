@@ -16,6 +16,7 @@ protection.
 - `Format (rustfmt)`
 - `Lint (clippy)`
 - `GQ Logic Tests`
+- `Fix Regression Gate`
 
 Checks are strict, so a PR must be current with `main`. `Graph Vocabulary
 Guard` remains as an always-reporting context but reports a successful skip on

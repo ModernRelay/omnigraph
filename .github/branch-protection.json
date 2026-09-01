@@ -10,7 +10,8 @@
       "Test omnigraph-server --features aws",
       "Format (rustfmt)",
       "Lint (clippy)",
-      "GQ Logic Tests"
+      "GQ Logic Tests",
+      "Fix Regression Gate"
     ]
   },
   "enforce_admins": false,
