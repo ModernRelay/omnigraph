@@ -162,17 +162,47 @@ struct SearchMode {
     bm25_scan_limit: Option<usize>,
     /// RRF fusion: (primary, secondary, k_constant, limit).
     rrf: Option<RrfMode>,
+    /// The rrf prefilter gate's eligible-id set for this arm's BM25 scan
+    /// (`execute_rrf_fusion` sets it on an arm iff that arm carries an
+    /// uncapped `bm25` target on the ranked variable — never on a `nearest`
+    /// arm, whose constitutive `k` truncation would make a prefiltered run
+    /// answer-DIFFERENT, not just cheaper). The set over-approximates the
+    /// traversal's survivors (single owner of that invariant:
+    /// `rrf_prefilter_gate`'s doc), so ANDing it into the scan is a cost
+    /// change only. Not a cap: `to_uncapped` must NOT clear it.
+    bm25_eligible_ids: Option<EligibleIds>,
+}
+
+/// Shared eligible-id set, `Debug`-opaque so a logged `SearchMode` prints the
+/// cardinality instead of up to `DEFAULT_RRF_GATE_MAX_IDS` id strings.
+#[derive(Clone)]
+struct EligibleIds(Arc<Vec<String>>);
+
+impl std::fmt::Debug for EligibleIds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EligibleIds(len={})", self.0.len())
+    }
 }
 
 impl SearchMode {
     /// This mode with the BM25 scan cap cleared (only a standalone `bm25()`
     /// ordering ever carries one — `rrf()` arms are never capped, see
     /// `extract_sub_search_mode`). Any future scan cap must be cleared here
-    /// too.
+    /// too. (`bm25_eligible_ids` is not a cap — a superset prefilter is
+    /// answer-preserving — so it survives.)
     fn to_uncapped(&self) -> Self {
         Self {
             bm25_scan_limit: None,
             ..self.clone()
+        }
+    }
+
+    /// The eligible-id set to AND into `variable`'s scan, if this mode is a
+    /// bm25 arm targeting `variable` and the gate chose the prefilter plan.
+    fn bm25_eligible_ids_for(&self, variable: &str) -> Option<&[String]> {
+        match (&self.bm25, &self.bm25_eligible_ids) {
+            (Some((var, ..)), Some(ids)) if var == variable => Some(ids.0.as_slice()),
+            _ => None,
         }
     }
 }
@@ -704,6 +734,424 @@ fn search_score_orderings(search_mode: &SearchMode) -> Option<Vec<IROrdering>> {
     }])
 }
 
+// ─── RRF prefilter gate ──────────────────────────────────────────────────────
+
+/// Prefilter admission ratio: the gate's selective plan runs when
+/// |eligible| / corpus is at or below this. Set by the gate benchmark
+/// (`benches/scenarios.rs` `rrf-gate`, 2026-08-31): on a 100k-row corpus the
+/// prefiltered plan's warm wall clock still beat the postfilter plan's at
+/// 10% eligibility (31.5 ms vs 53.5 ms) and lost at 25% (85 ms vs 68.5 ms);
+/// a 200 KiB-payload corpus crossed even higher. 0.10 is the conservative
+/// (smaller) crossover across both corpora.
+const DEFAULT_RRF_GATE_RATIO: f64 = 0.10;
+/// Absolute ceiling on the eligible-id in-list: the per-id predicate cost
+/// the ratio cannot see on huge corpora. Set by the same benchmark's 10^5 /
+/// 10^6 microbench (1e6-row corpus): at 1e5 ids the prefiltered plan still
+/// won (324.5 ms vs 360.5 ms warm) and at 1e6 it lost 1.7x (2.76 s vs
+/// 1.63 s) — `Expr` construction itself stays negligible (31 ms at 1e6);
+/// the loss is the in-list probe/filter evaluation.
+const DEFAULT_RRF_GATE_MAX_IDS: usize = 100_000;
+
+fn rrf_gate_ratio() -> f64 {
+    std::env::var("OMNIGRAPH_RRF_GATE_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|r| r.is_finite() && *r >= 0.0)
+        .unwrap_or(DEFAULT_RRF_GATE_RATIO)
+}
+
+fn rrf_gate_max_ids() -> usize {
+    std::env::var("OMNIGRAPH_RRF_GATE_MAX_IDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_RRF_GATE_MAX_IDS)
+}
+
+/// The rrf gate's force hook. `OMNIGRAPH_RRF_PLAN` ∈ {auto (default),
+/// force_prefilter, force_postfilter}; the scoped test seam
+/// (`instrumentation::with_rrf_plan`) takes precedence over the
+/// process-global env var, mirroring `traversal_indexed_override`. A force
+/// overrides only the gate's THRESHOLD decision, never a correctness fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RrfPlanForce {
+    Auto,
+    Prefilter,
+    Postfilter,
+}
+
+fn rrf_plan_force() -> RrfPlanForce {
+    let mode = crate::instrumentation::rrf_plan_override()
+        .map(str::to_string)
+        .or_else(|| std::env::var("OMNIGRAPH_RRF_PLAN").ok());
+    match mode.as_deref() {
+        Some("force_prefilter") => RrfPlanForce::Prefilter,
+        Some("force_postfilter") => RrfPlanForce::Postfilter,
+        // A diagnosis knob must not fail silent while someone is diagnosing:
+        // an unrecognized value runs auto, loudly.
+        Some(other) if !other.is_empty() && other != "auto" => {
+            tracing::warn!(
+                value = other,
+                "unrecognized OMNIGRAPH_RRF_PLAN value; running auto"
+            );
+            RrfPlanForce::Auto
+        }
+        _ => RrfPlanForce::Auto,
+    }
+}
+
+/// Top-level Expand ops whose `src_var` is the ranked variable — the
+/// admission table's eligibility sources, as (edge_type, direction) pairs.
+/// `None` is the shape fall-back: the ranked variable is some Expand's dst
+/// (its NodeScan never installs the search — pre-existing silent-ignore), it
+/// is not introduced by a top-level NodeScan, or no top-level Expand
+/// constrains it. Expands inside an AntiJoin inner are NEVER sources: the
+/// anti-join inverts their meaning, and deriving eligibility from one is a
+/// subset error — the one direction that changes answers (the superset
+/// rule on `rrf_prefilter_gate`). A `min_hops == 0` Expand would make every node
+/// eligible; typecheck T15 rejects it, and it is skipped defensively here
+/// (skipping a source only widens the set).
+fn rrf_gate_expand_sources<'a>(
+    pipeline: &'a [IROp],
+    ranked_var: &str,
+) -> Option<Vec<(&'a str, Direction)>> {
+    let mut introduced_by_scan = false;
+    let mut sources: Vec<(&str, Direction)> = Vec::new();
+    for op in pipeline {
+        match op {
+            IROp::NodeScan { variable, .. } if variable == ranked_var => {
+                introduced_by_scan = true;
+            }
+            // Field-exhaustive on purpose (no `..`): a future Expand field
+            // must be classified here — superset-safe or not — before this
+            // walk compiles, the field-level twin of the exhaustive op match.
+            // The elided-by-name fields are each shrink-only or
+            // multiplicity-only: `dst_type` (typing, checked at the catalog
+            // in the gate), `max_hops` (an upper bound never widens the
+            // first-hop necessity), `dst_filters` (shrink survivors only),
+            // `edge_binding` (row multiplicity, not membership).
+            IROp::Expand {
+                src_var,
+                dst_var,
+                edge_type,
+                direction,
+                min_hops,
+                dst_type: _,
+                max_hops: _,
+                dst_filters: _,
+                edge_binding: _,
+            } => {
+                if dst_var == ranked_var {
+                    return None;
+                }
+                if src_var == ranked_var && *min_hops > 0 {
+                    sources.push((edge_type.as_str(), *direction));
+                }
+            }
+            IROp::NodeScan { .. } | IROp::Filter(_) | IROp::AntiJoin { .. } => {}
+        }
+    }
+    if introduced_by_scan && !sources.is_empty() {
+        Some(sources)
+    } else {
+        None
+    }
+}
+
+/// The rrf prefilter gate: decide, before the arms run, between two ANSWER-IDENTICAL
+/// plans — prefilter (the uncapped bm25 arms rank only the traversal's
+/// eligible ids) and postfilter (the uncapped corpus-wide arms, v0.9 rrf
+/// semantics).
+///
+/// INVARIANT (single owner): with bm25 arms prefiltered and nearest arms
+/// untouched, over FTS-index-covered data,
+/// up to BM25 score ties, the candidate plans are answer-identical;
+/// cardinality decides cost only. A mis-estimate wastes time, never flips a
+/// winner — re-coupling answer content to the estimate would recreate the
+/// PR #574 cap starvation one level up. Every fence below guards that
+/// identity:
+/// - the eligible set MUST over-approximate the traversal's survivors (a
+///   superset only costs speedup; a subset changes answers) — every
+///   admitted shape in `rrf_gate_expand_sources` is an instance;
+/// - full FTS fragment coverage (uncovered fragments are scored
+///   filter-dependently, so a mask would change their scores);
+/// - `nearest` arms are never prefiltered (their constitutive `k` makes a
+///   prefiltered run answer-different) — the caller's threading rule;
+/// - an empty eligible set runs postfilter (same empty join, and `IN ()`
+///   edge semantics never arise).
+///
+/// Fallible steps fall back to postfilter — a query must never fail because
+/// an optimization could not start. The gate reads the eligible COUNT only;
+/// id strings materialize only after the prefilter plan is chosen, so the
+/// broad regime never builds them. Every decision records a
+/// `rrf_gate_verdicts` probe entry.
+async fn rrf_prefilter_gate(
+    ir: &QueryIR,
+    snapshot: &Snapshot,
+    graph_index: &GraphIndexHandle<'_>,
+    catalog: &Catalog,
+    rrf: &RrfMode,
+) -> Option<EligibleIds> {
+    use crate::instrumentation::{
+        RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_rrf_gate_verdict,
+    };
+
+    let fall_back =
+        |fallback: RrfGateFallback, forced: bool, eligible: Option<u64>, corpus: Option<u64>| {
+            // Production-visible trace beside the test-only probe: a
+            // persistently failing fence (e.g. a CSR build error) silently
+            // disables the optimization otherwise — the bm25 retry's
+            // logging precedent.
+            tracing::debug!(
+                ?fallback,
+                forced,
+                "rrf prefilter gate fell back to the postfilter plan"
+            );
+            record_rrf_gate_verdict(RrfGateVerdict {
+                plan: RrfGatePlan::Postfilter,
+                fallback: Some(fallback),
+                forced,
+                eligible,
+                corpus,
+            });
+        };
+
+    let force = rrf_plan_force();
+    if force == RrfPlanForce::Postfilter {
+        fall_back(RrfGateFallback::Forced, true, None, None);
+        return None;
+    }
+    let forced = force == RrfPlanForce::Prefilter;
+
+    // Both arms must target one ranked variable, and at least one arm must
+    // be bm25 — a nearest-only fusion has nothing the gate may prefilter.
+    let arm_target = |mode: &SearchMode| {
+        mode.bm25
+            .as_ref()
+            .map(|(v, ..)| v.clone())
+            .or_else(|| mode.nearest.as_ref().map(|(v, ..)| v.clone()))
+    };
+    let (Some(primary_var), Some(secondary_var)) =
+        (arm_target(&rrf.primary), arm_target(&rrf.secondary))
+    else {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    };
+    if primary_var != secondary_var {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    }
+    let ranked_var = primary_var.as_str();
+    let bm25_props: Vec<&str> = [&rrf.primary, &rrf.secondary]
+        .into_iter()
+        .filter_map(|arm| arm.bm25.as_ref().map(|(_, prop, _)| prop.as_str()))
+        .collect();
+    if bm25_props.is_empty() {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    }
+
+    let Some(sources) = rrf_gate_expand_sources(&ir.pipeline, ranked_var) else {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    };
+    let Some(ranked_type) = resolve_binding_type_name(&ir.pipeline, ranked_var) else {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    };
+
+    // Gate input: the ranked type's manifest-resident entity count — the
+    // expand cost model's own corpus spelling, no async count_rows.
+    let node_key = format!("node:{}", ranked_type);
+    let Some(node_entry) = snapshot.dataset(&node_key) else {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    };
+    let corpus = node_entry.entity_count;
+
+    // Correctness fence: the prefilter plan is admitted only when the ranked
+    // table's FTS index covers ALL fragments (see
+    // `TableStore::fts_covers_all_fragments`); a coverage probe failure is
+    // conservatively treated as uncovered. Never overridden by force.
+    match snapshot.open_lance_dataset(&node_key).await {
+        Ok(ds) => {
+            for prop in &bm25_props {
+                match crate::table_store::TableStore::fts_covers_all_fragments(&ds, prop).await {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
+                        return None;
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
+            return None;
+        }
+    }
+
+    // On build Err the gate falls back — the postfilter plan needs no CSR up
+    // front. (`GraphIndexHandle::get` is lazy and fallible; the traversal
+    // will surface a real failure on its own terms later.)
+    let graph = match graph_index.get().await {
+        Ok(Some(graph)) => graph,
+        Ok(None) | Err(_) => {
+            fall_back(RrfGateFallback::BuildErr, forced, None, Some(corpus));
+            return None;
+        }
+    };
+
+    // The dense space is built from edge-table endpoints only: a ranked type
+    // absent from it has no node with any edge — the eligible set is empty.
+    let Some(idx) = graph.type_index(ranked_type) else {
+        fall_back(
+            RrfGateFallback::EmptyEligible,
+            forced,
+            Some(0),
+            Some(corpus),
+        );
+        return None;
+    };
+
+    // Resolve each source Expand to the adjacency (CSR for Out, CSC for In,
+    // union for Both) whose `has_neighbors` answers "does this node satisfy
+    // the source's first edge". Several sources intersect — still a superset
+    // of the traversal's survivors. An edge type with no built adjacency has
+    // zero edges, so the intersection is empty. The endpoint-type check and
+    // the width check are LOAD-BEARING: `has_neighbors` indexes
+    // `offsets[n + 1]` unchecked, so a misaligned dense space would panic.
+    let mut adjacencies: Vec<(
+        Option<&crate::graph_index::CsrIndex>,
+        Option<&crate::graph_index::CsrIndex>,
+    )> = Vec::with_capacity(sources.len());
+    for (edge_type, direction) in &sources {
+        let Some(edge_def) = catalog.edge_types.get(*edge_type) else {
+            fall_back(RrfGateFallback::Shape, forced, None, Some(corpus));
+            return None;
+        };
+        let side_matches = match direction {
+            Direction::Out => edge_def.from_type == ranked_type,
+            Direction::In => edge_def.to_type == ranked_type,
+            // Undirected is same-type only (typecheck T22).
+            Direction::Both => edge_def.from_type == ranked_type && edge_def.to_type == ranked_type,
+        };
+        if !side_matches {
+            fall_back(RrfGateFallback::Shape, forced, None, Some(corpus));
+            return None;
+        }
+        let (out, incoming) = match direction {
+            Direction::Out => (graph.csr(edge_type), None),
+            Direction::In => (None, graph.csc(edge_type)),
+            Direction::Both => (graph.csr(edge_type), graph.csc(edge_type)),
+        };
+        if out.is_none() && incoming.is_none() {
+            fall_back(
+                RrfGateFallback::EmptyEligible,
+                forced,
+                Some(0),
+                Some(corpus),
+            );
+            return None;
+        }
+        for adjacency in [out, incoming].into_iter().flatten() {
+            if adjacency.num_nodes() != idx.len() {
+                fall_back(RrfGateFallback::BuildErr, forced, None, Some(corpus));
+                return None;
+            }
+        }
+        adjacencies.push((out, incoming));
+    }
+
+    let passes = |dense: u32| {
+        adjacencies.iter().all(|(out, incoming)| {
+            out.is_some_and(|adj| adj.has_neighbors(dense))
+                || incoming.is_some_and(|adj| adj.has_neighbors(dense))
+        })
+    };
+
+    // COUNT pass only — no allocation until the prefilter plan is chosen.
+    let eligible_count = (0..idx.len() as u32).filter(|&dense| passes(dense)).count() as u64;
+    if eligible_count == 0 {
+        fall_back(
+            RrfGateFallback::EmptyEligible,
+            forced,
+            Some(0),
+            Some(corpus),
+        );
+        return None;
+    }
+
+    // Threshold: ratio AND absolute cap, both after the zero override; pure
+    // cost tuning (the one decision a force may override).
+    if !forced {
+        let ratio_ok = corpus > 0 && (eligible_count as f64) <= rrf_gate_ratio() * (corpus as f64);
+        let cap_ok = eligible_count <= rrf_gate_max_ids() as u64;
+        if !(ratio_ok && cap_ok) {
+            fall_back(
+                RrfGateFallback::Threshold,
+                false,
+                Some(eligible_count),
+                Some(corpus),
+            );
+            return None;
+        }
+    }
+
+    let mut ids: Vec<String> = Vec::with_capacity(eligible_count as usize);
+    for dense in 0..idx.len() as u32 {
+        if passes(dense) {
+            if let Some(id) = idx.to_id(dense) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    // The count pass and this materialization share `passes`, and `to_id` is
+    // total over the dense range, so a mismatch is unreachable — but if one
+    // ever appears, a silently SHRUNK set would be a subset error (the one
+    // answer-changing direction). Fall back instead: cost-only, like every
+    // other impossible-state fence in this gate.
+    if ids.len() as u64 != eligible_count {
+        fall_back(
+            RrfGateFallback::BuildErr,
+            forced,
+            Some(eligible_count),
+            Some(corpus),
+        );
+        return None;
+    }
+    // Test-only red control (`instrumentation::with_rrf_gate_subset_drop`):
+    // deliberately violates the superset rule so the differential oracle can
+    // prove it detects a subset. Compiled out of release binaries with its
+    // seam — an answer-corrupting hook must not exist in production.
+    #[cfg(debug_assertions)]
+    if let Some(dropped) = crate::instrumentation::rrf_gate_subset_drop() {
+        ids.retain(|id| *id != dropped);
+    }
+    record_rrf_gate_verdict(RrfGateVerdict {
+        plan: RrfGatePlan::Prefilter,
+        fallback: None,
+        forced,
+        eligible: Some(eligible_count),
+        corpus: Some(corpus),
+    });
+    Some(EligibleIds(Arc::new(ids)))
+}
+
+/// This arm's mode with the eligible-id prefilter attached iff the arm
+/// carries a bm25 target (both arms when both are bm25). A
+/// `nearest` arm passes through untouched and runs identical code in both
+/// plans — prefiltering its `k`-truncated scan would change answers.
+fn arm_with_bm25_prefilter(arm: &SearchMode, ids: &EligibleIds) -> SearchMode {
+    if arm.bm25.is_some() {
+        SearchMode {
+            bm25_eligible_ids: Some(ids.clone()),
+            ..arm.clone()
+        }
+    } else {
+        arm.clone()
+    }
+}
+
 /// One RRF pass: run both arms, fuse their ranks, reconstruct and limit.
 ///
 /// INPUT CONTRACT: bm25 arms are complete rankings, never capped — see
@@ -723,6 +1171,26 @@ async fn execute_rrf_fusion(
     let mut needed_columns = collect_needed_columns(ir);
     fail_open_rrf_leg_targets(&mut needed_columns, rrf);
 
+    // The prefilter gate: the eligible-id set is computed ONCE here, above
+    // the arms, then threaded ASYMMETRICALLY — into an arm iff it carries an
+    // uncapped bm25 target on the ranked variable (both arms when both are
+    // bm25), never into a `nearest` arm, which runs identical code in both
+    // plans. The asymmetry must live at this threading site:
+    // `execute_node_scan` applies its filters unconditionally and has no arm
+    // identity of its own. (The both-legs symmetry `fail_open_rrf_leg_targets`
+    // enforces for COLUMNS deliberately does not extend to rows.)
+    let eligible = rrf_prefilter_gate(ir, snapshot, graph_index, catalog, rrf).await;
+    let gated = eligible.as_ref().map(|ids| {
+        (
+            arm_with_bm25_prefilter(&rrf.primary, ids),
+            arm_with_bm25_prefilter(&rrf.secondary, ids),
+        )
+    });
+    let (primary_mode, secondary_mode) = match &gated {
+        Some((primary, secondary)) => (primary, secondary),
+        None => (rrf.primary.as_ref(), rrf.secondary.as_ref()),
+    };
+
     // Execute primary search
     let mut primary_wide: Option<RecordBatch> = None;
     execute_pipeline(
@@ -732,7 +1200,7 @@ async fn execute_rrf_fusion(
         graph_index,
         catalog,
         &mut primary_wide,
-        &rrf.primary,
+        primary_mode,
         None,
         &needed_columns,
     )
@@ -747,7 +1215,7 @@ async fn execute_rrf_fusion(
         graph_index,
         catalog,
         &mut secondary_wide,
-        &rrf.secondary,
+        secondary_mode,
         None,
         &needed_columns,
     )
@@ -770,9 +1238,18 @@ async fn execute_rrf_fusion(
         ))
     })?;
     let secondary_batch = secondary_wide.as_ref().ok_or_else(|| {
+        // Name the secondary arm's own target — this message interpolated
+        // the primary variable, misdirecting a secondary-leg failure.
+        let secondary_var = rrf
+            .secondary
+            .nearest
+            .as_ref()
+            .map(|(v, ..)| v.as_str())
+            .or_else(|| rrf.secondary.bm25.as_ref().map(|(v, ..)| v.as_str()))
+            .unwrap_or(primary_var);
         OmniError::manifest(format!(
             "rrf secondary variable '{}' not in bindings",
-            primary_var
+            secondary_var
         ))
     })?;
 
@@ -2868,16 +3345,33 @@ async fn expand_hydrate_and_align(
     Ok(())
 }
 
+/// `id IN (ids)` as one structured DataFusion `Expr` — the scan-pushdown
+/// shape shared by `hydrate_nodes` and the rrf prefilter gate's arm push.
+/// The structured form routes the IN-list through the `id` BTREE scalar
+/// index (index-search → take) rather than evaluating a string filter via
+/// DataFusion `InListEval`, which is O(N×M) and was measured at 72× the
+/// indexed cost on a 100k-node hop.
+///
+/// Likely future mechanism: Lance 11 grew
+/// `Scanner::with_row_addr_prefilter(RowAddrMask)` — the caller hands the
+/// scanner a precomputed row-address set directly, composing with FTS and
+/// ANN, instead of an expression Lance must evaluate (BTREE probe per id,
+/// re-done every query). Worth revisiting if the id→row-addr probe or the
+/// gate's id-count cap (`DEFAULT_RRF_GATE_MAX_IDS`, set where in-list
+/// evaluation starts losing) ever shows up as the bottleneck: a mask built
+/// from a cached id→addr mapping would lift both.
+fn id_in_list_expr(ids: &[String]) -> datafusion::prelude::Expr {
+    use datafusion::prelude::{col, lit};
+    let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
+    col("id").in_list(id_list, false)
+}
+
 /// Load full node rows for a set of IDs from a snapshot.
 ///
-/// The `id IN (...)` predicate is built as a structured DataFusion `Expr` and
-/// AND'd with any pushable `dst_filters` (destination-binding filters), then
-/// applied via `Scanner::filter_expr`. The structured form routes the id
-/// IN-list through the `id` BTREE scalar index (index-search → take) rather
-/// than evaluating a string filter via DataFusion `InListEval`, which is
-/// O(N×M) and was measured at 72× the indexed cost on a 100k-node hop
-/// (MR-376). Non-pushable `dst_filters` (`ir_filter_to_expr` → None) are
-/// applied in memory by the caller after hydration.
+/// The `id IN (...)` predicate (`id_in_list_expr`) is AND'd with any
+/// pushable `dst_filters` (destination-binding filters), then applied via
+/// `Scanner::filter_expr`. Non-pushable `dst_filters` (`ir_filter_to_expr`
+/// → None) are applied in memory by the caller after hydration.
 async fn hydrate_nodes(
     snapshot: &Snapshot,
     catalog: &Catalog,
@@ -2886,8 +3380,6 @@ async fn hydrate_nodes(
     dst_filters: &[IRFilter],
     params: &ParamMap,
 ) -> Result<RecordBatch> {
-    use datafusion::prelude::{col, lit};
-
     let node_type = catalog
         .node_types
         .get(type_name)
@@ -2901,8 +3393,7 @@ async fn hydrate_nodes(
     let ds = snapshot.open_lance_dataset(&table_key).await?;
 
     // `id IN (ids)` AND any pushable destination filters, as a structured Expr.
-    let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
-    let mut filter_expr = col("id").in_list(id_list, false);
+    let mut filter_expr = id_in_list_expr(ids);
     if let Some(dst_expr) =
         build_lance_filter_expr(dst_filters, params, Some(&node_type.arrow_schema))
     {
@@ -3176,7 +3667,22 @@ async fn execute_node_scan(
     // coerce literals to each column's exact type so narrow-numeric BTREEs are
     // used. Other call sites that still take string SQL (count_rows, the
     // mutation delete path) migrate in follow-up MRs.
-    let filter_expr = build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
+    let mut filter_expr = build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
+
+    // The rrf prefilter gate's selective plan: AND the traversal's
+    // eligible-id set into this bm25 arm's scan — `hydrate_nodes`' proven
+    // `id IN (...)` shape, routed through the `id` BTREE, ranked under
+    // `prefilter(true)` (armed below by the filter's presence). The set is a
+    // superset of the traversal's survivors and the arm stays uncapped, so
+    // this changes cost, never the fused answer (up to BM25 score ties; the
+    // gate's coverage fence keeps scores index-global).
+    if let Some(eligible_ids) = search_mode.bm25_eligible_ids_for(variable) {
+        let in_list = id_in_list_expr(eligible_ids);
+        filter_expr = Some(match filter_expr {
+            Some(expr) => expr.and(in_list),
+            None => in_list,
+        });
+    }
 
     // Blob columns must be excluded from scan when a filter is present
     // (Lance bug: BlobsDescriptions + filter triggers a projection assertion).

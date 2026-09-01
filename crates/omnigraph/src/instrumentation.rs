@@ -21,8 +21,8 @@
 //! module stays generic over the `lance::io`-re-exported trait, so it adds no
 //! production dependency.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -179,6 +179,67 @@ pub struct QueryIoProbes {
     /// regression changes this count while every result assertion still
     /// passes.
     pub bm25_scan_rows: Arc<AtomicU64>,
+    /// Plan verdicts recorded by the rrf prefilter gate
+    /// (`execute_rrf_fusion`), one per rrf execution in scope order. The
+    /// gate's two plans are answer-identical by design, so a gate that
+    /// silently always falls back to postfilter passes every result-level
+    /// test — admission and fence tests assert on this probe instead.
+    pub rrf_gate_verdicts: Arc<Mutex<Vec<RrfGateVerdict>>>,
+}
+
+/// The two candidate plans of the rrf prefilter gate. Over FTS-index-covered
+/// data and up to BM25 score ties they are answer-identical — the eligible-set
+/// cardinality decides cost only (`execute_rrf_fusion`'s gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RrfGatePlan {
+    /// Selective plan: the uncapped bm25 arms rank only the traversal's
+    /// eligible ids (`id IN (...)` under `prefilter(true)`).
+    Prefilter,
+    /// Broad plan: the uncapped corpus-wide arms (v0.9 rrf semantics).
+    Postfilter,
+}
+
+/// Why the gate ran the postfilter plan. `None` on the verdict means the
+/// prefilter plan won naturally (or was forced).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RrfGateFallback {
+    /// Eligible set too large for the ratio or absolute-id-count threshold.
+    Threshold,
+    /// Query shape outside the admission table (no top-level Expand
+    /// constrains the ranked variable, the ranked variable is an Expand dst,
+    /// arms target different variables, or no bm25 arm exists).
+    Shape,
+    /// The ranked table's FTS index does not cover every fragment, so a
+    /// prefilter mask could change BM25 scores (filter-dependent scoring of
+    /// uncovered fragments) — a correctness fence, never overridden.
+    Coverage,
+    /// The graph index could not be built or is misaligned; a query must
+    /// never fail because an optimization could not start.
+    BuildErr,
+    /// The eligible set is empty: the postfilter plan yields the same empty
+    /// join and `IN ()` edge semantics never arise (correctness fence).
+    EmptyEligible,
+    /// `OMNIGRAPH_RRF_PLAN=force_postfilter` (or the scoped override) chose.
+    Forced,
+}
+
+/// One rrf prefilter-gate decision, recorded via the `rrf_gate_verdicts`
+/// probe. `eligible`/`corpus` are `None` when the gate fell back before
+/// counting (forced postfilter, shape, coverage, build error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RrfGateVerdict {
+    pub plan: RrfGatePlan,
+    pub fallback: Option<RrfGateFallback>,
+    /// A force was active for this decision (the threshold was not
+    /// consulted). NOT "the force won": a forced prefilter can still fall
+    /// back at a correctness fence — then `plan` is `Postfilter`, `fallback`
+    /// names the fence, and this stays `true`.
+    pub forced: bool,
+    /// |eligible| from the CSR degree walk (count only — ids are not built
+    /// unless the prefilter plan is chosen).
+    pub eligible: Option<u64>,
+    /// The ranked node type's manifest-resident `entity_count`.
+    pub corpus: Option<u64>,
 }
 
 tokio::task_local! {
@@ -222,6 +283,61 @@ where
 /// production (no scope installed), so the env var is consulted instead.
 pub(crate) fn traversal_mode_override() -> Option<&'static str> {
     TRAVERSAL_MODE_OVERRIDE.try_with(|m| *m).ok().flatten()
+}
+
+tokio::task_local! {
+    static RRF_PLAN_OVERRIDE: Option<&'static str>;
+}
+
+/// Force the rrf prefilter gate's plan (`"force_prefilter"` |
+/// `"force_postfilter"`) for the scope of `fut` WITHOUT mutating the
+/// process-global `OMNIGRAPH_RRF_PLAN` env var. Mirrors
+/// [`with_traversal_mode`]: scope-bound (cannot leak) and process-safe (a
+/// forced-plan test never affects a concurrent test in the same binary). The
+/// force overrides only the gate's THRESHOLD decision, never a correctness
+/// fence — a forced-prefilter query rejected by a fence (shape, coverage,
+/// build error, empty eligible set) runs postfilter, and the
+/// `rrf_gate_verdicts` probe records why.
+pub async fn with_rrf_plan<F>(mode: &'static str, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    RRF_PLAN_OVERRIDE.scope(Some(mode), fut).await
+}
+
+/// The scoped rrf-plan override active for this task, if any. `None` in
+/// production (no scope installed), so the env var is consulted instead.
+pub(crate) fn rrf_plan_override() -> Option<&'static str> {
+    RRF_PLAN_OVERRIDE.try_with(|m| *m).ok().flatten()
+}
+
+#[cfg(debug_assertions)]
+tokio::task_local! {
+    static RRF_GATE_SUBSET_DROP: Option<String>;
+}
+
+/// RED CONTROL ONLY: drop `id` from the rrf prefilter gate's materialized
+/// eligible-id set for the scope of `fut` — a deliberate violation of the
+/// gate's superset rule (single owner: `exec::query::rrf_prefilter_gate`'s
+/// invariant doc; a subset changes answers). The differential oracle uses
+/// this to prove its equivalence relation can turn red: dropping one
+/// surviving id MUST make the forced-prefilter and forced-postfilter
+/// answers differ, or the oracle is vacuous. `cfg(debug_assertions)`: an
+/// answer-corrupting API must not exist in release binaries — dev-profile
+/// test runs (where the red control lives) keep it.
+#[cfg(debug_assertions)]
+pub async fn with_rrf_gate_subset_drop<F>(id: String, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    RRF_GATE_SUBSET_DROP.scope(Some(id), fut).await
+}
+
+/// The scoped subset-drop red control active for this task, if any. `None`
+/// in production (no scope installed).
+#[cfg(debug_assertions)]
+pub(crate) fn rrf_gate_subset_drop() -> Option<String> {
+    RRF_GATE_SUBSET_DROP.try_with(|m| m.clone()).ok().flatten()
 }
 
 tokio::task_local! {
@@ -458,6 +574,19 @@ pub(crate) fn record_bm25_uncapped_retry() {
 /// installed (production).
 pub(crate) fn record_bm25_scan_rows(rows: u64) {
     let _ = current(|p| p.bm25_scan_rows.fetch_add(rows, Ordering::Relaxed));
+}
+
+/// Record one rrf prefilter-gate verdict. No-op when no probes are installed
+/// (production).
+pub(crate) fn record_rrf_gate_verdict(verdict: RrfGateVerdict) {
+    let _ = current(|p| {
+        // Push through a poisoned lock: dropping verdicts after an unrelated
+        // panic would fail a fence test's `len() == 1` assert confusingly.
+        p.rrf_gate_verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(verdict);
+    });
 }
 
 /// Record `commits` walked into a change-feed poll's first-parent chain. No-op
