@@ -2,7 +2,7 @@ mod helpers;
 
 use std::env;
 
-use arrow_array::{Array, StringArray};
+use arrow_array::{Array, Int64Array, StringArray};
 use lance_index::is_system_index;
 use serial_test::serial;
 
@@ -135,6 +135,135 @@ query nearest_hops($q: Vector(4)) {
     limit 2
 }
 "#;
+
+// MECHANISM tier for issue #563 (the symptom-scale twin is the #[ignore]d
+// tests/repro_issue_563.rs): a BM25 corpus whose edge-bearing chunks sit
+// outside the capped scan's window. Every chunk matches the query term, but only chunks 8..=11 have an
+// edge — and with `limit 2` the scan cap is 8 rows (2 ×
+// BM25_SCAN_OVERFETCH_FACTOR; if that factor grows past 4 the capped window
+// reaches the edge-bearing band and the retry stops being exercised). Neither the
+// highest-scoring 8 nor the lowest-scoring 8 chunks can satisfy the join; the
+// band is deliberately in the middle so the test holds whichever way BM25
+// orders the corpus.
+const UNDERFILL_SCHEMA: &str = r#"
+node Chunk {
+    slug: String @key
+    text: String @index
+}
+
+node Artifact {
+    slug: String @key
+}
+
+edge ChunkOfArtifact: Chunk -> Artifact {
+    label: String
+}
+"#;
+
+const UNDERFILL_QUERY: &str = r#"
+query recall($q: String) {
+    match {
+        $c: Chunk
+        $c chunkOfArtifact $a
+        search($c.text, $q)
+    }
+    return { $c.slug, $a.slug }
+    order { bm25($c.text, $q) }
+    limit 2
+}
+"#;
+
+const UNDERFILL_AGG_QUERY: &str = r#"
+query recall_count($q: String) {
+    match {
+        $c: Chunk
+        search($c.text, $q)
+    }
+    return { count($c) as total }
+    order { bm25($c.text, $q) }
+    limit 2
+}
+"#;
+
+const UNDERFILL_RRF_QUERY: &str = r#"
+query recall_rrf($q: String) {
+    match {
+        $c: Chunk
+        $c chunkOfArtifact $a
+        search($c.text, $q)
+    }
+    return { $c.slug, $a.slug }
+    order { rrf(bm25($c.text, $q), bm25($c.text, $q)) }
+    limit 2
+}
+"#;
+
+const UNDERFILL_CHUNKS: usize = 20;
+const UNDERFILL_LINKED: std::ops::RangeInclusive<usize> = 8..=11;
+
+fn underfill_seed_data() -> String {
+    let mut rows = vec![r#"{"type":"Artifact","data":{"slug":"art-0"}}"#.to_string()];
+    for chunk in 0..UNDERFILL_CHUNKS {
+        // Vary term frequency so the corpus has a real BM25 order rather than
+        // a tie the engine could resolve arbitrarily.
+        let needle = vec!["needle"; UNDERFILL_CHUNKS - chunk].join(" ");
+        rows.push(format!(
+            r#"{{"type":"Chunk","data":{{"slug":"chunk-{chunk:02}","text":"{needle} filler"}}}}"#
+        ));
+    }
+    for chunk in UNDERFILL_LINKED {
+        rows.push(format!(
+            r#"{{"edge":"ChunkOfArtifact","from":"chunk-{chunk:02}","to":"art-0","data":{{"id":"e-{chunk:02}","label":"of"}}}}"#
+        ));
+    }
+    rows.join("\n")
+}
+
+const STARVATION_RRF_QUERY: &str = r#"
+query recall_two_terms($q1: String, $q2: String) {
+    match {
+        $c: Chunk
+        $c chunkOfArtifact $a
+        search($c.text, $q1)
+    }
+    return { $c.slug }
+    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    limit 1
+}
+"#;
+
+/// Seven chunks with (alpha, beta) term frequencies, padded to 20 tokens each;
+/// only x, y, n carry an edge. Alpha ranks the four edge-less decoys above
+/// every eligible chunk; beta ranks n first. Fusing the COMPLETE rankings
+/// makes x the winner (strong in both arms: 1/61 + 1/62 beats n's
+/// 1/63 + 1/61 at k = 60); losing the alpha arm makes n win on beta alone.
+fn starvation_seed_data() -> String {
+    let mut rows = vec![r#"{"type":"Artifact","data":{"slug":"art-0"}}"#.to_string()];
+    let chunks: [(&str, usize, usize); 7] = [
+        ("decoy-1", 7, 1),
+        ("decoy-2", 6, 2),
+        ("decoy-3", 5, 3),
+        ("decoy-4", 4, 4),
+        ("x", 3, 6),
+        ("y", 2, 5),
+        ("n", 1, 7),
+    ];
+    for (slug, alpha, beta) in chunks {
+        let mut words = vec!["alpha"; alpha];
+        words.extend(vec!["beta"; beta]);
+        words.extend(vec!["filler"; 20 - alpha - beta]);
+        rows.push(format!(
+            r#"{{"type":"Chunk","data":{{"slug":"{slug}","text":"{}"}}}}"#,
+            words.join(" ")
+        ));
+    }
+    for slug in ["x", "y", "n"] {
+        rows.push(format!(
+            r#"{{"edge":"ChunkOfArtifact","from":"{slug}","to":"art-0","data":{{"id":"e-{slug}","label":"of"}}}}"#
+        ));
+    }
+    rows.join("\n")
+}
 
 async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
@@ -1165,6 +1294,232 @@ async fn rrf_rank_preserves_every_bound_edge_row_once() {
             ("rank-3".to_string(), "C".to_string()),
         ],
         "fusion ranks source entities, then retains each matched edge row once"
+    );
+}
+
+/// A ranked read caps its BM25 scan (issue #563). The cap is an optimization,
+/// never a row budget — when the join drops every capped row, the query must
+/// still answer in full rather than serve a short result. (BM25-only: the
+/// `nearest` arm's `k` remains a hard budget.)
+#[tokio::test]
+#[serial]
+async fn bm25_join_fills_limit_when_capped_scan_underfills_issue_563() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
+    load_jsonl(&db, &underfill_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    let mut db = db;
+
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            UNDERFILL_QUERY,
+            "recall",
+            &params(&[("$q", "needle")]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    // Every capped-window row lacks an edge, so the uncapped retry must fire —
+    // the only observable proof the cap engaged (see `bm25_uncapped_retries`).
+    assert_eq!(
+        probes
+            .bm25_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the under-fill retry must fire exactly once"
+    );
+    // Cap MAGNITUDE pin: capped pass scans 8 rows (limit 2 × factor 4), the
+    // uncapped retry scans all 20 — a factor regression moves this count while
+    // every result assertion still passes.
+    assert_eq!(
+        probes
+            .bm25_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        28,
+        "scan rows must be capped-8 plus uncapped-20"
+    );
+
+    // BM25 ranks by term frequency here (tf = 20 - chunk), so the two
+    // best-scoring edge-bearing chunks are exactly 08 then 09, in order.
+    assert_eq!(
+        result_slugs(&result),
+        vec!["chunk-08".to_string(), "chunk-09".to_string()],
+        "the limit must be filled, in rank order, from the edge-bearing chunks outside the scan cap"
+    );
+}
+
+/// Aggregate returns are never capped (see `bm25_scan_limit` for the why):
+/// `count` must see every matching document.
+#[tokio::test]
+#[serial]
+async fn bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
+    load_jsonl(&db, &underfill_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    let mut db = db;
+
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            UNDERFILL_AGG_QUERY,
+            "recall_count",
+            &params(&[("$q", "needle")]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    // The exemption means the FIRST scan is uncapped: all 20 rows, no retry.
+    // A count of 20 reached via a capped-then-retried run would be wrong
+    // mechanics with the right answer; these two asserts see through it.
+    assert_eq!(
+        probes
+            .bm25_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "aggregates are never capped, so no retry may arise"
+    );
+    assert_eq!(
+        probes
+            .bm25_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        20,
+        "the aggregate's single scan must cover every matching document"
+    );
+
+    let batch = result.concat_batches().unwrap();
+    let totals = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        totals.value(0),
+        UNDERFILL_CHUNKS as i64,
+        "count must cover every matching chunk, not only the capped scan window"
+    );
+}
+
+/// The rrf arms are never capped (PR #574 review; the starvation mechanism
+/// is documented on `extract_sub_search_mode`). Pins: one uncapped pass per
+/// arm, zero retries; a reintroduced cap moves the scan-row count.
+#[tokio::test]
+#[serial]
+async fn rrf_arms_scan_uncapped_in_one_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
+    load_jsonl(&db, &underfill_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    let mut db = db;
+
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            UNDERFILL_RRF_QUERY,
+            "recall_rrf",
+            &params(&[("$q", "needle")]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    // No cap, no retry machinery on the rrf path.
+    assert_eq!(
+        probes
+            .bm25_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "rrf arms are uncapped, so no under-fill retry may arise"
+    );
+    // Each arm scans the full matched corpus exactly once (2 × 20).
+    assert_eq!(
+        probes
+            .bm25_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        40,
+        "both rrf arms must scan every matching document in one pass"
+    );
+
+    // Both arms rank identically (same bm25 expression), so fusion preserves
+    // the tf order: the best-scoring edge-bearing chunks are 08 then 09.
+    assert_eq!(
+        result_slugs(&result),
+        vec!["chunk-08".to_string(), "chunk-09".to_string()],
+        "the fused limit must be filled, in rank order, from the edge-bearing chunks"
+    );
+}
+
+/// The #574 review fixture: the four best alpha scorers carry no edge. Were
+/// the alpha arm capped at limit × BM25_SCAN_OVERFETCH_FACTOR (4), the
+/// traversal would evict its entire window, fusion would rank on beta alone,
+/// and the winner would silently flip from x to n with the row count still
+/// full. Red against the capped rrf implementation; green on uncapped arms.
+#[tokio::test]
+#[serial]
+async fn rrf_decoy_flood_does_not_flip_the_fused_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
+    load_jsonl(&db, &starvation_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    let mut db = db;
+
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            STARVATION_RRF_QUERY,
+            "recall_two_terms",
+            &params(&[("$q1", "alpha"), ("$q2", "beta")]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result_slugs(&result),
+        vec!["x".to_string()],
+        "x wins the fused ranking; n wins only if the alpha arm is starved"
+    );
+    // Both arms scan all seven chunks, one pass, no retry.
+    assert_eq!(
+        probes
+            .bm25_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        14,
+        "both rrf arms must scan the full seven-chunk corpus in one pass"
+    );
+    assert_eq!(
+        probes
+            .bm25_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "rrf arms are uncapped, so no under-fill retry may arise"
     );
 }
 
