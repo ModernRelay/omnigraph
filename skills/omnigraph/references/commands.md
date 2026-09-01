@@ -2,11 +2,12 @@
 
 ## Contents
 - Inspect state (snapshot, export)
-- Branches · commits · graphs
+- Branches · commits · changes · graphs
+- Blob reads
 - Schema · lint · embed · init
 - Load (bulk JSONL)
 - Query / mutate
-- Maintenance (optimize, cleanup)
+- Maintenance (optimize, full-text rebuild, cleanup)
 - Stored queries
 - Operator config & credentials
 - Config resolution order
@@ -17,13 +18,14 @@ Commands you'll reach for but don't need best-practice rules around. Quick synta
 
 ## Inspect State
 
-### `snapshot` — tables + row counts
+### `snapshot` — node/edge types and entity counts
 
 ```bash
 omnigraph snapshot $REPO --branch main --json
 ```
 
-Returns the manifest: all node/edge tables with row counts and versions. Use this to verify a load succeeded or to see what types exist.
+Returns every node/edge type with entity counts and published dataset versions.
+Use it to verify a load or inspect the graph shape.
 
 ### `export` — full JSONL dump
 
@@ -39,33 +41,53 @@ Filter by type:
 omnigraph export $REPO --branch main --type Signal > signals.jsonl
 ```
 
+Use repeatable `--type` to filter node or edge types.
+
+## Blob Reads
+
+```bash
+omnigraph blob stat node Document manual content --store "$REPO" --json
+omnigraph blob get node Document manual content --store "$REPO" --out manual.bin
+omnigraph blob get node Document manual content --store "$REPO" --offset 0 --length 4096
+```
+
+The selector is `<node|edge> <TYPE> <ID> <PROPERTY>`. Choose a branch or
+snapshot; `get` streams managed bytes and `stat` inspects metadata. See
+[`blobs.md`](blobs.md) before handling external references or ranged reads.
+
 ## Branches
 
 ```bash
 omnigraph branch create --from main <branch-name> --store $REPO
 omnigraph branch list --store $REPO
-omnigraph branch merge <branch-name> --into main --store $REPO
+omnigraph branch merge <branch-name> --into main --delete-branch --store $REPO
 omnigraph branch delete <branch-name> --store $REPO
 ```
 
-All support `--json`.
+All support `--json`. `--delete-branch` removes the source only after a
+successful merge publication.
 
 ## Commits (History)
 
 ```bash
-omnigraph commit list $REPO --branch main
-omnigraph commit show $REPO <commit-id>
+omnigraph commit list --store "$REPO" --branch main
+omnigraph commit show <commit-id> --store "$REPO"
+omnigraph commit changes <commit-id> --store "$REPO" --json
 ```
 
-Inspect graph history. Useful for "what changed between these two points" investigation.
+`commit changes` compares one commit with its first parent and can filter with
+repeatable `--kind`, `--type`, and `--op`. For a durable branch feed and
+baseline recovery, see [`changes.md`](changes.md).
 
 ## Graphs (multi-graph servers)
 
 ```bash
-omnigraph graphs list --config X --json
+omnigraph graphs list --server <name-or-url> --json
 ```
 
-Lists the graphs a multi-graph server serves. Remote servers only (rejects local URIs); the server must expose `GET /graphs` via `server.policy.file`. See `references/server-policy.md`.
+Lists the graphs a multi-graph server serves. Remote servers only (rejects local
+URIs); a cluster-scoped policy bundle must grant `graph_list`. See
+[`server-policy.md`](server-policy.md).
 
 ## Schema
 
@@ -89,9 +111,9 @@ omnigraph lint --query queries/foo.gq $REPO --json
 ## Embed
 
 ```bash
-omnigraph embed --seed embed-config.yaml                  # fill missing
-omnigraph embed --seed embed-config.yaml --reembed_all    # regenerate all
-omnigraph embed --seed embed-config.yaml --clean          # delete
+omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json
+omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json --reembed-all
+omnigraph embed --seed embed-config.yaml --clean
 omnigraph embed --seed embed-config.yaml --select "Type:field=value"
 ```
 
@@ -105,7 +127,9 @@ omnigraph init --schema schema.pg $REPO
 
 Creates a new graph at `$REPO` with the given schema. Declare the deployment in a `cluster.yaml` (see `references/cluster.md`).
 
-**Strict by default (v0.6.0+):** `init` against a URI that already holds schema files errors with `AlreadyInitialized` instead of silently overwriting. Use `omnigraph init --force` to re-init deliberately. `--force` only skips the schema-file preflight — it does **not** purge existing Lance datasets.
+**Strict by default:** `init` refuses any initialized graph. `--force` only
+replaces orphan schema artifacts after proving there is no `__manifest`; it
+never overwrites an initialized graph or purges Lance datasets.
 
 **Note:** `init` does not accept `--json`. Drop the flag if you see `unexpected argument --json`.
 
@@ -119,34 +143,57 @@ omnigraph load --data seed.jsonl --mode merge $REPO
 omnigraph load --data delta.jsonl --branch feature-x --from main --mode merge $REPO
 ```
 
-`--mode` is **required** (no default): `merge`, `append`, or `overwrite`. `load` works against local **and** remote URIs. See `references/data.md`.
+`--mode` is **required** (no default): `merge`, `append`, or `overwrite`.
+Address either direct storage or a served graph. See `references/data.md`.
 
 ## Query / Mutate
 
 ```bash
 omnigraph query  get_signal --query queries/signals.gq --params '{"slug":"sig-foo"}'    # ad-hoc file; <name> is positional
 omnigraph query  get_signal --server intel-dev --params '{"slug":"sig-foo"}'            # served stored query by name
-omnigraph mutate add_signal --query queries/mutations.gq --params '{"slug":"sig-foo",...}'
+omnigraph mutate add_signal --query queries/mutations.gq --params '{"slug":"sig-foo","name":"Foo","brief":"Example","createdAt":"2026-04-14T00:00:00Z"}'
 ```
 
-With aliases:
+With a read alias:
 
 ```bash
 omnigraph alias signal sig-foo
-omnigraph alias add-signal sig-foo "Name" "Brief" 2026-04-14T00:00:00Z 2026-04-14T00:00:00Z 2026-04-14T00:00:00Z
 ```
+
+Aliases are read-only. Invoke a served stored mutation with `omnigraph mutate
+<name> --server ...`.
 
 > `query` and `mutate` also accept inline source via `-e/--query-string '<gq>'` instead of `--query <file>`.
 
-## Maintenance: Optimize & Cleanup (v0.6.1)
+## Maintenance
 
-### `optimize` — non-destructive Lance compaction
+### `optimize` — compaction and index reconciliation
 
 ```bash
 omnigraph optimize $REPO --json
 ```
 
-Compacts fragments and reclaims deleted-row space. Non-destructive — safe to run any time. **Skips tables with a `Blob` property** (Lance blob-v2 compaction decode bug); skipped tables are reported in the `skipped` field of `--json` output and in logs. Non-blob tables compact normally. Blob-table fragment count won't shrink until the upstream Lance fix lands — reads/writes are unaffected.
+Compacts fragments and reconciles declared scalar/vector index coverage without
+deleting retained versions. Lance 11 supports compaction of Blob-bearing data;
+null,
+valid-empty, and non-empty Blob values remain distinct. Existing full-text
+indexes are preserved and any uncovered tail is scanned; use the explicit
+rebuild command when full-text coverage or analyzer compatibility must change.
+
+### `rebuild-full-text-indexes` — explicit analyzer upgrade
+
+```bash
+omnigraph rebuild-full-text-indexes "$REPO" --branch main --json
+```
+
+Direct storage only; `--cluster <root> --graph <id>` also works. Stop overlapping
+writers, preserve a verified whole-store backup, and rebuild every live branch
+that needs search after a Lance 11 upgrade. Do not mix old and new serving
+binaries. Rebuilds use default English analysis, replacing custom tokenizer
+settings; JSON `warnings` reports this for actual work. Check the selected
+`branch`, `graph_commit_id`, and `rebuilt_indexes`; an empty list/null commit is
+a no-op, not a migration of other branches or historical snapshots. `--as` is
+actor attribution and does not install server policy on direct access.
 
 ### `cleanup` — destructive version GC
 
@@ -154,16 +201,22 @@ Compacts fragments and reclaims deleted-row space. Non-destructive — safe to r
 omnigraph cleanup $REPO --keep 5 --older-than 7d --confirm
 ```
 
-Garbage-collects old table versions, dropping time-travel reachability for anything pruned. **Destructive** — requires `--confirm`. Duration units for `--older-than`: `s`, `m`, `h`, `d`, `w`. Also reconciles orphaned per-table forks left by an interrupted `branch delete`.
+Garbage-collects old dataset versions, dropping time-travel reachability for
+anything pruned. **Destructive** — requires `--confirm`. At least one of
+`--keep` and `--older-than` is required; with both, a version must be outside
+both windows. Duration units: `s`, `m`, `h`, `d`, `w`.
 
-## Stored Queries (v0.6.1)
+## Stored Queries
 
 ```bash
-omnigraph queries validate              # type-check the stored-query registry vs the live schema (offline; exits non-zero on drift)
-omnigraph queries list                  # list registry query names, MCP exposure, and typed params
+omnigraph queries validate --cluster .              # type-check every applied registry
+omnigraph queries list --cluster . --graph knowledge # list names and typed params
 ```
 
-`validate` opens the addressed graph and type-checks every applied stored query against the live schema — catches drift without restarting the server. `list` prints that graph's registry. Address the graph with `--store <uri>` or a positional URI. Distinct from `lint` (which validates a single `.gq` file). See `references/stored-queries.md`.
+`queries` operates on applied cluster state, not a graph URI. `validate`
+checks every registry against its applied schema; `list` may select one graph.
+Distinct from `lint`, which validates authoring source. See
+[`stored-queries.md`](stored-queries.md).
 
 ## Operator Config & Credentials
 
@@ -172,7 +225,7 @@ echo "$TOKEN" | omnigraph login <server>   # store a bearer token in ~/.omnigrap
 omnigraph logout <server>                  # remove it (idempotent)
 ```
 
-The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` *directory* (mainly for test isolation), and an absent file is just an empty layer (zero-config). Separately, `$OMNIGRAPH_CONFIG` stands in for the `--config` flag — which targets the **cluster directory / server config**, never the operator config. See SKILL.md → *The two config surfaces*.
+The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. Only `cluster` subcommands accept `--config`.
 
 ## Addressing a Graph
 
@@ -180,34 +233,45 @@ How the CLI resolves which graph a data command (`query`, `mutate`, `load`, `bra
 
 Precedence (highest first):
 
-1. **`--store <uri>`** or a **positional `file://`/`s3://` URI** — direct storage access (bypasses any server; no catalog, so stored-query *names* don't resolve). `--store` is exclusive with a positional URI and with `--server`.
+1. **`--store <uri>`** or a **positional `file://`/`s3://`/`az://` URI** — direct storage access (bypasses any server; no catalog, so stored-query *names* don't resolve). `--store` is exclusive with a positional URI and with `--server`. Azure is a qualification preview and writes require `omnigraph-azure-admission`.
 2. **`--server <name|url>`** (+ `--graph <id>` for a multi-graph server) — served/remote. A name resolves from `servers:` in `~/.omnigraph/config.yaml`; a literal `http(s)://` URL also works.
 3. **`--profile <name>`** (or `$OMNIGRAPH_PROFILE`) — a named scope bundle from `profiles:` in the operator config (binds one of server/cluster/store + a default graph).
 4. **Operator defaults** — `defaults.server` + `defaults.default_graph`, or `defaults.store` for a zero-flag local scope (mutually exclusive with `defaults.server`).
 
-Control-plane commands use `--config <dir>` (cluster); maintenance against a cluster-managed graph uses `--cluster <dir|s3://> --graph <id>`. Each command declares a **capability** — `any` / `served` / `direct` / `control` / `local` — shown in `omnigraph --help`; mis-addressing (e.g. `--server` on a `direct` verb, or a remote URI to `optimize`) fails loudly.
+Cluster subcommands use `--config <dir>`; policy and stored-query control-plane
+commands use `--cluster <dir|uri>`. Maintenance against a
+cluster-managed graph uses `--cluster <dir|file://|s3://|az://> --graph <id>`.
+Each command declares a **capability** — `any` / `served` / `direct` /
+`control` / `local` — shown in `omnigraph --help`; mis-addressing fails loudly.
 
 For query source (`query`/`mutate`):
 
 1. **`--query <file>`** or **`-e/--query-string '<gq>'`** — exactly one (operator aliases are invoked via the separate `alias` subcommand)
-2. Relative `--query` paths resolve through **`query.roots`** in config
+2. Relative `--query` paths resolve from the current working directory
 
 For params:
 
 1. **Explicit `--params '{...}'`** wins on key conflict
 2. **Positional alias args** map to alias `args` list
 
-## Output Formats
+## Output Formats and Positions
 
-`--format <fmt>` on query/mutate:
+`--format <fmt>` on read queries and aliases:
 
 - `table` (default) — human-readable
 - `kv` — `key: value` per line; good for single rows
 - `csv` — comma-separated
 - `jsonl` — NDJSON, one per line, with metadata line first
-- `json` — pretty JSON array
+- `json` — pretty `ReadOutput` envelope (metadata, columns, and rows)
 
-For admin commands (branch, commit, schema, policy): use `--json` for structured output, otherwise human text.
+Mutations do not take `--format`; use `--json`. Successful `mutate --json` and
+`load --json` include the exact published `commit` (`null` for a no-op
+mutation). `query --json` includes `graph_commit_id` when the read snapshot has
+an effective graph head (a fresh pre-commit graph can omit it). When returned,
+use that position with `mutate --if-commit`; see [`changes.md`](changes.md).
+
+For admin commands that advertise it (branch, commit, schema): use `--json` for
+structured output, otherwise human text. Policy subcommands do not offer JSON.
 
 ## Health Check
 
@@ -217,7 +281,7 @@ curl http://127.0.0.1:8080/healthz
 
 Returns `200 OK` if the server is up.
 
-## Cluster Control Plane (omnigraph >= 0.7.0)
+## Cluster Control Plane
 
 ```bash
 omnigraph cluster validate     --config <dir>          # parse + typecheck the declaration

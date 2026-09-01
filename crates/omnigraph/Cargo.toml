@@ -13,7 +13,20 @@ name = "omnigraph"
 
 [features]
 default = []
-failpoints = ["dep:fail", "fail/failpoints"]
+failpoints = ["dep:fail-parallel", "fail-parallel/failpoints"]
+# Test-only authority (PR #527 review P1-5): the DST seams' INSTALLERS
+# (seeded IDs, logical clock, gate hook), the mutable Lance registry
+# re-export, the harness-added injected-storage constructors
+# (init_with_storage, open_read_only_with_storage), and the
+# bottom-listing (`dst_list_all_keys`) exist only under this non-default
+# feature. Default builds keep direct real-ID/real-clock paths and
+# expose no dst_* authority. Deliberate exception: `open_with_storage`
+# predates the harness and stays public unconditionally. Scope note:
+# "default builds" means per-package builds (`-p`, and bare cargo via
+# default-members); any `--workspace` invocation unifies this feature IN
+# through the omnigraph-dst dev crate — release artifacts build with
+# `-p` and stay clean, and dst.yml lints the `-p` shape per PR.
+dst = ["omnigraph-storage/dst"]
 
 [dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.10.0" }
@@ -26,6 +39,10 @@ lance-datafusion = { workspace = true }
 datafusion = { workspace = true }
 lance-file = { workspace = true }
 lance-index = { workspace = true }
+frostem = { workspace = true }
+lance-tokenizer = { workspace = true }
+stop-words = { workspace = true }
+unicode-normalization = { workspace = true }
 lance-linalg = { workspace = true }
 lance-namespace = { workspace = true }
 lance-table = { workspace = true }
@@ -49,7 +66,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
-fail = { workspace = true, optional = true }
+fail-parallel = { workspace = true, optional = true }
 time = { workspace = true }
 async-trait = { workspace = true }
 url = { workspace = true }
@@ -62,10 +79,11 @@ tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,
 # so production builds (which exclude dev-deps) never see it.
-lance-io = { version = "10.0.0", features = ["test-util"] }
+lance-io = { version = "11.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
 syn = { version = "2", features = ["full", "visit"] }
+toml = "0.9"
 # benches/scenarios.rs: wait4/rusage peak-RSS and benchmark memory caps.
 libc = "0.2"
 

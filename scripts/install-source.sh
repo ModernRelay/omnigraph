@@ -50,6 +50,7 @@ install_from_dir() {
   mkdir -p "$INSTALL_DIR"
   install -m 0755 "$1/omnigraph" "$INSTALL_DIR/omnigraph"
   install -m 0755 "$1/omnigraph-server" "$INSTALL_DIR/omnigraph-server"
+  install -m 0755 "$1/omnigraph-azure-admission" "$INSTALL_DIR/omnigraph-azure-admission"
 }
 
 build_from_source() {
@@ -65,10 +66,12 @@ build_from_source() {
   fi
 
   need_cmd cargo
+  command -v protoc >/dev/null 2>&1 \
+    || die "missing required command: protoc — install the Protocol Buffers compiler first (brew install protobuf / apt-get install -y protobuf-compiler libprotobuf-dev)"
   log "Building omnigraph binaries from source"
   (
     cd "$repo_root"
-    cargo build --release --locked -p omnigraph-cli -p omnigraph-server
+    cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission
   )
 
   install_from_dir "$repo_root/target/release"
@@ -80,10 +83,12 @@ print_summary() {
 Installed:
   $INSTALL_DIR/omnigraph
   $INSTALL_DIR/omnigraph-server
+  $INSTALL_DIR/omnigraph-azure-admission
 
 Verify:
   $INSTALL_DIR/omnigraph version
   $INSTALL_DIR/omnigraph-server --help
+  $INSTALL_DIR/omnigraph-azure-admission --help
 
 EOF
 

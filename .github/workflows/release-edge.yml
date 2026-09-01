@@ -1,37 +1,77 @@
 name: Release Edge
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - "**/*.md"
-      - "**/*.mdx"
-      - "**/*.txt"
-      - "**/*.rst"
-      - "**/*.adoc"
+  workflow_call:
+    inputs:
+      source_ref:
+        required: true
+        type: string
+      ci_run_id:
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Current main ref or commit to release. Defaults to the selected workflow ref.
+        required: false
+        type: string
+      ci_run_id:
+        description: Optional CI run that contains the successful exact-SHA vocabulary audit.
+        required: false
+        type: string
 
 jobs:
+  vocabulary_gate:
+    name: Require audited edge source
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-vocabulary-gate.yml
+    with:
+      source_ref: ${{ inputs.source_ref || github.sha }}
+      ci_run_id: ${{ inputs.ci_run_id || '' }}
+
   prepare_edge_release:
     name: Prepare edge release
+    needs: vocabulary_gate
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      publish: ${{ steps.freshness.outputs.publish }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
+          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
           fetch-depth: 0
 
-      - name: Force-update edge tag
+      - name: Reject a stale edge source
+        id: freshness
+        env:
+          SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
         run: |
-          git tag -f edge "$GITHUB_SHA"
+          set -euo pipefail
+          current_main="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+          if [[ "$current_main" != "$SOURCE_SHA" ]]; then
+            echo "::notice::main advanced to ${current_main}; skipping stale edge source ${SOURCE_SHA}"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Force-update edge tag
+        if: steps.freshness.outputs.publish == 'true'
+        env:
+          SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
+        run: |
+          git tag -f edge "$SOURCE_SHA"
           git push origin refs/tags/edge --force
 
   build_release:
     name: Build edge ${{ matrix.asset_name }}
-    needs: prepare_edge_release
+    needs: [vocabulary_gate, prepare_edge_release]
+    if: needs.prepare_edge_release.outputs.publish == 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -55,7 +95,9 @@ jobs:
       RUSTFLAGS: ${{ matrix.rustflags || '' }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -72,18 +114,18 @@ jobs:
         run: choco install protoc -y
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
 
       - name: Cache Rust build data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
             . -> target
 
       - name: Build release binaries
-        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server
+        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission
 
       - name: Package Unix release archive
         if: runner.os != 'Windows'
@@ -91,46 +133,51 @@ jobs:
           mkdir -p release
           install -m 0755 target/release/omnigraph release/omnigraph
           install -m 0755 target/release/omnigraph-server release/omnigraph-server
-          tar -C release -czf "${{ matrix.asset_name }}.tar.gz" omnigraph omnigraph-server
+          install -m 0755 target/release/omnigraph-azure-admission release/omnigraph-azure-admission
+          tar -C release -czf "${{ matrix.asset_name }}.tar.gz" omnigraph omnigraph-server omnigraph-azure-admission
           shasum -a 256 "${{ matrix.asset_name }}.tar.gz" > "${{ matrix.asset_name }}.sha256"
 
       - name: Package Windows release archive
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item target/release/omnigraph.exe release/omnigraph.exe
           Copy-Item target/release/omnigraph-server.exe release/omnigraph-server.exe
-          Compress-Archive -Path release/omnigraph.exe, release/omnigraph-server.exe -DestinationPath "${{ matrix.asset_name }}.zip" -Force
+          Copy-Item target/release/omnigraph-azure-admission.exe release/omnigraph-azure-admission.exe
+          Compress-Archive -Path release/omnigraph.exe, release/omnigraph-server.exe, release/omnigraph-azure-admission.exe -DestinationPath "${{ matrix.asset_name }}.zip" -Force
           $hash = (Get-FileHash "${{ matrix.asset_name }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  ${{ matrix.asset_name }}.zip" | Out-File -FilePath "${{ matrix.asset_name }}.sha256" -Encoding ascii
           New-Item -ItemType Directory -Force -Path verify | Out-Null
           Expand-Archive -Path "${{ matrix.asset_name }}.zip" -DestinationPath verify -Force
           $items = Get-ChildItem -Path verify -File
-          if ($items.Count -ne 2 -or !(Test-Path verify/omnigraph.exe) -or !(Test-Path verify/omnigraph-server.exe)) {
+          if ($items.Count -ne 3 -or !(Test-Path verify/omnigraph.exe) -or !(Test-Path verify/omnigraph-server.exe) -or !(Test-Path verify/omnigraph-azure-admission.exe)) {
             throw "Windows release archive is missing expected binaries"
           }
 
       - name: Publish edge release assets
-        uses: softprops/action-gh-release@v2.5.0
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: edge
           name: Edge
           prerelease: true
           make_latest: false
           body: |
-            Rolling prerelease from `${{ github.sha }}`.
+            Rolling prerelease from `${{ needs.vocabulary_gate.outputs.source_sha }}`.
           files: |
             ${{ matrix.asset_name }}.*
 
   smoke_windows_installer:
     name: Smoke Windows installer
-    needs: build_release
+    needs: [vocabulary_gate, build_release]
     runs-on: windows-latest
     permissions:
       contents: read
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
 
       - name: Install from edge release
         run: ./scripts/install.ps1 -ReleaseChannel edge -InstallDir "$env:RUNNER_TEMP/omnigraph-bin"
@@ -139,3 +186,4 @@ jobs:
         run: |
           & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph.exe" version
           & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph-server.exe" --help
+          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph-azure-admission.exe" --help

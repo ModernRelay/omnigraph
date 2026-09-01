@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use walkdir::WalkDir;
 
-mod markdown;
 mod public_rust;
 mod rust_strings;
 
@@ -20,9 +19,12 @@ pub const INVENTORY_HEADER: &str = "schema_version\toccurrence_id\tsurface\tsour
 const SCHEMA_VERSION: &str = "2";
 const SURFACE_OPENAPI: &str = "openapi";
 pub(crate) const SURFACE_RUST_STRING: &str = "rust_string";
-pub(crate) const SURFACE_USER_DOCS: &str = "user_docs";
 pub(crate) const SURFACE_PUBLIC_RUST: &str = "public_rust";
-const SURFACES: &[&str] = &[SURFACE_OPENAPI, "rust_string", "user_docs", "public_rust"];
+// Comparison commits created before user documentation left this gate may
+// still contain classified prose rows. They are validated only while reading
+// the immutable base inventory and are never accepted in the current one.
+const RETIRED_BASE_SURFACE_USER_DOCS: &str = "user_docs";
+const SURFACES: &[&str] = &[SURFACE_OPENAPI, SURFACE_RUST_STRING, SURFACE_PUBLIC_RUST];
 const OPENAPI_SITE_KINDS: &[&str] = &[
     "component_name",
     "header_name",
@@ -34,6 +36,19 @@ const OPENAPI_SITE_KINDS: &[&str] = &[
     "discriminator_name",
     "enum_value",
     "prose",
+];
+const RETIRED_USER_DOC_SITE_KINDS: &[&str] = &[
+    "heading",
+    "paragraph",
+    "list_item",
+    "block_quote",
+    "table_cell",
+    "link_label",
+    "image_label",
+    "inline_code",
+    "fenced_code",
+    "indented_code",
+    "compatibility_anchor",
 ];
 const CLASSIFICATIONS: &[&str] = &[
     "legacy_graph_misuse",
@@ -172,7 +187,6 @@ pub struct CheckOptions {
 pub enum GuardSurface {
     Openapi,
     RustString,
-    UserDocs,
     PublicRust,
     All,
 }
@@ -241,6 +255,17 @@ pub fn render_tsv(rows: &[InventoryRow]) -> Result<String, GuardError> {
 }
 
 pub fn parse_inventory(contents: &str) -> Result<Vec<InventoryRow>, GuardError> {
+    parse_inventory_with_base_compatibility(contents, false)
+}
+
+fn parse_base_inventory(contents: &str) -> Result<Vec<InventoryRow>, GuardError> {
+    parse_inventory_with_base_compatibility(contents, true)
+}
+
+fn parse_inventory_with_base_compatibility(
+    contents: &str,
+    allow_retired_user_docs: bool,
+) -> Result<Vec<InventoryRow>, GuardError> {
     let normalized = contents.replace("\r\n", "\n");
     if normalized.contains('\r') {
         return Err(GuardError::Inventory(
@@ -292,7 +317,7 @@ pub fn parse_inventory(contents: &str) -> Result<Vec<InventoryRow>, GuardError> 
             test_owner: fields[11].to_owned(),
             rationale: fields[12].to_owned(),
         };
-        validate_inventory_row(&row, line_number)?;
+        validate_inventory_row(&row, line_number, allow_retired_user_docs)?;
         if !seen.insert(row.occurrence_id.clone()) {
             return Err(GuardError::Inventory(format!(
                 "duplicate occurrence_id {:?} at line {line_number}",
@@ -308,12 +333,18 @@ pub fn parse_inventory(contents: &str) -> Result<Vec<InventoryRow>, GuardError> 
             )));
         }
         previous_id = Some(row.occurrence_id.clone());
-        rows.push(row);
+        if row.surface != RETIRED_BASE_SURFACE_USER_DOCS {
+            rows.push(row);
+        }
     }
     Ok(rows)
 }
 
-fn validate_inventory_row(row: &InventoryRow, line_number: usize) -> Result<(), GuardError> {
+fn validate_inventory_row(
+    row: &InventoryRow,
+    line_number: usize,
+    allow_retired_user_docs: bool,
+) -> Result<(), GuardError> {
     if row.schema_version != SCHEMA_VERSION {
         return Err(GuardError::Inventory(format!(
             "line {line_number} has unknown schema_version {:?}",
@@ -329,7 +360,9 @@ fn validate_inventory_row(row: &InventoryRow, line_number: usize) -> Result<(), 
             "line {line_number} is missing an observation identity field"
         )));
     }
-    if !SURFACES.contains(&row.surface.as_str()) {
+    if !SURFACES.contains(&row.surface.as_str())
+        && !(allow_retired_user_docs && row.surface == RETIRED_BASE_SURFACE_USER_DOCS)
+    {
         return Err(GuardError::Inventory(format!(
             "line {line_number} has unknown surface {:?}",
             row.surface
@@ -343,8 +376,8 @@ fn validate_inventory_row(row: &InventoryRow, line_number: usize) -> Result<(), 
     let known_site_kinds = match row.surface.as_str() {
         SURFACE_OPENAPI => OPENAPI_SITE_KINDS,
         SURFACE_RUST_STRING => rust_strings::SITE_KINDS,
-        SURFACE_USER_DOCS => markdown::SITE_KINDS,
         SURFACE_PUBLIC_RUST => public_rust::SITE_KINDS,
+        RETIRED_BASE_SURFACE_USER_DOCS if allow_retired_user_docs => RETIRED_USER_DOC_SITE_KINDS,
         _ => unreachable!("surface was validated above"),
     };
     if !known_site_kinds.contains(&row.site_kind.as_str()) {
@@ -420,7 +453,7 @@ fn check_at_root(root: &Path, options: &CheckOptions) -> Result<CheckReport, Gua
     let base_inventory_text = git_show(root, &options.base, &inventory_path)?;
 
     let current_inventory = parse_inventory(&current_inventory_text)?;
-    let base_inventory = parse_inventory(&base_inventory_text)?;
+    let base_inventory = parse_base_inventory(&base_inventory_text)?;
 
     let mut current_count = 0;
     let mut base_count = 0;
@@ -447,10 +480,6 @@ fn check_at_root(root: &Path, options: &CheckOptions) -> Result<CheckReport, Gua
             SURFACE_RUST_STRING => (
                 scan_current_rust_strings(root)?,
                 scan_base_rust_strings(root, &options.base)?,
-            ),
-            SURFACE_USER_DOCS => (
-                scan_current_user_docs(root)?,
-                scan_base_user_docs(root, &options.base)?,
             ),
             SURFACE_PUBLIC_RUST => {
                 let public_api_tool = resolve_tool_executable(root, &options.public_api_tool);
@@ -525,7 +554,6 @@ fn selected_surfaces(surface: GuardSurface) -> &'static [&'static str] {
     match surface {
         GuardSurface::Openapi => &[SURFACE_OPENAPI],
         GuardSurface::RustString => &[SURFACE_RUST_STRING],
-        GuardSurface::UserDocs => &[SURFACE_USER_DOCS],
         GuardSurface::PublicRust => &[SURFACE_PUBLIC_RUST],
         GuardSurface::All => SURFACES,
     }
@@ -871,10 +899,6 @@ pub fn scan_rust_tree(root: &Path) -> Result<Vec<InventoryRow>, GuardError> {
     scan_current_rust_strings(root)
 }
 
-pub fn scan_user_docs_tree(root: &Path) -> Result<Vec<InventoryRow>, GuardError> {
-    scan_current_user_docs(root)
-}
-
 pub fn scan_public_rust_tree(
     root: &Path,
     executable: PathBuf,
@@ -918,29 +942,6 @@ fn scan_base_rust_strings(root: &Path, base: &str) -> Result<Vec<InventoryRow>, 
         rows.extend(rust_strings::scan(&contents, &source_path)?);
     }
     sort_unique_observations(rows, SURFACE_RUST_STRING)
-}
-
-fn scan_current_user_docs(root: &Path) -> Result<Vec<InventoryRow>, GuardError> {
-    let mut rows = Vec::new();
-    for path in current_files(root, Path::new("docs/user"), is_user_doc_path)? {
-        let source_path = path_to_slashes(&path);
-        let contents = fs::read_to_string(root.join(&path)).map_err(|source| GuardError::Read {
-            path: source_path.clone(),
-            source,
-        })?;
-        rows.extend(markdown::scan(&contents, &source_path));
-    }
-    sort_unique_observations(rows, SURFACE_USER_DOCS)
-}
-
-fn scan_base_user_docs(root: &Path, base: &str) -> Result<Vec<InventoryRow>, GuardError> {
-    let mut rows = Vec::new();
-    for path in base_files(root, base, Path::new("docs/user"), is_user_doc_path)? {
-        let source_path = path_to_slashes(&path);
-        let contents = git_show(root, base, &path)?;
-        rows.extend(markdown::scan(&contents, &source_path));
-    }
-    sort_unique_observations(rows, SURFACE_USER_DOCS)
 }
 
 fn current_files(
@@ -1017,10 +1018,6 @@ fn is_rust_source_path(path: &Path) -> bool {
             .file_stem()
             .and_then(|value| value.to_str())
             .is_some_and(|stem| stem == "tests" || stem.ends_with("_tests"))
-}
-
-fn is_user_doc_path(path: &Path) -> bool {
-    path.extension().and_then(|value| value.to_str()) == Some("md")
 }
 
 fn sort_unique_observations(
@@ -2341,7 +2338,6 @@ mod tests {
             .remove(0);
         for (surface, site_kind) in [
             ("rust_string", "thiserror_attribute"),
-            ("user_docs", "paragraph"),
             ("public_rust", "public_signature"),
         ] {
             let mut row = review_rows(vec![observation.clone()], |_| "physical_storage").remove(0);
@@ -2354,6 +2350,47 @@ mod tests {
                 &format!("unknown {surface} site_kind"),
             );
         }
+    }
+
+    #[test]
+    fn retired_user_docs_rows_are_accepted_only_in_the_base_inventory() {
+        let row = retired_user_doc_row();
+        let inventory = raw_inventory(std::slice::from_ref(&row));
+
+        assert_error_contains(parse_inventory(&inventory), "unknown surface \"user_docs\"");
+        assert!(
+            parse_base_inventory(&inventory)
+                .expect("the immutable base may contain the retired surface")
+                .is_empty(),
+            "retired prose rows must not participate in active comparisons"
+        );
+
+        let mut unknown_site = row;
+        unknown_site.site_kind = "future_doc_site".to_owned();
+        assert_error_contains(
+            parse_base_inventory(&raw_inventory(&[unknown_site])),
+            "unknown user_docs site_kind",
+        );
+    }
+
+    #[test]
+    fn merge_base_check_filters_retired_user_docs_rows() {
+        let spec = minimal_spec(&[("base", "physical table")]);
+        let mut repo = TestRepo::new();
+        fs::write(repo.root().join("openapi.json"), &spec).expect("write OpenAPI");
+        let mut base_rows = review_rows(
+            scan_openapi(&spec, "openapi.json").expect("scan OpenAPI"),
+            |_| "physical_storage",
+        );
+        base_rows.push(retired_user_doc_row());
+        base_rows.sort_by(|left, right| left.occurrence_id.cmp(&right.occurrence_id));
+        repo.write_inventory(&base_rows);
+        repo.base = repo.commit_all("base with retired user-doc inventory");
+
+        repo.write_current(&spec, |_| "physical_storage");
+        let report = check_repo(&repo).expect("active surfaces ignore retired base prose rows");
+        assert_eq!(report.current_occurrences, 1);
+        assert_eq!(report.base_occurrences, 1);
     }
 
     #[test]
@@ -2487,97 +2524,86 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_nonlegacy_doc_event_does_not_mask_or_inherit_a_legacy_transition() {
-        let source_path = "docs/user/example.md";
-        let base = review_rows(
-            markdown::scan(
-                "# Vocabulary\n\n- legacy table wording\n- physical row wording\n",
-                source_path,
-            ),
-            |row| {
-                if row.current_term.eq_ignore_ascii_case("table") {
-                    "legacy_graph_misuse"
-                } else {
-                    "physical_storage"
-                }
-            },
-        );
+    fn unchanged_nonlegacy_event_does_not_mask_or_inherit_a_legacy_transition() {
+        let base = vec![
+            transition_fixture_row("legacy table wording", "table", "legacy_graph_misuse"),
+            transition_fixture_row("physical row wording", "row", "physical_storage"),
+        ];
 
-        let removed = review_rows(
-            markdown::scan("# Vocabulary\n\n- physical row wording\n", source_path),
-            |_| "physical_storage",
-        );
-        compare_surface_classification_sets(SURFACE_USER_DOCS, &base, &removed)
+        let removed = vec![transition_fixture_row(
+            "physical row wording",
+            "row",
+            "physical_storage",
+        )];
+        compare_surface_classification_sets(SURFACE_RUST_STRING, &base, &removed)
             .expect("removing a legacy event must not charge its unchanged nonlegacy neighbour");
 
         let mut false_marker = removed.clone();
         false_marker[0].compatibility_treatment = REVIEWED_SEMANTIC_RECLASSIFICATION.to_owned();
         false_marker[0].rollout_phase = "presentation".to_owned();
         assert_error_contains(
-            compare_surface_classification_sets(SURFACE_USER_DOCS, &base, &false_marker),
+            compare_surface_classification_sets(SURFACE_RUST_STRING, &base, &false_marker),
             "unused reviewed_semantic_reclassification marker",
         );
 
-        let rewritten = review_rows(
-            markdown::scan(
-                "# Vocabulary\n\n- rewritten column wording\n- physical row wording\n",
-                source_path,
-            ),
-            |_| "physical_storage",
-        );
+        let rewritten = vec![
+            transition_fixture_row("rewritten column wording", "column", "physical_storage"),
+            transition_fixture_row("physical row wording", "row", "physical_storage"),
+        ];
         assert_error_contains(
-            compare_surface_classification_sets(SURFACE_USER_DOCS, &base, &rewritten),
+            compare_surface_classification_sets(SURFACE_RUST_STRING, &base, &rewritten),
             "reclassifies surviving legacy_graph_misuse stable boundary",
         );
 
         let mut misplaced_marker = rewritten.clone();
         let unchanged_row = misplaced_marker
             .iter_mut()
-            .find(|row| row.current_term.eq_ignore_ascii_case("row"))
+            .find(|row| row.current_term == "row")
             .expect("unchanged event must contain its original vocabulary term");
         unchanged_row.compatibility_treatment = REVIEWED_SEMANTIC_RECLASSIFICATION.to_owned();
         unchanged_row.rollout_phase = "presentation".to_owned();
         assert_error_contains(
-            compare_surface_classification_sets(SURFACE_USER_DOCS, &base, &misplaced_marker),
+            compare_surface_classification_sets(SURFACE_RUST_STRING, &base, &misplaced_marker),
             "reclassifies surviving legacy_graph_misuse stable boundary",
         );
 
         let mut reviewed_rewrite = rewritten.clone();
         let rewritten_row = reviewed_rewrite
             .iter_mut()
-            .find(|row| row.current_term.eq_ignore_ascii_case("column"))
+            .find(|row| row.current_term == "column")
             .expect("rewritten event must contain the replacement vocabulary term");
         rewritten_row.compatibility_treatment = REVIEWED_SEMANTIC_RECLASSIFICATION.to_owned();
         rewritten_row.rollout_phase = "presentation".to_owned();
-        compare_surface_classification_sets(SURFACE_USER_DOCS, &base, &reviewed_rewrite)
+        compare_surface_classification_sets(SURFACE_RUST_STRING, &base, &reviewed_rewrite)
             .expect("only the rewritten legacy event needs an explicit transition marker");
         compare_surface_classification_sets(
-            SURFACE_USER_DOCS,
+            SURFACE_RUST_STRING,
             &reviewed_rewrite,
             &reviewed_rewrite,
         )
         .expect("the accepted marker may persist unchanged for the next generation");
 
-        let retired_marker = review_rows(
-            markdown::scan(
-                "# Vocabulary\n\n- revised column wording\n- physical row wording\n",
-                source_path,
-            ),
-            |_| "physical_storage",
-        );
-        compare_surface_classification_sets(SURFACE_USER_DOCS, &reviewed_rewrite, &retired_marker)
-            .expect("an accepted marker may retire when its observation changes later");
+        let retired_marker = vec![
+            transition_fixture_row("revised column wording", "column", "physical_storage"),
+            transition_fixture_row("physical row wording", "row", "physical_storage"),
+        ];
+        compare_surface_classification_sets(
+            SURFACE_RUST_STRING,
+            &reviewed_rewrite,
+            &retired_marker,
+        )
+        .expect("an accepted marker may retire when its observation changes later");
 
         let mut rewritten_marker = retired_marker;
         let rewritten_row = rewritten_marker
             .iter_mut()
-            .find(|row| row.current_term.eq_ignore_ascii_case("column"))
+            .find(|row| row.current_term == "column")
             .expect("revised event must contain the replacement vocabulary term");
         rewritten_row.compatibility_treatment = REVIEWED_SEMANTIC_RECLASSIFICATION.to_owned();
         rewritten_row.rollout_phase = "presentation".to_owned();
         assert_error_contains(
             compare_surface_classification_sets(
-                SURFACE_USER_DOCS,
+                SURFACE_RUST_STRING,
                 &reviewed_rewrite,
                 &rewritten_marker,
             ),
@@ -2874,6 +2900,47 @@ mod tests {
         }
         rows.sort_by(|left, right| left.occurrence_id.cmp(&right.occurrence_id));
         rows
+    }
+
+    fn retired_user_doc_row() -> InventoryRow {
+        review_rows(
+            vec![InventoryRow::observation(
+                "user_docs:docs%2Fuser%2Fexample.md:Vocabulary:paragraph:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:table:1:1"
+                    .to_owned(),
+                RETIRED_BASE_SURFACE_USER_DOCS,
+                "docs/user/example.md",
+                "Vocabulary :: paragraph :: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef #1",
+                "paragraph",
+                "table".to_owned(),
+            )],
+            |_| "physical_storage",
+        )
+        .remove(0)
+    }
+
+    fn transition_fixture_row(
+        value: &'static str,
+        term: &'static str,
+        classification: &'static str,
+    ) -> InventoryRow {
+        let fingerprint = containing_value_fingerprint(value);
+        review_rows(
+            vec![InventoryRow::observation(
+                format!(
+                    "rust_string:crates%2Fexample%2Fsrc%2Flib.rs:%3Cmodule%3E%3A%3Afn%20render:thiserror_attribute:{fingerprint}:{}:1:1",
+                    percent_encode(term)
+                ),
+                SURFACE_RUST_STRING,
+                "crates/example/src/lib.rs",
+                &format!(
+                    "<module>::fn render :: thiserror_attribute :: {fingerprint} #1"
+                ),
+                "thiserror_attribute",
+                term.to_owned(),
+            )],
+            |_| classification,
+        )
+        .remove(0)
     }
 
     fn raw_inventory(rows: &[InventoryRow]) -> String {

@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use fail::FailScenario;
 use omnigraph::db::Omnigraph;
 use omnigraph::error::OmniError;
+use omnigraph::failpoints::FailScenario;
 // One ScopedFailPoint for both engine- and cluster-scoped failpoint names:
 // it is registry-only (error-type agnostic) and lives in the lowest crate.
 use omnigraph::failpoints::ScopedFailPoint;
@@ -485,8 +485,10 @@ async fn schema_crash_before_apply_recovers_via_sweep() {
 async fn schema_apply_error_before_graph_movement_removes_sidecar() {
     let scenario = FailScenario::setup();
     let dir = fixture();
-    converge_with_live_graph(dir.path()).await;
-    let pre_digest = live_schema_digest(dir.path()).await;
+    // Keep the test driver's large futures off the stack while the retry
+    // exercises Lance's nested schema-recovery commit path.
+    Box::pin(converge_with_live_graph(dir.path())).await;
+    let pre_digest = Box::pin(live_schema_digest(dir.path())).await;
     fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
 
     {
@@ -494,7 +496,7 @@ async fn schema_apply_error_before_graph_movement_removes_sidecar() {
             omnigraph::failpoints::names::SCHEMA_APPLY_BEFORE_STAGING_WRITE,
             "return",
         );
-        let out = apply_config_dir(dir.path()).await;
+        let out = Box::pin(apply_config_dir(dir.path())).await;
         assert!(!out.ok);
         assert!(
             out.diagnostics
@@ -503,7 +505,7 @@ async fn schema_apply_error_before_graph_movement_removes_sidecar() {
             "{:?}",
             out.diagnostics
         );
-        assert_eq!(live_schema_digest(dir.path()).await, pre_digest);
+        assert_eq!(Box::pin(live_schema_digest(dir.path())).await, pre_digest);
         assert!(
             recovery_sidecars(dir.path()).is_empty(),
             "{:?}",
@@ -511,10 +513,10 @@ async fn schema_apply_error_before_graph_movement_removes_sidecar() {
         );
     }
 
-    let recovered = apply_config_dir(dir.path()).await;
+    let recovered = Box::pin(apply_config_dir(dir.path())).await;
     assert!(recovered.ok && recovered.converged, "{recovered:?}");
     assert!(recovery_sidecars(dir.path()).is_empty());
-    assert_ne!(live_schema_digest(dir.path()).await, pre_digest);
+    assert_ne!(Box::pin(live_schema_digest(dir.path())).await, pre_digest);
     scenario.teardown();
 }
 

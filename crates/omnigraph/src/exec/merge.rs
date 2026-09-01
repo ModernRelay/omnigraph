@@ -429,16 +429,35 @@ impl OrderedTableCursor {
     }
 
     async fn from_dataset(dataset: Option<Dataset>, eager_signatures: bool) -> Result<Self> {
+        Self::from_dataset_with(dataset, eager_signatures, None).await
+    }
+
+    /// An ordered cursor restricted to candidate row keys via an exact
+    /// `id IN (...)` filter, so the three-way classification loop touches only
+    /// rows whose fragments changed between the pinned versions.
+    async fn from_dataset_filtered(dataset: Option<Dataset>, filter: &str) -> Result<Self> {
+        Self::from_dataset_with(dataset, true, Some(filter)).await
+    }
+
+    async fn from_dataset_with(
+        dataset: Option<Dataset>,
+        eager_signatures: bool,
+        filter: Option<&str>,
+    ) -> Result<Self> {
         let stream = if let Some(ds) = &dataset {
-            crate::instrumentation::record_ordered_cursor_scan(
-                KEYED_WRITE_MAX_ROWS,
-                KEYED_WRITE_MAX_BYTES,
-            );
+            // A filtered scan is not a full-table scan; record no cursor-scan
+            // probe, so probe-count assertions keep counting full walks only.
+            if filter.is_none() {
+                crate::instrumentation::record_ordered_cursor_scan(
+                    KEYED_WRITE_MAX_ROWS,
+                    KEYED_WRITE_MAX_BYTES,
+                );
+            }
             Some(Box::pin(
                 crate::table_store::TableStore::scan_stream_with(
                     ds,
                     None,
-                    None,
+                    filter,
                     Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
                     true,
                     |scanner| {
@@ -802,7 +821,9 @@ async fn try_proven_pure_insert_history(
         return Ok(None);
     }
 
-    let history_start = std::time::Instant::now();
+    let history_timing = crate::instrumentation::start_merge_timing(
+        crate::instrumentation::MergeTimingPhase::ProvenInsertHistory,
+    );
     let base = base_snapshot.open_lance_dataset(table_key).await?;
     let source = source_snapshot.open_lance_dataset(table_key).await?;
     if source.version().version != source_entry.published_dataset_version
@@ -919,10 +940,7 @@ async fn try_proven_pure_insert_history(
     if proven_inserted_rows != inserted_rows {
         return Ok(None);
     }
-    crate::instrumentation::record_merge_timing(
-        crate::instrumentation::MergeTimingPhase::ProvenInsertHistory,
-        history_start.elapsed(),
-    );
+    history_timing.finish();
 
     Ok(Some(ProvenPureInsertAdopt {
         source,
@@ -1127,7 +1145,9 @@ async fn plan_proven_pure_insert_chunks(
     expected_rows: u64,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
 ) -> Result<Option<Vec<usize>>> {
-    let scan_start = std::time::Instant::now();
+    let scan_timing = crate::instrumentation::start_merge_timing(
+        crate::instrumentation::MergeTimingPhase::ProvenInsertPlanScan,
+    );
     let source = SnapshotHandle::new(source.clone());
     let mut stream = db
         .storage()
@@ -1159,10 +1179,7 @@ async fn plan_proven_pure_insert_chunks(
             return Ok(None);
         }
     }
-    crate::instrumentation::record_merge_timing(
-        crate::instrumentation::MergeTimingPhase::ProvenInsertPlanScan,
-        scan_start.elapsed(),
-    );
+    scan_timing.finish();
     if observed_rows != expected_rows || chunk_rows.is_empty() {
         return Err(OmniError::manifest_internal(format!(
             "branch merge pure-insert plan for '{table_key}' observed {observed_rows} rows in {} chunks against a provenance proof for {expected_rows}",
@@ -1436,27 +1453,37 @@ fn min_cursor_id(
         .min()
 }
 
-async fn stage_streaming_table_merge(
-    target_db: &Omnigraph,
-    table_key: &str,
-    catalog: &Catalog,
-    base_snapshot: &Snapshot,
-    source_snapshot: &Snapshot,
-    target_snapshot: &Snapshot,
+/// One non-skip row decision from the three-way classification, recorded when
+/// the lineage-delta verify pass compares the walk and lineage paths. Rows
+/// classified unchanged record nothing — whether never visited (non-candidates
+/// on the lineage path) or visited and found equal — and that shared absence
+/// is part of the property under verification.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RowOutcomeKind {
+    Deleted,
+    Delta,
+    Conflict,
+}
+
+/// The three-way classification loop, shared by the full-scan walk (the
+/// verify-mode oracle) and the lineage-delta candidate path so both apply one
+/// decision rule. The candidate path feeds it `id IN (...)`-filtered cursors
+/// chunk by chunk.
+#[allow(clippy::too_many_arguments)]
+async fn run_three_way_classification(
+    base: &mut OrderedTableCursor,
+    source: &mut OrderedTableCursor,
+    target: &mut OrderedTableCursor,
+    delta_writer: &mut StagedTableWriter,
+    deleted_ids: &mut DeleteIdChunks,
     conflicts: &mut Vec<MergeConflict>,
+    prior_conflict_count: usize,
+    needs_update: &mut bool,
+    table_key: &str,
+    materializer: &crate::table_store::TableStore,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
-) -> Result<Option<StagedMergeResult>> {
-    let schema = schema_for_table_key(catalog, table_key)?;
-    let prior_conflict_count = conflicts.len();
-    let materializer = target_db.blob_materializer();
-    let mut delta_writer = StagedTableWriter::new(&format!("{}_delta", table_key), schema)?;
-    let mut deleted_ids = DeleteIdChunks::default();
-    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
-    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
-    let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key).await?;
-
-    let mut needs_update = false;
-
+    mut outcome_log: Option<&mut Vec<(String, RowOutcomeKind)>>,
+) -> Result<()> {
     loop {
         let base_row = base.peek_cloned().await?;
         let source_row = source.peek_cloned().await?;
@@ -1501,6 +1528,9 @@ async fn stage_streaming_table_merge(
                 source_row.is_some(),
                 target_row.is_some(),
             ));
+            if let Some(log) = outcome_log.as_deref_mut() {
+                log.push((next_id.clone(), RowOutcomeKind::Conflict));
+            }
             None
         };
 
@@ -1511,7 +1541,10 @@ async fn stage_streaming_table_merge(
         // Row existed in target but not in merge result → delete
         if selection.is_none() && target_row.is_some() {
             deleted_ids.push(next_id.clone())?;
-            needs_update = true;
+            *needs_update = true;
+            if let Some(log) = outcome_log.as_deref_mut() {
+                log.push((next_id.clone(), RowOutcomeKind::Deleted));
+            }
             continue;
         }
 
@@ -1521,11 +1554,713 @@ async fn stage_streaming_table_merge(
             // the committed target via index lookups, not a full re-scan.
             if !cursor_rows_equal(Some(selection), target_row.as_ref()).await? {
                 delta_writer
-                    .push_row(selection, &materializer, external_preflight)
+                    .push_row(selection, materializer, external_preflight)
                     .await?;
-                needs_update = true;
+                *needs_update = true;
+                if let Some(log) = outcome_log.as_deref_mut() {
+                    log.push((next_id.clone(), RowOutcomeKind::Delta));
+                }
             }
         }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_streaming_table_merge_walk(
+    target_db: &Omnigraph,
+    table_key: &str,
+    catalog: &Catalog,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+    target_snapshot: &Snapshot,
+    conflicts: &mut Vec<MergeConflict>,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
+    outcome_log: Option<&mut Vec<(String, RowOutcomeKind)>>,
+) -> Result<Option<StagedMergeResult>> {
+    let schema = schema_for_table_key(catalog, table_key)?;
+    let prior_conflict_count = conflicts.len();
+    let materializer = target_db.blob_materializer();
+    let mut delta_writer = StagedTableWriter::new(&format!("{}_delta", table_key), schema)?;
+    let mut deleted_ids = DeleteIdChunks::default();
+    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
+    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
+    let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key).await?;
+
+    let mut needs_update = false;
+    run_three_way_classification(
+        &mut base,
+        &mut source,
+        &mut target,
+        &mut delta_writer,
+        &mut deleted_ids,
+        conflicts,
+        prior_conflict_count,
+        &mut needs_update,
+        table_key,
+        &materializer,
+        external_preflight,
+        outcome_log,
+    )
+    .await?;
+
+    if conflicts.len() > prior_conflict_count {
+        return Ok(None);
+    }
+    if !needs_update {
+        return Ok(None);
+    }
+
+    let delta_staged = if delta_writer.row_count > 0 {
+        Some(delta_writer.finish().await?)
+    } else {
+        None
+    };
+
+    Ok(Some(StagedMergeResult {
+        delta_staged,
+        deleted_ids,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Lineage-delta candidate discovery: merge classification reads only rows
+// whose Lance version metadata (fragment lists + deletion files) changed
+// between the pinned versions, instead of full ordered scans.
+//
+// The superset property this relies on is structural, from Lance's
+// immutability: a fragment is byte-identical between two manifests iff it has
+// the same data files, the same overlay files, and the same deletion file
+// (data files and deletion files are uniquely named, never rewritten in
+// place). Such a fragment contributes identical live rows to both versions,
+// so no row of it can differ between base and side; every changed, new, or
+// deleted row must live in a fragment that is new/rewritten on one side or in
+// the deletion-vector difference of a shared fragment. False positives
+// (e.g. compaction-moved rows) are classified unchanged by the shared
+// comparison loop; false negatives are impossible while fragment files stay
+// uniquely named and immutable. The precondition gate below fails closed to
+// the walk.
+// ---------------------------------------------------------------------------
+
+/// `OMNIGRAPH_MERGE_LINEAGE` = `off` (full-scan walk), `on` (lineage when the
+/// gate passes, walk otherwise), `verify` (run BOTH, compare classifications,
+/// keep the walk's result as the oracle). An unrecognized value disables the
+/// lineage path (with a warning) rather than silently taking a default.
+/// Defaults when unset: verify in debug builds (every merge in the engine
+/// test suite cross-checks the two paths), lineage in release builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineageMergeMode {
+    Off,
+    On,
+    Verify,
+}
+
+const LINEAGE_MERGE_MODE_ENV: &str = "OMNIGRAPH_MERGE_LINEAGE";
+/// Ids per `id IN (...)` chunk on the candidate fetch path. Row-count bound
+/// only; the byte bound reuses the delete-filter budget machinery.
+const LINEAGE_FILTER_MAX_IDS: usize = 512;
+/// Retained-byte budget for the discovered candidate id set, per-id accounting
+/// matching what `DeleteIdChunks` re-applies at chunking time. Crossing it
+/// falls back to the walk: a candidate set approaching the whole table is the
+/// walk's own regime, and the gate's fail-closed contract must hold for
+/// budgets as well as preconditions.
+const LINEAGE_CANDIDATE_MAX_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
+
+fn lineage_merge_mode() -> LineageMergeMode {
+    match std::env::var(LINEAGE_MERGE_MODE_ENV) {
+        Ok(value) => match value.as_str() {
+            "off" => LineageMergeMode::Off,
+            "on" => LineageMergeMode::On,
+            "verify" => LineageMergeMode::Verify,
+            other => {
+                // An explicit-but-unrecognized request must not silently take
+                // a build-dependent default: this env var is the operational
+                // kill switch, and a typo'd "OFF" enabling the path it meant
+                // to disable is the worst reading. Disable, warn once.
+                static UNRECOGNIZED_WARNING: std::sync::Once = std::sync::Once::new();
+                UNRECOGNIZED_WARNING.call_once(|| {
+                    tracing::warn!(
+                        value = other,
+                        "unrecognized {LINEAGE_MERGE_MODE_ENV} value (expected off | on | \
+                         verify); lineage merge disabled"
+                    );
+                });
+                LineageMergeMode::Off
+            }
+        },
+        Err(std::env::VarError::NotPresent) => {
+            if cfg!(debug_assertions) {
+                LineageMergeMode::Verify
+            } else {
+                LineageMergeMode::On
+            }
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            static NOT_UNICODE_WARNING: std::sync::Once = std::sync::Once::new();
+            NOT_UNICODE_WARNING.call_once(|| {
+                tracing::warn!(
+                    "non-unicode {LINEAGE_MERGE_MODE_ENV} value; lineage merge disabled"
+                );
+            });
+            LineageMergeMode::Off
+        }
+    }
+}
+
+/// A gated lineage-merge plan: the three pinned datasets plus the candidate
+/// row-key superset discovered from fragment/deletion metadata, already
+/// chunked and budget-checked (every budget decision happens at plan time so
+/// the gate's walk fallback covers it; the staging path cannot fail on a
+/// budget the walk would have absorbed).
+struct LineageMergePlan {
+    base: Option<Dataset>,
+    source: Option<Dataset>,
+    target: Option<Dataset>,
+    candidate_chunks: DeleteIdChunks,
+}
+
+/// Resolve one data file to its physical identity: (owning root, relative
+/// path), with `base_id` resolved through the manifest's base paths. `None`
+/// when the referenced base path is missing — callers treat that fragment as
+/// changed (superset-safe).
+fn resolved_data_file_key<'a>(
+    dataset: &'a Dataset,
+    base_id: Option<u32>,
+    path: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let root = match base_id {
+        None => dataset.uri(),
+        Some(base_id) => dataset
+            .manifest
+            .base_paths
+            .get(&base_id)
+            .map(|base_path| base_path.path.as_str())?,
+    };
+    // The same local root appears both as `file:///abs/path` (dataset URIs)
+    // and bare `/abs/path` (stored base paths); strip the scheme so the two
+    // spellings of one root compare equal. Non-file schemes are untouched.
+    let root = root.strip_prefix("file://").unwrap_or(root);
+    Some((root.trim_end_matches('/'), path))
+}
+
+/// Whether two fragment incarnations hold byte-identical row data: same
+/// resolved data files (base-path indirection resolved on each side) and the
+/// same overlay list. Deletion state is compared separately — a deletion-file
+/// mismatch is self-correcting through the deletion-vector content diff.
+fn fragment_data_identical(
+    base_dataset: &Dataset,
+    base_meta: &lance_table::format::Fragment,
+    side_dataset: &Dataset,
+    side_meta: &lance_table::format::Fragment,
+) -> bool {
+    if base_meta.files.len() != side_meta.files.len()
+        || base_meta.overlays.len() != side_meta.overlays.len()
+    {
+        return false;
+    }
+    // Overlay data files carry `base_id` indirection exactly like fragment
+    // data files, and the same `base_id` number can resolve to different
+    // roots in the two manifests — so overlays must compare through resolved
+    // physical identity too, never raw struct equality. A false "identical"
+    // here is the one direction that breaks the candidate superset.
+    let overlays_identical = base_meta
+        .overlays
+        .iter()
+        .zip(side_meta.overlays.iter())
+        .all(|(base_overlay, side_overlay)| {
+            base_overlay.coverage == side_overlay.coverage
+                && base_overlay.committed_version == side_overlay.committed_version
+                && data_file_identical(
+                    base_dataset,
+                    &base_overlay.data_file,
+                    side_dataset,
+                    &side_overlay.data_file,
+                )
+        });
+    if !overlays_identical {
+        return false;
+    }
+    base_meta
+        .files
+        .iter()
+        .zip(side_meta.files.iter())
+        .all(|(base_file, side_file)| {
+            data_file_identical(base_dataset, base_file, side_dataset, side_file)
+        })
+}
+
+/// Whether two data-file references name the same physical file with the same
+/// column layout, `base_id` indirection resolved on each side.
+fn data_file_identical(
+    base_dataset: &Dataset,
+    base_file: &lance_table::format::DataFile,
+    side_dataset: &Dataset,
+    side_file: &lance_table::format::DataFile,
+) -> bool {
+    base_file.fields == side_file.fields
+        && base_file.column_indices == side_file.column_indices
+        && match (
+            resolved_data_file_key(base_dataset, base_file.base_id, &base_file.path),
+            resolved_data_file_key(side_dataset, side_file.base_id, &side_file.path),
+        ) {
+            (Some(base_key), Some(side_key)) => base_key == side_key,
+            _ => false,
+        }
+}
+
+/// Whether two deletion-file references name the same physical deletion file.
+/// `(read_version, id, file_type, base_id)` pins the uniquely-named file; a
+/// false negative only costs two deletion-vector reads whose content diff
+/// comes back empty (superset-safe).
+fn deletion_file_identical(
+    base_meta: &lance_table::format::Fragment,
+    side_meta: &lance_table::format::Fragment,
+) -> bool {
+    match (&base_meta.deletion_file, &side_meta.deletion_file) {
+        (None, None) => true,
+        (Some(base_file), Some(side_file)) => {
+            base_file.read_version == side_file.read_version
+                && base_file.id == side_file.id
+                && base_file.file_type == side_file.file_type
+                && base_file.base_id == side_file.base_id
+        }
+        _ => false,
+    }
+}
+
+async fn fragment_deletion_vector(
+    fragment: &lance::dataset::fragment::FileFragment,
+) -> Result<lance_core::utils::deletion::DeletionVector> {
+    Ok(fragment
+        .get_deletion_vector()
+        .await
+        .map_err(OmniError::storage)?
+        .map(|dv| dv.as_ref().clone())
+        .unwrap_or_default())
+}
+
+/// Read candidate row keys out of one dataset: every live row of
+/// `full_fragments`, plus the rows of `offset_fragments` whose local offsets
+/// are in the wanted set (deletion-vector differences). One fragment-restricted
+/// scan, `id` column + row address only. Returns `false` as soon as the
+/// running retained-byte estimate for the candidate set crosses
+/// [`LINEAGE_CANDIDATE_MAX_BYTES`] (see the constant's doc for the fallback
+/// contract).
+async fn gather_candidate_ids(
+    dataset: &Dataset,
+    full_fragments: Vec<lance_table::format::Fragment>,
+    offset_fragments: Vec<(lance_table::format::Fragment, HashSet<u32>)>,
+    candidates: &mut std::collections::BTreeSet<String>,
+    retained_bytes: &mut u64,
+) -> Result<bool> {
+    if full_fragments.is_empty() && offset_fragments.is_empty() {
+        return Ok(true);
+    }
+    let full_fragment_ids: HashSet<u64> = full_fragments.iter().map(|f| f.id).collect();
+    let offsets_by_fragment: HashMap<u64, &HashSet<u32>> = offset_fragments
+        .iter()
+        .map(|(fragment, offsets)| (fragment.id, offsets))
+        .collect();
+    let mut scan_fragments = full_fragments.clone();
+    scan_fragments.extend(
+        offset_fragments
+            .iter()
+            .map(|(fragment, _)| fragment.clone()),
+    );
+
+    let mut stream = crate::table_store::TableStore::scan_stream_with(
+        dataset,
+        Some(&["id"]),
+        None,
+        None,
+        false,
+        |scanner| {
+            scanner.with_fragments(scan_fragments);
+            scanner.with_row_address();
+            Ok(())
+        },
+    )
+    .await?;
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        let addresses = batch
+            .column_by_name(lance_core::ROW_ADDR)
+            .ok_or_else(|| {
+                OmniError::manifest_internal("lineage candidate scan missing row addresses")
+            })?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                OmniError::manifest_internal("lineage candidate row address column is not u64")
+            })?
+            .clone();
+        for row in 0..batch.num_rows() {
+            let address =
+                lance_core::utils::address::RowAddress::new_from_u64(addresses.value(row));
+            let fragment_id = u64::from(address.fragment_id());
+            let offset = address.row_offset();
+            let wanted = full_fragment_ids.contains(&fragment_id)
+                || offsets_by_fragment
+                    .get(&fragment_id)
+                    .is_some_and(|offsets| offsets.contains(&offset));
+            if wanted {
+                let id = row_id_at(&batch, row)?;
+                // The same per-id accounting `DeleteIdChunks` re-applies at
+                // chunking time: id bytes plus owned-String bookkeeping.
+                let id_storage = u64::try_from(id.len())
+                    .map_err(|_| {
+                        OmniError::manifest_internal("lineage candidate id bytes exceed u64")
+                    })?
+                    .saturating_add(2 * std::mem::size_of::<String>() as u64);
+                if candidates.insert(id) {
+                    *retained_bytes = retained_bytes.saturating_add(id_storage);
+                    if *retained_bytes > LINEAGE_CANDIDATE_MAX_BYTES {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Metadata-level diff of one (base, side) pair: fragments new or
+/// rewritten on the side contribute all their live rows; shared fragments with
+/// a changed deletion file contribute exactly the deletion-vector difference
+/// (read from the version where those rows are live); fragments present only
+/// in base contribute all their base-live rows (dropped or compacted away —
+/// the superset absorbs the difference); byte-identical fragments contribute
+/// nothing and are never read.
+async fn lineage_side_candidates(
+    base: Option<&Dataset>,
+    side: Option<&Dataset>,
+    candidates: &mut std::collections::BTreeSet<String>,
+    retained_bytes: &mut u64,
+) -> Result<bool> {
+    let base_fragments: HashMap<u64, lance::dataset::fragment::FileFragment> = base
+        .map(|dataset| {
+            dataset
+                .get_fragments()
+                .into_iter()
+                .map(|fragment| (fragment.metadata().id, fragment))
+                .collect()
+        })
+        .unwrap_or_default();
+    let side_fragments: HashMap<u64, lance::dataset::fragment::FileFragment> = side
+        .map(|dataset| {
+            dataset
+                .get_fragments()
+                .into_iter()
+                .map(|fragment| (fragment.metadata().id, fragment))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut base_full: Vec<lance_table::format::Fragment> = Vec::new();
+    let mut side_full: Vec<lance_table::format::Fragment> = Vec::new();
+    let mut base_offsets: Vec<(lance_table::format::Fragment, HashSet<u32>)> = Vec::new();
+    let mut side_offsets: Vec<(lance_table::format::Fragment, HashSet<u32>)> = Vec::new();
+
+    for (fragment_id, side_fragment) in &side_fragments {
+        let side_meta = side_fragment.metadata();
+        match (base_fragments.get(fragment_id), base, side) {
+            (Some(base_fragment), Some(base_dataset), Some(side_dataset)) => {
+                let base_meta = base_fragment.metadata();
+                if fragment_data_identical(base_dataset, base_meta, side_dataset, side_meta) {
+                    if deletion_file_identical(base_meta, side_meta) {
+                        // Byte-identical fragment: identical live rows on both
+                        // versions; contributes nothing.
+                        continue;
+                    }
+                    let base_dv = fragment_deletion_vector(base_fragment).await?;
+                    let side_dv = fragment_deletion_vector(side_fragment).await?;
+                    let newly_deleted: HashSet<u32> = side_dv
+                        .iter()
+                        .filter(|offset| !base_dv.contains(*offset))
+                        .collect();
+                    // Rows deleted in base but live on the side cannot arise
+                    // from forward writes; kept for structural completeness so
+                    // the superset never depends on that assumption.
+                    let newly_live: HashSet<u32> = base_dv
+                        .iter()
+                        .filter(|offset| !side_dv.contains(*offset))
+                        .collect();
+                    if !newly_deleted.is_empty() {
+                        base_offsets.push((base_meta.clone(), newly_deleted));
+                    }
+                    if !newly_live.is_empty() {
+                        side_offsets.push((side_meta.clone(), newly_live));
+                    }
+                } else {
+                    // Same fragment id backed by different data/overlay files
+                    // (field update / compaction shape). All live rows of both
+                    // incarnations are candidates.
+                    side_full.push(side_meta.clone());
+                    base_full.push(base_meta.clone());
+                }
+            }
+            _ => side_full.push(side_meta.clone()),
+        }
+    }
+    for (fragment_id, base_fragment) in &base_fragments {
+        if !side_fragments.contains_key(fragment_id) {
+            base_full.push(base_fragment.metadata().clone());
+        }
+    }
+
+    if let Some(base) = base {
+        if !gather_candidate_ids(base, base_full, base_offsets, candidates, retained_bytes).await? {
+            return Ok(false);
+        }
+    }
+    if let Some(side) = side {
+        if !gather_candidate_ids(side, side_full, side_offsets, candidates, retained_bytes).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The fail-closed precondition gate. Returns a plan only when every
+/// assumption verifiably holds; any miss falls back to the walk:
+/// scalar-only schema (Blob descriptor budgeting stays on the walk), one
+/// table path across the three pins, pinned versions matching the manifest
+/// entries, stable row ids and the exact-id primary-key contract on every
+/// present dataset, one Lance schema across the present pins, each present
+/// side a provable descendant of the base manifest state (same-branch linear
+/// history or a branch whose identifier references the base version — the
+/// same check `try_proven_pure_insert_history` applies), and a candidate set
+/// within the retained-byte budget.
+async fn plan_lineage_merge(
+    catalog: &Catalog,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+    target_snapshot: &Snapshot,
+    table_key: &str,
+) -> Result<Option<LineageMergePlan>> {
+    if schema_has_blob(&schema_for_table_key(catalog, table_key)?)? {
+        tracing::debug!(table_key, "lineage merge gate: blob schema; using the walk");
+        return Ok(None);
+    }
+    let base_entry = base_snapshot.dataset(table_key);
+    let source_entry = source_snapshot.dataset(table_key);
+    let target_entry = target_snapshot.dataset(table_key);
+    let mut table_paths = [base_entry, source_entry, target_entry]
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.dataset_path.as_str());
+    if let Some(first_path) = table_paths.next() {
+        if table_paths.any(|path| path != first_path) {
+            tracing::debug!(
+                table_key,
+                "lineage merge gate: table paths differ; using the walk"
+            );
+            return Ok(None);
+        }
+    }
+
+    let base = match base_entry {
+        Some(_) => Some(base_snapshot.open_lance_dataset(table_key).await?),
+        None => None,
+    };
+    let source = match source_entry {
+        Some(_) => Some(source_snapshot.open_lance_dataset(table_key).await?),
+        None => None,
+    };
+    let target = match target_entry {
+        Some(_) => Some(target_snapshot.open_lance_dataset(table_key).await?),
+        None => None,
+    };
+
+    for (dataset, entry) in [
+        (&base, base_entry),
+        (&source, source_entry),
+        (&target, target_entry),
+    ] {
+        let (Some(dataset), Some(entry)) = (dataset, entry) else {
+            continue;
+        };
+        if dataset.version().version != entry.published_dataset_version
+            || !dataset.manifest.uses_stable_row_ids()
+        {
+            tracing::debug!(
+                table_key,
+                "lineage merge gate: version pin or stable-row-id check failed; using the walk"
+            );
+            return Ok(None);
+        }
+        // The `id IN (...)` candidate fetch relies on exact-id semantics: a
+        // nullable id would let the walk visit a NULL-id row the IN filter
+        // silently drops. Same contract the other exact-id consumers verify.
+        if crate::table_store::exact_id_primary_key_field_id(dataset, "lineage merge gate").is_err()
+        {
+            tracing::debug!(
+                table_key,
+                "lineage merge gate: exact-id primary-key contract missing; using the walk"
+            );
+            return Ok(None);
+        }
+        // `base_id` references (a branch reusing its parent's files, or
+        // balanced storage) are resolved through `manifest.base_paths` in
+        // `fragment_data_identical`; an unresolvable reference degrades that
+        // fragment to fully-changed (superset-safe), so no gate is needed.
+    }
+
+    // A metadata-only schema change (no fragment rewrite) leaves fragments
+    // byte-identical while row comparison sees every row changed — the one
+    // shape where fragment identity is not row identity. Require one schema
+    // across the present pins.
+    {
+        let mut schemas = [&base, &source, &target].into_iter().flatten();
+        if let Some(first_schema) = schemas.next().map(|dataset| dataset.schema()) {
+            if schemas.any(|dataset| dataset.schema() != first_schema) {
+                tracing::debug!(
+                    table_key,
+                    "lineage merge gate: schemas differ across the pins; using the walk"
+                );
+                return Ok(None);
+            }
+        }
+    }
+
+    if let (Some(base_dataset), Some(base_entry)) = (&base, base_entry) {
+        let base_identifier = base_dataset
+            .branch_identifier()
+            .await
+            .map_err(OmniError::storage)?;
+        for (side_dataset, side_entry) in [(&source, source_entry), (&target, target_entry)] {
+            let (Some(side_dataset), Some(side_entry)) = (side_dataset, side_entry) else {
+                continue;
+            };
+            let side_identifier = side_dataset
+                .branch_identifier()
+                .await
+                .map_err(OmniError::storage)?;
+            if side_entry.native_dataset_branch == base_entry.native_dataset_branch {
+                if side_entry.published_dataset_version < base_entry.published_dataset_version
+                    || side_identifier != base_identifier
+                {
+                    tracing::debug!(
+                        table_key,
+                        "lineage merge gate: same-branch history not linear; using the walk"
+                    );
+                    return Ok(None);
+                }
+            } else if side_identifier.find_referenced_version(&base_identifier)
+                != Some(base_entry.published_dataset_version)
+            {
+                tracing::debug!(
+                    table_key,
+                    "lineage merge gate: side is not a provable descendant of the base; using the walk"
+                );
+                return Ok(None);
+            }
+        }
+    }
+
+    let discovery_started = std::time::Instant::now();
+    let mut candidate_ids = std::collections::BTreeSet::new();
+    let mut retained_bytes = 0u64;
+    let within_budget = lineage_side_candidates(
+        base.as_ref(),
+        source.as_ref(),
+        &mut candidate_ids,
+        &mut retained_bytes,
+    )
+    .await?
+        && lineage_side_candidates(
+            base.as_ref(),
+            target.as_ref(),
+            &mut candidate_ids,
+            &mut retained_bytes,
+        )
+        .await?;
+    if !within_budget {
+        tracing::debug!(
+            table_key,
+            candidates = candidate_ids.len(),
+            "lineage merge gate: candidate set exceeds the retained-byte budget; using the walk"
+        );
+        return Ok(None);
+    }
+    tracing::debug!(
+        table_key,
+        candidates = candidate_ids.len(),
+        elapsed_ms = discovery_started.elapsed().as_secs_f64() * 1000.0,
+        "lineage merge: candidate discovery complete"
+    );
+
+    let mut candidate_chunks = DeleteIdChunks::default();
+    for id in candidate_ids {
+        match candidate_chunks.push_bounded(id, LINEAGE_FILTER_MAX_IDS, KEYED_WRITE_MAX_BYTES) {
+            Ok(()) => {}
+            // The discovery budget above uses the same per-id accounting, so
+            // this arm is belt and braces — but a budget miss must fall back
+            // to the walk (the gate's contract), never fail a merge the walk
+            // would complete.
+            Err(OmniError::ResourceLimitExceeded { .. }) => {
+                tracing::debug!(
+                    table_key,
+                    "lineage merge gate: candidate chunk budget exceeded; using the walk"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(Some(LineageMergePlan {
+        base,
+        source,
+        target,
+        candidate_chunks,
+    }))
+}
+
+/// The lineage-delta staging path: the shared classification loop fed only
+/// candidate rows, fetched via chunked exact `id IN (...)` ordered scans on
+/// the three already-open pinned datasets. Chunks partition the ascending key
+/// space, so staged deltas and deleted ids come out in the same order the
+/// walk produces.
+#[allow(clippy::too_many_arguments)]
+async fn stage_lineage_table_merge(
+    target_db: &Omnigraph,
+    table_key: &str,
+    catalog: &Catalog,
+    plan: &LineageMergePlan,
+    conflicts: &mut Vec<MergeConflict>,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
+    mut outcome_log: Option<&mut Vec<(String, RowOutcomeKind)>>,
+) -> Result<Option<StagedMergeResult>> {
+    let schema = schema_for_table_key(catalog, table_key)?;
+    let prior_conflict_count = conflicts.len();
+    let materializer = target_db.blob_materializer();
+    let mut delta_writer = StagedTableWriter::new(&format!("{}_delta", table_key), schema)?;
+    let mut deleted_ids = DeleteIdChunks::default();
+    let mut needs_update = false;
+
+    for chunk in &plan.candidate_chunks.chunks {
+        let filter = chunk.filter()?;
+        let mut base =
+            OrderedTableCursor::from_dataset_filtered(plan.base.clone(), &filter).await?;
+        let mut source =
+            OrderedTableCursor::from_dataset_filtered(plan.source.clone(), &filter).await?;
+        let mut target =
+            OrderedTableCursor::from_dataset_filtered(plan.target.clone(), &filter).await?;
+        run_three_way_classification(
+            &mut base,
+            &mut source,
+            &mut target,
+            &mut delta_writer,
+            &mut deleted_ids,
+            conflicts,
+            prior_conflict_count,
+            &mut needs_update,
+            table_key,
+            &materializer,
+            external_preflight,
+            outcome_log.as_deref_mut(),
+        )
+        .await?;
     }
 
     if conflicts.len() > prior_conflict_count {
@@ -1545,6 +2280,205 @@ async fn stage_streaming_table_merge(
         delta_staged,
         deleted_ids,
     }))
+}
+
+/// Verify-mode comparison: the two paths must produce identical non-skip row
+/// classifications, identical deleted-id sequences, and identical staged delta
+/// row counts. A divergence is a correctness bug in the lineage path; the
+/// merge fails loudly.
+fn verify_lineage_agreement(
+    table_key: &str,
+    walk_log: &[(String, RowOutcomeKind)],
+    lineage_log: &[(String, RowOutcomeKind)],
+    walk_result: Option<&StagedMergeResult>,
+    lineage_result: Option<&StagedMergeResult>,
+) -> Result<()> {
+    let mut walk_sorted = walk_log.to_vec();
+    let mut lineage_sorted = lineage_log.to_vec();
+    walk_sorted.sort();
+    lineage_sorted.sort();
+    if walk_sorted != lineage_sorted {
+        let first_difference = walk_sorted
+            .iter()
+            .zip(lineage_sorted.iter())
+            .find(|(walk, lineage)| walk != lineage)
+            .map(|(walk, lineage)| format!("walk {walk:?} vs lineage {lineage:?}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "walk logged {} outcomes, lineage logged {}",
+                    walk_sorted.len(),
+                    lineage_sorted.len()
+                )
+            });
+        return Err(OmniError::manifest_internal(format!(
+            "lineage-merge verify divergence for '{table_key}': {first_difference}; set \
+             {LINEAGE_MERGE_MODE_ENV}=off to run the walk only"
+        )));
+    }
+    let walk_deleted: Vec<&String> = walk_result
+        .map(|result| result.deleted_ids.iter().collect())
+        .unwrap_or_default();
+    let lineage_deleted: Vec<&String> = lineage_result
+        .map(|result| result.deleted_ids.iter().collect())
+        .unwrap_or_default();
+    if walk_deleted != lineage_deleted {
+        // Counts can be equal while contents differ; name the first
+        // differing position so the operator sees the actual mismatch.
+        let detail = walk_deleted
+            .iter()
+            .zip(lineage_deleted.iter())
+            .find(|(walk, lineage)| walk != lineage)
+            .map(|(walk, lineage)| {
+                format!("first differing id: walk '{walk}' vs lineage '{lineage}'")
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "{} walk vs {} lineage",
+                    walk_deleted.len(),
+                    lineage_deleted.len()
+                )
+            });
+        return Err(OmniError::manifest_internal(format!(
+            "lineage-merge verify divergence for '{table_key}': deleted ids differ ({detail}); \
+             set {LINEAGE_MERGE_MODE_ENV}=off to run the walk only"
+        )));
+    }
+    let walk_delta_rows = walk_result
+        .and_then(|result| result.delta_staged.as_ref())
+        .map(|staged| staged.row_count)
+        .unwrap_or(0);
+    let lineage_delta_rows = lineage_result
+        .and_then(|result| result.delta_staged.as_ref())
+        .map(|staged| staged.row_count)
+        .unwrap_or(0);
+    if walk_delta_rows != lineage_delta_rows {
+        return Err(OmniError::manifest_internal(format!(
+            "lineage-merge verify divergence for '{table_key}': staged delta rows differ \
+             ({walk_delta_rows} walk vs {lineage_delta_rows} lineage); set \
+             {LINEAGE_MERGE_MODE_ENV}=off to run the walk only"
+        )));
+    }
+    tracing::debug!(
+        table_key,
+        outcomes = walk_sorted.len(),
+        deleted = walk_deleted.len(),
+        delta_rows = walk_delta_rows,
+        "lineage merge verify: paths agree"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_streaming_table_merge(
+    target_db: &Omnigraph,
+    table_key: &str,
+    catalog: &Catalog,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+    target_snapshot: &Snapshot,
+    conflicts: &mut Vec<MergeConflict>,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
+) -> Result<Option<StagedMergeResult>> {
+    match lineage_merge_mode() {
+        LineageMergeMode::Off => {
+            stage_streaming_table_merge_walk(
+                target_db,
+                table_key,
+                catalog,
+                base_snapshot,
+                source_snapshot,
+                target_snapshot,
+                conflicts,
+                external_preflight,
+                None,
+            )
+            .await
+        }
+        LineageMergeMode::On => {
+            match plan_lineage_merge(
+                catalog,
+                base_snapshot,
+                source_snapshot,
+                target_snapshot,
+                table_key,
+            )
+            .await?
+            {
+                Some(plan) => {
+                    stage_lineage_table_merge(
+                        target_db,
+                        table_key,
+                        catalog,
+                        &plan,
+                        conflicts,
+                        external_preflight,
+                        None,
+                    )
+                    .await
+                }
+                None => {
+                    stage_streaming_table_merge_walk(
+                        target_db,
+                        table_key,
+                        catalog,
+                        base_snapshot,
+                        source_snapshot,
+                        target_snapshot,
+                        conflicts,
+                        external_preflight,
+                        None,
+                    )
+                    .await
+                }
+            }
+        }
+        LineageMergeMode::Verify => {
+            let mut walk_log = Vec::new();
+            let walk_result = stage_streaming_table_merge_walk(
+                target_db,
+                table_key,
+                catalog,
+                base_snapshot,
+                source_snapshot,
+                target_snapshot,
+                conflicts,
+                external_preflight,
+                Some(&mut walk_log),
+            )
+            .await?;
+            let Some(plan) = plan_lineage_merge(
+                catalog,
+                base_snapshot,
+                source_snapshot,
+                target_snapshot,
+                table_key,
+            )
+            .await?
+            else {
+                return Ok(walk_result);
+            };
+            let mut lineage_log = Vec::new();
+            let mut lineage_conflicts: Vec<MergeConflict> = Vec::new();
+            let lineage_result = stage_lineage_table_merge(
+                target_db,
+                table_key,
+                catalog,
+                &plan,
+                &mut lineage_conflicts,
+                external_preflight,
+                Some(&mut lineage_log),
+            )
+            .await?;
+            verify_lineage_agreement(
+                table_key,
+                &walk_log,
+                &lineage_log,
+                walk_result.as_ref(),
+                lineage_result.as_ref(),
+            )?;
+            Ok(walk_result)
+        }
+    }
 }
 
 /// First pass for a Blob-bearing three-way merge. It repeats the immutable
@@ -1972,7 +2906,9 @@ fn validation_projection(catalog: &Catalog, table_key: &str) -> Vec<String> {
     let mut cols = vec!["id".to_string()];
     if let Some(name) = table_key.strip_prefix("node:") {
         if let Some(node_type) = catalog.node_types.get(name) {
-            for (prop, ty) in &node_type.properties {
+            let mut __dst_np: Vec<_> = node_type.properties.iter().collect();
+            __dst_np.sort_by(|a, b| a.0.cmp(b.0));
+            for (prop, ty) in __dst_np {
                 if !is_heavy(ty) {
                     cols.push(prop.clone());
                 }
@@ -1982,7 +2918,9 @@ fn validation_projection(catalog: &Catalog, table_key: &str) -> Vec<String> {
         cols.push("src".to_string());
         cols.push("dst".to_string());
         if let Some(edge_type) = catalog.edge_types.get(name) {
-            for (prop, ty) in &edge_type.properties {
+            let mut __dst_ep: Vec<_> = edge_type.properties.iter().collect();
+            __dst_ep.sort_by(|a, b| a.0.cmp(b.0));
+            for (prop, ty) in __dst_ep {
                 if !is_heavy(ty) {
                     cols.push(prop.clone());
                 }
@@ -2628,7 +3566,7 @@ fn pre_minted_merge_transaction(
 ) -> crate::table_store::StagedTransactionIdentity {
     crate::table_store::StagedTransactionIdentity {
         read_version,
-        uuid: format!("omnigraph-merge-{}", ulid::Ulid::new()),
+        uuid: format!("omnigraph-merge-{}", crate::dst_ids::new_ulid()),
     }
 }
 
@@ -3167,7 +4105,9 @@ async fn commit_keyed_stream_chunks(
         observed_rows = observed_rows
             .checked_add(batch.num_rows() as u64)
             .ok_or_else(|| OmniError::manifest_internal("branch merge row count overflow"))?;
-        let stage_start = std::time::Instant::now();
+        let stage_timing = crate::instrumentation::start_merge_timing(
+            crate::instrumentation::MergeTimingPhase::KeyedStage,
+        );
         let staged = match stage_kind {
             KeyedChunkStage::General(semantics) => {
                 target_db
@@ -3188,10 +4128,7 @@ async fn commit_keyed_stream_chunks(
                     .await?
             }
         };
-        crate::instrumentation::record_merge_timing(
-            crate::instrumentation::MergeTimingPhase::KeyedStage,
-            stage_start.elapsed(),
-        );
+        stage_timing.finish();
         let planned = planned_transactions.get(*planned_index).ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "branch merge table '{table_key}' has no transaction planned for keyed chunk {}",
@@ -3199,12 +4136,11 @@ async fn commit_keyed_stream_chunks(
             ))
         })?;
         *planned_index += 1;
-        let commit_start = std::time::Instant::now();
-        current = commit_exact_merge_stage(target_db, current, staged, planned).await?;
-        crate::instrumentation::record_merge_timing(
+        let commit_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::KeyedCommit,
-            commit_start.elapsed(),
         );
+        current = commit_exact_merge_stage(target_db, current, staged, planned).await?;
+        commit_timing.finish();
         if chunk_index + 1 < chunk_rows.len()
             && let Some(failpoint) = between_chunk_failpoint
         {
@@ -3250,7 +4186,6 @@ async fn publish_proven_pure_insert_adopt(
     prepared_target: PreparedExistingMergeTarget,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
 ) -> Result<crate::db::DatasetUpdate> {
-    let publish_start = std::time::Instant::now();
     let (current, full_path, table_branch) = prepared_target.into_parts();
     let source = SnapshotHandle::new(proven.source.clone());
     let stream = target_db
@@ -3288,10 +4223,6 @@ async fn publish_proven_pure_insert_adopt(
         .storage()
         .table_state(&full_path, &committed)
         .await?;
-    crate::instrumentation::record_merge_timing(
-        crate::instrumentation::MergeTimingPhase::PhysicalPublish,
-        publish_start.elapsed(),
-    );
 
     Ok(crate::db::DatasetUpdate {
         identity,
@@ -3525,7 +4456,10 @@ impl Omnigraph {
             actor_id,
         )?;
         self.ensure_schema_apply_idle("branch_merge").await?;
-        self.branch_merge_impl(source, target, actor_id).await
+        // Keep the recovery/planning future out of the public API's callers;
+        // deeply composed loads and merges otherwise retain large debug
+        // construction frames throughout execution. Poll it in the same task.
+        Box::pin(self.branch_merge_impl(source, target, actor_id)).await
     }
 
     async fn branch_merge_impl(
@@ -3534,7 +4468,9 @@ impl Omnigraph {
         target: &str,
         actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
-        let outer_prepare_start = std::time::Instant::now();
+        let outer_prepare_timing = crate::instrumentation::start_merge_timing(
+            crate::instrumentation::MergeTimingPhase::OuterPrepare,
+        );
         if is_internal_system_branch(source) || is_internal_system_branch(target) {
             return Err(OmniError::manifest(format!(
                 "branch_merge does not allow internal system refs ('{}' -> '{}')",
@@ -3584,7 +4520,7 @@ impl Omnigraph {
             .effective_graph_head
             .clone()
             .ok_or_else(|| OmniError::manifest("target branch has no head commit".to_string()))?;
-        let base_commit = CommitGraph::merge_base_from_commits(
+        let base_commit = CommitGraph::merge_base_from_snapshots(
             source_commits,
             target_commits,
             &source_head_commit_id,
@@ -3644,10 +4580,7 @@ impl Omnigraph {
             // stale instance after the merge.
             (!target_was_active).then_some(previous)
         };
-        crate::instrumentation::record_merge_timing(
-            crate::instrumentation::MergeTimingPhase::OuterPrepare,
-            outer_prepare_start.elapsed(),
-        );
+        outer_prepare_timing.finish();
         // Keep the deliberately large merge planner/publisher state out of the
         // operation shell's generated future. The inner operation composes
         // ordered typed comparison, Blob materialization, validation, recovery,
@@ -3668,7 +4601,9 @@ impl Omnigraph {
             actor_id,
         ))
         .await;
-        let outer_restore_start = std::time::Instant::now();
+        let outer_restore_timing = crate::instrumentation::start_merge_timing(
+            crate::instrumentation::MergeTimingPhase::OuterRestoreRefresh,
+        );
         if let Some(previous) = previous {
             self.restore_coordinator(previous).await;
         }
@@ -3689,10 +4624,7 @@ impl Omnigraph {
             }
         }
 
-        crate::instrumentation::record_merge_timing(
-            crate::instrumentation::MergeTimingPhase::OuterRestoreRefresh,
-            outer_restore_start.elapsed(),
-        );
+        outer_restore_timing.finish();
 
         merge_result
     }
@@ -3727,7 +4659,16 @@ impl Omnigraph {
         ordered_table_keys.sort();
 
         let mut conflicts = Vec::new();
-        let target_active = self.active_branch().await;
+        // Adopt planning, sidecar pins, and first-touch opens name the
+        // target's forks by native ref; queue keys, gates, and lineage keep
+        // the logical branch name.
+        let target_active: Option<String> = match target_branch {
+            None => None,
+            Some(target) => Some(match target_snapshot.native_branch() {
+                Some(native) => native.to_string(),
+                None => self.native_branch_for(target).await?,
+            }),
+        };
         let mut candidates: HashMap<String, CandidateTableState> = HashMap::new();
         let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
         let mut blob_table_keys = HashSet::new();
@@ -3773,22 +4714,28 @@ impl Omnigraph {
                     {
                         candidates.insert(table_key.clone(), candidate);
                     }
-                } else if let Some(staged) = stage_streaming_table_merge(
-                    self,
-                    table_key,
-                    catalog,
-                    base_snapshot,
-                    source_snapshot,
-                    target_snapshot,
-                    &mut conflicts,
-                    &empty_external_preflight,
-                )
-                .await?
-                {
-                    candidates.insert(
-                        table_key.clone(),
-                        CandidateTableState::RewriteMerged(staged),
+                } else {
+                    let table_walk_timing = crate::instrumentation::start_merge_timing(
+                        crate::instrumentation::MergeTimingPhase::TableWalk,
                     );
+                    let staged = stage_streaming_table_merge(
+                        self,
+                        table_key,
+                        catalog,
+                        base_snapshot,
+                        source_snapshot,
+                        target_snapshot,
+                        &mut conflicts,
+                        &empty_external_preflight,
+                    )
+                    .await?;
+                    table_walk_timing.finish();
+                    if let Some(staged) = staged {
+                        candidates.insert(
+                            table_key.clone(),
+                            CandidateTableState::RewriteMerged(staged),
+                        );
+                    }
                 }
                 continue;
             }
@@ -3972,7 +4919,10 @@ impl Omnigraph {
                 continue;
             }
 
-            if let Some(staged) = stage_streaming_table_merge(
+            let table_walk_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::TableWalk,
+            );
+            let staged = stage_streaming_table_merge(
                 self,
                 table_key,
                 catalog,
@@ -3982,8 +4932,9 @@ impl Omnigraph {
                 &mut conflicts,
                 &external_preflight,
             )
-            .await?
-            {
+            .await?;
+            table_walk_timing.finish();
+            if let Some(staged) = staged {
                 candidates.insert(
                     table_key.clone(),
                     CandidateTableState::RewriteMerged(staged),
@@ -4002,13 +4953,12 @@ impl Omnigraph {
         let validation_is_redundant =
             is_fast_forward && proven_fast_forward_needs_no_validation(catalog, &candidates);
         if !validation_is_redundant {
-            let validation_start = std::time::Instant::now();
+            let validation_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::CandidateValidation,
+            );
             let changeset = build_merge_changeset(self, catalog, &candidates).await?;
             validate_merge_candidates(catalog, target_snapshot, &changeset).await?;
-            crate::instrumentation::record_merge_timing(
-                crate::instrumentation::MergeTimingPhase::CandidateValidation,
-                validation_start.elapsed(),
-            );
+            validation_timing.finish();
         }
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_MERGE_POST_CANDIDATE_VALIDATION,
@@ -4029,7 +4979,9 @@ impl Omnigraph {
         // re-run the sidecar barrier and re-read both manifest branches before
         // Phase A. Planning remains outside table queues, but no plan derived
         // from a stale source/target snapshot can cross into physical effects.
-        let final_revalidation_start = std::time::Instant::now();
+        let final_revalidation_timing = crate::instrumentation::start_merge_timing(
+            crate::instrumentation::MergeTimingPhase::FinalRevalidation,
+        );
         let active_branch_for_keys = target_branch.map(str::to_string);
         let merge_branches = [
             source_branch.map(str::to_string),
@@ -4119,7 +5071,9 @@ impl Omnigraph {
                 )),
             ));
         }
-        for (table_key, candidate) in &candidates {
+        let mut __dst_cand: Vec<_> = candidates.iter().collect();
+        __dst_cand.sort_by(|a, b| a.0.cmp(b.0));
+        for (table_key, candidate) in __dst_cand {
             if let CandidateTableState::AdoptPureInserts(proven) = candidate {
                 revalidate_proven_pure_insert_source(
                     self,
@@ -4190,9 +5144,12 @@ impl Omnigraph {
             let planned_output_branch = match candidate {
                 CandidateTableState::RewriteMerged(_)
                 | CandidateTableState::AdoptWithDelta(_)
-                | CandidateTableState::AdoptPureInserts(_) => active_branch_for_keys.clone(),
+                | CandidateTableState::AdoptPureInserts(_) => target_active.clone(),
                 CandidateTableState::AdoptSourceState { .. } => {
-                    match (target_branch, source_entry.native_dataset_branch.as_deref()) {
+                    match (
+                        target_active.as_deref(),
+                        source_entry.native_dataset_branch.as_deref(),
+                    ) {
                         (Some(target), Some(_)) => Some(target.to_string()),
                         _ => None,
                     }
@@ -4216,7 +5173,8 @@ impl Omnigraph {
                             table_key
                         ))
                     })?;
-                    let source_fork_version = target_branch
+                    let source_fork_version = target_active
+                        .as_deref()
                         .filter(|target| entry.native_dataset_branch.as_deref() != Some(*target))
                         .map(|_| entry.published_dataset_version);
                     if source_fork_version.is_some()
@@ -4258,7 +5216,7 @@ impl Omnigraph {
                         expected_version,
                         post_commit_pin: expected_version + 1,
                         confirmed_version: None,
-                        table_branch: active_branch_for_keys.clone(),
+                        table_branch: target_active.clone(),
                     });
                     recovery_effects.push(crate::db::manifest::RecoveryBranchMergeEffect {
                         identity,
@@ -4272,7 +5230,7 @@ impl Omnigraph {
                     });
                 }
                 CandidateTableState::AdoptSourceState { .. } => {
-                    let Some(target) = target_branch else {
+                    let Some(target) = target_active.as_deref() else {
                         continue;
                     };
                     let creates_target_ref = source_entry.native_dataset_branch.is_some()
@@ -4337,10 +5295,7 @@ impl Omnigraph {
                 continue;
             }
         }
-        crate::instrumentation::record_merge_timing(
-            crate::instrumentation::MergeTimingPhase::FinalRevalidation,
-            final_revalidation_start.elapsed(),
-        );
+        final_revalidation_timing.finish();
 
         // Keep the sidecar alongside its handle: after the whole physical
         // effect set completes, confirmation binds every output slot and every
@@ -4379,17 +5334,16 @@ impl Omnigraph {
                     tombstones: Vec::new(),
                 },
             )?;
-            let recovery_arm_start = std::time::Instant::now();
+            let recovery_arm_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::RecoveryArm,
+            );
             let handle = crate::db::manifest::write_sidecar(
                 self.root_uri(),
                 self.storage_adapter(),
                 &sidecar,
             )
             .await?;
-            crate::instrumentation::record_merge_timing(
-                crate::instrumentation::MergeTimingPhase::RecoveryArm,
-                recovery_arm_start.elapsed(),
-            );
+            recovery_arm_timing.finish();
             Some((sidecar, handle))
         };
 
@@ -4408,6 +5362,9 @@ impl Omnigraph {
                 )?;
             }
 
+            let physical_publish_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::PhysicalPublish,
+            );
             let mut updates = Vec::new();
             let mut changed_edge_tables = false;
             let mut confirmed_ref_identifiers = HashMap::new();
@@ -4506,7 +5463,7 @@ impl Omnigraph {
                     }
                 };
                 if first_touch_effects.contains(table_key) {
-                    let target = target_branch.ok_or_else(|| {
+                    let target = target_active.as_deref().ok_or_else(|| {
                         OmniError::manifest_internal(format!(
                             "first-touch merge effect '{}' has no named target branch",
                             table_key
@@ -4536,6 +5493,7 @@ impl Omnigraph {
                 }
                 updates.push(update);
             }
+            physical_publish_timing.finish();
 
             // The Armed body remains rollback-only until every physical effect,
             // every first-touch ref identity, and every logical output slot are
@@ -4544,7 +5502,9 @@ impl Omnigraph {
                 crate::failpoints::names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM,
             )?;
             if let Some((sidecar, _)) = recovery.as_mut() {
-                let recovery_confirm_start = std::time::Instant::now();
+                let recovery_confirm_timing = crate::instrumentation::start_merge_timing(
+                    crate::instrumentation::MergeTimingPhase::RecoveryConfirm,
+                );
                 crate::db::manifest::confirm_branch_merge_sidecar_v9(
                     self.root_uri(),
                     self.storage_adapter(),
@@ -4553,10 +5513,7 @@ impl Omnigraph {
                     &confirmed_ref_identifiers,
                 )
                 .await?;
-                crate::instrumentation::record_merge_timing(
-                    crate::instrumentation::MergeTimingPhase::RecoveryConfirm,
-                    recovery_confirm_start.elapsed(),
-                );
+                recovery_confirm_timing.finish();
             }
 
             crate::failpoints::maybe_fail(
@@ -4569,7 +5526,9 @@ impl Omnigraph {
                 target_txn.effective_graph_head.as_deref(),
                 Some(target_head_commit_id)
             );
-            let manifest_publish_start = std::time::Instant::now();
+            let manifest_publish_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::ManifestPublish,
+            );
             // The manifest publisher reaches Lance MergeInsert and DataFusion's
             // physical planner. Erase that substrate-heavy future at the graph
             // publication boundary instead of making this recovery envelope's
@@ -4583,10 +5542,7 @@ impl Omnigraph {
                 merge_lineage,
             ))
             .await?;
-            crate::instrumentation::record_merge_timing(
-                crate::instrumentation::MergeTimingPhase::ManifestPublish,
-                manifest_publish_start.elapsed(),
-            );
+            manifest_publish_timing.finish();
 
             Ok::<_, OmniError>((updates, changed_edge_tables))
         })
@@ -4608,7 +5564,9 @@ impl Omnigraph {
         // Best-effort cleanup; the merge already landed durably so failing the
         // user here is undesirable.
         if let Some((_, handle)) = recovery {
-            let recovery_cleanup_start = std::time::Instant::now();
+            let recovery_cleanup_timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::RecoveryCleanup,
+            );
             if let Err(err) =
                 crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
             {
@@ -4618,10 +5576,7 @@ impl Omnigraph {
                     "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
                 );
             }
-            crate::instrumentation::record_merge_timing(
-                crate::instrumentation::MergeTimingPhase::RecoveryCleanup,
-                recovery_cleanup_start.elapsed(),
-            );
+            recovery_cleanup_timing.finish();
         }
 
         if changed_edge_tables {

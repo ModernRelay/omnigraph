@@ -12,8 +12,8 @@ use omnigraph_compiler::catalog::Catalog;
 use crate::error::{OmniError, Result};
 
 use super::layout::{
-    manifest_uri, open_manifest_dataset_with_identifier_with_session,
-    open_manifest_dataset_with_session,
+    manifest_uri, open_manifest_branch_with_identifier,
+    open_manifest_dataset_with_identifier_with_session, open_manifest_dataset_with_session,
 };
 use super::metadata::TableVersionMetadata;
 use super::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, current_stamp_entry, guard_stamp};
@@ -45,7 +45,7 @@ impl GenesisManifestAttempt {
     pub(crate) fn mint() -> Result<Self> {
         Ok(Self {
             lineage: GraphLineageRow {
-                graph_commit_id: ulid::Ulid::new().to_string(),
+                graph_commit_id: crate::dst_ids::new_ulid().to_string(),
                 graph_branch: None,
                 graph_manifest_version: GENESIS_MANIFEST_VERSION,
                 parent_commit_id: None,
@@ -131,8 +131,10 @@ pub(super) async fn init_manifest_graph(
             OmniError::manifest_internal(format!("attach stamp metadata to init batch: {e}"))
         })?;
     let reader = RecordBatchIterator::new(vec![Ok(manifest_batch)], schema);
+    let manifest_path = manifest_uri(root);
     let params = WriteParams {
         mode: WriteMode::Create,
+        store_params: Some(crate::storage::lance_store_params_for_uri(&manifest_path)?),
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
         auto_cleanup: None,
@@ -140,7 +142,6 @@ pub(super) async fn init_manifest_graph(
         session: Some(Arc::clone(control_session)),
         ..Default::default()
     };
-    let manifest_path = manifest_uri(root);
     let dataset = Dataset::write(reader, &manifest_path, Some(params))
         .await
         .map_err(|e| ManifestInitError::ManifestCreateOutcomeUnknown(OmniError::storage(e)))?;
@@ -246,15 +247,16 @@ pub(super) async fn open_manifest_graph(
     Dataset,
     ManifestState,
     lance::dataset::refs::BranchIdentifier,
+    Option<String>,
 )> {
-    let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
+    let (dataset, branch_identifier, native_branch) = open_manifest_branch_with_identifier(
         root_uri.trim_end_matches('/'),
         branch,
         control_session,
     )
     .await?;
     let known_state = read_manifest_state(&dataset).await?;
-    Ok((dataset, known_state, branch_identifier))
+    Ok((dataset, known_state, branch_identifier, native_branch))
 }
 
 pub(super) async fn open_manifest_graph_with_lineage(
@@ -309,7 +311,9 @@ async fn build_initial_entries(
         )
     })?;
 
-    for (name, node_type) in &catalog.node_types {
+    let mut __dst_nt: Vec<_> = catalog.node_types.iter().collect();
+    __dst_nt.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, node_type) in __dst_nt {
         let node_ir = accepted_ir
             .nodes
             .iter()
@@ -340,7 +344,9 @@ async fn build_initial_entries(
         version_metadata.insert(identity, metadata.to_json_string()?);
     }
 
-    for (name, edge_type) in &catalog.edge_types {
+    let mut __dst_et: Vec<_> = catalog.edge_types.iter().collect();
+    __dst_et.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, edge_type) in __dst_et {
         let edge_ir = accepted_ir
             .edges
             .iter()
@@ -389,6 +395,7 @@ async fn create_empty_dataset(
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
     let params = WriteParams {
         mode: WriteMode::Create,
+        store_params: Some(crate::storage::lance_store_params_for_uri(uri)?),
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
         allow_external_blob_outside_bases: true,

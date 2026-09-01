@@ -238,6 +238,10 @@ pub struct IoCounts {
     /// `__manifest` registry scans (publish state; includes the graph-lineage rows
     /// folded into `__manifest` by RFC-013 Phase 7).
     pub manifest_reads: u64,
+    /// Bytes returned by those real object-store reads. This distinguishes a
+    /// physical-address take from scanning a compacted history-sized fragment
+    /// even when both use a similar number of requests.
+    pub manifest_read_bytes: u64,
     /// Version-probe invocations (the cheap freshness check).
     pub version_probes: u64,
     /// DATA-table open CALL count through the two instrumented chokepoints — an
@@ -256,6 +260,20 @@ pub struct IoCounts {
     /// CPU/allocation term that grows with the backlog independently of the
     /// manifest/data IO counters.
     pub feed_commits_visited: u64,
+    /// CDC candidate-planning and bounded-page CPU/memory proxies. These are
+    /// explicit production seams because object-store read counts cannot reveal
+    /// repeated transaction-history walks or full-manifest iteration.
+    pub candidate_transaction_reads: u64,
+    pub candidate_fragment_metadata_steps: u64,
+    pub candidate_rows_examined: u64,
+    pub candidate_scan_target_rows_peak: u64,
+    pub candidate_scan_target_bytes_peak: u64,
+    pub change_images_materialized: u64,
+    /// Incremental vs full merge-authority projection refreshes and the exact
+    /// number of physical manifest rows hydrated to classify DV additions.
+    pub projection_incremental_refreshes: u64,
+    pub projection_full_refreshes: u64,
+    pub projection_identity_rows: u64,
 }
 
 impl IoCounts {
@@ -503,6 +521,15 @@ struct OpProbes {
     internal_open_count: Arc<AtomicU64>,
     manifest_scan_count: Arc<AtomicU64>,
     feed_commits_visited: Arc<AtomicU64>,
+    candidate_transaction_reads: Arc<AtomicU64>,
+    candidate_fragment_metadata_steps: Arc<AtomicU64>,
+    candidate_rows_examined: Arc<AtomicU64>,
+    candidate_scan_target_rows_peak: Arc<AtomicU64>,
+    candidate_scan_target_bytes_peak: Arc<AtomicU64>,
+    change_images_materialized: Arc<AtomicU64>,
+    projection_incremental_refreshes: Arc<AtomicU64>,
+    projection_full_refreshes: Arc<AtomicU64>,
+    projection_identity_rows: Arc<AtomicU64>,
 }
 
 impl OpProbes {
@@ -523,6 +550,15 @@ impl OpProbes {
             internal_open_count: Arc::new(AtomicU64::new(0)),
             manifest_scan_count: Arc::new(AtomicU64::new(0)),
             feed_commits_visited: Arc::new(AtomicU64::new(0)),
+            candidate_transaction_reads: Arc::new(AtomicU64::new(0)),
+            candidate_fragment_metadata_steps: Arc::new(AtomicU64::new(0)),
+            candidate_rows_examined: Arc::new(AtomicU64::new(0)),
+            candidate_scan_target_rows_peak: Arc::new(AtomicU64::new(0)),
+            candidate_scan_target_bytes_peak: Arc::new(AtomicU64::new(0)),
+            change_images_materialized: Arc::new(AtomicU64::new(0)),
+            projection_incremental_refreshes: Arc::new(AtomicU64::new(0)),
+            projection_full_refreshes: Arc::new(AtomicU64::new(0)),
+            projection_identity_rows: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
@@ -532,6 +568,15 @@ impl OpProbes {
             internal_open_count: Arc::clone(&h.internal_open_count),
             manifest_scan_count: Arc::clone(&h.manifest_scan_count),
             feed_commits_visited: Arc::clone(&h.feed_commits_visited),
+            candidate_transaction_reads: Arc::clone(&h.candidate_transaction_reads),
+            candidate_fragment_metadata_steps: Arc::clone(&h.candidate_fragment_metadata_steps),
+            candidate_rows_examined: Arc::clone(&h.candidate_rows_examined),
+            candidate_scan_target_rows_peak: Arc::clone(&h.candidate_scan_target_rows_peak),
+            candidate_scan_target_bytes_peak: Arc::clone(&h.candidate_scan_target_bytes_peak),
+            change_images_materialized: Arc::clone(&h.change_images_materialized),
+            projection_incremental_refreshes: Arc::clone(&h.projection_incremental_refreshes),
+            projection_full_refreshes: Arc::clone(&h.projection_full_refreshes),
+            projection_identity_rows: Arc::clone(&h.projection_identity_rows),
             // graph_build_count / graph_edges_built unused by this harness.
             ..Default::default()
         };
@@ -559,11 +604,29 @@ impl OpProbes {
             data_opener_reads: t.opener_reads,
             data_scan_reads: t.scan_reads,
             manifest_reads: manifest.read_iops,
+            manifest_read_bytes: manifest.read_bytes,
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
             internal_open_count: self.internal_open_count.load(Ordering::Relaxed),
             manifest_scan_count: self.manifest_scan_count.load(Ordering::Relaxed),
             feed_commits_visited: self.feed_commits_visited.load(Ordering::Relaxed),
+            candidate_transaction_reads: self.candidate_transaction_reads.load(Ordering::Relaxed),
+            candidate_fragment_metadata_steps: self
+                .candidate_fragment_metadata_steps
+                .load(Ordering::Relaxed),
+            candidate_rows_examined: self.candidate_rows_examined.load(Ordering::Relaxed),
+            candidate_scan_target_rows_peak: self
+                .candidate_scan_target_rows_peak
+                .load(Ordering::Relaxed),
+            candidate_scan_target_bytes_peak: self
+                .candidate_scan_target_bytes_peak
+                .load(Ordering::Relaxed),
+            change_images_materialized: self.change_images_materialized.load(Ordering::Relaxed),
+            projection_incremental_refreshes: self
+                .projection_incremental_refreshes
+                .load(Ordering::Relaxed),
+            projection_full_refreshes: self.projection_full_refreshes.load(Ordering::Relaxed),
+            projection_identity_rows: self.projection_identity_rows.load(Ordering::Relaxed),
         }
     }
 }
@@ -581,7 +644,9 @@ pub fn last_manifest_reads() -> Vec<String> {
 /// The only place the `QueryIoProbes` task-local + tracker wiring lives.
 pub async fn measure<F: Future>(op: F) -> (F::Output, IoCounts) {
     let (probes, handles) = OpProbes::install();
-    let out = with_query_io_probes(probes, op).await;
+    // Keep Lance 11's deeper write future out of the enclosing test future's
+    // layout; this helper is compiled by owners using rustc's default limit.
+    let out = with_query_io_probes(probes, Box::pin(op)).await;
     (out, handles.counts())
 }
 
@@ -590,7 +655,8 @@ pub async fn measure<F: Future>(op: F) -> (F::Output, IoCounts) {
 pub async fn measure_with_staged<F: Future>(op: F) -> (F::Output, IoCounts, StagedCounts) {
     let (probes, handles) = OpProbes::install();
     let merge = MergeWriteProbes::default();
-    let out = with_merge_write_probes(merge.clone(), with_query_io_probes(probes, op)).await;
+    let out =
+        with_merge_write_probes(merge.clone(), with_query_io_probes(probes, Box::pin(op))).await;
     let staged = StagedCounts {
         stage_append: merge.stage_append_calls(),
         stage_merge_insert: merge.stage_merge_insert_calls(),

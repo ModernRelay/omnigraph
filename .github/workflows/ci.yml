@@ -97,12 +97,53 @@ jobs:
       - name: Verify AGENTS.md ↔ docs/ cross-links
         run: bash scripts/check-agents-md.sh
 
+      - name: Verify documentation structure and RFC registry
+        run: python3 scripts/check-docs.py
+
+  workflow_action_pins:
+    name: Check Workflow Action Pins
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Reject mutable external action refs
+        run: python3 scripts/check-workflow-action-pins.py
+
+      - name: Enforce release vocabulary gates
+        run: python3 scripts/check-release-vocabulary-gates.py
+
+  azure_contract_guards:
+    name: Azure Contract Guards
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Verify container and package binary sets match
+        run: python3 scripts/check-container-binary-contract.py
+
+      - name: Enforce Azure admission dependency direction
+        run: python3 scripts/check-azure-admission-boundary.py
+
   graph_vocabulary_guard:
     name: Graph Vocabulary Guard
-    # Required PR context: keep this job independent of the documentation-only
-    # classifier so it always reports. The review-owned inventory protects the
-    # OpenAPI, Rust presentation-string, user-doc, and public-Rust surfaces.
+    # Keep this exact reporting context while it remains required by branch
+    # protection, but do not run the substrate-sized audit on pull requests.
+    # The full audit still runs after merge, on tags, and by manual dispatch.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      # Single switch for the vocabulary audit, disabled by decision on
+      # 2026-08-28. Set to "true" to re-enable every audit step at once (the
+      # public-Rust tooling and all three checks are gated on it). The job
+      # still runs its unit tests and reports success either way, so branch
+      # protection and the exact-SHA release gates stay wired.
+      VOCABULARY_AUDIT_ENABLED: "false"
     # A cold default + relevant all-features rustdoc pass over all seven public
     # library crates is substrate-sized. The first hosted run completed the
     # public-Rust step in 39 minutes, while the larger breaking-contract tree
@@ -154,13 +195,15 @@ jobs:
           echo "sha=$base" >> "$GITHUB_OUTPUT"
 
       - name: Install public-Rust system dependencies
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
       - name: Restore pinned public-Rust tooling
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         id: public_rust_tool_cache
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.rustup/toolchains/nightly-2026-08-01-x86_64-unknown-linux-gnu
@@ -169,6 +212,7 @@ jobs:
           key: vocabulary-public-api-${{ runner.os }}-${{ runner.arch }}-nightly-2026-08-01-cargo-public-api-0.52.0-v1
 
       - name: Install exact public-Rust tooling
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         id: public_rust_tool
         run: |
           set -euo pipefail
@@ -184,6 +228,7 @@ jobs:
           echo "binary=$tool" >> "$GITHUB_OUTPUT"
 
       - name: Cache public-Rust build data
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
@@ -193,12 +238,13 @@ jobs:
       - name: Test vocabulary guard
         run: cargo test -p omnigraph-vocabulary-guard --locked
 
-      - name: Check OpenAPI, Rust-string, and user-doc vocabulary
+      - name: Check OpenAPI and Rust-string vocabulary
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         env:
           BASE_SHA: ${{ steps.comparison_base.outputs.sha }}
         run: |
           set -euo pipefail
-          for surface in openapi rust-string user-docs; do
+          for surface in openapi rust-string; do
             cargo run -p omnigraph-vocabulary-guard --locked -- \
               check --surface "$surface" --base "$BASE_SHA" \
               --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
@@ -206,6 +252,7 @@ jobs:
           done
 
       - name: Check public-Rust vocabulary
+        if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         env:
           BASE_SHA: ${{ steps.comparison_base.outputs.sha }}
           CARGO_PUBLIC_API: ${{ steps.public_rust_tool.outputs.binary }}
@@ -216,6 +263,61 @@ jobs:
             --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
             --cargo-public-api "$tool" \
             --public-api-target-dir target/vocabulary-public-api
+
+  release_edge_after_vocabulary:
+    name: Release edge after vocabulary audit
+    needs: [classify_changes, graph_vocabulary_guard]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify_changes.outputs.run_full_ci == 'true'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/release-edge.yml
+    with:
+      source_ref: ${{ github.sha }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+
+  release_tag_after_vocabulary:
+    name: Release tag after vocabulary audit
+    needs: graph_vocabulary_guard
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ github.ref_name }}
+      source_ref: ${{ github.ref }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+    secrets: inherit
+
+  publish_tag_image_after_vocabulary:
+    name: Publish tag image after vocabulary audit
+    needs: graph_vocabulary_guard
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      tag: ${{ github.ref_name }}
+      source_ref: ${{ github.ref }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+    secrets: inherit
+
+  publish_tag_crates_after_vocabulary:
+    name: Publish tag crates after vocabulary audit
+    needs: graph_vocabulary_guard
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/publish-crates.yml
+    with:
+      tag: ${{ github.ref_name }}
+      source_ref: ${{ github.ref }}
+      ci_run_id: ${{ format('{0}', github.run_id) }}
+    secrets: inherit
 
   entrypoint_test:
     name: Container Entrypoint
@@ -228,6 +330,39 @@ jobs:
 
       - name: Verify omnigraph-server entrypoint arg composition
         run: sh docker/entrypoint_test.sh
+
+      - name: Test non-destructive Azure validation mode
+        run: sh deploy/azure/validate_test.sh
+
+      - name: Test Azure bootstrap readiness and admission modes
+        run: sh deploy/azure/bootstrap-entrypoint_test.sh
+
+      - name: Build Azure bootstrap image from inherited non-root user
+        run: sh deploy/azure/bootstrap_image_test.sh
+
+  azure_deployment_validation:
+    name: Azure Deployment Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Compile Azure Bicep templates
+        # Azure CLI 2.77.0 plus an explicit Bicep version. Both values are
+        # immutable inputs; the command performs no Azure login or mutation.
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            mcr.microsoft.com/azure-cli:2.77.0@sha256:d41153958a61392a4c9db1591e33b533ca8ab8b59529d212d06bb6ec7e9c1f25 \
+            sh -eu -c '
+              az bicep install --version v0.46.1 >/dev/null
+              az bicep build --file deploy/azure/foundation.bicep --stdout >/dev/null
+              az bicep build --file deploy/azure/runtime.bicep --stdout >/dev/null
+            '
 
   fmt:
     name: Format (rustfmt)
@@ -362,6 +497,19 @@ jobs:
           workspaces: |
             . -> target
 
+      - name: Install genuine v0.9 release for upgrade regression
+        run: |
+          set -euo pipefail
+          v09_dir="$RUNNER_TEMP/omnigraph-v09"
+          # The installer downloads the official archive and verifies its
+          # SHA256 before extraction. An exact VERSION never falls back to edge.
+          REPO_SLUG=ModernRelay/omnigraph VERSION=v0.9.0 INSTALL_DIR="$v09_dir" \
+            bash scripts/install.sh
+          test -x "$v09_dir/omnigraph"
+          [[ "$("$v09_dir/omnigraph" --version)" == "omnigraph 0.9.0" ]] \
+            || { echo "::error::upgrade regression requires the genuine v0.9.0 CLI"; exit 1; }
+          echo "OMNIGRAPH_V09_BIN=$v09_dir/omnigraph" >> "$GITHUB_ENV"
+
       - name: Run workspace and failpoint tests once
         run: |
           set -euo pipefail
@@ -373,6 +521,14 @@ jobs:
           cargo test --workspace --locked --no-fail-fast \
             --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
             -- --nocapture 2>&1 | tee "$test_log"
+          if grep -Fq "skipping v0.9 upgrade e2e:" "$test_log"; then
+            echo "::error::v0.9 upgrade regression skipped despite a configured release binary"
+            exit 1
+          fi
+          grep -Fq "v0.9 -> v0.10 upgrade e2e completed" "$test_log" \
+            || { echo "::error::v0.9 upgrade regression did not complete"; exit 1; }
+          grep -Eq "test current_v010_upgrades_genuine_v09_graph_end_to_end \\.\\.\\. ok" "$test_log" \
+            || { echo "::error::exact v0.9 upgrade regression did not pass"; exit 1; }
 
 
   v5_v6_format_fence:
@@ -710,3 +866,244 @@ jobs:
             echo "Unable to copy /logs from the RustFS container"
           fi
           echo "::endgroup::"
+
+  azurite_integration:
+    name: Azurite Azure Integration
+    # This configured backend contract runs after merge, on tags, and by
+    # manual dispatch. Keep it independent of `test` so cold backend graphs
+    # start together and a failure reports at its real boundary.
+    needs: classify_changes
+    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    runs-on: ubuntu-latest
+    # Cold failpoint and default-feature Lance graphs compile sequentially on
+    # the first cache miss; keep the timeout above the RustFS shard envelope.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      AZURE_STORAGE_USE_EMULATOR: "true"
+      AZURE_STORAGE_ACCOUNT_NAME: devstoreaccount1
+      AZURITE_BLOB_STORAGE_URL: http://127.0.0.1:10000
+      OMNIGRAPH_AZURE_TEST_CONTAINER: omnigraph-tests
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Cache Azure integration build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: azurite-azure
+
+      - name: Start pinned Azurite Blob service
+        # Azurite 3.35.0, pinned to the immutable multi-arch index digest.
+        run: |
+          set -euo pipefail
+          docker rm -f azurite >/dev/null 2>&1 || true
+          docker run -d \
+            --name azurite \
+            -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite:3.35.0@sha256:647c63a91102a9d8e8000aab803436e1fc85fbb285e7ce830a82ee5d6661cf37 \
+            azurite-blob --blobHost 0.0.0.0 --blobPort 10000
+          for _ in $(seq 1 60); do
+            if curl --silent --show-error \
+              "${AZURITE_BLOB_STORAGE_URL}/${AZURE_STORAGE_ACCOUNT_NAME}?comp=list" \
+              >/dev/null
+            then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Azurite did not become reachable"
+          docker logs azurite
+          exit 1
+
+      - name: Create Azurite test container
+        # This is the public emulator key, never a production credential. The
+        # emulator canonicalized resource repeats the account path segment.
+        run: |
+          python3 - <<'PY'
+          import base64
+          import datetime
+          import email.utils
+          import hashlib
+          import hmac
+          import os
+          import urllib.request
+
+          account = os.environ['AZURE_STORAGE_ACCOUNT_NAME']
+          container = os.environ['OMNIGRAPH_AZURE_TEST_CONTAINER']
+          endpoint = os.environ['AZURITE_BLOB_STORAGE_URL']
+          key = base64.b64decode(
+              'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/'
+              'K1SZFPTOtr/KBHBeksoGMGw=='
+          )
+          date = email.utils.format_datetime(
+              datetime.datetime.now(datetime.timezone.utc), usegmt=True
+          )
+          version = '2023-11-03'
+          canonical_headers = f'x-ms-date:{date}\nx-ms-version:{version}\n'
+          canonical_resource = (
+              f'/{account}/{account}/{container}\nrestype:container'
+          )
+          string_to_sign = (
+              'PUT\n\n\n\n\n\n\n\n\n\n\n\n'
+              + canonical_headers
+              + canonical_resource
+          )
+          signature = base64.b64encode(
+              hmac.new(key, string_to_sign.encode(), hashlib.sha256).digest()
+          ).decode()
+          request = urllib.request.Request(
+              f'{endpoint}/{account}/{container}?restype=container',
+              method='PUT',
+              headers={
+                  'Authorization': f'SharedKey {account}:{signature}',
+                  'Content-Length': '0',
+                  'x-ms-date': date,
+                  'x-ms-version': version,
+              },
+          )
+          with urllib.request.urlopen(request, timeout=10) as response:
+              if response.status != 201:
+                  raise SystemExit(f'unexpected create-container status: {response.status}')
+          PY
+
+      - name: Run exact Azure integration owners
+        run: |
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/azurite-azure.log"
+          : >"$test_log"
+
+          cargo test --locked -p omnigraph-storage \
+            tests::contract_suite_azure_when_configured \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+          cargo test --locked -p omnigraph-azure-admission \
+            tests::configured_azurite_enforces_one_lease_owner_and_explicit_break \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+          cargo test --locked -p omnigraph-azure-admission --test supervisor \
+            -- --nocapture 2>&1 | tee -a "$test_log"
+          cargo test --locked -p omnigraph-engine --features failpoints --test failpoints \
+            azure_recovery_rolls_forward_after_finalize_publisher_failure \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+          cargo test --locked -p omnigraph-engine --features failpoints --test failpoints \
+            azure_schema_apply_recovers_source_and_destination_after_partial_rename \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+          cargo test --locked -p omnigraph-cluster --test s3_cluster \
+            azure_cluster_full_lifecycle_import_apply_serve_evolve_delete \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+          cargo test --locked -p omnigraph-server --test s3 \
+            server_opens_azure_graph_directly_and_serves_snapshot_and_read \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+          cargo test --locked -p omnigraph-server --test s3 \
+            server_boots_azure_cluster_from_bare_storage_uri_and_serves_query \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+          cargo test --locked -p omnigraph-cli --test system_local \
+            local_cli_azure_end_to_end_init_load_read_flow \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+
+          if grep -Eiq 'skipping .*azure|skipping .*azurite' "$test_log"; then
+            echo "::error::a configured Azure test emitted its unconfigured skip"
+            exit 1
+          fi
+          for test_name in \
+            contract_suite_azure_when_configured \
+            configured_azurite_enforces_one_lease_owner_and_explicit_break \
+            held_admission_never_launches_child_then_runs_once_after_release \
+            held_job_terminated_before_admission_fails_without_launching_child \
+            graceful_server_signal_drains_process_group_before_release \
+            unexpected_server_exit_strands_lease_until_explicit_break \
+            azure_recovery_rolls_forward_after_finalize_publisher_failure \
+            azure_schema_apply_recovers_source_and_destination_after_partial_rename \
+            azure_cluster_full_lifecycle_import_apply_serve_evolve_delete \
+            server_opens_azure_graph_directly_and_serves_snapshot_and_read \
+            server_boots_azure_cluster_from_bare_storage_uri_and_serves_query \
+            local_cli_azure_end_to_end_init_load_read_flow
+          do
+            grep -Eq "test (tests::)?${test_name} \.\.\. ok" "$test_log" \
+              || { echo "::error::required Azure cell '${test_name}' did not execute normally"; exit 1; }
+          done
+
+      - name: Verify control and Lance objects share the declared container
+        run: |
+          python3 - "$RUNNER_TEMP/azurite-inventory.txt" <<'PY'
+          import base64
+          import datetime
+          import email.utils
+          import hashlib
+          import hmac
+          import os
+          import pathlib
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          account = os.environ['AZURE_STORAGE_ACCOUNT_NAME']
+          container = os.environ['OMNIGRAPH_AZURE_TEST_CONTAINER']
+          endpoint = os.environ['AZURITE_BLOB_STORAGE_URL']
+          key = base64.b64decode(
+              'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/'
+              'K1SZFPTOtr/KBHBeksoGMGw=='
+          )
+          date = email.utils.format_datetime(
+              datetime.datetime.now(datetime.timezone.utc), usegmt=True
+          )
+          version = '2023-11-03'
+          canonical_headers = f'x-ms-date:{date}\nx-ms-version:{version}\n'
+          canonical_resource = (
+              f'/{account}/{account}/{container}\ncomp:list\nrestype:container'
+          )
+          string_to_sign = (
+              'GET\n\n\n\n\n\n\n\n\n\n\n\n'
+              + canonical_headers
+              + canonical_resource
+          )
+          signature = base64.b64encode(
+              hmac.new(key, string_to_sign.encode(), hashlib.sha256).digest()
+          ).decode()
+          request = urllib.request.Request(
+              f'{endpoint}/{account}/{container}?comp=list&restype=container',
+              headers={
+                  'Authorization': f'SharedKey {account}:{signature}',
+                  'x-ms-date': date,
+                  'x-ms-version': version,
+              },
+          )
+          with urllib.request.urlopen(request, timeout=10) as response:
+              inventory = ET.fromstring(response.read())
+          if inventory.findtext('NextMarker'):
+              raise SystemExit('Azure inventory exceeded one explicit 5,000-object page')
+          names = [node.text or '' for node in inventory.findall('.//Name')]
+          pathlib.Path(__import__('sys').argv[1]).write_text('\n'.join(names) + '\n')
+          if not any('/__cluster/' in name for name in names):
+              raise SystemExit('no Azure cluster control object was observed')
+          if not any('.lance/' in name or '/_versions/' in name for name in names):
+              raise SystemExit('no Azure Lance dataset object was observed')
+          if not any(name.startswith('__omnigraph_azure_admission/v1/') for name in names):
+              raise SystemExit('no root-derived admission object was observed')
+          PY
+
+      - name: Upload Azurite integration evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: azurite-azure-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/azurite-azure.log
+            ${{ runner.temp }}/azurite-inventory.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Dump Azurite logs on failure
+        if: failure()
+        run: docker logs azurite

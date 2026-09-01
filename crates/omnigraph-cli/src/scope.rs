@@ -200,7 +200,7 @@ fn scope_from_binding(
                 );
             }
             // A cluster value is a config name (resolved against `clusters:`)
-            // or a literal root: an `s3://`/`file://` URI or a local cluster
+            // or a literal root: an `s3://`/`az://`/`file://` URI or a local cluster
             // directory. Only a configured name is rewritten; anything else is
             // passed through to the cluster-state resolver verbatim, so a bare
             // directory path keeps working as it did for per-command `--cluster`.

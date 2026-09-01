@@ -17,13 +17,15 @@ use std::collections::BTreeSet;
 
 use lance::Dataset;
 
+use super::candidate_scan::{CandidatePlan, EmitSource};
 use super::model::{
     COMMIT_CHANGES_MAX_BYTES, ChangeEntityKind, ChangeFeedScope, ChangeOpKind, EntityEndpoints,
     EntityImage, GraphEntityChange, GraphTypeRef,
 };
-use super::row_compare::{OrderedRows, RawRow, rows_equal, user_schema_fingerprint};
+use super::row_compare::{OrderedRows, RawRow, ScanTargets, rows_equal, user_schema_fingerprint};
 use super::token::{cursor_rejected, opaque_type_id};
 use super::{changed_table_intervals, parse_table_key};
+use crate::db::DatasetEntry;
 use crate::db::logical_row_image;
 use crate::db::manifest::Snapshot;
 use crate::error::{OmniError, Result};
@@ -126,6 +128,7 @@ async fn emitted_image(
     raw: &RawRow,
     kind: ChangeEntityKind,
 ) -> Result<EntityImage> {
+    crate::instrumentation::record_change_image_materialized();
     let mut properties = logical_row_image(dataset, &raw.slice, 0).await?;
     properties.remove("id");
     let endpoints = if kind == ChangeEntityKind::Edge {
@@ -147,14 +150,14 @@ async fn emitted_image(
     })
 }
 
-enum Emit {
+pub(crate) enum Emit {
     Delete(RawRow),
     Insert(RawRow),
     Update { before: RawRow, after: RawRow },
 }
 
 impl Emit {
-    fn op(&self) -> ChangeOpKind {
+    pub(crate) fn op(&self) -> ChangeOpKind {
         match self {
             Self::Insert(_) => ChangeOpKind::Insert,
             Self::Update { .. } => ChangeOpKind::Update,
@@ -166,7 +169,7 @@ impl Emit {
 /// The next in-scope logical change in the ordered id merge, or `None` when
 /// both sides are exhausted. Equal rows and out-of-scope operations are
 /// consumed without image or payload work.
-async fn next_emit(
+pub(crate) async fn next_emit(
     from: &mut OrderedRows,
     to: &mut OrderedRows,
     scope: &ChangeFeedScope,
@@ -206,14 +209,23 @@ async fn next_emit(
 /// One paired table lifetime that survived the schema gate, with both pinned
 /// datasets already open (the same handles the scans consume, so a changed
 /// interval costs at most two opens per page).
-struct IntervalPlan {
+pub(crate) struct IntervalPlan {
     /// The published opaque type identity: the block ordering key, the
     /// continuation key, and `GraphTypeRef.id`, all one value.
     opaque_id: String,
     kind: ChangeEntityKind,
     type_name: String,
-    from_dataset: Dataset,
-    to_dataset: Dataset,
+    /// The paired manifest entries (begin/end version, branch, identity).
+    pub(crate) from_entry: DatasetEntry,
+    pub(crate) to_entry: DatasetEntry,
+    pub(crate) from_dataset: Dataset,
+    pub(crate) to_dataset: Dataset,
+    /// The candidate-pruning decision, computed by `plan_intervals` BEFORE the
+    /// final post-open head witness. The adjacent transaction is referenced by
+    /// the already-pinned child manifest, and `Some` stores the complete
+    /// transaction-touched parent/child fragment plan so emission performs no
+    /// later history lookup. `None` means the exact ordered merge.
+    pub(crate) candidate_plan: Option<CandidatePlan>,
 }
 
 /// Resolve the exceptional bounded digest position to its exact logical ID.
@@ -288,6 +300,7 @@ async fn plan_intervals(
     child: &Snapshot,
     schema_identity_domain: &str,
     graph_commit_id: &str,
+    scope: &ChangeFeedScope,
 ) -> Result<Vec<IntervalPlan>> {
     let intervals = changed_table_intervals(parent, child);
 
@@ -329,12 +342,33 @@ async fn plan_intervals(
                     return Err(schema_boundary(graph_commit_id, table_key));
                 }
                 let (kind, type_name) = parse_table_key(table_key);
+                let kind: ChangeEntityKind = kind.into();
+                // Classify the interval HERE — before the head witness below —
+                // and retain the complete physical plan. The one transaction is
+                // referenced by the already-pinned child manifest; no history
+                // lookup is permitted later during emission. Scope-filtered
+                // intervals are never emitted, so their stored decision is
+                // irrelevant.
+                let candidate_plan = if scope.wants_kind(kind) && scope.wants_type_name(type_name) {
+                    super::candidate_scan::interval_candidate_plan(
+                        from,
+                        to,
+                        &from_dataset,
+                        &to_dataset,
+                    )
+                    .await?
+                } else {
+                    None
+                };
                 plans.push(IntervalPlan {
                     opaque_id: opaque_type_id(schema_identity_domain, interval.identity),
-                    kind: kind.into(),
+                    kind,
                     type_name: type_name.to_string(),
+                    from_entry: from.clone(),
+                    to_entry: to.clone(),
                     from_dataset,
                     to_dataset,
+                    candidate_plan,
                 });
             }
             (None, None) => unreachable!("changed intervals have at least one endpoint"),
@@ -356,6 +390,12 @@ async fn plan_intervals(
     // cannot undergo branch-name ABA and pays no extra manifest resolution.
     reprove_named_branch_heads(store, parent, &parent_branches).await?;
     reprove_named_branch_heads(store, child, &child_branches).await?;
+    // Nothing after this witness may read the branch's numeric-path history
+    // live: version manifests sit at replaceable numeric paths (unlike
+    // UUID-named data and transaction files), so a later live read would see a
+    // recreated branch's history under this commit's label. Tests park here
+    // and recreate the branch to pin that contract.
+    crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_POST_HEAD_WITNESS)?;
     // The opaque ids are domain-scoped SHA-256 projections of distinct
     // immutable identities, so this order is total and deterministic.
     plans.sort_by(|left, right| {
@@ -377,6 +417,9 @@ async fn reprove_named_branch_heads(
     branches: &BTreeSet<String>,
 ) -> Result<()> {
     for branch in branches {
+        // `branches` holds native fork refs; graph heads are keyed by the
+        // logical branch those forks belong to.
+        let branch = crate::branch_names::logical_branch_name(branch);
         let fresh = crate::db::manifest::ManifestCoordinator::snapshot_at(
             store.root_uri(),
             Some(branch),
@@ -416,6 +459,7 @@ pub(crate) async fn enumerate_commit_changes(
         child,
         schema_identity_domain,
         graph_commit_id,
+        scope,
     )
     .await?;
 
@@ -458,23 +502,55 @@ pub(crate) async fn enumerate_commit_changes(
             id: plan.opaque_id.clone(),
             name: plan.type_name.clone(),
         };
-        let mut left = OrderedRows::open(plan.from_dataset, after_id.as_deref()).await?;
-        let mut right = OrderedRows::open(plan.to_dataset, after_id.as_deref()).await?;
+        // Per-interval emitter: the touched-fragment candidate path when the
+        // commit's effect is a proven adjacent row-set-preserving shape, else
+        // the exact full ordered merge. Both yield the same id-ordered `Emit`
+        // stream, so the budgeting/continuation loop below is identical.
+        // Before-images come from the parent handle, after-images from the
+        // child handle. The pruning decision itself was made by
+        // `plan_intervals` before, and covered by, the final head witness — no
+        // live history read happens here.
+        let mut source = EmitSource::plan(
+            &plan.from_entry,
+            &plan.to_entry,
+            plan.from_dataset,
+            plan.to_dataset,
+            plan.candidate_plan,
+            after_id.as_deref(),
+            scope,
+            ScanTargets::for_page(budget.remaining_rows, budget.remaining_bytes),
+        )
+        .await?;
 
-        while let Some(emit) = next_emit(&mut left, &mut right, scope).await? {
+        while let Some(emit) = source.next().await? {
+            // The source yields one look-ahead change so we can distinguish a
+            // complete block from a truncated one. If the page's row budget (or
+            // an already-used byte budget) is exhausted, that sentinel must not
+            // materialize JSON or Blob payloads merely to prove continuation.
+            if budget.remaining_rows == 0 || (budget.remaining_bytes == 0 && budget.has_emitted()) {
+                return Ok(match last_emitted {
+                    Some(key) if emitted_this_call => CommitEnumeration::Truncated(key),
+                    // A feed can carry an exhausted page-wide budget into the
+                    // next commit. Its caller ends at the previous block
+                    // boundary; no image-size value is needed in that case.
+                    _ => CommitEnumeration::Exhausted { required_bytes: 0 },
+                });
+            }
             let op = emit.op();
             let (id, before, after) = match emit {
                 Emit::Insert(raw) => {
-                    let image = emitted_image(right.dataset(), &raw, plan.kind).await?;
+                    let image = emitted_image(source.child_dataset(), &raw, plan.kind).await?;
                     (raw.id, None, Some(image))
                 }
                 Emit::Delete(raw) => {
-                    let image = emitted_image(left.dataset(), &raw, plan.kind).await?;
+                    let image = emitted_image(source.parent_dataset(), &raw, plan.kind).await?;
                     (raw.id, Some(image), None)
                 }
                 Emit::Update { before, after } => {
-                    let before_image = emitted_image(left.dataset(), &before, plan.kind).await?;
-                    let after_image = emitted_image(right.dataset(), &after, plan.kind).await?;
+                    let before_image =
+                        emitted_image(source.parent_dataset(), &before, plan.kind).await?;
+                    let after_image =
+                        emitted_image(source.child_dataset(), &after, plan.kind).await?;
                     (after.id, Some(before_image), Some(after_image))
                 }
             };
@@ -500,11 +576,11 @@ pub(crate) async fn enumerate_commit_changes(
             // over budget), so a legal committed change — whose two images can
             // exceed the write-path-derived ceiling once managed Blobs inline as
             // base64 — is always deliverable, one per page if needed. The row
-            // budget still bounds packing. `Exhausted` now only signals a
-            // zero-capacity request (`max_changes == 0`), which validation
-            // already rejects; it is retained defensively.
+            // budget still bounds packing. `Exhausted` is retained for a feed
+            // carrying a page-wide budget already consumed by a prior block;
+            // a standalone request's validated budget starts nonzero.
             let over_bytes = encoded_bytes > budget.remaining_bytes;
-            if budget.remaining_rows == 0 || (over_bytes && budget.has_emitted()) {
+            if over_bytes && budget.has_emitted() {
                 return Ok(match last_emitted {
                     Some(key) if emitted_this_call => CommitEnumeration::Truncated(key),
                     _ => CommitEnumeration::Exhausted {

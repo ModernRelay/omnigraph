@@ -9,8 +9,21 @@
 
 pub(crate) mod blob;
 mod branch_control;
+mod branch_names;
 pub mod changes;
 pub mod db;
+#[cfg(feature = "dst")]
+pub mod dst_clock;
+#[cfg(not(feature = "dst"))]
+pub(crate) mod dst_clock;
+#[cfg(feature = "dst")]
+pub mod dst_gate;
+#[cfg(not(feature = "dst"))]
+pub(crate) mod dst_gate;
+#[cfg(feature = "dst")]
+pub mod dst_ids;
+#[cfg(not(feature = "dst"))]
+pub(crate) mod dst_ids;
 pub mod embedding;
 pub mod error;
 mod exec;
@@ -40,3 +53,12 @@ pub struct MutationReceipt {
     pub result: omnigraph_compiler::result::MutationResult,
     pub commit: Option<db::GraphCommit>,
 }
+
+// DST seam: registry access for the harness's Lance-realm fault injector.
+// Mutable process-wide authority, so it exists only under the `dst`
+// feature — and doc(hidden), unlike the documented dst_* seam modules:
+// the modules are the designed test API, this re-export is raw internal
+// authority kept greppable but out of the docs.
+#[cfg(feature = "dst")]
+#[doc(hidden)]
+pub use lance_access::store_registry as dst_lance_store_registry;

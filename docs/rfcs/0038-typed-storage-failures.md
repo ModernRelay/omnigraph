@@ -1,15 +1,24 @@
+---
+rfc: "0038"
+title: "Typed storage failures"
+track: public
+status: accepted
+implementation: complete
+authors:
+  - Ragnor Comerford (@ragnorc)
+created: 2026-08-16
+updated: 2026-08-23
+discussion: "https://github.com/ModernRelay/omnigraph/pull/491"
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
+
 # RFC 0038: Typed storage failures
 
-| | |
-|---|---|
-| **Status** | Accepted |
-| **Author track** | Public contribution |
-| **Author(s)** | Ragnor Comerford ([`ragnorc`](https://github.com/ragnorc)) |
-| **Discussion** | [PR #491](https://github.com/ModernRelay/omnigraph/pull/491) and its [maintainer review](https://github.com/ModernRelay/omnigraph/pull/491#issuecomment-5281302575) |
-| **Implementation** | [PR #491](https://github.com/ModernRelay/omnigraph/pull/491) is the obsolete prototype; [PR #524](https://github.com/ModernRelay/omnigraph/pull/524) is its replacement from current `main`. |
-
-> Status is maintained by maintainers: `Proposed` while the PR is open,
-> `Accepted` on merge, `Declined` on close, and `Superseded by NNNN` later.
+[PR #491](https://github.com/ModernRelay/omnigraph/pull/491) is the obsolete
+prototype; [PR #524](https://github.com/ModernRelay/omnigraph/pull/524) is the
+completed replacement from current `main`.
 
 ## Summary
 
@@ -270,7 +279,7 @@ Existing operation-local boundaries retain their narrower meanings:
 - optimize keeps its local raw-Lance retry classifier; and
 - no other Lance conflict becomes a replay signal.
 
-RFC-034 recovery disposition and RFC-036 supervision remain separate
+RFC 0034 recovery disposition and RFC 0036 supervision remain separate
 contracts. A future supervisor may consider `Transient` after its recovery and
 effect-state rules authorize another attempt, but this RFC supplies neither
 that authorization nor scheduling policy.

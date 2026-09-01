@@ -1,33 +1,35 @@
 ---
-type: spec
-title: "RFC-028 — Stable schema identity and table incarnation"
-description: Defines accepted rename-stable type, property, and table identities plus drop/recreate incarnation semantics as the shared prerequisite for RFC-023 through RFC-026.
-status: implemented
-tags: [eng, rfc, schema, identity, incarnation, migration, versioning, lance, omnigraph]
-timestamp: 2026-07-14
-owner: OmniGraph maintainers
+rfc: "0028"
+title: "Stable schema identity and table incarnation"
+track: maintainer
+status: accepted
+implementation: complete
+authors:
+  - OmniGraph maintainers
+created: 2026-07-14
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-028: Stable schema identity and table incarnation
+# RFC 0028: Stable schema identity and table incarnation
 
-**Status:** Implemented (2026-07-15)
-**Date:** 2026-07-14
-**Author track:** Maintainer design series
-
-> **RFC-026 disposition:** stable schema identity remains implemented in v5/v6,
-> but RFC-026 was later rejected and removed. Its lifecycle, WAL, and v7+
+> **RFC 0026 disposition:** stable schema identity remains implemented in v5/v6,
+> but RFC 0026 was later rejected and removed. Its lifecycle, WAL, and v7+
 > passages below are historical consumers of the identity model, not current
-> format behavior. See [the removal decision](../dev/wal-removal.md).
+> format behavior. See [the current ingestion design](../dev/ingestion.md).
 
-**Depends on:** [RFC-022](0022-unified-write-path.md)'s accepted-schema capture,
+**Depends on:** [RFC 0022](0022-unified-write-path.md)'s accepted-schema capture,
 SchemaApply recovery, and strict publication boundary
 **Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance table-schema,
 schema-evolution, transaction, and versioning specifications
 **Audience:** compiler, schema, engine, migration, and release maintainers
-**Architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
-BLOCKER-07 is closed by this implementation; sibling blockers retain their own
-RFC boundaries.
+
+Architecture-review BLOCKER-07 is closed by this implementation. The durable
+review conclusions are incorporated here; the separate ledger has been retired.
 
 ---
 
@@ -78,18 +80,18 @@ reject the graph.
 
 That gap is already load-bearing for four independent drafts:
 
-- [RFC-023](0023-key-conflict-fencing.md) must preserve the key contract across
+- [RFC 0023](0023-key-conflict-fencing.md) must preserve the key contract across
   table and field renames;
-- [RFC-024](0024-durable-table-heads.md) needs a head key that does not change
+- [RFC 0024](0024-durable-table-heads.md) needs a head key that does not change
   when the public graph type name changes and a token that detects dataset ABA;
-- [RFC-025](0025-checkpoint-retention.md) must bind retained table versions to
+- [RFC 0025](0025-checkpoint-retention.md) must bind retained table versions to
   the intended logical table lifetime;
-- [RFC-026](0026-memwal-streaming-ingest.md) must keep logical stream lifecycle
+- [RFC 0026](0026-memwal-streaming-ingest.md) must keep logical stream lifecycle
   and reject-history ownership stable across rename while separately rebinding
   any rematerialized physical WAL and refusing drop/recreate adoption.
 
 Letting each consumer invent identity would create four formats that can drift.
-Making RFC-024 own the shared capability is also wrong: durable heads remain an
+Making RFC 0024 own the shared capability is also wrong: durable heads remain an
 independently gated optimization and cannot be a hidden prerequisite for every
 correctness consumer. This RFC extracts the one common contract.
 
@@ -106,7 +108,7 @@ In scope:
 - graph-root and branch semantics;
 - the boundary between logical identity and Lance physical field/ref identity;
 - internal-format activation and upgrade behavior;
-- the contract consumed by RFC-023 through RFC-026.
+- the contract consumed by RFC 0023 through RFC 0026.
 
 Out of scope:
 
@@ -419,7 +421,7 @@ or graph-visible state can move:
 6. validate identity uniqueness and every name/ID relationship;
 7. stage desired source, desired IR, schema state, and the exact identity-bearing
    migration plan;
-8. arm the RFC-022 SchemaApply sidecar with the accepted and desired schema
+8. arm the RFC 0022 SchemaApply sidecar with the accepted and desired schema
    tokens before the first table effect.
 
 After arming, the desired domain, IDs, incarnations, hashes, and allocator mark
@@ -429,7 +431,7 @@ recovery uses the staged IR and exact sidecar rather than recompiling source or
 reminting identity.
 
 Roll-forward publishes the fixed manifest outcome before promoting the staged
-schema contract, preserving RFC-022's existing ordering. Rollback restores or
+schema contract, preserving RFC 0022's existing ordering. Rollback restores or
 reclaims only effects owned by the attempt and leaves the previously accepted
 IR authoritative. A first-touch table path is never adopted because its name
 matches a desired type; ownership still requires the exact sidecar and physical
@@ -444,7 +446,7 @@ boundary or introduce branch-local schemas.
 
 Lance field IDs are immutable within one Lance table schema and Lance's native
 column-rename operation preserves them. A Lance field ID is nevertheless scoped
-to one exact physical dataset/schema lineage, not to RFC-028's logical table
+to one exact physical dataset/schema lineage, not to RFC 0028's logical table
 incarnation, and is not a graph-level type or property ID. OmniGraph's current
 staged overwrite path does not claim to preserve a field ID across a property
 rename until it uses, and verifies, Lance's native rename primitive.
@@ -461,20 +463,20 @@ For an interface projection, the catalog first resolves the interface-owned
 property ID through the node property's satisfaction link; only the resulting
 node-owned property ID maps to that table's Lance field.
 
-RFC-023 therefore addresses primary-key metadata by the pinned table's Lance
+RFC 0023 therefore addresses primary-key metadata by the pinned table's Lance
 field ID while binding the surrounding table contract to
-`(stable_table_id, incarnation_id)`. RFC-024 through RFC-026 similarly carry
+`(stable_table_id, incarnation_id)`. RFC 0024 through RFC 0026 similarly carry
 logical identity and retain their own exact physical tokens.
 
 ## 8. Format activation and upgrade
 
 SchemaIR v2, the identity domain/allocator, and identity-bearing manifest rows
-are one internal storage-format capability. RFC-028 landed as internal manifest
+are one internal storage-format capability. RFC 0028 landed as internal manifest
 schema v5; that release kept `MIN_SUPPORTED == CURRENT == 5` and added the
 identity version to the release/stamp history. V6 preserved this contract and
-added RFC-023 key fencing; v7 preserved both and added RFC-026 identity-keyed
+added RFC 0023 key fencing; v7 preserved both and added RFC 0026 identity-keyed
 stream-lifecycle authority. Historical v8 preserved those contracts and added
-RFC-026 stream-config v2 plus recovery-v11 for the private B1 row/fold core.
+RFC 0026 stream-config v2 plus recovery-v11 for the private B1 row/fold core.
 V9 preserves those worker mechanics and activates stream-config v3, lifecycle
 state v2, trusted hidden attribution, the manifest-selected token participant,
 and recovery-v12's exact base-plus-token fold. V10 adds the required
@@ -512,7 +514,7 @@ graph. Activation follows the documented strand:
 3. use the new binary to initialize a different graph root; init mints the new
    identity domain and writes a complete identity-capable schema contract before
    accepting data;
-4. load the export through the ordinary RFC-022 recovered write path;
+4. load the export through the ordinary RFC 0022 recovered write path;
 5. verify the rebuilt graph, then cut clients over.
 
 The rebuilt root does not preserve old identities, branches, commit DAG,
@@ -527,22 +529,22 @@ init/import never mutates the source graph; discard or repair the target and
 retry.
 
 An independently released later capability requires another rebuild under the
-same policy. RFC-023, RFC-024, RFC-025, or RFC-026 may co-release with this
+same policy. RFC 0023, RFC 0024, RFC 0025, or RFC 0026 may co-release with this
 format to reduce operator cutovers only after each RFC is independently
 accepted and the combined initialization/recovery matrix passes. Co-release is
 release coordination, not permission for a draft sibling to define identity.
 
 ## 9. Consumer contract
 
-- **RFC-023:** every keyed table is identified by stable table ID plus
+- **RFC 0023:** every keyed table is identified by stable table ID plus
   incarnation; the pinned Lance field ID addresses PK metadata. Rename preserves
   the pair; drop/re-add cannot inherit the old fencing authority.
-- **RFC-024:** `table_head` keys use stable table ID and head payloads carry
+- **RFC 0024:** `table_head` keys use stable table ID and head payloads carry
   incarnation. It owns head storage and lookup, not ID minting.
-- **RFC-025:** checkpoint table entries carry stable table ID and incarnation in
+- **RFC 0025:** checkpoint table entries carry stable table ID and incarnation in
   addition to exact physical location/ref/version pins. It owns retention
   authority and Lance tags, not identity.
-- **RFC-026:** stream lifecycle rows and deterministic reject keys carry stable
+- **RFC 0026:** stream lifecycle rows and deterministic reject keys carry stable
   table ID plus incarnation. A same-dataset rename preserves the physical
   enrollment. Any future explicit rematerializing-rename capability would
   preserve logical history ownership but must fence and rebind through a fresh
@@ -705,11 +707,11 @@ The implementation review completed these gates:
 2. confirm every name-bearing internal reference that must become ID-bearing;
 3. confirm format refusal runs before schema/recovery parsing on every open
    mode;
-4. enumerate the exact RFC-022 sidecar fields that fix desired identity,
+4. enumerate the exact RFC 0022 sidecar fields that fix desired identity,
    allocator state, manifest identity pairs, and rename bindings;
 5. name the implementation tests that extend existing compiler,
    `lifecycle.rs`, `schema_apply.rs`, recovery, and cross-version owners.
 
 This implementation closes BLOCKER-07's specification-ownership contradiction.
-RFC-023 through RFC-026 may consume the stable pair, but each still owns its
+RFC 0023 through RFC 0026 may consume the stable pair, but each still owns its
 independent activation, evidence, and format/recovery gates.

@@ -1,99 +1,171 @@
-# RFCs
+# OmniGraph RFCs
 
-Substantial changes to OmniGraph — new user-facing surface, format or protocol
-changes, anything irreversible or cross-cutting — go through a lightweight RFC
-so the design is agreed *as reviewable code* before implementation starts.
-`docs/rfcs/` is the durable home for both externally authored proposals and
-maintainer design series. Every formal RFC uses the same four-digit filename
-namespace; explicit metadata selects the applicable lifecycle.
+RFCs are durable decision records for changes that are costly to reverse or
+wide enough that implementation review alone cannot establish the right shape.
+All formal RFCs live in this directory and use one lifecycle, one metadata
+schema, and one number namespace. `track` records where a proposal came from;
+it does not change the review or acceptance rules.
 
-This complements the always-on review bar in
-[../dev/invariants.md](../dev/invariants.md): the invariants say *what every
-change must respect*; an RFC says *why this particular change is worth making and
-how*.
+The architectural invariants remain the hard boundary for every change. An RFC
+explains why a particular design is worth its long-term liability and records
+the evidence behind the decision; it cannot waive
+[the invariants or deny-list](../dev/invariants.md).
 
-> **Two tracks, don't conflate their lifecycle.** Every RFC must declare an
-> `Author track` of either `Public contribution` or
-> `Maintainer design series`, plus an explicit `Status`. Those fields—not the
-> filename—select the lifecycle. Anyone may author a public contribution RFC,
-> and merge means maintainer acceptance. Maintainer design series may be merged
-> and revised while still draft so design, review findings, and implementation
-> evidence remain visible together. Existing `docs/dev/rfc-00N-*.md` files are
-> legacy internal design and implementation records that retain their existing
-> lifecycle; new formal RFCs live here.
+## When an RFC is required
 
-## When you need one
+Write an RFC before implementing:
 
-- **RFC required:** new query/schema/CLI/HTTP surface; on-disk or wire-format
-  changes; a new substrate dependency; anything the deny-list in
-  [../dev/invariants.md](../dev/invariants.md) flags; anything irreversible
-  ("reversibility shapes evidence demand").
-- **RFC not required:** bug fixes for an `accepted` issue, and the trivial
-  fast-lane (typos, docs, deps) — see [../../CONTRIBUTING.md](../../CONTRIBUTING.md).
+- a new query, schema, CLI, HTTP, or SDK contract;
+- an on-disk format, wire format, recovery protocol, or compatibility change;
+- a new storage substrate or dependency that constrains future architecture;
+- a cross-cutting correctness, authorization, or operational boundary; or
+- an exception to a deny-list item or another hard-to-reverse choice.
 
-If you're unsure, open the issue anyway — triage routes it: `accepted` alone
-means code may follow, while `needs-rfc` means the design lands first.
+Routine bug fixes, narrow refactors, dependency maintenance, and documentation
+corrections normally do not need an RFC. If the code can land safely and be
+reverted cheaply without committing the project to a lasting contract, an
+issue and implementation PR are usually enough.
 
-## Public contribution lifecycle
+## File and heading format
 
+- Filename: `NNNN-kebab-title.md`.
+- Heading: `# RFC NNNN: Title`.
+- Reference labels use `RFC NNNN` and point to the canonical RFC filename.
+- `0000-template.md` is reserved and is not an RFC.
+- Allocate the number only when adding the RFC file. Numbers are never reused
+  or backfilled, including numbers from rejected, superseded, abandoned, or
+  out-of-tree drafts.
+- Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
+  Revise the canonical file; preserve meaningful changes in its decision log.
+
+The next available number is **0044**. RFC 0040 is reserved by
+[PR #546](https://github.com/ModernRelay/omnigraph/pull/546); lower gaps are
+historical and must not be reused.
+
+## Required frontmatter
+
+Every RFC uses exactly this schema:
+
+```yaml
+---
+rfc: "0042"
+title: "Short descriptive title"
+track: maintainer
+status: draft
+implementation: not-started
+authors:
+  - Name or handle
+created: 2026-08-23
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
 ```
-Issue (feature/rfc + needs-triage)
-      │ maintainer accepts the problem → needs-rfc
-      ▼
-RFC pull request  →  adds docs/rfcs/NNNN-title.md
-                         (Author track: Public contribution; Status: Proposed)
-      │
-maintainer review  ──▶  changes requested / declined (PR closed, with rationale)
-      │
-      ▼
-merged  ==  Accepted   (the merged file is the durable decision record)
-      │
-      ▼
-Implementation PR(s)  reference the accepted RFC
+
+Field rules:
+
+- `rfc` is the four-digit string from the filename and heading.
+- `title` matches the heading text.
+- `track` is `public` or `maintainer`; both follow the same lifecycle.
+- `status` is one of `draft`, `accepted`, `rejected`, or `superseded`.
+- `implementation` is one of `not-started`, `in-progress`, `partial`,
+  `complete`, `removed`, or `n/a`.
+- `authors` is a non-empty list.
+- `created` and `updated` use `YYYY-MM-DD`.
+- `discussion` is a durable issue/PR URL or `null`.
+- `supersedes` and `superseded_by` contain four-digit RFC strings. Update both
+  sides when the relationship applies to the whole decision.
+- `blocked_on` contains concrete evidence or dependency gates. Research being
+  blocked is not a lifecycle status; it is a draft with a non-empty list.
+
+Frontmatter is the only status and date authority. Do not repeat it in a table
+or a hand-written `Status`, `Date`, `Author track`, or `Implementation` field.
+The body may contain a dated disposition or implementation note when it adds
+context rather than restating metadata.
+
+## Lifecycle
+
+```text
+draft ──maintainer decision──▶ accepted ──later replacement──▶ superseded
+  │                                  │
+  └──maintainer decision──▶ rejected └──implementation progresses separately
 ```
 
-- **Author:** anyone. **Acceptance:** a maintainer decision, performed by
-  merging the RFC PR. Declining is closing it with rationale.
-- The merged RFC *is* the accepted record — there is no separate sign-off step.
-- Later reversals don't edit history: supersede with a new RFC that links back
-  and flip the old one's `Status` to `Superseded`.
+- **Draft**: under design and review. A draft may live on the main branch so
+  review and evidence have one durable home, but merge alone does not accept
+  it. Product behavior must not claim authority from a draft.
+- **Accepted**: maintainers approved the decision and its stated boundaries.
+  Implementation status moves independently as work lands.
+- **Rejected**: the decision was not adopted. Keep the record and concise
+  rationale; use `removed` if an experiment shipped and was later deleted,
+  otherwise `n/a` or `not-started` as appropriate.
+- **Superseded**: another RFC owns the current decision. Link both directions
+  and keep the old rationale intact.
 
-## Numbering & naming
+Acceptance requires all invariants, compatibility consequences, operational
+boundaries, and owned evidence gates to be explicit. A blocker owned by another
+RFC does not block an independently reviewable decision, but hidden shared
+dependencies do.
 
-- Every formal RFC file is `docs/rfcs/NNNN-kebab-title.md`, where `NNNN` is
-  the next free zero-padded integer. `0000-template.md` is reserved.
-- Pick the number when you open the PR; if it collides with another in-flight
-  RFC, the second to merge bumps theirs.
-- Numbers are never reused. A maintainer-series or superseded record still
-  reserves its number.
-- Every RFC declares exactly one `Author track` and an explicit `Status`. If a
-  file has both YAML frontmatter and rendered metadata, the values must agree.
+## Process
 
-### Public status values
+1. Copy [the template](0000-template.md) to the next available number.
+2. Set every frontmatter field and open a PR in `draft` status.
+3. Review the problem, user/operational behavior, invariants, substrate
+   alignment, compatibility, evidence, alternatives, and rollout.
+4. Record material review outcomes in the RFC's decision log. Do not maintain a
+   separate review ledger.
+5. A maintainer decision changes the lifecycle to `accepted` or `rejected`.
+6. Implementation PRs link the accepted RFC and update `implementation` plus
+   any durable evidence or support boundary in the canonical file.
+7. A later incompatible decision gets a new RFC and supersedes the old one.
 
-`Proposed` (open PR) · `Accepted` (merged) · `Declined` (closed) ·
-`Superseded by NNNN` · `Implemented` (set once the work lands, optional).
+For Lance-dependent work, follow [the Lance reading protocol](../dev/lance.md)
+and record the exact upstream version and surfaces reviewed. For test planning,
+extend existing owners according to [the test map](../dev/testing.md).
 
-Copy [0000-template.md](0000-template.md) to start a public contribution RFC.
+## Registry
 
-## Maintainer design-series lifecycle
+This table is the human index for the canonical RFC corpus.
 
-Maintainers use this lane for a related architecture series that benefits from
-durable in-repository review before every decision or implementation dependency
-is ready. Merge publishes the current reviewed design state; it does **not** by
-itself mean acceptance. Each file names `Maintainer design series` as its author
-track, identifies an owner, links its review ledger when one exists, and records
-support boundaries alongside implementation evidence. This metadata is required
-for new or materially revised series; older records are not silently reclassified.
-
-When YAML frontmatter is present, its machine-readable status is `draft`,
-`research-blocked`, `accepted`, `implemented`, or `superseded`; headings render
-these as `Draft`, `Research blocked`, `Accepted`, `Implemented`, and
-`Superseded by RFC-<number>`.
-Moving a file to `accepted` or `implemented` requires dispositioning the blockers
-owned by that RFC. Open findings in a sibling RFC do not prevent an independently
-reviewable member of the series from advancing.
-
-The explicit author track and status are a process boundary, not an authority
-distinction: both tracks are reviewed by maintainers, and neither may bypass
-the invariants, compatibility gates, or evidence required by the change.
+| RFC | Decision | Track | Status | Implementation |
+|---|---|---|---|---|
+| [0001](0001-fragment-adopt-branch-merge.md) | Branch merge by fragment adoption | maintainer | draft | not-started |
+| [0002](0002-config-cli-architecture.md) | Config and CLI architecture | maintainer | superseded | partial |
+| [0003](0003-mcp-server-surface.md) | MCP server surface | maintainer | draft | not-started |
+| [0004](0004-cluster-graph-schema-apply.md) | Cluster graph and schema apply | maintainer | accepted | complete |
+| [0005](0005-server-cluster-boot.md) | Server boot from cluster state | maintainer | accepted | complete |
+| [0006](0006-object-storage-cluster-roots.md) | Object-storage cluster roots | maintainer | accepted | complete |
+| [0007](0007-operator-config.md) | Per-operator configuration | maintainer | accepted | complete |
+| [0008](0008-retire-omnigraph-yaml.md) | Retire `omnigraph.yaml` | maintainer | accepted | complete |
+| [0009](0009-unified-access-paths.md) | Unified embedded and remote access paths | maintainer | accepted | complete |
+| [0010](0010-cli-planes.md) | Explicit CLI planes | maintainer | superseded | partial |
+| [0011](0011-cli-addressing-and-config.md) | CLI addressing and configuration | maintainer | accepted | complete |
+| [0012](0012-embedding-provider-config.md) | Provider-independent embedding configuration | maintainer | accepted | complete |
+| [0013](0013-write-path-latency.md) | Write-path latency and bounded history cost | maintainer | superseded | partial |
+| [0015](0015-ingest-embeddings.md) | Ingest-time `@embed` reconciliation | maintainer | draft | not-started |
+| [0018](0018-ingest-wal.md) | Streaming-ingest WAL on Lance MemWAL | maintainer | rejected | removed |
+| [0019](0019-heads-and-fences.md) | Heads and fences | maintainer | superseded | partial |
+| [0022](0022-unified-write-path.md) | Unified graph-write protocol | maintainer | accepted | complete |
+| [0023](0023-key-conflict-fencing.md) | Substrate-native key-conflict fencing | maintainer | accepted | complete |
+| [0024](0024-durable-table-heads.md) | Durable table heads | maintainer | draft | not-started |
+| [0025](0025-checkpoint-retention.md) | Checkpoint-pinned retention | maintainer | draft | not-started |
+| [0026](0026-memwal-streaming-ingest.md) | MemWAL streaming ingest | maintainer | rejected | removed |
+| [0027](0027-lineage-merge-deltas.md) | Lineage-based merge deltas | maintainer | draft | not-started |
+| [0028](0028-stable-schema-identity.md) | Stable schema identity and table incarnation | maintainer | accepted | complete |
+| [0029](0029-azure-blob-storage.md) | Native Azure Blob storage | public | accepted | in-progress |
+| [0030](0030-cdc-time-travel.md) | Graph change feed and retained-history contract | maintainer | accepted | partial |
+| [0031](0031-comparative-cost-harness.md) | Comparative cost harness | maintainer | draft | not-started |
+| [0032](0032-adversarial-correctness-harness.md) | Adversarial correctness harness | maintainer | draft | not-started |
+| [0033](0033-blob-management.md) | Blob management | maintainer | accepted | partial |
+| [0034](0034-durable-recovery-authority.md) | Durable recovery authority and outcomes | maintainer | draft | not-started |
+| [0035](0035-served-operation-ownership.md) | Served operation ownership | maintainer | draft | not-started |
+| [0036](0036-atomic-runtime-activation.md) | Atomic runtime activation and graph availability supervision | maintainer | draft | not-started |
+| [0037](0037-deterministic-simulation-harness.md) | Deterministic simulation harness | public | accepted | in-progress |
+| [0038](0038-typed-storage-failures.md) | Typed storage failures | public | accepted | complete |
+| [0039](0039-end-to-end-benchmark.md) | The end-to-end benchmark | public | accepted | in-progress |
+| [0041](0041-inline-stored-queries.md) | Inline and stored queries | maintainer | accepted | partial |
+| [0042](0042-incarnation-suffixed-branch-refs.md) | Incarnation-suffixed native branch refs | maintainer | accepted | complete |
+| [0043](0043-full-text-index-compatibility.md) | Full-text index compatibility and explicit rebuild | maintainer | accepted | complete |

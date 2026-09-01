@@ -310,7 +310,9 @@ impl Omnigraph {
             actor_id,
         )?;
         let (requested, base_branch) = Self::normalize_load_scope(branch, base)?;
-        self.load_as_inner(requested, base_branch, data, mode, actor_id, input_shape)
+        // Keep the full load state machine off the stack of every public
+        // wrapper and its callers; policy and scope checks precede allocation.
+        Box::pin(self.load_as_inner(requested, base_branch, data, mode, actor_id, input_shape))
             .await
     }
 
@@ -357,6 +359,11 @@ impl Omnigraph {
                 )
                 .await?;
                 branch_created = true;
+                // DST window (loader walk D1 → D2): the implicit fork is
+                // durable, the load has not begun.
+                crate::failpoints::maybe_fail(
+                    crate::failpoints::names::LOAD_POST_BRANCH_CREATE_PRE_STAGE,
+                )?;
             }
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
@@ -665,7 +672,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let mut node_id_remap = TypedNodeIdRemap::default();
     let mut prepared_nodes: Vec<(String, String, Vec<RecordBatch>, usize)> =
         Vec::with_capacity(node_rows.len().saturating_add(strict_nodes.len()));
-    for (type_name, rows) in &node_rows {
+    let mut __dst_nr: Vec<_> = node_rows.iter().collect();
+    __dst_nr.sort_by(|a, b| a.0.cmp(b.0));
+    for (type_name, rows) in __dst_nr {
         let node_type = &catalog.node_types[type_name];
         let batch = build_node_batch(node_type, rows, &mut node_id_remap)?;
         // Validation (value/enum/unique) runs end-of-load via the evaluator.
@@ -676,7 +685,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         prepared_nodes.push((type_name.clone(), table_key, vec![batch], loaded_count));
     }
-    for (type_name, rows) in strict_nodes {
+    let mut __dst_sn: Vec<_> = strict_nodes.into_iter().collect();
+    __dst_sn.sort_by(|a, b| a.0.cmp(&b.0));
+    for (type_name, rows) in __dst_sn {
         let table_key = format!("node:{type_name}");
         let _entry = snapshot
             .dataset(&table_key)
@@ -716,7 +727,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // runs end-of-load via the unified evaluator, below.
     let mut prepared_edges: Vec<(String, String, Vec<RecordBatch>, usize)> =
         Vec::with_capacity(edge_rows.len().saturating_add(strict_edges.len()));
-    for (edge_name, rows) in &edge_rows {
+    let mut __dst_er: Vec<_> = edge_rows.iter().collect();
+    __dst_er.sort_by(|a, b| a.0.cmp(b.0));
+    for (edge_name, rows) in __dst_er {
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows, &node_id_remap)?;
         // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
@@ -727,7 +740,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         prepared_edges.push((edge_name.clone(), table_key, vec![batch], loaded_count));
     }
-    for (edge_name, rows) in strict_edges {
+    let mut __dst_se: Vec<_> = strict_edges.into_iter().collect();
+    __dst_se.sort_by(|a, b| a.0.cmp(&b.0));
+    for (edge_name, rows) in __dst_se {
         let table_key = format!("edge:{edge_name}");
         let _entry = snapshot
             .dataset(&table_key)
@@ -797,7 +812,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
 
     // Phase 4: Atomic manifest commit with publisher-level OCC.
     let staged = staging
-        .stage_all_with_concurrency(db, branch, load_write_concurrency())
+        .stage_all_with_concurrency(db, branch, crate::exec::staging::stage_write_concurrency())
         .await?;
     crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
     let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
@@ -2626,28 +2641,8 @@ fn parse_date64_json_value(value: &JsonValue) -> Result<Option<i64>> {
     Ok(None)
 }
 
-/// Write a batch to a Lance dataset, returning (new_version, total_row_count).
-/// How many per-type Lance writes to run concurrently during a load.
-///
-/// Each write is an independent S3 manifest + fragment write against a
-/// different table. Ops within a single table must still be serial (Lance
-/// OCC on the manifest), but cross-table writes have no shared state.
-///
-/// 8 is a conservative default — enough to overlap S3 round-trip latency
-/// across the typical 10-30 table schemas without flooding the runtime.
-/// Override via `OMNIGRAPH_LOAD_CONCURRENCY` for benchmarking.
-const DEFAULT_LOAD_WRITE_CONCURRENCY: usize = 8;
-
-fn load_write_concurrency() -> usize {
-    std::env::var("OMNIGRAPH_LOAD_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_LOAD_WRITE_CONCURRENCY)
-}
-
 fn generate_id() -> String {
-    ulid::Ulid::new().to_string()
+    crate::dst_ids::new_ulid().to_string()
 }
 
 pub(crate) fn parse_date32_literal(value: &str) -> Result<i32> {
@@ -2775,7 +2770,9 @@ pub(crate) fn validate_enum_constraints(
 ) -> Result<()> {
     use arrow_array::{Array, ListArray};
 
-    for (prop_name, prop_type) in properties {
+    let mut __dst_pp: Vec<_> = properties.iter().collect();
+    __dst_pp.sort_by(|a, b| a.0.cmp(b.0));
+    for (prop_name, prop_type) in __dst_pp {
         let Some(allowed) = prop_type.enum_values.as_ref() else {
             continue;
         };

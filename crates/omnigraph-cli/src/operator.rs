@@ -109,7 +109,7 @@ pub(crate) struct OperatorDefaults {
     /// under `servers:`. Mutually exclusive with `store` — a scope binds one
     /// entity.
     pub(crate) server: Option<String>,
-    /// Default **store** scope (RFC-011): a `file://` / `s3://` graph storage
+    /// Default **store** scope (RFC-011): a `file://` / `s3://` / `az://` graph storage
     /// URI used as the zero-flag local default for graph commands when no
     /// `--profile` / primitive address is given. The local-dev counterpart of
     /// `server`; mutually exclusive with it.
@@ -142,7 +142,7 @@ pub(crate) struct OperatorProfile {
 /// A managed-cluster storage root (RFC-011).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct OperatorCluster {
-    /// The cluster's storage-root URI (`file://` / `s3://`).
+    /// The cluster's storage-root URI (`file://` / `s3://` / `az://`).
     pub(crate) root: String,
     #[serde(flatten)]
     unknown: serde_yaml::Mapping,

@@ -141,6 +141,29 @@ fn table_identity_rejects_zero_and_drives_paths_and_object_ids() {
     );
 }
 
+#[test]
+fn azure_table_locations_and_manifest_paths_use_remote_object_layout() {
+    let root = "az://omnigraph/clusters/company%20brain";
+    let table_path = "nodes/000000000000002a-0000000000000007";
+
+    assert_eq!(
+        table_uri_for_path(root, table_path, None).unwrap(),
+        format!("{root}/{table_path}")
+    );
+    assert_eq!(
+        table_uri_for_path(root, table_path, Some("review/one")).unwrap(),
+        format!("{root}/{table_path}/tree/review/one")
+    );
+    assert_eq!(
+        object_store_path_from_uri(&format!(
+            "{root}/{table_path}/_versions/00000000000000000001.manifest"
+        ))
+        .unwrap(),
+        format!("clusters/company brain/{table_path}/_versions/00000000000000000001.manifest")
+    );
+    assert!(table_uri_for_path("https://example.test/graph", table_path, None).is_err());
+}
+
 #[tokio::test]
 async fn historical_alias_binding_keeps_same_name_node_and_edge_identities_distinct() {
     let dir = tempfile::tempdir().unwrap();
@@ -449,17 +472,60 @@ async fn test_snapshot_open_sub_table() {
 }
 
 #[tokio::test]
-async fn snapshot_scanner_strict_rows_survive_byte_target_override() {
+async fn snapshot_dataset_proves_index_inventory_from_raw_manifest_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/indexed.lance", dir.path().display());
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+    )
+    .unwrap();
+    let dataset = crate::table_store::TableStore::write_dataset(&uri, batch)
+        .await
+        .unwrap();
+    assert!(
+        !SnapshotDataset::new(dataset.clone()).has_raw_index_section(),
+        "a dataset created without indexes must have no raw index section"
+    );
+
+    let store = crate::table_store::TableStore::new(
+        dir.path().to_str().unwrap(),
+        Arc::new(lance::session::Session::default()),
+    );
+    let staged = store
+        .stage_create_indices(
+            &dataset,
+            &[crate::storage_layer::IndexBuildSpec::BTree {
+                column: "id".to_string(),
+                name: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let indexed = store
+        .commit_staged(Arc::new(dataset), staged)
+        .await
+        .unwrap();
+    assert!(
+        SnapshotDataset::new(indexed).has_raw_index_section(),
+        "the raw manifest witness must observe a committed index section"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_scanner_row_and_byte_limits_are_composed() {
     const ROWS: usize = 10_000;
     const BATCH_ROWS: usize = 8_192;
 
     let dir = tempfile::tempdir().unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+    let expected_ids = (0..ROWS)
+        .map(|row| format!("row-{row:05}"))
+        .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
-        vec![Arc::new(StringArray::from_iter_values(
-            (0..ROWS).map(|row| format!("row-{row:05}")),
-        ))],
+        vec![Arc::new(StringArray::from_iter_values(&expected_ids))],
     )
     .unwrap();
     let reader = RecordBatchIterator::new([Ok(batch)], Arc::clone(&schema));
@@ -467,9 +533,69 @@ async fn snapshot_scanner_strict_rows_survive_byte_target_override() {
         .await
         .unwrap();
     let table = SnapshotDataset::new(dataset);
+    let assert_contents = |batches: &[RecordBatch]| {
+        let actual_ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_ids.len(), ROWS);
+        assert_eq!(
+            actual_ids,
+            expected_ids
+                .iter()
+                .map(|id| Some(id.as_str()))
+                .collect::<Vec<_>>()
+        );
+    };
+
+    // A large byte target must retain the row ceiling; a small one must
+    // constrain the batches further. Neither setting may lose or alter rows.
+    for (byte_target, byte_limited) in [(32 * 1024 * 1024, false), (4 * 1024, true)] {
+        let mut scanner = table.scan();
+        scanner.batch_size(BATCH_ROWS);
+        scanner.batch_size_bytes(byte_target);
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_contents(&batches);
+        assert!(
+            batches
+                .iter()
+                .all(|batch| (1..=BATCH_ROWS).contains(&batch.num_rows()))
+        );
+        let largest_batch = batches.iter().map(RecordBatch::num_rows).max().unwrap();
+        if byte_limited {
+            assert!(largest_batch < BATCH_ROWS);
+        } else {
+            assert_eq!(largest_batch, BATCH_ROWS);
+        }
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            // Count this fixture's logical bytes, not retained Arrow buffers.
+            let logical_bytes = std::mem::size_of_val(ids.value_offsets())
+                + (ids.value_offsets().last().unwrap() - ids.value_offsets()[0]) as usize;
+            assert!(logical_bytes <= byte_target as usize);
+        }
+    }
+
+    // Strict batching still guarantees exact row counts when used alone.
     let mut scanner = table.scan();
     scanner.batch_size(BATCH_ROWS);
-    scanner.batch_size_bytes(32 * 1024 * 1024);
     scanner.strict_batch_size(true);
 
     let batches = scanner
@@ -479,12 +605,29 @@ async fn snapshot_scanner_strict_rows_survive_byte_target_override() {
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
+    assert_contents(&batches);
     assert_eq!(
         batches
             .iter()
             .map(RecordBatch::num_rows)
             .collect::<Vec<_>>(),
         vec![BATCH_ROWS, ROWS - BATCH_ROWS]
+    );
+
+    scanner.batch_size_bytes(32 * 1024 * 1024);
+    let error = scanner
+        .try_into_stream()
+        .await
+        .err()
+        .expect("strict row batching and a byte target must be rejected");
+    assert_eq!(
+        error.storage_failure().map(|failure| failure.kind),
+        Some(StorageFailureKind::Configuration)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("strict_batch_size=true cannot be combined with batch_size_bytes=")
     );
 }
 
@@ -2872,4 +3015,67 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
 
     // The final DAG is a single linear chain of genesis + 8 = 9, no fork.
     assert_linear_chain(uri, N + 1).await;
+}
+
+/// The incremental fold and a clean full reopen must produce the same state
+/// and lineage. This is an explicit correctness oracle, kept out of the
+/// production refresh path so debug cost tests measure the same I/O shape as a
+/// release build.
+#[tokio::test]
+async fn projection_refresh_matches_clean_full_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let _mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    async fn publish_empty_commit(publisher: &GraphNamespacePublisher) -> Result<()> {
+        let intent = LineageIntent {
+            graph_commit_id: ulid::Ulid::new().to_string(),
+            branch: None,
+            actor_id: None,
+            merged_parent_commit_id: None,
+            created_at: lineage_now_micros(),
+        };
+        publisher
+            .publish(&[], &HashMap::new(), Some(&intent))
+            .await
+            .map(|_| ())
+    }
+    let publisher = GraphNamespacePublisher::new(uri, None);
+    let control_session = crate::lance_access::control_session();
+    let (mut reader, mut folded_lineage) =
+        ManifestCoordinator::open_with_lineage(uri, None, &control_session)
+            .await
+            .unwrap();
+    let old_head = reader.known_state.graph_heads[MAIN_BRANCH_HEAD_KEY].clone();
+
+    for _ in 0..8 {
+        publish_empty_commit(&publisher).await.unwrap();
+    }
+    let LineageRefresh::Append(delta) = reader.refresh_with_lineage().await.unwrap() else {
+        panic!("append-only history must take the incremental refresh path");
+    };
+    assert_eq!(delta.len(), 8, "refresh must return only new lineage rows");
+    folded_lineage.extend(delta);
+    assert_ne!(
+        reader.known_state.graph_heads[MAIN_BRANCH_HEAD_KEY], old_head,
+        "the oracle must exercise mutable graph-head replacement, not only appends"
+    );
+
+    let (fresh, mut full_lineage) =
+        ManifestCoordinator::open_with_lineage(uri, None, &control_session)
+            .await
+            .unwrap();
+    assert_eq!(reader.known_state.version, fresh.known_state.version);
+    assert_eq!(
+        format!("{:?}", reader.known_state.entries),
+        format!("{:?}", fresh.known_state.entries)
+    );
+    assert_eq!(
+        reader.known_state.graph_heads,
+        fresh.known_state.graph_heads
+    );
+    folded_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+    full_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+    assert_eq!(folded_lineage, full_lineage);
 }

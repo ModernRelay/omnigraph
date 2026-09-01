@@ -510,6 +510,7 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -561,6 +562,7 @@ pub(crate) async fn server_read(
         (status = 400, description = "Bad request - also returned when the query body contains mutations; use POST /mutate (or its deprecated alias POST /change) for write queries", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -890,7 +892,10 @@ pub(crate) async fn server_export(
             (cut, result) = &mut export => {
                 let error = result.err().map(|error| std::io::Error::other(error.to_string()));
                 let _ = tx
-                    .send(export_transport::ExportFrame::Terminal { cut, error })
+                    .send(export_transport::ExportFrame::Terminal {
+                        cut: Box::new(cut),
+                        error,
+                    })
                     .await;
             }
         }
@@ -1330,7 +1335,7 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
-        (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
+        (status = 409, description = "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
         (status = 413, description = "Stored keyed mutation exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
@@ -2561,13 +2566,11 @@ mod change_route_error_tests {
         assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(mapped.message().contains("recovery required"));
         assert!(!mapped.message().contains("/srv/private"));
-        assert_eq!(
-            mapped
-                .recovery_required
-                .as_deref()
-                .map(|details| details.operation_id.as_str()),
-            Some("op-public")
-        );
+        assert!(matches!(
+            mapped.details.as_deref(),
+            Some(crate::ApiErrorDetails::RecoveryRequired(details))
+                if details.operation_id == "op-public"
+        ));
     }
 }
 
@@ -3104,7 +3107,10 @@ pub(crate) async fn server_changes_baseline(
                     Err(error) => Some(std::io::Error::other(error.to_string())),
                 };
                 let _ = tx
-                    .send(export_transport::ExportFrame::Terminal { cut, error })
+                    .send(export_transport::ExportFrame::Terminal {
+                        cut: Box::new(cut),
+                        error,
+                    })
                     .await;
             }
         }

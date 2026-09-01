@@ -41,6 +41,68 @@ async fn append_new_persons(db: &mut Omnigraph, branch: &str, n: usize) {
     }
 }
 
+/// Every successful physical merge operation contributes exactly one publish
+/// interval, including ref-only routes with no keyed storage work.
+fn assert_single_physical_publish(probes: &MergeWriteProbes) {
+    let timings = probes.merge_timing_snapshot();
+    let physical_publish = timings
+        .iter()
+        .find(|reading| reading.phase == "PhysicalPublish")
+        .expect("merge timing snapshot must include PhysicalPublish");
+
+    assert_eq!(
+        physical_publish.interval_count, 1,
+        "one merge operation must complete exactly one PhysicalPublish interval: {timings:?}"
+    );
+}
+
+/// Keyed storage work is nested inside the operation-level publish interval,
+/// so the outer interval must enclose every completed stage and commit.
+fn assert_single_physical_publish_encloses_keyed_work(probes: &MergeWriteProbes) {
+    assert_single_physical_publish(probes);
+
+    let timings = probes.merge_timing_snapshot();
+    let phase = |name| {
+        timings
+            .iter()
+            .find(|reading| reading.phase == name)
+            .unwrap_or_else(|| panic!("merge timing snapshot lacks phase '{name}'"))
+    };
+    let physical_publish = phase("PhysicalPublish");
+    let keyed_stage = phase("KeyedStage");
+    let keyed_commit = phase("KeyedCommit");
+
+    assert!(
+        keyed_stage.interval_count > 0,
+        "fixture must exercise keyed staging: {timings:?}"
+    );
+    assert!(
+        keyed_commit.interval_count > 0,
+        "fixture must exercise keyed commit: {timings:?}"
+    );
+    let keyed_stage_calls = probes
+        .stage_merge_insert_calls()
+        .checked_add(probes.stage_known_present_update_calls())
+        .and_then(|calls| calls.checked_add(probes.stage_fenced_insert_calls()))
+        .expect("test stage-call total must not overflow");
+    assert_eq!(
+        keyed_stage.interval_count, keyed_stage_calls,
+        "each successful keyed storage stage must complete one KeyedStage interval: {timings:?}"
+    );
+    assert_eq!(
+        keyed_commit.interval_count, keyed_stage.interval_count,
+        "each successfully staged keyed chunk must complete one KeyedCommit interval: {timings:?}"
+    );
+    let keyed_total_us = keyed_stage
+        .total_us
+        .checked_add(keyed_commit.total_us)
+        .expect("test timing totals must not overflow");
+    assert!(
+        physical_publish.total_us >= keyed_total_us,
+        "PhysicalPublish must enclose KeyedStage + KeyedCommit: {timings:?}"
+    );
+}
+
 /// THE structural gate. A one-chunk append-only source delta must use one
 /// exact-id fenced insert and zero bare appends. The storage adapter converts
 /// Lance's uncommitted data fragments into a filter-bearing `Update`, so the
@@ -60,6 +122,12 @@ async fn append_only_fast_forward_merge_uses_fenced_insert() {
         .await
         .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
+
+    assert_eq!(
+        probes.table_walk_interval_count(),
+        0,
+        "proven insert replay must bypass the general three-way table walk"
+    );
 
     assert_eq!(
         probes.stage_fenced_insert_calls(),
@@ -95,6 +163,7 @@ async fn append_only_fast_forward_merge_uses_fenced_insert() {
         0,
         "exact pure-insert fast-forward with only identity-backed @key must not rescan its already accepted source rows for validation",
     );
+    assert_single_physical_publish_encloses_keyed_work(&probes);
 }
 
 /// A lazy graph branch pins an immutable table version while continuing to
@@ -155,6 +224,7 @@ async fn lazy_target_ref_only_fast_forward_uses_pin_after_main_advances() {
     assert_eq!(probes.stage_merge_insert_calls(), 0);
     assert_eq!(probes.strict_insert_preflight_calls(), 0);
     assert_eq!(probes.stage_append_calls(), 0);
+    assert_single_physical_publish(&probes);
 
     let names = collect_column_strings(
         &read_table_branch(&merger, "target", "node:Person").await,
@@ -339,12 +409,7 @@ async fn append_only_fast_forward_merge_uses_bounded_fenced_insert_chain() {
         base_entry.dataset_path.trim_start_matches('/')
     );
     let base_table = Dataset::open(&person_uri).await.unwrap();
-    let source_table = Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("feature")
-        .await
-        .unwrap();
+    let source_table = helpers::open_dataset_head(&person_uri, Some("feature")).await;
     let base_identifier = base_table.branch_identifier().await.unwrap();
     let source_identifier = source_table.branch_identifier().await.unwrap();
     assert_eq!(
@@ -436,12 +501,8 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
         .branch_identifier()
         .await
         .unwrap();
-    let source_identifier = Dataset::open(&person_uri)
+    let source_identifier = helpers::open_dataset_head(&person_uri, Some("experiment"))
         .await
-        .unwrap()
-        .checkout_branch("experiment")
-        .await
-        .unwrap()
         .branch_identifier()
         .await
         .unwrap();
@@ -486,12 +547,7 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         main.uri().trim_end_matches('/'),
         base_entry.dataset_path.trim_start_matches('/')
     );
-    let source = Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .checkout_branch("feature")
-        .await
-        .unwrap();
+    let source = helpers::open_dataset_head(&person_uri, Some("feature")).await;
     let missing_version = source
         .version()
         .version
@@ -503,7 +559,7 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
     );
     let versions_dir = std::path::Path::new(&person_uri)
         .join("tree")
-        .join("feature")
+        .join(graph_native_ref(uri, "feature").await)
         .join("_versions");
     let v1_path = versions_dir.join(format!("{missing_version}.manifest"));
     let v2_path = versions_dir.join(format!("{:020}.manifest", u64::MAX - missing_version));
@@ -572,6 +628,7 @@ async fn changed_only_adopt_uses_known_present_update() {
     );
     assert_eq!(probes.stage_known_present_update_calls(), 1);
     assert_eq!(probes.stage_known_present_update_rows(), 1);
+    assert_single_physical_publish_encloses_keyed_work(&probes);
 }
 
 /// Read `column` for the node whose `id == id` from `main`. Outer `None` = id
@@ -833,25 +890,55 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
 }
 
 /// Functional correctness: a fast-forward merge of an append-only branch leaves
-/// main equal to the source branch. Independent of the cost-budget gate.
+/// main equal to the source branch. The fixture changes both a node and an edge
+/// table so the operation-level publish interval cannot accidentally become a
+/// per-candidate interval. Independent of the cost-budget gate.
 #[tokio::test]
 async fn fast_forward_merge_yields_source_state() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
-    let base_count = count_rows(&main, "node:Person").await;
+    let base_person_count = count_rows(&main, "node:Person").await;
+    let base_knows_count = count_rows(&main, "edge:Knows").await;
 
     main.branch_create("feature").await.unwrap();
     let mut feature = Omnigraph::open(uri).await.unwrap();
     append_new_persons(&mut feature, "feature", 5).await;
-    let source_count = count_rows_branch(&feature, "feature", "node:Person").await;
-    assert_eq!(source_count, base_count + 5);
+    let mutation = feature
+        .mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person_and_friend",
+            &mixed_params(
+                &[("$name", "ff_linked"), ("$friend", "Alice")],
+                &[("$age", 31)],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mutation.affected_nodes, 1);
+    assert_eq!(mutation.affected_edges, 1);
 
-    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    let source_person_count = count_rows_branch(&feature, "feature", "node:Person").await;
+    let source_knows_count = count_rows_branch(&feature, "feature", "edge:Knows").await;
+    assert_eq!(source_person_count, base_person_count + 6);
+    assert_eq!(source_knows_count, base_knows_count + 1);
+
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(
+        probes.stage_fenced_insert_calls(),
+        2,
+        "node:Person and edge:Knows must each publish one proven-insert candidate"
+    );
+    assert_single_physical_publish_encloses_keyed_work(&probes);
 
-    // main now equals source: the 5 new persons are present, the base rows kept.
-    assert_eq!(count_rows(&main, "node:Person").await, source_count);
+    // main now equals source: both changed tables landed and their base rows remain.
+    assert_eq!(count_rows(&main, "node:Person").await, source_person_count);
+    assert_eq!(count_rows(&main, "edge:Knows").await, source_knows_count);
     let names = collect_column_strings(&read_table(&main, "node:Person").await, "name");
     for i in 0..5 {
         assert!(
@@ -859,6 +946,7 @@ async fn fast_forward_merge_yields_source_state() {
             "merged main missing new person ff_new_{i}; have {names:?}"
         );
     }
+    assert!(names.iter().any(|name| name == "ff_linked"));
 }
 
 const VEC_SCHEMA: &str = "node Chunk {\n  slug: String @key\n  embedding: Vector(8) @index\n}\n";
@@ -950,10 +1038,16 @@ async fn merged_outcome_defers_vector_index_to_reconciler() {
         .unwrap();
     assert_eq!(outcome, MergeOutcome::Merged);
     assert_eq!(
+        probes.table_walk_interval_count(),
+        1,
+        "one diverged scalar table must emit one general table-walk interval"
+    );
+    assert_eq!(
         probes.stage_vector_index_calls(),
         0,
         "three-way merge must not stage derived vector-index work inline"
     );
+    assert_single_physical_publish_encloses_keyed_work(&probes);
     assert_eq!(count_rows(&main, "node:Chunk").await, 25);
 }
 
@@ -1007,6 +1101,11 @@ async fn fast_forward_merge_streams_blob_columns() {
         .await
         .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(
+        probes.table_walk_interval_count(),
+        0,
+        "proven Blob insert replay must bypass the general table walk"
+    );
     assert_eq!(probes.stage_fenced_insert_calls(), 1);
     assert_eq!(probes.stage_fenced_insert_rows(), 1);
     assert_eq!(probes.stage_merge_insert_calls(), 0);

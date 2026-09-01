@@ -4,20 +4,22 @@
 FROM public.ecr.aws/debian/debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl tini \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system omnigraph \
     && useradd --system --gid omnigraph --create-home --home-dir /var/lib/omnigraph omnigraph
 
 COPY target/release/omnigraph-server /usr/local/bin/omnigraph-server
-# The CLI ships in the image so the cluster day-2 loop (cluster
-# apply/approve/status, data loads by explicit URI) runs in-container via
-# `docker exec` / ECS exec / `railway shell` — no omnigraph.yaml required.
+# The CLI ships for non-Azure day-2 workflows and read-only inspection. Never
+# start an Azure writer with `docker exec` / ECS exec / `railway shell`: quiesce
+# the server and run that writer as a job through omnigraph-azure-admission.
 COPY target/release/omnigraph /usr/local/bin/omnigraph
+COPY target/release/omnigraph-azure-admission /usr/local/bin/omnigraph-azure-admission
 COPY docker/entrypoint.sh /usr/local/bin/omnigraph-entrypoint
 
-RUN chmod 0755 /usr/local/bin/omnigraph-server /usr/local/bin/omnigraph /usr/local/bin/omnigraph-entrypoint
+RUN chmod 0755 /usr/local/bin/omnigraph-server /usr/local/bin/omnigraph \
+    /usr/local/bin/omnigraph-azure-admission /usr/local/bin/omnigraph-entrypoint
 
 ENV OMNIGRAPH_BIND=0.0.0.0:8080
 

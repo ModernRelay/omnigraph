@@ -647,6 +647,69 @@ async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
     assert!(super::has_insert_absence_certificate(&history[0]));
 }
 
+/// Every general keyed-write `Update` (here an upsert that UPDATES an existing
+/// row, so it is not a pure insert and earns no `insert_absence`) carries the
+/// durable no-by-source-delete marker, and it survives commit → reopen →
+/// `list_transactions` (the exact read path the CDC candidate-pruning classifier
+/// uses). This is the durable provenance that lets pruning trust a persisted
+/// `Update` removed no rows; an external merge would carry no marker.
+#[tokio::test]
+async fn keyed_upsert_stamps_no_by_source_delete_marker_and_persists_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let base_version = ds.version().version;
+
+    let staged = store
+        .stage_keyed_write(
+            ds.clone(),
+            "Person",
+            person_pk_batch(&[("alice", Some(31))]),
+            KeyedWriteSemantics::Upsert,
+        )
+        .await
+        .unwrap();
+    assert!(
+        super::has_no_by_source_delete_marker(&staged.transaction),
+        "every keyed-write Update carries the no-by-source-delete marker"
+    );
+    assert!(
+        !super::has_insert_absence_certificate(&staged.transaction),
+        "an upsert that updates an existing row is not a pure insert, so no insert_absence"
+    );
+
+    let committed = store.commit_staged(Arc::new(ds), staged).await.unwrap();
+    let committed_version = committed.version().version;
+    let reopened = Dataset::open(&uri).await.unwrap();
+    let persisted = reopened
+        .read_transaction_by_version(committed_version)
+        .await
+        .unwrap()
+        .expect("committed keyed upsert transaction");
+    assert!(
+        super::has_no_by_source_delete_marker(&persisted),
+        "the marker must survive commit and reopen"
+    );
+
+    let history = reopened
+        .delta()
+        .with_begin_version(base_version)
+        .with_end_version(committed_version)
+        .build()
+        .unwrap()
+        .list_transactions()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert!(
+        super::has_no_by_source_delete_marker(&history[0]),
+        "list_transactions (the candidate-pruning read path) sees the marker"
+    );
+}
+
 #[tokio::test]
 async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
     let dir = tempfile::tempdir().unwrap();
@@ -2158,7 +2221,7 @@ async fn stage_overwrite_does_not_advance_head_until_commit() {
 /// `_rowid` stability (change-feed validators, index reconcilers) would
 /// observe silent corruption.
 ///
-/// Pinned invariant — see `docs/storage.md` "Stable row IDs".
+/// Pinned invariant — see `docs/dev/lance.md` "Stable row IDs".
 #[tokio::test]
 async fn stage_overwrite_preserves_stable_row_ids() {
     let dir = tempfile::tempdir().unwrap();
@@ -2196,6 +2259,34 @@ async fn stage_overwrite_preserves_stable_row_ids() {
          is in WriteParams at table_store.rs::stage_overwrite — see \
          ADR 0001."
     );
+    // Replacement rows must not inherit the identities of the removed rows.
+    // Lance 11 keeps both allocation counters above the dataset's history.
+    assert!(
+        new_ds
+            .manifest
+            .fragments
+            .iter()
+            .all(|fragment| fragment.id > ds.manifest.max_fragment_id().unwrap()),
+        "overwrite must allocate fresh fragment IDs"
+    );
+    assert_eq!(new_ds.manifest.next_row_id, ds.manifest.next_row_id + 1);
+    let batches: Vec<RecordBatch> = new_ds
+        .scan()
+        .with_row_id()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_ids(&batches), vec!["zoe"]);
+    let row_ids = batches[0]
+        .column_by_name("_rowid")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(row_ids.values().as_ref(), &[ds.manifest.next_row_id]);
 }
 
 /// `stage_overwrite` semantically REPLACES every committed fragment.
@@ -2349,9 +2440,9 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                 IndexBuildSpec::FullText {
                     column: "body".to_string(),
                 },
-                // Second index on the SAME column: the explicit name keeps it
-                // from replacing the FTS index under Lance's shared default
-                // name (the dual-index shape free-text @index columns get).
+                // Second index on the SAME column: independent builders share
+                // one snapshot, so explicit names avoid an uncommitted-name
+                // collision. This exercises the primitive's companion shape.
                 IndexBuildSpec::BTree {
                     column: "body".to_string(),
                     name: Some("body_btree".to_string()),
@@ -2401,6 +2492,162 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
         "the explicitly-named companion BTREE must land beside the FTS index"
     );
     assert!(store.has_vector_index(&new_ds, "embedding").await.unwrap());
+
+    // Metadata-only coverage cases, reusing this fixture's typed index
+    // inventory. The synthetic empty segment borrows another index UUID;
+    // no posting files are opened and these snapshots are never searched.
+    // A scalar's full union is a no-op, but vector segments may still need
+    // partition rebalancing, so preserve their previous per-segment candidacy.
+    use lance::index::DatasetIndexExt;
+    let inventory = new_ds.load_indices().await.unwrap();
+    let mut coverage_ds = new_ds;
+    for (column, expected_work) in [("id", false), ("embedding", true)] {
+        let field_id = coverage_ds.schema().field(column).unwrap().id;
+        let complete = inventory
+            .iter()
+            .find(|index| index.fields == [field_id])
+            .unwrap()
+            .clone();
+        let mut empty = complete.clone();
+        empty.uuid = inventory
+            .iter()
+            .find(|index| index.uuid != complete.uuid)
+            .unwrap()
+            .uuid;
+        empty.fragment_bitmap.as_mut().unwrap().clear();
+        let current = coverage_ds.load_indices().await.unwrap();
+        let transaction = lance::dataset::transaction::Transaction::new(
+            coverage_ds.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![complete, empty],
+                removed_indices: current.as_ref().clone(),
+            },
+            None,
+        );
+        coverage_ds = lance::dataset::CommitBuilder::new(Arc::new(coverage_ds))
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert!(
+            TableStore::has_unindexed_fragments(&coverage_ds)
+                .await
+                .unwrap(),
+            "fixture must expose per-segment partial coverage for {column}"
+        );
+        assert_eq!(
+            TableStore::has_foldable_unindexed_fragments(&coverage_ds)
+                .await
+                .unwrap(),
+            expected_work,
+            "scalar union coverage must not suppress vector rebalance candidacy on {column}"
+        );
+    }
+}
+
+/// Saved v10 postings demonstrate the real cross-version false-negative bug;
+/// the adapter refuses them and replaces every old segment in one exact commit.
+#[tokio::test]
+async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() {
+    use base64::Engine;
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::FullTextSearchQuery;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(include_str!("../../tests/fixtures/lance10-fts.json")).unwrap();
+    for (relative, encoded) in fixture {
+        assert!(
+            std::path::Path::new(&relative)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        );
+        let path = dir.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            base64::prelude::BASE64_STANDARD.decode(encoded).unwrap(),
+        )
+        .unwrap();
+    }
+    let uri = dir.path().to_str().unwrap();
+    let old = Dataset::open(uri).await.unwrap();
+    let store = TableStore::new(uri, test_session());
+    assert_eq!(old.version().version, 2);
+    assert_eq!(store.count_rows(&old, None).await.unwrap(), 3);
+    let old_indices = old.load_indices().await.unwrap();
+
+    for (term, unsafe_count) in [("organism", 0), ("university", 0), ("running", 1)] {
+        let mut raw = old.scan();
+        raw.full_text_search(FullTextSearchQuery::new(term.into()))
+            .unwrap();
+        let raw_batches: Vec<_> = raw
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            raw_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            unsafe_count,
+            "characterize stock v11 reading actual v10 postings"
+        );
+        let guarded = TableStore::scan_stream_with(&old, None, None, None, false, |scan| {
+            scan.full_text_search(FullTextSearchQuery::new(term.into()))
+                .map_err(OmniError::storage)?;
+            Ok(())
+        })
+        .await;
+        assert!(matches!(
+            guarded,
+            Err(OmniError::FullTextIndexRebuildRequired { .. })
+        ));
+    }
+    let staged = store
+        .stage_create_indices(
+            &old,
+            &[IndexBuildSpec::FullText {
+                column: "text".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    let Operation::CreateIndex {
+        new_indices,
+        removed_indices,
+    } = &staged.transaction.operation
+    else {
+        panic!("expected index-only replacement");
+    };
+    assert_eq!(new_indices.len(), 1);
+    assert_eq!(removed_indices.len(), 1);
+    assert_eq!(removed_indices[0].uuid, old_indices[0].uuid);
+    assert_eq!(Dataset::open(uri).await.unwrap().version().version, 2);
+    let (rebuilt, _) = store
+        .commit_staged_exact(Arc::new(old.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.version().version, 3);
+    assert_eq!(rebuilt.load_indices().await.unwrap().len(), 1);
+    for term in ["organism", "university", "running"] {
+        let batches: Vec<_> =
+            TableStore::scan_stream_with(&rebuilt, None, None, None, false, |scan| {
+                scan.full_text_search(FullTextSearchQuery::new(term.into()))
+                    .map_err(OmniError::storage)?;
+                Ok(())
+            })
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    }
+    assert_eq!(store.count_rows(&old, None).await.unwrap(), 3);
+    assert!(matches!(
+        super::fts_compat::verify_index(&old, &old_indices[0]).await,
+        Err(OmniError::FullTextIndexRebuildRequired { .. })
+    ));
 }
 
 /// Staged delete (Lance 7.0 `DeleteBuilder::execute_uncommitted`, lance#6658):
@@ -2545,6 +2792,15 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
          this assertion fires, lance changed restore semantics — re-read \
          lance src/dataset.rs::restore and update the recovery sweep's \
          rollback path before proceeding."
+    );
+    assert_eq!(
+        post.manifest.next_row_id, ds.manifest.next_row_id,
+        "restore must not make previously allocated stable row IDs reusable"
+    );
+    assert_eq!(
+        post.manifest.max_fragment_id(),
+        ds.manifest.max_fragment_id(),
+        "restore must retain the historical fragment-ID high-water mark"
     );
 
     // Content equality: the restored HEAD must match version 1 (just alice).

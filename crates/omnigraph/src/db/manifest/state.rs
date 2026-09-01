@@ -87,7 +87,11 @@ struct GraphHeadMetadata {
 /// The `object_id` for a branch's mutable head pointer row. Main encodes as
 /// `graph_head:main`; named branches as `graph_head:<branch>`.
 pub(crate) fn graph_head_object_id(branch: Option<&str>) -> String {
-    format!("graph_head:{}", branch.unwrap_or(MAIN_BRANCH_HEAD_KEY))
+    format!(
+        "{}{}",
+        super::GRAPH_HEAD_OBJECT_ID_PREFIX,
+        branch.unwrap_or(MAIN_BRANCH_HEAD_KEY)
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +192,224 @@ fn manifest_state_from_scan(version: u64, scan: ManifestScan) -> Result<Manifest
     )
 }
 
+/// Fold accumulators for the manifest projection, retained by a coordinator so
+/// a refresh can fold ONLY newly appended rows instead of re-scanning the
+/// whole catalog (the projection at head H is derivable from the
+/// projection at H-1 plus the appended rows). The fold arms are the exact
+/// reductions `assemble_manifest_state` applies — both paths run through this
+/// type, so the incremental and full projections CANNOT diverge in
+/// dedup/filter/sort semantics. Sizes: `registrations`/`latest_versions`/
+/// `tombstone_map` are O(tables), and `graph_heads` is O(branches). Lineage is
+/// deliberately not retained here: `GraphCoordinator` already owns that
+/// projection, and duplicating it made an otherwise small exception-safety
+/// clone O(commit history).
+#[derive(Debug, Clone)]
+pub(super) struct ProjectionAccumulator {
+    registrations: HashMap<TableIdentity, TableRegistration>,
+    latest_versions: HashMap<TableIdentity, DatasetEntry>,
+    tombstone_map: HashMap<TableIdentity, u64>,
+    graph_heads: HashMap<String, String>,
+}
+
+impl ProjectionAccumulator {
+    fn empty() -> Self {
+        Self {
+            registrations: HashMap::new(),
+            latest_versions: HashMap::new(),
+            tombstone_map: HashMap::new(),
+            graph_heads: HashMap::new(),
+        }
+    }
+
+    /// Fold rows in. THE one copy of the per-row reductions: the full scan,
+    /// the fragment-restricted delta fold, and `assemble_manifest_state`
+    /// (and through it the publisher's post-publish fold) all run this, so
+    /// none of them can drift in dedup/keep semantics.
+    fn fold_parts(
+        &mut self,
+        registrations: HashMap<TableIdentity, TableRegistration>,
+        version_entries: Vec<DatasetEntry>,
+        tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
+        graph_heads: HashMap<String, String>,
+    ) -> Result<()> {
+        for (identity, registration) in registrations {
+            if let Some(existing) = self.registrations.insert(identity, registration.clone()) {
+                if existing != registration {
+                    return Err(OmniError::manifest_internal(format!(
+                        "manifest has conflicting table rows for identity {identity}"
+                    )));
+                }
+            }
+        }
+        for entry in version_entries {
+            match self.latest_versions.get(&entry.identity) {
+                Some(existing)
+                    if existing.published_dataset_version >= entry.published_dataset_version => {}
+                _ => {
+                    self.latest_versions.insert(entry.identity, entry);
+                }
+            }
+        }
+        for (identity, tombstone_version) in tombstones {
+            match self.tombstone_map.get(&identity) {
+                Some(existing) if *existing >= tombstone_version => {}
+                _ => {
+                    self.tombstone_map.insert(identity, tombstone_version);
+                }
+            }
+        }
+        self.graph_heads.extend(graph_heads);
+        Ok(())
+    }
+
+    fn fold_scan(&mut self, scan: ManifestScan) -> Result<()> {
+        // A delta tombstone may refer to a registration in an older fragment,
+        // so validate against the union of incoming and retained authority.
+        // Do this before mutating the accumulator to preserve exception safety.
+        for tombstone in &scan.tombstones {
+            let registration = scan
+                .table_registrations
+                .get(&tombstone.identity)
+                .or_else(|| self.registrations.get(&tombstone.identity))
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "manifest tombstone for identity {} has no table registration",
+                        tombstone.identity
+                    ))
+                })?;
+            if registration.table_key != tombstone.table_key {
+                return Err(OmniError::manifest_internal(format!(
+                    "manifest tombstone identity {} has diagnostic alias '{}', current binding is '{}'",
+                    tombstone.identity, tombstone.table_key, registration.table_key
+                )));
+            }
+        }
+        self.fold_parts(
+            scan.table_registrations,
+            scan.version_entries,
+            scan.tombstones
+                .into_iter()
+                .map(|t| (t.identity, t.tombstone_version)),
+            scan.graph_heads,
+        )
+    }
+
+    /// Drop one branch's head pointer (its durable row was deleted — the
+    /// mutable-row half of a head update, or a branch deletion; a replacement,
+    /// when one exists, arrives via the delta fragments' live rows).
+    pub(super) fn remove_head(&mut self, branch_key: &str) {
+        self.graph_heads.remove(branch_key);
+    }
+
+    /// Reduce to the visible state at `version`. Pure and repeatable.
+    pub(super) fn finish(&self, version: u64) -> Result<ManifestState> {
+        finish_manifest_state(
+            version,
+            &self.registrations,
+            self.latest_versions.values().cloned(),
+            &self.tombstone_map,
+            self.graph_heads.clone(),
+        )
+    }
+}
+
+/// One coherent scan producing the finished state, compact retained fold
+/// accumulators, and lineage rows handed off to `CommitGraph`. The plain read
+/// paths keep `read_manifest_state`.
+pub(super) async fn read_manifest_projection(
+    dataset: &Dataset,
+) -> Result<(ManifestState, ProjectionAccumulator, Vec<GraphLineageRow>)> {
+    let version = dataset.version().version;
+    let mut scan = read_manifest_scan_fragments(dataset, true, None).await?;
+    let lineage_rows = std::mem::take(&mut scan.lineage_rows);
+    let mut accumulator = ProjectionAccumulator::empty();
+    accumulator.fold_scan(scan)?;
+    let state = accumulator.finish(version)?;
+    Ok((state, accumulator, lineage_rows))
+}
+
+/// Fold ONLY the live rows of `fragments` of `dataset` into `accumulator`
+/// (the appended-fragments delta of an incremental refresh) and reduce to the
+/// state at the dataset's version.
+pub(super) async fn fold_projection_delta(
+    dataset: &Dataset,
+    fragments: Vec<lance_table::format::Fragment>,
+    accumulator: &mut ProjectionAccumulator,
+) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
+    let version = dataset.version().version;
+    let mut scan = read_manifest_scan_fragments(dataset, true, Some(fragments)).await?;
+    let lineage_rows = std::mem::take(&mut scan.lineage_rows);
+    accumulator.fold_scan(scan)?;
+    Ok((accumulator.finish(version)?, lineage_rows))
+}
+
+/// `(object_type, object_id)` of the rows at `offsets` inside one fragment,
+/// read from a pinned version where those rows are still live. Bounded by the
+/// deletion-vector difference the caller measured — a handful of rows, never
+/// history-sized.
+pub(super) async fn read_object_identities_at_offsets(
+    dataset: &Dataset,
+    fragment: lance_table::format::Fragment,
+    offsets: &std::collections::HashSet<u32>,
+) -> Result<Vec<(String, String)>> {
+    if offsets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let fragment_id = u32::try_from(fragment.id).map_err(|_| {
+        OmniError::manifest_internal(format!(
+            "manifest fragment id {} cannot be represented as a Lance row address",
+            fragment.id
+        ))
+    })?;
+    let mut addresses = offsets
+        .iter()
+        .copied()
+        .map(|offset| {
+            u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+                fragment_id,
+                offset,
+            ))
+        })
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+
+    // A fragment restriction limits which files a scanner visits; it is not a
+    // row-level take. Use the physical addresses already supplied by the
+    // deletion-vector delta so a compacted, history-sized fragment still reads
+    // only the newly deleted head rows from the exact pinned old dataset.
+    let dataset = Arc::new(dataset.clone());
+    let projection_schema = dataset
+        .schema()
+        .project_preserve_system_columns(&["object_id", "object_type"])
+        .map_err(OmniError::storage)?;
+    let projection = lance::dataset::ProjectionRequest::from_schema(projection_schema)
+        .into_projection_plan(Arc::clone(&dataset))
+        .map_err(OmniError::storage)?;
+    let batch = lance::dataset::TakeBuilder::try_new_from_addresses(
+        dataset,
+        addresses,
+        Arc::new(projection),
+    )
+    .map_err(OmniError::storage)?
+    .execute()
+    .await
+    .map_err(OmniError::storage)?;
+    crate::instrumentation::record_projection_identity_rows(batch.num_rows());
+
+    let object_ids = string_column(&batch, "object_id")?;
+    let object_types = string_column(&batch, "object_type")?;
+    let identities = (0..batch.num_rows())
+        .map(|row| {
+            (
+                object_types.value(row).to_string(),
+                object_ids.value(row).to_string(),
+            )
+        })
+        .collect();
+    Ok(identities)
+}
+
 /// Reduce raw manifest rows to the visible per-table state: keep the latest
 /// `table_version` per immutable table identity, drop any whose latest version
 /// is sealed by a
@@ -204,29 +426,22 @@ pub(super) fn assemble_manifest_state(
     tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
     graph_heads: HashMap<String, String>,
 ) -> Result<ManifestState> {
-    let mut latest_versions = HashMap::<TableIdentity, DatasetEntry>::new();
-    for entry in version_entries {
-        match latest_versions.get(&entry.identity) {
-            Some(existing)
-                if existing.published_dataset_version >= entry.published_dataset_version => {}
-            _ => {
-                latest_versions.insert(entry.identity, entry);
-            }
-        }
-    }
+    let mut accumulator = ProjectionAccumulator::empty();
+    accumulator.fold_parts(registrations, version_entries, tombstones, graph_heads)?;
+    accumulator.finish(version)
+}
 
-    let mut tombstone_map = HashMap::<TableIdentity, u64>::new();
-    for (identity, tombstone_version) in tombstones {
-        match tombstone_map.get(&identity) {
-            Some(existing) if *existing >= tombstone_version => {}
-            _ => {
-                tombstone_map.insert(identity, tombstone_version);
-            }
-        }
-    }
-
+/// The shared reduction tail (tombstone filter, alias-uniqueness check, sort)
+/// — one implementation under both the full-scan path and the incremental
+/// fold, so the two cannot diverge.
+fn finish_manifest_state(
+    version: u64,
+    registrations: &HashMap<TableIdentity, TableRegistration>,
+    latest_versions: impl Iterator<Item = DatasetEntry>,
+    tombstone_map: &HashMap<TableIdentity, u64>,
+    graph_heads: HashMap<String, String>,
+) -> Result<ManifestState> {
     let mut entries: Vec<DatasetEntry> = latest_versions
-        .into_values()
         .filter(|entry| {
             tombstone_map
                 .get(&entry.identity)
@@ -381,7 +596,7 @@ fn decode_graph_head_row(
     })?;
     let branch_key = object_ids
         .value(row)
-        .strip_prefix("graph_head:")
+        .strip_prefix(super::GRAPH_HEAD_OBJECT_ID_PREFIX)
         .ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "invalid graph_head object id {}",
@@ -393,6 +608,18 @@ fn decode_graph_head_row(
 }
 
 async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<ManifestScan> {
+    read_manifest_scan_fragments(dataset, collect_lineage, None).await
+}
+
+/// The one manifest row decoder. `fragments = None` scans the whole catalog;
+/// `Some(...)` restricts to the given fragments' LIVE rows — the incremental
+/// refresh's delta read, which decodes O(appended rows) instead of
+/// O(history).
+async fn read_manifest_scan_fragments(
+    dataset: &Dataset,
+    collect_lineage: bool,
+    fragments: Option<Vec<lance_table::format::Fragment>>,
+) -> Result<ManifestScan> {
     crate::instrumentation::record_manifest_scan();
     // Project only the columns the assembly below reads (RFC-013 PR2 #1c). The
     // `object_id` is needed for the bounded graph-head authority decode on every
@@ -410,8 +637,15 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         "table_branch",
         "row_count",
     ];
+    let is_delta_scan = fragments.is_some();
     let mut scanner = dataset.scan();
     scanner.project(&projection).map_err(OmniError::storage)?;
+    if let Some(fragments) = fragments {
+        // Lance semantics this fold depends on: `with_fragments(vec![])`
+        // scans ZERO fragments (it does not fall back to all) — an empty
+        // delta (a DV-only refresh window) must read nothing.
+        scanner.with_fragments(fragments);
+    }
     let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
         .await
@@ -584,20 +818,26 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
                 .cmp(&b.published_dataset_version),
         )
     });
-    for tombstone in &tombstones {
-        let registration = table_registrations
-            .get(&tombstone.identity)
-            .ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "manifest tombstone for identity {} has no table registration",
-                    tombstone.identity
-                ))
-            })?;
-        if registration.table_key != tombstone.table_key {
-            return Err(OmniError::manifest_internal(format!(
-                "manifest tombstone identity {} has diagnostic alias '{}', current binding is '{}'",
-                tombstone.identity, tombstone.table_key, registration.table_key
-            )));
+    // Whole-catalog invariant only: a delta scan's tombstone can reference a
+    // registration living in an unread older fragment (a table drop in the
+    // refresh window), so the join check would misfire there — the fold's
+    // `finish` joins against the ACCUMULATED registration map instead.
+    if !is_delta_scan {
+        for tombstone in &tombstones {
+            let registration = table_registrations
+                .get(&tombstone.identity)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "manifest tombstone for identity {} has no table registration",
+                        tombstone.identity
+                    ))
+                })?;
+            if registration.table_key != tombstone.table_key {
+                return Err(OmniError::manifest_internal(format!(
+                    "manifest tombstone identity {} has diagnostic alias '{}', current binding is '{}'",
+                    tombstone.identity, tombstone.table_key, registration.table_key
+                )));
+            }
         }
     }
 

@@ -9,12 +9,12 @@ use crate::error::{OmniError, Result};
 use crate::failpoints;
 use crate::storage::{StorageAdapter, normalize_root_uri};
 
-use super::commit_graph::{CommitGraph, FirstParentEdge, GraphCommit};
+use super::commit_graph::{CommitGraph, CommitGraphSnapshot, FirstParentEdge, GraphCommit};
 use super::is_internal_system_branch;
 use super::manifest::{
     CapturedManifestProbe, DatasetUpdate, ExpectedTableVersions, GenesisManifestAttempt,
-    LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
-    PublishPrecondition, Snapshot,
+    LineageIntent, LineageRefresh, ManifestChange, ManifestCoordinator, ManifestIncarnation,
+    ManifestInitError, PublishPrecondition, Snapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -297,8 +297,10 @@ impl GraphCoordinator {
     }
 
     pub async fn refresh(&mut self) -> Result<()> {
-        let lineage_rows = self.manifest.refresh_with_lineage().await?;
-        self.commit_graph.replace_from_manifest_rows(lineage_rows);
+        match self.manifest.refresh_with_lineage().await? {
+            LineageRefresh::Replace(rows) => self.commit_graph.replace_from_manifest_rows(rows),
+            LineageRefresh::Append(rows) => self.commit_graph.append_manifest_rows(rows),
+        }
         Ok(())
     }
 
@@ -335,6 +337,12 @@ impl GraphCoordinator {
         self.commit_graph.load_commits().await
     }
 
+    /// O(1) lineage authority handle for merge-base selection. Unlike
+    /// `load_commits`, this does not clone the complete history.
+    pub(crate) fn commit_graph_snapshot(&self) -> CommitGraphSnapshot {
+        self.commit_graph.snapshot()
+    }
+
     pub async fn branch_list(&self) -> Result<Vec<String>> {
         self.manifest.list_graph_branches().await.map(|branches| {
             branches
@@ -346,6 +354,17 @@ impl GraphCoordinator {
 
     pub(crate) async fn all_branches(&self) -> Result<Vec<String>> {
         self.manifest.list_graph_branches().await
+    }
+
+    /// The native Lance ref this coordinator's branch resolved to; `None` on
+    /// main. Every table fork of the branch carries exactly this name.
+    pub(crate) fn native_branch(&self) -> Option<&str> {
+        self.manifest.native_branch()
+    }
+
+    /// Every live native branch ref except `main` (logical names may differ).
+    pub(crate) async fn all_native_branches(&self) -> Result<Vec<String>> {
+        self.manifest.list_native_graph_branches().await
     }
 
     pub async fn branch_descendants(&self, name: &str) -> Result<Vec<String>> {
@@ -767,7 +786,7 @@ impl GraphCoordinator {
         merged_parent_commit_id: Option<String>,
     ) -> Result<LineageIntent> {
         Ok(LineageIntent {
-            graph_commit_id: ulid::Ulid::new().to_string(),
+            graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             branch: self.current_branch().map(str::to_string),
             actor_id: actor_id.map(str::to_string),
             merged_parent_commit_id,
@@ -829,6 +848,7 @@ fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
     if branch == "main" {
         return Ok(None);
     }
+    crate::branch_names::ensure_logical_branch_name(branch)?;
     Ok(Some(branch.to_string()))
 }
 

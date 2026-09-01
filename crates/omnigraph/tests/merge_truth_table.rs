@@ -134,7 +134,7 @@ enum OpVariant {
     /// same cell as [`OpVariant::Noop`] — it reaches adopt classification
     /// where `Noop` is skipped outright. Regression cover for #473.
     NetZeroEdge,
-    /// Not in today's mutation grammar; see `crates/omnigraph/docs/query-language.md`
+    /// Not in today's mutation grammar; see `docs/user/mutations/index.md`.
     /// (`.gq` exposes only `insert | update set | delete`).
     DropProperty,
     /// Schema has no first-class label concept; labels are encoded as
@@ -793,7 +793,7 @@ fn build_case(left: OpVariant, right: OpVariant) -> MergeCase {
         //
         // Any cell that involves one of these op variants is dispositioned
         // as `Unsupported`. The mutation grammar exposes `insert | update
-        // set | delete` only (see `docs/query-language.md`); there is no
+        // set | delete` only (see `docs/user/mutations/index.md`); there is no
         // first-class `drop nullable property` or `add/remove label`
         // operation today. When those land, fill in the cells below and
         // delete the catch-all.

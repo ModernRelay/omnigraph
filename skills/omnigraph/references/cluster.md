@@ -7,7 +7,7 @@
 - Serving (`--cluster`, config-free bucket boot)
 - Recovery cheat-sheet
 
-The cluster control plane (omnigraph >= 0.7.0) manages a whole deployment —
+The cluster control plane manages a whole deployment —
 graphs, schemas, stored queries, Cedar policies — as **declared files in one
 directory**, converged Terraform-style. It is the **only way to serve** a
 graph (the server is cluster-only); the data-plane operations in the other
@@ -28,15 +28,16 @@ company-brain/
 ```yaml
 # cluster.yaml
 version: 1
-# storage: s3://my-bucket/clusters/company-brain   # optional — put ledger,
-#   catalog, and graph roots on S3 object storage (default: this folder)
+# storage: s3://my-bucket/clusters/company-brain   # optional object-store root;
+# preview Azure roots use az://container/prefix (default: this folder)
 state: { backend: cluster, lock: true }
 graphs:
   knowledge:
     schema: schema.pg
     queries: queries/    # the .gq files ARE the declaration — every `query <name>` registers
-policies:
-  base: { file: base.policy.yaml, applies_to: [knowledge] }  # or [cluster] for server-level
+    external_blobs:      # omitted means deny new external references
+      allow:
+        - { base: s3://company-assets/knowledge/, scope: server_safe }
 ```
 
 `queries` also accepts a file list (`[a.gq, b.gq]`) or a fine-grained
@@ -67,8 +68,22 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
   the lock becomes genuinely cross-machine. Absent, everything defaults to the
   config directory (byte-compatible with pre-existing clusters). Credentials
   come from the standard `AWS_*` env contract, never `cluster.yaml`.
-- **`--as <actor>` attributes every run** (sidecars, audit, engine commits).
-  Defaults from your operator config's `operator.actor`; required for `approve`.
+- **`storage: az://container/prefix` is preview-only.** Every writer, server,
+  apply job, and maintenance process for an Azure root must run through
+  `omnigraph-azure-admission`; the preview lease is external admission, not an
+  engine-level distributed-writer fence.
+- **One mutation-capable process per graph remains the supported topology.** A
+  cluster ledger lock serializes control-plane runs; it does not fence arbitrary
+  data-plane writers. Provide external admission before running another writer.
+- **External Blob ingress is default-deny.** `graphs.<id>.external_blobs.allow`
+  lists normalized URI bases. `scope: server_safe` can be installed by the
+  server; `embedded_only` is never installed by the server or direct-store CLI.
+  Cedar chooses who may write; this list chooses which source objects a writer
+  may cause the process to inspect.
+- **`--as <actor>` attributes `cluster apply` and `cluster approve`** (sidecars,
+  audit, and engine commits where applicable). It defaults from operator config's
+  `operator.actor` and is required for `approve`; the other cluster subcommands
+  reject this flag.
 - **Destructive changes are gated**: removing a graph from `cluster.yaml`
   blocks with `approval_required` until
   `omnigraph cluster approve graph.<id> --config . --as <you>` records a
@@ -95,16 +110,20 @@ coupling.
 
 ## Serving
 
-`omnigraph-server --cluster <dir>` is exclusive (cannot combine with a URI,
-`--target`, or `--config`), always multi-graph (`/graphs/{id}/...`), and
-fail-fast: missing/pending/tampered state refuses boot with a remedy. Every
-declared query is exposed (`GET /graphs/<id>/queries`, `POST
+`omnigraph-server --cluster <dir-or-uri>` is the exclusive boot source (there
+is no separate `--config` merge) and is always multi-graph
+(`/graphs/{id}/...`). By default, graph-attributed recovery, query-registry, or
+provider failures quarantine only the affected graph and healthy graphs still
+serve. Cluster-global or unattributable failures are fatal, as are any graph
+failures with `--require-all-graphs`. Every healthy graph's applied query is
+exposed (`GET /graphs/<id>/queries`, `POST
 /graphs/<id>/queries/<name>`); Cedar bundles attach via `applies_to`
-(`cluster` → server-level gate incl. `graph_list`; `graph.<id>` → that
+(`cluster` → server-level gate incl. `graph_list`; a graph id → that
 graph's gate incl. `invoke_query`). Bearer tokens and bind stay process-level
 (env/flags).
 
-**Config-free serving.** `--cluster` also accepts the storage-root URI
+**Config-free serving.** `--cluster` also accepts a `file://`, `s3://`, or
+preview `az://` storage-root URI
 directly — `omnigraph-server --cluster s3://bucket/prefix` boots from the
 applied revision on the bucket with **no checkout of the config repo**. The
 ledger and catalog on the bucket are the whole deployment artifact; policy
@@ -119,10 +138,11 @@ in-container `cluster apply`.
 | Symptom | Fix |
 |---|---|
 | Apply crashed mid-run | run `cluster apply` again — sidecars + sweep reconcile |
-| Held lock | `cluster status` (shows lock id) → `cluster force-unlock <LOCK_ID> --config .` |
-| Lost/corrupt `state.json` | `cluster import` rebuilds from config + live graphs, then `apply` |
+| Held lock | First prove no `plan`/`apply`/`refresh`/`import` is still live; then use `cluster status` and clear that exact id with `cluster force-unlock <LOCK_ID> --config .` |
+| Missing `state.json` | `cluster import` bootstraps state from config + live graphs, then `apply` |
+| Corrupt `state.json` | restore a trusted cluster-state backup or follow the diagnostic; `cluster import` never overwrites existing state |
 | Server refuses to boot | the error names its remedy (usually `cluster refresh` + `apply`, restart) |
-| `approval_stale` warning | re-run `cluster approve` — the plan changed since you approved |
+| `approval_stale` warning | re-run and review `cluster plan`, then approve the current digest — the planned change changed |
 
 Full reference: the omnigraph repo's `docs/user/clusters/index.md` (operator guide)
 and `docs/user/clusters/config.md` (every key, flag, and diagnostic).

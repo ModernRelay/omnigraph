@@ -1,0 +1,318 @@
+# DST nightly tier: the volume hunts — hours,
+# nobody waits, runs latest main (which already passed the per-PR tier).
+# Seed-space discipline (the exploration planner's design): every night
+# owns a fresh DISJOINT interval derived from the date, so no two nights
+# overlap. Replay honesty (#527 P1-7): only the DETERMINISTIC arms
+# (det-fleet, sched) replay a failure exactly from its logged seed line;
+# a `wild` failure is EVIDENCE, not a transcript — real pool timing is
+# not seed-derived, so its seed row bounds a rerun, it does not repeat it.
+# Volume without fresh territory flattens: the date-derived base gives
+# fresh seeds automatically; fresh RECIPES (new scenario shapes) are
+# future planner work, deliberately not in this workflow.
+#
+# A failure does not block anything: the shard goes red, the log carries
+# the seed+arm row and (deterministic fleet) the auto-replay BUNDLE —
+# triage next morning starts from a transcript, not a log dig.
+name: DST nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  # Manual replay of a past night: seed_base takes the NIGHT base (the
+  # "night base:" value any shard logged); empty = tonight's date arithmetic.
+  workflow_dispatch:
+    inputs:
+      seed_base:
+        description: "Night base to replay (empty = tonight's date arithmetic)"
+        required: false
+        default: ""
+      det_seeds:
+        description: "Seeds per det-fleet shard, 1..=100 (empty = 60; shard stride follows it)"
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: --cfg tokio_unstable
+  # Pool-quiescing trio (`env_knobs::QUIESCE_ENV`) — same keys and
+  # reason as dst.yml. Wild-arm steps override the VALUES;
+  # require_pool_env asserts presence only.
+  RAYON_NUM_THREADS: "1"
+  LANCE_CPU_THREADS: "1"
+  LANCE_DETERMINISTIC_BACKOFF: "1"
+
+jobs:
+  det-fleet:
+    name: Deterministic fleet (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: dst
+          save-if: false
+      # Disjoint interval: 1000 seeds/night from the epoch 2026-08-14;
+      # det-fleet owns offsets 0..360 (6 shards x 60 seeds). Failures are
+      # replayable seeds; the pass log carries the auto-replay bundles.
+      - name: Fleet shard
+        # Dispatch inputs cross into the shell via env, never inline
+        # interpolation (script-injection hardening), and must be numeric.
+        env:
+          SEED_BASE_INPUT: ${{ inputs.seed_base }}
+          DET_SEEDS_INPUT: ${{ inputs.det_seeds }}
+        run: |
+          days=$(( ( $(date -u +%s) - $(date -u -d 2026-08-14 +%s) ) / 86400 ))
+          seed_floor=200000
+          night_span=1000
+          night_base=$(( seed_floor + days * night_span ))
+          if [ -n "$SEED_BASE_INPUT" ]; then
+            case "$SEED_BASE_INPUT" in (*[!0-9]*) echo "seed_base must be numeric"; exit 1;; esac
+            night_base=$(( 10#$SEED_BASE_INPUT ))
+          fi
+          seeds="${DET_SEEDS_INPUT:-60}"
+          case "$seeds" in (*[!0-9]*|'') echo "det_seeds must be numeric"; exit 1;; esac
+          seeds=$(( 10#$seeds ))
+          # Cap 100: 6 shards x 100 = 600, where the concurrent offsets
+          # begin — any higher and det shards replay concurrent seeds.
+          if [ "$seeds" -lt 1 ] || [ "$seeds" -gt 100 ]; then
+            echo "det_seeds must be 1..=100 (det tier owns night offsets 0..600)"; exit 1
+          fi
+          # Shard stride follows the seed count so overridden counts stay disjoint.
+          export DST_FLEET_SEED_BASE=$(( night_base + ${{ matrix.shard }} * seeds ))
+          export DST_FLEET_SEEDS="$seeds"
+          # The base line opens the log file (tee, no -a) so the report can
+          # cross-check every shard's night base from the artifact; cargo
+          # then appends.
+          echo "night base: $night_base shard base: $DST_FLEET_SEED_BASE seeds: $DST_FLEET_SEEDS" | tee det-fleet-shard-${{ matrix.shard }}.log
+          set -o pipefail
+          cargo test -p omnigraph-dst --locked --test scenarios dst_fleet -- --exact --ignored --nocapture 2>&1 | tee -a det-fleet-shard-${{ matrix.shard }}.log
+      # Failure rows and replay verdicts go to the job summary.
+      - name: Failure rows into the job summary
+        if: always()
+        run: |
+          {
+            echo "### det-fleet shard ${{ matrix.shard }}"
+            echo '```'
+            if [ -f det-fleet-shard-${{ matrix.shard }}.log ]; then
+              grep -E "^dst fleet FAILURE seed=|^dst fleet BUNDLE verdict|^FLEET COMPLETE" det-fleet-shard-${{ matrix.shard }}.log || echo "no failure rows"
+            else
+              echo "shard log missing"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # The full shard log (report lines + auto-replay BUNDLE transcripts)
+      # as a downloadable artifact, red or green.
+      - name: Upload shard log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: det-fleet-shard-${{ matrix.shard }}
+          path: det-fleet-shard-${{ matrix.shard }}.log
+          retention-days: 30
+          overwrite: true
+
+  concurrent-fleet:
+    name: Concurrent fleet ${{ matrix.mode }} (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+        mode: [wild, sched]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: dst
+          save-if: false
+      # Two regimes, per the measured doctrine: `wild` hunts with real
+      # simultaneity (unquiesced pools; NON-REPLAYABLE — see the replay
+      # honesty note in this file's header). `sched` runs under the
+      # storage-call arbiter (quiesced-scope replay). Offsets 600..660
+      # (wild) and 800..860 (sched) inside the night's interval keep
+      # every job disjoint.
+      - name: Concurrent shard
+        # Dispatch input crosses into the shell via env (same hardening as
+        # the det-fleet step).
+        env:
+          SEED_BASE_INPUT: ${{ inputs.seed_base }}
+        run: |
+          days=$(( ( $(date -u +%s) - $(date -u -d 2026-08-14 +%s) ) / 86400 ))
+          offset=600
+          if [ "${{ matrix.mode }}" = "sched" ]; then
+            offset=800
+            export OMNIGRAPH_DST_SEAM_SCHEDULE=1
+          else
+            export LANCE_CPU_THREADS=4
+            export RAYON_NUM_THREADS=4
+          fi
+          seed_floor=200000
+          night_span=1000
+          night_base=$(( seed_floor + days * night_span ))
+          if [ -n "$SEED_BASE_INPUT" ]; then
+            case "$SEED_BASE_INPUT" in (*[!0-9]*) echo "seed_base must be numeric"; exit 1;; esac
+            night_base=$(( 10#$SEED_BASE_INPUT ))
+          fi
+          base=$(( night_base + offset + ${{ matrix.shard }} * 15 ))
+          OMNIGRAPH_DST_SEEDS=$(seq -s, "$base" $(( base + 14 )))
+          export OMNIGRAPH_DST_SEEDS
+          # Base line opens the log (report cross-check), cargo appends.
+          echo "night base: $night_base (mode ${{ matrix.mode }} shard ${{ matrix.shard }})" | tee concurrent-${{ matrix.mode }}-shard-${{ matrix.shard }}.log
+          echo "night seeds: $OMNIGRAPH_DST_SEEDS (mode ${{ matrix.mode }})"
+          set -o pipefail
+          cargo test -p omnigraph-dst --locked --test scenarios dst_concurrent_fleet -- --exact --ignored --nocapture 2>&1 | tee -a concurrent-${{ matrix.mode }}-shard-${{ matrix.shard }}.log
+      # Violation and panic lines go to the job summary. Concurrent
+      # failures panic in place (no FAILURE rows, no completion line) —
+      # these anchors are their actual output.
+      - name: Failure rows into the job summary
+        if: always()
+        run: |
+          {
+            echo "### concurrent ${{ matrix.mode }} shard ${{ matrix.shard }}"
+            echo '```'
+            if [ -f concurrent-${{ matrix.mode }}-shard-${{ matrix.shard }}.log ]; then
+              grep -E "dst concurrent VIOLATION|panicked at|test result:" concurrent-${{ matrix.mode }}-shard-${{ matrix.shard }}.log || echo "no failure rows"
+            else
+              echo "shard log missing"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # For the `wild` mode the artifact IS the evidence: those failures
+      # are non-replayable (real pool timing), so the log is the finding.
+      - name: Upload shard log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: concurrent-${{ matrix.mode }}-shard-${{ matrix.shard }}
+          path: concurrent-${{ matrix.mode }}-shard-${{ matrix.shard }}.log
+          retention-days: 30
+          overwrite: true
+
+  # ONE report for the whole night (the morning read; also shipped as the
+  # `nightly-report` artifact): det known/novel split from FAILURE_JSON
+  # rows, concurrent reds from their VIOLATION/panic lines, and a shard-log
+  # presence count so a missing log never reads as a green shard.
+  nightly-report:
+    name: Nightly report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [det-fleet, concurrent-fleet]
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+    steps:
+      - name: Download all shard logs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: shards
+          # Shard artifacts only — on a re-run attempt the previous
+          # attempt's nightly-report artifact also exists, and ingesting
+          # it would duplicate every row.
+          pattern: "*-shard-*"
+      - name: Build the report
+        run: |
+          {
+            echo "# DST nightly report"
+            echo
+            echo "## Shard logs present (expected 14: 6 det + 8 concurrent)"
+            echo '```'
+            find shards -name "*.log" 2>/dev/null | sort || true
+            # Expected counts mirror the two matrix blocks above — update together.
+            log_count=$(find shards -name "*.log" 2>/dev/null | wc -l | tr -d ' ')
+            echo "count: $log_count"
+            if [ "$log_count" -ne 14 ]; then
+              echo "WARNING: shard logs missing — a missing log is NOT a green shard (cancelled/timed-out jobs upload nothing)"
+            fi
+            # A log can exist yet be PARTIAL (shard killed mid-fleet):
+            # completion is checked separately from presence.
+            det_done=$(grep -rh "^FLEET COMPLETE" shards 2>/dev/null | wc -l | tr -d ' ')
+            conc_done=$(grep -rl "test result:" shards/concurrent-* 2>/dev/null | wc -l | tr -d ' ')
+            echo "det completions: $det_done/6  concurrent completions: $conc_done/8"
+            if [ "$det_done" -ne 6 ] || [ "$conc_done" -ne 8 ]; then
+              echo "WARNING: a shard uploaded a log but never completed (timeout/kill?) — its failures appear in no section below"
+            fi
+            echo '```'
+            echo
+            echo "## Seed bases (every shard must agree on the night base)"
+            echo '```'
+            grep -rh "night base:" shards || echo "none"
+            echo '```'
+            echo
+            echo "## NOVEL det failures (triage these first)"
+            echo '```'
+            grep -rh "^dst fleet FAILURE_JSON" shards | grep '"known":null' || echo "none"
+            echo '```'
+            echo
+            echo "## Known-family det failures (triaged; still red)"
+            echo '```'
+            grep -rh "^dst fleet FAILURE_JSON" shards | grep -v '"known":null' || echo "none"
+            echo '```'
+            echo
+            echo "## Concurrent failures (violations and panics)"
+            echo '```'
+            grep -r -E "dst concurrent VIOLATION|panicked at|test result: FAILED" shards/concurrent-* 2>/dev/null || echo "none"
+            echo '```'
+            echo
+            echo "## Det failure rows (human form)"
+            echo '```'
+            grep -rh "^dst fleet FAILURE seed=" shards || echo "none"
+            echo '```'
+            echo
+            echo "## Replay verdicts"
+            echo '```'
+            grep -rh "^dst fleet BUNDLE verdict" shards || echo "none"
+            echo '```'
+            echo
+            echo "## Det completion lines (path = shard identity)"
+            echo '```'
+            grep -r "^FLEET COMPLETE" shards || echo "none"
+            echo '```'
+          } | tee nightly-report.md
+          # Step summaries cap at 1 MiB; on a mass-failure night ship the
+          # head and point at the artifact rather than losing the page.
+          if [ "$(wc -c < nightly-report.md | tr -d ' ')" -gt 900000 ]; then
+            head -c 900000 nightly-report.md >> "$GITHUB_STEP_SUMMARY"
+            echo "... (truncated; full report in the nightly-report artifact)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat nightly-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # Shard logs keep 30d; the report keeps 90d — it is the durable
+      # summary, and transcripts are re-derivable from seeds.
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-report
+          path: nightly-report.md
+          retention-days: 90
+          overwrite: true

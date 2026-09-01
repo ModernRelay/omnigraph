@@ -97,7 +97,7 @@ pub(crate) enum ExportFrame {
     Terminal {
         /// The move-only cut stays queued behind every data frame. Dropping a
         /// disconnected response drops this frame and releases the root slot.
-        cut: ExportCut,
+        cut: Box<ExportCut>,
         error: Option<io::Error>,
     },
 }
@@ -137,6 +137,7 @@ impl Stream for ExportBodyStream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(ExportFrame::Data(bytes))) => Poll::Ready(Some(Ok(bytes))),
             Poll::Ready(Some(ExportFrame::Terminal { cut, error })) => {
+                let cut = *cut;
                 drop(cut);
                 self.lease.take();
                 self.done = true;
@@ -276,7 +277,10 @@ mod tests {
             .await;
         result.unwrap();
         sender
-            .send(ExportFrame::Terminal { cut, error: None })
+            .send(ExportFrame::Terminal {
+                cut: Box::new(cut),
+                error: None,
+            })
             .await
             .unwrap();
         drop(sender);

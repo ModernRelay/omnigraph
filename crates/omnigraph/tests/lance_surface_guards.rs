@@ -1071,9 +1071,70 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 //   5. a live slash-name path-child makes force delete remove an ancestor's
 //      BranchContents but intentionally retain its dataset files. OmniGraph's
 //      prefix-disjoint live-name invariant prevents this false-success shape.
-//   6. a tag targeting a named branch does not retain `tree/{branch}`. RFC-025
-//      must therefore refuse graph-branch deletion while checkpoint authority
-//      names that branch; the Lance tag alone is not a deletion fence.
+//   6. Lance 11 refuses even force deletion while a tag targets the branch.
+//      The ref, tree, and tagged snapshot remain readable until the tag is
+//      explicitly removed. Graph-level retention authority remains separate.
+
+// Incarnation-suffixed ref names. OmniGraph names every graph-branch life
+// `{logical}.{ULID}`. This pins the substrate facts that design relies on:
+// Lance accepts the name, stores the life at `tree/{logical}.{ULID}/` as a
+// SIBLING of any bare `tree/{logical}/`, and a recreation under a new suffix
+// shares no path with a lingering dead tree, so the dead tree is inert
+// garbage rather than a clone-target collision.
+#[tokio::test]
+async fn incarnation_suffixed_branch_names_are_path_disjoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard-incarnation.lance");
+    let uri = uri.to_str().unwrap();
+    let mut ds = fresh_dataset(uri).await;
+    let base = ds.version().version;
+
+    let first = "feature.01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let second = "feature.01BX5ZZKBKACTAV9WEVGEMMVRZ";
+    ds.create_branch(first, base, None)
+        .await
+        .expect("Lance must accept a `.`-suffixed segment as a branch name");
+    let tree = std::path::Path::new(uri).join("tree");
+    assert!(tree.join(first).is_dir(), "the life lives at tree/{first}");
+    assert!(
+        !tree.join("feature").exists(),
+        "a suffixed life must not create or nest under a bare tree/feature/"
+    );
+
+    // Simulate a delete whose tree removal never settled: remove only the ref.
+    std::fs::remove_file(
+        std::path::Path::new(uri)
+            .join("_refs")
+            .join("branches")
+            .join(format!("{first}.json")),
+    )
+    .unwrap();
+    assert!(
+        tree.join(first).is_dir(),
+        "precondition: the dead life's tree lingers"
+    );
+
+    // A new life under a new suffix is unaffected by the dead tree.
+    ds.create_branch(second, base, None)
+        .await
+        .expect("a recreation under a new incarnation never collides with a dead tree");
+    assert!(tree.join(second).is_dir());
+    let branches = ds.list_branches().await.unwrap();
+    assert!(branches.contains_key(second));
+    assert!(
+        !branches.contains_key(first),
+        "the dead life is unlisted: ref absence is the only authority Lance keeps"
+    );
+    // Lance's checkout is PATH-based: it reads tree/{name} whether or not
+    // the ref exists, so a dead life's lingering tree is still readable by
+    // name. That is why OmniGraph resolves a logical name through the ref
+    // listing and only checks out a name the listing proves live.
+    assert!(
+        ds.checkout_branch(first).await.is_ok(),
+        "Lance checkout reads a dead life's tree by path; if this now fails, the \
+         listing-first resolution rule could be relaxed"
+    );
+}
 
 #[tokio::test]
 async fn force_delete_branch_semantics() {
@@ -1101,29 +1162,43 @@ async fn force_delete_branch_semantics() {
         .create(branch_delete_tag, ("feature", feature_version))
         .await
         .expect("the RFC-025 deterministic internal spelling must be a valid Lance tag");
-    ds.force_delete_branch("feature").await.unwrap();
+    let error = ds
+        .force_delete_branch("feature")
+        .await
+        .expect_err("a named-branch tag must fence even force deletion");
+    assert!(matches!(error, lance::Error::RefConflict { .. }));
     assert!(
-        !ds.list_branches().await.unwrap().contains_key("feature"),
-        "force_delete_branch should remove an existing branch ref"
+        ds.list_branches().await.unwrap().contains_key("feature"),
+        "a tag-blocked deletion must preserve the branch ref"
     );
     assert!(
-        !std::path::Path::new(uri)
+        std::path::Path::new(uri)
             .join("tree")
             .join("feature")
             .exists(),
-        "a tag targeting a named branch must not retain its physical branch tree"
+        "a tag-blocked deletion must preserve the physical branch tree"
     );
     assert_eq!(
         ds.tags().get(branch_delete_tag).await.unwrap().version,
         feature_version,
         "branch deletion must not be mistaken for tag deletion"
     );
-    assert!(
-        ds.checkout_version(branch_delete_tag).await.is_err(),
-        "the surviving tag must not make a deleted branch version readable; \
-         OmniGraph's checkpoint-aware branch-delete guard is load-bearing"
+    let tagged = ds.checkout_version(branch_delete_tag).await.unwrap();
+    assert_eq!(
+        tagged.count_rows(None).await.unwrap(),
+        feature.count_rows(None).await.unwrap(),
+        "a tag-blocked deletion must preserve the tagged snapshot"
     );
     ds.tags().delete(branch_delete_tag).await.unwrap();
+    ds.force_delete_branch("feature").await.unwrap();
+    assert!(!ds.list_branches().await.unwrap().contains_key("feature"));
+    assert!(
+        !std::path::Path::new(uri)
+            .join("tree")
+            .join("feature")
+            .exists(),
+        "after removing the tag, force deletion must reclaim the branch tree"
+    );
 
     // (3) Force delete is idempotent even when both the ref and tree are absent.
     ds.force_delete_branch("never").await.unwrap();
@@ -3555,39 +3630,36 @@ async fn contains_filter_routes_to_ngram_index_and_rechecks_exactly() {
         ids_for(&ds, contains(ident("text"), lit("ta ray"))).await,
         vec!["2"]
     );
-    // KNOWN UPSTREAM BUG (pinned; lance-format/lance#7841; re-confirmed on Lance
-    // 9.0.0 stable + DataFusion 54): a needle below the trigram width (3)
-    // should degrade to a recheck-everything scan — the NGram index returns
-    // an `at_least(empty)` lower bound for it — but the scan planner treats
-    // the empty probe as authoritative and returns ZERO rows: silent row
-    // loss, not an error. Both rows here contain "ra" (the unindexed scan
-    // path returns them, proven by the in-memory-arm tests), so a red on
-    // this assertion means Lance FIXED sub-trigram containment: flip it to
-    // expect ["1", "2"] and lift the sub-trigram caveat before shipping the
-    // NGRAM `@index` kind — .gq String `contains` must never silently drop
-    // rows on short needles.
+    // Lance 11 fixes lance-format/lance#7841 by leaving below-trigram-width
+    // needles on the full-scan path. They must return every exact match,
+    // excluding both a nonmatching row and NULL, rather than interpreting
+    // the index's empty lower bound as an empty answer.
+    let short_filter = contains(ident("text"), lit("ra"));
+    let mut scanner = ds.scan();
+    scanner.filter_expr(short_filter.clone());
+    let plan = scanner.create_plan().await.unwrap();
+    let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
+    assert!(
+        !plan_str.contains("ScalarIndexQuery"),
+        "below-trigram-width contains must fall back to a full scan. plan:\n{plan_str}"
+    );
     assert_eq!(
-        ids_for(&ds, contains(ident("text"), lit("ra"))).await,
-        Vec::<String>::new(),
-        "sub-trigram contains on an NGRAM'd column currently drops all rows \
-         (upstream bug); a non-empty result means Lance fixed it — update \
-         this guard and the NGRAM rollout caveat"
+        ids_for(&ds, short_filter).await,
+        vec!["1", "2"],
+        "sub-trigram contains must preserve exact substring semantics"
     );
 }
 
-// --- Guard 23: a second index on a column requires an explicit distinct name ---
+// --- Guard 23: index kinds get distinct default names; replacement is by name --
 //
-// Lance derives the default index name `{column}_idx` and `.replace(true)`
-// removes existing indexes BY NAME. So an unnamed second-index build on an
-// already-indexed column either replaces the first index or refuses — it
-// never yields two coexisting indexes. The engine therefore MUST pass an
-// explicit `.name(...)` whenever it adds a second index kind to one column
-// (dual BTREE beside FTS; opt-in NGRAM). Pins both halves: distinctly-named
-// indexes of different types coexist, and the unnamed path never silently
-// coexists. If Lance changes its naming/replace semantics, this turns red —
-// re-validate the engine's index-naming strategy in stage_create_indices.
+// Lance 11 derives `{column}_idx`, then `_2`, `_3`, ... when an existing name
+// belongs to another field or index kind. A same-kind rebuild reuses its
+// default name, and `.replace(true)` still removes indexes BY NAME. The
+// engine retains explicit companion names: independent uncommitted builders
+// against one pinned dataset cannot see each other's new names. Pin exact
+// sequential naming and replacement without changing that staging policy.
 #[tokio::test]
-async fn second_index_on_column_requires_explicit_distinct_name() {
+async fn index_default_names_distinguish_kinds_and_replacement_is_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("guard23.lance");
     let uri = uri.to_str().unwrap();
@@ -3623,6 +3695,12 @@ async fn second_index_on_column_requires_explicit_distinct_name() {
         v
     }
 
+    fn index_names(indices: &[lance_table::format::IndexMetadata]) -> Vec<&str> {
+        let mut names: Vec<&str> = indices.iter().map(|m| m.name.as_str()).collect();
+        names.sort();
+        names
+    }
+
     // Baseline: an unnamed FTS build lands under the default `text_idx` name.
     ds.create_index_builder(
         &["text"],
@@ -3636,27 +3714,31 @@ async fn second_index_on_column_requires_explicit_distinct_name() {
     assert_eq!(after_fts.len(), 1);
     assert_eq!(after_fts[0].name, "text_idx");
 
-    // The trap: an unnamed BTREE build on the same column must never leave
-    // BOTH indexes standing (today it replaces the FTS under the shared
-    // default name; an error would also satisfy the pin).
-    let unnamed = ds
-        .create_index_builder(&["text"], IndexType::BTree, &ScalarIndexParams::default())
+    // A different kind gets a distinct default name without replacing FTS.
+    ds.create_index_builder(&["text"], IndexType::BTree, &ScalarIndexParams::default())
         .replace(true)
-        .await;
+        .await
+        .unwrap();
     ds.checkout_latest().await.unwrap();
     let after_unnamed = ds.load_indices().await.unwrap();
-    let distinct_types = type_urls(&after_unnamed).len();
-    assert!(
-        unnamed.is_err() || distinct_types == 1,
-        "an unnamed second-index build must replace or refuse, never coexist \
-         (got {} indexes with types {:?}) — if Lance now auto-uniquifies \
-         same-field names, re-validate the engine's explicit-naming strategy",
-        after_unnamed.len(),
-        type_urls(&after_unnamed),
+    assert_eq!(index_names(&after_unnamed), vec!["text_idx", "text_idx_2"]);
+    assert_eq!(type_urls(&after_unnamed).len(), 2);
+    assert_eq!(
+        after_unnamed
+            .iter()
+            .find(|m| m.name == "text_idx")
+            .unwrap()
+            .uuid,
+        after_fts[0].uuid,
+        "the unnamed BTREE must preserve the existing FTS artifact"
     );
+    let unnamed_btree_uuid = after_unnamed
+        .iter()
+        .find(|m| m.name == "text_idx_2")
+        .unwrap()
+        .uuid;
 
-    // The contract the engine relies on: an explicitly-named second index of a
-    // different type coexists with the first.
+    // Rebuilding the same kind reuses its default name and replaces only FTS.
     ds.create_index_builder(
         &["text"],
         IndexType::Inverted,
@@ -3665,6 +3747,26 @@ async fn second_index_on_column_requires_explicit_distinct_name() {
     .replace(true)
     .await
     .unwrap();
+    let after_rebuild = ds.load_indices().await.unwrap();
+    assert_eq!(index_names(&after_rebuild), vec!["text_idx", "text_idx_2"]);
+    let rebuilt_fts_uuid = after_rebuild
+        .iter()
+        .find(|m| m.name == "text_idx")
+        .unwrap()
+        .uuid;
+    assert_ne!(rebuilt_fts_uuid, after_fts[0].uuid);
+    assert_eq!(
+        after_rebuild
+            .iter()
+            .find(|m| m.name == "text_idx_2")
+            .unwrap()
+            .uuid,
+        unnamed_btree_uuid,
+        "rebuilding FTS must preserve the other kind's artifact"
+    );
+
+    // An explicitly distinct name also coexists, including with another
+    // index of the same kind; replacement is by name, not column or kind.
     ds.create_index_builder(&["text"], IndexType::BTree, &ScalarIndexParams::default())
         .name("text_btree_idx".to_string())
         .replace(true)
@@ -3672,16 +3774,21 @@ async fn second_index_on_column_requires_explicit_distinct_name() {
         .unwrap();
     ds.checkout_latest().await.unwrap();
     let after_named = ds.load_indices().await.unwrap();
-    let names: Vec<&str> = {
-        let mut n: Vec<&str> = after_named.iter().map(|m| m.name.as_str()).collect();
-        n.sort();
-        n
-    };
     assert_eq!(
-        names,
-        vec!["text_btree_idx", "text_idx"],
+        index_names(&after_named),
+        vec!["text_btree_idx", "text_idx", "text_idx_2"],
         "distinctly-named indexes of different types must coexist on one column"
     );
+    for (name, expected_uuid) in [
+        ("text_idx", rebuilt_fts_uuid),
+        ("text_idx_2", unnamed_btree_uuid),
+    ] {
+        assert_eq!(
+            after_named.iter().find(|m| m.name == name).unwrap().uuid,
+            expected_uuid,
+            "the explicitly named BTREE must preserve '{name}'"
+        );
+    }
     assert_eq!(
         type_urls(&after_named).len(),
         2,

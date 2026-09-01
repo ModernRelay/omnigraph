@@ -11,7 +11,8 @@ body:
         design a maintainer hasn't agreed should exist. Once accepted (and labelled
         `needs-rfc`), open an RFC PR per
         [docs/rfcs/README.md](https://github.com/ModernRelay/omnigraph/blob/main/docs/rfcs/README.md);
-        the merged RFC then sanctions the implementation PRs, and this issue tracks them.
+        implementation begins only after the RFC lifecycle is explicitly `accepted`;
+        merging a draft does not accept it. This issue then tracks the implementation.
   - type: textarea
     id: problem
     attributes:

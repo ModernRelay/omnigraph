@@ -1,23 +1,25 @@
 ---
-type: spec
-title: "RFC-023 — Substrate-native key-conflict fencing"
-description: Make concurrent keyed writes fail or retry through Lance's transaction conflict filters, forbid keyed Append, and activate the contract only in a fencing-compatible internal format reached through rebuild cutover.
-status: implemented
-tags: [eng, rfc, write-path, concurrency, lance, primary-key]
-timestamp: 2026-07-10
-owner: OmniGraph maintainers
+rfc: "0023"
+title: "Substrate-native key-conflict fencing"
+track: maintainer
+status: accepted
+implementation: complete
+authors:
+  - OmniGraph maintainers
+created: 2026-07-10
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-023: Substrate-native key-conflict fencing
+# RFC 0023: Substrate-native key-conflict fencing
 
-**Status:** Implemented (2026-07-15) — all acceptance gates satisfied
-**Date:** 2026-07-10
-**Author track:** Maintainer design series
-
-> **RFC-026 disposition:** the key-fencing contract remains implemented in
+> **RFC 0026 disposition:** the key-fencing contract remains implemented in
 > internal schema v6. References below to a future MemWAL fold are historical;
-> RFC-026 was rejected and removed. See
-> [the removal decision](../dev/wal-removal.md).
+> RFC 0026 was rejected and removed. See
+> [the current ingestion design](../dev/ingestion.md).
 
 **Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance transaction,
@@ -45,21 +47,21 @@ direct-Lance comparator, and maximum signed paired peak-RSS overheads were
 all 60 measured setup/operation/verification child phases, exact-content
 checks, and route checks passed. The operator procedure for diagnosing and
 repairing pre-existing duplicate IDs is recorded in the
-[upgrade guide](../user/operations/upgrade.md#repairing-duplicate-ids-found-during-the-v6-rebuild);
+[upgrade guide](../user/operations/upgrade.md);
 the destructive-recovery topology boundary remains single-writer-process. The
 genuine v5↔v6 rebuild/reverse-refusal run is green.
-**Relationship to RFC-022:** this RFC is the fencing decision split from the
-earlier monolithic RFC-022 draft. [RFC-022](0022-unified-write-path.md)
+**Relationship to RFC 0022:** this RFC is the fencing decision split from the
+earlier monolithic RFC 0022 draft. [RFC 0022](0022-unified-write-path.md)
 defines the shared write/recovery protocol; this RFC owns the substrate,
 compatibility stamp, and rollout requirements for key conflicts. Stable table
 identity and incarnation come from
-[RFC-028](0028-stable-schema-identity.md), which is a prerequisite. This RFC
-may share a release with [RFC-024](0024-durable-table-heads.md), but neither
+[RFC 0028](0028-stable-schema-identity.md), which is a prerequisite. This RFC
+may share a release with [RFC 0024](0024-durable-table-heads.md), but neither
 RFC depends on the other's storage decision.
 **Audience:** engine, storage, migration, and release maintainers
-**Architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
-All RFC-023 blocker dispositions and acceptance evidence are reflected below;
-the ledger continues to track sibling RFC gates.
+
+All architecture-review blocker dispositions and acceptance evidence are
+incorporated below; the separate review ledger has been retired.
 
 ---
 
@@ -188,7 +190,7 @@ In scope:
 
 - node and edge data tables;
 - mutation, load, branch merge, and recovery replay paths, plus the keyed-write
-  contract that a future RFC-026 WAL fold must satisfy once streaming is
+  contract that a future RFC 0026 WAL fold must satisfy once streaming is
   implemented;
 - new-format table creation and export/import cutover activation;
 - schema/overwrite preservation of PK metadata;
@@ -214,9 +216,9 @@ validation. An edge endpoint move is an update of the row identified by `id`.
 
 The PK field is addressed by the pinned Lance schema's stable field ID, not
 column position or mutable name. The surrounding logical table contract is
-bound to [RFC-028](0028-stable-schema-identity.md)'s stable table ID and
+bound to [RFC 0028](0028-stable-schema-identity.md)'s stable table ID and
 incarnation. That prerequisite is active in internal schema v5. Internal schema
-v6 adds the independent fencing/PK contract without changing RFC-028's identity
+v6 adds the independent fencing/PK contract without changing RFC 0028's identity
 model.
 
 ### 4.2 Keyless append-only tables
@@ -505,7 +507,7 @@ necessary because two old, unfiltered writers still have no filters to compare.
 ## 6. Retry and validation semantics
 
 A Lance retryable key conflict does **not** by itself authorize a restart. The
-writer first classifies the current RFC-022 attempt:
+writer first classifies the current RFC 0022 attempt:
 
 1. A conflict detected before the recovery sidecar is armed has no physical
    effect. The writer discards the staged attempt and may perform a bounded
@@ -579,7 +581,7 @@ binary refuses the fencing-capable stamp.
 
 The fencing-compatible format is internal schema **v6**, shipped by 0.9.0 and
 retained unchanged by 0.10.0 (the later v7+ development stamps were rejected
-with the RFC-026 experiment). It follows RFC-028's v5 identity format; RFC-024 and later draft
+with the RFC 0026 experiment). It follows RFC 0028's v5 identity format; RFC 0024 and later draft
 capabilities are not included. Each later internal-format change requires its
 own rebuild under the strand policy unless independently accepted capabilities
 deliberately co-release after a combined initialization and recovery review.
@@ -604,10 +606,10 @@ Existing graphs activate fencing only through the documented rebuild path:
 2. show the accepted schema with that old binary;
 3. initialize a different graph root with the fencing-capable binary; every
    keyed table is created with the exact PK metadata before any data load;
-4. import through ordinary `load`, using RFC-022 staging/recovery and the
+4. import through ordinary `load`, using RFC 0022 staging/recovery and the
    production fenced route;
 5. fail before serving if the export contains duplicate `id` values or the
-   physical PK contract differs from the accepted RFC-028 identity/catalog;
+   physical PK contract differs from the accepted RFC 0028 identity/catalog;
 6. verify the target, then cut clients over.
 
 The source is never mutated, so a failed target init or import is discarded or
@@ -630,14 +632,14 @@ Once set, the following are storage invariants:
 - schema apply cannot remove, replace, reorder semantically, or make nullable a
   PK field;
 - a property rename within one dataset preserves the PK field ID and metadata;
-- a supported pure type rename is metadata-only under RFC-028: it preserves the
+- a supported pure type rename is metadata-only under RFC 0028: it preserves the
   same dataset, logical table ID/incarnation, Lance schema, field IDs, and PK
   metadata; a separate property change may still rewrite that same dataset;
 - branch fork/clone preserves it;
 - import/rebuild creates it before accepting data;
 - recovery restore may select an older data image only if that image is already
   fencing/PK-compatible;
-- a table recreation uses RFC-028's new stable table ID and incarnation and
+- a table recreation uses RFC 0028's new stable table ID and incarnation and
   installs the catalog-derived PK contract at creation;
 - `__manifest`'s existing legacy PK key form is preserved exactly as stored;
   fresh initialization writes that selected form directly rather than
@@ -862,8 +864,9 @@ histories. The named-branch identity/history cell is therefore satisfied. No
 co-release was selected for v6, so the conditional combined capability matrix
 is not applicable. Stamp rewind was not used as evidence.
 
-The operator duplicate-repair procedure is now published in the
-[v6 rebuild runbook](../user/operations/upgrade.md#repairing-duplicate-ids-found-during-the-v6-rebuild).
+The operator duplicate-repair procedure is retained here as historical rollout
+evidence; the current [upgrade guide](../user/operations/upgrade.md) owns the
+supported rebuild workflow.
 It inventories duplicate IDs by logical table, preserves the old root and raw
 export, requires an application-aware consolidation/remap decision plus an
 edge-rewrite ledger, proves the repaired export through a disposable v6 root,
@@ -895,8 +898,7 @@ and the cold runtime remain measured terms. Unsafe keyed Append stays removed
 regardless; failure of the fixed gate would have required the mitigation named
 in §5.1 before acceptance.
 
-> 💬 **Instrument required (tightening 5 in the
-> [review ledger](../dev/rfc-022-027-architecture-review.md)):**
+> 💬 **Review requirement (tightening 5):**
 > `helpers::cost` measures I/O, not peak RSS, so this memory bound is
 > unenforceable as written. Use the subprocess `scenarios.rs` harness or an
 > equivalent `wait4`/`ru_maxrss` instrument, and name dataset sizes, baseline,
@@ -1259,7 +1261,7 @@ correctness cells are recorded in §11.2 and are green.
 2. **Satisfied 2026-07-15:** the repeated v2-path scale curve passed its 1M
    median-latency and maximum-RSS thresholds versus the indexed baseline.
 3. **Satisfied 2026-07-15:** the
-   [v6 rebuild runbook](../user/operations/upgrade.md#repairing-duplicate-ids-found-during-the-v6-rebuild)
+   [v6 rebuild guidance](../user/operations/upgrade.md)
    inventories every table-scoped duplicate, requires an application-aware
    consolidation/remap and edge-rewrite ledger, verifies the repaired snapshot
    in a disposable v6 root, and rebuilds the production candidate at a clean
@@ -1267,7 +1269,7 @@ correctness cells are recorded in §11.2 and are green.
    detection and atomic target refusal; no automatic repair or winner-selection
    tooling is claimed.
 4. **Satisfied 2026-07-15:** accepted and implemented
-   [RFC-028](0028-stable-schema-identity.md) identity (internal schema v5).
+   [RFC 0028](0028-stable-schema-identity.md) identity (internal schema v5).
 5. **Retained support boundary, not a current-topology acceptance gate:**
    cross-process recovery ownership must land before any broadened topology
    claim. V6 destructive recovery remains single-writer-process.

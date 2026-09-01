@@ -1,4 +1,4 @@
-//! Read-path cost instrumentation (test seam).
+//! Read/write cost instrumentation (test and benchmark seam).
 //!
 //! Two boundary instruments let cost-budget tests assert that a warm read does
 //! no redundant IO, the way LanceDB's IO-counted tests do (see
@@ -10,6 +10,8 @@
 //!   so the open helpers attach nothing (one unset-`Option` check per open).
 //! - **omnigraph `StorageAdapter`** — [`CountingStorageAdapter`], a decorator that
 //!   counts per-method calls (the schema-contract reads on the query path).
+//! - **branch merge** — [`MergeWriteProbes`] reports structural route counters
+//!   and completed timing intervals without reading the clock when unset.
 //!
 //! The probes themselves only observe, and the decorator delegates every call.
 //! The shared dataset opener also supplies the process control session when a
@@ -21,15 +23,51 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
-use lance::io::{ObjectStoreParams, WrappingObjectStore};
+use lance::io::WrappingObjectStore;
 
 use crate::error::{OmniError, Result};
 use crate::storage::{ListDirBounds, StorageAdapter};
+
+macro_rules! declare_engine_cargo_features {
+    ($($feature:literal),+ $(,)?) => {
+        /// Every Cargo feature declared by `omnigraph-engine`.
+        ///
+        /// Benchmark admission compares this registry to the crate manifest
+        /// captured by its build script. Adding a Cargo feature without adding
+        /// it here therefore fails closed instead of collapsing two builds into
+        /// one benchmark identity.
+        #[doc(hidden)]
+        pub const fn declared_engine_cargo_features() -> &'static [&'static str] {
+            &[$($feature),+]
+        }
+
+        /// Cargo features compiled into this exact `omnigraph-engine` artifact.
+        ///
+        /// This read-only build seam lets benchmark and diagnostic binaries
+        /// report dependency features from the crate that owns them. A
+        /// dependent crate's `cfg(feature = ...)` namespace cannot observe
+        /// features enabled directly on `omnigraph-engine` by Cargo's workspace
+        /// feature graph.
+        #[doc(hidden)]
+        pub const fn enabled_engine_cargo_features() -> &'static [&'static str] {
+            &[
+                $(
+                    #[cfg(feature = $feature)]
+                    $feature,
+                )+
+            ]
+        }
+    };
+}
+
+// Keep this list sorted. Benchmark admission independently derives the same
+// registry from Cargo.toml and refuses execution on any mismatch.
+declare_engine_cargo_features!("default", "dst", "failpoints");
 
 /// Per-query IO probes, installed for a query's task via [`with_query_io_probes`].
 ///
@@ -90,6 +128,37 @@ pub struct QueryIoProbes {
     /// invisible to the manifest/data IO counters — a cost test asserts it so a
     /// future forward-child projection (the bounded-visit fix) is measurable.
     pub feed_commits_visited: Arc<AtomicU64>,
+    /// Adjacent-version transaction files read while classifying CDC candidate
+    /// intervals. Wider intervals must fall back before incrementing this
+    /// counter, keeping stateless tiny-page resumes constant in history depth.
+    pub candidate_transaction_reads: Arc<AtomicU64>,
+    /// Manifest fragment entries compared or validated while deriving a CDC
+    /// candidate plan. This exposes the metadata CPU term that object-store I/O
+    /// counters cannot see.
+    pub candidate_fragment_metadata_steps: Arc<AtomicU64>,
+    /// Candidate child rows pulled by the pruned emitter. A max-changes=1 page
+    /// over all-changing rows should inspect only the emitted row plus one
+    /// continuation sentinel.
+    pub candidate_rows_examined: Arc<AtomicU64>,
+    /// Largest row/byte scanner target requested by a candidate emitter in the
+    /// measured operation. Both are maxima (not sums) because parent and child
+    /// streams use the same current-page target.
+    pub candidate_scan_target_rows_peak: Arc<AtomicU64>,
+    pub candidate_scan_target_bytes_peak: Arc<AtomicU64>,
+    /// Complete logical change images materialized (and therefore eligible to
+    /// read managed Blob payloads). A continuation sentinel must not increment
+    /// this counter.
+    pub change_images_materialized: Arc<AtomicU64>,
+    /// Manifest-projection refreshes served by the incremental projection fold
+    /// (only appended catalog fragments read) vs the full O(history) scan.
+    /// Cost tests assert the incremental path engages so a silent
+    /// always-full-scan regression is structurally visible.
+    pub projection_incremental_refreshes: Arc<AtomicU64>,
+    pub projection_full_refreshes: Arc<AtomicU64>,
+    /// Physical manifest rows hydrated to classify deletion-vector deltas.
+    /// This must equal the newly deleted offset count; a fragment scan would
+    /// make it grow with the compacted catalog's history instead.
+    pub projection_identity_rows: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -133,6 +202,119 @@ where
 /// production (no scope installed), so the env var is consulted instead.
 pub(crate) fn traversal_mode_override() -> Option<&'static str> {
     TRAVERSAL_MODE_OVERRIDE.try_with(|m| *m).ok().flatten()
+}
+
+tokio::task_local! {
+    static STAGE_WRITE_CONCURRENCY_OVERRIDE: Option<usize>;
+    static STAGE_WRITE_PROBES: StageWriteProbes;
+}
+
+/// Deterministic probe for the number of table-fragment staging futures that
+/// are inside their storage call at once.
+///
+/// `release_after` is a test rendezvous: the first staged tables wait until
+/// that many participants have entered. A concurrency regression therefore
+/// times out instead of passing from result equivalence alone. Production
+/// leaves this task-local unset, so staging only pays the unset lookup.
+#[derive(Clone)]
+pub struct StageWriteProbes {
+    state: Arc<StageWriteProbeState>,
+}
+
+struct StageWriteProbeState {
+    active: AtomicU64,
+    entered: AtomicU64,
+    peak: AtomicU64,
+    rendezvous: tokio::sync::Barrier,
+}
+
+impl StageWriteProbes {
+    /// Create a probe that releases each group after `release_after` staged
+    /// tables have entered the storage-call boundary.
+    pub fn rendezvous(release_after: usize) -> Self {
+        assert!(release_after > 0, "stage-write rendezvous must be non-zero");
+        Self {
+            state: Arc::new(StageWriteProbeState {
+                active: AtomicU64::new(0),
+                entered: AtomicU64::new(0),
+                peak: AtomicU64::new(0),
+                rendezvous: tokio::sync::Barrier::new(release_after),
+            }),
+        }
+    }
+
+    /// Number of table-storage staging calls that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.state.entered.load(Ordering::Relaxed)
+    }
+
+    /// Maximum table-storage staging calls simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.state.peak.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) struct StageWriteProbeGuard {
+    state: Arc<StageWriteProbeState>,
+}
+
+impl Drop for StageWriteProbeGuard {
+    fn drop(&mut self) {
+        self.state.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Run `fut` with deterministic table-staging probes installed.
+pub async fn with_stage_write_probes<F>(probes: StageWriteProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    STAGE_WRITE_PROBES.scope(probes, fut).await
+}
+
+pub(crate) async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
+    let state = STAGE_WRITE_PROBES
+        .try_with(|probes| probes.state.clone())
+        .ok()?;
+    state.entered.fetch_add(1, Ordering::Relaxed);
+    // Count only after every participant is released. The first staging call
+    // must then remain pending in its real storage future for a second call to
+    // raise the peak above one; parked rendezvous waiters do not count.
+    state.rendezvous.wait().await;
+    let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
+    state.peak.fetch_max(active, Ordering::Relaxed);
+    let guard = StageWriteProbeGuard {
+        state: state.clone(),
+    };
+    Some(guard)
+}
+
+/// Force the fragment-writing stage width for the scope of `fut` WITHOUT
+/// mutating the process-global `OMNIGRAPH_LOAD_CONCURRENCY` env var. Same seam
+/// as [`with_traversal_mode`], for the same reason: a width-forcing test stays
+/// scope-bound and process-safe, so it never perturbs a concurrent test in the
+/// same binary and needs no `#[serial]`. The env var stays the production/ops
+/// escape hatch; this scoped override takes precedence over it
+/// (`exec::staging::stage_write_concurrency`).
+///
+/// `0` is not a concurrency: it is ignored in favour of the default, matching
+/// the env parse rules.
+pub async fn with_stage_write_concurrency<F>(concurrency: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    STAGE_WRITE_CONCURRENCY_OVERRIDE
+        .scope(Some(concurrency), fut)
+        .await
+}
+
+/// The scoped staging-width override active for this task, if any. `None` in
+/// production (no scope installed), so the env var is consulted instead.
+pub(crate) fn stage_write_concurrency_override() -> Option<usize> {
+    STAGE_WRITE_CONCURRENCY_OVERRIDE
+        .try_with(|c| *c)
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
@@ -183,6 +365,32 @@ pub(crate) fn record_manifest_scan() {
     });
 }
 
+/// Record one manifest-projection refresh served by the incremental
+/// fold. No-op unless a cost probe is active.
+pub(crate) fn record_projection_incremental_refresh() {
+    let _ = current(|p| {
+        p.projection_incremental_refreshes
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one manifest-projection refresh that fell back to (or started as)
+/// the full O(history) scan. No-op unless a cost probe is active.
+pub(crate) fn record_projection_full_refresh() {
+    let _ = current(|p| {
+        p.projection_full_refreshes.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record rows returned by the physical-address take used to classify newly
+/// deleted manifest rows. No-op unless a cost probe is active.
+pub(crate) fn record_projection_identity_rows(rows: usize) {
+    let _ = current(|p| {
+        p.projection_identity_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    });
+}
+
 /// Record one topology-index build over `edges` edge tables (the
 /// `RuntimeCache::graph_index` cache-miss path). No-op when no probes are
 /// installed (production).
@@ -217,17 +425,49 @@ pub(crate) fn record_feed_commits_visited(commits: usize) {
     });
 }
 
-/// Per-operation staged-write counts, installed for a task via
-/// [`with_merge_write_probes`]. Lets a cost-budget test assert WHICH staged-write
-/// primitive an operation invokes — e.g. that an append-only fast-forward merge
-/// routes new rows through the exact-id fenced merge adapter and does **zero**
-/// bare appends. Counts the publish-path primitives only; merge-staging temp
-/// tables use `append_or_create_batch`, not these.
+pub(crate) fn record_candidate_transaction_read() {
+    let _ = current(|p| {
+        p.candidate_transaction_reads
+            .fetch_add(1, Ordering::Relaxed)
+    });
+}
+
+pub(crate) fn record_candidate_fragment_metadata_steps(steps: u64) {
+    if steps > 0 {
+        let _ = current(|p| {
+            p.candidate_fragment_metadata_steps
+                .fetch_add(steps, Ordering::Relaxed)
+        });
+    }
+}
+
+pub(crate) fn record_candidate_row_examined() {
+    let _ = current(|p| p.candidate_rows_examined.fetch_add(1, Ordering::Relaxed));
+}
+
+pub(crate) fn record_candidate_scan_targets(rows: usize, bytes: u64) {
+    let _ = current(|p| {
+        p.candidate_scan_target_rows_peak
+            .fetch_max(rows as u64, Ordering::Relaxed);
+        p.candidate_scan_target_bytes_peak
+            .fetch_max(bytes, Ordering::Relaxed);
+    });
+}
+
+pub(crate) fn record_change_image_materialized() {
+    let _ = current(|p| p.change_images_materialized.fetch_add(1, Ordering::Relaxed));
+}
+
+/// One internal branch-merge timing bucket.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MergeTimingPhase {
     OuterPrepare,
     ProvenInsertHistory,
     ProvenInsertPlanScan,
+    /// One general three-way ordered table walk plus staging its merged rows.
+    /// Scalar and Blob tables each record one interval; proven-insert routes
+    /// bypass this phase entirely.
+    TableWalk,
     CandidateValidation,
     FinalRevalidation,
     RecoveryArm,
@@ -241,13 +481,80 @@ pub(crate) enum MergeTimingPhase {
 }
 
 impl MergeTimingPhase {
-    const COUNT: usize = 13;
+    const COUNT: usize = 14;
 
     const fn index(self) -> usize {
         self as usize
     }
+
+    const ALL: [Self; Self::COUNT] = [
+        Self::OuterPrepare,
+        Self::ProvenInsertHistory,
+        Self::ProvenInsertPlanScan,
+        Self::TableWalk,
+        Self::CandidateValidation,
+        Self::FinalRevalidation,
+        Self::RecoveryArm,
+        Self::PhysicalPublish,
+        Self::KeyedStage,
+        Self::KeyedCommit,
+        Self::RecoveryConfirm,
+        Self::ManifestPublish,
+        Self::RecoveryCleanup,
+        Self::OuterRestoreRefresh,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::OuterPrepare => "OuterPrepare",
+            Self::ProvenInsertHistory => "ProvenInsertHistory",
+            Self::ProvenInsertPlanScan => "ProvenInsertPlanScan",
+            Self::TableWalk => "TableWalk",
+            Self::CandidateValidation => "CandidateValidation",
+            Self::FinalRevalidation => "FinalRevalidation",
+            Self::RecoveryArm => "RecoveryArm",
+            Self::PhysicalPublish => "PhysicalPublish",
+            Self::KeyedStage => "KeyedStage",
+            Self::KeyedCommit => "KeyedCommit",
+            Self::RecoveryConfirm => "RecoveryConfirm",
+            Self::ManifestPublish => "ManifestPublish",
+            Self::RecoveryCleanup => "RecoveryCleanup",
+            Self::OuterRestoreRefresh => "OuterRestoreRefresh",
+        }
+    }
 }
 
+/// One diagnostic merge phase returned by
+/// [`MergeWriteProbes::merge_timing_snapshot`]. Times are accumulated in
+/// microseconds; `interval_count` remains exact even when a duration rounds
+/// down to zero microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergeTimingReading {
+    /// Stable, additive diagnostic identifier. Existing identifiers are never
+    /// renamed or repurposed; callers must tolerate new identifiers.
+    pub phase: &'static str,
+    /// Sum of every explicitly completed interval, rounded down to microseconds.
+    pub total_us: u64,
+    /// Largest explicitly completed interval, rounded down to microseconds.
+    pub max_us: u64,
+    /// Exact number of explicitly completed intervals. Failed and cancelled
+    /// phases drop their unfinished span and do not increment this count.
+    pub interval_count: u64,
+}
+
+#[derive(Default)]
+struct MergeTimingCounters {
+    total_ns: [AtomicU64; MergeTimingPhase::COUNT],
+    max_ns: [AtomicU64; MergeTimingPhase::COUNT],
+    interval_count: [AtomicU64; MergeTimingPhase::COUNT],
+}
+
+/// Per-operation branch-merge route and timing counters.
+///
+/// Install a fresh instance with [`with_merge_write_probes`] for each measured
+/// repetition. Counters accumulate for the lifetime of this value; read a
+/// timing snapshot after the scoped future completes.
 #[derive(Clone, Default)]
 pub struct MergeWriteProbes {
     pub stage_append_calls: Arc<AtomicU64>,
@@ -307,8 +614,7 @@ pub struct MergeWriteProbes {
     /// Diagnostic-only elapsed-time buckets. They are non-overlapping at the
     /// top level; `KeyedStage` and `KeyedCommit` are intentional sub-buckets of
     /// `PhysicalPublish`. Production pays only the unset task-local probe.
-    merge_timing_total_ns: Arc<[AtomicU64; MergeTimingPhase::COUNT]>,
-    merge_timing_max_ns: Arc<[AtomicU64; MergeTimingPhase::COUNT]>,
+    merge_timing: Arc<MergeTimingCounters>,
 }
 
 impl MergeWriteProbes {
@@ -382,10 +688,13 @@ impl MergeWriteProbes {
             .load(Ordering::Relaxed)
     }
     fn merge_timing_total_us(&self, phase: MergeTimingPhase) -> u64 {
-        self.merge_timing_total_ns[phase.index()].load(Ordering::Relaxed) / 1_000
+        self.merge_timing.total_ns[phase.index()].load(Ordering::Relaxed) / 1_000
     }
     fn merge_timing_max_us(&self, phase: MergeTimingPhase) -> u64 {
-        self.merge_timing_max_ns[phase.index()].load(Ordering::Relaxed) / 1_000
+        self.merge_timing.max_ns[phase.index()].load(Ordering::Relaxed) / 1_000
+    }
+    fn merge_timing_interval_count(&self, phase: MergeTimingPhase) -> u64 {
+        self.merge_timing.interval_count[phase.index()].load(Ordering::Relaxed)
     }
     pub fn outer_prepare_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::OuterPrepare)
@@ -395,6 +704,15 @@ impl MergeWriteProbes {
     }
     pub fn proven_insert_plan_scan_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::ProvenInsertPlanScan)
+    }
+    pub fn table_walk_total_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::TableWalk)
+    }
+    pub fn table_walk_max_us(&self) -> u64 {
+        self.merge_timing_max_us(MergeTimingPhase::TableWalk)
+    }
+    pub fn table_walk_interval_count(&self) -> u64 {
+        self.merge_timing_interval_count(MergeTimingPhase::TableWalk)
     }
     pub fn candidate_validation_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::CandidateValidation)
@@ -432,14 +750,34 @@ impl MergeWriteProbes {
     pub fn outer_restore_refresh_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::OuterRestoreRefresh)
     }
+
+    /// Snapshot all completed merge timing intervals in deterministic order.
+    ///
+    /// Take the snapshot after the [`with_merge_write_probes`] future completes.
+    /// `phase` is the stable identifier: callers must match by name rather than
+    /// position and tolerate additive phases. This observational read uses the
+    /// same relaxed counters as the individual accessors.
+    pub fn merge_timing_snapshot(&self) -> Vec<MergeTimingReading> {
+        MergeTimingPhase::ALL
+            .into_iter()
+            .map(|phase| MergeTimingReading {
+                phase: phase.name(),
+                total_us: self.merge_timing_total_us(phase),
+                max_us: self.merge_timing_max_us(phase),
+                interval_count: self.merge_timing_interval_count(phase),
+            })
+            .collect()
+    }
 }
 
 tokio::task_local! {
     static MERGE_WRITE_PROBES: MergeWriteProbes;
 }
 
-/// Run `fut` with staged-write probes installed. Test-only entry point; nothing
-/// in production sets the probes, so `record_stage_*` below are no-ops.
+/// Run `fut` with branch-merge test/benchmark probes installed.
+///
+/// Production leaves this scope unset. Use a fresh [`MergeWriteProbes`] per
+/// measured repetition and inspect it only after this future completes.
 pub async fn with_merge_write_probes<F>(probes: MergeWriteProbes, fut: F) -> F::Output
 where
     F: std::future::Future,
@@ -573,14 +911,49 @@ pub(crate) fn record_proven_insert_raw_batch(bytes: u64) {
     });
 }
 
-/// Add one elapsed interval to a diagnostic merge phase. No-op when no test or
-/// benchmark probe is installed.
-pub(crate) fn record_merge_timing(phase: MergeTimingPhase, elapsed: Duration) {
-    let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-    let _ = MERGE_WRITE_PROBES.try_with(|p| {
-        p.merge_timing_total_ns[phase.index()].fetch_add(nanos, Ordering::Relaxed);
-        p.merge_timing_max_ns[phase.index()].fetch_max(nanos, Ordering::Relaxed);
-    });
+/// An explicitly completed diagnostic timing interval. The disabled variant
+/// carries no timestamp, so production performs only the task-local probe.
+#[must_use = "call finish after the timed phase succeeds"]
+pub(crate) struct MergeTimingSpan {
+    active: Option<ActiveMergeTimingSpan>,
+}
+
+struct ActiveMergeTimingSpan {
+    phase: MergeTimingPhase,
+    started: Instant,
+    counters: Arc<MergeTimingCounters>,
+}
+
+impl MergeTimingSpan {
+    /// Record this interval. Dropping a span without finishing preserves the
+    /// existing success-only behavior for failed or cancelled phases.
+    pub(crate) fn finish(self) {
+        let Some(ActiveMergeTimingSpan {
+            phase,
+            started,
+            counters,
+        }) = self.active
+        else {
+            return;
+        };
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        counters.total_ns[phase.index()].fetch_add(nanos, Ordering::Relaxed);
+        counters.max_ns[phase.index()].fetch_max(nanos, Ordering::Relaxed);
+        counters.interval_count[phase.index()].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Start one diagnostic merge phase. No clock is read unless a test or
+/// benchmark installed merge probes for this task.
+pub(crate) fn start_merge_timing(phase: MergeTimingPhase) -> MergeTimingSpan {
+    let active = MERGE_WRITE_PROBES
+        .try_with(|probes| ActiveMergeTimingSpan {
+            phase,
+            counters: Arc::clone(&probes.merge_timing),
+            started: Instant::now(),
+        })
+        .ok();
+    MergeTimingSpan { active }
 }
 
 /// Which version [`open_dataset`] resolves.
@@ -627,10 +1000,11 @@ pub(crate) async fn open_dataset(
         .unwrap_or_else(crate::lance_access::control_session);
     builder = builder.with_session(session);
     if let Some(wrapper) = wrapper {
-        builder = builder.with_store_params(ObjectStoreParams {
-            object_store_wrapper: Some(wrapper),
-            ..Default::default()
-        });
+        let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
+        store_params.object_store_wrapper = Some(wrapper);
+        builder = builder.with_store_params(store_params);
+    } else {
+        builder = builder.with_store_params(crate::storage::lance_store_params_for_uri(uri)?);
     }
     builder.load().await.map_err(|error| match error {
         // Only the two shapes cleanup/drop legitimately leaves behind for a
@@ -840,5 +1214,107 @@ impl StorageAdapter for CountingStorageAdapter {
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
         self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.delete_prefix(prefix_uri).await
+    }
+}
+
+#[cfg(test)]
+mod merge_timing_phase_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn benchmark_feature_attestation_covers_every_engine_feature() {
+        let manifest = toml::from_str::<toml::Value>(include_str!("../Cargo.toml"))
+            .expect("engine Cargo.toml parses as TOML");
+        let declared = manifest["features"]
+            .as_table()
+            .expect("engine Cargo.toml has a features table")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let registry = declared_engine_cargo_features()
+            .iter()
+            .map(|feature| (*feature).to_string())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(declared, registry, "update the benchmark feature registry");
+
+        let suppressed_optional_dependencies = manifest["features"]
+            .as_table()
+            .unwrap()
+            .values()
+            .filter_map(toml::Value::as_array)
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .filter_map(|feature| feature.strip_prefix("dep:"))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut optional_dependencies = BTreeSet::new();
+        let mut inspect_dependencies = |value: Option<&toml::Value>| {
+            let Some(table) = value.and_then(toml::Value::as_table) else {
+                return;
+            };
+            optional_dependencies.extend(
+                table
+                    .iter()
+                    .filter(|(_name, specification)| {
+                        specification
+                            .as_table()
+                            .and_then(|fields| fields.get("optional"))
+                            .and_then(toml::Value::as_bool)
+                            .is_some_and(|optional| optional)
+                    })
+                    .map(|(name, _specification)| name.clone()),
+            );
+        };
+        for table in ["dependencies", "build-dependencies"] {
+            inspect_dependencies(manifest.get(table));
+        }
+        if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+            for target in targets.values() {
+                for table in ["dependencies", "build-dependencies"] {
+                    inspect_dependencies(target.get(table));
+                }
+            }
+        }
+        assert!(
+            optional_dependencies
+                .difference(&suppressed_optional_dependencies)
+                .next()
+                .is_none(),
+            "optional dependencies must use dep:name so no implicit feature escapes attestation"
+        );
+    }
+
+    #[test]
+    fn all_lists_every_phase_in_counter_order() {
+        for (index, phase) in MergeTimingPhase::ALL.into_iter().enumerate() {
+            assert_eq!(phase.index(), index);
+        }
+    }
+
+    #[tokio::test]
+    async fn timing_spans_record_only_when_explicitly_finished() {
+        assert!(
+            start_merge_timing(MergeTimingPhase::TableWalk)
+                .active
+                .is_none()
+        );
+
+        let probes = MergeWriteProbes::default();
+        with_merge_write_probes(probes.clone(), async {
+            start_merge_timing(MergeTimingPhase::TableWalk).finish();
+            drop(start_merge_timing(MergeTimingPhase::TableWalk));
+        })
+        .await;
+
+        assert_eq!(probes.table_walk_interval_count(), 1);
+        let readings = probes.merge_timing_snapshot();
+        assert_eq!(readings.len(), MergeTimingPhase::COUNT);
+        let table_walk = readings
+            .iter()
+            .find(|reading| reading.phase == "TableWalk")
+            .expect("TableWalk timing reading");
+        assert_eq!(table_walk.interval_count, 1);
     }
 }

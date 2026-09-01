@@ -157,6 +157,37 @@ pub(crate) struct MutationStaging {
     pub(crate) op_kinds: HashMap<String, MutationOpKind>,
 }
 
+/// Concurrency for the fragment-writing stage, shared by the loader and
+/// end-of-query mutation staging. Each staged write is an independent Lance
+/// dataset (manifest + fragments for a different table); ops within a single
+/// table stay serial under Lance's manifest OCC, so cross-table staging has
+/// no shared state to race.
+///
+/// The default of 8 preserves the loader's existing bound. Override it via
+/// `OMNIGRAPH_LOAD_CONCURRENCY`.
+pub(crate) const DEFAULT_STAGE_WRITE_CONCURRENCY: usize = 8;
+
+/// Resolution order: the scoped test override
+/// ([`crate::instrumentation::with_stage_write_concurrency`]), then
+/// `OMNIGRAPH_LOAD_CONCURRENCY`, then the default. Tests force a width through
+/// the scoped seam so they never mutate process-global environment.
+pub(crate) fn stage_write_concurrency() -> usize {
+    if let Some(scoped) = crate::instrumentation::stage_write_concurrency_override()
+        && scoped > 0
+    {
+        return scoped;
+    }
+    parse_stage_write_concurrency(std::env::var("OMNIGRAPH_LOAD_CONCURRENCY").ok().as_deref())
+}
+
+/// Pure half of [`stage_write_concurrency`], split out so the parse rules are
+/// unit-testable without mutating process-global environment.
+fn parse_stage_write_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_STAGE_WRITE_CONCURRENCY)
+}
+
 impl MutationStaging {
     /// Capture pre-write metadata on first touch of a table. Subsequent
     /// touches preserve the original `paths` and `expected_versions`
@@ -364,7 +395,9 @@ impl MutationStaging {
     /// and loader write paths so their validation input cannot drift.
     pub(crate) fn to_changeset(&self) -> crate::validate::ChangeSet {
         let mut changeset = crate::validate::ChangeSet::new();
-        for table_key in self.pending.keys() {
+        let mut __dst_pk: Vec<_> = self.pending.keys().collect();
+        __dst_pk.sort();
+        for table_key in __dst_pk {
             let batches = self.pending_batches(table_key);
             if batches.is_empty() {
                 continue;
@@ -376,7 +409,9 @@ impl MutationStaging {
         // Deletes (disjoint from `pending` by D₂) carry their removed ids so the
         // evaluator recounts the srcs a delete empties (`@card`) and sees removed
         // rows for RI — the faithful change-set the merge path also builds.
-        for (table_key, ids) in &self.deleted_ids {
+        let mut __dst_di: Vec<_> = self.deleted_ids.iter().collect();
+        __dst_di.sort_by(|a, b| a.0.cmp(b.0));
+        for (table_key, ids) in __dst_di {
             if ids.is_empty() {
                 continue;
             }
@@ -434,15 +469,23 @@ impl MutationStaging {
     /// run between staging (slow S3 PUTs, no queue) and commit (fast,
     /// under per-`(table_key, branch)` queue).
     ///
-    /// Sequential per-table for now — parallelizing across independent
-    /// Lance datasets is a perf follow-up; same loop structure as the
-    /// pre-split `finalize`.
+    /// Stages independent constructive (insert/update/overwrite) Lance
+    /// datasets concurrently at [`stage_write_concurrency`] — the same knob
+    /// the loader path has always run at. Deferred first-touch branch effects
+    /// and delete transactions remain serial. Publication is untouched:
+    /// everything after staging still funnels through the single manifest CAS.
+    /// Failure semantics are also untouched: the constructive staging stream
+    /// drains before the first error surfaces, exactly as the width-1
+    /// delegation it replaces did (any
+    /// staged-but-unpublished residue was already reclaimable, not
+    /// graph-visible).
     pub(crate) async fn stage_all(
         self,
         db: &crate::db::Omnigraph,
         branch: Option<&str>,
     ) -> Result<StagedMutation> {
-        self.stage_all_with_concurrency(db, branch, 1).await
+        self.stage_all_with_concurrency(db, branch, stage_write_concurrency())
+            .await
     }
 
     /// Loader-facing variant of [`stage_all`] that preserves
@@ -471,7 +514,9 @@ impl MutationStaging {
 
         let mut stage_inputs: Vec<(String, PreparedPendingTable, StagedTablePath, u64)> =
             Vec::with_capacity(pending.len());
-        for (table_key, table) in pending {
+        let mut __dst_pt: Vec<_> = pending.into_iter().collect();
+        __dst_pt.sort_by(|a, b| a.0.cmp(&b.0));
+        for (table_key, table) in __dst_pt {
             let path = paths.get(&table_key).cloned().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "MutationStaging::stage_all: missing path for table '{}'",
@@ -548,8 +593,16 @@ impl MutationStaging {
         }
         let concurrency = concurrency.min(stage_inputs.len()).max(1);
         let mut staged_entries: Vec<StagedTableEntry> =
-            futures::stream::iter(stage_inputs.into_iter().map(
-                |(table_key, table, path, expected)| async move {
+            futures::stream::iter(stage_inputs.into_iter().enumerate().map(
+                |(stage_idx, (table_key, table, path, expected))| async move {
+                    // DST window (loader walk, inside D2): between per-table
+                    // fragment uploads — a partial staged set with no
+                    // breadcrumb (benign by construction; cleanup reclaims).
+                    if stage_idx > 0 {
+                        crate::failpoints::maybe_fail(
+                            crate::failpoints::names::LOAD_BETWEEN_TABLE_STAGES,
+                        )?;
+                    }
                     stage_pending_table(db, table_key, table, path, expected).await
                 },
             ))
@@ -572,7 +625,9 @@ impl MutationStaging {
         // predicate matching zero committed rows yields `None` and is skipped
         // (the staged equivalent of the old "skip record_inline on 0 rows" —
         // no inline HEAD advance, closing the zero-row drift class).
-        for (table_key, predicates) in delete_predicates {
+        let mut __dst_dp: Vec<_> = delete_predicates.into_iter().collect();
+        __dst_dp.sort_by(|a, b| a.0.cmp(&b.0));
+        for (table_key, predicates) in __dst_dp {
             let path = paths.get(&table_key).cloned().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "MutationStaging::stage_all: missing path for delete table '{}'",
@@ -731,6 +786,11 @@ async fn stage_pending_table(
         }));
     }
 
+    // Bracket the actual storage future, not preparation or publication. The
+    // task-local probe is unset in production; tests use its rendezvous to
+    // prove that the configured cross-table width is exercised.
+    let _stage_write_probe = crate::instrumentation::enter_stage_write_probe().await;
+
     // Stage produces uncommitted fragments + transaction. No Lance HEAD
     // advance until `commit_all` runs `commit_staged`.
     let staged = match table.mode {
@@ -886,7 +946,7 @@ fn pre_minted_transaction_identity(
         // Lance treats the UUID as an opaque transaction identity/path
         // component. A ULID is equally unique and filesystem-safe while
         // avoiding a second UUID generator in the engine surface.
-        uuid: format!("omnigraph-{}", ulid::Ulid::new()),
+        uuid: format!("omnigraph-{}", crate::dst_ids::new_ulid()),
     }
 }
 
@@ -976,7 +1036,7 @@ pub(crate) struct CommittedMutation {
     /// Root schema, coarse branch, and sorted `(table, branch)` guards. The
     /// caller MUST hold the complete set across manifest publish (see
     /// `commit_all`) so no same-process writer interleaves after revalidation.
-    pub(crate) guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+    pub(crate) guards: Vec<crate::db::write_queue::QueueGuard>,
 }
 
 impl StagedMutation {
@@ -1226,6 +1286,10 @@ impl StagedMutation {
         let sidecar_handle =
             Some(write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?);
         let operation_id = sidecar.operation_id.clone();
+        crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_ARM_PRE_EFFECT)
+            .map_err(|error| {
+                OmniError::recovery_required(operation_id.clone(), error.to_string())
+            })?;
         if staged
             .iter()
             .any(|entry| entry.path.deferred_fork.is_some())
@@ -1618,4 +1682,55 @@ fn dedupe_merge_batches_by_id(
         return Ok(sliced.into_iter().next().unwrap());
     }
     arrow_select::concat::concat_batches(schema, &sliced).map_err(OmniError::arrow_internal)
+}
+
+#[cfg(test)]
+mod stage_write_concurrency_tests {
+    use super::{parse_stage_write_concurrency, stage_write_concurrency};
+    use crate::instrumentation::with_stage_write_concurrency;
+
+    // Pure parser, no process-global environment touched.
+    #[test]
+    fn resolves_default_override_and_junk() {
+        assert_eq!(
+            parse_stage_write_concurrency(None),
+            8,
+            "default without the env var"
+        );
+        assert_eq!(parse_stage_write_concurrency(Some("3")), 3, "override wins");
+        assert_eq!(
+            parse_stage_write_concurrency(Some("0")),
+            8,
+            "zero is not a concurrency"
+        );
+        assert_eq!(
+            parse_stage_write_concurrency(Some("banana")),
+            8,
+            "junk falls back to default"
+        );
+    }
+
+    /// The scoped seam must actually reach the resolver, and must not outlive its
+    /// future. Without this, a width-forcing test would silently run at the default
+    /// width on both sides of an equivalence comparison and prove nothing.
+    #[tokio::test]
+    async fn scoped_override_wins_and_does_not_leak() {
+        let outside_before = stage_write_concurrency();
+        assert_eq!(
+            with_stage_write_concurrency(3, async { stage_write_concurrency() }).await,
+            3,
+            "the scoped override must reach the resolver"
+        );
+        // 0 is not a concurrency: the scope is ignored, not obeyed.
+        assert_ne!(
+            with_stage_write_concurrency(0, async { stage_write_concurrency() }).await,
+            0,
+            "a zero override must fall back, never pin the width to zero"
+        );
+        assert_eq!(
+            stage_write_concurrency(),
+            outside_before,
+            "the override must be gone once its future resolves"
+        );
+    }
 }

@@ -1,625 +1,225 @@
-# Upgrading across a storage-format change (export / import)
+# Upgrading OmniGraph
 
-Omnigraph storage is **strict-single-version**: a binary reads exactly one
-internal-schema (storage-format) version. There is no in-place migration. When a
-release changes the internal schema, a graph created by an older release is
-**refused on open** with a message that points here, and you move it forward by
-rebuilding it: export with the old binary, then `init` + `load` with the new one.
+OmniGraph intentionally supports one storage format per binary. When a release
+changes that format, the new binary refuses the old graph and tells you which
+release line can export it. Upgrade by rebuilding at a new URI:
 
-This is a deliberate pre-release design choice. The rationale (lower long-term
-liability than carrying in-place migration code for a format that is still
-changing) is in [docs/dev/versioning.md](../../dev/versioning.md).
+1. export the schema and one branch with a compatible old binary;
+2. initialize a new graph with the new binary;
+3. load the export;
+4. verify and cut over;
+5. retire the old graph only after the cutover is proven.
 
-## How you know you need this
+Ordinary patch/minor upgrades that keep the same storage format do not require
+this export/import procedure. Derived indexes may still need rebuilding, as
+below, and CLI/API compatibility is independent of graph storage. Check the
+[release notes](../../releases/) before upgrading.
 
-Opening a graph whose stamp is below the binary's version fails with a
-message that **names the release line that wrote it** and the exact commands —
-so you can fetch the right old binary without guessing:
+## v0.9 to v0.10
 
-```
-__manifest is stamped at internal schema v4, but this omnigraph reads only v6.
-This graph was created by omnigraph 0.8.x. Rebuild it: with an omnigraph
-0.8.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
-binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
---mode overwrite --data graph.jsonl <new-graph>`. (Data, vectors, and blobs are
-preserved; commit history and branches are not.) See docs/user/operations/upgrade.md.
-```
+Released v0.9.0 uses Lance 9; v0.10.0 uses Lance 11. Both use graph storage
+format v6, so existing entities, branches, and retained history do not need an
+export/import migration. Development builds using Lance 10 follow the same
+full-text upgrade procedure below.
 
-### Which old binary do I need?
+The CLI/API vocabulary changes are not rolling-compatible. Update the CLI,
+server, and client integrations together, with application traffic stopped.
+Even without full-text indexes, do not run an old and new fleet against the
+same graph. Keep the old executables and a verified whole-root backup until the
+upgrade is proven. See the [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility).
 
-The on-disk stamp maps to the release line that wrote it. Export with any binary
-from that line (the latest is safest):
+## Full-text index upgrade
 
-| On-disk stamp | Written by | Export with |
-|---|---|---|
-| internal schema v1 | omnigraph ≤ 0.3.1 | any 0.3.1-or-earlier binary |
-| internal schema v2 | omnigraph 0.4.1–0.6.1 | the latest 0.6.x (e.g. 0.6.1) |
-| internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
-| internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
-| internal schema v5 | unreleased development builds | the exact source build that wrote the graph |
-| internal schema v6 | omnigraph 0.9.x–0.10.x | — current format; no rebuild needed |
+The Lance 11 upgrade keeps graph storage format v6, entities, branches, and
+history. It changes the English stemmer used by full-text search. Old indexes
+cannot safely be searched by the new analyzer, so OmniGraph explicitly refuses
+full-text queries until the selected indexes have been rebuilt.
 
-Internal schemas v7-v19 were unreleased development formats from the rejected
-MemWAL experiment. They are not an upgrade ladder and the current binary does
-not reinterpret them; see the [decision record](../../dev/wal-removal.md).
+1. Stop application readers and writers. Using the old CLI, inventory the live
+   branches and record which need full-text search, including `main`:
 
-You can also check versions before you hit a refusal:
+   ```bash
+   old-omnigraph branch list --store ./graph.omni --json
+   ```
 
-- `omnigraph version` — the binary's served version (the `internal-schema <N>` line).
-- `omnigraph snapshot <graph>` — the graph's on-disk `internal_schema_version`.
+2. Preserve and verify a backup of the **entire graph root**: metadata, branch
+   references, history, data, and indexes. A single branch's JSONL export is not
+   a rollback backup. For a cluster-managed graph, the root is
+   `<cluster-root>/graphs/<graph-id>.omni`; retain the deployment bundle and
+   configuration too. Keep any externally referenced storage available.
+3. Stop every old server, embedded writer, and maintenance process. Upgrade the
+   CLI and entire serving fleet together, leaving application traffic stopped.
+   Do not mix Lance 9/10 and Lance 11 readers or writers. Keep the server stopped
+   while the new direct-storage maintenance CLI rebuilds indexes.
+4. Use the new operator CLI to rebuild each branch on the inventory checklist:
 
-If the graph's stamp is **higher** than the binary's, the binary is too old —
-upgrade omnigraph rather than rebuilding the graph.
+   ```bash
+   omnigraph rebuild-full-text-indexes ./graph.omni --branch main --as operator --json
+   omnigraph rebuild-full-text-indexes ./graph.omni --branch review --as operator --json
+   ```
 
-If the refusal says `__manifest` has the current graph-manifest layout but **no
-internal-schema stamp at all**, the graph is not a genuine pre-stamp store. It
-may be an `omnigraph init` from an older binary interrupted between creating
-`__manifest` and writing its separate stamp commit, or the stamp metadata may
-have been damaged or externally modified later. OmniGraph cannot safely tell
-which happened and refuses to open the graph.
+   `--as` is optional actor attribution, not server-policy authorization. Inspect
+   `branch`, `graph_commit_id`, `rebuilt_indexes`, and `warnings`. A successful
+   non-empty rebuild publishes all planned indexes on that branch in one graph
+   commit. An empty index list with a null commit means no work was needed; it
+   does not mean other branches or historical snapshots were migrated.
 
-Delete the root and run `omnigraph init` again **only if you independently know
-that initialization never completed**. Otherwise preserve the root, do not
-reinitialize it in place, and investigate the metadata or restore from a
-known-good backup.
+   Rebuilding replaces custom tokenizer settings with the default English
+   analyzer and reports that warning. See [maintenance](maintenance.md#rebuild-full-text-indexes).
 
-## What is preserved (and what is not)
+5. Verify representative searches and entity counts on **every rebuilt branch**.
+   Include words affected by stemming, such as `organism` and `university`.
+   Start only the new fleet, keeping application traffic stopped, and verify
+   CLI/API integrations against the new response fields before resuming traffic.
+6. Keep the backup for rollback. Old binaries can silently miss matches in newly
+   rebuilt indexes; roll back by restoring the whole pre-upgrade backup with
+   the old fleet, not by pointing an old binary at the upgraded store.
 
-| Preserved | Not preserved |
+Ordinary reads, traversal, and vector search remain available without the
+full-text rebuild. Historical snapshots are unchanged and may refuse full-text
+search; rebuilding a live branch does not upgrade its earlier snapshots.
+Branch creation from a pinned historical snapshot is not supported.
+The operation is explicit and can be expensive on large graphs; `optimize` is
+not a replacement for this migration.
+
+### Unsupported index inventory
+
+Automatic full-text rebuilding supports engine-created v6 indexes from Lance
+9/10 with recorded index-kind metadata. If legacy or externally created
+inventory does not identify its physical index kind, the command refuses before
+publishing any index changes. It cannot safely guess whether an unknown index
+is full-text, scalar, or vector; repeating the command does not fix this.
+
+Use compatible old tooling for a controlled export/import into a new graph root,
+or restore a trusted backup with supported inventory. Export/import preserves
+entities but not shared branch ancestry or history, as described below. Keep the
+source intact until verification and cutover; do not drop unknown indexes or
+edit their metadata to bypass the refusal.
+
+### Cluster state and rollback
+
+Keep the pre-upgrade cluster deployment bundle, configuration, and state backup
+alongside the graph-root backups. A rollback restores that consistent set with
+the old executables; it does not point an old server at upgraded index files.
+
+If v0.10 applied an `external_blobs` policy and the cluster state itself is not
+being restored, v0.9 cannot read that new optional state field. While every
+writer is stopped, remove `external_blobs` from each graph's configuration,
+review `cluster plan`, and use the v0.10 `cluster apply` to converge the removal
+before starting v0.9. Editing only the YAML is insufficient; do not hand-edit
+the state ledger. This state-shape step does **not** replace restoring the
+pre-upgrade graph backup after full-text rebuilding.
+
+A downgrade also removes v0.10's default-deny external-URI enforcement: v0.9
+writers admitted arbitrary supported sources, including `file://`. Do not roll
+back to v0.9 if that ingress boundary is required.
+
+## What an export/import rebuild preserves
+
+This table describes rebuilding a graph at a new URI for a graph-format change,
+not the full-text index rebuild above. An index rebuild retains the existing
+graph's entities, branches, and history.
+
+| Preserved | Starts fresh |
 |---|---|
-| All node and edge entities | Commit history (the graph DAG starts fresh) |
-| Vector properties (embeddings round-trip verbatim) | Branches (export is a single-branch snapshot) |
-| Blob properties | Snapshot/time-travel history of the old graph |
-| The schema (re-applied at `init`) | |
+| Nodes and edges in the exported branch | Commit history |
+| IDs and property values | Branch topology |
+| Stored vectors | Old snapshots |
+| Managed Blob values | Physical indexes and layout |
 
-The rebuilt graph is a faithful copy of the exported branch's **current state**.
-Commit history cannot be carried forward. To preserve the current states of
-multiple branches, export each branch you care about separately and rebuild
-each export into a different graph root. Every result is a main-only graph with
-a newly minted identity domain and self-contained history; the old branch
-topology and shared ancestry are not reconstructed.
+Export each branch you need separately. Each import becomes an independent
+main branch in a new graph; shared ancestry is not reconstructed.
 
-## The recipe
+## Choose the export binary
 
-Use the **old** binary for the export steps and the **new** binary for init/load.
-Keep them as separate executables (for example a downloaded release archive) so you
-can run both.
+The refusal message names the release line that wrote the graph. The known
+mapping is:
 
-```bash
-# 1. With the OLD binary — capture the schema and the data.
-old-omnigraph schema show   s3://bucket/graph.omni > schema.pg
-old-omnigraph export         s3://bucket/graph.omni > graph.jsonl
+| Storage generation | Export with |
+|---|---|
+| v1 | 0.3.1 or earlier |
+| v2 | latest 0.6.x |
+| v3 | latest 0.7.x |
+| v4 | latest 0.8.x |
+| v5 | the exact unreleased development build that wrote it |
+| v6 | current 0.9.x–0.10.x line; entity export/import normally not required within this generation |
 
-# 2. With the NEW binary — create a fresh graph and load the data.
-omnigraph init --schema schema.pg s3://bucket/graph-v2.omni
-omnigraph load --mode overwrite --data graph.jsonl s3://bucket/graph-v2.omni
+If the graph's generation is newer than the binary, upgrade the binary rather
+than rebuilding with it.
 
-# 3. With the NEW binary — verify.
-omnigraph snapshot s3://bucket/graph-v2.omni     # internal_schema_version is current
-omnigraph version                                 # confirms the binary's served version
-```
+## Rebuild
 
-`omnigraph export` writes a full JSONL snapshot (one record per node or edge, all
-properties including vectors and blobs) of the chosen branch (default `main`; pass
-`--branch` for another) to stdout. `omnigraph load --mode overwrite` replaces the
-target graph's contents with that snapshot.
-
-The direct-store recipe above can import managed Blob values only. In v0.10 a
-bare direct CLI open has no allow-policy source and rejects every new external
-URI reference. If the export contains external Blob URIs, initialize the target
-as a cluster graph, configure exact `external_blobs` bases, and load through its
-server, or write the export through an embedded `Omnigraph` handle with an
-`ExternalBlobPolicy` installed. There is deliberately no per-load escape flag.
-
-Once you have verified the rebuilt graph, retire the old one. If you rebuilt
-through a storage-format boundary, the target must be a different URI: keep the
-source root intact until entity/vector/blob verification and fleet cutover are
-complete. Do not use force-init to turn the old root into the new format.
-
-## Notes
-
-- **Upgrade the whole fleet together.** A mixed fleet where an old binary still
-  writes a graph a newer binary has stamped is unsupported, as with any
-  internal-schema bump.
-- **Embeddings are not recomputed.** Export carries the stored vectors verbatim, so
-  a load does not re-run the embedding pipeline. If you changed the embedding model,
-  re-embed after loading.
-- **External Blob URIs remain references only through a policy-aware rebuild.**
-  Export preserves the URI and an allowed `--mode overwrite` retains it, so
-  verify that the new fleet can still read the referenced object before
-  cutover. The direct-store CLI recipe cannot admit the URI in v0.10; use the
-  configured cluster-server or embedded-policy route described above. Later
-  allowed keyed `append`/`merge` writes copy external payloads instead.
-- **Server deployments**: for a managed-Blob-only export, take the graph out of
-  the serving set, rebuild it offline with the direct CLI, then point the
-  cluster at the rebuilt graph (`cluster apply`). If the export contains
-  external references, rebuild through a staging cluster server with the exact
-  allow bases configured, or through an embedded handle with the graph policy
-  installed; the direct-store CLI cannot admit those references.
-
-## Migrating to v0.8.0
-
-v0.8.0 is the first release with a storage-format change since v0.4.0. Any graph
-created by an earlier release must be rebuilt with the recipe above. Beyond the
-rebuild, v0.8.0 changes two things to plan for: the on-disk layout, and
-write-time validation strictness.
-
-### What changed on disk (internal schema v4)
-
-- **Graph commit lineage now lives in the `__manifest` graph-manifest dataset.** Commits, parents,
-  merge parents, per-branch heads, and the authoring actor are stored as
-  `graph_commit` / `graph_head` rows, written in the **same atomic commit** as the
-  dataset-version rows (encoded as `table_version`) of a graph publish. Previously a crash in a narrow window
-  could leave a published version with no matching history entry; that window no
-  longer exists.
-- **Two internal datasets are retired.** `_graph_commits.lance` and
-  `_graph_commit_actors.lance` are no longer created, read, or written — a graph
-  created by v0.8.0 has neither. If backup scripts, disk-usage tooling, or
-  monitoring reference those paths inside a graph directory, update them.
-- **The version gate is enforced in both directions, including read-only opens.**
-  A v0.8.0 binary refuses a pre-v0.8.0 graph with the rebuild message above; a
-  pre-v0.8.0 binary refuses a v0.8.0 graph with an
-  `upgrade omnigraph before opening this graph` error. There is no mixed-version
-  window: upgrade every binary that touches a graph together, then rebuild.
-
-If you have tooling that inspects `__manifest` directly, note that it now holds
-  three kinds of rows (dataset versions, commits, branch heads) rather than one —
-  filter by row kind instead of assuming every row is a dataset version.
-
-### Stricter validation — pre-flight your pipelines
-
-Independently of the storage change, v0.8.0 unifies constraint validation across
-all three write surfaces (load, mutation, branch merge). Every change is stricter;
-none relaxes an existing check. A pipeline that unknowingly relied on one of these
-gaps will now fail loudly at write time:
-
-- **Enum constraints are enforced on branch merge** (previously only on load and
-  mutation).
-- **Cross-version uniqueness**: inserting a `@unique` value that collides with a
-  different, already-committed entity is rejected on load and mutation (previously
-  only merges caught it). Re-upserting the *same* entity — same key — is still an
-  update, not a violation.
-- **Duplicate keys within one input batch are rejected**: the same `@key` value
-  twice in one load file is an error. The same id across *separate* batches or
-  statements still coalesces (last write wins).
-- **Typed node IDs are canonicalized during rebuild**: a keyed node is stored
-  under the canonical ID derived from its complete `@key` tuple. Legacy scalar
-  spellings that denote the same typed value are accepted, and edge endpoints
-  are rewritten by their declared node endpoint type. An ambiguous old-ID
-  mapping is refused rather than guessed.
-- **Overwrite loads validate the new image per type**: an edges-only overwrite
-  resolves referential integrity against the retained node types, and orphan
-  edges are rejected.
-
-Pre-flight recipe: before upgrading a production writer, run your ingest with a
-v0.8.0 binary against a **branch** of a rebuilt copy, using the **same `--mode`
-your pipeline uses in production** (`--mode` is always required; `overwrite` is
-the mode whose validation changed most):
+Keep the old and new executables separate. Use a different target URI so the
+source remains recoverable throughout verification.
 
 ```bash
-omnigraph load --data batch.jsonl --mode merge \
-  --branch preflight --from main s3://bucket/graph-v2.omni
+# Old binary
+old-omnigraph schema show s3://bucket/graph.omni > schema.pg
+old-omnigraph export s3://bucket/graph.omni > graph.jsonl
+
+# New binary
+omnigraph init --schema schema.pg s3://bucket/graph-new.omni
+omnigraph load --mode overwrite --data graph.jsonl \
+  s3://bucket/graph-new.omni
+
+# Verify with the new binary
+omnigraph snapshot s3://bucket/graph-new.omni --json
+omnigraph schema show s3://bucket/graph-new.omni
 ```
 
-Entities violating the stricter checks fail the load with a typed error naming the
-constraint; fix the data (or the constraint) and re-run. Nothing is partially
-applied — a failed load publishes no commit.
-
-### Verifying versions
-
-The two CLI checks are listed in
-[How you know you need this](#how-you-know-you-need-this) (`omnigraph version`,
-`omnigraph snapshot`). New in v0.8.0, the server's `GET /healthz` response also
-reports `internal_schema_version`.
-
-## Unreleased internal schema v5
-
-Internal schema v5 activates RFC-028 stable schema identity. Accepted type and
-property IDs are allocated inside one graph identity domain and survive
-supported renames; dropping and later recreating a declaration starts a new
-logical lifetime. The `__manifest` journal keys dataset registrations, versions,
-and tombstones by stable table ID plus incarnation, and initial dataset paths are
-derived from that pair rather than a mutable type name.
-
-V5 was never released. It is documented here only so a maintainer can recognize
-an old development root. This is why a v4 graph must be rebuilt instead of
-opened in place: v4 has only
-name-derived SchemaIR IDs and name-keyed manifest history, so there is no safe,
-unambiguous identity to backfill after renames or drop/recreate events. Export
-with the latest v0.8.x binary, initialize a different root with the current v6
-binary, load the export, verify it, and then cut clients over. The new root
-deliberately mints a new identity domain; identity continuity across
-export/import is not claimed.
-
-Tooling that reads `__manifest` directly must treat `stable_table_id` and
-`table_incarnation_id` as the dataset coordinate. Persisted `table_key` remains
-the current internal human-readable alias and can change during a type rename;
-public contracts use graph type names/keys. A pure rename keeps
-the same physical dataset path and Lance version.
-
-## Migrating to internal schema v6
-
-Internal schema v6 activates RFC-023 key-conflict fencing while preserving the
-stable identity model introduced by v5. Every newly created node and edge
-dataset declares exactly its non-null physical `id` field as Lance's
-unenforced primary key. Production graph inserts and upserts then use an
-exact-`id` filter-bearing transaction route; a bare Lance Append is not used for
-keyed graph entities.
-
-The user-visible load modes are now deliberately distinct:
-
-- `--mode append` means **strict insert**. If an `id` already exists, the load
-  returns `KeyConflict` and does not update that entity. An effect-free concurrent
-  same-key winner has the same result.
-- `--mode merge` means **upsert**. Existing IDs are updated; new IDs are
-  inserted. If a retryable conflict occurs before any effect, the engine
-  discards the complete attempt, rereads current authority, reruns validation,
-  and stages a fresh attempt.
-- `--mode overwrite` replaces the target image as before; the replacement
-  dataset still carries the exact-`id` PK metadata.
-
-For Blob values admitted by the graph's external-Blob policy, `append` and
-`merge` copy referenced payload bytes after enforcing a 32 MiB aggregate
-pre-read ceiling. `overwrite` retains Lance's external-reference behavior. This
-is intentional: Lance's merge-insert builder has no `WriteParams` hook, while
-Overwrite does. A direct-store CLI open has no allow-policy source in this
-phase; use a configured cluster server or an embedded handle for such an import.
-
-This format cannot be obtained by adding metadata to a live v4 or development
-v5 root. Lance's filtered/unfiltered conflict behavior is directional, so every
-dataset image and every writer must cross the boundary together. For a released
-v4 graph, quiesce writers, export with the latest 0.8.x binary, initialize a
-**different** root with the current 0.10.x binary, load the export, verify the v6
-stamp and data, then cut the whole fleet over. A development v5 root must be
-exported with the exact source build that wrote it. The current binary refuses
-both older roots, and the old binary must never write the new v6 root.
-
-The v6 load checks the export for duplicate logical IDs before any dataset effect.
-Older bare-Append workloads could contain a committed collision; do not resolve
-one by silently choosing a winner during upgrade. A duplicate-bearing load
-fails atomically and leaves the separately initialized v6 target as a valid
-empty graph; do not serve that target, discard it, repair the source/export,
-and restart the rebuild into another clean root. Keep the source root intact
-until the rebuilt graph has passed entity/vector/blob checks.
-
-### Repairing duplicate IDs found during the v6 rebuild
-
-There is no `repair duplicates` command, and the importer never chooses a
-winner from export order. Repair the **exported snapshot**, not Lance files or
-the old graph root. Run this procedure independently for every branch snapshot
-you intend to preserve.
-
-A duplicate is scoped to one logical node or edge type:
-
-- node key: `["node", <node type>, <data.id>]`;
-- edge key: `["edge", <edge type>, <data.id>]`.
-
-The same ID in two different node types, two different edge types, or a node
-and an edge is not a collision. Do not deduplicate IDs globally.
-
-#### 1. Quiesce and preserve the evidence
-
-Stop every writer and drain or stop the servers that expose the graph before
-the final export. Do not remove a cluster resource if that would trigger graph
-deletion. Keep the old fleet quiesced through cutover so the repaired snapshot
-cannot miss a later write. Export with the old-format binary and make the raw
-artifacts read-only:
+For another branch:
 
 ```bash
-set -euo pipefail
-
-OLD_ROOT=s3://bucket/graph.omni
-BRANCH=main
-
-old-omnigraph schema show "$OLD_ROOT" > schema.pg
-old-omnigraph export --branch "$BRANCH" "$OLD_ROOT" > graph.raw.jsonl
-shasum -a 256 schema.pg graph.raw.jsonl > rebuild-inputs.sha256
-chmod a-w schema.pg graph.raw.jsonl rebuild-inputs.sha256
+old-omnigraph export --branch review s3://bucket/graph.omni \
+  > review.jsonl
+omnigraph init --schema schema.pg s3://bucket/graph-review-new.omni
+omnigraph load --mode overwrite --data review.jsonl \
+  s3://bucket/graph-review-new.omni
 ```
 
-Use `sha256sum` instead of `shasum -a 256` on systems that provide only the
-former. Preserve the source root, raw export, checksum, old/new binary versions,
-and branch name until the rollback window has closed. Do not run `repair`,
-`cleanup`, or a hand-written Lance mutation against the old root.
+## Verify before cutover
 
-#### 2. Detect every duplicate entity key
+At minimum:
 
-The following scan requires `jq` and an external `sort`. It streams the export;
-only `sort` needs spill space. The encoded keys keep arbitrary UTF-8 IDs and
-control characters safe as one line:
+- compare entity counts by type;
+- run representative queries and mutations in a staging copy;
+- sample IDs, vectors, null values, and Blob values;
+- rebuild or reconcile declared indexes with `optimize`;
+- verify server policy, stored queries, and external Blob access in the target
+  cluster;
+- keep the old graph read-only until the new fleet is serving successfully.
 
-```bash
-set -euo pipefail
+Embeddings are copied as stored vectors; they are not regenerated. If the model
+changed, re-embed after the import.
 
-jq -rc '
-  def logical_key:
-    if ((.type? | type) == "string" and (.data.id? | type) == "string") then
-      ["node", .type, .data.id]
-    elif ((.edge? | type) == "string" and (.data.id? | type) == "string") then
-      ["edge", .edge, .data.id]
-    else
-      error("invalid export record: expected a node or edge with string data.id")
-    end;
-  logical_key | @base64
-' graph.raw.jsonl |
-  LC_ALL=C sort |
-  uniq -d > duplicate-keys.b64
-```
+External Blob references require the target graph's allow-list to admit the
+same sources. A direct-store CLI has no cluster allow-list and therefore cannot
+admit new external references. Rebuild such data through a configured cluster
+server or an embedded host that installs the policy. See
+[Blob values](../blobs.md).
 
-If the pipeline exits nonzero, discard its partial output and stop; malformed
-JSON or a missing/string-invalid `data.id` is not a clean duplicate scan.
-An empty `duplicate-keys.b64` means this snapshot has no duplicate entity keys.
-If it is non-empty, generate a reviewable report containing every exported record
-for every affected key:
+## Cluster cutover
 
-```bash
-set -euo pipefail
+Cluster graph roots are derived as `<cluster-root>/graphs/<graph-id>.omni`; a
+graph declaration cannot point at an arbitrary replacement root. Choose one of
+these cutovers:
 
-jq --rawfile duplicates duplicate-keys.b64 -c '
-  def logical_key:
-    if ((.type? | type) == "string" and (.data.id? | type) == "string") then
-      ["node", .type, .data.id]
-    elif ((.edge? | type) == "string" and (.data.id? | type) == "string") then
-      ["edge", .edge, .data.id]
-    else
-      error("invalid export record")
-    end;
-  ($duplicates | split("\n") | map(select(length > 0)) |
-    reduce .[] as $key ({}; .[$key] = true)) as $duplicate_keys
-  | (logical_key | @base64) as $encoded_key
-  | select($duplicate_keys[$encoded_key] == true)
-  | {key: logical_key, row: .}
-' graph.raw.jsonl |
-  LC_ALL=C sort > duplicate-report.jsonl
-```
+- **New graph ID in the same cluster.** Add (for example)
+  `knowledge_next` with the desired schema, query, provider, and policy
+  bindings. Validate, plan, and apply so the cluster creates its derived root.
+  Load the export into `<cluster-root>/graphs/knowledge_next.omni`, restart,
+  verify the new ID, and move clients to it. Remove the old declaration only
+  after the retention window, using the normal approved-delete workflow.
+- **Same graph ID in a parallel cluster root.** Copy the source bundle, set a
+  new `storage` root, and keep the original cluster untouched. Validate, plan,
+  and apply the new bundle; load the export into its derived graph root; then
+  point the server fleet at the new cluster root and restart together. This
+  preserves the public graph ID while changing the whole deployment artifact.
 
-Do not stop after fixing the first ID named by the importer. This scan is the
-complete inventory for the exported snapshot.
+In either case, quiesce writers before export and cutover. External Blob
+references must be loaded through a policy-aware server or embedded host after
+the target allow-list is applied.
 
-#### 3. Record an application-aware decision for each key
-
-Create `graph.repaired.jsonl` from the immutable raw export with a reviewed,
-deterministic transformation. Keep a decision ledger beside it containing the
-key, evidence, chosen action, resulting IDs, every edge rewrite, and reviewer.
-For each group, choose one of these domain decisions:
-
-- **One real entity or relationship:** consolidate the records into exactly one
-  canonical entity record. Resolve every differing property explicitly. Byte-identical
-  records still require a recorded “keep one” decision.
-- **Multiple real entities:** keep one ID and mint stable new application IDs
-  for the others. Before remapping a node, inspect `schema.pg` for that node
-  type. If it declares `@key`, choose replacement values for the complete key
-  tuple and write every component to its property. The safest repaired record
-  omits `data.id` and lets the loader derive the canonical physical ID; any
-  incident edge must then use that derived ID. If the repair tooling writes
-  `data.id` explicitly, use the exact encoding documented under
-  [schema type and dataset layout](../schema/index.md#table-layout): the canonical scalar
-  string for one key component, or the JSON-array string for a composite key.
-  If the node has no declared `@key`, update only `data.id`. Then
-  update every incident edge entity's `from` or `to` whose edge schema points to
-  that node type. A matching text ID in another node type must not be rewritten
-  automatically.
-- **Erroneous entity:** remove its record, and remove or redirect incident edges only when
-  the application contract says they belonged to that erroneous entity.
-- **Duplicate edge ID:** consolidate the relationship or mint new edge IDs.
-  Edge endpoint IDs change only if the corresponding node decision requires it.
-
-Never use “first record”, “last record”, lexical order, `sort -u`, or an old commit's
-apparent arrival order as evidence. The export is a snapshot, not an authority
-for which racing write was intended. Prefer the upstream system of record,
-domain timestamps with documented semantics, or human review. If the graph is
-derived from another system of record, make the repair there and generate the
-candidate export from that corrected source instead of mutating the old graph.
-
-Rerun the exact detector from step 2 against `graph.repaired.jsonl`, writing to
-`repaired-duplicate-keys.b64` so the original evidence is not overwritten; the
-new file must be empty. Checksum the repaired export and decision ledger. If a
-repaired node ID leaves an edge endpoint ambiguous, stop—the v6 schema/RI check
-must not be used to guess the intended endpoint.
-
-#### 4. Validate in a disposable v6 root
-
-Use a new URI that has never been initialized, is outside any managed cluster
-graph prefix, and will never be served:
-
-```bash
-set -euo pipefail
-
-TICKET=change-1234
-VALIDATION_ROOT="s3://bucket/graph-v6-validation-${TICKET}.omni"
-
-omnigraph init --schema schema.pg "$VALIDATION_ROOT"
-omnigraph --yes load --mode overwrite --data graph.repaired.jsonl "$VALIDATION_ROOT"
-omnigraph export "$VALIDATION_ROOT" > graph.canonical.jsonl
-```
-
-`--yes` is a global CLI flag. It is required for a non-interactive overwrite
-of a non-local root, as in this S3 example. At an interactive terminal, omit
-it and answer the overwrite prompt with `y` or `yes`; a local root needs
-neither. `init` does not use `--yes`: the target must be genuinely new. Never
-substitute `init --force`, because reusing a root would invalidate this clean-
-rebuild procedure.
-
-If `init` or `load` fails, preserve the error, discard that target with your
-storage tooling, repair the export, and retry at another clean URI. Do not try
-to heal the initialized empty target with `append` or `merge`.
-
-Compare the repaired input with the v6 re-export semantically. This helper
-preserves arbitrary-size JSON integers, canonicalizes object-key order, and
-lets external `sort` compare the complete record multisets:
-
-```bash
-set -euo pipefail
-
-canonicalize_jsonl() {
-  python3 -c '
-import json, sys
-for line in sys.stdin:
-    if line.strip():
-        print(json.dumps(json.loads(line), sort_keys=True,
-                         separators=(",", ":"), ensure_ascii=False))
-' < "$1" | LC_ALL=C sort
-}
-
-canonicalize_jsonl graph.repaired.jsonl > repaired.semantic.jsonl
-canonicalize_jsonl graph.canonical.jsonl > canonical.semantic.jsonl
-cmp repaired.semantic.jsonl canonical.semantic.jsonl
-```
-
-Also rerun the duplicate detector against `graph.canonical.jsonl` into a new
-`canonical-duplicate-keys.b64`, execute the application's integrity queries,
-compare per-type entity counts, check vectors, and verify blob content. A matching
-external Blob URI proves only that the reference round-tripped; read or checksum
-the referenced object from the new fleet's credentials before cutover.
-
-#### 5. Build the production candidate and cut over
-
-Treat `graph.canonical.jsonl`—the successful v6 re-export—as the audited input
-to one final clean root for a standalone graph:
-
-```bash
-set -euo pipefail
-
-TICKET=change-1234
-NEW_ROOT="s3://bucket/graph-v6-${TICKET}.omni"
-
-canonicalize_jsonl() {
-  python3 -c '
-import json, sys
-for line in sys.stdin:
-    if line.strip():
-        print(json.dumps(json.loads(line), sort_keys=True,
-                         separators=(",", ":"), ensure_ascii=False))
-' < "$1" | LC_ALL=C sort
-}
-
-omnigraph init --schema schema.pg "$NEW_ROOT"
-omnigraph --yes load --mode overwrite --data graph.canonical.jsonl "$NEW_ROOT"
-omnigraph export "$NEW_ROOT" > graph.final.jsonl
-canonicalize_jsonl graph.canonical.jsonl > canonical.production.semantic.jsonl
-canonicalize_jsonl graph.final.jsonl > final.production.semantic.jsonl
-cmp canonical.production.semantic.jsonl final.production.semantic.jsonl
-```
-
-The last comparison is semantic and does not assume that scan/export record order
-is a storage contract. Cut the whole fleet or cluster configuration over only
-after it and the application checks pass. Never serve the failed empty target
-or the disposable validation root. Keep the old root and all repair evidence
-through the rollback window; if any check fails, leave production on the old
-root and start again at a new target URI.
-
-#### 6. Rebuild and cut over a cluster as one unit
-
-A cluster-managed upgrade is not step 5 repeated as independent pointer swaps.
-The cluster storage root contains one ledger and catalog for the complete
-declared graph set. Build a parallel cluster for **all** graphs, validate it as
-one fleet, and switch the whole fleet together.
-
-Start from a fresh version-control checkout of the authored cluster config.
-Do not clone generated `__cluster/` state or a local `graphs/` directory. Edit
-`cluster.yaml` so `storage:` names an unused parallel cluster prefix, prove that
-prefix is empty with the object-store tooling, and retain the old config and
-root unchanged. Then prepare a reviewed plan:
-
-```bash
-set -euo pipefail
-
-NEW_CONFIG=/absolute/path/to/company-brain-v6
-NEW_CLUSTER_ROOT=s3://bucket/clusters/company-brain-v6-change-1234
-
-test -d "$NEW_CONFIG"
-test ! -e "$NEW_CONFIG/__cluster"
-test ! -e "$NEW_CONFIG/graphs"
-
-# Set `storage:` to exactly $NEW_CLUSTER_ROOT before saving.
-"${EDITOR:-vi}" "$NEW_CONFIG/cluster.yaml"
-omnigraph cluster validate --config "$NEW_CONFIG"
-omnigraph cluster import --config "$NEW_CONFIG"
-omnigraph cluster plan --config "$NEW_CONFIG" --json > parallel-cluster-plan.json
-```
-
-Review `parallel-cluster-plan.json`. Confirm that it describes the fresh
-parallel deployment, includes every graph declared in `cluster.yaml`, and has
-no unexpected delete or approval gate. Only then apply it; `cluster apply`
-creates every derived graph root and publishes the parallel ledger and catalog:
-
-```bash
-set -euo pipefail
-
-NEW_CONFIG=/absolute/path/to/company-brain-v6
-omnigraph cluster apply --config "$NEW_CONFIG"
-```
-
-Complete steps 1–4 for every declared graph and create a reviewed
-`rebuilt-graphs.tsv` with exactly one tab-separated row per `graphs:` key:
-`<graph-id><TAB><canonical-export-path>`. Check set equality between its graph
-IDs and the config; missing, extra, or repeated IDs are a stop condition. Load
-and semantically re-export every record into the roots created by `cluster apply`:
-
-```bash
-set -euo pipefail
-
-NEW_CLUSTER_ROOT=s3://bucket/clusters/company-brain-v6-change-1234
-REPORT_DIR=parallel-cluster-validation
-test -s rebuilt-graphs.tsv
-test ! -e "$REPORT_DIR"
-mkdir "$REPORT_DIR"
-
-awk -F '\t' 'NF != 2 || $1 == "" || $2 == "" { exit 1 }' rebuilt-graphs.tsv
-cut -f1 rebuilt-graphs.tsv | LC_ALL=C sort | uniq -d > \
-  "$REPORT_DIR/duplicate-graph-ids.txt"
-test ! -s "$REPORT_DIR/duplicate-graph-ids.txt"
-
-canonicalize_jsonl() {
-  python3 -c '
-import json, sys
-for line in sys.stdin:
-    if line.strip():
-        print(json.dumps(json.loads(line), sort_keys=True,
-                         separators=(",", ":"), ensure_ascii=False))
-' < "$1" | LC_ALL=C sort
-}
-
-graph_id=
-canonical_export=
-while IFS=$'\t' read -r graph_id canonical_export ||
-    test -n "${graph_id}${canonical_export}"; do
-  test -n "$graph_id"
-  test -n "$canonical_export"
-  test -f "$canonical_export"
-
-  graph_root="${NEW_CLUSTER_ROOT%/}/graphs/${graph_id}.omni"
-  final_export="$REPORT_DIR/${graph_id}.final.jsonl"
-  omnigraph --yes load --mode overwrite --data "$canonical_export" "$graph_root"
-  omnigraph export "$graph_root" > "$final_export"
-  canonicalize_jsonl "$canonical_export" > \
-    "$REPORT_DIR/${graph_id}.input.semantic.jsonl"
-  canonicalize_jsonl "$final_export" > \
-    "$REPORT_DIR/${graph_id}.final.semantic.jsonl"
-  cmp "$REPORT_DIR/${graph_id}.input.semantic.jsonl" \
-    "$REPORT_DIR/${graph_id}.final.semantic.jsonl"
-done < rebuilt-graphs.tsv
-```
-
-For every graph, also rerun the duplicate detector, compare per-type entity counts,
-read vectors and blobs, and run its application integrity queries. One graph
-passing does not qualify the cluster. After every graph and catalog resource
-passes, refresh the ledger from live observations and capture the final state
-and plan:
-
-```bash
-set -euo pipefail
-
-NEW_CONFIG=/absolute/path/to/company-brain-v6
-omnigraph cluster refresh --config "$NEW_CONFIG"
-omnigraph cluster status --config "$NEW_CONFIG" --json > parallel-cluster-status.json
-omnigraph cluster plan --config "$NEW_CONFIG" --json > parallel-cluster-final-plan.json
-```
-
-Require a healthy status and a final plan with no changes. For cutover, stop
-every old-cluster replica, change every replica's boot source to the same new
-config checkout or `NEW_CLUSTER_ROOT`, and then restart the whole fleet. Verify
-graph enumeration and health before reopening writes. Never swap one graph
-pointer, mix replicas on old and new cluster roots, or delete the old root. A
-rollback likewise stops the whole new fleet and switches every replica back;
-retain both roots and all repair evidence through the rollback window.
+Do not run a mixed fleet of binaries that disagree on the storage format. Do
+not edit internal metadata, overwrite the source root with `init --force`, or
+copy files or backing datasets between graph roots.

@@ -1,0 +1,6 @@
+version: 1
+name: local-smoke
+
+runs:
+  - case: ../cases/branch-merge-d50-warm.case-v1.yaml
+    repetitions: 5

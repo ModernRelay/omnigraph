@@ -1,20 +1,25 @@
 ---
-type: spec
-title: "RFC-036 — Atomic runtime activation and graph availability supervision"
-description: Build one coherent graph service generation from durable authority and immutable applied configuration, then activate it atomically with bounded availability supervision.
+rfc: "0036"
+title: "Atomic runtime activation and graph availability supervision"
+track: maintainer
 status: draft
-tags: [eng, rfc, server, availability, activation, cache, concurrency, lance, omnigraph]
-timestamp: 2026-08-13
-owner: OmniGraph maintainers
+implementation: not-started
+authors:
+  - OmniGraph maintainers
+created: 2026-08-13
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on:
+  - RFC 0034 acceptance and implementation
+  - RFC 0035 acceptance and implementation
 ---
 
-# RFC-036: Atomic runtime activation and graph availability supervision
+# RFC 0036: Atomic runtime activation and graph availability supervision
 
-- **Status:** Draft
-- **Date:** 2026-08-13
-- **Author track:** Maintainer design series
-- **Depends on:** RFC-034 durable recovery authority; RFC-035 served-operation
-  admission and lifetime; RFC-038 typed storage-failure classification;
+- **Depends on:** RFC 0034 durable recovery authority; RFC 0035 served-operation
+  admission and lifetime; RFC 0038 typed storage-failure classification;
   internal manifest schema v6; Lance 10.0.0.
 - **Replaces:** the unmerged graph-supervision direction in PR #489. Useful
   tests and operational requirements from that PR remain inputs, but its
@@ -29,11 +34,11 @@ policy, queries, providers, witnesses, readiness, and correctness caches. None
 publishes independently.
 
 A supervisor builds away from serving. Its supervision-owned task set obtains
-RFC-034's opaque `FinalizedRecoveryGuard` by recovery or no-effect verification.
+RFC 0034's opaque `FinalizedRecoveryGuard` by recovery or no-effect verification.
 The graph factory borrows that guard under the same root-gate domain,
 opens a fresh verified engine without running recovery itself, and returns a
 complete candidate which owns the guard. One shutdown-latched operation closes
-every predecessor lane, registers and stores the fresh RFC-035 cell, then
+every predecessor lane, registers and stores the fresh RFC 0035 cell, then
 releases the guard. No fallible work follows predecessor close.
 
 Requests pin one generation and its local caches; hard read-only replicas have no
@@ -60,40 +65,40 @@ an old generation only while its admission contract remains safe.
 
 ### Dependency contract
 
-RFC-034 owns all durable recovery semantics, including recovery authority,
+RFC 0034 owns all durable recovery semantics, including recovery authority,
 sidecar classification, roll-forward or compensation choice, Restore, audit,
-and terminal durable cleanup. RFC-036 sees only an opaque
-`FinalizedRecoveryGuard` and RFC-034's `RecoveryOutcome` with
+and terminal durable cleanup. RFC 0036 sees only an opaque
+`FinalizedRecoveryGuard` and RFC 0034's `RecoveryOutcome` with
 `RecoveryDisposition::{Clean, RollForwardRequired, NeedsCompensation,
 Blocked}`. It MUST NOT inspect a sidecar, infer terminal recovery from table
 HEADs, or translate those variants into a second recovery vocabulary.
 
-V1 managed supervision requests only RFC-034 `RollForwardOnly` recovery and
+V1 managed supervision requests only RFC 0034 `RollForwardOnly` recovery and
 cannot mint `ExclusiveRecoveryPermit`. `RecoveryDisposition::NeedsCompensation` becomes
 `Blocked/OperatorRequired` with no retry; offline recovery may proceed only after
 all serving processes for that graph stop. A healthy writable candidate uses
-RFC-034's effect-free `ReadWriteNoRecovery(ReadWriteLeaderGuard)`: it never runs
+RFC 0034's effect-free `ReadWriteNoRecovery(ReadWriteLeaderGuard)`: it never runs
 recovery, returns the exact non-clean disposition when a durable unit exists,
 and on `Clean` returns the equivalent terminal `FinalizedRecoveryGuard`.
 
-RFC-035 owns served-operation admission, request/task lifetime, disconnect
-behavior, per-graph draining, and shutdown ordering. RFC-036 consumes its
+RFC 0035 owns served-operation admission, request/task lifetime, disconnect
+behavior, per-graph draining, and shutdown ordering. RFC 0036 consumes its
 indivisible serving cell: one non-reusable token, exact `ReadObserver` and `Write`
 admission lanes, and one runtime `Arc`. A request retains the matching lane
-permit and that `Arc` until terminal completion. RFC-036 chooses which lanes a
-transition closes; RFC-035 implements close/drain and task settlement.
+permit and that `Arc` until terminal completion. RFC 0036 chooses which lanes a
+transition closes; RFC 0035 implements close/drain and task settlement.
 
-Fresh cells publish only through RFC-035's process-wide
+Fresh cells publish only through RFC 0035's process-wide
 `ServingRegistrationLatch`: `register_and_publish` for an initial cell and
 `replace_and_publish` for a replacement. Both linearize cell registration and
-the registry store against `Running -> Stopping`; RFC-035 owns their mechanics.
+the registry store against `Running -> Stopping`; RFC 0035 owns their mechanics.
 
-RFC-036 also consumes RFC-035's typed `TransitionDrain`. Required lanes close
+RFC 0036 also consumes RFC 0035's typed `TransitionDrain`. Required lanes close
 before recovery or build, and only `Drained(DrainedProof)` authorizes progress.
 `DrainPending` parks the strong drain and does not authorize work. Recovery tasks
-join RFC-035's one `ShutdownDeadline`; this RFC neither resets it nor defines cutoff.
+join RFC 0035's one `ShutdownDeadline`; this RFC neither resets it nor defines cutoff.
 
-RFC-038 owns the mapping from substrate errors to stable condition classes. A
+RFC 0038 owns the mapping from substrate errors to stable condition classes. A
 condition class is not replay authority. This RFC may consider `Transient` only
 after its operation-local effect and recovery rules authorize another attempt;
 it does not classify by matching error strings or redefine the taxonomy.
@@ -183,7 +188,7 @@ struct UnactivatedGeneration {
 }
 ```
 
-RFC-036 instantiates RFC-035's opaque cell handle as `Arc<GraphGeneration>`.
+RFC 0036 instantiates RFC 0035's opaque cell handle as `Arc<GraphGeneration>`.
 The runtime, token, lanes, and executor therefore cannot mix across epochs.
 Facades are private: reads cannot yield a writer. Each read-write
 entry retains one private, persistent `ReadWriteLeaderGuard`; the effect-free
@@ -277,7 +282,7 @@ Readiness is derived as follows:
 `draining`, with no retry or public counts.
 `RecoveryDisposition::NeedsCompensation` projects blocked `operator_required`,
 no retry, and only unclosed-lane readiness. `RecoveryDisposition::Blocked`
-projects its RFC-034-owned blocker without guessing retryability.
+projects its RFC 0034-owned blocker without guessing retryability.
 
 ## 7. Candidate construction and atomic activation
 
@@ -299,13 +304,13 @@ For one attempt, the supervisor:
    requests only `RollForwardOnly`; a bounded continuation yields fairly and
    retains closed graph-local state without a build permit.
    `NeedsCompensation` publishes `Blocked/OperatorRequired`, `Blocked` preserves
-   the RFC-034 blocker, and only `Clean` supplies the finalized guard;
+   the RFC 0034 blocker, and only `Clean` supplies the finalized guard;
 5. invokes only `ReadWriteNoRecovery(ReadWriteLeaderGuard)` for writable
    construction, borrowing that existing guard after recovery or obtaining an
    equivalent guard by no-effect verification. A hard read-only path instead
    invokes `ReadOnlyProbe` and carries no guard;
 6. builds fresh schema/catalog, policy, queries, providers, facades, and caches
-   from one coherent view, then binds the generation into a fresh RFC-035 cell;
+   from one coherent view, then binds the generation into a fresh RFC 0035 cell;
 7. checks the complete witness and moves any finalized guard into one
    `UnactivatedGeneration`; and
 8. submits that wrapper for activation.
@@ -411,14 +416,14 @@ a boolean checked in handlers.
 - It cannot submit durable recovery or take the verified-recovery factory path.
 - It never reports write readiness, including after a successful rebuild.
 - Pending recovery leaves it blocked or serving only the exact old reads that
-  RFC-034/RFC-035 explicitly deem safe.
+  RFC 0034/RFC 0035 explicitly deem safe.
 
 An external writer may advance durable state. A cheap manifest/schema probe can
 wake a read-only rebuild. Requests already on G1 remain pinned; a complete G2
 replaces it only after verification. A transient G2 build failure does not
 destroy G1.
 
-This is local capability enforcement; RFC-034 defines write topology.
+This is local capability enforcement; RFC 0034 defines write topology.
 
 ## 11. Availability supervision
 
@@ -430,7 +435,7 @@ hints only:
 
 - initial startup;
 - admitted-operation `RecoveryRequired`/`GenerationStale`, or `DrainReadyWake`;
-- completion of RFC-034 recovery;
+- completion of RFC 0034 recovery;
 - a cheap durable freshness probe;
 - an operator retry request; and
 - a scheduled retry deadline.
@@ -449,9 +454,9 @@ retains the wrapper. A candidate timeout may cancel the effect-free factory
 scope; it cannot detach the recovery task, which must settle and dispose of any
 retained guard.
 
-The task set is an RFC-035 `ShutdownParticipant`. It receives the same absolute
+The task set is an RFC 0035 `ShutdownParticipant`. It receives the same absolute
 `ShutdownDeadline` as connection and served-operation drain and may consume
-only the time remaining. RFC-035 owns registration and cutoff; RFC-034 owns all
+only the time remaining. RFC 0035 owns registration and cutoff; RFC 0034 owns all
 recovery behavior. This RFC defines only task ownership and scheduling.
 
 Supervisor memory is not a durable queue. Process restart reconstructs work
@@ -459,12 +464,12 @@ from applied configuration and durable graph authority.
 
 ### 11.2 Retry and stale-attempt fencing
 
-The supervisor consumes RFC-038's typed condition class only after the
+The supervisor consumes RFC 0038's typed condition class only after the
 operation-local recovery disposition authorizes another attempt. Authorized
 attempts whose condition is `Transient` use capped exponential backoff with
 full jitter. Other conditions remain blocked until an explicit
 operator/configuration/authority change. `Unknown` is not silently retryable,
-and RFC-038 exposes no generic retry decision.
+and RFC 0038 exposes no generic retry decision.
 
 `RecoveryDisposition::NeedsCompensation` bypasses managed retry: no wake can mint an
 `ExclusiveRecoveryPermit`. Only completed offline recovery after all serving
@@ -535,7 +540,7 @@ are not public contract.
 ### 12.2 Route failure
 
 False route readiness returns 503, not 404. A selected closed/draining lane uses
-RFC-035's no-`ErrorCode` lifecycle `kind=generation_draining`,
+RFC 0035's no-`ErrorCode` lifecycle `kind=generation_draining`,
 `outcome=not_started`; other bodies carry graph, state, broad failure class,
 and optional retry. Pre-Cedar
 responses contain no backend detail.
@@ -548,7 +553,7 @@ and lists 503 on every per-graph route that can fail at routing admission.
 
 ## 13. Cost and observability
 
-Healthy routing does one registry lookup, one `Arc` clone, and RFC-035 admission;
+Healthy routing does one registry lookup, one `Arc` clone, and RFC 0035 admission;
 it never opens a graph, scans a manifest, or compiles policy/query content.
 Freshness uses the cheap Lance/manifest probe and never reconstructs history per
 request; same-schema data commits do not rebuild a generation.
@@ -562,7 +567,7 @@ detail stays in logs; inherited Lance object-store metrics are not duplicated.
 ## 14. Implementation sequence
 
 1. Build complete generations, exact factory modes, one guard path, and fresh caches.
-2. Add stable entries, RFC-035 cells/drains, latched activation, and retirement.
+2. Add stable entries, RFC 0035 cells/drains, latched activation, and retirement.
 3. Add bounded fair supervision and retry, then status, metrics, docs, and OpenAPI.
 
 No phase exposes a partial generation or a wake without a live supervisor.
@@ -589,15 +594,15 @@ Existing test owners are extended, not duplicated:
 - `multi_graph.rs`/system tests: zero-ready bind, graph isolation, capacity
   release including parked drains, fair separate bounds, timeout independence,
   backoff reset/coalescing, and bounded strict startup.
-- RFC-035 tests: proof/pending/final-wake and acquire/replace/store races;
+- RFC 0035 tests: proof/pending/final-wake and acquire/replace/store races;
   both-lane/shared-deadline recovery; weak-index bounds; and every
   shutdown/deregister interleaving.
 - `boot_settings.rs`/`openapi.rs`: ready-only default, `include=all`, legacy and
   unknown-value decoding, safe 404/503, conditional retry, no backend detail.
 
 Use the [test ownership map](../dev/testing.md), deterministic barriers, shared
-cost harness, and RustFS transient/e-tag cells. RFC-034 owns recovery evidence;
-RFC-035 owns lifetime/shutdown evidence. Every phase runs the canonical
+cost harness, and RustFS transient/e-tag cells. RFC 0034 owns recovery evidence;
+RFC 0035 owns lifetime/shutdown evidence. Every phase runs the canonical
 feature-superset suite, denied-warning clippy, format, OpenAPI, and link checks.
 
 ## 16. Drawbacks and rejected alternatives

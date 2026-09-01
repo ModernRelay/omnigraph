@@ -313,7 +313,16 @@ async fn main() -> Result<()> {
             // RFC-010 Slice 3: graphs inside an established cluster are created
             // by `cluster apply` (which records ledger/recovery/approvals), not
             // by hand-running `init` into the cluster's storage layout.
-            if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri).await {
+            if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri)
+                .await
+                .map_err(|diagnostic| {
+                    color_eyre::eyre::eyre!(
+                        "could not check cluster ownership for `{}`: {}",
+                        diagnostic.path,
+                        diagnostic.message
+                    )
+                })?
+            {
                 bail!(
                     "`{uri}` is inside cluster `{root}`. Graphs in a cluster are created by \
                      `cluster apply` (which records ledger, recovery, and approvals), not `init`. \
@@ -879,8 +888,15 @@ async fn main() -> Result<()> {
                 // address a storage root; a served apply (`--server`) is the
                 // server's concern.
                 if !client.is_remote() {
-                    if let Some(root) =
-                        omnigraph_cluster::cluster_root_for_graph_uri(client.uri()).await
+                    if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(client.uri())
+                        .await
+                        .map_err(|diagnostic| {
+                            color_eyre::eyre::eyre!(
+                                "could not check cluster ownership for `{}`: {}",
+                                diagnostic.path,
+                                diagnostic.message
+                            )
+                        })?
                     {
                         bail!(
                             "`{}` is inside cluster `{root}`. A graph in a cluster evolves via \
@@ -1328,6 +1344,66 @@ async fn main() -> Result<()> {
                             p.property, p.reason
                         );
                     }
+                }
+            }
+        }
+        Command::RebuildFullTextIndexes { uri, branch, json } => {
+            let uri = resolve_maintenance_uri(
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+                cli.cluster.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                "rebuild-full-text-indexes",
+            )
+            .await?;
+            let actor = resolve_cli_actor(cli.as_actor.as_deref())?;
+            echo_write_target(cli.quiet, "rebuild-full-text-indexes", &uri, false);
+            let db = Omnigraph::open(&uri).await?;
+            let result = db
+                .rebuild_full_text_indices_on_as(&branch, actor.as_deref())
+                .await?;
+            let warnings = if result.rebuilt_indexes.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.",
+                ]
+            };
+            if json {
+                print_json(&serde_json::json!({
+                    "uri": uri,
+                    "branch": result.branch,
+                    "graph_commit_id": result.graph_commit_id,
+                    "warnings": warnings,
+                    "rebuilt_indexes": result.rebuilt_indexes.iter().map(|index| {
+                        serde_json::json!({
+                            "type_key": index.type_key,
+                            "property": index.property,
+                        })
+                    }).collect::<Vec<_>>(),
+                }))?;
+            } else {
+                for warning in &warnings {
+                    eprintln!("warning: {warning}");
+                }
+                println!(
+                    "rebuild-full-text-indexes {} — branch {}, {} indexes rebuilt",
+                    uri,
+                    result.branch,
+                    result.rebuilt_indexes.len(),
+                );
+                for index in &result.rebuilt_indexes {
+                    println!(
+                        "  {}, property '{}'",
+                        graph_type_subject(&index.type_key),
+                        index.property,
+                    );
+                }
+                if let Some(commit_id) = result.graph_commit_id {
+                    println!("graph commit: {commit_id}");
+                } else {
+                    println!("no-op; no graph commit published");
                 }
             }
         }

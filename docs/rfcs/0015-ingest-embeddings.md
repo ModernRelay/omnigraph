@@ -1,11 +1,23 @@
-# RFC-015: Ingest-time `@embed` via the embedding reconciler
+---
+rfc: "0015"
+title: "Ingest-time `@embed` reconciliation"
+track: maintainer
+status: draft
+implementation: not-started
+authors:
+  - OmniGraph maintainers
+created: 2026-06-21
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
+---
 
-**Status:** Draft
-**Date:** 2026-06-21
-**Owner:** OmniGraph maintainers
-**Tickets:** `iss-ingest-embed` (umbrella); relates to RFC-012 (embedding client),
+# RFC 0015: Ingest-time `@embed` reconciliation
+
+**Tickets:** `iss-ingest-embed` (umbrella); relates to RFC 0012 (embedding client),
 invariant 7 (indexes are derived state)
-**Author track:** Maintainer design series
 
 > Evidence tags: **[S]** verified in v0.7.1 source (`file:line`), **[U]** verified
 > against an external system, **[D]** documented behavior. Unmarked = design intent.
@@ -41,8 +53,8 @@ codebase on three independent counts**:
    embedding is the same shape (expensive, network-bound, derivable). The
    deny-list does not distinguish "build the index" from "compute the value the
    index covers."
-2. **It blows the write-path cost contract.** RFC-013 (and its
-   [Step 3b handoff](../dev/handoff-rfc-013-write-path.md)) is making the
+2. **It blows the write-path cost contract.** RFC 0013 (and its
+   [write protocol](../dev/writes.md)) is making the
    write path O(1) and failure-bounded. A per-row embedding call is
    O(network-latency) and fallible — a single-row `mutate` would block on a
    model round-trip (the latency that makes this unacceptable for interactive
@@ -151,7 +163,7 @@ partial coverage, surfaced — not silent:
 | **Graph-target embed** | `omnigraph embed` is file→file [D] | `omnigraph embed --graph <scope>` runs the reconciler against a live graph. |
 
 The provider client, model-identity recording, same-space validation, and
-retry/backoff already exist (RFC-012) — this is write-path + reconciler
+retry/backoff already exist (RFC 0012) — this is write-path + reconciler
 integration, not a new subsystem.
 
 ## Invariants & deny-list check
@@ -248,12 +260,12 @@ the synchronous opt-in covers callers that cannot tolerate it.
 
 ## Relationship to prior work
 
-- **RFC-012 (embedding provider config):** provides the client, model identity,
-  same-space validation, retry/backoff this RFC consumes. RFC-015 is the
-  write-path/reconciler integration RFC-012 deferred.
+- **RFC 0012 (embedding provider config):** provides the client, model identity,
+  same-space validation, retry/backoff this RFC consumes. RFC 0015 is the
+  write-path/reconciler integration RFC 0012 deferred.
 - **Invariant 7 / the deferred-vector-index path** (`table_ops.rs`
   `PendingIndex`, `optimize.rs` [S]): the mechanism this extends from
   index-coverage to row-level embedding coverage.
-- **RFC-013 (write-path latency) / step 3b:** the cost-and-failure-bounding
+- **RFC 0013 (write-path latency) / step 3b:** the cost-and-failure-bounding
   contract that makes synchronous inline embedding unacceptable and the
   reconciler necessary.

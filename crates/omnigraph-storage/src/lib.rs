@@ -1,15 +1,18 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
+use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
-use object_store::{DynObjectStore, ObjectStore, ObjectStoreExt, PutMode, PutPayload};
+use object_store::{DynObjectStore, GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 use url::Url;
 
 use thiserror::Error;
@@ -303,6 +306,714 @@ impl From<std::io::Error> for StorageError {
 
 const FILE_SCHEME_PREFIX: &str = "file://";
 const S3_SCHEME_PREFIX: &str = "s3://";
+const AZURE_SCHEME_PREFIX: &str = "az://";
+/// The DST harness's opaque in-memory scheme (Lance's shared-memory
+/// provider). Named beside its siblings; every user (the classification
+/// arm, the URI normalizer, the Memory-codec strip) is `dst`-gated, so
+/// the const is too.
+#[cfg(feature = "dst")]
+const SHARED_MEMORY_SCHEME_PREFIX: &str = "shared-memory://";
+const DEFAULT_AZURITE_BLOB_STORAGE_URL: &str = "http://127.0.0.1:10000";
+// Keep the Azure GET -> multipart PUT rename envelope bounded. Five MiB is
+// accepted as a non-final multipart part by every object_store backend and
+// leaves schema promotion with a small, fixed peak copy buffer.
+const AZURE_RENAME_PART_BYTES: u64 = 5 * 1024 * 1024;
+// Public, well-known Azurite development key. Never use this for Azure.
+const DEFAULT_AZURITE_ACCOUNT_KEY: &str =
+    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+const AZURE_ADMISSION_PREFIX: &str = "__omnigraph_azure_admission/v1";
+
+/// Render a storage location for diagnostics without exposing URI credentials.
+///
+/// This is deliberately not a canonicalization API: callers must use the
+/// original URI for I/O. The returned label removes userinfo, query strings,
+/// and fragments, and falls back to a scheme-only label when a malformed URI
+/// cannot be safely decomposed.
+pub fn redacted_storage_uri(uri: &str) -> String {
+    if !has_uri_scheme(uri) || is_windows_drive_path(uri) {
+        return uri.to_string();
+    }
+
+    let Ok(mut url) = Url::parse(uri) else {
+        let scheme = uri
+            .split_once(':')
+            .map(|(scheme, _)| scheme)
+            .filter(|scheme| {
+                !scheme.is_empty()
+                    && scheme.as_bytes()[0].is_ascii_alphabetic()
+                    && scheme.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+                    })
+            })
+            .unwrap_or("storage");
+        return format!("{scheme}://<invalid or redacted>");
+    };
+
+    let had_userinfo = !url.username().is_empty() || url.password().is_some();
+    let had_query = url.query().is_some();
+    let had_fragment = url.fragment().is_some();
+    if had_userinfo && (url.set_password(None).is_err() || url.set_username("").is_err()) {
+        return format!("{}://<credentials redacted>", url.scheme());
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+
+    let mut redacted = Vec::new();
+    if had_userinfo {
+        redacted.push("userinfo");
+    }
+    if had_query {
+        redacted.push("query");
+    }
+    if had_fragment {
+        redacted.push("fragment");
+    }
+    if redacted.is_empty() {
+        url.to_string()
+    } else {
+        format!("{} [{} redacted]", url, redacted.join(", "))
+    }
+}
+
+/// Process-wide Azure location and identity selection captured before the
+/// first Azure client is built.
+///
+/// The complete object-store configuration is captured so control-object and
+/// Lance clients cannot silently select different accounts, endpoints, or
+/// static credentials after the process has started. Upstream managed-identity
+/// providers may still refresh short-lived credentials after construction.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AzureStorageConfig {
+    account_name: String,
+    endpoint: Option<String>,
+    emulator_url: Option<String>,
+    use_emulator: bool,
+    client_id: Option<String>,
+    identity_endpoint: Option<String>,
+    identity_header: Option<String>,
+    azure_options: BTreeMap<String, String>,
+    environment_snapshot: Option<AzureEnvironmentSnapshot>,
+}
+
+impl fmt::Debug for AzureStorageConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzureStorageConfig")
+            .field("account_name", &self.account_name)
+            .field("endpoint", &self.endpoint.as_ref().map(|_| "<configured>"))
+            .field(
+                "emulator_url",
+                &self.emulator_url.as_ref().map(|_| "<configured>"),
+            )
+            .field("use_emulator", &self.use_emulator)
+            .field("client_id", &self.client_id)
+            .field(
+                "identity_endpoint",
+                &self.identity_endpoint.as_ref().map(|_| "<configured>"),
+            )
+            .field(
+                "identity_header",
+                &self.identity_header.as_ref().map(|_| "<redacted>"),
+            )
+            .field("azure_options", &RedactedAzureOptions(&self.azure_options))
+            .field(
+                "environment_snapshot",
+                &self.environment_snapshot.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AzureEnvironmentSnapshot {
+    values: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for AzureEnvironmentSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzureEnvironmentSnapshot")
+            .field("keys", &self.values.keys().collect::<Vec<_>>())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+struct RedactedAzureOptions<'a>(&'a BTreeMap<String, String>);
+
+impl fmt::Debug for RedactedAzureOptions<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|key| (key, "<redacted>")))
+            .finish()
+    }
+}
+
+/// Captured secret material consumed only by the narrow Azure lease wrapper.
+///
+/// This is deliberately hidden from generated documentation. Its `Debug`
+/// implementation never prints credential values, and no general raw-secret
+/// getter is exposed by [`CanonicalAzureRoot`].
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq)]
+pub enum AzureAdmissionCredential {
+    BearerToken(String),
+    SharedKey {
+        account: String,
+        encoded_key: String,
+    },
+    ManagedIdentity {
+        endpoint: String,
+        secret_header: String,
+        client_id: Option<String>,
+    },
+}
+
+impl fmt::Debug for AzureAdmissionCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BearerToken(_) => f.write_str("BearerToken(<redacted>)"),
+            Self::SharedKey { account, .. } => f
+                .debug_struct("SharedKey")
+                .field("account", account)
+                .field("encoded_key", &"<redacted>")
+                .finish(),
+            Self::ManagedIdentity {
+                endpoint,
+                client_id,
+                ..
+            } => f
+                .debug_struct("ManagedIdentity")
+                .field("endpoint", endpoint)
+                .field("secret_header", &"<redacted>")
+                .field("client_id", client_id)
+                .finish(),
+        }
+    }
+}
+
+impl AzureStorageConfig {
+    /// Construct an explicit production configuration.
+    ///
+    /// Account and endpoint selection come from this value. Supported Azure
+    /// credential and HTTP-client environment variables are still captured
+    /// once when the root is constructed, so explicit selection does not
+    /// weaken the upstream authentication chain.
+    pub fn new(account_name: impl Into<String>) -> Self {
+        Self {
+            account_name: account_name.into(),
+            endpoint: None,
+            emulator_url: None,
+            use_emulator: false,
+            client_id: None,
+            identity_endpoint: None,
+            identity_header: None,
+            azure_options: BTreeMap::new(),
+            environment_snapshot: None,
+        }
+    }
+
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
+    }
+
+    pub fn with_emulator(mut self, emulator_url: impl Into<String>) -> Self {
+        self.use_emulator = true;
+        self.emulator_url = Some(emulator_url.into());
+        self
+    }
+
+    pub fn with_default_emulator(mut self) -> Self {
+        self.use_emulator = true;
+        self.emulator_url = None;
+        self
+    }
+
+    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id = Some(client_id.into());
+        self
+    }
+
+    pub fn with_identity_endpoint(mut self, identity_endpoint: impl Into<String>) -> Self {
+        self.identity_endpoint = Some(identity_endpoint.into());
+        self
+    }
+
+    /// Test/deployment seam for the App Service managed-identity secret
+    /// header. The value remains redacted from `Debug` and errors.
+    #[doc(hidden)]
+    pub fn with_identity_header(mut self, identity_header: impl Into<String>) -> Self {
+        self.identity_header = Some(identity_header.into());
+        self
+    }
+
+    /// Test/deployment seam for static Shared Key authentication. Production
+    /// should prefer managed identity.
+    #[doc(hidden)]
+    pub fn with_account_key(mut self, encoded_key: impl Into<String>) -> Self {
+        self.azure_options.insert(
+            AzureConfigKey::AccessKey.as_ref().to_string(),
+            encoded_key.into(),
+        );
+        self
+    }
+
+    /// Test/deployment seam for a pre-acquired bearer token.
+    #[doc(hidden)]
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.azure_options
+            .insert(AzureConfigKey::Token.as_ref().to_string(), token.into());
+        self
+    }
+
+    fn capture_from_env() -> Result<Self> {
+        let (environment_snapshot, azure_options) = capture_azure_environment()?;
+        let account_name = required_option(
+            &azure_options,
+            AzureConfigKey::AccountName,
+            "AZURE_STORAGE_ACCOUNT_NAME",
+        )?;
+        let endpoint = option(&azure_options, AzureConfigKey::Endpoint);
+        let client_id = option(&azure_options, AzureConfigKey::ClientId);
+        let use_emulator = option(&azure_options, AzureConfigKey::UseEmulator)
+            .map(|value| parse_bool("AZURE_STORAGE_USE_EMULATOR", &value))
+            .transpose()?
+            .unwrap_or(false);
+        let emulator_url = environment_snapshot
+            .values
+            .get("AZURITE_BLOB_STORAGE_URL")
+            .cloned();
+        let identity_endpoint = option(&azure_options, AzureConfigKey::MsiEndpoint);
+        let identity_header = environment_snapshot.values.get("IDENTITY_HEADER").cloned();
+        Ok(Self {
+            account_name,
+            endpoint,
+            emulator_url,
+            use_emulator,
+            client_id,
+            identity_endpoint,
+            identity_header,
+            azure_options,
+            environment_snapshot: Some(environment_snapshot),
+        })
+    }
+
+    fn verify_environment_unchanged(&self) -> Result<()> {
+        if let Some(expected) = &self.environment_snapshot {
+            expected.verify_unchanged()?;
+        }
+        Ok(())
+    }
+}
+
+impl AzureEnvironmentSnapshot {
+    fn verify_unchanged(&self) -> Result<()> {
+        let (current, _) = capture_azure_environment()?;
+        self.verify_matches(&current)
+    }
+
+    fn verify_matches(&self, current: &Self) -> Result<()> {
+        if current == self {
+            return Ok(());
+        }
+        let changed = self
+            .values
+            .keys()
+            .chain(current.values.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|key| self.values.get(*key) != current.values.get(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        Err(StorageError::backend(
+            StorageFailureKind::Configuration,
+            format!(
+                "Azure storage environment changed after process capture (changed keys: {}); restart the process",
+                changed.join(", ")
+            ),
+        ))
+    }
+}
+
+/// Strict, canonical Azure root plus one process-captured backend selection.
+///
+/// The public URI deliberately contains only container and object prefix. The
+/// account and service endpoint are snapshotted separately from environment so
+/// the same URI cannot drift between control-object and Lance clients while a
+/// process is alive.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CanonicalAzureRoot {
+    canonical_uri: String,
+    account_name: String,
+    container: String,
+    prefix: String,
+    service_url: Url,
+    storage_endpoint: String,
+    use_emulator: bool,
+    client_id: Option<String>,
+    identity_endpoint: Option<String>,
+    identity_header: Option<String>,
+    azure_options: BTreeMap<String, String>,
+    environment_snapshot: Option<AzureEnvironmentSnapshot>,
+    root_digest_hex: String,
+    admission_blob_path: String,
+    admission_blob_uri: String,
+}
+
+impl fmt::Debug for CanonicalAzureRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CanonicalAzureRoot")
+            .field("canonical_uri", &self.canonical_uri)
+            .field("account_name", &self.account_name)
+            .field("container", &self.container)
+            .field("prefix", &self.prefix)
+            .field("service_url", &self.service_url)
+            .field("storage_endpoint", &self.storage_endpoint)
+            .field("use_emulator", &self.use_emulator)
+            .field("client_id", &self.client_id)
+            .field("identity_endpoint", &self.identity_endpoint)
+            .field(
+                "identity_header",
+                &self.identity_header.as_ref().map(|_| "<redacted>"),
+            )
+            .field("azure_options", &RedactedAzureOptions(&self.azure_options))
+            .field(
+                "environment_snapshot",
+                &self.environment_snapshot.as_ref().map(|_| "<redacted>"),
+            )
+            .field("root_digest_hex", &self.root_digest_hex)
+            .field("admission_blob_path", &self.admission_blob_path)
+            .field("admission_blob_uri", &self.admission_blob_uri)
+            .finish()
+    }
+}
+
+impl CanonicalAzureRoot {
+    /// Parse an Azure root using the process-wide Azure selection snapshot.
+    ///
+    /// The first call, including a failed call, fixes the selection for the
+    /// process. Operators must restart after changing Azure location variables.
+    pub fn from_env(root_uri: &str) -> Result<Self> {
+        // URI validity is independent of environment and is checked before a
+        // missing account can obscure a malformed or unsafe root.
+        let canonical_uri = parse_azure_uri(root_uri)?.canonical_uri;
+        static AZURE_CONFIG: OnceLock<std::result::Result<AzureStorageConfig, StorageFailure>> =
+            OnceLock::new();
+        let config = AZURE_CONFIG.get_or_init(|| {
+            AzureStorageConfig::capture_from_env().map_err(|error| {
+                StorageFailure::new(StorageFailureKind::Configuration, error.to_string())
+            })
+        });
+        match config {
+            Ok(config) => {
+                config.verify_environment_unchanged()?;
+                Self::from_config(&canonical_uri, config.clone())
+            }
+            Err(failure) => Err(StorageError::Backend(failure.clone())),
+        }
+    }
+
+    /// Parse an Azure root against an explicit, immutable selection.
+    pub fn from_config(root_uri: &str, config: AzureStorageConfig) -> Result<Self> {
+        let (current_environment, ambient_options) = capture_azure_environment()?;
+        if let Some(expected) = &config.environment_snapshot {
+            expected.verify_matches(&current_environment)?;
+        }
+        let location = parse_azure_uri(root_uri)?;
+        let account_name = validate_azure_account_name(&config.account_name)?;
+        if config.use_emulator && config.endpoint.is_some() {
+            return Err(StorageError::backend(
+                StorageFailureKind::Configuration,
+                "Azure emulator configuration cannot also set AZURE_STORAGE_ENDPOINT",
+            ));
+        }
+
+        let service_url = if config.use_emulator {
+            let value = config
+                .emulator_url
+                .as_deref()
+                .unwrap_or(DEFAULT_AZURITE_BLOB_STORAGE_URL);
+            parse_azure_service_url(value, "Azurite Blob service")?
+        } else if let Some(endpoint) = config.endpoint.as_deref() {
+            let endpoint = parse_azure_service_url(endpoint, "Azure Blob service endpoint")?;
+            if endpoint.scheme() != "https" {
+                return Err(StorageError::backend(
+                    StorageFailureKind::Configuration,
+                    "invalid Azure Blob service endpoint: HTTPS is required outside Azurite mode",
+                ));
+            }
+            endpoint
+        } else {
+            let value = format!("https://{account_name}.blob.core.windows.net");
+            parse_azure_service_url(&value, "Azure Blob service endpoint")?
+        };
+
+        // object_store 0.13.2's emulator branch has no endpoint option: it
+        // rereads AZURITE_BLOB_STORAGE_URL at build time. Model Azurite as an
+        // ordinary explicit HTTP endpoint instead, including the account path
+        // that the emulator branch would otherwise append. This gives control
+        // objects and Lance the exact same immutable endpoint.
+        let storage_endpoint = if config.use_emulator {
+            azure_service_url_with_segment(&service_url, &account_name)?.to_string()
+        } else {
+            service_url.to_string()
+        };
+
+        let mut azure_options = ambient_options;
+        azure_options.extend(config.azure_options);
+        azure_options.insert(
+            AzureConfigKey::AccountName.as_ref().to_string(),
+            account_name.clone(),
+        );
+        azure_options.insert(
+            AzureConfigKey::Endpoint.as_ref().to_string(),
+            storage_endpoint.clone(),
+        );
+        azure_options.insert(
+            AzureConfigKey::UseEmulator.as_ref().to_string(),
+            "false".to_string(),
+        );
+        azure_options.insert(
+            AzureConfigKey::UseFabricEndpoint.as_ref().to_string(),
+            "false".to_string(),
+        );
+        validate_azure_http_policy(
+            config.use_emulator,
+            &current_environment.values,
+            &azure_options,
+        )?;
+        if config.use_emulator {
+            azure_options.insert("allow_http".to_string(), "true".to_string());
+        }
+        let client_id = nonempty_optional(
+            config
+                .client_id
+                .or_else(|| option(&azure_options, AzureConfigKey::ClientId)),
+            "Azure client id",
+        )?;
+        if let Some(client_id) = &client_id {
+            azure_options.insert(
+                AzureConfigKey::ClientId.as_ref().to_string(),
+                client_id.clone(),
+            );
+        }
+        let identity_endpoint = config
+            .identity_endpoint
+            .or_else(|| option(&azure_options, AzureConfigKey::MsiEndpoint))
+            .as_deref()
+            .map(|value| parse_azure_service_url(value, "Azure managed-identity endpoint"))
+            .transpose()?
+            .map(|url| url.to_string());
+        if let Some(identity_endpoint) = &identity_endpoint {
+            azure_options.insert(
+                AzureConfigKey::MsiEndpoint.as_ref().to_string(),
+                identity_endpoint.clone(),
+            );
+        }
+
+        let has_emulator_credential = [
+            AzureConfigKey::AccessKey,
+            AzureConfigKey::Token,
+            AzureConfigKey::SasKey,
+        ]
+        .iter()
+        .any(|key| azure_options.contains_key(key.as_ref()));
+        let uses_default_emulator_key = config.use_emulator && !has_emulator_credential;
+        if uses_default_emulator_key {
+            azure_options.insert(
+                AzureConfigKey::AccessKey.as_ref().to_string(),
+                DEFAULT_AZURITE_ACCOUNT_KEY.to_string(),
+            );
+        }
+
+        let digest_input = format!(
+            "omnigraph-azure-root-v1\nservice={}\naccount={}\ncontainer={}\nroot={}",
+            service_url.as_str(),
+            account_name,
+            location.container,
+            location.canonical_uri
+        );
+        let root_digest_hex = sha256_hex(digest_input.as_bytes());
+        let admission_blob_path = format!("{AZURE_ADMISSION_PREFIX}/{root_digest_hex}/writer.lock");
+        let admission_blob_uri = format!("az://{}/{}", location.container, admission_blob_path);
+
+        Ok(Self {
+            canonical_uri: location.canonical_uri,
+            account_name,
+            container: location.container,
+            prefix: location.key,
+            service_url,
+            storage_endpoint,
+            use_emulator: config.use_emulator,
+            client_id,
+            identity_endpoint,
+            identity_header: nonempty_optional(
+                config
+                    .identity_header
+                    .or_else(|| current_environment.values.get("IDENTITY_HEADER").cloned()),
+                "Azure managed-identity secret header",
+            )?,
+            azure_options,
+            environment_snapshot: Some(current_environment),
+            root_digest_hex,
+            admission_blob_path,
+            admission_blob_uri,
+        })
+    }
+
+    pub fn canonical_uri(&self) -> &str {
+        &self.canonical_uri
+    }
+
+    pub fn account_name(&self) -> &str {
+        &self.account_name
+    }
+
+    pub fn container(&self) -> &str {
+        &self.container
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// Canonical Blob service base URL. In emulator mode this is the Azurite
+    /// base before the required `/account/container` path components.
+    pub fn endpoint(&self) -> &Url {
+        &self.service_url
+    }
+
+    pub fn use_emulator(&self) -> bool {
+        self.use_emulator
+    }
+
+    pub fn client_id(&self) -> Option<&str> {
+        self.client_id.as_deref()
+    }
+
+    pub fn identity_endpoint(&self) -> Option<&str> {
+        self.identity_endpoint.as_deref()
+    }
+
+    /// Refuse to construct another Azure client if any upstream-recognized
+    /// Azure setting changed since the process snapshot was captured.
+    pub fn verify_environment_unchanged(&self) -> Result<()> {
+        if let Some(expected) = &self.environment_snapshot {
+            expected.verify_unchanged()?;
+        }
+        Ok(())
+    }
+
+    pub fn root_digest_hex(&self) -> &str {
+        &self.root_digest_hex
+    }
+
+    pub fn admission_blob_path(&self) -> &str {
+        &self.admission_blob_path
+    }
+
+    pub fn admission_blob_uri(&self) -> &str {
+        &self.admission_blob_uri
+    }
+
+    /// Exact REST URL for the reserved admission Blob, including Azurite's
+    /// account path component when emulator mode is selected.
+    pub fn admission_blob_url(&self) -> Result<Url> {
+        self.object_url(self.admission_blob_path())
+    }
+
+    /// Exact REST URL for one container-relative object key.
+    pub fn object_url(&self, object_path: &str) -> Result<Url> {
+        let object_path = validate_relative_object_path(object_path)?;
+        let mut url = self.service_url.clone();
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            StorageError::backend(
+                StorageFailureKind::Permanent,
+                format!(
+                    "Azure Blob service URL cannot be a base: '{}'",
+                    self.service_url
+                ),
+            )
+        })?;
+        segments.pop_if_empty();
+        if self.use_emulator {
+            segments.push(&self.account_name);
+        }
+        segments.push(&self.container);
+        for segment in object_path.split('/') {
+            segments.push(segment);
+        }
+        drop(segments);
+        Ok(url)
+    }
+
+    /// Complete captured options for constructing Lance's redacted
+    /// [`StorageOptionsAccessor`](https://docs.rs/lance-io/latest/lance_io/object_store/struct.StorageOptionsAccessor.html).
+    ///
+    /// This narrow cross-crate seam intentionally includes credentials: if
+    /// Lance filled them from its independent environment cache, its data
+    /// client could authenticate differently from the control-object client.
+    /// Callers must pass the map directly into the accessor and must never log
+    /// or otherwise expose it. `StorageOptionsAccessor`'s own `Debug`
+    /// implementation does not render option values.
+    #[doc(hidden)]
+    pub fn lance_storage_options(&self) -> Result<HashMap<String, String>> {
+        self.verify_environment_unchanged()?;
+        Ok(self
+            .azure_options
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
+    /// Return the captured authentication shape for the dedicated Blob lease
+    /// wrapper without exposing general credential getters.
+    #[doc(hidden)]
+    pub fn admission_credential(&self) -> Result<AzureAdmissionCredential> {
+        self.verify_environment_unchanged()?;
+        if self.use_emulator {
+            let encoded_key = self
+                .azure_options
+                .get(AzureConfigKey::AccessKey.as_ref())
+                .cloned()
+                .ok_or_else(|| {
+                    StorageError::backend(
+                        StorageFailureKind::Configuration,
+                        "Azure admission requires a Shared Key in emulator mode",
+                    )
+                })?;
+            return Ok(AzureAdmissionCredential::SharedKey {
+                account: self.account_name.clone(),
+                encoded_key,
+            });
+        }
+        if let Some(token) = self.azure_options.get(AzureConfigKey::Token.as_ref()) {
+            return Ok(AzureAdmissionCredential::BearerToken(token.clone()));
+        }
+        if let Some(encoded_key) = self.azure_options.get(AzureConfigKey::AccessKey.as_ref()) {
+            return Ok(AzureAdmissionCredential::SharedKey {
+                account: self.account_name.clone(),
+                encoded_key: encoded_key.clone(),
+            });
+        }
+        let endpoint = self.identity_endpoint.clone().ok_or_else(|| {
+            StorageError::backend(
+                StorageFailureKind::Configuration,
+                "IDENTITY_ENDPOINT is required for managed-identity admission",
+            )
+        })?;
+        let secret_header = self.identity_header.clone().ok_or_else(|| {
+            StorageError::backend(
+                StorageFailureKind::Configuration,
+                "IDENTITY_HEADER is required for managed-identity admission",
+            )
+        })?;
+        Ok(AzureAdmissionCredential::ManagedIdentity {
+            endpoint,
+            secret_header,
+            client_id: self.client_id.clone(),
+        })
+    }
+}
 
 #[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
@@ -344,6 +1055,11 @@ pub trait StorageAdapter: Debug + Send + Sync {
     /// error. Callers use this to establish ownership before running
     /// best-effort cleanup on partial failure.
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool>;
+    /// Return whether an exact object or any object recursively below this
+    /// URI exists. The prefix probe stops after its first result and
+    /// propagates every listing failure; only a successful empty listing is
+    /// absence. This also supports directory-shaped dataset roots without
+    /// relying on synthetic directory objects.
     async fn exists(&self, uri: &str) -> Result<bool>;
     /// Move a file from `from_uri` to `to_uri`, replacing any existing file at
     /// `to_uri`. Atomic on local POSIX; on S3 implemented as copy + delete
@@ -422,13 +1138,14 @@ fn local_version_token(bytes: &[u8]) -> String {
 pub enum StorageKind {
     Local,
     S3,
+    Azure,
 }
 
 /// Concrete storage selection for control-plane authority checks.
 ///
 /// Unlike [`StorageAdapter`], this handle cannot be implemented by a caller:
-/// it is minted only after this crate selects and initializes the real local
-/// or S3 backend. Authority factories accept this concrete handle so an
+/// it is minted only after this crate selects and initializes a real local,
+/// S3, or Azure backend. Authority factories accept this concrete handle so an
 /// in-memory/custom adapter cannot manufacture persisted cluster evidence.
 #[derive(Debug, Clone)]
 pub struct StorageHandle {
@@ -463,6 +1180,10 @@ pub struct ObjectStorageAdapter {
     /// and the `write_text_if_match` strategy — the two must agree or every
     /// CAS loses.
     supports_conditional_update: bool,
+    #[cfg(test)]
+    omit_read_etag: bool,
+    #[cfg(test)]
+    omit_write_etag: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,6 +1193,8 @@ enum UriCodec {
     Local,
     /// `s3://{bucket}/{key}` URIs, mapped onto a bucket-scoped store.
     S3 { bucket: String },
+    /// `az://{container}/{key}` URIs, mapped onto a container-scoped store.
+    Azure { container: String },
     /// Opaque keys for the in-memory test/embedded backend; leading
     /// slashes are stripped.
     Memory,
@@ -483,6 +1206,13 @@ struct S3Location {
     key: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AzureLocation {
+    container: String,
+    key: String,
+    canonical_uri: String,
+}
+
 impl ObjectStorageAdapter {
     /// Local-filesystem backend rooted at `/`. URIs are plain paths or
     /// `file://` URIs; relative paths are lexically absolutized against the
@@ -492,6 +1222,10 @@ impl ObjectStorageAdapter {
             store: Arc::new(LocalFileSystem::new()),
             codec: UriCodec::Local,
             supports_conditional_update: false,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
         }
     }
 
@@ -533,6 +1267,59 @@ impl ObjectStorageAdapter {
                 bucket: location.bucket,
             },
             supports_conditional_update: true,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
+        })
+    }
+
+    /// Azure backend selected from the process-wide canonical root snapshot.
+    pub fn azure_from_root_uri(root_uri: &str) -> Result<Self> {
+        let root = CanonicalAzureRoot::from_env(root_uri)?;
+        Self::azure_from_root(&root)
+    }
+
+    /// Azure backend scoped to the canonical root's container.
+    pub fn azure_from_root(root: &CanonicalAzureRoot) -> Result<Self> {
+        root.verify_environment_unchanged()?;
+        // Starting from `new` is load-bearing: `from_env` would refresh live
+        // process state and could move control objects away from Lance after
+        // CanonicalAzureRoot captured the backend selection.
+        let mut builder = MicrosoftAzureBuilder::new();
+        for (key, value) in &root.azure_options {
+            let key = AzureConfigKey::from_str(key).map_err(|_| {
+                StorageError::backend(
+                    StorageFailureKind::Configuration,
+                    format!("captured Azure option key '{key}' is not supported by object_store"),
+                )
+            })?;
+            builder = builder.with_config(key, value.clone());
+        }
+        builder = builder
+            .with_account(root.account_name())
+            .with_container_name(root.container())
+            .with_endpoint(root.storage_endpoint.clone())
+            .with_use_emulator(false);
+        let store = builder.build().map_err(|_| {
+            StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!(
+                    "failed to initialize Azure storage for '{}'; verify the captured Azure configuration",
+                    root.canonical_uri()
+                ),
+            )
+        })?;
+        Ok(Self {
+            store: Arc::new(store),
+            codec: UriCodec::Azure {
+                container: root.container().to_string(),
+            },
+            supports_conditional_update: true,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
         })
     }
 
@@ -545,6 +1332,10 @@ impl ObjectStorageAdapter {
             store: Arc::new(InMemory::new()),
             codec: UriCodec::Memory,
             supports_conditional_update: true,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
         }
     }
 
@@ -583,12 +1374,118 @@ impl ObjectStorageAdapter {
                     )
                 })
             }
-            UriCodec::Memory => ObjectPath::parse(uri.trim_start_matches('/')).map_err(|err| {
-                StorageError::backend(
-                    StorageFailureKind::Configuration,
-                    format!("invalid memory object path for '{}': {}", uri, err),
-                )
-            }),
+            UriCodec::Azure { container } => {
+                let location = parse_azure_uri(uri)?;
+                if &location.container != container {
+                    return Err(StorageError::backend(
+                        StorageFailureKind::Configuration,
+                        format!(
+                            "Azure storage container mismatch for '{}': expected '{}', found '{}'",
+                            uri, container, location.container
+                        ),
+                    ));
+                }
+                if location.key.is_empty() {
+                    return Err(StorageError::backend(
+                        StorageFailureKind::Configuration,
+                        format!("Azure storage path is empty for '{}'", uri),
+                    ));
+                }
+                ObjectPath::parse(&location.key).map_err(|err| {
+                    StorageError::backend(
+                        StorageFailureKind::Configuration,
+                        format!("invalid Azure object path for '{}': {}", uri, err),
+                    )
+                })
+            }
+            UriCodec::Memory => {
+                // DST: accept the harness's scheme-carrying roots
+                // (shared-memory://name/key) — that scheme is namespacing
+                // only; the authority+path becomes the opaque key. Only
+                // this one scheme, and only under `dst`: default builds
+                // keep the base behavior (scheme-carrying keys error in
+                // ObjectPath::parse).
+                #[cfg(feature = "dst")]
+                let key = uri.strip_prefix(SHARED_MEMORY_SCHEME_PREFIX).unwrap_or(uri);
+                #[cfg(not(feature = "dst"))]
+                let key = uri;
+                ObjectPath::parse(key.trim_start_matches('/')).map_err(|err| {
+                    StorageError::backend(
+                        StorageFailureKind::Configuration,
+                        format!("invalid memory object path for '{}': {}", uri, err),
+                    )
+                })
+            }
+        }
+    }
+
+    async fn read_azure_rename_part(
+        &self,
+        from: &ObjectPath,
+        from_uri: &str,
+        source_etag: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<PutPayload> {
+        let expected = end.checked_sub(start).ok_or_else(|| {
+            StorageError::backend(
+                StorageFailureKind::Permanent,
+                format!(
+                    "storage rename_read failed for '{}': invalid range {start}..{end}",
+                    redacted_storage_uri(from_uri)
+                ),
+            )
+        })?;
+        let result = self
+            .store
+            .get_opts(
+                from,
+                GetOptions::new()
+                    .with_if_match(Some(source_etag.to_string()))
+                    .with_range(Some(start..end)),
+            )
+            .await
+            .map_err(|err| storage_backend_error("rename_read", from_uri, err))?;
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|err| storage_backend_error("rename_read", from_uri, err))?;
+        let actual = u64::try_from(bytes.len()).map_err(|_| {
+            StorageError::backend(
+                StorageFailureKind::Permanent,
+                format!(
+                    "storage rename_read failed for '{}': response length exceeds u64",
+                    redacted_storage_uri(from_uri)
+                ),
+            )
+        })?;
+        if actual != expected {
+            return Err(StorageError::backend(
+                StorageFailureKind::Permanent,
+                format!(
+                    "storage rename_read failed for '{}': expected {expected} bytes for range \
+                     {start}..{end}, received {actual}",
+                    redacted_storage_uri(from_uri)
+                ),
+            ));
+        }
+        Ok(PutPayload::from(bytes))
+    }
+
+    async fn abort_azure_rename_after_error(
+        upload: &mut Box<dyn object_store::MultipartUpload>,
+        to_uri: &str,
+        primary: StorageError,
+    ) -> StorageError {
+        match upload.abort().await {
+            Ok(()) => primary,
+            Err(abort_error) => StorageError::backend(
+                StorageFailureKind::Unknown,
+                format!(
+                    "{primary}; storage rename_abort failed for '{}': {abort_error}",
+                    redacted_storage_uri(to_uri)
+                ),
+            ),
         }
     }
 
@@ -611,6 +1508,35 @@ impl ObjectStorageAdapter {
             return StorageError::io_context(link_error, message);
         }
         storage_backend_error("write_if_absent", uri, err)
+    }
+
+    /// DST-only bottom-count listing: every key currently held by the
+    /// backing store, flat, no prefix filter. This reads BELOW every
+    /// harness wrapper (the store itself is the one surface a bypass
+    /// writer cannot avoid), so the DST write census can reconcile
+    /// wrapper-recorded writes against ground truth. Hidden like the
+    /// engine's dst seams; not part of the storage contract.
+    ///
+    /// UNBOUNDED and unscoped by design (census roots are universe-sized;
+    /// a partial listing would hide exactly the bypass writes it exists
+    /// to find) — census use on universe-scoped roots only; on a
+    /// local-filesystem adapter it walks the store's whole root.
+    ///
+    /// # Errors
+    /// When the backing store's listing fails.
+    #[doc(hidden)]
+    #[cfg(feature = "dst")]
+    pub async fn dst_list_all_keys(&self) -> Result<Vec<String>> {
+        let listing: Vec<object_store::ObjectMeta> = self
+            .store
+            .list(None)
+            .try_collect()
+            .await
+            .map_err(|err| storage_backend_error("dst_list_all_keys", "<all>", err))?;
+        Ok(listing
+            .into_iter()
+            .map(|meta| meta.location.to_string())
+            .collect())
     }
 }
 
@@ -830,14 +1756,105 @@ impl StorageAdapter for ObjectStorageAdapter {
     }
 
     async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
-        // ObjectStore::rename: LocalFileSystem overrides it with an atomic
-        // fs::rename (creating missing destination parents); object stores
-        // use the default copy + delete — if the copy succeeds and the
-        // delete fails (or the process crashes between them), both source
-        // and destination exist with the same content. Recovery code must
-        // tolerate this case — see schema_state::recover_schema_state_files.
         let from = self.object_path(from_uri)?;
         let to = self.object_path(to_uri)?;
+        if matches!(self.codec, UriCodec::Azure { .. }) {
+            // Azure Copy Blob may complete asynchronously. Control-object
+            // rename instead performs ETag-pinned bounded range GETs, a
+            // visibility-complete PUT, and then DELETE. It is still
+            // intentionally non-atomic: a crash after PUT can leave both
+            // objects, which recovery owns. Multipart blocks are provider-
+            // invisible until complete; every earlier failure aborts them.
+            let source = self
+                .store
+                .head(&from)
+                .await
+                .map_err(|err| storage_backend_error("rename_read", from_uri, err))?;
+            let source_etag = required_remote_etag("rename_read", from_uri, source.e_tag.clone())?;
+
+            if source.size == 0 {
+                self.store
+                    .put(&to, PutPayload::default())
+                    .await
+                    .map_err(|err| storage_backend_error("rename_write", to_uri, err))?;
+            } else if source.size <= AZURE_RENAME_PART_BYTES {
+                let payload = self
+                    .read_azure_rename_part(&from, from_uri, &source_etag, 0, source.size)
+                    .await?;
+                self.store
+                    .put(&to, payload)
+                    .await
+                    .map_err(|err| storage_backend_error("rename_write", to_uri, err))?;
+            } else {
+                let mut upload = self
+                    .store
+                    .put_multipart(&to)
+                    .await
+                    .map_err(|err| storage_backend_error("rename_write", to_uri, err))?;
+                let mut start = 0_u64;
+                while start < source.size {
+                    let end = match start
+                        .checked_add(AZURE_RENAME_PART_BYTES)
+                        .map(|end| end.min(source.size))
+                    {
+                        Some(end) => end,
+                        None => {
+                            let error = StorageError::backend(
+                                StorageFailureKind::Permanent,
+                                format!(
+                                    "storage rename_read failed for '{}': source range arithmetic \
+                                     overflow at {start} bytes",
+                                    redacted_storage_uri(from_uri)
+                                ),
+                            );
+                            return Err(Self::abort_azure_rename_after_error(
+                                &mut upload,
+                                to_uri,
+                                error,
+                            )
+                            .await);
+                        }
+                    };
+                    let payload = match self
+                        .read_azure_rename_part(&from, from_uri, &source_etag, start, end)
+                        .await
+                    {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            return Err(Self::abort_azure_rename_after_error(
+                                &mut upload,
+                                to_uri,
+                                error,
+                            )
+                            .await);
+                        }
+                    };
+                    if let Err(error) = upload.put_part(payload).await {
+                        let error = storage_backend_error("rename_write", to_uri, error);
+                        return Err(Self::abort_azure_rename_after_error(
+                            &mut upload,
+                            to_uri,
+                            error,
+                        )
+                        .await);
+                    }
+                    start = end;
+                }
+                if let Err(error) = upload.complete().await {
+                    let error = storage_backend_error("rename_write", to_uri, error);
+                    return Err(
+                        Self::abort_azure_rename_after_error(&mut upload, to_uri, error).await,
+                    );
+                }
+            }
+            self.store
+                .delete(&from)
+                .await
+                .map_err(|err| storage_backend_error("rename_delete", from_uri, err))?;
+            return Ok(());
+        }
+        // LocalFileSystem overrides rename with atomic fs::rename. S3 uses
+        // copy + delete and may leave both names after a crash.
         self.store
             .rename(&from, &to)
             .await
@@ -1011,6 +2028,8 @@ impl StorageAdapter for ObjectStorageAdapter {
             .await
             .map_err(|err| storage_backend_error("read", uri, err))?;
         let etag = result.meta.e_tag.clone();
+        #[cfg(test)]
+        let etag = if self.omit_read_etag { None } else { etag };
         let bytes = result
             .bytes()
             .await
@@ -1020,9 +2039,7 @@ impl StorageAdapter for ObjectStorageAdapter {
         // the token is the ETag; the local emulation compares content, so
         // the token is the content hash. Mixing them makes every CAS lose.
         let version = if self.supports_conditional_update {
-            // Every S3-compatible store we target returns ETags; fall back
-            // to a content token rather than failing if one ever omits it.
-            etag.unwrap_or_else(|| local_version_token(&bytes))
+            required_remote_etag("read", uri, etag)?
         } else {
             local_version_token(&bytes)
         };
@@ -1052,9 +2069,10 @@ impl StorageAdapter for ObjectStorageAdapter {
                 .await
             {
                 Ok(result) => {
-                    Ok(Some(result.e_tag.unwrap_or_else(|| {
-                        local_version_token(contents.as_bytes())
-                    })))
+                    let etag = result.e_tag;
+                    #[cfg(test)]
+                    let etag = if self.omit_write_etag { None } else { etag };
+                    Ok(Some(required_remote_etag("write_if_match", uri, etag)?))
                 }
                 Err(object_store::Error::Precondition { .. })
                 | Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -1116,11 +2134,32 @@ impl StorageAdapter for ObjectStorageAdapter {
     }
 }
 
-pub fn storage_kind_for_uri(uri: &str) -> StorageKind {
+pub fn storage_kind_for_uri(uri: &str) -> Result<StorageKind> {
+    // `shared-memory://` is the DST harness's in-memory scheme (Lance's
+    // shared-memory provider). Classified Local: universes need Local
+    // layout/probe semantics while all IO is served by the injected
+    // adapter. Gated on `dst`, so production builds refuse the scheme
+    // like any unknown one.
+    #[cfg(feature = "dst")]
+    if uri.starts_with(SHARED_MEMORY_SCHEME_PREFIX) {
+        return Ok(StorageKind::Local);
+    }
     if uri.starts_with(S3_SCHEME_PREFIX) {
-        StorageKind::S3
+        Ok(StorageKind::S3)
+    } else if uri.starts_with(AZURE_SCHEME_PREFIX) {
+        Ok(StorageKind::Azure)
+    } else if uri.starts_with(FILE_SCHEME_PREFIX)
+        || !has_uri_scheme(uri)
+        || is_windows_drive_path(uri)
+    {
+        Ok(StorageKind::Local)
     } else {
-        StorageKind::Local
+        let scheme = uri.split_once(':').map(|(scheme, _)| scheme).unwrap_or(uri);
+        let diagnostic_uri = redacted_storage_uri(uri);
+        Err(StorageError::backend(
+            StorageFailureKind::Configuration,
+            format!("unsupported storage URI scheme '{scheme}' in '{diagnostic_uri}'"),
+        ))
     }
 }
 
@@ -1130,7 +2169,7 @@ pub fn storage_for_uri(uri: &str) -> Result<Arc<dyn StorageAdapter>> {
 
 /// Select a concrete backend for control-plane authority reads and locks.
 pub fn storage_handle_for_uri(uri: &str) -> Result<StorageHandle> {
-    match storage_kind_for_uri(uri) {
+    match storage_kind_for_uri(uri)? {
         StorageKind::Local => Ok(StorageHandle {
             adapter: Arc::new(ObjectStorageAdapter::local()),
             kind: StorageKind::Local,
@@ -1139,16 +2178,29 @@ pub fn storage_handle_for_uri(uri: &str) -> Result<StorageHandle> {
             adapter: Arc::new(ObjectStorageAdapter::s3_from_root_uri(uri)?),
             kind: StorageKind::S3,
         }),
+        StorageKind::Azure => Ok(StorageHandle {
+            adapter: Arc::new(ObjectStorageAdapter::azure_from_root_uri(uri)?),
+            kind: StorageKind::Azure,
+        }),
     }
 }
 
 pub fn normalize_root_uri(uri: &str) -> Result<String> {
-    match storage_kind_for_uri(uri) {
+    // DST: Lance's `shared-memory://` scheme is opaque —
+    // normalized like other object-store URIs, never as a local path.
+    // Gated like the classification arm below, so production builds
+    // refuse the scheme at every step.
+    #[cfg(feature = "dst")]
+    if uri.starts_with(SHARED_MEMORY_SCHEME_PREFIX) {
+        return Ok(trim_trailing_slashes(uri));
+    }
+    match storage_kind_for_uri(uri)? {
         StorageKind::Local => {
             let path = local_path_from_uri(uri)?;
             Ok(normalize_local_path(&path))
         }
         StorageKind::S3 => Ok(trim_trailing_slashes(uri)),
+        StorageKind::Azure => Ok(parse_azure_uri(uri)?.canonical_uri),
     }
 }
 
@@ -1204,7 +2256,7 @@ pub fn write_queue_root_identity(normalized_root: &str) -> Result<String> {
 pub fn join_uri(root_uri: &str, relative_path: &str) -> String {
     let relative_path = relative_path.trim_start_matches('/');
     match storage_kind_for_uri(root_uri) {
-        StorageKind::S3 => {
+        Ok(StorageKind::S3 | StorageKind::Azure) => {
             let root = trim_trailing_slashes(root_uri);
             if root.is_empty() {
                 relative_path.to_string()
@@ -1212,7 +2264,7 @@ pub fn join_uri(root_uri: &str, relative_path: &str) -> String {
                 format!("{}/{}", root, relative_path)
             }
         }
-        StorageKind::Local => {
+        Ok(StorageKind::Local) => {
             let root = if root_uri.starts_with(FILE_SCHEME_PREFIX) {
                 local_path_from_file_uri(root_uri)
                     .map(|path| normalize_local_path(&path))
@@ -1222,6 +2274,13 @@ pub fn join_uri(root_uri: &str, relative_path: &str) -> String {
             };
             let joined = Path::new(&root).join(relative_path);
             normalize_local_path(&joined)
+        }
+        Err(_) => {
+            // Joining is intentionally infallible for legacy internal callers,
+            // but an unknown URI is never reinterpreted as a filesystem path.
+            // Backend selection/normalization remains the fail-closed gate.
+            let root = trim_trailing_slashes(root_uri);
+            format!("{root}/{relative_path}")
         }
     }
 }
@@ -1243,6 +2302,14 @@ fn has_uri_scheme(value: &str) -> bool {
         && scheme
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+fn is_windows_drive_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
 }
 
 /// Lexically absolutize a local path: join relative paths onto the current
@@ -1331,6 +2398,446 @@ fn decode_storage_text(uri: &str, bytes: &[u8]) -> Result<String> {
         StorageError::backend(
             StorageFailureKind::Permanent,
             format!("storage read failed for '{uri}': {error}"),
+        )
+    })
+}
+
+fn azure_configuration_error(message: impl Into<String>) -> StorageError {
+    StorageError::backend(StorageFailureKind::Configuration, message)
+}
+
+fn parse_azure_uri(uri: &str) -> Result<AzureLocation> {
+    let diagnostic_uri = redacted_storage_uri(uri);
+    let remainder = uri.strip_prefix(AZURE_SCHEME_PREFIX).ok_or_else(|| {
+        azure_configuration_error(format!(
+            "unsupported Azure URI '{}': expected az://<container>[/<prefix>]",
+            diagnostic_uri
+        ))
+    })?;
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let raw_authority = &remainder[..authority_end];
+    if raw_authority.is_empty() {
+        return Err(azure_configuration_error(format!(
+            "missing Azure container in '{}'",
+            diagnostic_uri
+        )));
+    }
+    let raw_path = &remainder[authority_end..];
+    if raw_path.contains('\\') {
+        return Err(azure_configuration_error(format!(
+            "Azure URI path contains a backslash in '{}'",
+            diagnostic_uri
+        )));
+    }
+
+    let url = Url::parse(uri).map_err(|err| {
+        azure_configuration_error(format!("invalid Azure URI '{}': {}", diagnostic_uri, err))
+    })?;
+    if url.scheme() != "az" {
+        return Err(azure_configuration_error(format!(
+            "unsupported Azure URI scheme in '{}'",
+            diagnostic_uri
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(azure_configuration_error(format!(
+            "Azure URI must not contain userinfo in '{}'",
+            diagnostic_uri
+        )));
+    }
+    if url.port().is_some() {
+        return Err(azure_configuration_error(format!(
+            "Azure URI must not contain a port in '{}'",
+            diagnostic_uri
+        )));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(azure_configuration_error(format!(
+            "Azure URI must not contain a query or fragment in '{}'",
+            diagnostic_uri
+        )));
+    }
+    let container = url.host_str().ok_or_else(|| {
+        azure_configuration_error(format!("missing Azure container in '{}'", diagnostic_uri))
+    })?;
+    // URL parsing normalizes hosts. Requiring the raw authority to equal the
+    // validated container rejects account-qualified, case, IDNA, and escaped
+    // aliases instead of giving one container multiple accepted spellings.
+    if raw_authority != container {
+        return Err(azure_configuration_error(format!(
+            "Azure container authority is not canonical in '{}'",
+            diagnostic_uri
+        )));
+    }
+    validate_azure_container(container)?;
+
+    let raw_path = raw_path.strip_prefix('/').unwrap_or(raw_path);
+    let mut raw_segments = raw_path.split('/').collect::<Vec<_>>();
+    if raw_segments.last() == Some(&"") {
+        raw_segments.pop();
+    }
+    if raw_segments.iter().any(|segment| segment.is_empty()) {
+        return Err(azure_configuration_error(format!(
+            "Azure URI path contains an empty segment in '{}'",
+            diagnostic_uri
+        )));
+    }
+
+    let mut decoded_segments = Vec::with_capacity(raw_segments.len());
+    for raw_segment in raw_segments {
+        let segment = percent_decode_uri_segment(raw_segment, &diagnostic_uri)?;
+        validate_azure_path_segment(&segment, &diagnostic_uri)?;
+        decoded_segments.push(segment);
+    }
+
+    let mut canonical = Url::parse(&format!("az://{container}")).expect("validated Azure base");
+    if !decoded_segments.is_empty() {
+        let mut segments = canonical
+            .path_segments_mut()
+            .expect("az URLs are hierarchical");
+        segments.pop_if_empty();
+        for segment in &decoded_segments {
+            segments.push(segment);
+        }
+    }
+    let canonical_uri = canonical.as_str().trim_end_matches('/').to_string();
+    Ok(AzureLocation {
+        container: container.to_string(),
+        key: decoded_segments.join("/"),
+        canonical_uri,
+    })
+}
+
+fn validate_azure_container(container: &str) -> Result<()> {
+    let bytes = container.as_bytes();
+    let valid = (3..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        && !container.contains("--");
+    if valid {
+        Ok(())
+    } else {
+        Err(azure_configuration_error(format!(
+            "invalid Azure container '{}': expected 3-63 lowercase letters, digits, or single hyphens, starting and ending with a letter or digit",
+            container
+        )))
+    }
+}
+
+fn validate_azure_account_name(account: &str) -> Result<String> {
+    let account = account.trim();
+    let valid = (3..=24).contains(&account.len())
+        && account
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    if valid {
+        Ok(account.to_string())
+    } else {
+        Err(azure_configuration_error(format!(
+            "invalid AZURE_STORAGE_ACCOUNT_NAME '{}': expected 3-24 lowercase letters or digits",
+            account
+        )))
+    }
+}
+
+fn percent_decode_uri_segment(segment: &str, uri: &str) -> Result<String> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(azure_configuration_error(format!(
+                    "Azure URI contains an incomplete percent encoding in '{}'",
+                    uri
+                )));
+            }
+            let high = hex_value(bytes[index + 1]).ok_or_else(|| {
+                azure_configuration_error(format!(
+                    "Azure URI contains an invalid percent encoding in '{}'",
+                    uri
+                ))
+            })?;
+            let low = hex_value(bytes[index + 2]).ok_or_else(|| {
+                azure_configuration_error(format!(
+                    "Azure URI contains an invalid percent encoding in '{}'",
+                    uri
+                ))
+            })?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| {
+        azure_configuration_error(format!("Azure URI path is not valid UTF-8 in '{}'", uri))
+    })
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn validate_azure_path_segment(segment: &str, uri: &str) -> Result<()> {
+    if segment == "." || segment == ".." {
+        return Err(azure_configuration_error(format!(
+            "Azure URI path contains a dot segment in '{}'",
+            uri
+        )));
+    }
+    if segment.contains(['/', '\\']) {
+        return Err(azure_configuration_error(format!(
+            "Azure URI path contains an encoded separator in '{}'",
+            uri
+        )));
+    }
+    if segment.chars().any(char::is_control) {
+        return Err(azure_configuration_error(format!(
+            "Azure URI path contains a control character in '{}'",
+            uri
+        )));
+    }
+    Ok(())
+}
+
+fn validate_relative_object_path(path: &str) -> Result<&str> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+    {
+        return Err(azure_configuration_error(format!(
+            "invalid Azure container-relative object path '{}'",
+            path
+        )));
+    }
+    Ok(path)
+}
+
+fn parse_azure_service_url(value: &str, label: &str) -> Result<Url> {
+    let mut url = Url::parse(value)
+        .map_err(|_| azure_configuration_error(format!("invalid {label}: malformed URL")))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(azure_configuration_error(format!(
+            "invalid {label}: expected an HTTP(S) base URL without credentials, query, or fragment"
+        )));
+    }
+    let normalized_path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&normalized_path);
+    Ok(url)
+}
+
+fn azure_service_url_with_segment(base: &Url, segment: &str) -> Result<Url> {
+    let mut url = base.clone();
+    let mut segments = url.path_segments_mut().map_err(|_| {
+        azure_configuration_error("invalid Azure service endpoint: URL cannot be a base")
+    })?;
+    segments.pop_if_empty();
+    segments.push(segment);
+    drop(segments);
+    Ok(url)
+}
+
+fn capture_azure_environment() -> Result<(AzureEnvironmentSnapshot, BTreeMap<String, String>)> {
+    capture_azure_environment_values(env::vars_os().filter_map(|(raw_key, raw_value)| {
+        Some((raw_key.into_string().ok()?, raw_value.into_string().ok()?))
+    }))
+}
+
+fn capture_azure_environment_values(
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> Result<(AzureEnvironmentSnapshot, BTreeMap<String, String>)> {
+    let mut values = BTreeMap::new();
+    let mut unsupported_aliases = Vec::new();
+    for (key, value) in environment {
+        let direct = matches!(
+            key.as_str(),
+            "AZURITE_BLOB_STORAGE_URL"
+                | "IDENTITY_ENDPOINT"
+                | "IDENTITY_HEADER"
+                // Azure Container Apps may inject this deprecated alias
+                // alongside IDENTITY_ENDPOINT. Capture it so normalization
+                // can prove both clients received one identical endpoint.
+                | "MSI_ENDPOINT"
+                // Lance reads these outside AzureConfigKey. Capture them so
+                // later client construction can detect drift and mirror the
+                // effective HTTP allowance in the control adapter.
+                | "AZURE_STORAGE_ALLOW_HTTP"
+                | "AZURE_STORAGE_USE_HTTP"
+                | "AWS_ALLOW_HTTP"
+                | "OBJECT_STORE_CLIENT_MAX_RETRIES"
+                | "OBJECT_STORE_CLIENT_RETRY_TIMEOUT"
+        );
+        let recognized = AzureConfigKey::from_str(&key.to_ascii_lowercase()).is_ok();
+        if direct || (key.starts_with("AZURE_") && recognized) {
+            values.insert(key, value);
+        } else if recognized {
+            // Lance accepts generic aliases such as TOKEN and ENDPOINT while
+            // object_store::MicrosoftAzureBuilder::from_env deliberately does
+            // not. Refuse them instead of letting unrelated process variables
+            // become Azure credentials or silently split the two clients.
+            unsupported_aliases.push(key);
+        }
+    }
+    if values.contains_key("MSI_ENDPOINT") && !values.contains_key("IDENTITY_ENDPOINT") {
+        // object_store's Azure builder reads IDENTITY_ENDPOINT directly while
+        // Lance also recognizes MSI_ENDPOINT. Accept the legacy alias only as
+        // a matching platform duplicate, never as an independent selector.
+        unsupported_aliases.push("MSI_ENDPOINT".to_string());
+    }
+    if !unsupported_aliases.is_empty() {
+        unsupported_aliases.sort();
+        unsupported_aliases.dedup();
+        return Err(azure_configuration_error(format!(
+            "unsupported unprefixed Azure environment aliases detected: {}; use the documented AZURE_* names",
+            unsupported_aliases.join(", ")
+        )));
+    }
+
+    let normalized = normalize_azure_environment(&values)?;
+
+    Ok((AzureEnvironmentSnapshot { values }, normalized))
+}
+
+fn normalize_azure_environment(
+    values: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut normalized = BTreeMap::<String, (String, String)>::new();
+    for (source, value) in values {
+        let Ok(key) = AzureConfigKey::from_str(&source.to_ascii_lowercase()) else {
+            continue;
+        };
+        let canonical = key.as_ref().to_string();
+        if let Some((previous_source, previous_value)) = normalized.get(&canonical)
+            && previous_value != value
+        {
+            return Err(azure_configuration_error(format!(
+                "conflicting Azure storage environment aliases: {previous_source} and {source} differ"
+            )));
+        }
+        normalized.insert(canonical, (source.clone(), value.clone()));
+    }
+    let mut normalized = normalized
+        .into_iter()
+        .map(|(key, (_, value))| (key, value))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(allow_http) = lance_allow_http_override(values)? {
+        normalized.insert("allow_http".to_string(), allow_http.to_string());
+    }
+    Ok(normalized)
+}
+
+fn lance_allow_http_override(values: &BTreeMap<String, String>) -> Result<Option<bool>> {
+    let mut effective = None;
+    // This is Lance StorageOptions::new's load order. Later values win.
+    for key in [
+        "AZURE_STORAGE_ALLOW_HTTP",
+        "AZURE_STORAGE_USE_HTTP",
+        "AWS_ALLOW_HTTP",
+    ] {
+        if let Some(value) = values.get(key) {
+            effective = Some(parse_bool(key, value)?);
+        }
+    }
+    Ok(effective)
+}
+
+fn validate_azure_http_policy(
+    use_emulator: bool,
+    environment: &BTreeMap<String, String>,
+    options: &BTreeMap<String, String>,
+) -> Result<()> {
+    let process_override = lance_allow_http_override(environment)?;
+    if use_emulator {
+        if process_override == Some(false) {
+            return Err(azure_configuration_error(
+                "Azurite requires HTTP, but a process-wide Lance HTTP override disables it",
+            ));
+        }
+        return Ok(());
+    }
+
+    let configured_override = options
+        .get("allow_http")
+        .map(|value| parse_bool("allow_http", value))
+        .transpose()?;
+    if process_override == Some(true) || configured_override == Some(true) {
+        return Err(azure_configuration_error(
+            "production Azure storage forbids HTTP allowances; unset AZURE_STORAGE_ALLOW_HTTP, \
+             AZURE_STORAGE_USE_HTTP, and AWS_ALLOW_HTTP",
+        ));
+    }
+    Ok(())
+}
+
+fn option(options: &BTreeMap<String, String>, key: AzureConfigKey) -> Option<String> {
+    options.get(key.as_ref()).cloned()
+}
+
+fn required_option(
+    options: &BTreeMap<String, String>,
+    key: AzureConfigKey,
+    environment_name: &str,
+) -> Result<String> {
+    option(options, key)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            azure_configuration_error(format!("{environment_name} is required for Azure storage"))
+        })
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "y" => Ok(true),
+        "0" | "false" | "off" | "no" | "n" => Ok(false),
+        _ => Err(azure_configuration_error(format!(
+            "invalid boolean value for {key}"
+        ))),
+    }
+}
+
+fn nonempty_optional(value: Option<String>, label: &str) -> Result<Option<String>> {
+    match value {
+        Some(value) if value.trim().is_empty() => Err(azure_configuration_error(format!(
+            "{label} must not be empty"
+        ))),
+        value => Ok(value),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn required_remote_etag(action: &str, uri: &str, etag: Option<String>) -> Result<String> {
+    etag.filter(|etag| !etag.is_empty()).ok_or_else(|| {
+        StorageError::backend(
+            StorageFailureKind::Permanent,
+            format!(
+                "storage {action} failed for '{uri}': remote backend omitted the required ETag"
+            ),
         )
     })
 }
@@ -1874,6 +3381,223 @@ mod tests {
         );
         assert_eq!(failure.to_string(), failure.message);
     }
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutResult, UploadPart,
+    };
+    use std::ops::Range;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AzureRenameFault {
+        None,
+        MissingHeadEtag,
+        ChangeSourceBeforeSecondRange,
+        FailPart(usize),
+        FailComplete,
+        FailList,
+    }
+
+    #[derive(Debug, Default)]
+    struct AzureRenameProbe {
+        ranges: Mutex<Vec<(Range<u64>, Option<String>)>>,
+        multipart_creates: std::sync::atomic::AtomicUsize,
+        aborts: Arc<std::sync::atomic::AtomicUsize>,
+        completes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct AzureRenameFaultStore {
+        inner: Arc<InMemory>,
+        fault: AzureRenameFault,
+        probe: Arc<AzureRenameProbe>,
+    }
+
+    impl std::fmt::Display for AzureRenameFaultStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("azure-rename-fault-store")
+        }
+    }
+
+    #[derive(Debug)]
+    struct AzureRenameFaultUpload {
+        inner: Box<dyn MultipartUpload>,
+        fault: AzureRenameFault,
+        part_index: usize,
+        aborts: Arc<std::sync::atomic::AtomicUsize>,
+        completes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn injected_object_store_error(operation: &str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "azure-rename-fault-store",
+            source: Box::new(std::io::Error::other(format!(
+                "injected {operation} failure"
+            ))),
+        }
+    }
+
+    #[async_trait]
+    impl MultipartUpload for AzureRenameFaultUpload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            let index = self.part_index;
+            self.part_index += 1;
+            if self.fault == AzureRenameFault::FailPart(index) {
+                return Box::pin(async { Err(injected_object_store_error("multipart part")) });
+            }
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            self.completes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.fault == AzureRenameFault::FailComplete {
+                return Err(injected_object_store_error("multipart complete"));
+            }
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.aborts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.abort().await
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for AzureRenameFaultStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.probe
+                .multipart_creates
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let inner = self.inner.put_multipart_opts(location, options).await?;
+            Ok(Box::new(AzureRenameFaultUpload {
+                inner,
+                fault: self.fault,
+                part_index: 0,
+                aborts: Arc::clone(&self.probe.aborts),
+                completes: Arc::clone(&self.probe.completes),
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let is_head = options.head;
+            let bounded_range = match options.range.as_ref() {
+                Some(GetRange::Bounded(range)) => Some(range.clone()),
+                _ => None,
+            };
+            if let Some(range) = bounded_range {
+                let change_source = {
+                    let mut ranges = self.probe.ranges.lock().unwrap();
+                    ranges.push((range, options.if_match.clone()));
+                    self.fault == AzureRenameFault::ChangeSourceBeforeSecondRange
+                        && ranges.len() == 2
+                };
+                if change_source {
+                    let replacement =
+                        vec![b'z'; usize::try_from(AZURE_RENAME_PART_BYTES + 17).unwrap()];
+                    self.inner
+                        .put(location, PutPayload::from(replacement))
+                        .await?;
+                }
+            }
+            let mut result = self.inner.get_opts(location, options).await?;
+            if is_head && self.fault == AzureRenameFault::MissingHeadEtag {
+                result.meta.e_tag = None;
+            }
+            Ok(result)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            if self.fault == AzureRenameFault::FailList {
+                return Box::pin(futures::stream::once(async {
+                    Err(injected_object_store_error("list"))
+                }));
+            }
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn azure_rename_fault_adapter(
+        fault: AzureRenameFault,
+    ) -> (ObjectStorageAdapter, Arc<AzureRenameProbe>) {
+        let probe = Arc::new(AzureRenameProbe::default());
+        let store: Arc<DynObjectStore> = Arc::new(AzureRenameFaultStore {
+            inner: Arc::new(InMemory::new()),
+            fault,
+            probe: Arc::clone(&probe),
+        });
+        (
+            ObjectStorageAdapter {
+                store,
+                codec: UriCodec::Azure {
+                    container: "container".to_string(),
+                },
+                supports_conditional_update: true,
+                omit_read_etag: false,
+                omit_write_etag: false,
+            },
+            probe,
+        )
+    }
+
+    #[tokio::test]
+    async fn directory_shaped_exists_propagates_listing_failure() {
+        let (adapter, _) = azure_rename_fault_adapter(AzureRenameFault::FailList);
+        let error = adapter
+            .exists("az://container/graphs/knowledge.omni")
+            .await
+            .expect_err("a failed recursive probe must not become absence");
+        let StorageError::Backend(failure) = error else {
+            panic!("object-store listing failures must stay typed");
+        };
+        assert_eq!(failure.kind, StorageFailureKind::Unknown);
+        assert!(failure.message.contains("injected list failure"));
+    }
 
     /// The executable backend contract: every assertion here must hold for
     /// EVERY backend (the divergence class this adapter closed was "two
@@ -1937,6 +3661,13 @@ mod tests {
                 .unwrap()
         );
         assert!(adapter.exists(&format!("{root}/contract")).await.unwrap());
+
+        // A recursive prefix probe must remain path-component delimited. A
+        // sibling with a longer, byte-sharing name is not the requested
+        // dataset root.
+        let sibling_only = format!("{root}/graphical/__manifest/latest");
+        adapter.write_text(&sibling_only, "manifest").await.unwrap();
+        assert!(!adapter.exists(&format!("{root}/graph")).await.unwrap());
 
         // if_absent: exactly one claim wins; the loser leaves the winner's
         // object untouched.
@@ -2054,6 +3785,68 @@ mod tests {
         // strong-CAS path (ETag tokens + PutMode::Update) without a bucket.
         let adapter = ObjectStorageAdapter::in_memory();
         contract_suite(&adapter, "mem-root").await;
+    }
+
+    #[tokio::test]
+    async fn contract_suite_azure_when_configured() {
+        let Ok(container) = env::var("OMNIGRAPH_AZURE_TEST_CONTAINER") else {
+            eprintln!("skipping Azure storage contract: OMNIGRAPH_AZURE_TEST_CONTAINER is not set");
+            return;
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root_uri = format!(
+            "az://{container}/omnigraph-storage-contract-{}-{nonce}",
+            std::process::id()
+        );
+        let root = CanonicalAzureRoot::from_env(&root_uri).unwrap();
+        let adapter = Arc::new(ObjectStorageAdapter::azure_from_root(&root).unwrap());
+        contract_suite(adapter.as_ref(), root.canonical_uri()).await;
+
+        // The provider-level race is part of Azure's contract: exactly one
+        // If-None-Match claimant wins and the losing payload is never visible.
+        let claim = format!("{}/concurrent-claim.json", root.canonical_uri());
+        let first = {
+            let adapter = Arc::clone(&adapter);
+            let claim = claim.clone();
+            tokio::spawn(async move { adapter.write_text_if_absent(&claim, "first").await })
+        };
+        let second = {
+            let adapter = Arc::clone(&adapter);
+            let claim = claim.clone();
+            tokio::spawn(async move { adapter.write_text_if_absent(&claim, "second").await })
+        };
+        let outcomes = [
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
+        ];
+        assert_eq!(outcomes.into_iter().filter(|won| *won).count(), 1);
+        assert!(matches!(
+            adapter.read_text(&claim).await.unwrap().as_str(),
+            "first" | "second"
+        ));
+
+        // Cross the multipart threshold against the actual Azure adapter,
+        // not only the in-memory fault seam used by the focused unit tests.
+        let large_source = format!("{}/large-rename-source.json", root.canonical_uri());
+        let large_destination = format!("{}/large-rename-destination.json", root.canonical_uri());
+        let large_payload = "x".repeat(usize::try_from(AZURE_RENAME_PART_BYTES + 17).unwrap());
+        adapter
+            .write_text(&large_source, &large_payload)
+            .await
+            .unwrap();
+        adapter
+            .rename_text(&large_source, &large_destination)
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter.read_text(&large_destination).await.unwrap(),
+            large_payload
+        );
+        assert!(!adapter.exists(&large_source).await.unwrap());
+        adapter.delete_prefix(root.canonical_uri()).await.unwrap();
     }
 
     #[tokio::test]
@@ -2304,6 +4097,8 @@ mod tests {
                 bucket: "bounded-list-bucket".to_string(),
             },
             supports_conditional_update: true,
+            omit_read_etag: false,
+            omit_write_etag: false,
         };
         assert_bounded_list_prefix_and_uri_contract(
             &s3_adapter,
@@ -2449,21 +4244,205 @@ mod tests {
         assert_eq!(adapter.read_text(&dst).await.unwrap(), "x");
     }
 
-    #[test]
-    fn storage_backend_selection_is_scheme_aware() {
-        assert_eq!(storage_kind_for_uri("/tmp/graph"), StorageKind::Local);
+    #[tokio::test]
+    async fn azure_rename_uses_bounded_etag_pinned_ranges_and_handles_empty() {
+        let (adapter, probe) = azure_rename_fault_adapter(AzureRenameFault::None);
+        let source = "az://container/source.json";
+        let destination = "az://container/destination.json";
+        let payload = "x".repeat(usize::try_from(AZURE_RENAME_PART_BYTES + 17).unwrap());
+        adapter.write_text(source, &payload).await.unwrap();
+
+        adapter.rename_text(source, destination).await.unwrap();
+
+        assert_eq!(adapter.read_text(destination).await.unwrap(), payload);
+        assert!(!adapter.exists(source).await.unwrap());
+        let ranges = probe.ranges.lock().unwrap().clone();
         assert_eq!(
-            storage_kind_for_uri("file:///tmp/graph"),
-            StorageKind::Local
+            ranges
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                0..AZURE_RENAME_PART_BYTES,
+                AZURE_RENAME_PART_BYTES..AZURE_RENAME_PART_BYTES + 17,
+            ]
+        );
+        assert!(ranges.iter().all(|(range, etag)| range.end - range.start
+            <= AZURE_RENAME_PART_BYTES
+            && etag.as_deref().is_some_and(|etag| !etag.is_empty())));
+        assert!(ranges.windows(2).all(|pair| pair[0].1 == pair[1].1));
+        assert_eq!(
+            probe
+                .multipart_creates
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
         assert_eq!(
-            storage_kind_for_uri("s3://omnigraph-preview/graph"),
-            StorageKind::S3
+            probe.completes.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(probe.aborts.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let empty_source = "az://container/empty-source.json";
+        let empty_destination = "az://container/empty-destination.json";
+        adapter.write_text(empty_source, "").await.unwrap();
+        adapter
+            .rename_text(empty_source, empty_destination)
+            .await
+            .unwrap();
+        assert_eq!(adapter.read_text(empty_destination).await.unwrap(), "");
+        assert!(!adapter.exists(empty_source).await.unwrap());
+        assert_eq!(
+            probe
+                .multipart_creates
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "zero-byte rename must use one atomic empty PUT, not multipart"
         );
     }
 
+    #[tokio::test]
+    async fn azure_rename_requires_head_etag_before_writing() {
+        let (adapter, probe) = azure_rename_fault_adapter(AzureRenameFault::MissingHeadEtag);
+        let source = "az://container/source.json";
+        let destination = "az://container/destination.json";
+        adapter.write_text(source, "payload").await.unwrap();
+
+        let error = adapter.rename_text(source, destination).await.unwrap_err();
+
+        assert!(error.to_string().contains("omitted the required ETag"));
+        assert!(adapter.exists(source).await.unwrap());
+        assert!(!adapter.exists(destination).await.unwrap());
+        assert!(probe.ranges.lock().unwrap().is_empty());
+        assert_eq!(
+            probe
+                .multipart_creates
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn azure_rename_aborts_when_source_changes_between_ranges() {
+        let (adapter, probe) =
+            azure_rename_fault_adapter(AzureRenameFault::ChangeSourceBeforeSecondRange);
+        let source = "az://container/source.json";
+        let destination = "az://container/destination.json";
+        let payload = "x".repeat(usize::try_from(AZURE_RENAME_PART_BYTES + 17).unwrap());
+        adapter.write_text(source, &payload).await.unwrap();
+
+        let error = adapter.rename_text(source, destination).await.unwrap_err();
+
+        assert!(error.to_string().contains("rename_read"));
+        assert_eq!(
+            adapter.read_text(source).await.unwrap().as_bytes()[0],
+            b'z',
+            "the concurrent source replacement must survive the failed rename"
+        );
+        assert!(!adapter.exists(destination).await.unwrap());
+        assert_eq!(probe.ranges.lock().unwrap().len(), 2);
+        assert_eq!(probe.aborts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            probe.completes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn azure_rename_aborts_part_and_complete_failures_before_delete() {
+        for fault in [
+            AzureRenameFault::FailPart(1),
+            AzureRenameFault::FailComplete,
+        ] {
+            let (adapter, probe) = azure_rename_fault_adapter(fault);
+            let source = "az://container/source.json";
+            let destination = "az://container/destination.json";
+            let payload = "x".repeat(usize::try_from(AZURE_RENAME_PART_BYTES + 17).unwrap());
+            adapter.write_text(source, &payload).await.unwrap();
+
+            let error = adapter.rename_text(source, destination).await.unwrap_err();
+
+            assert!(error.to_string().contains("rename_write"));
+            assert!(adapter.exists(source).await.unwrap());
+            assert!(
+                !adapter.exists(destination).await.unwrap(),
+                "the injected {fault:?} failure happens before the fake upload publishes"
+            );
+            assert_eq!(probe.aborts.load(std::sync::atomic::Ordering::Relaxed), 1);
+            assert_eq!(
+                probe.completes.load(std::sync::atomic::Ordering::Relaxed),
+                usize::from(fault == AzureRenameFault::FailComplete)
+            );
+        }
+    }
+
     #[test]
-    fn normalize_root_uri_preserves_local_and_s3_shapes() {
+    fn storage_backend_selection_is_scheme_aware() {
+        assert_eq!(
+            storage_kind_for_uri("/tmp/graph").unwrap(),
+            StorageKind::Local
+        );
+        assert_eq!(
+            storage_kind_for_uri("file:///tmp/graph").unwrap(),
+            StorageKind::Local
+        );
+        assert_eq!(
+            storage_kind_for_uri(r"C:\omnigraph\graph").unwrap(),
+            StorageKind::Local
+        );
+        assert_eq!(
+            storage_kind_for_uri("s3://omnigraph-preview/graph").unwrap(),
+            StorageKind::S3
+        );
+        assert_eq!(
+            storage_kind_for_uri("az://omnigraph/graph").unwrap(),
+            StorageKind::Azure
+        );
+        let error = storage_kind_for_uri("https://example.com/graph")
+            .expect_err("unknown schemes must never fall through to local storage");
+        assert!(error.to_string().contains("unsupported storage URI scheme"));
+    }
+
+    #[test]
+    fn storage_uri_diagnostics_redact_credentials() {
+        let query_secret = "TOPSECRET-QUERY";
+        let query_error = normalize_root_uri(&format!(
+            "az://container/path?sv=2026-01-01&sig={query_secret}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(!query_error.contains(query_secret));
+        assert!(query_error.contains("az://container/path"));
+        assert!(query_error.contains("query redacted"));
+
+        let password_secret = "TOPSECRET-PASSWORD";
+        let userinfo_error =
+            normalize_root_uri(&format!("az://operator:{password_secret}@container/path"))
+                .unwrap_err()
+                .to_string();
+        assert!(!userinfo_error.contains(password_secret));
+        assert!(userinfo_error.contains("az://container/path"));
+        assert!(userinfo_error.contains("userinfo redacted"));
+
+        let https_secret = "TOPSECRET-HTTPS-SAS";
+        let unsupported_error = storage_kind_for_uri(&format!(
+            "https://account.blob.core.windows.net/container?sig={https_secret}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(!unsupported_error.contains(https_secret));
+        assert!(unsupported_error.contains("https://account.blob.core.windows.net/container"));
+
+        let malformed_secret = "TOPSECRET-MALFORMED-SAS";
+        let malformed_error = normalize_root_uri(&format!("az://[invalid?sig={malformed_secret}"))
+            .unwrap_err()
+            .to_string();
+        assert!(!malformed_error.contains(malformed_secret));
+        assert!(malformed_error.contains("az://<invalid or redacted>"));
+    }
+
+    #[test]
+    fn normalize_root_uri_preserves_local_s3_and_azure_shapes() {
         assert_eq!(
             normalize_root_uri("/tmp/omnigraph/").unwrap(),
             "/tmp/omnigraph"
@@ -2476,6 +4455,11 @@ mod tests {
             normalize_root_uri("s3://bucket/prefix/").unwrap(),
             "s3://bucket/prefix"
         );
+        assert_eq!(
+            normalize_root_uri("az://container/prefix%20with%20space/").unwrap(),
+            "az://container/prefix%20with%20space"
+        );
+        assert!(normalize_root_uri("custom://root/path").is_err());
     }
 
     #[test]
@@ -2490,7 +4474,7 @@ mod tests {
     }
 
     #[test]
-    fn join_uri_handles_local_file_and_s3_roots() {
+    fn join_uri_handles_local_file_s3_and_azure_roots() {
         assert_eq!(
             join_uri("/tmp/omnigraph", "_schema.pg"),
             "/tmp/omnigraph/_schema.pg"
@@ -2503,6 +4487,15 @@ mod tests {
             join_uri("s3://bucket/prefix", "_schema.pg"),
             "s3://bucket/prefix/_schema.pg"
         );
+        assert_eq!(
+            join_uri("az://container/prefix", "_schema.pg"),
+            "az://container/prefix/_schema.pg"
+        );
+        assert_eq!(
+            join_uri("custom://opaque/root", "_schema.pg"),
+            "custom://opaque/root/_schema.pg",
+            "an unsupported scheme may remain opaque during joining but must never become a local path"
+        );
     }
 
     #[test]
@@ -2510,6 +4503,508 @@ mod tests {
         let location = parse_s3_uri("s3://bucket/graph/_schema.pg").unwrap();
         assert_eq!(location.bucket, "bucket");
         assert_eq!(location.key, "graph/_schema.pg");
+    }
+
+    #[test]
+    fn canonical_azure_root_owns_identity_options_and_admission_location() {
+        let config = AzureStorageConfig::new("companybrainprod")
+            .with_endpoint("https://companybrainprod.blob.core.windows.net/")
+            .with_client_id("00000000-0000-0000-0000-000000000001")
+            .with_identity_endpoint("http://127.0.0.1:42342/msi/token");
+        let root =
+            CanonicalAzureRoot::from_config("az://omnigraph/clusters/company%20brain/", config)
+                .unwrap();
+        assert_eq!(
+            root.canonical_uri(),
+            "az://omnigraph/clusters/company%20brain"
+        );
+        assert_eq!(root.account_name(), "companybrainprod");
+        assert_eq!(root.container(), "omnigraph");
+        assert_eq!(root.prefix(), "clusters/company brain");
+        assert!(!root.use_emulator());
+        assert_eq!(
+            root.client_id(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(
+            root.identity_endpoint(),
+            Some("http://127.0.0.1:42342/msi/token")
+        );
+        assert_eq!(root.root_digest_hex().len(), 64);
+        assert_eq!(
+            root.admission_blob_uri(),
+            format!(
+                "az://omnigraph/{AZURE_ADMISSION_PREFIX}/{}/writer.lock",
+                root.root_digest_hex()
+            )
+        );
+        assert_eq!(
+            root.admission_blob_url().unwrap().as_str(),
+            format!(
+                "https://companybrainprod.blob.core.windows.net/omnigraph/{AZURE_ADMISSION_PREFIX}/{}/writer.lock",
+                root.root_digest_hex()
+            )
+        );
+        let options = root.lance_storage_options().unwrap();
+        assert_eq!(
+            options
+                .get("azure_storage_account_name")
+                .map(String::as_str),
+            Some("companybrainprod")
+        );
+        assert_eq!(
+            options.get("azure_storage_endpoint").map(String::as_str),
+            Some("https://companybrainprod.blob.core.windows.net/")
+        );
+        assert_eq!(
+            options.get("azure_storage_client_id").map(String::as_str),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(
+            options.get("azure_msi_endpoint").map(String::as_str),
+            Some("http://127.0.0.1:42342/msi/token")
+        );
+
+        let same = CanonicalAzureRoot::from_config(
+            "az://omnigraph/clusters/company%20brain",
+            AzureStorageConfig::new("companybrainprod")
+                .with_endpoint("https://companybrainprod.blob.core.windows.net"),
+        )
+        .unwrap();
+        assert_eq!(same.root_digest_hex(), root.root_digest_hex());
+        let other = CanonicalAzureRoot::from_config(
+            "az://omnigraph/clusters/other",
+            AzureStorageConfig::new("companybrainprod"),
+        )
+        .unwrap();
+        assert_ne!(other.root_digest_hex(), root.root_digest_hex());
+    }
+
+    #[test]
+    fn canonical_azure_root_builds_exact_azurite_url() {
+        let root = CanonicalAzureRoot::from_config(
+            "az://omnigraph/clusters/test",
+            AzureStorageConfig::new("devstoreaccount1").with_emulator("http://127.0.0.1:10000/"),
+        )
+        .unwrap();
+        assert_eq!(
+            root.admission_blob_url().unwrap().as_str(),
+            format!(
+                "http://127.0.0.1:10000/devstoreaccount1/omnigraph/{AZURE_ADMISSION_PREFIX}/{}/writer.lock",
+                root.root_digest_hex()
+            )
+        );
+        let options = root.lance_storage_options().unwrap();
+        assert_eq!(
+            options
+                .get("azure_storage_use_emulator")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            options.get("azure_storage_endpoint").map(String::as_str),
+            Some("http://127.0.0.1:10000/devstoreaccount1")
+        );
+        assert_eq!(options.get("allow_http").map(String::as_str), Some("true"));
+        assert_eq!(
+            options.get("azure_storage_account_key").map(String::as_str),
+            Some(DEFAULT_AZURITE_ACCOUNT_KEY)
+        );
+        ObjectStorageAdapter::azure_from_root(&root).unwrap();
+    }
+
+    #[test]
+    fn canonical_azure_root_rejects_production_http_without_leaking_secrets() {
+        let token = "TOPSECRET-BEARER-TOKEN";
+        let endpoint_path_secret = "TOPSECRET-ENDPOINT-PATH";
+        let error = CanonicalAzureRoot::from_config(
+            "az://omnigraph/clusters/production",
+            AzureStorageConfig::new("companybrainprod")
+                .with_endpoint(format!("http://127.0.0.1/{endpoint_path_secret}"))
+                .with_bearer_token(token),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("HTTPS is required outside Azurite mode"));
+        assert!(!error.contains(token));
+        assert!(!error.contains(endpoint_path_secret));
+
+        let endpoint_query_secret = "TOPSECRET-ENDPOINT-QUERY";
+        let query_error = CanonicalAzureRoot::from_config(
+            "az://omnigraph/clusters/production",
+            AzureStorageConfig::new("companybrainprod")
+                .with_endpoint(format!("http://127.0.0.1/?sig={endpoint_query_secret}"))
+                .with_bearer_token(token),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!query_error.contains(token));
+        assert!(!query_error.contains(endpoint_query_secret));
+    }
+
+    #[test]
+    fn canonical_azure_root_seals_default_endpoint_and_fabric_selection() {
+        let mut config = AzureStorageConfig::new("companybrainprod");
+        config.azure_options.insert(
+            AzureConfigKey::Endpoint.as_ref().to_string(),
+            "https://ambient.invalid".to_string(),
+        );
+        config.azure_options.insert(
+            AzureConfigKey::UseFabricEndpoint.as_ref().to_string(),
+            "true".to_string(),
+        );
+
+        let root =
+            CanonicalAzureRoot::from_config("az://omnigraph/graphs/knowledge", config).unwrap();
+        let options = root.lance_storage_options().unwrap();
+        assert_eq!(
+            options
+                .get(AzureConfigKey::Endpoint.as_ref())
+                .map(String::as_str),
+            Some("https://companybrainprod.blob.core.windows.net/")
+        );
+        assert_eq!(
+            options
+                .get(AzureConfigKey::UseFabricEndpoint.as_ref())
+                .map(String::as_str),
+            Some("false")
+        );
+        ObjectStorageAdapter::azure_from_root(&root).unwrap();
+    }
+
+    #[test]
+    fn azure_environment_aliases_are_normalized_or_rejected() {
+        let mut values = BTreeMap::from([
+            (
+                "AZURE_STORAGE_ENDPOINT".to_string(),
+                "https://one.example".to_string(),
+            ),
+            (
+                "AZURE_ENDPOINT".to_string(),
+                "https://one.example".to_string(),
+            ),
+        ]);
+        let normalized = normalize_azure_environment(&values).unwrap();
+        assert_eq!(
+            normalized
+                .get(AzureConfigKey::Endpoint.as_ref())
+                .map(String::as_str),
+            Some("https://one.example")
+        );
+
+        values.insert(
+            "AZURE_ENDPOINT".to_string(),
+            "https://secret-value-that-must-not-render.example".to_string(),
+        );
+        let message = normalize_azure_environment(&values)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("AZURE_STORAGE_ENDPOINT"));
+        assert!(message.contains("AZURE_ENDPOINT"));
+        assert!(!message.contains("secret-value-that-must-not-render"));
+
+        let managed_identity_endpoint = "http://127.0.0.1:42342/msi/token";
+        let (snapshot, normalized) = capture_azure_environment_values([
+            (
+                "AZURE_STORAGE_ACCOUNT_NAME".to_string(),
+                "companybrainprod".to_string(),
+            ),
+            (
+                "IDENTITY_ENDPOINT".to_string(),
+                managed_identity_endpoint.to_string(),
+            ),
+            (
+                "MSI_ENDPOINT".to_string(),
+                managed_identity_endpoint.to_string(),
+            ),
+            (
+                "IDENTITY_HEADER".to_string(),
+                "identity-header-secret".to_string(),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            normalized
+                .get(AzureConfigKey::MsiEndpoint.as_ref())
+                .map(String::as_str),
+            Some(managed_identity_endpoint)
+        );
+        assert!(snapshot.values.contains_key("IDENTITY_ENDPOINT"));
+        assert!(snapshot.values.contains_key("MSI_ENDPOINT"));
+
+        let conflicting_identity_endpoint = "http://127.0.0.1:42343/msi/token";
+        let message = capture_azure_environment_values([
+            (
+                "IDENTITY_ENDPOINT".to_string(),
+                managed_identity_endpoint.to_string(),
+            ),
+            (
+                "MSI_ENDPOINT".to_string(),
+                conflicting_identity_endpoint.to_string(),
+            ),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("IDENTITY_ENDPOINT"));
+        assert!(message.contains("MSI_ENDPOINT"));
+        assert!(!message.contains(managed_identity_endpoint));
+        assert!(!message.contains(conflicting_identity_endpoint));
+
+        let legacy_only_endpoint = "http://legacy-only.invalid/msi/token";
+        let message = capture_azure_environment_values([(
+            "MSI_ENDPOINT".to_string(),
+            legacy_only_endpoint.to_string(),
+        )])
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("MSI_ENDPOINT"));
+        assert!(!message.contains(legacy_only_endpoint));
+    }
+
+    #[test]
+    fn production_azure_rejects_every_process_wide_http_allowance() {
+        for key in [
+            "AZURE_STORAGE_ALLOW_HTTP",
+            "AZURE_STORAGE_USE_HTTP",
+            "AWS_ALLOW_HTTP",
+        ] {
+            let environment = BTreeMap::from([(key.to_string(), "true".to_string())]);
+            let (_, options) = capture_azure_environment_values(environment.clone()).unwrap();
+            let error = validate_azure_http_policy(false, &environment, &options)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("production Azure storage forbids HTTP allowances"));
+            assert!(error.contains(key));
+        }
+
+        let mut options = BTreeMap::new();
+        options.insert("allow_http".to_string(), "true".to_string());
+        assert!(validate_azure_http_policy(false, &BTreeMap::new(), &options).is_err());
+        assert!(validate_azure_http_policy(true, &BTreeMap::new(), &options).is_ok());
+
+        let mut config = AzureStorageConfig::new("companybrainprod");
+        config
+            .azure_options
+            .insert("allow_http".to_string(), "true".to_string());
+        assert!(
+            CanonicalAzureRoot::from_config("az://omnigraph/clusters/production", config)
+                .unwrap_err()
+                .to_string()
+                .contains("production Azure storage forbids HTTP allowances")
+        );
+    }
+
+    #[test]
+    fn azure_environment_rejects_lance_only_unprefixed_aliases() {
+        let message = capture_azure_environment_values([
+            (
+                "AZURE_STORAGE_ACCOUNT_NAME".to_string(),
+                "companybrainprod".to_string(),
+            ),
+            ("TOKEN".to_string(), "unrelated-ci-secret".to_string()),
+            (
+                "ENDPOINT".to_string(),
+                "https://unrelated.example".to_string(),
+            ),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("TOKEN"));
+        assert!(message.contains("ENDPOINT"));
+        assert!(!message.contains("unrelated-ci-secret"));
+        assert!(!message.contains("unrelated.example"));
+    }
+
+    #[test]
+    fn azure_environment_snapshot_detects_drift_without_leaking_values() {
+        let (current, _) = capture_azure_environment().unwrap();
+        let mut captured = current;
+        let changed_key = "AZURE_FABRIC_SESSION_TOKEN";
+        let changed_value = format!(
+            "{}-secret-drift-value",
+            captured
+                .values
+                .get(changed_key)
+                .map(String::as_str)
+                .unwrap_or("captured")
+        );
+        captured
+            .values
+            .insert(changed_key.to_string(), changed_value.clone());
+
+        let message = captured.verify_unchanged().unwrap_err().to_string();
+        assert!(message.contains(changed_key));
+        assert!(!message.contains(&changed_value));
+    }
+
+    #[test]
+    fn azure_config_root_and_credentials_redact_every_secret() {
+        let secrets = [
+            "shared-key-secret-value",
+            "bearer-token-secret-value",
+            "client-secret-value",
+            "sas-secret-value",
+            "fabric-session-secret-value",
+            "identity-header-secret-value",
+        ];
+        let mut config = AzureStorageConfig::new("companybrainprod")
+            .with_account_key(secrets[0])
+            .with_bearer_token(secrets[1])
+            .with_identity_header(secrets[5]);
+        config.azure_options.insert(
+            AzureConfigKey::ClientSecret.as_ref().to_string(),
+            secrets[2].to_string(),
+        );
+        config.azure_options.insert(
+            AzureConfigKey::SasKey.as_ref().to_string(),
+            secrets[3].to_string(),
+        );
+        config.azure_options.insert(
+            AzureConfigKey::FabricSessionToken.as_ref().to_string(),
+            secrets[4].to_string(),
+        );
+
+        let config_debug = format!("{config:?}");
+        let unvalidated_config_debug = format!(
+            "{:?}",
+            AzureStorageConfig::new("companybrainprod")
+                .with_endpoint("https://example.invalid/?sig=config-debug-secret")
+                .with_identity_endpoint("http://127.0.0.1/msi/token?secret=identity-debug-secret",)
+        );
+        let root =
+            CanonicalAzureRoot::from_config("az://omnigraph/graphs/knowledge", config).unwrap();
+        let root_debug = format!("{root:?}");
+        let credential_debug = format!("{:?}", root.admission_credential().unwrap());
+        for secret in secrets {
+            assert!(!config_debug.contains(secret));
+            assert!(!root_debug.contains(secret));
+            assert!(!credential_debug.contains(secret));
+        }
+        assert!(!unvalidated_config_debug.contains("config-debug-secret"));
+        assert!(!unvalidated_config_debug.contains("identity-debug-secret"));
+
+        // The hidden handoff must carry the exact captured credential set to
+        // Lance; callers pass this directly into its redacted accessor.
+        let lance_options = root.lance_storage_options().unwrap();
+        assert_eq!(
+            lance_options
+                .get(AzureConfigKey::AccessKey.as_ref())
+                .map(String::as_str),
+            Some(secrets[0])
+        );
+        assert_eq!(
+            lance_options
+                .get(AzureConfigKey::Token.as_ref())
+                .map(String::as_str),
+            Some(secrets[1])
+        );
+
+        let malformed = CanonicalAzureRoot::from_config(
+            "az://omnigraph/graphs/knowledge",
+            AzureStorageConfig::new("companybrainprod")
+                .with_endpoint("https://example.invalid/?sig=endpoint-secret-value"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!malformed.contains("endpoint-secret-value"));
+    }
+
+    #[test]
+    fn azure_uri_parser_rejects_aliases_and_unsafe_paths() {
+        for uri in [
+            "az://",
+            "az://ab/path",
+            "az://Uppercase/path",
+            "az://container@account/path",
+            "az://container:443/path",
+            "az://container/path?sig=secret",
+            "az://container/path#fragment",
+            "az://container/a//b",
+            "az://container/a/./b",
+            "az://container/a/../b",
+            "az://container/%2e",
+            "az://container/%2E%2E",
+            "az://container/a%2Fb",
+            "az://container/a%5Cb",
+            "az://container/a\\b",
+            "az://container/%00",
+        ] {
+            assert!(
+                parse_azure_uri(uri).is_err(),
+                "unsafe or aliased Azure URI unexpectedly accepted: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_codec_refuses_cross_container_and_empty_object_access() {
+        let adapter = ObjectStorageAdapter {
+            store: Arc::new(InMemory::new()),
+            codec: UriCodec::Azure {
+                container: "container-one".to_string(),
+            },
+            supports_conditional_update: true,
+            omit_read_etag: false,
+            omit_write_etag: false,
+        };
+        assert!(
+            adapter
+                .object_path("az://container-two/path.json")
+                .unwrap_err()
+                .to_string()
+                .contains("container mismatch")
+        );
+        assert!(adapter.object_path("az://container-one").is_err());
+        assert_eq!(
+            adapter
+                .object_path("az://container-one/a%20b.json")
+                .unwrap()
+                .as_ref(),
+            "a b.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_conditional_updates_require_backend_etags() {
+        for action in ["read", "write_if_match"] {
+            let error = required_remote_etag(action, "az://container/state.json", None)
+                .expect_err("a remote content hash must never replace a missing ETag");
+            assert!(error.to_string().contains("omitted the required ETag"));
+        }
+        assert_eq!(
+            required_remote_etag(
+                "read",
+                "az://container/state.json",
+                Some("etag-1".to_string())
+            )
+            .unwrap(),
+            "etag-1"
+        );
+
+        let uri = "remote-etag/state.json";
+        let mut missing_read = ObjectStorageAdapter::in_memory();
+        missing_read.write_text(uri, "v1").await.unwrap();
+        missing_read.omit_read_etag = true;
+        let error = missing_read
+            .read_text_versioned(uri)
+            .await
+            .expect_err("a remote versioned read without an ETag must fail closed");
+        assert!(error.to_string().contains("omitted the required ETag"));
+
+        let mut missing_write = ObjectStorageAdapter::in_memory();
+        missing_write.write_text(uri, "v1").await.unwrap();
+        let (_, version) = missing_write.read_text_versioned(uri).await.unwrap();
+        missing_write.omit_write_etag = true;
+        let error = missing_write
+            .write_text_if_match(uri, "v2", &version)
+            .await
+            .expect_err("a successful remote CAS without its new ETag must fail closed");
+        assert!(error.to_string().contains("omitted the required ETag"));
+        assert_eq!(
+            missing_write.read_text(uri).await.unwrap(),
+            "v2",
+            "the error is post-effect ambiguity, never a claim that the write was absent"
+        );
     }
 
     /// Where hard links work the probe is negative and cleans up after

@@ -55,6 +55,16 @@ pub(crate) fn control_session() -> Arc<Session> {
     Arc::clone(&CONTROL_SESSION)
 }
 
+/// DST seam (Lance-realm fault injection): the process-wide
+/// Lance object-store registry, exposed so the DST harness can interpose a
+/// fault-injecting provider over the `shared-memory` scheme. Hidden: a test
+/// seam like `dst_ids`/`dst_clock`, not public API; production never calls it.
+#[doc(hidden)]
+#[cfg_attr(not(feature = "dst"), allow(dead_code))]
+pub fn store_registry() -> Arc<ObjectStoreRegistry> {
+    Arc::clone(&STORE_REGISTRY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,104 +1,161 @@
-# CI / Release Workflows
+# CI and releases
 
-`.github/workflows/`:
+Workflow YAML under `.github/workflows/` is the source of truth. This page explains the boundaries; it does not duplicate every job or pinned version.
 
-- **ci.yml**: classifies documentation-only changes, checks AGENTS/doc links, runs the required four-surface graph-vocabulary guard, compiles default features on code changes, runs the canonical `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints` gate (one feature-superset build — omitting the features skips every failpoint test and builds a different fingerprint) on its configured post-merge/tag/manual events, tests the AWS server feature, checks the container entrypoint, and runs bucket-gated RustFS correctness suites. There is no RFC-026/MemWAL job or abandoned v7-v19 binary build.
-  - Pull requests may use reporting-only checks while the full workspace gate
-    runs post-merge, on tags, or by manual dispatch. Run the canonical workspace
-    test locally before merging non-trivial code. A red post-merge main is
-    stop-the-line.
-  - Required branch-protection contexts must always report on pull requests;
-    never require a job that the workflow can skip.
-  - **Graph Vocabulary Guard** always reports, including for documentation-only
-    pull requests. It checks out full history, uses the exact pull-request base
-    SHA (the push `before` SHA for ordinary branch pushes, or the checked-out
-    commit's first parent for tag/manual runs), tests
-    `omnigraph-vocabulary-guard`, and proves an exact inventory bijection for
-    four surfaces in both trees: route-reachable OpenAPI, user-visible Rust
-    strings, rendered events in `docs/user/**/*.md`, and externally reachable
-    public Rust signatures. A missing or stale base asset fails closed. The
-    inventory lives at
-    `tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv`. G4 is
-    derived with exactly `cargo-public-api` 0.52.0 on
-    `nightly-2026-08-01`. Every one of the seven public library crates is
-    scanned with default features; crates that declare any non-default feature
-    are additionally scanned with all features and the two surfaces are
-    unioned. A crate with no non-default feature skips that provably identical
-    second pass. Workspace checks remain on the repository's stable pin.
-    `cargo-public-api` does not emit a unique declaration/re-export source span,
-    so each G4 row uses the owning package manifest as its stable source and the
-    complete normalized exported signature as its review boundary. The guard
-    does not invent a potentially wrong source location for aliases or
-    macro-generated items.
-    G4 always extracts both trees: Cargo `include!`, build scripts, generated
-    sources, configuration, and other transitive inputs make a path-based skip
-    predicate unsound. Current and base keep isolated build targets; the job's
-    pinned-tool and build-target caches reduce warm cost without allowing one
-    tree's path-crate artifacts to satisfy the other. Its 75-minute timeout
-    keeps a genuinely cold run finite and fails visibly instead of silently
-    accepting a stale public surface.
-    The guard rejects an unreviewed workspace library crate rather than
-    silently omitting it. It never regenerates OpenAPI; the server's existing
-    drift test remains the owner of generated-spec equality.
-    Its legacy monotonicity check first reserves exact observations that keep
-    the same non-legacy classification, then compares only the remaining rows
-    at the fingerprint-independent boundary. This prevents an unchanged
-    neighbour from inheriting a removed legacy row's transition marker while
-    preserving fail-closed review for actual text/fingerprint rewrites.
-    The v0.10 contract cutover closes compatibility aliases completely: exact
-    base removals are allowed, new/moved/reintroduced aliases fail the
-    comparison, and any surviving current-tree alias fails the job.
-  - CI does not regenerate `openapi.json`; intentional API changes regenerate
-    and commit it locally.
-  - The post-merge/tag/manual **V5 ↔ V6 Format Fence** builds the immutable
-    final-v5 CLI at `46b6d9084fb629b88d4ac9e8c546e0a30d213d19`, exposes it as
-    `OMNIGRAPH_V5_BIN`, and runs only
-    `current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6`. The job
-    fails if that exact test skips or if a broad filter matches another cell.
+## Pull-request gates
 
-Run the vocabulary boundary locally against the same base tip a pull request
-will use:
+`ci.yml` always classifies the diff. Only recognized documentation files may take the documentation-only path; a text fixture under a crate is source code.
+
+Branch protection currently requires these reporting contexts:
+
+- `Classify Changes`
+- `Check AGENTS.md Links`
+- `Check Workflow Action Pins`
+- `Graph Vocabulary Guard`
+- `Test omnigraph-server --features aws`
+- `Format (rustfmt)`
+- `Lint (clippy)`
+
+The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
+validates local documentation links, user/developer audience boundaries, RFC
+location and metadata, and registry agreement.
+
+`Graph Vocabulary Guard` remains a required reporting context, but its
+substrate-sized audit steps are currently disabled everywhere (decision of
+2026-08-28; the job-level `VOCABULARY_AUDIT_ENABLED` variable in `ci.yml` is
+the single switch). The job still
+runs its unit tests and reports success so the exact-SHA release gates stay
+wired. When re-enabled it checks OpenAPI, Rust presentation strings, and public
+Rust against the reviewed terminology inventory after merge, on tags, and by manual
+dispatch. User documentation is intentionally outside this exact-occurrence
+audit and is owned by `scripts/check-docs.py`. The AWS job reports a successful
+skip for a documentation-only change; formatting and Clippy are also skipped by
+the classifier without leaving required contexts pending.
+
+Automatic edge and versioned publication are jobs in the same CI run and cannot
+start until that run's vocabulary audit succeeds. Each publishing workflow then
+re-verifies the authorizing CI run, resolves its source once to an immutable
+commit, and builds only that commit. Version tags are checked again immediately
+before publication; a stale main audit cannot move the rolling `edge` tag
+backward. A manual backfill must already have a successful non-PR vocabulary
+audit for the exact commit. The current manual workflows therefore fail closed
+for historical pre-guard tags rather than offering a force bypass.
+
+GitHub evaluates a tag-push workflow from the commit selected by that tag. A
+new `v*` tag must not be created against a commit that predates these gates,
+because no later workflow edit can retroactively replace that commit's old
+publisher definitions. Enforcing that administrative boundary against tag
+creators requires repository tag policy in addition to the checked-in workflow
+gate.
+
+Formatting and Clippy use the repository's pinned toolchain. Lints remain warnings in the workspace; CI applies `-D warnings`. Clippy runs both the default and failpoint-superset graphs.
+
+Repository metadata gates also check:
+
+- immutable commit SHAs for external Actions and reusable workflows;
+- agreement between container and package binary sets;
+- the dependency direction around `omnigraph-azure-admission`.
+
+Container entrypoint and Azure deployment-validation jobs test argument composition, non-destructive Bicep validation, bootstrap readiness/admission modes, and non-root image ownership.
+
+## Full correctness graphs
+
+The full workspace suite does not run on pull requests. It runs after a non-documentation merge to `main`, on release tags, and by manual dispatch:
 
 ```bash
-cargo test -p omnigraph-vocabulary-guard --locked
-git fetch origin main
-BASE_SHA=$(git rev-parse origin/main)
-for surface in openapi rust-string user-docs; do
-  cargo run -p omnigraph-vocabulary-guard --locked -- \
-    check --surface "$surface" --base "$BASE_SHA" \
-    --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
-    --openapi openapi.json
-done
-
-rustup toolchain install nightly-2026-08-01 --profile minimal
-CARGO_INSTALL_ROOT="$PWD/target/vocabulary-public-api/tool" \
-  cargo install cargo-public-api --version 0.52.0 --locked
-cargo run -p omnigraph-vocabulary-guard --locked -- \
-  check --surface public-rust --base "$BASE_SHA" \
-  --inventory tools/omnigraph-vocabulary-guard/graph-vocabulary-inventory.tsv \
-  --cargo-public-api target/vocabulary-public-api/tool/bin/cargo-public-api \
-  --public-api-target-dir target/vocabulary-public-api
+cargo test --workspace --locked --no-fail-fast \
+  --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
-The inventory must already exist at `BASE_SHA`; absence is a failed precondition,
-not a bootstrap signal. Public-Rust extraction can be cold and substrate-sized;
-reuse its target directory. The optional `--presentation-only` OpenAPI mode is
-evidence only for a copy-only migration: it strips `description` and `summary`
-before comparison and rejects every structural change. Do not run or claim
-that proof for a deliberately breaking wire-contract change; use the exact
-generated-spec diff and boundary tests instead.
+This is deliberate latency policy, not a lesser standard. Run the canonical suite locally before merging a risky change or dispatch CI on the branch. A red post-merge `main` is stop-the-line.
 
-- **AWS feature build job**: `cargo build/test -p omnigraph-server --features aws` on ubuntu-latest.
-- **Windows binary build job**: `cargo build --release --locked -p omnigraph-cli -p omnigraph-server` on windows-latest with smoke checks for `omnigraph.exe version`, `omnigraph-server.exe --help`, and PowerShell installer syntax.
-- **RustFS S3 integration**: starts RustFS, requires a successful readiness
-  probe and bucket creation, and runs the configured bucket-gated
-  engine/server/cluster/CLI correctness suites, including ordinary recovery
-  failpoints. The default shard serializes only the outer libtest scenarios
-  (`--test-threads=1`); their internal Tokio work remains concurrent. Failures
-  capture `docker inspect`, container stdout/stderr, and RustFS's service logs
-  from `/logs`. Cost/benchmark instruments remain on demand and are not
-  promoted into correctness CI.
-- **release-edge.yml**: on every push to main, retags `edge`, builds Linux x86_64 / Linux arm64 / macOS arm64 archives and Windows x86_64 zip + sha256, publishes a rolling prerelease, then smoke-tests the Windows PowerShell installer against `edge`. The macOS arm64 matrix entry uses Rust's large code model because the release binary's text exceeds the architecture's +/-128 MiB direct-branch range; other platforms keep the workspace release profile unchanged.
-- **release.yml**: on `v*` tags, builds the Linux x86_64 / Linux arm64 / macOS arm64 archives and Windows x86_64 zip release matrix, updates the Homebrew tap (`scripts/update-homebrew-formula.sh`) by pushing the regenerated formula to `ModernRelay/homebrew-tap`, and smoke-tests the Windows PowerShell installer against the tag. It carries the same macOS-only large-code-model setting as the edge workflow so tagged and rolling artifacts cannot diverge at this linker boundary.
-- **package.yml**: manual ECR image build; emits two image tags per commit (`<sha>`, `<sha>-aws`) via CodeBuild.
-- **publish-image.yml**: builds and pushes the public `omnigraph-server` container image to GHCR (`ghcr.io/modernrelay/omnigraph-server:<tag>`) and to Docker Hub (`docker.io/modernrelay/omnigraph-server:<tag>`, the primary anonymous-pull channel; skipped when the `DOCKERHUB_*` secrets are unset) on `v*` tag pushes, plus manual `workflow_dispatch` with an explicit existing `v*` tag to backfill an image for a past release. Compiles the binaries inside a `rust:1-bookworm` builder container to match the Dockerfile's bookworm-slim runtime glibc (host-built ubuntu binaries do not run there), builds with `--features omnigraph-server/aws`, and moves `latest` only on real tag pushes — never on backfill dispatches. Separate from release.yml so an image-publish failure cannot block the binary release / Homebrew chain.
+Independent post-merge/tag/manual jobs own contracts that need special infrastructure:
+
+- **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
+  public Rust against the reviewed terminology inventory (audit steps currently
+  disabled; see above).
+- **V5 ↔ V6 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild.
+- **RustFS S3 integration** runs configured engine, server, cluster, CLI, recovery, and deterministic operation-count owners. A configured test that skips is a failure.
+- **Azurite Azure integration** runs only after merge, on tags, or by manual
+  dispatch. It exercises configured storage, admission-lease, recovery,
+  cluster, server, and CLI owners against a digest-pinned Azurite image, then
+  verifies that control objects, Lance data, and the admission object use the
+  declared container.
+- **AWS feature** builds and tests `omnigraph-server` with `--features aws`.
+
+Azure remains a qualification preview. Emulator coverage and the completed
+managed-identity smoke proof do not replace the pending adversarial live-Azure
+matrix, and every mutation-capable Azure server must retain the
+admission-wrapper boundary.
+
+CI checks OpenAPI drift but never rewrites `openapi.json`. Regenerate an intentional API change locally as described in [testing.md](testing.md).
+
+## DST tiers
+
+Two workflows own deterministic simulation testing; both set
+`RUSTFLAGS: --cfg tokio_unstable` themselves (the `omnigraph-dst` crate
+compiles empty without it, so the default jobs are unaffected):
+
+- **`dst.yml`** (per PR and on `main` pushes): the pinned deterministic
+  suite — every failure line carries the universe seed, so a red run is
+  reproducible locally from the log alone. The job also lints the shipped
+  engine shape (`-p`, no `dst` feature), which workspace feature
+  unification hides from the default Clippy job. Whether the suite blocks
+  a merge is the branch-protection required-contexts list.
+- **`dst-nightly.yml`** (cron 03:00 UTC + manual dispatch): matrix-sharded
+  deterministic and concurrent fleets over date-derived, mutually disjoint
+  seed intervals. Failures are logs with seed rows, not required contexts;
+  the concurrent fleet's `wild` mode makes no replay claim.
+
+## Local pre-push checks
+
+For Rust changes:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_macro
+cargo clippy --workspace --all-targets --locked \
+  --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
+  -- -D warnings -W clippy::dbg_macro
+cargo test --workspace --locked \
+  --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+```
+
+For repository metadata and workflow changes:
+
+```bash
+bash scripts/check-agents-md.sh
+python3 scripts/check-docs.py
+python3 scripts/check-workflow-action-pins.py
+python3 scripts/check-release-vocabulary-gates.py
+python3 scripts/check-container-binary-contract.py
+python3 scripts/check-azure-admission-boundary.py
+actionlint .github/workflows/*.yml
+shellcheck scripts/*.sh
+```
+
+`actionlint` and `shellcheck` are developer tools, not installed by Cargo. Run the applicable subset when a change does not touch their surface.
+
+## Release workflows
+
+| Workflow | Trigger and output |
+|---|---|
+| `release-edge.yml` | Called by a non-documentation `main` CI run after its vocabulary audit, or manually for an already-audited current `main`; updates the rolling `edge` release and platform archives. |
+| `release.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds platform archives, publishes the GitHub release, updates Homebrew when credentials are available, and smoke-tests the Windows installer. |
+| `publish-crates.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; publication remains paused until the registry-ownership policy changes. |
+| `publish-image.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds the bookworm-compatible public server image for GHCR and, when configured, Docker Hub. Manual backfills do not move `latest`. |
+| `package.yml` / `omnigraph-package.yml` | Manual AWS CodeBuild packaging for default and AWS-feature artifacts, with checksums, digests, and attestations. |
+| `refresh-docs-site.yml` | Documentation changes on `main` or manual dispatch; requests a docs-site redeploy. |
+
+Release archives and containers include the CLI, server, and Azure admission wrapper where their packaging contract requires all three. Keep the reusable package workflow, Dockerfile, and binary-contract check aligned.
+
+## Changing CI
+
+1. Preserve a reporting path for every branch-protection context on every pull request.
+2. Keep external Actions and reusable workflows pinned to full commit SHAs.
+3. Update the documentation classifier when adding a new documentation format; never classify by extension outside the approved docs paths.
+4. Keep configured object-store jobs fail-closed on accidental skips.
+5. Keep every automatic artifact publisher transitively behind a successful
+   exact-SHA vocabulary audit; a skipped pull-request context never authorizes
+   publication.
+6. Update [branch-protection.md](branch-protection.md) only when the declared required contexts or policy actually change.

@@ -2,8 +2,7 @@
 
 ## Contents
 - Embeddings are schema-declared
-- Generating embeddings
-- Embeddings + `load --mode merge` interaction
+- Offline embedding pipeline
 - Search functions in queries
 - The key pattern: scope first, rank second
 - Model / config
@@ -16,70 +15,53 @@ Vector embeddings and text search in Omnigraph.
 node Chunk {
     text: String
     chunk_index: I32
-    embedding: Vector(3072) @embed("text") @index
+    embedding: Vector(1536) @embed("text", model="openai/text-embedding-3-large") @index
     createdAt: DateTime
 }
 ```
 
 - `Vector(N)` — fixed-size float vector
-- `@embed("source_prop")` — what text field to embed from (quoted string)
-- `@index` — enables vector search on this field
+- `@embed("source_prop", model="model-id")` — associates the vector with its
+  String source and, optionally, the exact model space
+- `@index` — declares derived index intent and can accelerate vector search;
+  correctness falls back to an exact scan when coverage is missing
 
-The schema says **where** embeddings live and **what** they come from. Queries don't recompute; they read.
+The schema says **where** embeddings live and **what** they come from. It does
+not populate vectors during a load. Supply vectors in input or prepare JSONL
+with the offline command.
 
-## Generating Embeddings
+## Offline Embedding Pipeline
 
-### First time / refresh missing
+`omnigraph embed` transforms JSONL files; it does **not** mutate a graph:
 
 ```bash
-omnigraph embed --seed embed-config.yaml
+omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json
 ```
 
-Default mode is `fill_missing` — only generates embeddings for rows without one.
+By default it fills missing vectors. Load the output explicitly afterward.
 
-### Re-embed everything
-
-```bash
-omnigraph embed --seed embed-config.yaml --reembed_all
-```
-
-Use when:
-- You changed the source field: `@embed("body")` → `@embed("title")`
-- You mutated text at scale and need fresh embeddings
-- You switched embedding models (rare)
-
-### Selective refresh
+Use the same file/spec form with `--reembed-all` to replace selected vectors,
+or `--clean` to remove them. `--type` and `--select` narrow the records. A seed
+manifest is an alternative:
 
 ```bash
+omnigraph embed --seed embed-config.yaml --reembed-all
+omnigraph embed --seed embed-config.yaml --clean
 omnigraph embed --seed embed-config.yaml --select "Chunk:chunk_index=42"
 ```
 
-Regenerate only rows matching the selector.
-
-### Clean (delete) embeddings
-
-```bash
-omnigraph embed --seed embed-config.yaml --clean
-```
-
-## Embeddings + `load --mode merge` Interaction
-
-**`load --mode merge` does NOT recompute embeddings.**
-
-If you update rows whose source fields feed into `@embed(...)`, the source updates but the embedding stays stale.
-
-Two fixes:
-1. Run `omnigraph embed --reembed_all` after the merge
-2. Use `load --mode overwrite` instead, which re-triggers embedding on load
+Changing source text, source-property metadata, or model requires generating
+replacement vectors; neither `merge` nor `overwrite` does that automatically.
 
 ## Search Functions in Queries
 
-All ranking functions require `limit N` — they're order operators, not filters.
+Ranking functions are order operators, not filters. `nearest` and `rrf` require
+`limit N`; BM25 alone does not, though a limit keeps output bounded.
 
 ### Vector similarity
 
 ```gq
-query nearest_chunks($q: Vector(3072)) {
+query nearest_chunks($q: Vector(1536)) {
     match { $c: Chunk }
     return { $c.text }
     order { nearest($c.embedding, $q) }
@@ -101,7 +83,7 @@ query top_titles($q: String) {
 ### Hybrid (Reciprocal Rank Fusion)
 
 ```gq
-query hybrid($vq: Vector(3072), $tq: String) {
+query hybrid($vq: Vector(1536), $tq: String) {
     match { $d: Doc }
     return { $d.slug, $d.title }
     order { rrf(nearest($d.embedding, $vq), bm25($d.title, $tq)) }
@@ -116,7 +98,7 @@ match {
     $d: Doc
     search($d.title, $q)          // full-text filter
     fuzzy($d.title, $q, 2)        // fuzzy filter, max 2 edits
-    match_text($d.body, $q)       // phrase filter
+    match_text($d.body, $q)       // regular full-text filter (not phrase search)
 }
 ```
 
@@ -125,7 +107,7 @@ match {
 Filter with graph traversal before invoking vector or text ranking. Ranking over a narrow set is both cheaper and more relevant.
 
 ```gq
-query related_chunks($artifact_slug: String, $q: Vector(3072)) {
+query related_chunks($artifact_slug: String, $q: Vector(1536)) {
     match {
         $a: InformationArtifact { slug: $artifact_slug }
         $c partOfArtifact $a                      // scope: only this artifact's chunks
@@ -140,11 +122,29 @@ Don't rank over the entire chunk set if you know a traversal can narrow it first
 
 ## Model / Config
 
-Omnigraph uses **two distinct embedding clients** — don't conflate them:
+The offline command and a served graph have separate configuration surfaces,
+but must resolve to the same provider/model space. Stored and query vectors
+must match the schema's `Vector(N)` dimension; recording `model=` on `@embed`
+makes that contract explicit.
 
-| Client | When it runs | Default model | Configured via |
-|--------|--------------|---------------|----------------|
-| **Engine / load-time** | At load, when an `@embed("source")` field is populated (and `omnigraph embed`) | `gemini-embedding-2-preview` (3072-dim) | `GEMINI_API_KEY`, `OMNIGRAPH_GEMINI_BASE_URL`, `OMNIGRAPH_EMBED_*`, `OMNIGRAPH_EMBEDDINGS_MOCK` |
-| **Compiler / query-time** | When a query passes a *string* to a ranking op (e.g. `nearest($c.embedding, "some text")`) and the server auto-embeds it | `text-embedding-3-small` (OpenAI-style) | `NANOGRAPH_EMBED_MODEL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `NANOGRAPH_EMBEDDINGS_MOCK` |
+| Provider | Default model | Credential |
+|---|---|---|
+| `openai-compatible` (default, OpenRouter endpoint) | `openai/text-embedding-3-large` | `OPENROUTER_API_KEY` |
+| `openai` | `text-embedding-3-large` | `OPENAI_API_KEY` |
+| `gemini` | `gemini-embedding-2` | `GEMINI_API_KEY` |
+| `mock` | deterministic test vectors | none |
 
-The vector stored in the schema is produced by the **load-time (engine)** client, so `Vector(N)` must match that model's output dimension — `Vector(3072)` for `gemini-embedding-2-preview`. If you point the query-time client at a model with a different dimension than your stored vectors, similarity search returns garbage or errors — keep both sides on the same dimension. Vectors are stored L2-normalized.
+Configure direct/offline use with `OMNIGRAPH_EMBED_PROVIDER`,
+`OMNIGRAPH_EMBED_BASE_URL`, and `OMNIGRAPH_EMBED_MODEL`. Deadline/retry controls
+are `OMNIGRAPH_EMBED_DEADLINE_MS`, `OMNIGRAPH_EMBED_TIMEOUT_MS`,
+`OMNIGRAPH_EMBED_RETRY_ATTEMPTS`, and `OMNIGRAPH_EMBED_RETRY_BACKOFF_MS`;
+`OMNIGRAPH_EMBEDDINGS_MOCK` forces the mock provider.
+
+For a served graph, declare a named provider under `providers.embedding` in
+`cluster.yaml` and bind it with `graphs.<id>.embedding_provider`. API keys must
+be `${ENV_VAR}` references and are resolved by the server at startup. Generated
+vectors are finite, nonzero, and L2-normalized.
+
+After upgrading a Lance 9/10 store, full-text queries can require
+`rebuild-full-text-indexes` on each live branch. Ordinary reads and vector
+search do not depend on that rebuild; see [`commands.md`](commands.md#rebuild-full-text-indexes--explicit-analyzer-upgrade).

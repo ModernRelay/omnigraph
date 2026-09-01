@@ -47,7 +47,10 @@ aliases:
     format: table|kv|csv|jsonl|json   # optional: output format
 ```
 
-Dispatch with `omnigraph alias <name> [args]` — one subcommand for read **and** write stored queries (a mutation alias is double-gated by `invoke_query` + `change`). Aliases live in their own namespace, so one can never shadow or be shadowed by a built-in verb.
+Dispatch with `omnigraph alias <name> [args]`. Operator aliases are read-only;
+the CLI rejects a bound stored mutation. Invoke stored mutations with
+`omnigraph mutate <name> --server <server> --graph <id>`. Aliases live in their
+own namespace, so one can never shadow or be shadowed by a built-in verb.
 
 ### `args` bind to query parameters
 
@@ -83,8 +86,8 @@ Or per-alias (`format: jsonl`), or per-call (`--format jsonl`).
 
 ### When to use which
 
-- **`jsonl`** — one JSON object per line, first line is metadata; streams; ideal for agents
-- **`json`** — pretty-printed JSON array; smaller results; human-readable
+- **`jsonl`** — line-oriented NDJSON, with metadata first; ideal for agents
+- **`json`** — pretty-printed `ReadOutput` envelope (metadata, columns, and rows)
 - **`kv`** — `key: value` per line; good for single-row lookups
 - **`csv`** — for spreadsheets or line-count-heavy analysis
 - **`table`** — default human view; don't use in automation
@@ -96,7 +99,6 @@ Short, hyphenated, matches the conceptual operation:
 - `signal`, `pattern`, `element` — single lookup (typical pair with `format: kv`)
 - `signals`, `patterns`, `elements` — list
 - `signal-patterns`, `pattern-signals` — traversals
-- `add-signal`, `link-forms-pattern` — mutations
 
 ## Secrets Don't Belong in Aliases
 
@@ -116,9 +118,6 @@ aliases:
   signals:  { server: intel-dev, graph: spike, query: recent_signals }
   # Traversals
   pattern-signals: { server: intel-dev, graph: spike, query: pattern_signals, args: [slug] }
-  # Mutations (stored mutation; invoke_query + change)
-  add-signal:         { server: intel-dev, graph: spike, query: add_signal, args: [slug, name, brief, stagingTimestamp, createdAt, updatedAt] }
-  link-forms-pattern: { server: intel-dev, graph: spike, query: link_signal_forms_pattern, args: [signal, pattern] }
 ```
 
 Each `query:` names a stored query the cluster serves — declare them in `cluster.yaml` and `cluster apply` first (see [`stored-queries.md`](stored-queries.md)).
@@ -126,10 +125,12 @@ Each `query:` names a stored query the cluster serves — declare them in `clust
 ## Invocation Patterns
 
 ```bash
-# Invoke an alias (read or write — the bound stored query decides)
+# Invoke a read alias
 omnigraph alias signal sig-kimi-k25
-omnigraph alias add-signal sig-new "Name" "Brief" \
-  2026-04-14T00:00:00Z 2026-04-14T00:00:00Z 2026-04-14T00:00:00Z
+
+# Invoke a served stored mutation directly (aliases are read-only)
+omnigraph mutate add_signal --server intel-dev --graph spike \
+  --params '{"slug":"sig-new","name":"Name","brief":"Brief","stagingTimestamp":"2026-04-14T00:00:00Z","createdAt":"2026-04-14T00:00:00Z","updatedAt":"2026-04-14T00:00:00Z"}'
 
 # Override output format
 omnigraph alias signals --format jsonl
@@ -138,4 +139,7 @@ omnigraph alias signals --format jsonl
 omnigraph alias signal --params '{"slug":"sig-override"}'
 ```
 
-The `alias` subcommand carries `--params`/`--params-file`, `--format`/`--json`, and `--config`; the server, graph, and stored-query name come from the binding. For a different server/graph or a branch read, call `query`/`mutate` directly.
+The `alias` subcommand carries `--params`/`--params-file` and
+`--format`/`--json`; the server, graph, and stored-query name come from the
+binding. For a different server/graph or a branch read, call `query`/`mutate`
+directly.

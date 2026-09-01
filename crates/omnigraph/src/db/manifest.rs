@@ -36,18 +36,21 @@ mod state;
 pub(crate) use graph::{GenesisManifestAttempt, ManifestInitError};
 use graph::{
     init_manifest_graph, load_initial_manifest_state, open_exact_genesis_manifest,
-    open_manifest_graph, open_manifest_graph_with_lineage, snapshot_state_at,
+    open_manifest_graph, snapshot_state_at,
 };
 pub(crate) use layout::manifest_uri;
 #[cfg(test)]
 use layout::open_manifest_dataset;
 use layout::{
-    branch_ref_error, open_manifest_dataset_with_identifier_with_session,
-    open_manifest_dataset_with_session, table_uri_for_path,
+    branch_ref_error, open_manifest_branch_with_identifier,
+    open_manifest_dataset_native_with_session, open_manifest_dataset_with_identifier_with_session,
+    open_manifest_dataset_with_session, resolve_native_manifest_branch, table_uri_for_path,
 };
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
-use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
+use metadata::{
+    OMNIGRAPH_ROW_COUNT_KEY, object_store_path_from_uri, table_version_metadata_for_state,
+};
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
@@ -71,7 +74,10 @@ pub use state::DatasetEntry;
 #[cfg(test)]
 use state::string_column;
 pub(crate) use state::{GraphLineageRow, read_graph_lineage};
-use state::{ManifestState, read_manifest_state};
+use state::{
+    ManifestState, ProjectionAccumulator, fold_projection_delta, read_manifest_projection,
+    read_manifest_state, read_object_identities_at_offsets,
+};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
 /// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
@@ -90,6 +96,9 @@ const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
 /// Mutable per-branch head pointer for the graph lineage (RFC-013 Phase 7).
 /// `object_id` is `graph_head:<branch>` (`graph_head:main` for the main branch).
 const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
+/// `object_id` prefix of the head rows — one constant for row minting, row
+/// decode, and the incremental fold's dead-row classification.
+pub(super) const GRAPH_HEAD_OBJECT_ID_PREFIX: &str = "graph_head:";
 
 /// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
 /// `table_branch`/`manifest_branch` encode main as null, but `object_id` must be
@@ -144,6 +153,22 @@ pub(crate) async fn refuse_if_internal_schema_unsupported(root_uri: &str) -> Res
     migrations::guard_stamp(&dataset).map(|_| ())
 }
 
+/// Whether the selected graph-manifest dataset depends on files outside its
+/// own dataset root.
+///
+/// A directory copy is self-contained only when both this manifest dataset
+/// and every user dataset have no Lance `base_paths`. Keep the paths private:
+/// callers need a relocation eligibility bit, not access to storage
+/// locations that may contain credentials or deployment details.
+pub(crate) async fn manifest_has_external_base_paths(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<bool> {
+    let control_session = crate::lance_access::control_session();
+    let dataset = open_manifest_dataset_with_session(root_uri, branch, &control_session).await?;
+    Ok(!dataset.manifest().base_paths.is_empty())
+}
+
 /// Immutable point-in-time view of the database.
 ///
 /// Cheap to create (no storage I/O). All reads within a query go through one
@@ -159,6 +184,11 @@ pub struct Snapshot {
     /// resolving the head separately (e.g. via `CommitGraph`) could pair this
     /// snapshot's datasets with a different version's head.
     graph_heads: HashMap<String, String>,
+    /// The native Lance ref this branch snapshot was served from, when it came
+    /// from a live branch coordinator (`None` on main, for time-travel reads,
+    /// and for directly built test snapshots). Writers fork tables under this
+    /// exact name so every fork of one incarnation shares one physical name.
+    native_branch: Option<String>,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
     /// `Omnigraph::resolved_target` for live Branch reads so dataset opens reuse
     /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
@@ -186,6 +216,7 @@ pub struct SnapshotDataset {
 /// writable handle and bypass graph publication.
 pub struct SnapshotScanner {
     scanner: Scanner,
+    dataset: Dataset,
 }
 
 impl SnapshotScanner {
@@ -207,16 +238,19 @@ impl SnapshotScanner {
         self
     }
 
-    /// Set the requested number of rows returned in one scan batch.
+    /// Set the maximum number of rows returned in one scan batch.
     ///
-    /// Lance's byte-based batch target overrides this setting unless
-    /// [`Self::strict_batch_size`] is also enabled.
+    /// When [`Self::batch_size_bytes`] is also configured, both limits apply;
+    /// whichever is reached first determines the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.scanner.batch_size(batch_size);
         self
     }
 
     /// Set the approximate in-memory byte target for one scan batch.
+    ///
+    /// This composes with [`Self::batch_size`], but cannot be combined with
+    /// [`Self::strict_batch_size`] because merging batches can exceed the target.
     pub fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
         self.scanner.batch_size_bytes(batch_size_bytes);
         self
@@ -224,8 +258,8 @@ impl SnapshotScanner {
 
     /// Require full output batches to contain exactly the requested row count.
     ///
-    /// The final batch may contain fewer rows. This restores a hard output-row
-    /// ceiling when [`Self::batch_size_bytes`] is also configured.
+    /// The final batch may contain fewer rows. Enabling this with a byte target
+    /// (including one inherited from the dataset) fails when the scan executes.
     pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
         self.scanner.strict_batch_size(strict_batch_size);
         self
@@ -253,6 +287,8 @@ impl SnapshotScanner {
 
     /// Execute the configured read without exposing its physical plan.
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
+        crate::table_store::TableStore::validate_full_text_scan(&self.dataset, &self.scanner, None)
+            .await?;
         self.scanner
             .try_into_stream()
             .await
@@ -269,11 +305,18 @@ impl SnapshotDataset {
     pub fn scan(&self) -> SnapshotScanner {
         SnapshotScanner {
             scanner: self.dataset.scan(),
+            dataset: self.dataset.clone(),
         }
     }
 
     /// Count physical rows in this pinned dataset version, optionally with a filter.
     pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        if let Some(filter) = &filter {
+            let mut scanner = self.dataset.scan();
+            scanner.filter(filter).map_err(OmniError::storage)?;
+            crate::table_store::TableStore::validate_full_text_scan(&self.dataset, &scanner, None)
+                .await?;
+        }
         self.dataset
             .count_rows(filter)
             .await
@@ -296,6 +339,26 @@ impl SnapshotDataset {
             .load_indices()
             .await
             .map_err(OmniError::storage)
+    }
+
+    /// Whether this pinned Lance manifest carries any raw index-metadata
+    /// section, without filtering entries by the current reader's supported
+    /// index versions.
+    ///
+    /// An absent section proves an empty physical index inventory. Callers
+    /// that require that proof must not substitute [`Self::load_indices`],
+    /// whose compatibility filtering can hide unsupported metadata.
+    pub fn has_raw_index_section(&self) -> bool {
+        self.dataset.manifest().index_section.is_some()
+    }
+
+    /// Whether this pinned table version depends on files outside its dataset
+    /// root through Lance's `base_paths` relocation mechanism.
+    ///
+    /// The actual paths remain private so this read-only metadata surface
+    /// cannot disclose source locations or expose a writable Lance handle.
+    pub fn has_external_base_paths(&self) -> bool {
+        !self.dataset.manifest().base_paths.is_empty()
     }
 
     /// Whether `column` has complete usable BTREE coverage.
@@ -325,6 +388,12 @@ impl SnapshotDataset {
 }
 
 impl Snapshot {
+    /// The native Lance ref this branch snapshot was served from (`None` on
+    /// main, for time-travel reads, and for directly built snapshots).
+    pub(crate) fn native_branch(&self) -> Option<&str> {
+        self.native_branch.as_deref()
+    }
+
     /// Exact `graph_head:<branch>` commit id from this snapshot's own pinned
     /// graph-manifest version (`None` = main). Absent on a branch with no commits.
     ///
@@ -419,7 +488,7 @@ impl Snapshot {
                     &self.root_uri,
                     &entry.dataset_path,
                     entry.native_dataset_branch.as_deref(),
-                );
+                )?;
                 caches
                     .handles
                     .get_or_open(
@@ -541,16 +610,54 @@ async fn probe_dataset_latest_incarnation(
     // repeat. Read the version first so a recreation between the two probes
     // yields the replacement identifier rather than a false match to the held
     // lifetime.
-    let version = dataset
-        .latest_version_id()
+    let held = async {
+        let version = dataset
+            .latest_version_id()
+            .await
+            .map_err(|error| branch_ref_error(error, branch))?;
+        let branch_identifier = dataset
+            .branch_identifier()
+            .await
+            .map_err(|error| branch_ref_error(error, branch))?;
+        Ok::<_, OmniError>(ManifestIncarnation {
+            version,
+            e_tag: None,
+            timestamp_nanos: None,
+            branch_identifier,
+        })
+    }
+    .await;
+    let error = match held {
+        Ok(incarnation) => return Ok(incarnation),
+        Err(error @ (OmniError::BranchNotFound { .. } | OmniError::Storage(_))) => error,
+        Err(error) => return Err(error),
+    };
+    // The held native ref or its tree is gone. Under incarnation-suffixed refs
+    // a recreated branch lives at a new native ref, so re-resolve the logical
+    // name through the live registry: the replacement's identity is a
+    // guaranteed mismatch, and a deleted branch is a typed absence. Only a
+    // registry that still names the held ref makes the miss a real failure.
+    let live = crate::branch_control::list_branch_contents(dataset).await?;
+    let Some(native) =
+        crate::branch_names::resolve_native_branch(live.keys().map(String::as_str), branch)?
+    else {
+        return Err(OmniError::BranchNotFound {
+            branch: branch.to_string(),
+        });
+    };
+    if dataset.manifest().branch.as_deref() == Some(native.as_str()) {
+        return Err(error);
+    }
+    let replacement = dataset
+        .checkout_branch(&native)
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
-    let branch_identifier = dataset
+    let branch_identifier = replacement
         .branch_identifier()
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
     Ok(ManifestIncarnation {
-        version,
+        version: replacement.version().version,
         e_tag: None,
         timestamp_nanos: None,
         branch_identifier,
@@ -686,7 +793,7 @@ impl DatasetEntry {
             root_uri,
             &self.dataset_path,
             self.native_dataset_branch.as_deref(),
-        );
+        )?;
         // Route through the one opener (Fix 3). With no session this is exactly
         // the Fix-2 `from_uri(location).with_version`. This is the uncached
         // fallback (a snapshot detached from its graph's read caches); the
@@ -733,6 +840,19 @@ pub struct DatasetUpdate {
     pub(crate) version_metadata: TableVersionMetadata,
 }
 
+/// The set of deleted row offsets of one fragment (empty when it has no
+/// deletion vector).
+async fn fragment_deletion_offsets(
+    fragment: &lance::dataset::fragment::FileFragment,
+) -> Result<std::collections::HashSet<u32>> {
+    Ok(fragment
+        .get_deletion_vector()
+        .await
+        .map_err(OmniError::storage)?
+        .map(|dv| dv.as_ref().iter().collect())
+        .unwrap_or_default())
+}
+
 /// Coordinates cross-dataset state through the namespace `__manifest` table.
 ///
 /// Table rows register stable metadata such as location. Append-only
@@ -744,11 +864,34 @@ pub(crate) struct ManifestCoordinator {
     dataset: Dataset,
     known_state: ManifestState,
     active_branch: Option<String>,
+    /// The native Lance ref `active_branch` resolved to at open time
+    /// (`{logical}.{incarnation}`, or the bare name for a legacy ref). `None`
+    /// on main. Forks copy this exact name, so a recreated branch never
+    /// shares physical paths with a dead incarnation.
+    native_branch: Option<String>,
     /// Lance-native lifetime captured coherently with `dataset` and
     /// `known_state`. A named ref keeps this value across ordinary commits and
     /// receives a new value after delete/recreate.
     branch_identifier: lance::dataset::refs::BranchIdentifier,
     publisher: Arc<dyn ManifestBatchPublisher>,
+    /// Retained fold accumulators of the projection, tagged with the manifest
+    /// version they describe; `refresh_with_lineage` folds only the catalog
+    /// fragments appended since that version instead of re-scanning
+    /// O(history). The tag is the staleness fence: a path that advances
+    /// `dataset` without folding must clear this, and a missed clear is
+    /// caught by the tag mismatch — stale accumulators degrade to a full
+    /// scan, never serve as current. One extra lineage-row copy beside the
+    /// commit graph's; the maps are O(tables + branches).
+    projection: Option<(u64, ProjectionAccumulator)>,
+}
+
+/// How a manifest refresh updates the already-loaded commit projection.
+/// Incremental refreshes return only newly appended lineage rows; full
+/// refreshes replace the projection. Keeping the distinction avoids cloning
+/// all historical lineage merely to append one commit.
+pub(crate) enum LineageRefresh {
+    Replace(Vec<GraphLineageRow>),
+    Append(Vec<GraphLineageRow>),
 }
 
 impl ManifestCoordinator {
@@ -769,6 +912,7 @@ impl ManifestCoordinator {
         dataset: Dataset,
         known_state: ManifestState,
         active_branch: Option<String>,
+        native_branch: Option<String>,
         branch_identifier: lance::dataset::refs::BranchIdentifier,
         publisher: Arc<dyn ManifestBatchPublisher>,
     ) -> Self {
@@ -777,8 +921,10 @@ impl ManifestCoordinator {
             dataset,
             known_state,
             active_branch,
+            native_branch,
             branch_identifier,
             publisher,
+            projection: None,
         }
     }
 
@@ -787,6 +933,7 @@ impl ManifestCoordinator {
         dataset: Dataset,
         known_state: ManifestState,
         active_branch: Option<String>,
+        native_branch: Option<String>,
         branch_identifier: lance::dataset::refs::BranchIdentifier,
     ) -> Self {
         let publisher =
@@ -796,6 +943,7 @@ impl ManifestCoordinator {
             dataset,
             known_state,
             active_branch,
+            native_branch,
             branch_identifier,
             publisher,
         )
@@ -811,6 +959,7 @@ impl ManifestCoordinator {
                 .map(|entry| (entry.type_key.clone(), entry))
                 .collect(),
             graph_heads: state.graph_heads,
+            native_branch: None,
             read_caches: None,
         }
     }
@@ -879,6 +1028,7 @@ impl ManifestCoordinator {
                 dataset,
                 known_state,
                 None,
+                None,
                 lance::dataset::refs::BranchIdentifier::main(),
             ),
             lineage_rows,
@@ -900,6 +1050,7 @@ impl ManifestCoordinator {
                 dataset,
                 known_state,
                 None,
+                None,
                 lance::dataset::refs::BranchIdentifier::main(),
             ),
             lineage_rows,
@@ -917,12 +1068,13 @@ impl ManifestCoordinator {
         control_session: &Arc<lance::session::Session>,
     ) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state, branch_identifier) =
+        let (dataset, known_state, branch_identifier, _native_branch) =
             open_manifest_graph(root, None, control_session).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
             dataset,
             known_state,
+            None,
             None,
             branch_identifier,
         ))
@@ -944,13 +1096,14 @@ impl ManifestCoordinator {
         }
 
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state, branch_identifier) =
+        let (dataset, known_state, branch_identifier, native_branch) =
             open_manifest_graph(root, Some(branch), control_session).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
             dataset,
             known_state,
             Some(branch.to_string()),
+            native_branch,
             branch_identifier,
         ))
     }
@@ -960,20 +1113,42 @@ impl ManifestCoordinator {
         branch: Option<&str>,
         control_session: &Arc<lance::session::Session>,
     ) -> Result<(Self, Vec<GraphLineageRow>)> {
+        // Boxed wholesale for the same stack-depth reason as
+        // `refresh_with_lineage`: this body now builds the projection
+        // accumulators and is awaited inside the merge future via
+        // coordinator swaps.
+        Box::pin(Self::open_with_lineage_inner(
+            root_uri,
+            branch,
+            control_session,
+        ))
+        .await
+    }
+
+    async fn open_with_lineage_inner(
+        root_uri: &str,
+        branch: Option<&str>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<(Self, Vec<GraphLineageRow>)> {
         let root = root_uri.trim_end_matches('/');
         let branch = branch.filter(|branch| *branch != "main");
-        let (dataset, known_state, lineage_rows, branch_identifier) =
-            open_manifest_graph_with_lineage(root, branch, control_session).await?;
-        Ok((
-            Self::from_parts_with_default_publisher(
-                root,
-                dataset,
-                known_state,
-                branch.map(str::to_string),
-                branch_identifier,
-            ),
-            lineage_rows,
-        ))
+        // Retain the fold accumulators alongside the state (the incremental merge-authority projection): the
+        // scan this open pays anyway becomes the base a later refresh folds
+        // deltas into, instead of a sunk cost repeated per refresh.
+        let (dataset, branch_identifier, native_branch) =
+            open_manifest_branch_with_identifier(root, branch, control_session).await?;
+        let (known_state, projection, lineage_rows) = read_manifest_projection(&dataset).await?;
+        let projection_version = dataset.version().version;
+        let mut coordinator = Self::from_parts_with_default_publisher(
+            root,
+            dataset,
+            known_state,
+            branch.map(str::to_string),
+            native_branch,
+            branch_identifier,
+        );
+        coordinator.projection = Some((projection_version, projection));
+        Ok((coordinator, lineage_rows))
     }
 
     pub async fn snapshot_at(
@@ -1007,22 +1182,27 @@ impl ManifestCoordinator {
     /// projection to fence delete/recreate ABA.
     pub(super) async fn branch_depends_on_delete_target_under_control_gates(
         root_uri: &str,
-        candidate_branch: Option<&str>,
-        delete_target: &str,
+        candidate_native: Option<&str>,
+        delete_target_native: &str,
         control_session: &Arc<lance::session::Session>,
     ) -> Result<bool> {
         let root = root_uri.trim_end_matches('/');
+        // The caller resolved every candidate from one listing; open the
+        // native ref directly rather than paying a listing per branch.
         let dataset =
-            open_manifest_dataset_with_session(root, candidate_branch, control_session).await?;
+            open_manifest_dataset_native_with_session(root, candidate_native, control_session)
+                .await?;
         let snapshot = Self::snapshot_from_state(root, read_manifest_state(&dataset).await?);
         Ok(snapshot
             .datasets()
-            .any(|entry| entry.native_dataset_branch.as_deref() == Some(delete_target)))
+            .any(|entry| entry.native_dataset_branch.as_deref() == Some(delete_target_native)))
     }
 
     /// Return a Snapshot from the known manifest state. No storage I/O.
     pub fn snapshot(&self) -> Snapshot {
-        Self::snapshot_from_state(&self.root_uri, self.known_state.clone())
+        let mut snapshot = Self::snapshot_from_state(&self.root_uri, self.known_state.clone());
+        snapshot.native_branch = self.native_branch.clone();
+        snapshot
     }
 
     pub(crate) fn control_session(&self) -> Arc<lance::session::Session> {
@@ -1037,19 +1217,186 @@ impl ManifestCoordinator {
         }
     }
 
-    pub(crate) async fn refresh_with_lineage(&mut self) -> Result<Vec<GraphLineageRow>> {
+    pub(crate) async fn refresh_with_lineage(&mut self) -> Result<LineageRefresh> {
+        // Boxed wholesale: this body carries the incremental fold (fragment
+        // maps and compact projection rollback state) plus the full-scan
+        // fallback, and it is awaited deep inside the merge future — the
+        // engine's known stack-depth hazard. The box keeps that layout out of
+        // every caller's generator frame.
+        Box::pin(self.refresh_with_lineage_inner()).await
+    }
+
+    async fn refresh_with_lineage_inner(&mut self) -> Result<LineageRefresh> {
+        // Incremental first (the incremental-projection design): fold only the catalog fragments
+        // appended since the held pin. Every unprovable precondition falls
+        // back to the full scan below — provably current or full read.
+        if let Some(lineage_rows) = self.refresh_incremental().await? {
+            return Ok(LineageRefresh::Append(lineage_rows));
+        }
+        crate::instrumentation::record_projection_full_refresh();
         let control_session = self.dataset.session();
-        let (dataset, known_state, lineage_rows, branch_identifier) =
-            open_manifest_graph_with_lineage(
-                &self.root_uri,
-                self.active_branch.as_deref(),
-                &control_session,
-            )
-            .await?;
+        let (dataset, branch_identifier, native_branch) = open_manifest_branch_with_identifier(
+            &self.root_uri,
+            self.active_branch.as_deref(),
+            &control_session,
+        )
+        .await?;
+        let (known_state, projection, lineage_rows) = read_manifest_projection(&dataset).await?;
+        let projection_version = dataset.version().version;
         self.dataset = dataset;
         self.known_state = known_state;
         self.branch_identifier = branch_identifier;
-        Ok(lineage_rows)
+        self.native_branch = native_branch;
+        self.projection = Some((projection_version, projection));
+        Ok(LineageRefresh::Replace(lineage_rows))
+    }
+
+    /// Incremental projection refresh. `Ok(None)` = a precondition
+    /// was unprovable — the caller does the full scan. `Ok(Some(rows))` = the
+    /// coordinator now describes the latest catalog version, having read only
+    /// the appended fragments (plus the deletion-vector differences on shared
+    /// ones). The returned rows are only the lineage delta, not a clone of the
+    /// coordinator's complete commit history.
+    ///
+    /// Soundness rests on the catalog's write shape: publishes append new
+    /// fragments and, for the mutable `graph_head:<branch>` rows, mark the
+    /// superseded row deleted in an existing fragment's deletion vector. So a
+    /// provable delta is: every held fragment still present with identical
+    /// data files and overlays (compaction rewrites fail this and fall back),
+    /// deletion-vector growth explained entirely by `graph_head` rows (any
+    /// other deleted row means machinery this fold does not model — full
+    /// read), and new fragments whose LIVE rows are the appended state. In
+    async fn refresh_incremental(&mut self) -> Result<Option<Vec<GraphLineageRow>>> {
+        let Some((projection_version, projection)) = self.projection.as_ref() else {
+            return Ok(None);
+        };
+        // The staleness fence: accumulators describing any version other than
+        // the held pin cannot be folded onto (some path advanced the dataset
+        // without them) — full scan.
+        if *projection_version != self.dataset.version().version {
+            return Ok(None);
+        }
+        let control_session = self.dataset.session();
+        let (new_dataset, new_identifier) = open_manifest_dataset_with_identifier_with_session(
+            &self.root_uri,
+            self.active_branch.as_deref(),
+            &control_session,
+        )
+        .await?;
+        // Delete/recreate ABA fence: a same-named branch with a new lifetime
+        // must never fold onto the old lifetime's projection.
+        if new_identifier != self.branch_identifier {
+            tracing::debug!("projection refresh: branch identifier changed; full scan");
+            return Ok(None);
+        }
+        if new_dataset.version().version == self.dataset.version().version {
+            crate::instrumentation::record_projection_incremental_refresh();
+            return Ok(Some(Vec::new()));
+        }
+
+        let old_fragments: std::collections::HashMap<u64, lance::dataset::fragment::FileFragment> =
+            self.dataset
+                .get_fragments()
+                .into_iter()
+                .map(|fragment| (fragment.metadata().id, fragment))
+                .collect();
+        let mut delta_fragments = Vec::new();
+        let mut dead_head_rows: Vec<(
+            lance_table::format::Fragment,
+            std::collections::HashSet<u32>,
+        )> = Vec::new();
+        for new_fragment in new_dataset.get_fragments() {
+            let new_meta = new_fragment.metadata().clone();
+            let Some(old_fragment) = old_fragments.get(&new_meta.id) else {
+                delta_fragments.push(new_meta);
+                continue;
+            };
+            let old_meta = old_fragment.metadata();
+            if old_meta.files != new_meta.files || old_meta.overlays != new_meta.overlays {
+                // Rewritten in place (compaction shape) — not an append.
+                tracing::debug!("projection refresh: fragment rewritten; full scan");
+                return Ok(None);
+            }
+            if old_meta.deletion_file == new_meta.deletion_file {
+                continue;
+            }
+            let old_dv = fragment_deletion_offsets(old_fragment).await?;
+            let new_dv = fragment_deletion_offsets(&new_fragment).await?;
+            if old_dv.difference(&new_dv).next().is_some() {
+                // A row came back to life; no forward publish does that.
+                tracing::debug!("projection refresh: deletion vector shrank; full scan");
+                return Ok(None);
+            }
+            let newly_dead: std::collections::HashSet<u32> =
+                new_dv.difference(&old_dv).copied().collect();
+            if !newly_dead.is_empty() {
+                dead_head_rows.push((old_meta.clone(), newly_dead));
+            }
+        }
+        // Held fragments absent from the new version (cleanup/compaction
+        // shapes) are not an append either.
+        let new_ids: std::collections::HashSet<u64> = new_dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().id)
+            .collect();
+        if old_fragments.keys().any(|id| !new_ids.contains(id)) {
+            tracing::debug!("projection refresh: held fragment removed; full scan");
+            return Ok(None);
+        }
+
+        // Exception safety: fold a compact O(tables + branches) clone and
+        // install only after every row classification succeeds.
+        let mut folded = projection.clone();
+        for (fragment, offsets) in &dead_head_rows {
+            let identities =
+                read_object_identities_at_offsets(&self.dataset, fragment.clone(), offsets).await?;
+            if identities.len() != offsets.len() {
+                tracing::debug!("projection refresh: dead rows unaccounted; full scan");
+                return Ok(None);
+            }
+            for (object_type, object_id) in identities {
+                if object_type != OBJECT_TYPE_GRAPH_HEAD {
+                    // A deleted row this fold does not model (retention,
+                    // repair, future machinery): the append assumption is
+                    // gone.
+                    tracing::debug!(
+                        object_type,
+                        "projection refresh: non-head row deleted; full scan"
+                    );
+                    return Ok(None);
+                }
+                let Some(branch_key) = object_id.strip_prefix(GRAPH_HEAD_OBJECT_ID_PREFIX) else {
+                    // A head-typed row without the head prefix is a
+                    // malformed-row signal, not a routine fallback shape —
+                    // say so before degrading to the full scan (which
+                    // re-checks it loudly).
+                    tracing::warn!(
+                        object_id,
+                        "projection refresh: malformed graph_head object id; full scan"
+                    );
+                    return Ok(None);
+                };
+                folded.remove_head(branch_key);
+            }
+        }
+        let (known_state, lineage_rows) =
+            match fold_projection_delta(&new_dataset, delta_fragments, &mut folded).await {
+                Ok(delta) => delta,
+                Err(error) => {
+                    // A fold inconsistency means a precondition this gate missed,
+                    // not a caller error — degrade to the full scan.
+                    tracing::debug!(error = %error, "projection refresh: fold failed; full scan");
+                    return Ok(None);
+                }
+            };
+
+        crate::instrumentation::record_projection_incremental_refresh();
+        let projection_version = new_dataset.version().version;
+        self.dataset = new_dataset;
+        self.known_state = known_state;
+        self.projection = Some((projection_version, folded));
+        Ok(Some(lineage_rows))
     }
 
     /// Refresh one live-read view without ever installing a manifest state
@@ -1073,7 +1420,7 @@ impl ManifestCoordinator {
         projection_has_head: impl FnOnce(&str) -> bool,
     ) -> Result<Option<Vec<GraphLineageRow>>> {
         let control_session = self.dataset.session();
-        let (dataset, branch_identifier) = open_manifest_dataset_with_identifier_with_session(
+        let (dataset, branch_identifier, native_branch) = open_manifest_branch_with_identifier(
             &self.root_uri,
             self.active_branch.as_deref(),
             &control_session,
@@ -1097,6 +1444,11 @@ impl ManifestCoordinator {
         self.dataset = dataset;
         self.known_state = known_state;
         self.branch_identifier = branch_identifier;
+        self.native_branch = native_branch;
+        // Same staleness rule as the post-publish fold: this refresh advances
+        // `dataset` without folding the projection accumulators, so they must
+        // not survive it.
+        self.projection = None;
         Ok(lineage_rows)
     }
 
@@ -1209,6 +1561,10 @@ impl ManifestCoordinator {
         // so adopt it directly instead of an O(fragments) `read_manifest_state`.
         self.dataset = dataset;
         self.known_state = known_state;
+        // The projection accumulators do not ride this fold — cleared so a
+        // later incremental refresh cannot serve the pre-publish lineage as
+        // "unchanged" (the staleness fence on the `projection` field).
+        self.projection = None;
         Ok(CommitOutcome {
             version: self.version(),
             parent_commit_id,
@@ -1250,6 +1606,11 @@ impl ManifestCoordinator {
         Ok(self.branch_identifier.clone())
     }
 
+    /// The native Lance ref this coordinator's branch resolved to; `None` on main.
+    pub(crate) fn native_branch(&self) -> Option<&str> {
+        self.native_branch.as_deref()
+    }
+
     /// Exact materialized `graph_head:<active-branch>` from the same pinned
     /// manifest version as [`Self::snapshot`]. This is write authority, not a
     /// lineage-cache query: a read may refresh only the manifest, so consulting
@@ -1280,9 +1641,27 @@ impl ManifestCoordinator {
         probe_dataset_latest_incarnation(&self.dataset, self.active_branch.as_deref()).await
     }
 
+    /// Create the logical branch `name` as a fresh native incarnation.
+    ///
+    /// The native ref is `{name}.{ulid}`, so a recreated branch never shares a
+    /// physical path with a dead predecessor; the logical name stays the only
+    /// public identity. The registry check runs on logical names, so a live
+    /// legacy ref named exactly `name` also counts as existing.
     pub(crate) async fn create_branch(&mut self, name: &str) -> Result<()> {
+        crate::branch_names::ensure_logical_branch_name(name)?;
         let mut ds = self.dataset.clone();
-        match crate::branch_control::create_branch_recoverably(&mut ds, name, self.version())
+        let live = list_branch_contents(&ds).await?;
+        if crate::branch_names::resolve_native_branch(live.keys().map(String::as_str), name)?
+            .is_some()
+        {
+            return Err(OmniError::manifest_conflict(format!(
+                "branch '{}' already exists",
+                name
+            )));
+        }
+        let native =
+            crate::branch_names::native_branch_name(name, &crate::branch_names::mint_incarnation());
+        match crate::branch_control::create_branch_recoverably(&mut ds, &native, self.version())
             .await?
         {
             crate::branch_control::BranchCreateOutcome::Created(_) => Ok(()),
@@ -1306,12 +1685,17 @@ impl ManifestCoordinator {
     pub(crate) async fn delete_branch(&mut self, name: &str) -> Result<()> {
         let mut ds = self.open_branch_control_dataset().await?;
         let branches = list_branch_contents(&ds).await?;
+        let native =
+            crate::branch_names::resolve_native_branch(branches.keys().map(String::as_str), name)?
+                .ok_or_else(|| {
+                    OmniError::manifest_not_found(format!("branch '{}' not found", name))
+                })?;
         let expected_identifier = branches
-            .get(name)
+            .get(&native)
             .ok_or_else(|| OmniError::manifest_not_found(format!("branch '{}' not found", name)))?
             .identifier
             .clone();
-        crate::branch_control::delete_branch_recoverably(&mut ds, name, &expected_identifier)
+        crate::branch_control::delete_branch_recoverably(&mut ds, &native, &expected_identifier)
             .await?;
         Ok(())
     }
@@ -1330,21 +1714,53 @@ impl ManifestCoordinator {
         expected_identifier: &lance::dataset::refs::BranchIdentifier,
     ) -> Result<()> {
         let mut ds = self.open_branch_control_dataset().await?;
-        crate::branch_control::delete_branch_recoverably(&mut ds, name, expected_identifier).await
+        let native = resolve_native_manifest_branch(&ds, name).await?;
+        crate::branch_control::delete_branch_recoverably(&mut ds, &native, expected_identifier)
+            .await
     }
 
+    /// Logical graph branches, `main` first. Each live native ref maps to
+    /// exactly one logical name; a duplicate incarnation fails loudly.
     pub async fn list_graph_branches(&self) -> Result<Vec<String>> {
         let branches = list_branch_contents(&self.dataset).await?;
-        let mut names: Vec<String> = branches.into_keys().filter(|name| name != "main").collect();
+        let mut names = Vec::with_capacity(branches.len());
+        let mut seen = HashSet::with_capacity(branches.len());
+        for native in branches.keys().filter(|name| *name != "main") {
+            let logical = crate::branch_names::logical_branch_name(native).to_string();
+            if !seen.insert(logical.clone()) {
+                return Err(OmniError::manifest_conflict(format!(
+                    "branch '{logical}' has more than one live native incarnation; run cleanup \
+                     before using it"
+                )));
+            }
+            names.push(logical);
+        }
         names.sort();
         let mut all = vec!["main".to_string()];
         all.extend(names);
         Ok(all)
     }
 
+    /// Every live native branch ref except `main`, sorted. Cleanup compares
+    /// per-table fork refs against exactly this set.
+    pub(crate) async fn list_native_graph_branches(&self) -> Result<Vec<String>> {
+        let branches = list_branch_contents(&self.dataset).await?;
+        let mut names: Vec<String> = branches.into_keys().filter(|name| name != "main").collect();
+        names.sort();
+        Ok(names)
+    }
+
+    /// Logical names of every branch forked (transitively) from `name`.
+    /// Lance records parents by native ref, so the walk runs on native names
+    /// and maps each child back to its logical name.
     pub async fn descendant_branches(&self, name: &str) -> Result<Vec<String>> {
         let branches = list_branch_contents(&self.dataset).await?;
-        let mut frontier = vec![name.to_string()];
+        let Some(native) =
+            crate::branch_names::resolve_native_branch(branches.keys().map(String::as_str), name)?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut frontier = vec![native];
         let mut descendants = Vec::new();
         let mut seen = HashSet::new();
 
@@ -1359,8 +1775,8 @@ impl ManifestCoordinator {
             children.sort();
             for child in children {
                 if seen.insert(child.clone()) {
-                    frontier.push(child.clone());
-                    descendants.push(child);
+                    descendants.push(crate::branch_names::logical_branch_name(&child).to_string());
+                    frontier.push(child);
                 }
             }
         }

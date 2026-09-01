@@ -448,6 +448,23 @@ pub async fn execute_query(
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
 ) -> Result<QueryResult> {
+    let mut resolved_params = None;
+    for param in &ir.params {
+        if !params.contains_key(&param.name) {
+            if param.nullable {
+                resolved_params
+                    .get_or_insert_with(|| params.clone())
+                    .insert(param.name.clone(), Literal::Null);
+            } else {
+                return Err(OmniError::manifest(format!(
+                    "parameter '{}' not provided",
+                    param.name
+                )));
+            }
+        }
+    }
+    let params = resolved_params.as_ref().unwrap_or(params);
+
     let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
 
     // RRF requires forked execution
@@ -474,6 +491,7 @@ pub async fn execute_query(
         _ => None,
     };
 
+    let needed_columns = collect_needed_columns(ir);
     let mut wide: Option<RecordBatch> = None;
     execute_pipeline(
         &ir.pipeline,
@@ -484,6 +502,7 @@ pub async fn execute_query(
         &mut wide,
         &search_mode,
         final_expand_cap,
+        &needed_columns,
     )
     .await?;
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
@@ -584,6 +603,9 @@ async fn execute_rrf_query(
     catalog: &Catalog,
     rrf: &RrfMode,
 ) -> Result<QueryResult> {
+    let mut needed_columns = collect_needed_columns(ir);
+    fail_open_rrf_leg_targets(&mut needed_columns, rrf);
+
     // Execute primary search
     let mut primary_wide: Option<RecordBatch> = None;
     execute_pipeline(
@@ -595,6 +617,7 @@ async fn execute_rrf_query(
         &mut primary_wide,
         &rrf.primary,
         None,
+        &needed_columns,
     )
     .await?;
 
@@ -609,6 +632,7 @@ async fn execute_rrf_query(
         &mut secondary_wide,
         &rrf.secondary,
         None,
+        &needed_columns,
     )
     .await?;
 
@@ -857,6 +881,177 @@ fn filter_variables(filter: &IRFilter) -> HashSet<String> {
     vars
 }
 
+/// Columns a query references for one bound variable, accumulated by
+/// [`collect_needed_columns`]. `All` is the fail-open verdict for an
+/// entity-valued reference (a bare `$var`): that scan keeps the full
+/// projection, so unattributable references never drop a column — only a
+/// walk gap on an attributed binding can (see `collect_pipeline_columns`).
+#[derive(Debug)]
+enum NeededColumns {
+    All,
+    Columns(HashSet<String>),
+}
+
+/// Derive each binding's needed columns from the whole query: RETURN
+/// expressions, `order {}`, and every filter in the pipeline, recursing into
+/// `AntiJoin` inners. Keys are variable names, query-global — same-name
+/// anti-join bindings merge by union (a superset; every scan re-intersects
+/// with its own schema). Filter columns stay in the demand set even when the
+/// filter hoists into the scanner: over-demand costs one scalar column.
+fn collect_needed_columns(ir: &QueryIR) -> HashMap<String, NeededColumns> {
+    // Destructured so a new column-bearing `QueryIR` field cannot be missed
+    // silently (same discipline as the exhaustive matches below).
+    let QueryIR {
+        name: _,
+        params: _,
+        pipeline,
+        return_exprs,
+        order_by,
+        limit: _,
+    } = ir;
+    let mut needed = HashMap::new();
+    collect_pipeline_columns(pipeline, &mut needed);
+    for IRProjection { expr, alias: _ } in return_exprs {
+        collect_expr_columns(expr, &mut needed);
+    }
+    for IROrdering {
+        expr,
+        descending: _,
+    } in order_by
+    {
+        collect_expr_columns(expr, &mut needed);
+    }
+    needed
+}
+
+fn collect_pipeline_columns(pipeline: &[IROp], needed: &mut HashMap<String, NeededColumns>) {
+    for op in pipeline {
+        // No `_` arm, and no `..` in any pattern: a new IROp — or a new FIELD
+        // on an existing one — must decide here whether it references columns.
+        // An unwalked reference prunes a column something still reads, which
+        // the `All` fail-open cannot catch.
+        match op {
+            IROp::NodeScan {
+                variable: _,
+                type_name: _,
+                filters,
+            } => {
+                for filter in filters {
+                    collect_filter_columns(filter, needed);
+                }
+            }
+            IROp::Expand {
+                src_var: _,
+                dst_var: _,
+                edge_type: _,
+                direction: _,
+                dst_type: _,
+                min_hops: _,
+                max_hops: _,
+                dst_filters,
+                edge_binding: _,
+            } => {
+                for filter in dst_filters {
+                    collect_filter_columns(filter, needed);
+                }
+            }
+            IROp::Filter(filter) => collect_filter_columns(filter, needed),
+            IROp::AntiJoin {
+                outer_var: _,
+                inner,
+            } => collect_pipeline_columns(inner, needed),
+        }
+    }
+}
+
+fn collect_filter_columns(filter: &IRFilter, needed: &mut HashMap<String, NeededColumns>) {
+    let IRFilter { left, op: _, right } = filter;
+    collect_expr_columns(left, needed);
+    collect_expr_columns(right, needed);
+}
+
+fn record_prop(needed: &mut HashMap<String, NeededColumns>, variable: &str, property: &str) {
+    match needed
+        .entry(variable.to_string())
+        .or_insert_with(|| NeededColumns::Columns(HashSet::new()))
+    {
+        NeededColumns::All => {}
+        NeededColumns::Columns(columns) => {
+            columns.insert(property.to_string());
+        }
+    }
+}
+
+fn collect_expr_columns(expr: &IRExpr, needed: &mut HashMap<String, NeededColumns>) {
+    match expr {
+        IRExpr::PropAccess { variable, property } => record_prop(needed, variable, property),
+        // Fail open — see `NeededColumns::All`.
+        IRExpr::Variable(variable) => {
+            needed.insert(variable.clone(), NeededColumns::All);
+        }
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => {
+            record_prop(needed, variable, property);
+            collect_expr_columns(query, needed);
+        }
+        IRExpr::Search { field, query }
+        | IRExpr::MatchText { field, query }
+        | IRExpr::Bm25 { field, query } => {
+            collect_expr_columns(field, needed);
+            collect_expr_columns(query, needed);
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            collect_expr_columns(field, needed);
+            collect_expr_columns(query, needed);
+            if let Some(max_edits) = max_edits {
+                collect_expr_columns(max_edits, needed);
+            }
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            collect_expr_columns(primary, needed);
+            collect_expr_columns(secondary, needed);
+            if let Some(k) = k {
+                collect_expr_columns(k, needed);
+            }
+        }
+        IRExpr::Aggregate { func: _, arg } => collect_expr_columns(arg, needed),
+        // AliasRef resolves to another RETURN item, whose expression this
+        // walk already visits directly; Param/Literal carry no columns.
+        IRExpr::AliasRef(_) | IRExpr::Param(_) | IRExpr::Literal(_) => {}
+    }
+}
+
+/// Both RRF legs run the same pipeline against one demand map, and
+/// `build_fused_batch` concats winner rows from both legs under one schema —
+/// so a binding that is a search target in EITHER leg must take the same
+/// fail-open verdict in BOTH legs, keeping the legs' pruned BASE columns
+/// identical. (Lance's autoprojected `_distance`/`_score` columns still
+/// differ between mixed-kind legs — a pre-existing fusion hazard this
+/// marking neither causes nor cures.)
+fn fail_open_rrf_leg_targets(needed: &mut HashMap<String, NeededColumns>, rrf: &RrfMode) {
+    for leg in [rrf.primary.as_ref(), rrf.secondary.as_ref()] {
+        // Both marks run independently (not first-of): over-marking is always
+        // sound, and this needs no leg-carries-one-target precondition.
+        if let Some((variable, ..)) = leg.nearest.as_ref() {
+            needed.insert(variable.clone(), NeededColumns::All);
+        }
+        if let Some((variable, ..)) = leg.bm25.as_ref() {
+            needed.insert(variable.clone(), NeededColumns::All);
+        }
+    }
+}
+
 fn execute_pipeline<'a>(
     pipeline: &'a [IROp],
     params: &'a ParamMap,
@@ -872,6 +1067,7 @@ fn execute_pipeline<'a>(
     // checked at the op site below. Anti-join inner pipelines and RRF arms
     // always pass `None`.
     final_expand_cap: Option<usize>,
+    needed_columns: &'a HashMap<String, NeededColumns>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         // Pre-pass: hoist filters onto the op that introduces their binding.
@@ -975,6 +1171,7 @@ fn execute_pipeline<'a>(
                         snapshot,
                         catalog,
                         search_mode,
+                        needed_columns.get(variable.as_str()),
                     )
                     .await?;
                     let prefixed = prefix_batch(&batch, variable)?;
@@ -1043,8 +1240,17 @@ fn execute_pipeline<'a>(
                 IROp::AntiJoin { outer_var, inner } => {
                     let gi = graph_index;
                     if let Some(batch) = wide.as_mut() {
-                        execute_anti_join(batch, inner, params, snapshot, gi, catalog, outer_var)
-                            .await?;
+                        execute_anti_join(
+                            batch,
+                            inner,
+                            params,
+                            snapshot,
+                            gi,
+                            catalog,
+                            outer_var,
+                            needed_columns,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1189,7 +1395,7 @@ fn traversal_indexed_override() -> Option<bool> {
 
 /// Max source-row frontier for which Expand uses the BTREE-indexed path.
 /// Larger frontiers fall back to the in-memory CSR (dense / whole-graph). See
-/// `docs/user/reference/constants.md`.
+/// `docs/dev/execution.md`.
 const DEFAULT_EXPAND_INDEXED_MAX_FRONTIER: usize = 1024;
 /// Max hop count for the indexed path (each hop is one indexed scan; very deep
 /// traversals fan out toward whole-graph and are better served by CSR).
@@ -2711,6 +2917,7 @@ async fn execute_anti_join(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     outer_var: &str,
+    needed_columns: &HashMap<String, NeededColumns>,
 ) -> Result<()> {
     // Only the bulk fast path consumes the CSR; the slow path's inner Expand
     // chooses its own access path. Realize the O(|E|) graph index ONLY when the
@@ -2781,6 +2988,7 @@ async fn execute_anti_join(
         &mut inner_wide,
         &no_search,
         None,
+        needed_columns,
     )
     .await?;
 
@@ -2826,6 +3034,7 @@ async fn execute_node_scan(
     snapshot: &Snapshot,
     catalog: &Catalog,
     search_mode: &SearchMode,
+    binding_columns: Option<&NeededColumns>,
 ) -> Result<RecordBatch> {
     let table_key = format!("node:{}", type_name);
     let ds = snapshot.open_lance_dataset(&table_key).await?;
@@ -2855,7 +3064,46 @@ async fn execute_node_scan(
         .filter(|f| !node_type.blob_properties.contains(f.name()))
         .map(|f| f.name().as_str())
         .collect();
-    let projection = has_blobs.then_some(non_blob_cols.as_slice());
+    // #564: RETURN-derived projection. `Some(Columns)` prunes the scan to
+    // the demanded set plus the always-keep set: `id` (Expand/AntiJoin join
+    // key, RRF fusion key, `apply_ordering` tie-break) and the type's key
+    // columns (the row's declared identity, retained as cheap insurance).
+    // `None` (unreferenced binding) and `All` (bare `$var`) fail open to the
+    // full non-blob projection; so do search scans, because Lance
+    // autoprojects `_distance`/`_score` onto explicit projections that omit
+    // them, with a deprecation warning. Only NodeScan bindings prune:
+    // `hydrate_nodes` (Expand dst hydration) and edge-property attach keep
+    // the full non-blob width.
+    let is_search_scan = search_mode
+        .nearest
+        .as_ref()
+        .is_some_and(|(var, ..)| var == variable)
+        || search_mode
+            .bm25
+            .as_ref()
+            .is_some_and(|(var, ..)| var == variable)
+        || filters.iter().any(is_search_filter);
+    let pruned_cols: Option<Vec<&str>> = match binding_columns {
+        Some(NeededColumns::Columns(columns)) if !is_search_scan => Some(
+            non_blob_cols
+                .iter()
+                .copied()
+                .filter(|name| {
+                    *name == "id"
+                        || node_type
+                            .key
+                            .as_ref()
+                            .is_some_and(|key| key.iter().any(|k| k == name))
+                        || columns.contains(*name)
+                })
+                .collect(),
+        ),
+        _ => None,
+    };
+    let projection = match &pruned_cols {
+        Some(columns) => Some(columns.as_slice()),
+        None => has_blobs.then_some(non_blob_cols.as_slice()),
+    };
     let batches = crate::table_store::TableStore::scan_stream_with(
         &ds,
         projection,
@@ -2898,7 +3146,7 @@ async fn execute_node_scan(
                     scanner
                         .nearest(prop, &query_arr, k)
                         .map_err(|error| OmniError::storage_context("nearest", error))?;
-                    // Lance 10's late payload `LanceRead` drops the sorted
+                    // Lance 11's late payload `LanceRead` drops the sorted
                     // candidate stream's ordering metadata. With more than
                     // one output partition, execute_plan may therefore use a
                     // scheduling-ordered coalescer and scramble large-k ANN
@@ -2929,17 +3177,22 @@ async fn execute_node_scan(
     .map_err(OmniError::storage)?;
 
     let scan_result = if batches.is_empty() {
-        RecordBatch::new_empty(batches.first().map(|b| b.schema()).unwrap_or_else(|| {
-            // Build a non-blob schema for empty result
-            let fields: Vec<_> = node_type
-                .arrow_schema
-                .fields()
-                .iter()
-                .filter(|f| !node_type.blob_properties.contains(f.name()))
-                .map(|f| f.as_ref().clone())
-                .collect();
-            Arc::new(Schema::new(fields))
-        }))
+        // Build the schema the scan would have produced (the pruned
+        // projection when one applied, all non-blob columns otherwise) so an
+        // empty result is shaped like a non-empty one — except search scans,
+        // whose non-empty batches also carry Lance's autoprojected
+        // `_distance`/`_score`; those are absent here.
+        let fields: Vec<_> = node_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .filter(|f| match &pruned_cols {
+                Some(columns) => columns.contains(&f.name().as_str()),
+                None => !node_type.blob_properties.contains(f.name()),
+            })
+            .map(|f| f.as_ref().clone())
+            .collect();
+        RecordBatch::new_empty(Arc::new(Schema::new(fields)))
     } else if batches.len() == 1 {
         batches.into_iter().next().unwrap()
     } else {
@@ -2955,7 +3208,9 @@ async fn execute_node_scan(
 }
 
 /// Add null Utf8 columns for blob properties excluded from a scan.
-/// Uses column_by_name (not positional) so it's order-independent.
+/// Uses column_by_name (not positional) so it's order-independent, and
+/// silently skips non-blob fields absent from the batch — LOAD-BEARING for
+/// pruned scans (#564), which legitimately omit undemanded non-blob columns.
 fn add_null_blob_columns(
     batch: &RecordBatch,
     node_type: &omnigraph_compiler::catalog::NodeType,
@@ -3961,6 +4216,430 @@ mod literal_lowering_tests {
         assert!(
             binary_has_int32_literal(&expr),
             "camelCase int column must keep its coerced Int32 literal (BTREE-eligible), got {expr:?}"
+        );
+    }
+}
+
+/// Always-on unit coverage for the needed-columns walk. IO-free and
+/// parallel-safe, unlike the `#[ignore]`d byte gate in
+/// `column_projection_tests`.
+#[cfg(test)]
+mod needed_columns_tests {
+    use super::*;
+
+    fn prop(variable: &str, property: &str) -> IRExpr {
+        IRExpr::PropAccess {
+            variable: variable.to_string(),
+            property: property.to_string(),
+        }
+    }
+
+    fn ir(pipeline: Vec<IROp>, return_exprs: Vec<IRExpr>, order_by: Vec<IRExpr>) -> QueryIR {
+        QueryIR {
+            name: "t".to_string(),
+            params: vec![],
+            pipeline,
+            return_exprs: return_exprs
+                .into_iter()
+                .map(|expr| IRProjection { expr, alias: None })
+                .collect(),
+            order_by: order_by
+                .into_iter()
+                .map(|expr| IROrdering {
+                    expr,
+                    descending: false,
+                })
+                .collect(),
+            limit: None,
+        }
+    }
+
+    fn scan(variable: &str) -> IROp {
+        IROp::NodeScan {
+            variable: variable.to_string(),
+            type_name: "T".to_string(),
+            filters: vec![],
+        }
+    }
+
+    fn columns_of<'a>(needed: &'a HashMap<String, NeededColumns>, var: &str) -> &'a NeededColumns {
+        needed.get(var).expect("binding must be in the demand map")
+    }
+
+    fn assert_columns(needed: &HashMap<String, NeededColumns>, var: &str, expected: &[&str]) {
+        match columns_of(needed, var) {
+            NeededColumns::All => panic!("expected specific columns for '{var}', got All"),
+            NeededColumns::Columns(cols) => {
+                let mut got: Vec<&str> = cols.iter().map(|c| c.as_str()).collect();
+                got.sort_unstable();
+                let mut want = expected.to_vec();
+                want.sort_unstable();
+                assert_eq!(got, want, "needed columns for '{var}'");
+            }
+        }
+    }
+
+    #[test]
+    fn return_props_are_the_only_demand_for_a_plain_projection() {
+        let q = ir(vec![scan("c")], vec![prop("c", "slug")], vec![]);
+        let needed = collect_needed_columns(&q);
+        assert_columns(&needed, "c", &["slug"]);
+    }
+
+    #[test]
+    fn order_filters_and_aggregates_all_contribute() {
+        let q = ir(
+            vec![
+                scan("c"),
+                IROp::Filter(IRFilter {
+                    left: prop("c", "state"),
+                    op: CompOp::Eq,
+                    right: IRExpr::Literal(Literal::String("open".into())),
+                }),
+            ],
+            vec![IRExpr::Aggregate {
+                func: AggFunc::Count,
+                arg: Box::new(prop("c", "slug")),
+            }],
+            vec![prop("c", "rank")],
+        );
+        let needed = collect_needed_columns(&q);
+        assert_columns(&needed, "c", &["slug", "state", "rank"]);
+    }
+
+    #[test]
+    fn bare_variable_reference_fails_open_to_all() {
+        let q = ir(
+            vec![scan("c")],
+            vec![IRExpr::Variable("c".to_string()), prop("c", "slug")],
+            vec![],
+        );
+        let needed = collect_needed_columns(&q);
+        assert!(
+            matches!(columns_of(&needed, "c"), NeededColumns::All),
+            "a bare $var must demand the whole row regardless of other refs"
+        );
+    }
+
+    #[test]
+    fn anti_join_inner_filters_attribute_to_their_bindings() {
+        // not-exists inner pipeline referencing both an inner and the outer
+        // binding: the outer scan must still read the outer column the inner
+        // filter compares against.
+        let inner = vec![
+            scan("x"),
+            IROp::Filter(IRFilter {
+                left: prop("x", "kind"),
+                op: CompOp::Eq,
+                right: prop("c", "kind_ref"),
+            }),
+        ];
+        let q = ir(
+            vec![
+                scan("c"),
+                IROp::AntiJoin {
+                    outer_var: "c".to_string(),
+                    inner,
+                },
+            ],
+            vec![prop("c", "slug")],
+            vec![],
+        );
+        let needed = collect_needed_columns(&q);
+        assert_columns(&needed, "c", &["slug", "kind_ref"]);
+        assert_columns(&needed, "x", &["kind"]);
+    }
+
+    #[test]
+    fn nearest_records_the_ranked_vector_property() {
+        let q = ir(
+            vec![scan("c")],
+            vec![prop("c", "slug")],
+            vec![IRExpr::Nearest {
+                variable: "c".to_string(),
+                property: "embedding".to_string(),
+                query: Box::new(IRExpr::Param("q".to_string())),
+            }],
+        );
+        let needed = collect_needed_columns(&q);
+        // Search bindings fail open at the scan; the demand set still
+        // carries the ranked column so search-scan pruning can consume it
+        // without re-walking.
+        assert_columns(&needed, "c", &["slug", "embedding"]);
+    }
+
+    #[test]
+    fn unreferenced_binding_has_no_demand_entry() {
+        // Cross-join shape: `$d` is bound but never referenced — no demand
+        // entry. `execute_node_scan` fails open to the full non-blob
+        // projection for a missing entry.
+        let q = ir(vec![scan("c"), scan("d")], vec![prop("c", "slug")], vec![]);
+        let needed = collect_needed_columns(&q);
+        assert!(needed.contains_key("c"));
+        assert!(!needed.contains_key("d"));
+    }
+
+    #[test]
+    fn expand_dst_filters_attribute_to_the_dst_binding() {
+        let q = ir(
+            vec![
+                scan("a"),
+                IROp::Expand {
+                    src_var: "a".to_string(),
+                    dst_var: "b".to_string(),
+                    edge_type: "knows".to_string(),
+                    direction: Direction::Out,
+                    dst_type: "T".to_string(),
+                    min_hops: 1,
+                    max_hops: Some(1),
+                    dst_filters: vec![IRFilter {
+                        left: prop("b", "state"),
+                        op: CompOp::Eq,
+                        right: IRExpr::Literal(Literal::String("open".into())),
+                    }],
+                    edge_binding: None,
+                },
+            ],
+            vec![prop("a", "slug")],
+            vec![],
+        );
+        let needed = collect_needed_columns(&q);
+        assert_columns(&needed, "a", &["slug"]);
+        assert_columns(&needed, "b", &["state"]);
+    }
+
+    #[test]
+    fn search_expression_arms_attribute_field_and_nested_columns() {
+        // Nothing consumes these entries while search scans fail open; this
+        // pins the walk's completeness — every operand (field, query,
+        // max_edits, k) — independent of any consumer.
+        let q = ir(
+            vec![scan("c")],
+            vec![prop("c", "slug")],
+            vec![IRExpr::Rrf {
+                primary: Box::new(IRExpr::Fuzzy {
+                    field: Box::new(prop("c", "title")),
+                    query: Box::new(prop("c", "probe")),
+                    max_edits: Some(Box::new(prop("c", "edits"))),
+                }),
+                secondary: Box::new(IRExpr::Bm25 {
+                    field: Box::new(prop("c", "body")),
+                    query: Box::new(IRExpr::Literal(Literal::String("q".into()))),
+                }),
+                k: Some(Box::new(prop("c", "k_ref"))),
+            }],
+        );
+        let needed = collect_needed_columns(&q);
+        assert_columns(
+            &needed,
+            "c",
+            &["slug", "title", "probe", "edits", "body", "k_ref"],
+        );
+    }
+
+    #[test]
+    fn rrf_leg_targets_fail_open_in_both_legs() {
+        // Cross-variable RRF: both legs' wide batches feed one fused concat,
+        // so each leg's search target must fail open in the OTHER leg too.
+        let mut needed = HashMap::new();
+        needed.insert(
+            "a".to_string(),
+            NeededColumns::Columns(HashSet::from(["x".to_string()])),
+        );
+        let rrf = RrfMode {
+            primary: Box::new(SearchMode {
+                nearest: Some(("a".to_string(), "emb".to_string(), vec![], 10)),
+                ..Default::default()
+            }),
+            secondary: Box::new(SearchMode {
+                bm25: Some(("b".to_string(), "text".to_string(), "q".to_string())),
+                ..Default::default()
+            }),
+            k: 60,
+            limit: 10,
+        };
+        fail_open_rrf_leg_targets(&mut needed, &rrf);
+        assert!(matches!(needed.get("a"), Some(NeededColumns::All)));
+        assert!(matches!(needed.get("b"), Some(NeededColumns::All)));
+    }
+}
+
+#[cfg(test)]
+mod column_projection_tests {
+    use super::*;
+
+    use crate::db::ReadTarget;
+    use crate::loader::{LoadMode, load_jsonl};
+
+    /// Embedding width. Wide enough (4 bytes/dim = 3 KiB/row) that the vector
+    /// column dominates the table, without an unwieldy JSONL fixture.
+    const DIM: usize = 768;
+    const ROWS: usize = 400;
+
+    const SCHEMA: &str = r#"
+node Chunk {
+    slug: String @key
+    embedding: Vector(768)
+}
+"#;
+
+    const QUERIES: &str = r#"
+query list_slugs() {
+    match { $c: Chunk }
+    return { $c.slug }
+}
+
+query first_slug() {
+    match { $c: Chunk }
+    return { $c.slug }
+    limit 1
+}
+"#;
+
+    /// Deterministic pseudo-random embeddings: a constant vector compresses to
+    /// nothing and would understate the column's real read cost.
+    fn seed_data() -> String {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut out = String::with_capacity(ROWS * DIM * 12);
+        for row in 0..ROWS {
+            out.push_str(&format!(
+                r#"{{"type":"Chunk","data":{{"slug":"chunk-{row:05}","embedding":["#
+            ));
+            for dim in 0..DIM {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let value = (state >> 40) as f32 / 16_777_216.0;
+                if dim > 0 {
+                    out.push(',');
+                }
+                out.push_str(&format!("{value:.6}"));
+            }
+            out.push_str("]}}\n");
+        }
+        out
+    }
+
+    /// What a measured read does after the `node:Chunk` handle is warm.
+    enum Read {
+        /// A GQ query, by name, and the rows it must return.
+        Query(&'static str, usize),
+        /// A Lance scan of the same pinned version, projected to `columns`.
+        LanceProjected(&'static [&'static str]),
+        /// A Lance scan of the same pinned version, no projection.
+        LanceFull,
+    }
+
+    /// Object-store bytes one read costs, measured on Lance's own per-store
+    /// `IOTracker` — the seam that sees local-file reads: `ObjectStore::open`
+    /// routes the `file` scheme through `LocalObjectReader::open_with_tracker`,
+    /// bypassing any wrapped `object_store` instrumentation.
+    ///
+    /// Each call opens its own `Omnigraph` handle, so every arm reads cold from
+    /// its own `ReadCaches`/`Session`. The `node:Chunk` handle is opened first
+    /// and its cost discarded, so the measurement covers the scan alone — and so
+    /// the query below reuses that same cached `Dataset`, hence the same store
+    /// and the same tracker.
+    async fn read_bytes(uri: &str, read: Read) -> u64 {
+        let db = Omnigraph::open(uri).await.unwrap();
+        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let dataset = snapshot.open_lance_dataset("node:Chunk").await.unwrap();
+        let store = dataset.object_store(None).await.unwrap();
+        let _ = store.io_stats_incremental();
+
+        let (rows, expected) = match read {
+            Read::Query(name, expected) => {
+                let result = db
+                    .query(ReadTarget::branch("main"), QUERIES, name, &ParamMap::new())
+                    .await
+                    .unwrap();
+                (
+                    result.batches().iter().map(|b| b.num_rows()).sum::<usize>(),
+                    expected,
+                )
+            }
+            Read::LanceProjected(columns) => {
+                let mut scanner = dataset.scan();
+                scanner.project(columns).unwrap();
+                let batches: Vec<RecordBatch> = scanner
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                (batches.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS)
+            }
+            Read::LanceFull => {
+                let batches: Vec<RecordBatch> = dataset
+                    .scan()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                (batches.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS)
+            }
+        };
+        assert_eq!(rows, expected, "each arm must return the rows it asked for");
+        store.io_stats_incremental().read_bytes
+    }
+
+    /// `return { $c.slug }` must not read the `embedding` column.
+    ///
+    /// Three reads of one identical `Chunk` table: the GQ query, a Lance scan
+    /// projected to the lightweight columns (what a column-pruned scan costs),
+    /// and an unprojected Lance scan (what a full-row read costs). With column
+    /// pruning on the scan the query stays within 2× of the projected scan
+    /// (headroom for catalog/`__manifest` reads through the same store).
+    ///
+    /// Ignored in the parallel suite: the engine's process-wide
+    /// `STORE_REGISTRY` (`lance_access.rs`) shares one `ObjectStore` per
+    /// `file://` provider, so this test's `IOTracker` also counts every
+    /// concurrent test's reads. The measurement is exact when the process is
+    /// quiet. Lives in-source rather than beside `tests/helpers/cost.rs`
+    /// (the designated home for object-store counters) because the
+    /// per-store `IOTracker` seam this measurement needs is reachable only
+    /// in-crate — `Snapshot::open_lance_dataset` is `pub(crate)`.
+    #[tokio::test]
+    #[ignore = "byte-cost gate; the local-FS IOTracker is process-shared — run solo via `cargo test -p omnigraph-engine --lib column_projection_tests -- --ignored --nocapture`"]
+    async fn slug_projection_does_not_read_vector_column_issue_564() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+        load_jsonl(&db, &seed_data(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+        drop(db);
+
+        let query = read_bytes(uri, Read::Query("list_slugs", ROWS)).await;
+        let limited = read_bytes(uri, Read::Query("first_slug", 1)).await;
+        let pruned = read_bytes(uri, Read::LanceProjected(&["id", "slug"])).await;
+        let full = read_bytes(uri, Read::LanceFull).await;
+
+        println!("gq return slug          = {query} bytes");
+        println!("gq return slug limit 1  = {limited} bytes");
+        println!("lance projected scan    = {pruned} bytes");
+        println!("lance full scan         = {full} bytes");
+
+        assert!(pruned > 0, "tracker must observe the projected scan");
+        assert!(
+            pruned * 4 <= full,
+            "fixture must make the vector column dominate: pruned={pruned} full={full}"
+        );
+        assert!(
+            query * 2 >= pruned,
+            "the query's reads must reach the same tracker: query={query} pruned={pruned}"
+        );
+        assert!(
+            limited <= pruned * 2,
+            "limit 1 must stay within 2x of the projected scan: limited={limited} pruned={pruned}"
+        );
+        assert!(
+            query <= pruned * 2,
+            "a slug-only projection must not pay for the embedding column: \
+             query={query} pruned={pruned} full={full}"
         );
     }
 }

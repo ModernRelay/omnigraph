@@ -1,4 +1,4 @@
-//! S3-backed single-graph serving (gated on OMNIGRAPH_S3_TEST_BUCKET).
+//! Object-store-backed serving, gated independently for S3 and Azure.
 //! Moved verbatim from tests/server.rs in the modularization.
 
 use std::fs;
@@ -40,7 +40,7 @@ async fn read_managed_blob_bytes(
     reader
         .read_range(0..reader.len())
         .await
-        .expect("small S3 test Blob fits one bounded range")
+        .expect("small object-store test Blob fits one bounded range")
         .to_vec()
 }
 
@@ -51,6 +51,19 @@ async fn server_opens_s3_graph_directly_and_serves_snapshot_and_read() {
         return;
     };
 
+    server_opens_object_store_graph_directly_and_serves_snapshot_and_read(uri).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_opens_azure_graph_directly_and_serves_snapshot_and_read() {
+    let Some(uri) = azure_test_graph_uri("server") else {
+        eprintln!("skipping azure server test: OMNIGRAPH_AZURE_TEST_CONTAINER is not set");
+        return;
+    };
+    server_opens_object_store_graph_directly_and_serves_snapshot_and_read(uri).await;
+}
+
+async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(uri: String) {
     Omnigraph::init(&uri, &fs::read_to_string(fixture("test.pg")).unwrap())
         .await
         .unwrap();
@@ -64,7 +77,7 @@ async fn server_opens_s3_graph_directly_and_serves_snapshot_and_read() {
     .unwrap();
 
     let app = build_app(
-        AppState::open_with_bearer_token(uri.clone(), Some("s3-token".to_string()))
+        AppState::open_with_bearer_token(uri.clone(), Some("object-store-token".to_string()))
             .await
             .unwrap(),
     );
@@ -74,7 +87,7 @@ async fn server_opens_s3_graph_directly_and_serves_snapshot_and_read() {
         Request::builder()
             .uri(g("/snapshot"))
             .method(Method::GET)
-            .header("authorization", "Bearer s3-token")
+            .header("authorization", "Bearer object-store-token")
             .body(Body::empty())
             .unwrap(),
     )
@@ -94,7 +107,7 @@ async fn server_opens_s3_graph_directly_and_serves_snapshot_and_read() {
         Request::builder()
             .uri(g("/read"))
             .method(Method::POST)
-            .header("authorization", "Bearer s3-token")
+            .header("authorization", "Bearer object-store-token")
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read).unwrap()))
             .unwrap(),
@@ -282,6 +295,100 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
 
     let response = tower::ServiceExt::oneshot(
         app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphs/knowledge/queries/find_person")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"params": {"name": "Ada"}}).to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["rows"][0]["p.name"], "Ada", "{value}");
+}
+
+/// Azure config-free serving uses the same applied cluster artifact as S3,
+/// without any local desired-config files at boot.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
+    let Some(container) = std::env::var("OMNIGRAPH_AZURE_TEST_CONTAINER").ok() else {
+        eprintln!("skipping azure cluster-serving test: OMNIGRAPH_AZURE_TEST_CONTAINER is not set");
+        return;
+    };
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let root = format!("az://{container}/cluster-serve/{unique}");
+
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("people.pg"),
+            "node Person {\n  name: String @key\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("people.gq"),
+            "query find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("cluster.yaml"),
+            format!(
+                "version: 1\nstorage: {root}\ngraphs:\n  knowledge:\n    schema: people.pg\n    queries:\n      find_person:\n        file: people.gq\n"
+            ),
+        )
+        .unwrap();
+        let import = omnigraph_cluster::import_config_dir(dir.path()).await;
+        assert!(import.ok, "{:?}", import.diagnostics);
+        let apply = omnigraph_cluster::apply_config_dir(dir.path()).await;
+        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+
+        let graph_uri = format!("{root}/graphs/knowledge.omni");
+        let db = Omnigraph::open(&graph_uri).await.unwrap();
+        load_jsonl(
+            &db,
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n",
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    }
+
+    let settings = omnigraph_server::load_server_settings(
+        Some(&std::path::PathBuf::from(&root)),
+        None,
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    let omnigraph_server::ServerConfigMode::Multi {
+        graphs,
+        config_path,
+        server_policy,
+    } = settings.mode;
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        Vec::new(),
+        server_policy.as_ref(),
+        config_path,
+        false,
+    )
+    .await
+    .unwrap();
+    let response = tower::ServiceExt::oneshot(
+        build_app(state),
         Request::builder()
             .method(Method::POST)
             .uri("/graphs/knowledge/queries/find_person")

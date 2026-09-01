@@ -1,0 +1,76 @@
+# DST per-PR tier: the pinned
+# suite — deterministic, minutes, meant to gate merges (enforcement
+# lives in the branch-protection required-checks list, not in this
+# file). Runs the active tests
+# only: every finding pin, the strict-replay meta-tests (a PR introducing
+# nondeterminism that perturbs the replay-compared report fails HERE,
+# not months later as a flaky hunt), the detector-census golden,
+# the reach-census floor, and the cost-count golden (a storage-cost
+# regression names the exact op and verb). Volume hunting lives in
+# dst-nightly.yml — same crate, same oracles, different budget.
+name: DST
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The dst crate is `#![cfg(tokio_unstable)]`-gated (tokio's seeded
+  # scheduler RNG needs it). Scoped to this workflow only.
+  RUSTFLAGS: --cfg tokio_unstable
+  # Pool-quiescing trio (`env_knobs::QUIESCE_ENV`): the crate-local
+  # .cargo/config.toml [env] copy applies only when cargo runs FROM the
+  # crate dir; this job runs from repo root, so supply it here — same
+  # reason RUSTFLAGS is set here.
+  RAYON_NUM_THREADS: "1"
+  LANCE_CPU_THREADS: "1"
+  LANCE_DETERMINISTIC_BACKOFF: "1"
+
+jobs:
+  dst-suite:
+    name: DST pinned suite
+    runs-on: ubuntu-latest
+    # Cold budget: the uncached build of the full dependency graph plus
+    # the shipped-shape clippy pass measured ~30 min on the standard
+    # runner; warm runs are minutes. 60 keeps the timeout a hang guard,
+    # not a cold-build ceiling.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: dst
+          # Push-only saving protects the long-lived main cache from PR
+          # eviction churn; PR runs still restore from it.
+          save-if: ${{ github.event_name == 'push' }}
+
+      # The whole active suite: lib proofs (arbiter, judges, classifiers,
+      # census guards) + scenario pins + the torn-init pin. Instruments
+      # stay #[ignore]d — nightly's job.
+      - name: DST pinned suite
+        run: cargo test -p omnigraph-dst --locked
+
+      # The dst crate's dep enables omnigraph-engine/dst, and resolver-2
+      # unification carries that into every --workspace build — so this
+      # job is the one per-PR gate that lints the engine's SHIPPED shape
+      # (default features, dst compiled out; releases build with -p).
+      - name: Clippy shipped engine shape (no dst)
+        run: cargo clippy -p omnigraph-engine -p omnigraph-storage --all-targets --locked -- -D warnings

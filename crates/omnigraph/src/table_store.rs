@@ -5,7 +5,7 @@ use arrow_array::{
 use arrow_schema::SchemaRef;
 use datafusion::common::{
     DataFusionError,
-    tree_node::{Transformed, TreeNode},
+    tree_node::{Transformed, TreeNode, TreeNodeRecursion},
 };
 use datafusion::execution::{
     context::{SessionConfig, SessionContext},
@@ -34,8 +34,8 @@ use lance::dataset::{
     WriteMode, WriteParams,
 };
 use lance::datatypes::Schema as LanceSchema;
-use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::{
     datatypes::BlobHandling,
     utils::{
@@ -54,7 +54,7 @@ use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::{num::NonZero, sync::Arc};
 
 use crate::blob::{
@@ -67,6 +67,8 @@ use crate::storage_layer::{
     ForkOutcome, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
     PendingScanBudget, ProvenInsertChunk,
 };
+
+pub(crate) mod fts_compat;
 
 /// Durable proof carried by an OmniGraph insertion-only transaction.
 ///
@@ -109,11 +111,20 @@ const ORDERED_SCAN_MAX_INPUT_BATCH_BYTES: u64 = ORDERED_SCAN_MEMORY_BYTES / 4;
 /// ordered plan after `scan_stream_with` chose the ordinary Lance executor.
 pub(crate) struct ScanTuning<'a> {
     scanner: &'a mut Scanner,
+    full_text_columns: Option<HashSet<String>>,
 }
 
 impl ScanTuning<'_> {
     pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.scanner.filter_expr(filter);
+        self
+    }
+
+    /// Scope the scan to exactly these physical fragments — a scan-input
+    /// selection like `filter_expr`, not an ordering decision, so the bounded
+    /// executor routing chosen by `scan_stream_with` is unaffected.
+    pub(crate) fn with_fragments(&mut self, fragments: Vec<Fragment>) -> &mut Self {
+        self.scanner.with_fragments(fragments);
         self
     }
 
@@ -136,7 +147,15 @@ impl ScanTuning<'_> {
         &mut self,
         query: FullTextSearchQuery,
     ) -> std::result::Result<&mut Self, lance::Error> {
+        // Compound queries can mix explicit and omitted columns. Any omitted
+        // leaf allows Lance to search all FTS columns, not just named leaves.
+        let columns = if query.query.is_missing_column() {
+            HashSet::new()
+        } else {
+            query.columns()
+        };
         self.scanner.full_text_search(query)?;
+        self.full_text_columns = Some(columns);
         Ok(self)
     }
 
@@ -236,6 +255,46 @@ pub(crate) fn has_insert_absence_certificate(transaction: &Transaction) -> bool 
         .as_ref()
         .and_then(|properties| properties.get(INSERT_ABSENCE_PROPERTY))
         .is_some_and(|value| value == INSERT_ABSENCE_V1)
+}
+
+/// Durable provenance marker asserting that a keyed-write `Operation::Update`
+/// was produced by an OmniGraph keyed writer, whose `merge_insert` never uses a
+/// delete-capable by-source arm (Lance defaults the unmatched-by-source arm to
+/// Keep, and the `no_delete_capable_merge_arm_in_engine_source` guard forbids
+/// such an arm in engine source). It therefore removed no unmatched-by-source
+/// row, so a
+/// consumer may treat the interval as row-set-preserving. Unlike
+/// `insert_absence`, it is stamped on every **general keyed MergeInsert
+/// update** — real upserts, known-present updates, and stream strict inserts —
+/// not only pure inserts; batch/proven strict inserts carry `insert_absence`
+/// instead, which consumers accept as the same no-delete proof. It is
+/// read-advisory: a missing marker only forces a fall-back, never a
+/// correctness change. A persisted `Update` from an external Lance merge
+/// (e.g. adopted via `repair --force`) carries no marker and cannot be pruned.
+pub(crate) const NO_BY_SOURCE_DELETE_PROPERTY: &str = "omnigraph.no_by_source_delete";
+pub(crate) const NO_BY_SOURCE_DELETE_V1: &str = "v1";
+
+pub(crate) fn has_no_by_source_delete_marker(transaction: &Transaction) -> bool {
+    transaction
+        .transaction_properties
+        .as_ref()
+        .and_then(|properties| properties.get(NO_BY_SOURCE_DELETE_PROPERTY))
+        .is_some_and(|value| value == NO_BY_SOURCE_DELETE_V1)
+}
+
+/// Stamp [`NO_BY_SOURCE_DELETE_PROPERTY`] on a keyed-write transaction before it
+/// is committed. Unconditional: every OmniGraph keyed `merge_insert` is
+/// no-by-source-delete by construction. Mirrors `certify_insert_absence`'s
+/// property write; the two keys are distinct, so a pure-insert upsert that also
+/// earns `insert_absence` carries both.
+fn stamp_no_by_source_delete(transaction: &mut Transaction) {
+    let properties = transaction
+        .transaction_properties
+        .get_or_insert_with(|| Arc::new(HashMap::new()));
+    Arc::make_mut(properties).insert(
+        NO_BY_SOURCE_DELETE_PROPERTY.to_string(),
+        NO_BY_SOURCE_DELETE_V1.to_string(),
+    );
 }
 
 /// Verify one persisted link of the insertion-absence proof chain and return
@@ -986,7 +1045,26 @@ impl TableStore {
         if entry.native_dataset_branch.is_none() {
             return self.open_at_entry(entry).await;
         }
-        let dataset = entry.open(&self.root_uri, None).await?;
+        let dataset = match entry.open(&self.root_uri, None).await {
+            Ok(dataset) => dataset,
+            Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
+                // Cleanup can reclaim a pinned version of a live fork (a
+                // retention gap), but a fork whose ref is gone altogether was
+                // reclaimed with its deleted branch; under incarnation-suffixed
+                // refs the branch may already live on elsewhere. Prove absence
+                // from the ref listing; any other failure keeps its own class.
+                if self.named_fork_is_absent(entry).await? {
+                    return Err(OmniError::manifest(format!(
+                        "change feed table '{}' has no persisted native-branch incarnation \
+                         witness at the reopened dataset; the branch was deleted and \
+                         recreated during the poll",
+                        entry.type_key,
+                    )));
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         // Defense-in-depth only: the e_tag is not a sufficient native-branch
         // incarnation witness (a store may persist none, and equality is a
         // content heuristic, not identity). The load-bearing witness is the
@@ -1008,6 +1086,20 @@ impl TableStore {
             )));
         }
         Ok(dataset)
+    }
+
+    /// Whether a named fork the accepted snapshot places on `entry` no longer
+    /// exists as a ref on its table dataset. Absence is proven from the ref
+    /// listing so a transient or permission failure surfaces as itself rather
+    /// than as a branch-lifecycle conclusion.
+    pub(crate) async fn named_fork_is_absent(&self, entry: &DatasetEntry) -> Result<bool> {
+        let Some(native) = entry.native_dataset_branch.as_deref() else {
+            return Ok(false);
+        };
+        let uri = self.dataset_uri(&entry.dataset_path);
+        let root = self.open_dataset_head(&uri, None).await?;
+        let refs = crate::branch_control::list_branch_contents(&root).await?;
+        Ok(!refs.contains_key(native))
     }
 
     pub async fn open_dataset_head(
@@ -1656,7 +1748,7 @@ impl TableStore {
     }
 
     /// Streaming scan with an explicit initial row estimate and approximate
-    /// decoded-byte target. Lance's byte target overrides the row setting;
+    /// decoded-byte target. Lance composes the byte target with the row setting;
     /// neither setting is a hard limit, and Lance may emit a larger batch.
     /// Callers that retain or
     /// transform batches must charge the actual batch against their own hard
@@ -1683,6 +1775,12 @@ impl TableStore {
         .await
     }
 
+    /// INPUT CONTRACT: every `projection` name must exist in `ds`'s schema at
+    /// its pinned version (`Scanner::project` errors typed otherwise);
+    /// `filter`/`order_by` columns need not be projected (Lance
+    /// late-materializes them); a caller whose consumers correlate rows must
+    /// project the correlating column itself — compare `scan_with_pending`,
+    /// which enforces that for its key column.
     pub fn scan_stream_with<F>(
         ds: &Dataset,
         projection: Option<&[&str]>,
@@ -1698,7 +1796,7 @@ impl TableStore {
         // The storage and mutation futures are already deeply composed; making
         // every closure here another generic async layer pushes otherwise
         // ordinary integration-test crates past rustc's layout-query limit.
-        let prepared: Result<(Scanner, bool)> = (|| {
+        let prepared = (|| -> Result<_> {
             let has_ordering = order_by
                 .as_ref()
                 .is_some_and(|ordering| !ordering.is_empty());
@@ -1717,14 +1815,19 @@ impl TableStore {
                     .order_by(Some(ordering))
                     .map_err(OmniError::storage)?;
             }
-            configure(&mut ScanTuning {
+            let mut tuning = ScanTuning {
                 scanner: &mut scanner,
-            })?;
-            Ok((scanner, has_ordering))
+                full_text_columns: None,
+            };
+            configure(&mut tuning)?;
+            let columns = tuning.full_text_columns;
+            Ok((scanner, has_ordering, columns))
         })();
 
+        let dataset = ds.clone();
         Box::pin(async move {
-            let (scanner, has_ordering) = prepared?;
+            let (scanner, has_ordering, columns) = prepared?;
+            Self::validate_full_text_scan(&dataset, &scanner, columns).await?;
             if has_ordering {
                 Self::execute_bounded_ordered_scan(
                     scanner,
@@ -1741,6 +1844,62 @@ impl TableStore {
                 scanner.try_into_stream().await.map_err(OmniError::storage)
             }
         })
+    }
+
+    /// Check only full-text reads, against this exact snapshot's artifacts.
+    /// SQL SDK filters are inspected as typed expressions, not string-matched.
+    pub(crate) async fn validate_full_text_scan(
+        ds: &Dataset,
+        scanner: &Scanner,
+        columns: Option<HashSet<String>>,
+    ) -> Result<()> {
+        let mut all_columns = columns.as_ref().is_some_and(HashSet::is_empty);
+        let mut requested = columns.unwrap_or_default();
+        if let Some(filter) = scanner.get_expr_filter().map_err(OmniError::storage)? {
+            filter
+                .apply(|expr| {
+                    if let Expr::ScalarFunction(function) = expr
+                        && function.name() == "contains_tokens"
+                    {
+                        match function.args.first() {
+                            Some(Expr::Column(column)) => {
+                                requested.insert(column.name.clone());
+                            }
+                            // An unfamiliar expression must not bypass the gate.
+                            _ => all_columns = true,
+                        }
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .map_err(OmniError::datafusion)?;
+        }
+        if !all_columns && requested.is_empty() {
+            return Ok(());
+        }
+        let fields: HashSet<_> = requested
+            .iter()
+            .filter_map(|column| ds.schema().field(column).map(|field| field.id))
+            .collect();
+        // Ordinary reads return above without allocating. Keep the optional
+        // storage-validation future out of every caller's scan/count state.
+        Box::pin(async move {
+            let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+            for index in indices.iter().filter(|index| {
+                (Self::is_full_text_index(index) || index.index_details.is_none())
+                    && (all_columns || index.fields.iter().any(|field| fields.contains(field)))
+            }) {
+                fts_compat::verify_index(ds, index).await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) fn is_full_text_index(index: &IndexMetadata) -> bool {
+        index
+            .index_details
+            .as_ref()
+            .is_some_and(|details| IndexDetails(details.clone()).supports_fts())
     }
 
     async fn execute_bounded_ordered_scan(
@@ -2064,14 +2223,13 @@ impl TableStore {
     /// True if any non-system index on `ds` leaves at least one current
     /// fragment uncovered, i.e. rows that the index does not yet account for
     /// (appended after the index was built, or rewritten by compaction). Such
-    /// fragments are scanned unindexed until a reindex (`optimize_indices`)
-    /// folds them in. Returns false when every index covers every fragment, or
+    /// fragments are scanned unindexed until index maintenance covers them
+    /// (full-text requires explicit rebuilding). Returns false when every index covers every fragment, or
     /// when the table has no (non-system) indices to optimize. A `None`
     /// `fragment_bitmap` means Lance cannot report coverage for that index, so
     /// we do not treat it as uncovered (mirrors `key_column_index_coverage`).
     ///
-    /// Used by `optimize` to decide whether an otherwise-already-compacted
-    /// table still has index work to do.
+    /// This reports physical coverage, not whether ordinary optimize can fix it.
     pub async fn has_unindexed_fragments(ds: &Dataset) -> Result<bool> {
         let indices = ds.load_indices().await.map_err(OmniError::storage)?;
         let frag_ids: Vec<u32> = ds.fragments().iter().map(|f| f.id as u32).collect();
@@ -2088,7 +2246,63 @@ impl TableStore {
         Ok(false)
     }
 
+    /// One eligibility rule for optimize planning and execution. Full-text
+    /// folding cannot establish analyzer proof; unknown kinds cannot be planned.
+    pub(crate) fn can_fold_index(index: &IndexMetadata) -> bool {
+        !is_system_index(index) && index.index_details.is_some() && !Self::is_full_text_index(index)
+    }
+
+    /// Coverage candidates for ordinary optimize. Scalar segments use Lance's
+    /// per-name union: collectively complete coverage is a scalar no-op.
+    /// Vectors retain per-segment candidacy because default optimize can
+    /// rebalance a partition even when the segment union covers every fragment.
+    pub(crate) async fn has_foldable_unindexed_fragments(ds: &Dataset) -> Result<bool> {
+        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+        let mut names = std::collections::BTreeSet::new();
+        for index in indices.iter().filter(|index| Self::can_fold_index(index)) {
+            if index
+                .index_details
+                .as_ref()
+                .is_some_and(|details| IndexDetails(details.clone()).is_vector())
+            {
+                if index.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                    ds.fragments()
+                        .iter()
+                        .any(|fragment| !bitmap.contains(fragment.id as u32))
+                }) {
+                    return Ok(true);
+                }
+            } else {
+                names.insert(index.name.as_str());
+            }
+        }
+        for name in names {
+            // As on the public coverage surface, unknown coverage is not
+            // evidence of work. Such legacy inventory needs explicit handling.
+            if indices
+                .iter()
+                .any(|index| index.name == name && index.fragment_bitmap.is_none())
+            {
+                continue;
+            }
+            if !ds
+                .unindexed_fragments(name)
+                .await
+                .map_err(OmniError::storage)?
+                .is_empty()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {
+        if let Some(filter) = &filter {
+            let mut scanner = ds.scan();
+            scanner.filter(filter).map_err(OmniError::storage)?;
+            Self::validate_full_text_scan(ds, &scanner, None).await?;
+        }
         ds.count_rows(filter).await.map_err(OmniError::storage)
     }
 
@@ -2162,6 +2376,7 @@ impl TableStore {
                 let control_session = crate::lance_access::control_session();
                 let params = WriteParams {
                     mode: WriteMode::Create,
+                    store_params: Some(crate::storage::lance_store_params_for_uri(dataset_uri)?),
                     enable_stable_row_ids: true,
                     data_storage_version: Some(LanceFileVersion::V2_2),
                     allow_external_blob_outside_bases: true,
@@ -3383,11 +3598,13 @@ impl TableStore {
             ));
         }
 
+        let store_params = crate::storage::lance_store_params_for_uri(dataset_uri)?;
         let dataset = CommitBuilder::new(dataset_uri)
             .use_stable_row_ids(true)
             .with_storage_format(LanceFileVersion::V2_2)
             .enable_v2_manifest_paths(true)
             .with_session(self.session.clone())
+            .with_store_params(store_params)
             .with_skip_auto_cleanup(true)
             .with_max_retries(0)
             .execute(staged.transaction)
@@ -3460,6 +3677,7 @@ impl TableStore {
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
         let params = WriteParams {
             mode: WriteMode::Create,
+            store_params: Some(crate::storage::lance_store_params_for_uri(dataset_uri)?),
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,
@@ -3503,15 +3721,10 @@ impl TableStore {
     ///
     /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
-        // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
-        // preserves the source dataset's flag through `Operation::Overwrite`
-        // when WriteParams omits it (pinned by
-        // `stage_overwrite_preserves_stable_row_ids` in table_store/staged_tests.rs),
-        // but setting it explicitly keeps the invariant documented at every Overwrite site
-        // (see docs/storage.md "Stable row IDs"). Setting it on an existing
-        // dataset that was created without stable row IDs is a no-op per
-        // Lance's row-id-lineage spec, so this stays correct for legacy
-        // datasets.
+        // Existing graph datasets retain stable row IDs through Overwrite;
+        // keep the flag explicit at this write site too. This is not the
+        // separate Lance migration API for legacy datasets without stable IDs.
+        // See `stage_overwrite_preserves_stable_row_ids` and docs/dev/lance.md.
         let (transaction, mut new_fragments) = if batch.num_rows() == 0 {
             let schema = LanceSchema::try_from(batch.schema().as_ref())
                 .map_err(OmniError::lance_internal)?;
@@ -3551,18 +3764,12 @@ impl TableStore {
             };
             (transaction, new_fragments)
         };
-        // Overwrite REPLACES every committed fragment, and Lance restarts
-        // fragment-ID and row-ID counters at the post-commit version.
-        // For our pre-commit staged view we need to:
-        //   1) Renumber temporary fragment IDs (Lance returns them as
-        //      `id = 0` from `execute_uncommitted` — see stage_append
-        //      for the same fix). For Overwrite there are no committed
-        //      fragments to collide with (they're all in
-        //      removed_fragment_ids below), so start at 1.
-        //   2) For stable-row-id datasets, assign row_id_meta starting
-        //      at 0 (Overwrite is a fresh-start) so `scan_with_staged`
-        //      doesn't hit the "Missing row id meta" panic in
-        //      lance-6.0.1 dataset/rowids.rs:22.
+        // These IDs belong only to the pre-commit scan view. All committed
+        // fragments are removed below, so provisional fragment IDs starting
+        // at 1 and row IDs starting at 0 cannot collide within that view.
+        // Only the cloned fragments are annotated: the untouched transaction
+        // lets Lance 11 allocate committed IDs above the historical high-water
+        // marks. Staged IDs must never be treated as committed identity.
         assign_fragment_ids(&mut new_fragments, 1);
         if ds.manifest.uses_stable_row_ids() {
             assign_row_id_meta(&mut new_fragments, 0)?;
@@ -3610,6 +3817,7 @@ impl TableStore {
         let mut new_indices = Vec::with_capacity(specs.len());
         let mut new_names = std::collections::HashSet::with_capacity(specs.len());
         let mut vector_builds = 0usize;
+        let mut full_text_fields = HashSet::new();
 
         for spec in specs {
             let (column, index_type) = match spec {
@@ -3624,15 +3832,15 @@ impl TableStore {
             }
 
             let mut ds_clone = ds.clone();
-            let new_idx = match spec {
+            let mut new_idx = match spec {
                 IndexBuildSpec::BTree { column, name } => {
                     let params = ScalarIndexParams::default();
                     let columns = [column.as_str()];
                     let mut builder =
                         ds_clone.create_index_builder(&columns, IndexType::BTree, &params);
-                    // An explicit name keeps this BTREE from replacing a
-                    // same-column index of another kind under Lance's shared
-                    // default name (see `IndexBuildSpec::BTree`).
+                    // Same-snapshot builders cannot see each other's new
+                    // default names; companions need explicit distinct names
+                    // even with Lance 11's sequential collision avoidance.
                     if let Some(name) = name {
                         builder = builder.name(name.clone());
                     }
@@ -3673,6 +3881,10 @@ impl TableStore {
                     new_idx.name, new_idx.dataset_version, read_version
                 )));
             }
+            if matches!(spec, IndexBuildSpec::FullText { .. }) {
+                fts_compat::write_certificate(ds, &mut new_idx).await?;
+                full_text_fields.extend(new_idx.fields.iter().copied());
+            }
             if !new_names.insert(new_idx.name.clone()) {
                 return Err(OmniError::manifest_internal(format!(
                     "stage_create_indices produced duplicate index name '{}'",
@@ -3684,7 +3896,14 @@ impl TableStore {
 
         let removed_indices: Vec<IndexMetadata> = existing_indices
             .iter()
-            .filter(|idx| new_names.contains(&idx.name))
+            .filter(|idx| {
+                new_names.contains(&idx.name)
+                    || (Self::is_full_text_index(idx)
+                        && idx
+                            .fields
+                            .iter()
+                            .any(|field| full_text_fields.contains(field)))
+            })
             .cloned()
             .collect();
         let transaction = TransactionBuilder::new(
@@ -3753,6 +3972,7 @@ impl TableStore {
             scanner.filter(f).map_err(OmniError::storage)?;
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
+        Self::validate_full_text_scan(ds, &scanner, None).await?;
         let stream = scanner
             .try_into_stream()
             .await
@@ -4069,6 +4289,7 @@ impl TableStore {
             scanner.filter(&f).map_err(OmniError::storage)?;
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
+        Self::validate_full_text_scan(ds, &scanner, None).await?;
         let count = scanner.count_rows().await.map_err(OmniError::storage)?;
         Ok(count as usize)
     }
@@ -4162,6 +4383,7 @@ impl TableStore {
         let control_session = crate::lance_access::control_session();
         let params = WriteParams {
             mode: WriteMode::Create,
+            store_params: Some(crate::storage::lance_store_params_for_uri(dataset_uri)?),
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,
@@ -4286,7 +4508,7 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
         let row_ids = next_row_id..(next_row_id + physical_rows);
         let sequence = RowIdSequence::from(row_ids);
         let serialized = write_row_ids(&sequence);
-        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
         next_row_id += physical_rows;
     }
     Ok(())
@@ -4918,7 +5140,7 @@ fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &
     Ok(())
 }
 
-fn exact_id_primary_key_field_id(ds: &Dataset, context: &'static str) -> Result<i32> {
+pub(crate) fn exact_id_primary_key_field_id(ds: &Dataset, context: &'static str) -> Result<i32> {
     let primary_key = ds.schema().unenforced_primary_key();
     if primary_key.len() == 1
         && primary_key[0].name == "id"
@@ -5588,7 +5810,7 @@ fn validate_proven_insert_source_batch(batch: &RecordBatch, table_key: &str) -> 
 /// Preserve all conflict metadata Lance returned while exposing the physical
 /// fragment delta needed by read-your-writes scans.
 fn staged_keyed_merge_result(
-    uncommitted: UncommittedMergeInsert,
+    mut uncommitted: UncommittedMergeInsert,
     context: &'static str,
 ) -> Result<StagedWrite> {
     let (new_fragments, removed_fragment_ids) = match &uncommitted.transaction.operation {
@@ -5609,6 +5831,13 @@ fn staged_keyed_merge_result(
             )));
         }
     };
+    // This is the single chokepoint for every general OmniGraph keyed
+    // `merge_insert` Update (upsert, known-present update, stream strict
+    // insert), none of which use a by-source-delete arm. Stamp the durable
+    // no-by-source-delete marker before the transaction is committed, so the CDC
+    // candidate-pruning classifier can trust this persisted `Update` removed no
+    // rows (an external merge adopted via `repair --force` carries no marker).
+    stamp_no_by_source_delete(&mut uncommitted.transaction);
     Ok(StagedWrite::with_commit_metadata(
         uncommitted.transaction,
         StagedCommitMetadata::affected_rows(uncommitted.affected_rows),

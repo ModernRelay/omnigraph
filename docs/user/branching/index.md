@@ -1,76 +1,120 @@
-# Branches, Commits, Snapshots
+# Branches, Commits, and History
 
-## L1 — Lance per-dataset branches
+A branch is an isolated, durable graph history. Use branches to prepare and
+review a multi-step change without exposing intermediate results on `main`.
 
-Lance supports branching at the dataset level: a branch is a named lineage of versions, and a copy-on-write fork creates a new branch from a source branch at a given version.
+## Branch workflow
 
-## L2 — Graph-level branches
+```bash
+# Create an isolated branch from main.
+omnigraph branch create review/add-benchmark --from main --store graph.omni
 
-OmniGraph builds *graph branches* on top with one authoritative `__manifest`
-ref whose dataset entries form a coherent graph snapshot; backing-dataset forks are
-created lazily on first write:
+# Write and inspect it.
+omnigraph load --data benchmark.jsonl --mode append \
+  --branch review/add-benchmark graph.omni
+omnigraph query sources_for_claim --query queries.gq \
+  --params '{"claim":"lower-latency"}' \
+  --branch review/add-benchmark --store graph.omni
 
-- **Create** (`branch create` / `branch create --from <target>`) — the name `main` is disallowed; fails if the branch exists. Logically atomic: the branch becomes visible only when its authoritative ref exists, so a name never half-exists in graph reads. If storage interruption leaves only Lance's unreachable shallow-clone directory, the next same-name create reclaims it and retries automatically.
-- **List** (`branch list`) — returns public branches, **filtering the internal** `__schema_apply_lock__` branch.
-- **Delete** (`branch delete`) — refuses if there are descendants on the branch, or if it is the current branch. Once its authoritative ref is removed, the branch is gone from every snapshot even if reclaiming a now-unreachable storage directory needs a later retry. Owned per-dataset forks are reclaimed best-effort; same-name create/first write safely reconciles relevant leftovers, and [`cleanup`](../operations/maintenance.md) remains the general backstop.
-- **Lazy forking**: a branch only forks a backing dataset when that dataset is first mutated on it. Pure-read branches share storage with their source. If two writers race to first-write the same branch, the loser gets a retryable "refresh and retry".
-- **Names are path-prefix-disjoint while live.** Slash-separated names are
-  supported (`review/2026-07`), but `review` and `review/2026-07` cannot both be
-  live because Lance stores them in overlapping physical directories. Choose
-  sibling names, or delete the existing ancestor/descendant first.
-- **Delete branches after merging.** Branches are designed as short-lived
-  transactions: create → write → merge → delete. A merged branch is not cleaned
-  up automatically — it stays in `branch list`, and every live branch caps how
-  far [`cleanup`](../operations/maintenance.md) can GC the main versions it
-  inherited, so stale merged branches quietly retain old data. Pass
-  `--delete-branch` to [`branch merge`](merge.md) (or `delete_branch: true` on
-  the merge endpoint) to do it in one step.
+# Publish its result to main, then remove the source branch.
+omnigraph branch merge review/add-benchmark --into main --delete-branch \
+  --store graph.omni
+```
 
-Graph branch create/delete are coordinated across handles in one writer
-process. Until Lance exposes conditional native ref mutation, separate writer
-processes must not concurrently control branches on the same graph.
+List and delete branches with:
 
-For a legacy graph that already contains path-prefix-overlapping live names,
-recovery also preserves the leaf-first escape hatch. If read-write open finds an
-unresolved first-touch sidecar for an ancestor dataset fork while a live path-child
-remains, it never deletes the child's storage. When the interrupted write owns no
-dataset effect, it leaves the sidecar in place and completes the open so you can
-delete the descendant branch leaf-first. When the same sidecar owns a partial
-dataset effect, open fails closed because cleanup and rollback must finish together;
-remove the descendant through an already-open handle or an offline Lance-level
-branch tool, then reopen. The next read-write open reclaims the ancestor residue,
-rolls back the partial effect, and retires the sidecar. `omnigraph repair` is not
-that offline tool: it correctly refuses to run while a recovery sidecar is pending.
+```bash
+omnigraph branch list --store graph.omni
+omnigraph branch delete review/abandoned --store graph.omni
+```
 
-## L2 — Commit graph
+Creating a branch defaults to `main` when `--from` is omitted. A load can create
+a missing target branch by combining `--branch <name>` with `--from <base>`.
 
-Each graph commit carries a ULID id, the graph branch and graph manifest version
-it published, its parent commit (two parents for a merge commit, one for a
-linear commit), the actor who made it, and a creation timestamp.
+Branches are cheap until written: unchanged data remains shared with the source.
+A branch remains after a normal merge, so prefer `--delete-branch` or delete it
+when review is complete. Live branches retain the history they depend on and can
+prevent `omnigraph cleanup` from reclaiming old data.
 
-- Every successful publish (load / change / merge / schema apply) appends one commit.
-- Merge commits have two parents; linear commits have one.
-- Inspect history with `commit list` and `commit show`. Listings are newest
-  first. `--branch <name>` shows the history reachable from that branch's head
-  (the main commits inherited up to the fork plus the branch's own commits);
-  omitting it shows `main`.
+Branch names may contain `/`, but live names must not be path prefixes of one
+another. For example, `review` and `review/alice` cannot coexist. `main` is
+reserved. A branch with descendants must be deleted leaf-first. A path segment
+may not end in `.` followed by 26 upper-case letters and digits: that shape is
+reserved for OmniGraph's internal per-life branch identity. Ordinary dotted
+names such as `release.1.2` are fine.
 
-## L2 — Snapshots & time travel
+Deleting a branch and creating another with the same name yields a fresh
+branch: it shares no storage with the deleted one, and readers that captured
+the deleted branch fail with a typed error rather than seeing the new data.
+`branch delete` returns once the branch is logically deleted; its per-dataset
+storage is reclaimed in the background (bounded by a 600-second watchdog), and
+branch operations that would conflict with that reclaim wait for it. The CLI
+and server join in-flight reclaims before exit, and `omnigraph cleanup`
+remains the backstop for anything abandoned.
 
-Reading a branch at a past version, or a single entity at a past version, is
-covered on the [time travel](time-travel.md) page. Merging branches and the
-conflict kinds are on the [merge](merge.md) page.
+Branch-control operations are safe across handles in one writer process. Do not
+run branch create/delete control concurrently from separate writer processes
+against the same graph.
 
-## L2 — Internal system branches
+## Atomicity model
 
-- `__schema_apply_lock__` — serializes schema migrations; filtered from `branch list` but used internally.
+OmniGraph does not provide connection-scoped `BEGIN` and `ROLLBACK`.
 
-## L2 — Recovery audit trail
+| Scope | Guarantee |
+|---|---|
+| One mutation query | All statements publish as one commit or none become visible. |
+| One load request | The complete batch publishes as one commit or none becomes visible. |
+| Several commands on a branch | Each command that publishes a change is a durable branch commit. Earlier commands are not rolled back if a later one fails. |
+| Branch merge | The resulting source state becomes visible on the target in one atomic commit. |
 
-Interrupted multi-dataset writes are recovered automatically the next time the
-graph is opened read-write. Each completed recovery is recorded internally in
-`_graph_commit_recoveries.lance`. A roll-forward keeps the interrupted
-writer's original commit id and actor; rollback and legacy recovery commits use
-the reserved actor `omnigraph:recovery`. Consequently, `commit list` is not a
-complete recovery log, and the CLI does not currently expose a query for the
-internal recovery-audit dataset.
+Deleting an abandoned branch discards that workspace from normal access, but it
+is an explicit lifecycle action rather than transaction rollback.
+
+## Commits
+
+Every write that publishes a change records a graph commit. A successful
+mutation that matches no entities publishes no commit. A commit includes its
+id, parent, branch, actor when known, and timestamp. Merge commits have two
+parents.
+
+```bash
+omnigraph commit list graph.omni --branch main
+omnigraph commit show <commit-id> --uri graph.omni
+```
+
+`commit list` is newest first. Omitting `--branch` shows history reachable from
+`main`; selecting a branch includes the history inherited at its fork plus its
+own commits.
+
+## Historical reads
+
+Every read targets either a live branch or an immutable graph commit. Take a
+`graph_commit_id` from `commit list --json` and pass it as the snapshot:
+
+```bash
+omnigraph query sources_for_claim --query queries.gq \
+  --params '{"claim":"lower-latency"}' \
+  --snapshot <graph-commit-id> --store graph.omni
+```
+
+A query stays on one snapshot for its entire lifetime. Historical reads can
+eventually fail after destructive cleanup removes the versions that commit
+needs. Branch deletion can likewise end access to branch-only history.
+
+## Changes and feeds
+
+Inspect the logical changes made by one commit:
+
+```bash
+omnigraph commit changes <commit-id> --store graph.omni --json
+```
+
+For continuous consumption, `omnigraph changes poll` follows complete commits
+on one branch and returns an opaque resume cursor. If cleanup has reclaimed
+required history, create a coherent snapshot and new cursor with
+`omnigraph changes baseline`.
+
+See [Changes and Change Feeds](changes.md) for filters, pagination, cursor
+checkpointing, and `410` retention-gap recovery.
+
+See [Merging Branches](merge.md) for merge outcomes and conflict handling.

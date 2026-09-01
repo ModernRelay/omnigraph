@@ -1,0 +1,2123 @@
+//! Synchronous containment supervisor for one measured repetition worker.
+//!
+//! The caller runs this module from `spawn_blocking` and transfers ownership of
+//! the disposable workspace into that blocking task. A canceled async caller
+//! therefore cannot drop the store while a child mutation is still live.
+
+use std::collections::VecDeque;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use crate::ValidatedCase;
+use crate::branch_merge::{BranchMergePlan, TARGET_BRANCH};
+use crate::machine::MachineIdentityV1;
+use crate::reset::{MetadataDigest, PhysicalDigest};
+use crate::runner::{
+    ChildProcessEvidence, MergePhaseEvidenceForm, RepObservation, RunnerError, RunnerResult,
+    configure_benchmark_worker_environment, validate_successful_merge_phase_topology,
+    validate_worker_build_attestation,
+};
+use crate::worker_protocol::{
+    ChildFrameV1, MAX_WORKER_FRAME_BYTES, ParentFrameV1, WORKER_PROTOCOL_VERSION, WorkerBuildV1,
+    WorkerRequestV1, WorkerStageV1, write_frame,
+};
+
+const AUXILIARY_DEADLINE_FLOOR: Duration = Duration::from_secs(300);
+// `deadline_seconds: null` means the experiment declares no operation
+// deadline, not that the harness may wait forever. This independent ceiling
+// bounds the worker without turning the ceiling into experiment identity.
+const UNDECLARED_MEASUREMENT_WATCHDOG: Duration = Duration::from_secs(3_600);
+const PROTOCOL_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+const REAP_DEADLINE: Duration = Duration::from_secs(10);
+const PROCESS_GROUP_POLL: Duration = Duration::from_millis(10);
+const PIPE_POLL: Duration = Duration::from_millis(10);
+const PIPE_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
+const PIPE_STOP_DEADLINE: Duration = Duration::from_secs(1);
+const MAX_CHILD_FRAMES: usize = 8;
+const STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone)]
+pub(crate) struct SupervisionInput {
+    pub worker_executable: PathBuf,
+    pub expected_worker_executable_sha256: String,
+    /// The first worker establishes this identity. Later workers must report
+    /// it exactly before the supervisor sends Begin.
+    pub expected_machine: Option<MachineIdentityV1>,
+    pub fixture_manifest_sha256: String,
+    pub repetition: u32,
+    pub case: ValidatedCase,
+    pub repetition_root: PathBuf,
+    pub worker_scratch_root: PathBuf,
+    pub physical_digest: PhysicalDigest,
+    pub metadata_digest: MetadataDigest,
+    pub deadline: Option<Duration>,
+    #[cfg(test)]
+    pub auxiliary_deadline_override: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupervisedRepetition {
+    pub sample: RepObservation,
+    pub worker_build: WorkerBuildV1,
+    pub machine: MachineIdentityV1,
+}
+
+/// Supervise one fresh worker process through exactly one mutation.
+#[cfg(unix)]
+pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<SupervisedRepetition> {
+    if !lower_sha256(&input.fixture_manifest_sha256) {
+        return Err(RunnerError::new(
+            "fixture_stamp_invalid",
+            "repetition input does not carry a canonical pre-measurement fixture stamp digest",
+        )
+        .with_repetition(input.repetition));
+    }
+    let measurement_watchdog = measurement_watchdog(&input);
+    let mut command = Command::new(&input.worker_executable);
+    configure_benchmark_worker_environment(&mut command, &input.worker_scratch_root);
+    command
+        .arg("__worker-v1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_child_process_group(&mut command);
+    let mut child = command.spawn().map_err(|error| {
+        RunnerError::new(
+            "worker_spawn_failed",
+            format!(
+                "could not spawn repetition worker {}: {error}",
+                input.worker_executable.display()
+            ),
+        )
+        .with_repetition(input.repetition)
+    })?;
+    let process_group = i32::try_from(child.id()).map_err(|_| {
+        let _ = child.kill();
+        let _ = child.wait();
+        RunnerError::new(
+            "worker_pid_overflow",
+            "worker process identifier does not fit the process-group API",
+        )
+        .with_repetition(input.repetition)
+    })?;
+    let (_, empty_frames) = mpsc::channel();
+    let mut worker = WorkerProcess {
+        child,
+        stdin_commands: None,
+        stdin_stop: None,
+        stdin_done: None,
+        stdin_thread: None,
+        frames: empty_frames,
+        stdout_stop: None,
+        stdout_done: None,
+        stdout_thread: None,
+        stderr_stop: None,
+        stderr_result: None,
+        stderr_thread: None,
+        process_group,
+        repetition: input.repetition,
+        declared_deadline: input.deadline,
+        measurement_watchdog,
+        started: Instant::now(),
+        reaped: None,
+    };
+    let Some(stdin) = worker.child.stdin.take() else {
+        return worker.kill_error(
+            "pipe-setup",
+            "worker_pipe_failed",
+            "worker stdin was not piped",
+        );
+    };
+    let stdin_writer = match spawn_stdin_writer(stdin) {
+        Ok(writer) => writer,
+        Err(error) => {
+            return worker.kill_error(
+                "writer-setup",
+                "worker_writer_spawn_failed",
+                format!("could not start worker stdin writer: {error}"),
+            );
+        }
+    };
+    worker.stdin_commands = Some(stdin_writer.commands);
+    worker.stdin_stop = Some(stdin_writer.stop);
+    worker.stdin_done = Some(stdin_writer.done);
+    worker.stdin_thread = Some(stdin_writer.thread);
+    let Some(stdout) = worker.child.stdout.take() else {
+        return worker.kill_error(
+            "pipe-setup",
+            "worker_pipe_failed",
+            "worker stdout was not piped",
+        );
+    };
+    let Some(stderr) = worker.child.stderr.take() else {
+        return worker.kill_error(
+            "pipe-setup",
+            "worker_pipe_failed",
+            "worker stderr was not piped",
+        );
+    };
+    let frame_reader = match spawn_frame_reader(stdout) {
+        Ok(reader) => reader,
+        Err(error) => {
+            return worker.kill_error(
+                "reader-setup",
+                "worker_reader_spawn_failed",
+                format!("could not start worker stdout reader: {error}"),
+            );
+        }
+    };
+    worker.frames = frame_reader.frames;
+    worker.stdout_stop = Some(frame_reader.stop);
+    worker.stdout_done = Some(frame_reader.done);
+    worker.stdout_thread = Some(frame_reader.thread);
+    let (stderr_stop, stderr_result, stderr_thread) = match spawn_stderr_reader(stderr) {
+        Ok(reader) => reader,
+        Err(error) => {
+            return worker.kill_error(
+                "reader-setup",
+                "worker_reader_spawn_failed",
+                format!("could not start worker stderr reader: {error}"),
+            );
+        }
+    };
+    worker.stderr_stop = Some(stderr_stop);
+    worker.stderr_result = Some(stderr_result);
+    worker.stderr_thread = Some(stderr_thread);
+
+    let request = ParentFrameV1::Request {
+        protocol_version: WORKER_PROTOCOL_VERSION,
+        request: Box::new(WorkerRequestV1 {
+            repetition: input.repetition,
+            case: input.case.definition.clone(),
+            expected_point_id: input.case.point_id.clone(),
+            expected_case_digest: input.case.case_digest.clone(),
+            repetition_root: input.repetition_root.clone(),
+            worker_scratch_root: input.worker_scratch_root.clone(),
+            expected_physical_digest: input.physical_digest.clone(),
+            expected_metadata_digest: input.metadata_digest.clone(),
+        }),
+    };
+    if let Err(error) = worker.write(&request, PROTOCOL_WRITE_DEADLINE) {
+        return worker.kill_error("request-write", "worker_protocol_error", error);
+    }
+
+    let auxiliary_deadline = auxiliary_deadline(&input);
+    let ready = match worker.receive(auxiliary_deadline) {
+        Ok(frame) => frame,
+        Err(ReceiveFailure::Timeout) => {
+            return worker.kill_error(
+                "prepare-timeout",
+                "worker_prepare_timeout",
+                format!(
+                    "repetition {} did not finish open/cache preparation within {} seconds",
+                    input.repetition,
+                    auxiliary_deadline.as_secs()
+                ),
+            );
+        }
+        Err(ReceiveFailure::Protocol(message)) => {
+            return worker.kill_error("prepare-protocol", "worker_protocol_error", message);
+        }
+    };
+    let (worker_build, machine) = match ready {
+        ChildFrameV1::Ready {
+            protocol_version,
+            repetition,
+            point_id,
+            case_digest,
+            worker_build,
+            machine,
+            physical_digest,
+            metadata_digest,
+        } if protocol_version == WORKER_PROTOCOL_VERSION
+            && repetition == input.repetition
+            && point_id == input.case.point_id
+            && case_digest == input.case.case_digest
+            && physical_digest == input.physical_digest
+            && metadata_digest == input.metadata_digest =>
+        {
+            if let Err(error) = validate_worker_build_attestation(
+                &worker_build,
+                &input.expected_worker_executable_sha256,
+            ) {
+                return worker.kill_error(
+                    "prepare-protocol",
+                    "worker_protocol_error",
+                    format!("worker build attestation was invalid: {}", error.message),
+                );
+            }
+            if let Err(error) = machine.validate() {
+                return worker.kill_error(
+                    "prepare-protocol",
+                    "worker_protocol_error",
+                    format!("worker machine identity was invalid: {error}"),
+                );
+            }
+            if input
+                .expected_machine
+                .as_ref()
+                .is_some_and(|expected| expected != &machine)
+            {
+                return worker.kill_error(
+                    "prepare-protocol",
+                    "worker_machine_identity_changed",
+                    "repetition worker machine identity differs from the first worker in this run",
+                );
+            }
+            (worker_build, machine)
+        }
+        ChildFrameV1::Failed {
+            stage,
+            code,
+            message,
+            settled_sample,
+            ..
+        } => {
+            if settled_sample.is_some()
+                || !matches!(
+                    stage,
+                    WorkerStageV1::Bootstrap
+                        | WorkerStageV1::Prepare
+                        | WorkerStageV1::Finalize
+                        | WorkerStageV1::Protocol
+                )
+            {
+                return worker.kill_error(
+                    "prepare-protocol",
+                    "worker_protocol_error",
+                    format!("worker sent an out-of-order {stage:?} failure before Ready"),
+                );
+            }
+            return worker.structured_failure(stage, code, message, settled_sample);
+        }
+        frame => {
+            return worker.kill_error(
+                "prepare-protocol",
+                "worker_protocol_error",
+                format!("worker sent an invalid ready frame: {frame:?}"),
+            );
+        }
+    };
+
+    let begin = ParentFrameV1::Begin {
+        protocol_version: WORKER_PROTOCOL_VERSION,
+        repetition: input.repetition,
+    };
+    let measured_started = Instant::now();
+    if let Err(error) = worker.write(
+        &begin,
+        remaining(measurement_watchdog, measured_started.elapsed()),
+    ) {
+        return worker.kill_error("begin-write", "worker_protocol_error", error);
+    }
+    let settled = match worker.receive(remaining(measurement_watchdog, measured_started.elapsed()))
+    {
+        Ok(frame) => frame,
+        Err(ReceiveFailure::Timeout) => {
+            let (code, message) =
+                measurement_timeout_failure(&input, "did not settle before the supervisor ceiling");
+            return worker.kill_error("measure-timeout", code, message);
+        }
+        Err(ReceiveFailure::Protocol(message)) => {
+            return worker.kill_error("measure-protocol", "worker_protocol_error", message);
+        }
+    };
+    let supervisor_settled_elapsed = measured_started.elapsed();
+    if supervisor_settled_elapsed > measurement_watchdog {
+        let (code, message) = measurement_timeout_failure(
+            &input,
+            "was not observed settled before the supervisor ceiling",
+        );
+        return worker.kill_error("measure-timeout", code, message);
+    }
+    let settled_elapsed_us = match settled {
+        ChildFrameV1::Settled {
+            protocol_version,
+            repetition,
+            elapsed_us,
+        } if protocol_version == WORKER_PROTOCOL_VERSION && repetition == input.repetition => {
+            elapsed_us
+        }
+        ChildFrameV1::Failed {
+            stage,
+            code,
+            message,
+            settled_sample,
+            ..
+        } => {
+            if settled_sample.is_some()
+                || !matches!(
+                    stage,
+                    WorkerStageV1::Prepare
+                        | WorkerStageV1::Measure
+                        | WorkerStageV1::Finalize
+                        | WorkerStageV1::Protocol
+                )
+            {
+                return worker.kill_error(
+                    "measure-protocol",
+                    "worker_protocol_error",
+                    format!("worker sent an out-of-order {stage:?} failure before Settled"),
+                );
+            }
+            return worker.structured_failure(stage, code, message, settled_sample);
+        }
+        frame => {
+            return worker.kill_error(
+                "measure-protocol",
+                "worker_protocol_error",
+                format!("worker sent an invalid settled frame: {frame:?}"),
+            );
+        }
+    };
+    let supervisor_settled_elapsed_us = duration_us(supervisor_settled_elapsed);
+    if settled_elapsed_us > supervisor_settled_elapsed_us {
+        return worker.kill_error(
+            "measure-protocol",
+            "worker_protocol_error",
+            format!(
+                "worker reported elapsed_us={settled_elapsed_us}, but the parent observed only {supervisor_settled_elapsed_us}us from before Begin through Settled"
+            ),
+        );
+    }
+
+    let complete = match worker.receive(auxiliary_deadline) {
+        Ok(frame) => frame,
+        Err(ReceiveFailure::Timeout) => {
+            return worker.kill_error(
+                "verify-timeout",
+                "worker_verification_timeout",
+                format!(
+                    "repetition {} settled but did not finish exact verification within {} seconds",
+                    input.repetition,
+                    auxiliary_deadline.as_secs()
+                ),
+            );
+        }
+        Err(ReceiveFailure::Protocol(message)) => {
+            return worker.kill_error("verify-protocol", "worker_protocol_error", message);
+        }
+    };
+    let mut sample = match complete {
+        ChildFrameV1::Complete {
+            protocol_version,
+            point_id,
+            case_digest,
+            sample,
+        } if protocol_version == WORKER_PROTOCOL_VERSION
+            && point_id == input.case.point_id
+            && case_digest == input.case.case_digest =>
+        {
+            *sample
+        }
+        ChildFrameV1::Failed {
+            stage,
+            code,
+            message,
+            settled_sample,
+            ..
+        } => {
+            if !matches!(
+                stage,
+                WorkerStageV1::Measure
+                    | WorkerStageV1::Verify
+                    | WorkerStageV1::Finalize
+                    | WorkerStageV1::Protocol
+            ) {
+                return worker.kill_error(
+                    "verify-protocol",
+                    "worker_protocol_error",
+                    format!("worker sent an out-of-order {stage:?} failure after Settled"),
+                );
+            }
+            if let Some(sample) = settled_sample.as_deref()
+                && let Err(message) = validate_sample_admission(sample, &input, settled_elapsed_us)
+            {
+                return worker.kill_error(
+                    "verify-protocol",
+                    "worker_protocol_error",
+                    format!("worker failure carried an invalid settled sample: {message}"),
+                );
+            }
+            return worker.structured_failure(stage, code, message, settled_sample);
+        }
+        frame => {
+            return worker.kill_error(
+                "verify-protocol",
+                "worker_protocol_error",
+                format!("worker sent an invalid completion frame: {frame:?}"),
+            );
+        }
+    };
+    if let Err(message) = validate_sample_admission(&sample, &input, settled_elapsed_us) {
+        return worker.kill_error("finalize-protocol", "worker_protocol_error", message);
+    }
+
+    let child_exit = match worker.wait_for_exit(auxiliary_deadline) {
+        Ok(child_exit) => child_exit,
+        Err(message) => {
+            return worker.kill_error("exit-timeout", "worker_exit_timeout", message);
+        }
+    };
+    let group_gone = match process_group_is_gone(process_group) {
+        Ok(gone) => gone,
+        Err(error) => {
+            return worker.kill_error(
+                "group-proof",
+                "worker_group_probe_failed",
+                error.to_string(),
+            );
+        }
+    };
+    if !child_exit.status.success() || !group_gone {
+        return worker.kill_error(
+            "finalize-exit",
+            "worker_exit_failed",
+            format!(
+                "worker reported completion but exited with {}; process_group_gone={group_gone}",
+                child_exit.status
+            ),
+        );
+    }
+    let capture = worker.finish_capture();
+    let trailing_output = worker
+        .frames
+        .try_iter()
+        .map(|frame| match frame {
+            Ok(frame) => format!("unexpected trailing frame {frame:?}"),
+            Err(error) => error,
+        })
+        .collect::<Vec<_>>();
+    if !capture.threads_stopped
+        || !capture.stdout_clean_eof
+        || !capture.stderr.clean_eof
+        || !trailing_output.is_empty()
+    {
+        let detail = if trailing_output.is_empty() {
+            "worker stdio did not close cleanly".to_string()
+        } else {
+            trailing_output.join("; ")
+        };
+        return Err(RunnerError::new(
+            "worker_protocol_error",
+            format!("worker completion was followed by invalid output: {detail}"),
+        )
+        .with_repetition(input.repetition)
+        .with_child_process(process_evidence(
+            "finalize-protocol".to_string(),
+            input.deadline,
+            measurement_watchdog,
+            worker.started.elapsed(),
+            "worker-completed".to_string(),
+            Some(&child_exit),
+            group_gone,
+            capture,
+        )));
+    }
+
+    sample.peak_rss_bytes = Some(child_exit.peak_rss_bytes);
+
+    if let Some(deadline) = input.deadline {
+        let deadline_us = duration_us(deadline);
+        if settled_elapsed_us > deadline_us {
+            return Err(RunnerError::new(
+                "merge_deadline_exceeded",
+                format!(
+                    "repetition {} settled in {}us, beyond the declared {}us deadline",
+                    input.repetition, settled_elapsed_us, deadline_us
+                ),
+            )
+            .with_repetition(input.repetition)
+            .with_settled_sample(sample));
+        }
+    }
+    Ok(SupervisedRepetition {
+        sample,
+        worker_build,
+        machine,
+    })
+}
+
+fn lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<SupervisedRepetition> {
+    Err(RunnerError::new(
+        "unsupported_worker_platform",
+        format!(
+            "process-isolated repetition supervision is unavailable on this platform for repetition {}",
+            input.repetition
+        ),
+    ))
+}
+
+#[cfg(unix)]
+struct WorkerProcess {
+    child: Child,
+    stdin_commands: Option<SyncSender<StdinWrite>>,
+    stdin_stop: Option<Arc<AtomicBool>>,
+    stdin_done: Option<Receiver<()>>,
+    stdin_thread: Option<JoinHandle<()>>,
+    frames: Receiver<Result<ChildFrameV1, String>>,
+    stdout_stop: Option<Arc<AtomicBool>>,
+    stdout_done: Option<Receiver<Result<(), String>>>,
+    stdout_thread: Option<JoinHandle<()>>,
+    stderr_stop: Option<Arc<AtomicBool>>,
+    stderr_result: Option<Receiver<StderrCapture>>,
+    stderr_thread: Option<JoinHandle<()>>,
+    process_group: i32,
+    repetition: u32,
+    declared_deadline: Option<Duration>,
+    measurement_watchdog: Duration,
+    started: Instant,
+    reaped: Option<ReapedChild>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct ReapedChild {
+    status: ExitStatus,
+    peak_rss_bytes: u64,
+}
+
+#[cfg(unix)]
+impl WorkerProcess {
+    fn write(&mut self, frame: &ParentFrameV1, timeout: Duration) -> Result<(), String> {
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, frame).map_err(|error| error.to_string())?;
+        let commands = self
+            .stdin_commands
+            .as_ref()
+            .ok_or_else(|| "worker stdin is already closed".to_string())?;
+        let (completed, completion) = mpsc::sync_channel(1);
+        match commands.try_send(StdinWrite { encoded, completed }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err("worker stdin already has a pending protocol write".to_string());
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err("worker stdin writer stopped unexpectedly".to_string());
+            }
+        }
+        match completion.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(format!(
+                "worker stdin write did not complete within {}ms",
+                timeout.as_millis()
+            )),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err("worker stdin writer stopped before acknowledging the frame".to_string())
+            }
+        }
+    }
+
+    fn receive(&self, timeout: Duration) -> Result<ChildFrameV1, ReceiveFailure> {
+        match self.frames.recv_timeout(timeout) {
+            Ok(Ok(frame)) if frame.protocol_version() == WORKER_PROTOCOL_VERSION => Ok(frame),
+            Ok(Ok(frame)) => Err(ReceiveFailure::Protocol(format!(
+                "worker sent protocol version {}, expected {}",
+                frame.protocol_version(),
+                WORKER_PROTOCOL_VERSION
+            ))),
+            Ok(Err(message)) => Err(ReceiveFailure::Protocol(message)),
+            Err(RecvTimeoutError::Timeout) => Err(ReceiveFailure::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Err(ReceiveFailure::Protocol(
+                "worker stdout closed before the expected frame".to_string(),
+            )),
+        }
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> Result<ReapedChild, String> {
+        if let Some(reaped) = &self.reaped {
+            return Ok(reaped.clone());
+        }
+        let started = Instant::now();
+        loop {
+            match wait4_nonblocking(self.process_group) {
+                Ok(Some(reaped)) => {
+                    self.reaped = Some(reaped.clone());
+                    return Ok(reaped);
+                }
+                Ok(None) if started.elapsed() < timeout => {
+                    std::thread::sleep(PROCESS_GROUP_POLL);
+                }
+                Ok(None) => {
+                    return Err(format!(
+                        "worker did not exit within {} seconds after its terminal frame",
+                        timeout.as_secs()
+                    ));
+                }
+                Err(error) => return Err(format!("could not wait for worker: {error}")),
+            }
+        }
+    }
+
+    fn structured_failure<T>(
+        mut self,
+        stage: WorkerStageV1,
+        code: String,
+        message: String,
+        settled_sample: Option<Box<RepObservation>>,
+    ) -> RunnerResult<T> {
+        let status = self.wait_for_exit(REAP_DEADLINE).ok();
+        let group_gone = process_group_is_gone(self.process_group).unwrap_or(false);
+        if status.is_none() || !group_gone {
+            return self.kill_error(
+                "structured-failure-reap",
+                "worker_reap_failed",
+                format!(
+                    "worker sent {stage:?} failure `{code}` but did not exit cleanly enough to release its store"
+                ),
+            );
+        }
+        let capture = self.finish_capture();
+        let mut error = RunnerError::new(code, message)
+            .with_repetition(self.repetition)
+            .with_child_process(process_evidence(
+                format!("{stage:?}"),
+                self.declared_deadline,
+                self.measurement_watchdog,
+                self.started.elapsed(),
+                "worker-failed".to_string(),
+                status.as_ref(),
+                group_gone,
+                capture,
+            ));
+        if let Some(sample) = settled_sample {
+            error = error.with_settled_sample(*sample);
+        }
+        Err(error)
+    }
+
+    fn kill_error<T>(
+        mut self,
+        stage: &str,
+        code: &str,
+        message: impl Into<String>,
+    ) -> RunnerResult<T> {
+        let message = message.into();
+        let kill_result = kill_process_group(self.process_group);
+        let status = self.wait_for_exit(REAP_DEADLINE).ok();
+        let group_gone =
+            wait_for_process_group_gone(self.process_group, REAP_DEADLINE).unwrap_or(false);
+        let capture = if group_gone {
+            self.finish_capture()
+        } else {
+            CaptureOutcome::default()
+        };
+        let termination = match kill_result {
+            Ok(()) => "sigkill".to_string(),
+            Err(error) => format!("sigkill-failed: {error}"),
+        };
+        Err(RunnerError::new(code, message)
+            .with_repetition(self.repetition)
+            .with_child_process(process_evidence(
+                stage.to_string(),
+                self.declared_deadline,
+                self.measurement_watchdog,
+                self.started.elapsed(),
+                termination,
+                status.as_ref(),
+                group_gone,
+                capture,
+            )))
+    }
+
+    fn finish_capture(&mut self) -> CaptureOutcome {
+        self.stdin_commands.take();
+        let stdin_stopped = finish_pipe_thread(
+            "stdin writer",
+            self.stdin_done.take(),
+            self.stdin_stop.take(),
+            self.stdin_thread.take(),
+        )
+        .is_ok();
+        let stdout_result = finish_pipe_thread(
+            "stdout reader",
+            self.stdout_done.take(),
+            self.stdout_stop.take(),
+            self.stdout_thread.take(),
+        );
+        let stderr_result = finish_pipe_thread(
+            "stderr reader",
+            self.stderr_result.take(),
+            self.stderr_stop.take(),
+            self.stderr_thread.take(),
+        );
+        let stdout_clean_eof = matches!(&stdout_result, Ok(Ok(())));
+        let stderr_stopped = stderr_result.is_ok();
+        CaptureOutcome {
+            stderr: stderr_result.unwrap_or_else(|error| StderrCapture {
+                tail: format!("[stderr capture did not stop cleanly: {error}]").into_bytes(),
+                truncated: false,
+                clean_eof: false,
+            }),
+            stdout_clean_eof,
+            threads_stopped: stdin_stopped && stdout_result.is_ok() && stderr_stopped,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        let child_reaped = self.reaped.is_some();
+        let group_gone = process_group_is_gone(self.process_group).unwrap_or(false);
+        if !child_reaped || !group_gone {
+            let _ = kill_process_group(self.process_group);
+            let _ = self.wait_for_exit(REAP_DEADLINE);
+            let _ = wait_for_process_group_gone(self.process_group, REAP_DEADLINE);
+        }
+        let _ = self.finish_capture();
+    }
+}
+
+#[cfg(unix)]
+struct StdinWrite {
+    encoded: Vec<u8>,
+    completed: SyncSender<Result<(), String>>,
+}
+
+#[cfg(unix)]
+struct StdinWriter {
+    commands: SyncSender<StdinWrite>,
+    stop: Arc<AtomicBool>,
+    done: Receiver<()>,
+    thread: JoinHandle<()>,
+}
+
+#[cfg(unix)]
+fn spawn_stdin_writer(mut stdin: std::process::ChildStdin) -> std::io::Result<StdinWriter> {
+    set_nonblocking(&stdin)?;
+    let (send, receive) = mpsc::sync_channel::<StdinWrite>(1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let (done_send, done) = mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
+        .name("omnigraph-bench-worker-stdin".to_string())
+        .spawn(move || {
+            loop {
+                match receive.recv_timeout(PIPE_POLL) {
+                    Ok(write) => {
+                        let result =
+                            write_nonblocking(&mut stdin, &write.encoded, thread_stop.as_ref());
+                        let failed = result.is_err();
+                        let _ = write.completed.send(result);
+                        if failed {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) if !thread_stop.load(Ordering::Acquire) => {}
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            let _ = done_send.send(());
+        })?;
+    Ok(StdinWriter {
+        commands: send,
+        stop,
+        done,
+        thread,
+    })
+}
+
+#[cfg(unix)]
+enum ReceiveFailure {
+    Timeout,
+    Protocol(String),
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct StderrCapture {
+    tail: Vec<u8>,
+    truncated: bool,
+    clean_eof: bool,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct CaptureOutcome {
+    stderr: StderrCapture,
+    stdout_clean_eof: bool,
+    threads_stopped: bool,
+}
+
+#[cfg(unix)]
+struct FrameReader {
+    frames: Receiver<Result<ChildFrameV1, String>>,
+    stop: Arc<AtomicBool>,
+    done: Receiver<Result<(), String>>,
+    thread: JoinHandle<()>,
+}
+
+#[cfg(unix)]
+fn spawn_frame_reader(mut stdout: std::process::ChildStdout) -> std::io::Result<FrameReader> {
+    set_nonblocking(&stdout)?;
+    let (send, receive) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let (done_send, done) = mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
+        .name("omnigraph-bench-worker-stdout".to_string())
+        .spawn(move || {
+            let result = read_frame_pipe(&mut stdout, thread_stop.as_ref(), &send);
+            if let Err(error) = &result {
+                let _ = send.send(Err(error.clone()));
+            }
+            let _ = done_send.send(result);
+        })?;
+    Ok(FrameReader {
+        frames: receive,
+        stop,
+        done,
+        thread,
+    })
+}
+
+#[cfg(unix)]
+fn spawn_stderr_reader(
+    mut stderr: std::process::ChildStderr,
+) -> std::io::Result<(Arc<AtomicBool>, Receiver<StderrCapture>, JoinHandle<()>)> {
+    set_nonblocking(&stderr)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let (result_send, result) = mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
+        .name("omnigraph-bench-worker-stderr".to_string())
+        .spawn(move || {
+            let capture = read_stderr_pipe(&mut stderr, thread_stop.as_ref());
+            let _ = result_send.send(capture);
+        })?;
+    Ok((stop, result, thread))
+}
+
+#[cfg(unix)]
+fn set_nonblocking<T: std::os::fd::AsFd>(pipe: &T) -> std::io::Result<()> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+    let flags = fcntl(pipe, FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    fcntl(pipe, FcntlArg::F_SETFL(flags))
+        .map(|_| ())
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
+fn write_nonblocking(
+    writer: &mut impl Write,
+    encoded: &[u8],
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < encoded.len() {
+        if stop.load(Ordering::Acquire) {
+            return Err("worker stdin writer was stopped".to_string());
+        }
+        match writer.write(&encoded[offset..]) {
+            Ok(0) => return Err("worker stdin closed during a protocol frame".to_string()),
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(PIPE_POLL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    writer.flush().map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn read_frame_pipe(
+    reader: &mut impl Read,
+    stop: &AtomicBool,
+    send: &mpsc::Sender<Result<ChildFrameV1, String>>,
+) -> Result<(), String> {
+    let mut pending = Vec::new();
+    let mut frames = 0usize;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) if pending.is_empty() => return Ok(()),
+            Ok(0) => {
+                return Err(format!(
+                    "worker stdout ended with {} unterminated frame bytes",
+                    pending.len()
+                ));
+            }
+            Ok(read) => {
+                pending.extend_from_slice(&buffer[..read]);
+                while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                    let mut framed = pending.drain(..=newline).collect::<Vec<_>>();
+                    framed.pop();
+                    if framed.is_empty() {
+                        return Err("worker stdout contained an empty frame".to_string());
+                    }
+                    if framed.len() > MAX_WORKER_FRAME_BYTES {
+                        return Err(format!(
+                            "worker stdout frame has {} bytes; the limit is {MAX_WORKER_FRAME_BYTES}",
+                            framed.len()
+                        ));
+                    }
+                    frames += 1;
+                    if frames > MAX_CHILD_FRAMES {
+                        return Err(format!(
+                            "worker emitted more than {MAX_CHILD_FRAMES} protocol frames"
+                        ));
+                    }
+                    let frame = serde_json::from_slice::<ChildFrameV1>(&framed)
+                        .map_err(|error| format!("could not decode worker frame: {error}"))?;
+                    if send.send(Ok(frame)).is_err() {
+                        return Ok(());
+                    }
+                }
+                if pending.len() > MAX_WORKER_FRAME_BYTES {
+                    return Err(format!(
+                        "worker stdout unterminated frame exceeds {MAX_WORKER_FRAME_BYTES} bytes"
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    return Err(
+                        "worker stdout did not reach clean EOF before capture shutdown".to_string(),
+                    );
+                }
+                std::thread::sleep(PIPE_POLL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("worker stdout read failed: {error}")),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_stderr_pipe(reader: &mut impl Read, stop: &AtomicBool) -> StderrCapture {
+    let mut retained = VecDeque::with_capacity(STDERR_TAIL_BYTES);
+    let mut truncated = false;
+    let clean_eof = loop {
+        let mut buffer = [0_u8; 8192];
+        match reader.read(&mut buffer) {
+            Ok(0) => break true,
+            Ok(read) => retain_stderr(&mut retained, &buffer[..read], &mut truncated),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    break false;
+                }
+                std::thread::sleep(PIPE_POLL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                retain_stderr(
+                    &mut retained,
+                    format!("\n[stderr read failed: {error}]").as_bytes(),
+                    &mut truncated,
+                );
+                break false;
+            }
+        }
+    };
+    StderrCapture {
+        tail: retained.into_iter().collect(),
+        truncated,
+        clean_eof,
+    }
+}
+
+#[cfg(unix)]
+fn retain_stderr(retained: &mut VecDeque<u8>, bytes: &[u8], truncated: &mut bool) {
+    for byte in bytes {
+        if retained.len() == STDERR_TAIL_BYTES {
+            retained.pop_front();
+            *truncated = true;
+        }
+        retained.push_back(*byte);
+    }
+}
+
+#[cfg(unix)]
+fn finish_pipe_thread<T>(
+    name: &str,
+    result: Option<Receiver<T>>,
+    stop: Option<Arc<AtomicBool>>,
+    thread: Option<JoinHandle<()>>,
+) -> Result<T, String> {
+    let result = result.ok_or_else(|| format!("{name} result channel was not installed"))?;
+    let stop = stop.ok_or_else(|| format!("{name} stop flag was not installed"))?;
+    let thread = thread.ok_or_else(|| format!("{name} thread was not installed"))?;
+    let value = match result.recv_timeout(PIPE_DRAIN_DEADLINE) {
+        Ok(value) => value,
+        Err(RecvTimeoutError::Timeout) => {
+            stop.store(true, Ordering::Release);
+            result.recv_timeout(PIPE_STOP_DEADLINE).map_err(|error| {
+                format!("{name} did not stop after bounded drain and cancellation: {error}")
+            })?
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            return Err(format!("{name} stopped without a completion result"));
+        }
+    };
+    thread
+        .join()
+        .map_err(|_| format!("{name} panicked after reporting completion"))?;
+    Ok(value)
+}
+
+#[cfg(unix)]
+fn process_evidence(
+    stage: String,
+    declared_deadline: Option<Duration>,
+    measurement_watchdog: Duration,
+    elapsed: Duration,
+    termination: String,
+    child_exit: Option<&ReapedChild>,
+    process_group_gone: bool,
+    capture: CaptureOutcome,
+) -> ChildProcessEvidence {
+    use std::os::unix::process::ExitStatusExt;
+
+    ChildProcessEvidence {
+        stage,
+        declared_deadline_us: declared_deadline.map(duration_us),
+        measurement_watchdog_us: duration_us(measurement_watchdog),
+        supervisor_elapsed_us: duration_us(elapsed),
+        termination,
+        exit_code: child_exit.and_then(|exit| exit.status.code()),
+        signal: child_exit.and_then(|exit| exit.status.signal()),
+        peak_rss_bytes: child_exit.map(|exit| exit.peak_rss_bytes),
+        direct_child_reaped: child_exit.is_some(),
+        process_group_gone,
+        stdio_closed_cleanly: capture.threads_stopped
+            && capture.stdout_clean_eof
+            && capture.stderr.clean_eof,
+        stderr_tail: String::from_utf8_lossy(&capture.stderr.tail).into_owned(),
+        stderr_truncated: capture.stderr.truncated,
+        quarantined_workspace: None,
+    }
+}
+
+#[cfg(unix)]
+fn wait4_nonblocking(pid: i32) -> Result<Option<ReapedChild>, String> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut status = 0;
+    let mut usage = std::mem::MaybeUninit::<nix::libc::rusage>::zeroed();
+    loop {
+        // SAFETY: `status` and `usage` point to valid writable storage, and
+        // `pid` is the direct child identifier captured immediately at spawn.
+        let reaped =
+            unsafe { nix::libc::wait4(pid, &mut status, nix::libc::WNOHANG, usage.as_mut_ptr()) };
+        if reaped == 0 {
+            return Ok(None);
+        }
+        if reaped == pid {
+            // SAFETY: a successful `wait4` initialized the rusage output.
+            let usage = unsafe { usage.assume_init() };
+            return Ok(Some(ReapedChild {
+                status: ExitStatus::from_raw(status),
+                peak_rss_bytes: normalized_peak_rss_bytes(&usage),
+            }));
+        }
+        if reaped == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(nix::libc::EINTR) {
+                continue;
+            }
+            return Err(error.to_string());
+        }
+        return Err(format!(
+            "wait4 reaped unexpected process {reaped}; expected {pid}"
+        ));
+    }
+}
+
+#[cfg(unix)]
+fn normalized_peak_rss_bytes(usage: &nix::libc::rusage) -> u64 {
+    let peak = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+    #[cfg(target_os = "macos")]
+    return peak;
+    #[cfg(not(target_os = "macos"))]
+    return peak.saturating_mul(1024);
+}
+
+#[cfg(unix)]
+fn configure_child_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // The standard-library hook is async-signal-safe; a custom `pre_exec`
+    // closure in a multithreaded parent would not be.
+    command.process_group(0);
+}
+
+#[cfg(unix)]
+fn kill_process_group(process_group: i32) -> Result<(), String> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    match kill(Pid::from_raw(-process_group), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn process_group_is_gone(process_group: i32) -> Result<bool, String> {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    match kill(Pid::from_raw(-process_group), None) {
+        Ok(()) => Ok(false),
+        Err(Errno::ESRCH) => Ok(true),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_gone(process_group: i32, timeout: Duration) -> Result<bool, String> {
+    let started = Instant::now();
+    loop {
+        if process_group_is_gone(process_group)? {
+            return Ok(true);
+        }
+        if started.elapsed() >= timeout {
+            return Ok(false);
+        }
+        std::thread::sleep(PROCESS_GROUP_POLL);
+    }
+}
+
+#[cfg(unix)]
+fn validate_sample_admission(
+    sample: &RepObservation,
+    input: &SupervisionInput,
+    settled_elapsed_us: u64,
+) -> Result<(), String> {
+    let plan = BranchMergePlan::try_from(&input.case)
+        .map_err(|error| format!("parent could not derive the worker plan: {error}"))?;
+    let expected_intervals = u64::try_from(plan.diverged_tables)
+        .map_err(|_| "diverged table count does not fit u64".to_string())?;
+    let expected_rows = plan
+        .expected_merged_rows()
+        .map_err(|error| format!("parent could not derive expected merged rows: {error}"))?;
+    validate_successful_merge_phase_topology(
+        &sample.phases,
+        &sample.route,
+        expected_intervals,
+        MergePhaseEvidenceForm::StoredSample,
+    )
+    .map_err(|error| format!("worker sample phase topology invalid: {error}"))?;
+    let expected_outcome = "merged".to_string();
+    let expected_branch = TARGET_BRANCH.to_string();
+    let mut mismatches = Vec::new();
+    record_admission_mismatch(
+        &mut mismatches,
+        "repetition",
+        &input.repetition,
+        &sample.repetition,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "elapsed_us",
+        &settled_elapsed_us,
+        &sample.elapsed_us,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "input_physical_digest_sha256",
+        &input.physical_digest.digest_sha256,
+        &sample.input_physical_digest_sha256,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "peak_rss_bytes",
+        &None::<u64>,
+        &sample.peak_rss_bytes,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "outcome",
+        &expected_outcome,
+        &sample.outcome,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.branch",
+        &expected_branch,
+        &sample.verification.branch,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.tables",
+        &plan.tables,
+        &sample.verification.tables,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.rows",
+        &expected_rows,
+        &sample.verification.rows,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.exact_content",
+        &true,
+        &sample.verification.exact_content,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.source_exact_content",
+        &true,
+        &sample.verification.source_exact_content,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.main_exact_content",
+        &true,
+        &sample.verification.main_exact_content,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "verification.protected_heads_unchanged",
+        &true,
+        &sample.verification.protected_heads_unchanged,
+    );
+    record_admission_mismatch(
+        &mut mismatches,
+        "logical_store_calls.physical_attempts_observed",
+        &false,
+        &sample.logical_store_calls.physical_attempts_observed,
+    );
+    if !mismatches.is_empty() {
+        return Err(format!(
+            "worker sample failed parent admission: {}",
+            mismatches.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn record_admission_mismatch<T: std::fmt::Debug + PartialEq>(
+    mismatches: &mut Vec<String>,
+    field: &str,
+    expected: &T,
+    observed: &T,
+) {
+    if expected != observed {
+        mismatches.push(format!(
+            "{field}: expected={expected:?}, observed={observed:?}"
+        ));
+    }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn auxiliary_deadline(input: &SupervisionInput) -> Duration {
+    #[cfg(test)]
+    if let Some(override_deadline) = input.auxiliary_deadline_override {
+        return override_deadline;
+    }
+    measurement_watchdog(input).max(AUXILIARY_DEADLINE_FLOOR)
+}
+
+fn measurement_watchdog(input: &SupervisionInput) -> Duration {
+    input.deadline.unwrap_or(UNDECLARED_MEASUREMENT_WATCHDOG)
+}
+
+fn measurement_timeout_failure(input: &SupervisionInput, action: &str) -> (&'static str, String) {
+    match input.deadline {
+        Some(deadline) => (
+            "merge_deadline_exceeded",
+            format!(
+                "repetition {} {action} within the declared {} second deadline; the worker process group was killed and reaped",
+                input.repetition,
+                deadline.as_secs()
+            ),
+        ),
+        None => (
+            "worker_measurement_watchdog_exceeded",
+            format!(
+                "repetition {} {action} within the independent {} second safety watchdog for an operation with no declared deadline; the worker process group was killed and reaped",
+                input.repetition,
+                UNDECLARED_MEASUREMENT_WATCHDOG.as_secs()
+            ),
+        ),
+    }
+}
+
+fn remaining(total: Duration, elapsed: Duration) -> Duration {
+    total.saturating_sub(elapsed)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use crate::counting::LogicalCallCounts;
+    use crate::runner::{
+        ControlCallObservation, LogicalStoreCallObservation, VerificationObservation,
+        test_general_merge_route, test_general_merge_stored_phases,
+    };
+    use crate::worker_protocol::ChildFrameV1;
+    use crate::{ValidatedCase, parse_case};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, MutexGuard};
+
+    use super::*;
+
+    const TEST_REPETITION: u32 = 7;
+    // Protocol stubs perform no timed merge. Zero is a valid lower bound;
+    // even a complete process round trip need not consume a fixed duration.
+    const TEST_ELAPSED_US: u64 = 0;
+    const QUICK_DEADLINE: Duration = Duration::from_millis(250);
+    const BOUNDED_AUXILIARY_DEADLINE: Duration = Duration::from_secs(2);
+    const GENEROUS_DEADLINE: Duration = Duration::from_secs(10);
+    const GENEROUS_AUXILIARY_DEADLINE: Duration = Duration::from_secs(10);
+    static WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_case() -> ValidatedCase {
+        parse_case(include_str!(
+            "../../../benchmarks/cases/branch-merge-d50-warm.case-v1.yaml"
+        ))
+        .into_result()
+        .unwrap()
+    }
+
+    fn physical_digest() -> PhysicalDigest {
+        PhysicalDigest {
+            files: 3,
+            bytes: 42,
+            digest_sha256: "a".repeat(64),
+        }
+    }
+
+    fn metadata_digest() -> MetadataDigest {
+        MetadataDigest {
+            entries: 5,
+            files: 3,
+            directories: 2,
+            bytes: 42,
+            shape_sha256: "b".repeat(64),
+            state_sha256: "c".repeat(64),
+        }
+    }
+
+    fn machine_identity() -> MachineIdentityV1 {
+        MachineIdentityV1 {
+            format_version: crate::machine::MACHINE_IDENTITY_FORMAT_VERSION,
+            os_name: "macos".to_string(),
+            os_version: "15.6".to_string(),
+            kernel_version: "24.6.0".to_string(),
+            architecture: "aarch64".to_string(),
+            cpu_model: "Apple M4".to_string(),
+            logical_cores: 10,
+            physical_cores: 10,
+            total_memory_bytes: 32 * 1024 * 1024 * 1024,
+            resource_control: crate::machine::ResourceControlV1::MacosNative,
+            scheduling: crate::machine::SchedulingIdentityV1 {
+                nice_level: 0,
+                policy: crate::machine::SchedulerPolicyV1::Other,
+                priority: 0,
+                reset_on_fork: false,
+            },
+            resource_limits: crate::machine::ResourceLimitIdentityV1 {
+                scope_version: crate::machine::RESOURCE_LIMIT_SCOPE_VERSION,
+                values_sha256: "9".repeat(64),
+            },
+            machine_label: format!("hostname-sha256:{}", "8".repeat(64)),
+        }
+    }
+
+    fn worker_build() -> WorkerBuildV1 {
+        WorkerBuildV1 {
+            source_commit: "0".repeat(40),
+            source_tree_dirty: Some(false),
+            cargo_profile: "release".to_string(),
+            cargo_opt_level: "2".to_string(),
+            debug_assertions: false,
+            effective_lance_mem_pool_size: Box::new(
+                crate::runner::EffectiveEnvironmentValue::Unset,
+            ),
+            target_triple: "aarch64-apple-darwin".to_string(),
+            rustc_version: "rustc 1.97.1".to_string(),
+            declared_release_lto: "thin".to_string(),
+            declared_release_codegen_units: Some(16),
+            declared_release_strip: Some(true),
+            cargo_encoded_rustflags_present: Some(false),
+            release_profile_environment_overrides_supported: Some(true),
+            effective_codegen_options_proved: false,
+            engine_feature_flags: omnigraph::instrumentation::enabled_engine_cargo_features()
+                .iter()
+                .map(|feature| (*feature).to_string())
+                .collect(),
+            enabled_techniques: Vec::new(),
+            executable_sha256: "d".repeat(64),
+        }
+    }
+
+    fn supervision_input(worker_executable: PathBuf) -> (tempfile::TempDir, SupervisionInput) {
+        let workspace = tempfile::tempdir().unwrap();
+        let repetition_root = workspace.path().join("supervisor-test-fixture");
+        let worker_scratch_root = workspace.path().join("worker-scratch-00000007");
+        std::fs::create_dir(&repetition_root).unwrap();
+        std::fs::create_dir(&worker_scratch_root).unwrap();
+        let input = SupervisionInput {
+            worker_executable,
+            expected_worker_executable_sha256: worker_build().executable_sha256,
+            expected_machine: None,
+            fixture_manifest_sha256: "e".repeat(64),
+            repetition: TEST_REPETITION,
+            case: test_case(),
+            repetition_root,
+            worker_scratch_root,
+            physical_digest: physical_digest(),
+            metadata_digest: metadata_digest(),
+            deadline: Some(GENEROUS_DEADLINE),
+            auxiliary_deadline_override: Some(GENEROUS_AUXILIARY_DEADLINE),
+        };
+        (workspace, input)
+    }
+
+    #[test]
+    fn undeclared_operation_deadline_keeps_an_independent_safety_watchdog() {
+        let (_workspace, mut input) = supervision_input(PathBuf::from("/unused"));
+        input.deadline = None;
+
+        assert_eq!(
+            measurement_watchdog(&input),
+            UNDECLARED_MEASUREMENT_WATCHDOG
+        );
+        let (code, message) = measurement_timeout_failure(&input, "did not settle");
+        assert_eq!(code, "worker_measurement_watchdog_exceeded");
+        assert!(message.contains("no declared deadline"), "{message}");
+    }
+
+    fn ready_frame(input: &SupervisionInput) -> ChildFrameV1 {
+        ChildFrameV1::Ready {
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            repetition: input.repetition,
+            point_id: input.case.point_id.clone(),
+            case_digest: input.case.case_digest.clone(),
+            worker_build: worker_build(),
+            machine: machine_identity(),
+            physical_digest: input.physical_digest.clone(),
+            metadata_digest: input.metadata_digest.clone(),
+        }
+    }
+
+    fn settled_frame(input: &SupervisionInput) -> ChildFrameV1 {
+        ChildFrameV1::Settled {
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            repetition: input.repetition,
+            elapsed_us: TEST_ELAPSED_US,
+        }
+    }
+
+    fn valid_sample(input: &SupervisionInput) -> RepObservation {
+        let plan = BranchMergePlan::try_from(&input.case).unwrap();
+        let intervals = u64::try_from(plan.diverged_tables).unwrap();
+        RepObservation {
+            repetition: input.repetition,
+            input_physical_digest_sha256: input.physical_digest.digest_sha256.clone(),
+            elapsed_us: TEST_ELAPSED_US,
+            peak_rss_bytes: None,
+            outcome: "merged".to_string(),
+            phases: test_general_merge_stored_phases(intervals, intervals),
+            route: test_general_merge_route(intervals, intervals),
+            logical_store_calls: LogicalStoreCallObservation {
+                manifest: LogicalCallCounts::default(),
+                table: LogicalCallCounts::default(),
+                physical_attempts_observed: false,
+            },
+            control_store_calls: ControlCallObservation {
+                read_text: 0,
+                read_text_if_exists: 0,
+                read_text_versioned: 0,
+                exists: 0,
+                list_dir: 0,
+                mutation_calls: 0,
+                write_text: 0,
+                delete: 0,
+            },
+            verification: VerificationObservation {
+                branch: TARGET_BRANCH.to_string(),
+                tables: plan.tables,
+                rows: plan.expected_merged_rows().unwrap(),
+                exact_content: true,
+                source_exact_content: true,
+                main_exact_content: true,
+                protected_heads_unchanged: true,
+            },
+        }
+    }
+
+    fn complete_frame(input: &SupervisionInput, sample: RepObservation) -> ChildFrameV1 {
+        ChildFrameV1::Complete {
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            point_id: input.case.point_id.clone(),
+            case_digest: input.case.case_digest.clone(),
+            sample: Box::new(sample),
+        }
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    fn emit(frame: &ChildFrameV1) -> String {
+        let encoded = serde_json::to_string(frame).unwrap();
+        format!("printf '%s\\n' {}\n", shell_quote(&encoded))
+    }
+
+    fn worker_script(body: &str) -> (MutexGuard<'static, ()>, tempfile::TempDir, PathBuf) {
+        let guard = WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker-stub");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        (guard, directory, path)
+    }
+
+    fn normal_exchange(input: &SupervisionInput, complete: ChildFrameV1) -> String {
+        format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n{}{}",
+            emit(&ready_frame(input)),
+            emit(&settled_frame(input)),
+            emit(&complete),
+        )
+    }
+
+    fn assert_contained_failure(
+        result: RunnerResult<SupervisedRepetition>,
+        expected_code: &str,
+        expected_stage: &str,
+    ) -> RunnerError {
+        let error = result.unwrap_err();
+        assert_eq!(error.code, expected_code, "{error:?}");
+        let evidence = error
+            .context
+            .child_process
+            .as_ref()
+            .expect("spawned worker failures must carry containment evidence");
+        assert_eq!(evidence.stage, expected_stage, "{error:?}");
+        assert!(evidence.direct_child_reaped, "{evidence:?}");
+        assert!(evidence.peak_rss_bytes.is_some(), "{evidence:?}");
+        assert!(evidence.process_group_gone, "{evidence:?}");
+        error
+    }
+
+    #[test]
+    fn valid_worker_completes_ready_begin_settled_complete_protocol() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let expected = valid_sample(&input);
+        let body = normal_exchange(&input, complete_frame(&input, expected.clone()));
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        let mut observed = supervise_repetition(input).unwrap();
+
+        assert!(observed.sample.peak_rss_bytes.is_some(), "{observed:?}");
+        observed.sample.peak_rss_bytes = None;
+        assert_eq!(observed.sample, expected);
+        assert_eq!(observed.worker_build, worker_build());
+        assert_eq!(observed.machine, machine_identity());
+    }
+
+    #[test]
+    fn worker_cannot_report_more_elapsed_time_than_the_parent_observed() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let forged = ChildFrameV1::Settled {
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            repetition: input.repetition,
+            elapsed_us: u64::MAX,
+        };
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n{}",
+            emit(&ready_frame(&input)),
+            emit(&forged),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        let error = assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "measure-protocol",
+        );
+        assert!(
+            error.message.contains("the parent observed only"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn supervised_repetitions_use_distinct_worker_processes() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        input.auxiliary_deadline_override = Some(Duration::from_secs(5));
+        let expected = valid_sample(&input);
+        let body = format!(
+            "printf '%s\\n' \"$$\" >> \"$0.pids\"\nsleep 1\n{}",
+            normal_exchange(&input, complete_frame(&input, expected.clone()))
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker.clone();
+        let second = input.clone();
+
+        let first_thread = std::thread::spawn(move || supervise_repetition(input));
+        let second_thread = std::thread::spawn(move || supervise_repetition(second));
+        for result in [first_thread.join().unwrap(), second_thread.join().unwrap()] {
+            let observed = result.unwrap();
+            assert!(observed.sample.peak_rss_bytes.is_some(), "{observed:?}");
+            let mut sample = observed.sample;
+            sample.peak_rss_bytes = None;
+            assert_eq!(sample, expected);
+        }
+
+        let pid_log = PathBuf::from(format!("{}.pids", worker.display()));
+        let mut pids = std::fs::read_to_string(pid_log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2, "{pids:?}");
+        pids.sort();
+        pids.dedup();
+        assert_eq!(pids.len(), 2, "each repetition needs a fresh process");
+    }
+
+    #[test]
+    fn worker_that_never_reads_stdin_is_bounded_by_prepare_deadline() {
+        let (_guard, _directory, worker) = worker_script("sleep 300\n");
+        let (_workspace, mut input) = supervision_input(worker);
+        input.auxiliary_deadline_override = Some(QUICK_DEADLINE);
+        let started = Instant::now();
+
+        let error = assert_contained_failure(
+            supervise_repetition(input),
+            "worker_prepare_timeout",
+            "prepare-timeout",
+        );
+
+        assert!(started.elapsed() < Duration::from_secs(5), "{error:?}");
+        assert!(
+            error
+                .context
+                .child_process
+                .as_ref()
+                .unwrap()
+                .stdio_closed_cleanly
+        );
+    }
+
+    #[test]
+    fn worker_measurement_hang_is_killed_at_the_declared_deadline() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        input.deadline = Some(QUICK_DEADLINE);
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\nsleep 300\n",
+            emit(&ready_frame(&input)),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        let error = assert_contained_failure(
+            supervise_repetition(input),
+            "merge_deadline_exceeded",
+            "measure-timeout",
+        );
+
+        assert!(
+            error
+                .context
+                .child_process
+                .as_ref()
+                .unwrap()
+                .supervisor_elapsed_us
+                < duration_us(Duration::from_secs(5)),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn worker_verification_hang_after_settled_is_bounded() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        input.auxiliary_deadline_override = Some(BOUNDED_AUXILIARY_DEADLINE);
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n{}sleep 300\n",
+            emit(&ready_frame(&input)),
+            emit(&settled_frame(&input)),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+        let started = Instant::now();
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_verification_timeout",
+            "verify-timeout",
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn worker_that_reports_complete_but_does_not_exit_is_killed() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        input.auxiliary_deadline_override = Some(BOUNDED_AUXILIARY_DEADLINE);
+        let sample = valid_sample(&input);
+        let mut body = normal_exchange(&input, complete_frame(&input, sample));
+        body.push_str("sleep 300\n");
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+        let started = Instant::now();
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_exit_timeout",
+            "exit-timeout",
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn valid_trailing_frame_after_complete_is_rejected() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let sample = valid_sample(&input);
+        let mut body = normal_exchange(&input, complete_frame(&input, sample));
+        body.push_str(&emit(&ready_frame(&input)));
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        let error = assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "finalize-protocol",
+        );
+        assert!(
+            error
+                .context
+                .child_process
+                .as_ref()
+                .unwrap()
+                .stdio_closed_cleanly
+        );
+    }
+
+    #[test]
+    fn malformed_trailing_output_after_complete_is_rejected() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let sample = valid_sample(&input);
+        let mut body = normal_exchange(&input, complete_frame(&input, sample));
+        body.push_str("printf '%s\\n' '{not-json'\n");
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        let error = assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "finalize-protocol",
+        );
+        assert!(!error.message.is_empty());
+    }
+
+    #[test]
+    fn forged_ready_identity_is_rejected() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let mut forged = ready_frame(&input);
+        if let ChildFrameV1::Ready { point_id, .. } = &mut forged {
+            *point_id = "0".repeat(64);
+        }
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n",
+            emit(&forged),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "prepare-protocol",
+        );
+    }
+
+    #[test]
+    fn incomplete_worker_build_attestation_is_rejected_before_measurement() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let mut forged = ready_frame(&input);
+        if let ChildFrameV1::Ready { worker_build, .. } = &mut forged {
+            worker_build.rustc_version = "unknown".to_string();
+        }
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n",
+            emit(&forged),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "prepare-protocol",
+        );
+    }
+
+    #[test]
+    fn invalid_worker_machine_identity_is_rejected_before_measurement() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let mut forged = ready_frame(&input);
+        if let ChildFrameV1::Ready { machine, .. } = &mut forged {
+            machine.logical_cores = 0;
+        }
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n",
+            emit(&forged),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "prepare-protocol",
+        );
+    }
+
+    #[test]
+    fn changed_worker_machine_identity_is_rejected_before_begin() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let mut expected = machine_identity();
+        expected.machine_label = format!("hostname-sha256:{}", "7".repeat(64));
+        expected.validate().unwrap();
+        input.expected_machine = Some(expected);
+        let body = format!(
+            "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n",
+            emit(&ready_frame(&input)),
+        );
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_machine_identity_changed",
+            "prepare-protocol",
+        );
+    }
+
+    #[test]
+    fn out_of_order_failed_frame_cannot_smuggle_settled_evidence_before_ready() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let forged = ChildFrameV1::Failed {
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            stage: WorkerStageV1::Verify,
+            code: "forged-verification-failure".to_string(),
+            message: "settled evidence arrived before Ready".to_string(),
+            settled_sample: Some(Box::new(valid_sample(&input))),
+        };
+        let body = format!("IFS= read -r request || exit 90\n{}", emit(&forged),);
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "prepare-protocol",
+        );
+    }
+
+    #[test]
+    fn forged_complete_sample_is_rejected_by_parent_admission() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        let mut sample = valid_sample(&input);
+        sample.verification.rows += 1;
+        let body = normal_exchange(&input, complete_frame(&input, sample));
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_protocol_error",
+            "finalize-protocol",
+        );
+    }
+
+    #[test]
+    fn parent_admission_names_every_mismatched_field_and_both_values() {
+        type MutateSample = fn(&mut RepObservation);
+        let cases: &[(&str, MutateSample)] = &[
+            ("repetition", |sample| sample.repetition += 1),
+            ("elapsed_us", |sample| sample.elapsed_us += 1),
+            ("input_physical_digest_sha256", |sample| {
+                sample.input_physical_digest_sha256 = "f".repeat(64);
+            }),
+            ("peak_rss_bytes", |sample| sample.peak_rss_bytes = Some(1)),
+            ("outcome", |sample| sample.outcome = "conflict".to_string()),
+            ("route.table_walk_intervals", |sample| {
+                sample.route.table_walk_intervals += 1;
+            }),
+            ("TableWalk", |sample| {
+                sample
+                    .phases
+                    .iter_mut()
+                    .find(|phase| phase.phase == "TableWalk")
+                    .unwrap()
+                    .interval_count += 1;
+            }),
+            ("verification.branch", |sample| {
+                sample.verification.branch = "source".to_string();
+            }),
+            ("verification.tables", |sample| {
+                sample.verification.tables += 1;
+            }),
+            ("verification.rows", |sample| {
+                sample.verification.rows += 1;
+            }),
+            ("verification.exact_content", |sample| {
+                sample.verification.exact_content = false;
+            }),
+            ("verification.source_exact_content", |sample| {
+                sample.verification.source_exact_content = false;
+            }),
+            ("verification.main_exact_content", |sample| {
+                sample.verification.main_exact_content = false;
+            }),
+            ("verification.protected_heads_unchanged", |sample| {
+                sample.verification.protected_heads_unchanged = false;
+            }),
+            ("logical_store_calls.physical_attempts_observed", |sample| {
+                sample.logical_store_calls.physical_attempts_observed = true
+            }),
+        ];
+        let (_workspace, input) = supervision_input(PathBuf::from("/unused"));
+
+        for (field, mutate) in cases {
+            let mut sample = valid_sample(&input);
+            mutate(&mut sample);
+            let message = validate_sample_admission(&sample, &input, TEST_ELAPSED_US).unwrap_err();
+            assert!(message.contains(field), "field={field}: {message}");
+            assert!(message.contains("expected="), "field={field}: {message}");
+            assert!(message.contains("observed="), "field={field}: {message}");
+        }
+    }
+
+    #[test]
+    fn parent_admission_enforces_successful_merge_phase_topology() {
+        let (_workspace, input) = supervision_input(PathBuf::from("/unused"));
+        validate_sample_admission(&valid_sample(&input), &input, TEST_ELAPSED_US).unwrap();
+
+        let mut empty = valid_sample(&input);
+        empty.phases.clear();
+        assert!(
+            validate_sample_admission(&empty, &input, TEST_ELAPSED_US)
+                .unwrap_err()
+                .contains("missing mandatory phase `OuterPrepare`")
+        );
+
+        let mut missing_publish = valid_sample(&input);
+        missing_publish
+            .phases
+            .retain(|phase| phase.phase != "PhysicalPublish");
+        assert!(
+            validate_sample_admission(&missing_publish, &input, TEST_ELAPSED_US)
+                .unwrap_err()
+                .contains("missing mandatory phase `PhysicalPublish`")
+        );
+
+        let mut bad_enclosure = valid_sample(&input);
+        for phase in bad_enclosure
+            .phases
+            .iter_mut()
+            .filter(|phase| matches!(phase.phase.as_str(), "KeyedStage" | "KeyedCommit"))
+        {
+            phase.total_us = 60;
+            phase.max_us = 20;
+        }
+        assert!(
+            validate_sample_admission(&bad_enclosure, &input, TEST_ELAPSED_US)
+                .unwrap_err()
+                .contains("does not enclose")
+        );
+    }
+
+    #[test]
+    fn descendant_holding_inherited_pipes_prevents_false_clean_completion() {
+        let placeholder = PathBuf::from("/placeholder");
+        let (_workspace, mut input) = supervision_input(placeholder);
+        input.auxiliary_deadline_override = Some(GENEROUS_AUXILIARY_DEADLINE);
+        let sample = valid_sample(&input);
+        let mut body = normal_exchange(&input, complete_frame(&input, sample));
+        body.push_str("sleep 300 &\nexit 0\n");
+        let (_guard, _directory, worker) = worker_script(&body);
+        input.worker_executable = worker;
+
+        assert_contained_failure(
+            supervise_repetition(input),
+            "worker_exit_failed",
+            "finalize-exit",
+        );
+    }
+
+    #[test]
+    fn sigkill_reaps_a_dedicated_process_group_before_returning() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 300");
+        configure_child_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let process_group = i32::try_from(child.id()).unwrap();
+
+        kill_process_group(process_group).unwrap();
+        let started = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            assert!(started.elapsed() < REAP_DEADLINE);
+            std::thread::sleep(PROCESS_GROUP_POLL);
+        }
+        assert!(wait_for_process_group_gone(process_group, REAP_DEADLINE).unwrap());
+    }
+
+    #[test]
+    fn stderr_capture_retains_a_bounded_tail_without_blocking_the_writer() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("yes x | head -c 131072 >&2")
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let (_stop, captured, stderr) = spawn_stderr_reader(child.stderr.take().unwrap()).unwrap();
+        assert!(child.wait().unwrap().success());
+        let captured = captured.recv_timeout(PIPE_DRAIN_DEADLINE).unwrap();
+        stderr.join().unwrap();
+        assert_eq!(captured.tail.len(), STDERR_TAIL_BYTES);
+        assert!(captured.truncated);
+        assert!(captured.clean_eof);
+    }
+}

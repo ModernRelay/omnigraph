@@ -1,13 +1,13 @@
-//! Declared CLI "planes" (RFC-010 Slice 1).
+//! Declared CLI "planes" (RFC 0010 Slice 1).
 //!
 //! Every subcommand belongs to exactly one plane. This classification is the
 //! single source of truth the wrong-plane guard consumes — and that later
-//! RFC-010 slices (the capability surface, plane-grouped help) will consume
+//! RFC 0010 slices (the capability surface, plane-grouped help) will consume
 //! too. The `command_plane` match is **exhaustive on purpose**: adding a
 //! `Command` variant is a compile error until its plane is declared, so the
 //! surface cannot silently drift from the command set.
 //!
-//! See [docs/dev/rfc-010-cli-planes-restructure.md].
+//! See [docs/rfcs/0010-cli-planes.md].
 
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -43,7 +43,7 @@ impl std::fmt::Display for Plane {
     }
 }
 
-/// What a command *needs*, in the user-facing vocabulary (RFC-011). This is the
+/// What a command *needs*, in the user-facing vocabulary (RFC 0011). This is the
 /// language CLI errors and `--help` speak; `Plane` stays the internal classifier
 /// (`Capability` is derived from it, so the two cannot drift).
 ///
@@ -173,8 +173,9 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // The actor rides direct-engine writes (`any` via --store) and cluster
         // writes; Blob get/stat are reads and never consume it. Served writes
         // resolve the actor from the bearer token
-        // (rejected downstream with its own message), and `direct`
-        // maintenance verbs record no actor. `control` refines per command:
+        // (rejected downstream with its own message). On `direct`, full-text
+        // rebuild attributes its graph publication; other maintenance verbs
+        // record no actor. `control` refines per command:
         // `cluster apply`/`approve` attribute an actor — the other read-only
         // control verbs (status/plan/validate, policy, queries) never read it.
         ScopeFlag::As => match capability {
@@ -195,7 +196,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     command: ClusterCommand::Apply { .. } | ClusterCommand::Approve { .. },
                 }
             ),
-            Served | Direct | Local => false,
+            Direct => matches!(cmd, Command::RebuildFullTextIndexes { .. }),
+            Served | Local => false,
         },
         // A profile is consumed wherever scope resolution runs: the data/
         // served resolvers, the maintenance-URI resolver, and the policy/
@@ -258,11 +260,12 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         } => Plane::Storage,
         // `queries` and `policy` tooling now source their inputs from a
         // cluster's applied state (`--cluster`), so they live on the control
-        // plane (RFC-011 — omnigraph.yaml excised from the CLI).
+        // plane (RFC 0011 — omnigraph.yaml excised from the CLI).
         Command::Queries { .. } => Plane::Control,
         Command::Policy { .. } => Plane::Control,
         Command::Init { .. }
         | Command::Optimize { .. }
+        | Command::RebuildFullTextIndexes { .. }
         | Command::Repair { .. }
         | Command::Cleanup { .. }
         | Command::Lint { .. } => Plane::Storage,
@@ -315,6 +318,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Alias { .. } => "alias",
         Command::Policy { .. } => "policy",
         Command::Optimize { .. } => "optimize",
+        Command::RebuildFullTextIndexes { .. } => "rebuild-full-text-indexes",
         Command::Repair { .. } => "repair",
         Command::Cleanup { .. } => "cleanup",
         Command::Cluster { .. } => "cluster",
@@ -335,13 +339,14 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
     matches!(
         cmd,
         Command::Optimize { .. }
+            | Command::RebuildFullTextIndexes { .. }
             | Command::Repair { .. }
             | Command::Cleanup { .. }
             // `lint` can type-check a `.gq` against a cluster graph's schema
-            // (RFC-011): `--cluster <dir> --graph <id>`.
+            // (RFC 0011): `--cluster <dir> --graph <id>`.
             | Command::Lint { .. }
             // The policy/queries tooling addresses a cluster's applied state
-            // (RFC-011): `--cluster <dir>` selects the cluster, `--graph <id>`
+            // (RFC 0011): `--cluster <dir>` selects the cluster, `--graph <id>`
             // picks a graph's bundle/registry within it.
             | Command::Policy { .. }
             | Command::Queries { .. }
@@ -364,7 +369,7 @@ fn accepts_graph_selector(cmd: &Command) -> bool {
 /// - `--cluster` → cluster-scoped direct/control verbs;
 /// - `--graph` → any multi-graph scope: a served scope *or* a cluster one.
 ///
-/// RFC-010 Slice 1, generalized for RFC-011 cluster addressing.
+/// RFC 0010 Slice 1, generalized for RFC 0011 cluster addressing.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     if let Command::Alias { .. } = &cli.command {
         // The binding owns all addressing. The listing keeps its historical
@@ -413,9 +418,10 @@ fn remediation(capability: Capability, cmd: &Command) -> &'static str {
     match capability {
         Capability::Direct => match cmd {
             Command::Init { .. } => " Pass a storage URI.",
-            Command::Optimize { .. } | Command::Repair { .. } | Command::Cleanup { .. } => {
-                " Pass a storage URI, or --cluster <dir> --graph <id>."
-            }
+            Command::Optimize { .. }
+            | Command::RebuildFullTextIndexes { .. }
+            | Command::Repair { .. }
+            | Command::Cleanup { .. } => " Pass a storage URI, or --cluster <dir> --graph <id>.",
             _ => " Pass a storage URI.",
         },
         Capability::Control => match cmd {
@@ -488,6 +494,10 @@ mod tests {
                 parse(&["omnigraph", "optimize", "g.omni"]),
                 [false, true, true, true, false, true],
             ),
+            (
+                parse(&["omnigraph", "rebuild-full-text-indexes", "g.omni"]),
+                [false, true, true, true, true, true],
+            ),
             // `init` addresses its target positionally and never resolves a
             // scope — --store and --profile are rejected, not silently
             // ignored (unlike the other direct verbs).
@@ -548,6 +558,10 @@ mod tests {
         assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
         assert_eq!(
             cap(&["omnigraph", "optimize", "graph.omni"]),
+            Capability::Direct
+        );
+        assert_eq!(
+            cap(&["omnigraph", "rebuild-full-text-indexes", "graph.omni"]),
             Capability::Direct
         );
         assert_eq!(

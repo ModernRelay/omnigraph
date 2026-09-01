@@ -351,6 +351,73 @@ async fn write_op_count_ceiling_at_shallow_depth() {
     .await;
 }
 
+/// Multi-table staging (#504) stages independent tables concurrently. Concurrency
+/// is a latency change, not a cost change: the work a two-table mutation does must
+/// stay bounded by the tables it touches and stay **flat across commit-history
+/// depth**, exactly like the single-table writes above. Without this gate the
+/// concurrent path could regress into re-resolving per-table state at depth — each
+/// stage paying its own history-proportional scan — and the equivalence test in
+/// `writes.rs` would still pass, because the results would remain correct while the
+/// write got quadratically slower on a deep graph.
+///
+/// Measured on local FS: depth~10 `__manifest`=11 / data=21, depth~100
+/// `__manifest`=10 / data=19 — flat within fixture noise, so the slack below is
+/// headroom, not a hidden allowance for growth. A history-proportional regression
+/// is ~10x at depth 100 and trips this immediately.
+#[tokio::test]
+async fn multi_table_staging_is_flat_in_history() {
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for depth in [10u64, 100] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = local_graph(&dir).await;
+            commit_many(&mut db, depth as usize).await;
+            // Compact first for the same reason as the internal-table lock above:
+            // the gate pins the periodically-compacted production shape.
+            db.optimize().await.unwrap();
+
+            // One mutation, two tables (Person node + Knows edge) — the shape that
+            // actually exercises concurrent staging. The edge points at a node
+            // `commit_many` already created, so referential integrity passes.
+            let (result, io) = measure(db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person_and_friend",
+                &mixed_params(
+                    &[
+                        ("$name", &format!("staged_{depth}")),
+                        ("$friend", "commit_many_0"),
+                    ],
+                    &[("$age", 30)],
+                ),
+            ))
+            .await;
+            result.unwrap();
+            eprintln!(
+                "multi-table staging depth~{depth}: __manifest={} data={} total={}",
+                io.manifest_reads,
+                io.data_reads,
+                io.total_reads()
+            );
+            curve.push((depth, io));
+        }
+
+        assert_flat(
+            &curve,
+            |counts| counts.manifest_reads,
+            6,
+            "multi-table staging __manifest reads",
+        );
+        assert_flat(
+            &curve,
+            |counts| counts.data_reads,
+            6,
+            "multi-table staging data reads",
+        );
+    })
+    .await;
+}
+
 // ── (C) Fitness assert via the staged-write probes ──
 
 /// A keyed `Person` insert routes through the exact-id fenced adapter exactly

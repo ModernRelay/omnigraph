@@ -220,7 +220,7 @@ macro_rules! write_surfaces {
 }
 
 write_surfaces! {
-    "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options"],
+    "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options", "init_with_storage"],
     "db/omnigraph.rs" => WriteProtocol::RecoveryExecutor => ["open", "open_with_storage", "refresh"],
     "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_with_receipt", "mutate_as", "mutate_as_with_receipt", "mutate_as_with_expected_head", "mutate_as_with_expected_head_receipt"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_with_receipt", "load_file", "load_graph_batch"],
@@ -228,7 +228,10 @@ write_surfaces! {
     "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
     "db/omnigraph.rs" => WriteProtocol::Composed("SchemaApply v9 + sentinel ref + optional hard-drop GC") => ["apply_schema", "apply_schema_with_options", "apply_schema_as", "apply_schema_as_with_catalog_check"],
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
-    "db/omnigraph.rs" => INDICES_V9 => ["ensure_indices", "ensure_indices_on"],
+    "db/omnigraph.rs" => INDICES_V9 => [
+        "ensure_indices", "ensure_indices_on",
+        "rebuild_full_text_indices_on", "rebuild_full_text_indices_on_as",
+    ],
     "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test"],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
@@ -243,6 +246,8 @@ write_surfaces! {
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
+    ("db/omnigraph.rs", "open_read_only_with_storage"),
+    ("db/omnigraph.rs", "manifest_has_external_base_paths"),
     ("db/omnigraph/export.rs", "capture_served_export_cut"),
     (
         "db/omnigraph/export.rs",
@@ -267,9 +272,13 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "snapshot_at_graph_manifest_version"),
     ("db/omnigraph.rs", "export_jsonl"),
     ("db/omnigraph.rs", "export_jsonl_to_writer"),
+    ("db/omnigraph.rs", "export_jsonl_unordered_to_writer"),
     ("db/omnigraph.rs", "graph_index"),
     ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),
+    // Joins already-dispatched branch_delete reclaims; performs no durable
+    // calls itself (the reclaim tasks' call sites are inventoried per-file).
+    ("db/omnigraph.rs", "wait_for_fork_reclaims"),
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
     ("exec/query.rs", "query"),
@@ -335,6 +344,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "all_branches",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "all_native_branches",
     ),
     (
         "db/graph_coordinator.rs",
@@ -427,6 +441,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/manifest.rs",
         "ManifestCoordinator",
         "list_graph_branches",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "list_native_graph_branches",
     ),
     (
         "db/manifest.rs",
@@ -605,7 +624,7 @@ gateway_surfaces! {
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
         "open_at_entry_verified", "open_dataset_head", "list_native_branches",
-        "ensure_expected_version",
+        "named_fork_is_absent", "ensure_expected_version",
         "reopen_for_mutation", "scan_batches", "scan_batches_for_rewrite",
         "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
@@ -624,6 +643,8 @@ gateway_surfaces! {
         "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
         "predicted_materialized_blob_batch_bytes",
         "materialize_blob_batch_bounded_with_preflight_cache",
+        "validate_full_text_scan", "is_full_text_index",
+        "can_fold_index", "has_foldable_unindexed_fragments",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
@@ -676,6 +697,7 @@ macro_rules! durable_calls {
 // manifest implementations are included; only standalone test-only sources
 // whose parent cfg is invisible to this file walker are excluded.
 durable_calls! {
+    ("table_store/fts_compat.rs", ".put(", 1, WriteProtocol::Composed("staged index artifact")),
     // The `__manifest` Create write is the manifest's entire birth: entries,
     // genesis lineage, and the internal-schema stamp all ride the one commit,
     // so the stamp is atomic with birth and no bootstrap write follows it.
@@ -706,11 +728,16 @@ durable_calls! {
     ("storage.rs", ".rename_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".delete(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".delete_prefix(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
-    ("omnigraph-storage/lib.rs", ".delete(", 2, WriteProtocol::Composed("storage adapter primitive")),
-    // 3rd `.put(`: the binary `write_bytes` primitive (graph-index artifact),
-    // same atomic-visibility PUT contract as `write_text`.
-    ("omnigraph-storage/lib.rs", ".put(", 3, WriteProtocol::Composed("object storage put primitive")),
+    ("omnigraph-storage/lib.rs", ".delete(", 3, WriteProtocol::Composed("storage adapter primitive, including Azure rename source retirement")),
+    // One `.put(` beyond upstream's Azure set: the binary `write_bytes`
+    // primitive (graph-index artifact), same atomic-visibility PUT contract
+    // as `write_text`.
+    ("omnigraph-storage/lib.rs", ".put(", 5, WriteProtocol::Composed("object storage put primitive, including Azure rename destination publication and the binary write_bytes primitive")),
     ("omnigraph-storage/lib.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
+    ("omnigraph-storage/lib.rs", ".put_multipart(", 1, WriteProtocol::Composed("Azure multipart rename staging")),
+    ("omnigraph-storage/lib.rs", ".put_part(", 1, WriteProtocol::Composed("Azure multipart rename staging")),
+    ("omnigraph-storage/lib.rs", ".complete(", 1, WriteProtocol::Composed("Azure multipart rename destination publication")),
+    ("omnigraph-storage/lib.rs", ".abort(", 1, WriteProtocol::Composed("Azure multipart rename failure cleanup")),
     ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
@@ -815,20 +842,28 @@ durable_calls! {
     ("exec/merge.rs", "TableStore::create_empty_dataset(", 1, WriteProtocol::EphemeralScratch),
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/table_ops.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    // Commit-change enumeration: pinned parent/child handles for typed row
-    // comparison, lazy image materialization, and descriptor-tie payload
-    // reads. Read-only by construction — the enumerator stages no transaction
-    // and publishes nothing.
-    ("changes/enumerate.rs", ".dataset()", 6, WriteProtocol::ReadOnlyAccess),
+    // Blob live-branch recheck: lists the table's refs to prove a vanished
+    // fork before the incarnation refusal; read-only access to the handle.
+    ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    // Commit-change enumeration: pinned parent/child handles for the ordered
+    // merge's typed row comparison. Read-only by construction — the enumerator
+    // stages no transaction and publishes nothing.
+    ("changes/enumerate.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    // Candidate-pruning emitter: pinned parent/child handles for the O(delta)
+    // candidate scan + parent before-image probe and the full-merge fallback.
+    // Read-only — it stages and publishes nothing.
+    ("changes/candidate_scan.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     // Net-diff cross-branch path: the same typed row comparison over two
     // pinned snapshot handles. Read-only — the diff stages and publishes
     // nothing.
     ("changes/mod.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
-    ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),
+    // The sixth accessor reports deferred FTS coverage from an immutable
+    // snapshot; it only reads index metadata and never stages or publishes.
+    ("db/omnigraph/optimize.rs", ".dataset()", 6, WriteProtocol::Composed("Optimize v9 planning + read-only coverage status + physical cleanup")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
@@ -860,6 +895,10 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".delete_prefix(",
     ".put(",
     ".put_opts(",
+    ".put_multipart(",
+    ".put_part(",
+    ".complete(",
+    ".abort(",
     ".rename(",
     ".rename_text(",
     "GraphCoordinator::init_commit_with_session(",
@@ -1916,6 +1955,38 @@ fn proven_insert_capability_has_one_production_mint_site() {
     );
 }
 
+/// The CDC candidate-pruning classifier (`changes::candidate_scan`) treats every
+/// persisted `Operation::Update` as row-set-preserving, deriving the change feed
+/// from a candidate scan without a delete pass. That is sound only because
+/// OmniGraph's `merge_insert` never deletes an unmatched-by-source row — Lance
+/// defaults the by-source arm to Keep and no engine code sets it otherwise. If a
+/// delete-capable by-source merge arm were ever introduced, a persisted
+/// `Operation::Update` could remove rows and the feed would silently drop that
+/// delete. Lock the floor: the by-source merge arm must be absent from engine
+/// source (production or test), so introducing one forces this classifier to be
+/// re-gated first.
+#[test]
+fn no_delete_capable_merge_arm_in_engine_source() {
+    let src = engine_src_root();
+    let mut offenders: Vec<String> = Vec::new();
+    for file in walk_rust_files(&src) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        if contents.contains("WhenNotMatchedBySource")
+            || contents.contains("when_not_matched_by_source")
+        {
+            offenders.push(relative_to_src(&src, &file));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a by-source merge arm appeared in engine source, which can make an \
+         Operation::Update delete rows. The CDC candidate-pruning classifier \
+         (changes::candidate_scan) assumes every Update is non-deleting; re-gate \
+         it before introducing this. Found in: {offenders:?}"
+    );
+}
+
 #[test]
 fn graph_visible_write_chokepoints_are_registered() {
     let src = engine_src_root();
@@ -2033,19 +2104,35 @@ fn structural_call_scanner_skips_test_module_but_keeps_later_production() {
         r#"
         #[cfg(test)]
         mod tests {
-            fn helper(storage: &Storage) {
+            fn helper(storage: &Storage, object_store: &ObjectStore, upload: &mut Upload) {
                 storage.commit_staged_exact();
+                object_store.put_multipart(location);
+                upload.put_part(payload);
+                upload.complete();
+                upload.abort();
             }
         }
 
-        fn production_after_tests(storage: &Storage) {
+        fn production_after_tests(
+            storage: &Storage,
+            object_store: &ObjectStore,
+            upload: &mut Upload,
+        ) {
             storage.commit_staged_exact();
+            object_store.put_multipart(location);
+            upload.put_part(payload);
+            upload.complete();
+            upload.abort();
         }
         "#,
         "scanner cfg(test) self-test",
     );
     let inventory = call_inventory(&ast);
     assert_eq!(inventory.counts.get("commit_staged_exact"), Some(&1));
+    assert_eq!(inventory.counts.get("put_multipart"), Some(&1));
+    assert_eq!(inventory.counts.get("put_part"), Some(&1));
+    assert_eq!(inventory.counts.get("complete"), Some(&1));
+    assert_eq!(inventory.counts.get("abort"), Some(&1));
 }
 
 #[test]
@@ -2057,6 +2144,8 @@ fn structural_call_scanner_closes_raw_dataset_and_ufcs_routes() {
             scanner: &mut Scanner,
             storage: &Storage,
             audit: &mut RecoveryAudit,
+            object_store: &ObjectStore,
+            upload: &mut Upload,
         ) {
             ds.append(reader, params);
             ds.list_branches();
@@ -2072,8 +2161,14 @@ fn structural_call_scanner_closes_raw_dataset_and_ufcs_routes() {
             StorageAdapter::write_text(storage, uri, contents);
             object_store.put(location, payload);
             object_store.put_opts(location, payload, options);
+            object_store.put_multipart(location);
+            upload.put_part(payload);
+            upload.complete();
+            upload.abort();
             object_store.rename(from, to);
             audit.append(RecoveryAuditRecord {});
+            let _ = "put_multipart() put_part() complete() abort()";
+            // upload.complete();
         }
         "#,
         "scanner raw Dataset/UFCS self-test",
@@ -2095,6 +2190,10 @@ fn structural_call_scanner_closes_raw_dataset_and_ufcs_routes() {
     assert_eq!(inventory.counts.get("write_text"), Some(&1));
     assert_eq!(inventory.counts.get("put"), Some(&1));
     assert_eq!(inventory.counts.get("put_opts"), Some(&1));
+    assert_eq!(inventory.counts.get("put_multipart"), Some(&1));
+    assert_eq!(inventory.counts.get("put_part"), Some(&1));
+    assert_eq!(inventory.counts.get("complete"), Some(&1));
+    assert_eq!(inventory.counts.get("abort"), Some(&1));
     assert_eq!(inventory.counts.get("rename"), Some(&1));
     assert_eq!(
         inventory.counts.get(".append(RecoveryAuditRecord"),

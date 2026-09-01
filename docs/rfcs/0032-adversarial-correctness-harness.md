@@ -1,31 +1,34 @@
 ---
-type: spec
-title: "RFC-032 — Adversarial correctness harness"
-description: Bounded durable-write-cut sweeps, seeded operation-sequence fuzzing, parser fuzzing, and scoped schedule exploration over the fault seams the engine owns — checked by explicit state witnesses and existing oracles, so more correctness bugs are found by search instead of by incident.
+rfc: "0032"
+title: "Adversarial correctness harness"
+track: maintainer
 status: draft
-tags: [eng, rfc, testing, fuzzing, fault-injection, dst, correctness, tooling, omnigraph]
-timestamp: 2026-08-06
-owner: OmniGraph maintainers
+implementation: not-started
+authors:
+  - OmniGraph maintainers
+created: 2026-08-06
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-032: Adversarial correctness harness
+# RFC 0032: Adversarial correctness harness
 
-**Status:** Draft
-**Date:** 2026-08-06
-**Author track:** Maintainer design series
-**Depends on:** nothing. It may reuse RFC-031's versioned local-record envelope,
+**Depends on:** nothing. It may reuse RFC 0031's versioned local-record envelope,
 but no phase depends on a shared record store. No product behavior, format, or
 protocol change; test-only engine/storage seams are in scope and guarded.
 **Complements, does not replace:** the failpoint suites (hand-placed crash
 windows, compile-checked names, `Rendezvous` race orchestration),
 `proptest_equivalence.rs`, `merge_truth_table.rs`, and the `helpers::cost` /
-RFC-031 cost instruments.
+RFC 0031 cost instruments.
 **Audience:** engine maintainers; anyone adding a writer kind, a recovery
 path, or a query-execution fork.
 
 (This RFC absorbs and supersedes the scratch test-harness library survey of
 2026-07-28. That survey's streaming-module targets did not survive the
-RFC-026 removal (#449); they are retargeted here.)
+RFC 0026 removal (#449); they are retargeted here.)
 
 ---
 
@@ -62,7 +65,7 @@ proves semantics, or that bounded crash/schedule search proves the absence of
 bugs (§6 records why a second full graph implementation is rejected).
 
 **Amendment note (2026-08-17).** §13 records
-[RFC-037's deterministic simulation harness](0037-deterministic-simulation-harness.md)
+[RFC 0037's deterministic simulation harness](0037-deterministic-simulation-harness.md)
 as an execution layer this RFC's instruments can also run on, notes the
 stronger determinism contract now available beside §3.3, and corrects two §6
 entries against measured evidence. Nothing in §§1-12 is restructured; each
@@ -75,7 +78,7 @@ affected section is engaged in place.
 | `failpoints.rs` + its compile-checked named points | deterministic crash/race coverage at chosen boundaries | enumerate windows nobody chose; a typo-guarded point still has to be *placed* |
 | `proptest_equivalence.rs` | generated cross-type collision, Expand-mode, no-phantom-row, and anti-join partition properties, 48 cases per property | vary the *operation sequence*; cover writers, branches, recovery |
 | `merge_truth_table.rs` | hand-built 9×9 merge oracle, compile-forced completeness | anything outside merge; generated compositions |
-| `helpers::cost`, RFC-031 | cost regression evidence | correctness under faults, schedules, or generated inputs |
+| `helpers::cost`, RFC 0031 | cost regression evidence | correctness under faults, schedules, or generated inputs |
 
 Each is good at its job. The gap is bounded exploration of additional crash
 cuts, input sequences, and schedules — with automatic shrinking to a minimal
@@ -204,7 +207,7 @@ backend reasons, and provider request IDs. An opaque backend error cannot prove
 cross-backend semantic equality and makes an otherwise-success cell
 incomparable/failing rather than being string-matched. Final canonical export
 remains a fixture/final-state cross-check, not a substitute for the transcript
-and not a shared contract with RFC-031.
+and not a shared contract with RFC 0031.
 
 ### 3.3 Determinism by normalized replay
 
@@ -400,19 +403,19 @@ emerges that merits exhaustive checking; none is planned.
   of oracle strength: a mutant surviving the truth table plus these suites is
   a hole in the harness, found before it is a hole in production.
 
-## 5. Relationship to RFC-031
+## 5. Relationship to RFC 0031
 
 - **One small envelope vocabulary, at most.** The two harnesses may share
   versioned run/environment stamping. Cost samples and high-volume fuzz/crash
   evidence keep separate schemas, retention, prefixes/artifacts, and reporters.
-- **Different canonical contracts.** RFC-031 owns cross-build fixture and
-  post-state fingerprints. RFC-032 owns typed operation transcripts and
+- **Different canonical contracts.** RFC 0031 owns cross-build fixture and
+  post-state fingerprints. RFC 0032 owns typed operation transcripts and
   writer-specific state projections. Similar NDJSON normalization is not enough
   reason to centralize them; existing owners are extended until the shapes
   demonstrably converge.
 - **Protocol faults remain later work.** If 503, slow-body, or conditional-put
-  injection is later justified, extend RFC-031's already-qualified proxy rather
-  than add a second S3 implementation. RFC-032 V1 does not depend on that mode.
+  injection is later justified, extend RFC 0031's already-qualified proxy rather
+  than add a second S3 implementation. RFC 0032 V1 does not depend on that mode.
 - **Independent landing order** otherwise; neither RFC blocks the other.
 
 ## 6. Rejected approaches (recorded to prevent relitigating)
@@ -432,7 +435,7 @@ emerges that merits exhaustive checking; none is planned.
   are object-store CAS, crash windows, and schedules; the cluster protocol is
   conditional-put on blobs, not a network protocol. Wrong failure model.
 - **stateright** (spec-level model checking of recovery) — the current ordinary
-  writer envelope is recovery-v9, while the removed RFC-026 experiment alone
+  writer envelope is recovery-v9, while the removed RFC 0026 experiment alone
   advanced through several private recovery shapes in weeks. A model that lags
   the implemented writer truth tables is a second source of truth for exactly
   the thing we least want two of. Revisit only for a closed, stable subprotocol.
@@ -481,7 +484,7 @@ Per the standing CI budget:
   bounded parser smoke corpus, four fixed operation seeds, and deterministic
   local failpoint cells run in their existing workspace owners. Post-merge CI
   already compiles one workspace feature superset with engine/cluster failpoints;
-  RFC-032 does not add a second Cargo invocation or a third feature graph. The
+  RFC 0032 does not add a second Cargo invocation or a third feature graph. The
   current CI does not run the full workspace suite on every PR, so this is not
   described as a PR gate. Corpus file count/bytes and non-vacuous cases are
   asserted. The ordinary additions own an internally enforced **20 s** aggregate
@@ -509,7 +512,7 @@ Per the standing CI budget:
 
 ## 9. Evidence gates
 
-Mirroring RFC-031 §9: a harness that cannot rediscover the bugs that motivated
+Mirroring RFC 0031 §9: a harness that cannot rediscover the bugs that motivated
 it is not finished. Every instrument ships a **sensitivity** self-test (a
 seeded defect it must find) and a **soundness** run (a clean pass on current
 code); where a historical fix can be cleanly reverted on a scratch branch,
@@ -568,7 +571,7 @@ that rediscovery is the flagship evidence.
 4. Consider Kani arithmetic proofs and scoped cargo-mutants oracle audit only
    after their narrower sensitivity gates justify the maintenance cost.
 
-Each phase lands with its §9 gate. No phase blocks RFC-031's implementation.
+Each phase lands with its §9 gate. No phase blocks RFC 0031's implementation.
 
 ## 11. Out of scope
 
@@ -580,7 +583,7 @@ Each phase lands with its §9 gate. No phase blocks RFC-031's implementation.
 - **Exhaustive enumeration of every concurrent durable-effect subset/order.**
   Each run observes and records one serialized arrival schedule; V1 does not
   exhaust schedules, subsets, or orders (§4.1).
-- **Sustained-load / latency-distribution testing** — the RFC-031 family's
+- **Sustained-load / latency-distribution testing** — the RFC 0031 family's
   separate future instrument.
 - **Production chaos** against live deployments.
 - **Replacing** failpoints, `merge_truth_table.rs`, `proptest_equivalence.rs`,
@@ -602,9 +605,9 @@ Added after the original draft. Since this RFC merged, DST v1 (the first
 iteration of the project's deterministic simulation testing) built and
 measured a harness that runs engine operations in a fully seeded simulated
 world; its design authority is
-[RFC-037](0037-deterministic-simulation-harness.md). RFC-037 stands beside this
-RFC as the simulation architecture; this amendment records only how RFC-032's
-instruments compose with that execution layer. Details live in RFC-037; this
+[RFC 0037](0037-deterministic-simulation-harness.md). RFC 0037 stands beside this
+RFC as the simulation architecture; this amendment records only how RFC 0032's
+instruments compose with that execution layer. Details live in RFC 0037; this
 amendment cites, it does not restate.
 
 ### 13.1 §3.3: two determinism contracts, each with its domain
@@ -654,7 +657,7 @@ Two of §4's instruments now have working twins in the simulated world:
   lane is now open and cheap to name: the first ask is an injectable clock
   (the mock-time ask, evidenced by the counting golden's byte wobble
   recorded in
-  [RFC-031 §11](0031-comparative-cost-harness.md#11-amendment-2026-08-16-the-counting-side-as-built)),
+  [RFC 0031 §11](0031-comparative-cost-harness.md#11-amendment-2026-08-16-the-counting-side-as-built)),
   with entropy and scheduling seams as candidates behind it. Each accepted
   upstream seam shrinks §2's cannot-virtualize list by one.
 

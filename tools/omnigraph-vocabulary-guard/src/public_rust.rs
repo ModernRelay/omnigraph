@@ -24,7 +24,8 @@ const PUBLIC_LIBRARY_PACKAGES: &[&str] = &[
     "omnigraph-server",
     "omnigraph-storage",
 ];
-const INTERNAL_LIBRARY_PACKAGES: &[&str] = &["omnigraph-vocabulary-guard"];
+const INTERNAL_LIBRARY_PACKAGES: &[&str] =
+    &["omnigraph-azure-admission", "omnigraph-vocabulary-guard"];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ToolConfig {
@@ -477,8 +478,12 @@ pub fn omnigraph::ordinary(value: usize)
     fn expected_package_set_is_explicit() {
         assert_eq!(PUBLIC_LIBRARY_PACKAGES.len(), 7);
         assert!(PUBLIC_LIBRARY_PACKAGES.contains(&"omnigraph-engine"));
+        assert!(!PUBLIC_LIBRARY_PACKAGES.contains(&"omnigraph-azure-admission"));
         assert!(!PUBLIC_LIBRARY_PACKAGES.contains(&"omnigraph-vocabulary-guard"));
-        assert_eq!(INTERNAL_LIBRARY_PACKAGES, &["omnigraph-vocabulary-guard"]);
+        assert_eq!(
+            INTERNAL_LIBRARY_PACKAGES,
+            &["omnigraph-azure-admission", "omnigraph-vocabulary-guard",]
+        );
     }
 
     #[test]

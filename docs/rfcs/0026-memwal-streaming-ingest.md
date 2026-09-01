@@ -1,18 +1,24 @@
 ---
-type: spec
-title: "RFC-026 — MemWAL streaming ingest"
-description: Historical implemented experiment using Lance MemWAL for streaming writes; rejected after benchmarking and removed in favor of direct commit-visible graph batches.
+rfc: "0026"
+title: "MemWAL streaming ingest"
+track: maintainer
 status: rejected
-tags: [eng, rfc, streaming, ingest, wal, memwal, lance, omnigraph]
-timestamp: 2026-07-10
-owner: OmniGraph maintainers
+implementation: removed
+authors:
+  - OmniGraph maintainers
+created: 2026-07-10
+updated: 2026-08-23
+discussion: null
+supersedes: ["0018"]
+superseded_by: []
+blocked_on: []
 ---
 
-# RFC-026 — MemWAL streaming ingest
+# RFC 0026: MemWAL streaming ingest
 
-**Status:** Rejected (2026-08-06). The implementation and its unreleased
-manifest v7-v19 formats were removed. See
-[Streaming ingestion after RFC-026](../dev/wal-removal.md).
+> **Disposition (2026-08-06):** The implementation and its unreleased manifest
+> v7-v19 formats were removed. See
+> the current [ingestion contract](../dev/ingestion.md).
 
 The experiment proved that Lance MemWAL can durably accept per-dataset rows,
 but OmniGraph still needed separate graph-level validation, token authority,
@@ -23,7 +29,7 @@ graph-level facade over the ordinary commit-visible `load_as` transaction.
 
 The remainder of this RFC is retained unchanged as historical design and
 implementation evidence. It is not an active contract.
-**Date:** 2026-07-10
+
 **Gate E0 evaluated:** 2026-07-18
 **Phase A foundation completed:** 2026-07-18
 **Historical Phase B1 subset acceptance:** 2026-07-19 (internal schema v8,
@@ -459,14 +465,13 @@ return aggregate-only results. All three controls require `stream_manage` and
 expose no declaration, table, lane, binding, or physical-result selector. This
 slice adds no coordinator, recovery grammar, or format strand; per-declaration
 resume/abort, public rebind, and direct SDK control remain inactive.
-**Author track:** Maintainer design series
-**Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
+**Depends on:** [RFC 0022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus
-[RFC-028](0028-stable-schema-identity.md)'s stable table identity and
+[RFC 0028](0028-stable-schema-identity.md)'s stable table identity and
 incarnation contract, plus
-[RFC-023](0023-key-conflict-fencing.md) for the initial keyed graph-stream
+[RFC 0023](0023-key-conflict-fencing.md) for the initial keyed graph-stream
 mode. Durable heads from
-[RFC-024](0024-durable-table-heads.md) are compatible but not required.
+[RFC 0024](0024-durable-table-heads.md) are compatible but not required.
 **Current implementation:** omnigraph 0.9.0; Lance 9.0.0 from crates.io
 **Gate R0 survey baseline:** Lance 9.0.0-rc.1 at git rev
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; complete MemWAL table and
@@ -474,8 +479,8 @@ system-index specifications, including the durability and writer-fencing
 changes carried into the final release. Current API assumptions remain pinned
 by [the Lance index and surface guards](../dev/lance.md).
 **Audience:** engine, server, CLI, policy, and operations maintainers
-**Open architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
-Findings marked **BLOCKER** must be dispositioned before acceptance.
+The former cross-RFC architecture review's durable findings and experiment
+evidence are incorporated below; the separate review ledger has been retired.
 
 ---
 
@@ -517,7 +522,7 @@ The contract is:
   per row;
 - acknowledgement does not mean graph visibility;
 - default queries see only the manifest-committed graph;
-- a fold is an ordinary RFC-022 graph writer and is the sole visibility point;
+- a fold is an ordinary RFC 0022 graph writer and is the sole visibility point;
 - fresh reads are explicit and never claim cross-table atomicity.
 
 ### 0.1 Gate E0: bounded-enrollment decision passed before activation
@@ -544,7 +549,7 @@ that result has now activated internal schema v7 and the bounded production
 foundation described in §12.2: recoverable empty enrollment, durable lifecycle
 authority, process-local admission/exclusion, and strict format
 refusal/rebuild. At that boundary it exposed no production enrollment entry
-point and could not append or acknowledge a row. RFC-026 remains draft, but
+point and could not append or acknowledge a row. RFC 0026 remains draft, but
 later F7a–F7c now expose graph-native served ingress, graph-redacted status,
 graph-wide resume, and checked `SEALED` maintenance.
 
@@ -729,7 +734,7 @@ admission. A client may compute embeddings first and submit the physical vector,
 but streaming never acknowledges a provider-dependent promise and retries never
 re-call an external model under the same `write_id`.
 
-Every stream contract is bound to RFC-028's
+Every stream contract is bound to RFC 0028's
 `(stable_table_id, incarnation_id)` pair. A rename preserves that pair, so the
 logical stream contract and ownership of reject history remain continuous.
 That continuity does **not** authorize adoption of physical WAL artifacts. A
@@ -775,7 +780,7 @@ a crate-private method and a feature-gated failpoint seam, using one fixed
 main-only/unsharded configuration so recovery and exclusion can be proven
 before a production caller exists.
 
-RFC-024 heads are optional. Every lifecycle row therefore carries two distinct
+RFC 0024 heads are optional. Every lifecycle row therefore carries two distinct
 classes of evidence:
 
 ```text
@@ -800,7 +805,7 @@ CurrentHeadWitness {
 
 `StreamPhysicalBinding` is stable for one physical enrollment. The
 `CurrentHeadWitness` is not: it is the exact public Lance composite at the
-currently accepted base HEAD, using the same capture discipline as RFC-024.
+currently accepted base HEAD, using the same capture discipline as RFC 0024.
 Every ordinary Lance commit changes at least the table version and current
 transaction UUID and normally the manifest e_tag. Calling that composite a
 stable “physical-ref incarnation” is incorrect.
@@ -810,7 +815,7 @@ resolves to the same stable table/incarnation and location/main ref, its
 persisted `CurrentHeadWitness` equals the physical table's current witness, and
 the table contains the expected singleton MemWAL index plus exactly the
 recorded shard namespace/configuration. Path, branch name, numeric version,
-timestamp, or the RFC-028 logical incarnation alone is never sufficient. Local
+timestamp, or the RFC 0028 logical incarnation alone is never sufficient. Local
 and S3/RustFS same-path/ref delete-recreate guards must change the witness; a
 backend without that proof cannot activate streaming.
 
@@ -828,9 +833,9 @@ fallback if a later profile requires concurrent base writers.
 
 The MemWAL index UUID is not used as enrollment identity because Lance may
 replace that metadata entry while advancing merged-generation state. A mutable
-table name, the RFC-028 logical pair alone, or a compatible-looking index is
-never enough. RFC-024 may project related table/ref facts into a durable head,
-but RFC-026 persists and validates this binding without depending on heads.
+table name, the RFC 0028 logical pair alone, or a compatible-looking index is
+never enough. RFC 0024 may project related table/ref facts into a durable head,
+but RFC 0026 persists and validates this binding without depending on heads.
 For the bounded profile, the pre-minted `enrollment_id` is also persisted as a
 namespaced MemWAL `writer_config_defaults` marker together with the exact
 configuration version. RC.1 explicitly permits arbitrary persisted default
@@ -859,19 +864,19 @@ first use, WAL row admission, and acknowledgement remain publicly inactive.
 Implemented Phase B1 reaches row admission only through a feature-gated private
 engine seam; schema-declared first use remains Phase B2.
 
-With Gate E0 green, the implemented bounded enrollment uses one RFC-022
+With Gate E0 green, the implemented bounded enrollment uses one RFC 0022
 multi-effect sidecar, not an ad-hoc state machine:
 
-1. run and await RFC-022's synchronous recovery barrier;
+1. run and await RFC 0022's synchronous recovery barrier;
 2. authorize, pin the manifest/schema/table state, and prepare a complete
    `ReadSet` containing schema identity, stable table ID and incarnation,
    location/main ref, exact pre-enrollment `CurrentHeadWitness`, PK metadata,
    the fixed Phase A configuration, and lifecycle-row absence. Public
    production schema-declared intent and supported `SEALED` physical rebind remain later phases;
 3. acquire any global claims and then the `(table, branch)` write queue in
-   RFC-022 order, then freshly revalidate the complete `ReadSet`; a mismatch
+   RFC 0022 order, then freshly revalidate the complete `ReadSet`; a mismatch
    restarts before any physical effect;
-4. verify RFC-023's already-installed PK; enrollment never performs a first-use
+4. verify RFC 0023's already-installed PK; enrollment never performs a first-use
    PK migration; validate the sharding configuration;
 5. pre-mint a never-reused enrollment UUID and one shard UUID, then arm a
    sidecar with writer kind `stream_enrollment`, the exact baseline witness,
@@ -903,7 +908,7 @@ multi-effect sidecar, not an ad-hoc state machine:
    retains the sidecar and returns `RecoveryRequired`;
 9. publish the achieved table version, `CurrentHeadWitness`, stable physical
    binding, exact pre-claim epoch floor, and `stream_state = OPEN` in one
-   manifest CAS, including the table-head row when RFC-024 is active; and
+   manifest CAS, including the table-head row when RFC 0024 is active; and
 10. resolve the enrollment sidecar before any future `put` is admitted. Phase A
     has no put/ack caller; the implemented private Phase B1 path enters through
     this recovery barrier, so `OPEN` plus an unresolved enrollment can never
@@ -1154,7 +1159,7 @@ This internal table is not a competing authority:
   existing B1 worker cut is authoritative;
 - after fold, the manifest-selected token-table version is authoritative;
 - a normal fold or correction stages the base-table and token-table effects in
-  one RFC-022 recovery envelope and exposes both in one `__manifest` CAS;
+  one RFC 0022 recovery envelope and exposes both in one `__manifest` CAS;
 - there is no per-ack token-table commit and no independently writable token
   path; and
 - for `PRESENT`, the winning base row's hidden metadata must agree with its
@@ -1851,7 +1856,7 @@ merge/base/current-token authority, so it cannot produce `SEALED`.
 
 The two retention profiles supply that hook differently. The selected B2a
 retain-all implementation may consume stock RC.1's manifest-first,
-sentinel-second claim only when an existing RFC-022 recovery sidecar, armed
+sentinel-second claim only when an existing RFC 0022 recovery sidecar, armed
 before invocation, can classify and finish the exact no-effect, manifest-only,
 manifest-plus-sentinel terminal, and lost-result authority states under the
 single-live-writer boundary. The sidecar—not the stock shard manifest—binds the
@@ -1869,7 +1874,7 @@ cursor exception is the reclamation successor: only after a quiescent whole-cut
 proof establishes no data-bearing tail may its manifest advance the cursor to
 the new sentinel. Claim IDs and individually bounded terminal receipts are common durable
 state. For B2a, the OmniGraph graph-manifest-authoritative `ClaimReceipt` is the
-durable projection of the already exactly classified RFC-022 sidecar proof for
+durable projection of the already exactly classified RFC 0022 sidecar proof for
 stock RC.1's manifest-first/sentinel-second effects; only then may the sidecar
 be finalized. For B2b it projects and binds the patched Lance terminal receipt
 and manifest-named sentinel. Reclaim/checkpoint IDs, retry horizons, and history
@@ -3545,7 +3550,7 @@ external producers to choose which tables participate.
 A streamed row for a table with `@embed` must carry the vector column; a row
 missing it is the effect-free per-line `invalid` before any attempt.
 Admission validates dimensions; vector-space/model identity is a documented
-producer obligation (RFC-012's recorded provider identity is the eventual
+producer obligation (RFC 0012's recorded provider identity is the eventual
 validation hook). The admission and fold paths make no external calls,
 unchanged from the B1/B2 core. The named future upgrade is server-side
 enrichment *before* the put — an opt-in, availability-coupled slower
@@ -4478,7 +4483,7 @@ effect and leaves the acknowledged generation durable. The current transform
 has no output-expansion source; a future derived-field transform must add
 separate evidence for that bound rather than inheriting this claim. The fold
 never splits one generation across transactions and never marks it merged
-after a partial prefix. With or without RFC-024, the
+after a partial prefix. With or without RFC 0024, the
 `ReadSet` carries schema identity, the complete stream
 binding/configuration/generation cut, the base table's exact
 `CurrentHeadWitness`, every probed table, and the conservative branch authority
@@ -4486,7 +4491,7 @@ token `(native branch incarnation, optional graph_head)`.
 Absence of `graph_head` on a fresh branch is part of that token. Any publisher
 retry compares the captured token and returns to full fold revalidation on a
 change; it never reparents a validation-sensitive fold around a concurrent
-commit. RFC-024 may later narrow false contention with table heads but is not a
+commit. RFC 0024 may later narrow false contention with table heads but is not a
 correctness dependency. The commit phase then:
 
 1. stages accepted rows with Lance merge-insert and includes the exact
@@ -4574,7 +4579,7 @@ The sidecar is mandatory even though merge-insert is staged. After
 manifest has not. A failure in that window is the ordinary multi-table recovery
 gap, not invisible staged state.
 
-A commit-time key conflict follows RFC-023's partial-effect rule. If exact
+A commit-time key conflict follows RFC 0023's partial-effect rule. If exact
 classification proves that no fold participant advanced, the fold finalizes
 the empty sidecar and may perform one bounded full replan from fresh authority.
 If any participant advanced, or emptiness cannot be proved, it keeps the
@@ -4664,7 +4669,7 @@ current base-table `CurrentHeadWitness`. Epochs
 are comparable only within the same enrollment and shard ID; a fresh shard in a
 new binding may start at 1 and is fenced from its predecessor by enrollment and
 shard identity, not by a larger number. The row is the logical lifecycle
-authority and is updated by an RFC-022 CAS. MemWAL shard epochs are the shard
+authority and is updated by an RFC 0022 CAS. MemWAL shard epochs are the shard
 writer fence; the bounded profile pairs them with the process-local admission
 lease and exclusive base-HEAD ownership. The general profile additionally
 requires the cross-process substrate admission seal. Neither an empty-
@@ -4691,7 +4696,7 @@ The bounded-profile drain sequence is:
 7. for an operation-scoped drain, perform the guarded operation; persistent
    public quiesce stops after step 6.
 
-`OPEN -> DRAINING` and `DRAINING -> SEALED` are RFC-022 authority-first
+`OPEN -> DRAINING` and `DRAINING -> SEALED` are RFC 0022 authority-first
 metadata writes; each drain-mode fold is a separate graph write in the future
 lifecycle recovery strand and exact drain mode specified by §4.3.
 `DRAINING` fully encodes every target per-shard floor and two equal copies of
@@ -4756,7 +4761,7 @@ current-HEAD witness, and per-shard epoch map.
 Future Phase-D schema apply must drain every affected enrolled type before
 changing fields, constraints, PK, embeddings, or `@stream` and resumes only
 when compatible. That writer is inactive in EXP, where schema change requires
-checked export and rebuild into a fresh graph. RFC-028's current pure type
+checked export and rebuild into a fresh graph. RFC 0028's current pure type
 rename retains the same dataset, identity, path, and Lance version, so it does
 not by itself rebind the physical enrollment. If a future schema feature
 supports a rematerializing rename while preserving the logical pair, it cannot
@@ -4934,7 +4939,7 @@ documented uncompacted-history term. No metadata term is relabeled
 history-flat here.
 
 Phase-B2/Phase-C `stream status` resolves the exact lifecycle rows and MemWAL metadata through a
-structured, bounded access path; it may reuse RFC-024's scalar-index machinery
+structured, bounded access path; it may reuse RFC 0024's scalar-index machinery
 but cannot claim history-flat cost while scanning manifest history.
 
 ## 11. Format activation and rebuild
@@ -5231,7 +5236,7 @@ exposes durable admission:
 3. use the old-format binary to export each selected branch's current logical
    state and, for `RETIRED`, its exact opaque retirement receipt;
 4. use the new binary to initialize a different graph root and load the export
-   through RFC-022;
+   through RFC 0022;
 5. validate the rebuilt graph before cutting clients over.
 
 Ordinary export contains only manifest-visible graph state. WAL-only rows,
@@ -5249,17 +5254,17 @@ sequencing authority.
 The new graph starts with no physical stream enrollment. Phase B2 must wire
 declared first use through §3 before production can enroll after cutover. The
 rebuild also loses branches not separately exported, commit DAG, snapshots,
-tombstones, recovery history, and time travel, as specified by RFC-028's
+tombstones, recovery history, and time travel, as specified by RFC 0028's
 common format strand.
 
 The retained source graph and its MemWAL artifacts remain owned by the old
 binary and are never opened by the new target as migration input. A failed
 target init/load cannot mutate the source. Independently released later format
-capabilities require another rebuild; co-release with RFC-023, RFC-024, RFC-025,
-or RFC-028 is allowed only after every participating RFC is independently
+capabilities require another rebuild; co-release with RFC 0023, RFC 0024, RFC 0025,
+or RFC 0028 is allowed only after every participating RFC is independently
 accepted and their combined init, refusal, recovery, and rebuild matrix passes.
 
-Enrollment, fold, and recovery retain RFC-022's single-live-writer-process
+Enrollment, fold, and recovery retain RFC 0022's single-live-writer-process
 support boundary, strengthened for the bounded profile by exclusive base-HEAD
 ownership while `OPEN`. MemWAL's shard epoch permits a crash successor after
 external exclusivity; it does not turn OmniGraph sidecar recovery into
@@ -6147,7 +6152,7 @@ remain concurrent with one another.
 |---|---|---|
 | E0 | production-neutral public-surface enrollment/witness classifier; no schema, API, sidecar, or format activation | **Passed 2026-07-18:** 14 substantive local cells, complete six-attempt zero-list 8/80 cost shape, Unix no-list/error tripwire, and one non-vacuous configured RustFS positive-plus-negative cell (§12.1) |
 | A | bounded main/unsharded/single-live-writer enrollment adapter, all-lifecycle effect exclusion with only the `SEALED` native-branch exception, lifecycle/admission lease, then graph-format capability/refusal and strict rebuild | **Implemented 2026-07-18 (§12.2):** internal schema v7, recovery-v10 enrollment, durable lifecycle CAS, process-local exclusion, crash/partial-format refusal, and genuine v6↔v7 strand evidence; no public enrollment or row path |
-| B1 | **Implemented privately 2026-07-19; acknowledgement containment added 2026-07-20; widest-shape closure repaired 2026-07-21:** internal schema v8/config-v2, root-scoped one-generation admission worker, durability-watcher success followed by a same-writer post-durability epoch check, conservative active-state reopen/replay, the pinned RC.1 replay-watermark bridge, and one explicit strict RFC-022 fold; no production caller | The graph-level behavior/crash/race suite and genuine v7↔v8 refusal/rebuild remain green. Fold charges logical dense-slice Arrow bytes and copies each scanner emission into dense owned arrays. The legal 8,192-row high-entropy near-cap generation folds and publishes exactly once without changing the logical 32-MiB admission cap; physical RSS is guarded only by the 384-MiB remeasurement tripwire (§12.4). Recovery-v11 is historical under the current v19 graph format |
+| B1 | **Implemented privately 2026-07-19; acknowledgement containment added 2026-07-20; widest-shape closure repaired 2026-07-21:** internal schema v8/config-v2, root-scoped one-generation admission worker, durability-watcher success followed by a same-writer post-durability epoch check, conservative active-state reopen/replay, the pinned RC.1 replay-watermark bridge, and one explicit strict RFC 0022 fold; no production caller | The graph-level behavior/crash/race suite and genuine v7↔v8 refusal/rebuild remain green. Fold charges logical dense-slice Arrow bytes and copies each scanner emission into dense owned arrays. The legal 8,192-row high-entropy near-cap generation folds and publishes exactly once without changing the logical 32-MiB admission cap; physical RSS is guarded only by the 384-MiB remeasurement tripwire (§12.4). Recovery-v11 is historical under the current v19 graph format |
 | R0 | production-neutral retained-growth/source audit; current-object census; referenced-cut retry; legal high-entropy near-cap materialize/fold cell; no schema, public caller, or deletion | **Historical bounded-retention no-go 2026-07-20; disposition amended 2026-07-21 (§0.2/§12.4):** RC.1 still exposes neither a complete reserve-first physical envelope/receipt nor a durable cross-open randomized-attempt cap. Those facts prohibit a finite storage promise but do not block selected unbounded retain-all. The formerly red widest cell is now green locally and on the configured-RustFS CI path; current-object observations remain advisory retention evidence, not provider billing/accounting |
 | B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Private gate implemented 2026-07-21 (§12.5):** no OmniGraph byte/object/file/history quota; zero canonical `_mem_wal` deletion; complete/partial provider residue remains retained, unreferenced, and untouched below its root through retry/reopen; provider failures are loud; local/configured-RustFS history sweeps are advisory. This gate itself activated no schema or product surface; the later private B2-common slice activates v9 |
 | B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |

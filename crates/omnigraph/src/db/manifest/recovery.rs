@@ -171,7 +171,7 @@ async fn publish_recovery_commit(
                 _ => None,
             };
             LineageIntent {
-                graph_commit_id: ulid::Ulid::new().to_string(),
+                graph_commit_id: crate::dst_ids::new_ulid().to_string(),
                 branch: sidecar.branch.clone(),
                 actor_id: Some(RECOVERY_ACTOR.to_string()),
                 merged_parent_commit_id,
@@ -2002,10 +2002,12 @@ fn validate_ensure_indices_v8_shape(sidecar_uri: &str, sidecar: &RecoverySidecar
         }
         let is_first_touch = effect.source_fork_version.is_some();
         if (is_first_touch
-            && !pin
-                .table_branch
-                .as_deref()
-                .is_some_and(|branch| branch != "main" && Some(branch) == sidecar_branch))
+            && !pin.table_branch.as_deref().is_some_and(|branch| {
+                // Pins name the native fork ref; the sidecar names the
+                // logical branch it belongs to.
+                branch != "main"
+                    && Some(crate::branch_names::logical_branch_name(branch)) == sidecar_branch
+            }))
             || effect
                 .source_fork_version
                 .is_some_and(|version| version != pin.expected_version)
@@ -3002,9 +3004,10 @@ pub(crate) async fn restore_table_to_version(
 /// this on every request. When sidecars exist, each is processed in
 /// `RecoveryMode::RollForwardOnly`: the common Phase B → Phase C
 /// residual (per-table `commit_staged` landed, manifest publish did
-/// not) rolls forward in-process; rollback-eligible or invariant-
-/// violating sidecars are deferred to the next ReadWrite open, exactly
-/// as `Omnigraph::refresh` documents.
+/// not) rolls forward in-process; a provably effect-free Armed
+/// mutation/load intent is retired (issue #554); the remaining
+/// rollback-eligible or invariant-violating sidecars are deferred to
+/// the next ReadWrite open, exactly as `Omnigraph::refresh` documents.
 ///
 /// Concurrency: unlike the open-time sweep, this runs while other writers may
 /// be in flight. RFC-022 mutation/load holds root-scoped schema → branch →
@@ -3224,7 +3227,7 @@ async fn discard_orphaned_branch_sidecar(
         // Phase 7) — no `_graph_commits.lance` row. The publisher stamps the
         // commit at the version it produces.
         let intent = LineageIntent {
-            graph_commit_id: ulid::Ulid::new().to_string(),
+            graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             branch: None,
             actor_id: Some(RECOVERY_ACTOR.to_string()),
             merged_parent_commit_id: None,
@@ -3483,7 +3486,11 @@ async fn classify_sidecar_tables(
                 .table_branch
                 .as_deref()
                 .is_some_and(|branch| branch != "main")
-            && sidecar.branch.as_deref() == pin.table_branch.as_deref()
+            && sidecar.branch.as_deref()
+                == pin
+                    .table_branch
+                    .as_deref()
+                    .map(crate::branch_names::logical_branch_name)
             && manifest_entry
                 .map(|entry| entry.native_dataset_branch != pin.table_branch)
                 .unwrap_or(true);
@@ -3597,8 +3604,9 @@ async fn process_sidecar(
     mode: RecoveryMode,
     schema_state_recovery: SchemaStateRecovery,
 ) -> Result<bool> {
-    // Returns whether durable state changed (roll-forward, roll-back, or
-    // stale-sidecar audit recovery). `false` = the sidecar was deferred
+    // Returns whether durable state changed (roll-forward, roll-back,
+    // effect-free retirement, or stale-sidecar audit recovery). `false` =
+    // the sidecar was deferred
     // untouched -- callers must not treat that as a completed heal (no
     // schema reload / cache invalidation is warranted).
     // v9 is one identity-bearing envelope shared by all active writers. Route
@@ -3733,19 +3741,77 @@ async fn process_sidecar(
         if !any_own_effect {
             // The sidecar was armed but this writer never landed a physical
             // effect. RollForwardOnly recovery may be looking at a LIVE writer,
-            // so an Armed sidecar is still ownership and must be left untouched
-            // even though root-scoped queues make it wait for in-process
-            // handles. A quiesced Full sweep may abandon it; first remove only
-            // exact, unpublished first-touch forks that this intent owns. Do
-            // not manufacture lineage for an empty intent and never restore a
-            // foreign advance.
+            // so an Armed sidecar is presumed ownership; the one exception is
+            // the identity-aware retirement below, which proves the intent
+            // effect-free before touching it. A quiesced Full sweep may
+            // abandon it; first remove only exact, unpublished first-touch
+            // forks that this intent owns. Do not manufacture lineage for an
+            // empty intent and never restore a foreign advance.
             if matches!(mode, RecoveryMode::RollForwardOnly)
                 && (protocol.effect_phase == RecoveryEffectPhase::Armed
                     || states.iter().any(|state| state.unpublished_fork))
             {
+                // A dead writer's Armed mutation/load intent would otherwise
+                // pend until the next ReadWrite open, which a long-lived
+                // server never performs (issue #554). The caller holds this
+                // sidecar's full schema -> branch -> table gate envelope, so
+                // no in-process writer can own it; exact transaction-identity
+                // finalization retires it only when provably effect-free, the
+                // same one-mutation-process boundary destructive Full
+                // recovery already assumes (docs/dev/invariants.md, current
+                // support boundaries). Exclusions that keep deferring to the
+                // next ReadWrite open: pre-v9 sidecars and non-mutation/load
+                // kinds (no exact identity to prove effect-freedom with —
+                // finalization ERRORS on both rather than declining, so those
+                // gates must run here) and first-touch forks (reclaiming an
+                // unpublished target ref requires the quiescence
+                // `cleanup_unpublished_no_effect_forks` documents). The Armed
+                // conjunct is defense in depth: the enclosing branch plus the
+                // fork exclusion already force Armed, and finalization
+                // re-checks it. An Armed EnsureIndices intent wedges the same
+                // way but carries no exact-effect identity; its live
+                // retirement needs its own safety argument and is
+                // deliberately not folded in here.
+                if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+                    && matches!(
+                        sidecar.writer_kind,
+                        SidecarKind::Mutation | SidecarKind::Load
+                    )
+                    && protocol.effect_phase == RecoveryEffectPhase::Armed
+                    && !states.iter().any(|state| state.unpublished_fork)
+                    && finalize_effect_free_occ_sidecar(
+                        root_uri,
+                        storage.as_ref(),
+                        snapshot,
+                        sidecar,
+                    )
+                    .await?
+                {
+                    warn!(
+                        operation_id = sidecar.operation_id.as_str(),
+                        writer_kind = ?sidecar.writer_kind,
+                        branch = sidecar.branch.as_deref().unwrap_or("<none>"),
+                        "recovery: retired a provably effect-free Armed intent from the live heal"
+                    );
+                    return Ok(true);
+                }
+                let defer_reason = if sidecar.schema_version
+                    != IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+                    || !matches!(
+                        sidecar.writer_kind,
+                        SidecarKind::Mutation | SidecarKind::Load
+                    ) {
+                    "pre-identity sidecar generation or kind"
+                } else if states.iter().any(|state| state.unpublished_fork) {
+                    "unpublished first-touch fork"
+                } else {
+                    "finalization declined"
+                };
                 warn!(
                     operation_id = sidecar.operation_id.as_str(),
-                    "recovery: deferring v3 sidecar with no physical effects and live ownership"
+                    schema_version = sidecar.schema_version,
+                    reason = defer_reason,
+                    "recovery: deferring sidecar with no physical effects to the next read-write open"
                 );
                 return Ok(false);
             }
@@ -6133,9 +6199,14 @@ fn first_touch_fork_version(sidecar: &RecoverySidecar, pin: &SidecarTablePin) ->
 /// no other pending sidecar may claim the same `(table_path, branch)`, and the
 /// live ref must still be exactly the fork point. Full recovery is quiesced, so
 /// this fresh re-check closes ordinary crash/retry races. Lance does not expose
-/// a compare-and-delete-by-branch-identifier primitive; callers must retain the
-/// Full-sweep quiescence guarantee rather than reusing this helper in a live
-/// reconciler.
+/// a compare-and-delete-by-branch-identifier primitive; a caller that can
+/// reach ref destruction here must either hold the Full-sweep quiescence
+/// guarantee or own the intent it destroys — the RFC-022 writer's own
+/// conflict-path finalization (`StagedMutation::commit_all`) reclaims the fork
+/// it just created under its still-held gate envelope. The live heal
+/// (`heal_pending_sidecars_roll_forward`) calls this only through
+/// `finalize_effect_free_occ_sidecar` with a fork-free pin set, where no ref
+/// surgery is reachable.
 async fn cleanup_unpublished_no_effect_forks(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -6181,8 +6252,9 @@ async fn cleanup_unpublished_no_effect_forks(
             // recovery is quiesced by the shared gates, so this no-effect
             // sidecar can safely discard itself without touching the ref. A
             // later/last claimant either cleans the still-untouched fork or
-            // recovers its owned effect. RollForwardOnly never calls this
-            // helper and continues to defer the unresolved ownership.
+            // recovers its owned effect. The RollForwardOnly live heal never
+            // reaches this arm (its fork-free pin set skips the whole loop)
+            // and continues to defer unresolved fork ownership.
             continue;
         }
 
@@ -7857,6 +7929,7 @@ async fn open_lance_head_if_present(
         let control_session = crate::lance_access::control_session();
         match lance::dataset::builder::DatasetBuilder::from_uri(table_path)
             .with_session(control_session)
+            .with_store_params(crate::storage::lance_store_params_for_uri(table_path)?)
             .load()
             .await
         {
@@ -7991,9 +8064,9 @@ fn new_unvalidated_sidecar(
     actor_id: Option<String>,
     tables: Vec<SidecarTablePin>,
 ) -> RecoverySidecar {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
+    use std::time::UNIX_EPOCH;
+    let operation_id = crate::dst_ids::new_ulid().to_string();
+    let started_at = match crate::dst_clock::system_time_now().duration_since(UNIX_EPOCH) {
         Ok(d) => format!("{}", d.as_micros()),
         Err(_) => "0".to_string(),
     };
@@ -8034,7 +8107,7 @@ pub(crate) fn new_ensure_indices_sidecar_v6(
         tables,
     );
     sidecar.ensure_indices_rollback_v6 = Some(RecoveryEnsureIndicesRollbackV6 {
-        rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+        rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
         rollback_audit_outcomes: None,
     });
     validate_sidecar_shape("<new-ensure-indices-sidecar>", &sidecar)?;
@@ -8069,8 +8142,9 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
         ));
     }
 
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+    let operation_id = crate::dst_ids::new_ulid().to_string();
+    let started_at = match crate::dst_clock::system_time_now().duration_since(std::time::UNIX_EPOCH)
+    {
         Ok(duration) => duration.as_micros().to_string(),
         Err(_) => "0".to_string(),
     };
@@ -8122,7 +8196,7 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
         protocol_v8: Some(RecoveryProtocolV8 {
             authority,
             lineage,
-            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             rollback_audit_outcomes: None,
             effect_phase: RecoveryEffectPhase::Armed,
             effects,
@@ -8325,8 +8399,9 @@ pub(crate) fn new_occ_sidecar_v9(
         ));
     }
 
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+    let operation_id = crate::dst_ids::new_ulid().to_string();
+    let started_at = match crate::dst_clock::system_time_now().duration_since(std::time::UNIX_EPOCH)
+    {
         Ok(duration) => duration.as_micros().to_string(),
         Err(_) => "0".to_string(),
     };
@@ -8368,7 +8443,7 @@ pub(crate) fn new_occ_sidecar_v9(
         protocol_v3: Some(RecoveryProtocolV3 {
             authority,
             lineage,
-            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             rollback_audit_outcomes: None,
             effect_phase: RecoveryEffectPhase::Armed,
             effects,
@@ -8535,8 +8610,9 @@ pub(crate) fn new_schema_apply_sidecar_v9(
     intended_delta: RecoveryManifestDelta,
     target_schema_ir_hash: String,
 ) -> Result<RecoverySidecar> {
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+    let operation_id = crate::dst_ids::new_ulid().to_string();
+    let started_at = match crate::dst_clock::system_time_now().duration_since(std::time::UNIX_EPOCH)
+    {
         Ok(duration) => duration.as_micros().to_string(),
         Err(_) => "0".to_string(),
     };
@@ -8558,7 +8634,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
         protocol_v7: Some(RecoveryProtocolV7 {
             authority,
             lineage,
-            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             rollback_audit_outcomes: None,
             target_schema_ir_hash,
             effect_phase: RecoveryEffectPhase::Armed,
@@ -8701,8 +8777,9 @@ pub(crate) fn new_branch_merge_sidecar_v9(
     effects: Vec<RecoveryBranchMergeEffect>,
     intended_delta: RecoveryManifestDelta,
 ) -> Result<RecoverySidecar> {
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+    let operation_id = crate::dst_ids::new_ulid().to_string();
+    let started_at = match crate::dst_clock::system_time_now().duration_since(std::time::UNIX_EPOCH)
+    {
         Ok(duration) => duration.as_micros().to_string(),
         Err(_) => "0".to_string(),
     };
@@ -8723,7 +8800,7 @@ pub(crate) fn new_branch_merge_sidecar_v9(
         protocol_v4: Some(RecoveryProtocolV4 {
             authority,
             lineage,
-            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             rollback_audit_outcomes: None,
             effect_phase: RecoveryEffectPhase::Armed,
             effects,
@@ -10628,7 +10705,7 @@ node Person {
 node Person { age: I32? }
 node Company { age: I32? }
 "#;
-        let _scenario = fail::FailScenario::setup();
+        let _scenario = crate::failpoints::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
@@ -10800,7 +10877,7 @@ node Company { age: I32? }
         const SCHEMA: &str = r#"
 node Person { age: I32? }
 "#;
-        let _scenario = fail::FailScenario::setup();
+        let _scenario = crate::failpoints::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();

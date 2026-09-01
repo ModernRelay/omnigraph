@@ -293,11 +293,11 @@ query set_note($title: String, $note: String) {
         .dataset("node:Document")
         .expect("feature Document entry");
     assert_eq!(source_entry.dataset_path, base_entry.dataset_path);
-    assert_eq!(
-        source_entry.native_dataset_branch.as_deref(),
-        Some("feature")
+    helpers::assert_native_branch_of(source_entry.native_dataset_branch.as_deref(), "feature");
+    let source_table_uri = format!(
+        "{base_table_uri}/tree/{}",
+        source_entry.native_dataset_branch.as_deref().unwrap()
     );
-    let source_table_uri = format!("{base_table_uri}/tree/feature");
     let source_dataset = Dataset::open(&source_table_uri).await.unwrap();
     assert_ne!(source_dataset.uri(), base_dataset.uri());
     let mut scanner = source_dataset.scan();

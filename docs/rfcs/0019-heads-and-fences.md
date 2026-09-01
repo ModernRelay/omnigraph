@@ -1,31 +1,38 @@
 ---
-type: spec
-title: "RFC-019 — Heads and Fences: structural O(1) writes without a warm-cache truth fork"
-description: Replaces the warm-publish/pinned-open machinery of PR #318 with two structural changes — durable per-table head rows ("refs, not replay") and substrate-native key-conflict fencing (Lance's unenforced-PK KeyExistenceFilter) — landing together as internal schema v5; composes with RFC-018 (WAL ingest) and the upstream multi-table-commit direction.
+rfc: "0019"
+title: "Heads and fences"
+track: maintainer
 status: superseded
-tags: [eng, rfc, write-path, manifest, lance, omnigraph]
-timestamp: 2026-07-04
-owner: OmniGraph maintainers
+implementation: partial
+authors:
+  - OmniGraph maintainers
+created: 2026-07-04
+updated: 2026-08-23
+discussion: null
+supersedes: []
+superseded_by: ["0023", "0024"]
+blocked_on: []
 ---
 
-# RFC-019 — Heads and Fences
+# RFC 0019: Heads and fences
 
-**Status:** Superseded by [RFC-023](0023-key-conflict-fencing.md) and [RFC-024](0024-durable-table-heads.md)
-**Date:** 2026-07-04
-**Author track:** Maintainer design series
+> **Disposition:** Superseded by
+> [RFC 0023](0023-key-conflict-fencing.md) and
+> [RFC 0024](0024-durable-table-heads.md).
+
 **Surveyed:** omnigraph `main` @ 98530a0e (0.8.0); Lance pinned 7.0.0 (+ vendored lance-table carrying lance#7480); upstream Lance v8.0.0 (released 2026-07-01), v9.0.0-beta.15; PR #318 at `2aab48ba` (reviewed 2026-07-04, 8 verified findings)
-**Companion docs:** RFC-018 (streaming-ingest WAL), PR #318's plan doc (`unlimited-history-latency-plan.md`, whose §9 "U2" this RFC promotes from follow-up to prerequisite)
+**Companion docs:** RFC 0018 (streaming-ingest WAL), PR #318's plan doc (`unlimited-history-latency-plan.md`, whose §9 "U2" this RFC promotes from follow-up to prerequisite)
 **Audience:** OmniGraph maintainers
 
-> **Later disposition:** RFC-018 and its successor RFC-026 were rejected. All
+> **Later disposition:** RFC 0018 and its successor RFC 0026 were rejected. All
 > MemWAL and streaming-ingest discussion below is retained historical context,
 > not an active dependency or roadmap. See
-> [the removal decision](../dev/wal-removal.md).
+> the current [ingestion contract](../dev/ingestion.md).
 
 > **Supersession note (2026-07-10):** key-conflict fencing and durable table
 > heads are separate irreversible decisions with different substrate gates and
-> rollout requirements. RFC-023 and RFC-024 review them independently under
-> RFC-022's shared graph-write protocol. RFC-023 also corrects this draft's
+> rollout requirements. RFC 0023 and RFC 0024 review them independently under
+> RFC 0022's shared graph-write protocol. RFC 0023 also corrects this draft's
 > load-bearing symmetry claim: on the surveyed Lance revision, an unfiltered
 > current transaction (including bare `Append`) can rebase after a filtered
 > update. Fencing therefore requires both transaction orders plus a fleet
@@ -60,8 +67,8 @@ migration (internal schema v4 → v5, "heads and fences"):
    safe by construction and may return for their residual ~1-RPC saving.
 
 Sequenced: Lance 7→8 bump (fence-first requires v8's #7251 fix; also
-RFC-018's Phase 0) → v5 migration (both format changes in one stamp bump, one
-upgrade story) → RFC-018's WAL phases on top. What survives from #318: the
+RFC 0018's Phase 0) → v5 migration (both format changes in one stamp bump, one
+upgrade story) → RFC 0018's WAL phases on top. What survives from #318: the
 freshness probe, session-held handles, the DST `Cohort` harness, the cost
 gates — and warm publish itself **as an explicitly temporary stopgap with v5
 as its named demolition**, if the latency is needed before v5 lands.
@@ -72,7 +79,7 @@ of the *mutable tip* belong durably inside the source of truth, and may live
 in process memory only as hints arbitrated per use by the commit authority.
 
 The one-line thesis: **heads make state cheap to read, fences make races
-loud, the WAL (RFC-018) makes commits rare where visibility can wait — and
+loud, the WAL (RFC 0018) makes commits rare where visibility can wait — and
 the single publish seam underneath keeps all three swappable for whatever
 multi-table primitive Lance ships.**
 
@@ -145,7 +152,7 @@ demolition — without naming the demolition.
 ### 1.5 The pinned open bought ~1 RPC with a silent-corruption window
 
 Two facts sharpen the pinned-open half. First, the expensive opener was
-already dead before #318: `main` carries RFC-013 step 3a
+already dead before #318: `main` carries RFC 0013 step 3a
 (`open_dataset_head_for_write` routes through the direct opener; the
 namespace builder's O(depth) chain resolution is gone). Second, Lance's
 latest-resolution is already cheap: `resolve_latest_location` is a local read
@@ -270,7 +277,7 @@ Add one **mutable head row per table** to `__manifest`:
   location, and branch.
 - Written by `ManifestBatchPublisher` in the **same merge-insert commit** as
   the immutable journal rows and lineage rows — pointer and journal cannot
-  diverge because they land atomically (the RFC-013 Phase 7 argument, reused).
+  diverge because they land atomically (the RFC 0013 Phase 7 argument, reused).
 - The journal rows are unchanged: time travel, `snapshot_at_version`, and
   diff/change feeds keep reading immutable history exactly as today.
 
@@ -302,7 +309,7 @@ before trusting any held handle) and the publisher CAS — both unchanged.
 - Head rows are hot rows: every publish rewrites O(touched tables) of them
   via `WhenMatched::UpdateAll` — the same write shape `graph_head` already
   exercises at every commit; no new contention point (the per-branch
-  serialization remains the `graph_head` row, §7.1 of RFC-013).
+  serialization remains the `graph_head` row, §7.1 of RFC 0013).
 - `__manifest` compaction (already in `optimize`) keeps the journal bounded;
   head rows make the *hot path* independent of whether compaction ran —
   removing the operational assumption that was #318's strongest argument for
@@ -363,7 +370,7 @@ before trusting any held handle) and the publisher CAS — both unchanged.
 The v2 plan path with a partial or racing source is only trustworthy on
 ≥ v8.0.0 (#7251 fixed the silent match-dropping under an all-null leading
 column on the indexed/legacy boundary). The 7→8 bump is therefore Phase 0 —
-shared with RFC-018, carrying the standing alignment-audit protocol, and
+shared with RFC 0018, carrying the standing alignment-audit protocol, and
 re-vendoring the lance#7480 `lance-table` patch at 8.0.0 (the fix ships in no
 release ≤ 8.0.0).
 
@@ -375,16 +382,16 @@ then be taken freely. Until the fence is on, non-strict staging opens should
 stay at step-3a live-HEAD-via-cheap-probe (§1.5) — the pin's price is wrong
 only while the window is silent.
 
-## 5. Relationship to RFC-018 (WAL) — the third leg
+## 5. Relationship to RFC 0018 (WAL) — the third leg
 
 Head rows and fences fix the **interactive** path (ack = visible): fast state
 read, fenced staged commit, one CAS — near the physical minimum for
 visibility-at-ack semantics. The **per-commit floor** (round trips, the
 `graph_head` CAS rate) is real but is the *price of the semantics*, and only
-workloads that can defer visibility can escape it. That is RFC-018's WAL:
+workloads that can defer visibility can escape it. That is RFC 0018's WAL:
 ack on durability, fold N writes into one commit **through the same publish
 seam**. Notably the fold's fenced merge benefits from §4 directly (MemWAL
-requires the PK anyway — RFC-018 §4.1's enrollment step becomes a no-op once
+requires the PK anyway — RFC 0018 §4.1's enrollment step becomes a no-op once
 v5 has annotated all tables), and head rows make the fold's publish cheap.
 The three pieces are one program:
 
@@ -392,7 +399,7 @@ The three pieces are one program:
 |---|---|---|
 | Head rows | O(history) manifest fold per write | unchanged |
 | Fence-first | silent dup-`@key` under races (MR-714) | races become loud retries |
-| WAL + fold (RFC-018) | per-commit floor, for deferrable-visibility workloads | ack = durable; visible at fold (opt-in surface) |
+| WAL + fold (RFC 0018) | per-commit floor, for deferrable-visibility workloads | ack = durable; visible at fold (opt-in surface) |
 
 **Upstream addendum (2026-07-05).** The lance#7264 discussion's 2026-07-03
 comment turned the Phase-4 target concrete: a unification of the two upstream
@@ -407,7 +414,7 @@ N+1** with the epoch in the record log, enforced in the writer's commit path —
 the fence-first shape (§4's philosophy), safety from commit-slot mechanics
 rather than clock discipline; (2) measured: ~450–600 ms commit, ~6–7 txn/s on
 S3 independent of catalog size, group commit as the lever — the numbers behind
-this RFC's Phase-4 swap and RFC-018's fold; (3) the `_txn/` record log carries
+this RFC's Phase-4 swap and RFC 0018's fold; (3) the `_txn/` record log carries
 a **durable pruned-through GC boundary** (GC advances it before deleting; a
 writer re-verifies `seq > boundary` after its put succeeds) — the
 `iss-cleanup-boundary-watermark` fix shape arriving as a substrate feature.
@@ -424,7 +431,7 @@ One stamp bump, two format changes, one upgrade story:
 - Every data table's key columns gain the unenforced-PK annotation. New
   tables: at creation. Existing tables: set-if-absent, loud refusal on a
   *different* existing PK (the `migrate_v1_to_v2` guarded shape, per
-  RFC-018 §4.1's identical need — coordinate so v5 satisfies both RFCs).
+  RFC 0018 §4.1's identical need — coordinate so v5 satisfies both RFCs).
 - Old binaries refuse v5 graphs at open with the standard stamp message; the
   upgrade path is the versioning policy's documented one. **This also
   retro-fixes #318's outstanding stamp-bump debt** (its lineage-row format
@@ -436,7 +443,7 @@ One stamp bump, two format changes, one upgrade story:
 Survives, unconditionally: the freshness probe and incarnation machinery;
 session-held dataset handles (aligned with Lance #7576); the `Cohort`
 multi-coordinator DST harness and cross-process suites; the cost-gate
-extensions (`write_cost` served-regime gates); RFC-013 step 3a's direct
+extensions (`write_cost` served-regime gates); RFC 0013 step 3a's direct
 opener; the lineage read-back-from-`_row_created_at_version` idea (with the
 v5 stamp bump it was owed, and a compaction surface guard).
 
@@ -489,10 +496,10 @@ on), `warm_head_hint`, the warm/cold equivalence surface.
 
 | Phase | Deliverable | Gate |
 |---|---|---|
-| 0 | Lance 7→8 bump (shared with RFC-018 Phase 0): alignment stanza, guards re-run, re-vendor lance#7480 patch at 8.0.0, #7251 regression pinned | v8.0.0 (released) |
+| 0 | Lance 7→8 bump (shared with RFC 0018 Phase 0): alignment stanza, guards re-run, re-vendor lance#7480 patch at 8.0.0, #7251 regression pinned | v8.0.0 (released) |
 | 1 | Fence-first on new tables: PK annotation at creation + `use_index(false)` data merges (measured); conflict→retry mapping; file upstream ask 4.2(b); revert pin-at-base to step-3a live-HEAD opens | Phase 0 |
 | 2 | v5 "heads and fences" migration: head rows + PK backfill on existing graphs, one stamp bump (folding in #318's owed bump if merged); publisher reads head rows; retire `WarmAttempt`/`warm_head_hint` | Phase 1, RFC review |
-| 3 | Re-enable pin-at-base opens (now fenced) if the ~1 RPC matters; RFC-018 WAL phases proceed on the v5 substrate | Phase 2 |
+| 3 | Re-enable pin-at-base opens (now fenced) if the ~1 RPC matters; RFC 0018 WAL phases proceed on the v5 substrate | Phase 2 |
 | 4 | Upstream multi-table primitive — now concretely the #7260×#7264 record+promote unification (see §5 addendum): publisher-seam swap; recovery sidecars retire by construction; head rows remain the graph-semantic layer | upstream ship |
 
 ## 11. Open questions

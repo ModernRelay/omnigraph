@@ -7,10 +7,8 @@ name: Publish container image
 # not block the binary release / Homebrew chain, and a manual backfill of an
 # old tag must not re-run the four-platform release matrix.
 #
-# Triggers (same dual pattern as release.yml):
-#   - push of a v* tag (normal release)
-#   - workflow_dispatch with an explicit `tag` (publish an image for a past
-#     tag; resolves the same `${{ inputs.tag || github.ref_name }}`)
+# Automatic tag publication is called by CI only after the exact commit passes
+# the vocabulary audit. Manual backfills reuse a prior exact-commit audit.
 #
 # The binaries are compiled inside a rust:1-bookworm container, NOT on the
 # runner host: the Dockerfile's runtime base is debian bookworm-slim
@@ -18,9 +16,17 @@ name: Publish container image
 # there. Builder and runtime must share the same distro release.
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      source_ref:
+        required: true
+        type: string
+      ci_run_id:
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -29,20 +35,31 @@ on:
         type: string
 
 jobs:
+  vocabulary_gate:
+    name: Require audited image source
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-vocabulary-gate.yml
+    with:
+      source_ref: ${{ inputs.source_ref || format('refs/tags/{0}', inputs.tag) }}
+      ci_run_id: ${{ inputs.ci_run_id || '' }}
+
   publish_image:
     name: Build and push image
+    needs: vocabulary_gate
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
     steps:
       # The dispatch `tag` input is free-form; without this guard a dispatcher
       # could pass a branch name or SHA and publish non-release code under a
       # release-looking image tag. Require an existing v* tag ref.
-      - name: Validate dispatch tag
-        if: github.event_name == 'workflow_dispatch'
+      - name: Validate release tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -52,10 +69,9 @@ jobs:
             || { echo "no such tag: ${RELEASE_TAG}" >&2; exit 1; }
 
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
-          # Fully qualified so a branch of the same name can never shadow the tag.
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
 
       - name: Build release binaries (bookworm builder)
         run: |
@@ -64,7 +80,11 @@ jobs:
             apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
             # --features omnigraph-server/aws: include the AWS Secrets Manager
             # bearer-token source so one public image serves both token modes.
-            cargo build --release --locked -p omnigraph-cli -p omnigraph-server --features omnigraph-server/aws
+            cargo build --release --locked \
+              -p omnigraph-cli \
+              -p omnigraph-server \
+              -p omnigraph-azure-admission \
+              --features omnigraph-server/aws
           '
 
       - name: Log in to GHCR
@@ -72,11 +92,31 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
 
+      - name: Verify release tag still selects audited source
+        run: |
+          set -euo pipefail
+          refs="$(git ls-remote origin \
+            "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}")"
+          tag_sha="$(awk '$2 ~ /\^\{\}$/ {print $1}' <<<"$refs")"
+          if [[ -z "$tag_sha" ]]; then
+            tag_sha="$(awk 'NR == 1 {print $1}' <<<"$refs")"
+          fi
+          [[ "$tag_sha" == "$SOURCE_SHA" ]] || {
+            echo "::error::${RELEASE_TAG} now selects ${tag_sha:-nothing}, expected ${SOURCE_SHA}"
+            exit 1
+          }
+
       - name: Build and push image
         run: |
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           image="ghcr.io/${owner}/omnigraph-server"
           docker build -t "${image}:${RELEASE_TAG}" .
+          docker run --rm --entrypoint /usr/local/bin/omnigraph \
+            "${image}:${RELEASE_TAG}" version
+          docker run --rm --entrypoint /usr/local/bin/omnigraph-server \
+            "${image}:${RELEASE_TAG}" --help >/dev/null
+          docker run --rm --entrypoint /usr/local/bin/omnigraph-azure-admission \
+            "${image}:${RELEASE_TAG}" --help >/dev/null
           docker push "${image}:${RELEASE_TAG}"
 
           # Move `latest` only on real tag pushes — a dispatch backfill of an

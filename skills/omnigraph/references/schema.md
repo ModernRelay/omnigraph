@@ -35,13 +35,14 @@ If the same enum appears on multiple nodes, duplicate it inline — there's no s
 
 `[String]` and `[I32]` are fine. `[Category]` (a list of enum values) is **not** supported. Use `[String]` with query-side filtering, or use a single-valued enum property if one value is enough.
 
-### `@embed` takes a quoted string
+### `@embed` takes a source and optional model
 
 ```pg
-embedding: Vector(3072) @embed("text") @index
+embedding: Vector(1536) @embed("text", model="openai/text-embedding-3-large") @index
 ```
 
-Not `@embed(text)`. The source property name is a string literal.
+The identifier form `@embed(text)` is also valid. The quoted form is canonical;
+omit `model=...` when the embedding provider supplies the model.
 
 ### Edge constraints go inside a body block
 
@@ -73,15 +74,22 @@ omnigraph schema apply --schema next.pg s3://bucket/repo
 
 If `supported: false`, fix the source before applying. Plan is free; run it as often as needed.
 
-Plan/apply diagnostics carry stable codes of the form **`OG-XXX-NNN`** (since v0.5.0) — match on the code, not the free-form message text.
+Plan/apply diagnostics may carry stable codes of the form **`OG-XXX-NNN`**. When
+a code is present, match it rather than the free-form message text.
 
-**Destructive drops are gated (since v0.5.0).** Dropping a property or type is a soft drop by default (or rejected); to actually lose data you must opt in:
+**Destructive drops are gated.** Dropping a property or type is a soft drop by
+default. To preview and execute a hard destructive drop, opt in on both steps:
 
 ```bash
+omnigraph schema plan --schema next.pg s3://bucket/repo --allow-data-loss --json
+# inspect the hard-drop plan
 omnigraph schema apply --schema next.pg s3://bucket/repo --allow-data-loss
 ```
 
-Over HTTP the equivalent is `{"allow_data_loss": true}` in the schema-apply body. Without the flag, a destructive drop returns a structured diagnostic instead of silently deleting columns.
+Without the flag, supported drops preserve prior physical data through soft
+drop semantics. A cluster-only server rejects
+`POST /graphs/{id}/schema/apply` with `409`; evolve a served graph through
+`cluster plan` and `cluster apply`.
 
 ### Apply is main-only
 
@@ -101,7 +109,8 @@ Works on node types, edge types, and properties.
 
 ### Required properties need a backfill plan
 
-Adding a non-nullable property to an existing node is rejected as unsupported. Pattern:
+Adding a non-nullable property to an existing node or edge type is rejected as
+unsupported. Pattern:
 
 1. Add as optional: `new_prop: String?`
 2. Apply
@@ -110,7 +119,7 @@ Adding a non-nullable property to an existing node is rejected as unsupported. P
    (a property-type change, OG-MF-106). Enforce presence at write time by
    convention until required-tightening ships as a migration step.
 
-### Enum widening is a supported apply (omnigraph >= 0.8.1)
+### Enum widening is a supported apply
 
 Adding variants to an `enum(...)` property is a metadata-only migration step:
 `schema plan` shows `extend enum ...`, `apply` touches no table data, and new
@@ -135,25 +144,28 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 
 ## Decorators (quick reference)
 
-**Property-level:**
-- `@key` — primary key (implies index; usually one per node)
-- `@unique` — uniqueness constraint
-- `@index` — query optimization
-- `@range(min, max)` — numeric bounds (open ranges allowed)
-- `@check(prop, "regex")` — regex pattern validation on a String property
-- `@embed("source_prop")` — embed from a String source into a Vector property
+**Property-level shorthand:**
+- `@key` — single-property node key
+- `@unique` — single-property uniqueness constraint
+- `@index` — single-property index intent (currently materialized automatically only for node properties)
+- `@embed("source_prop")` — on a node Vector property, embed from a String source
 - `@description("...")` — metadata (no migration impact)
-- `@instruction("...")` — semantic hint for LLMs/operators
 
 **Edge-level:**
 - `@card(min..max)` — edge cardinality (default: `0..*`)
 
-**Type-level (nodes/edges/properties):**
+**Type-level (nodes/edges):**
+- `@instruction("...")` — semantic hint for LLMs/operators
+
+**Rename (nodes/edges/properties):**
 - `@rename_from("OldName")` — migration-aware rename
 
 **Group-level (inside body block):**
-- `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at both intake and merge (works on edges too: `@unique(src, dst)`). Columns must reduce to a scalar key: `@unique` on a `[List]`/`Blob` column is rejected loudly at `load` (it used to be silently un-enforced — fixed in #160).
-- `@index(prop1, prop2)` — composite index
+- `@key(prop1, prop2)` — ordered node identity tuple
+- `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(src, dst)`). Members must reduce to scalar keys. Blob is rejected at schema admission; list/vector declarations may parse but writes fail scalar-key validation.
+- `@index(prop1, prop2)` — composite index intent. Composite and edge intents are accepted but are not currently materialized as property indexes.
+- `@range(prop, min..max)` — node-only numeric bounds; either bound may be omitted
+- `@check(prop, "regex")` — node-only String regular-expression constraint
 
 ## Interfaces
 

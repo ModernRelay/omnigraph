@@ -150,6 +150,13 @@ pub enum OmniError {
     /// the common opener so historical APIs never infer retention from error text.
     #[error("historical published dataset version {published_dataset_version} was reclaimed")]
     HistoricalVersionReclaimed { published_dataset_version: u64 },
+    /// The snapshot selected an FTS artifact whose analyzer generation cannot
+    /// be proven compatible. Ordinary reads remain available; do not return a
+    /// partial indexed result or infer provenance from the dataset writer.
+    #[error(
+        "full-text index '{index}' requires rebuild: {reason}; run omnigraph rebuild-full-text-indexes <URI> --branch <branch> on the live branch (historical snapshots are unchanged)"
+    )]
+    FullTextIndexRebuildRequired { index: String, reason: String },
     /// The exact staged-commit adapter proved that Lance contention was
     /// effect-free. This operation-local signal lets RFC-023 distinguish a
     /// safe key-fence re-evaluation from an arbitrary storage failure; generic
@@ -802,6 +809,10 @@ fn classify_engine_storage_source<'a>(
     use std::ops::ControlFlow::{Break, Continue};
 
     if let Some(error) = source.downcast_ref::<lance::Error>() {
+        // The probe's inner cause cannot establish whether the commit landed.
+        if error.is_commit_status_unknown() {
+            return Break(StorageFailureKind::Unknown);
+        }
         return match error {
             lance::Error::Timeout { .. } => Break(StorageFailureKind::Transient),
             lance::Error::DiskCapExceeded { .. }
@@ -1154,6 +1165,36 @@ mod tests {
             lance::Error::namespace_source(Box::new(std::fmt::Error)),
             StorageFailureKind::Unknown,
         );
+
+        // An unknown commit outcome is stronger evidence than its probe's
+        // cause: neither a missing manifest nor a timeout/conflict proves
+        // whether the write landed. Preserve that ambiguity through wrappers.
+        for nested_in_datafusion in [false, true] {
+            for source in [
+                lance::Error::not_found("manifest probe"),
+                lance::Error::timeout("manifest probe"),
+                lance::Error::version_conflict("manifest probe", 43, 42),
+            ] {
+                let error = lance::Error::commit_status_unknown_source(42, Box::new(source));
+                let (message, classified) = if nested_in_datafusion {
+                    use datafusion::error::DataFusionError;
+
+                    let error = DataFusionError::Context(
+                        "commit wrapper".to_string(),
+                        Box::new(DataFusionError::External(Box::new(error))),
+                    );
+                    (error.to_string(), OmniError::datafusion(error))
+                } else {
+                    (error.to_string(), OmniError::storage(error))
+                };
+                assert_eq!(
+                    classified.storage_failure().map(|failure| failure.kind),
+                    Some(StorageFailureKind::Unknown),
+                    "{message}"
+                );
+                assert_eq!(classified.to_string(), format!("storage: {message}"));
+            }
+        }
     }
 
     #[test]

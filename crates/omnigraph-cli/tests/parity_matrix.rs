@@ -602,11 +602,8 @@ fn parity_errors_share_exit_codes() {
         "unknown query name must fail on both arms\nlocal {l:?}\nremote {r:?}"
     );
 
-    // Discovery (parity HOLDS, behavior surprising): an inline query run
-    // with a declared-but-unbound param does NOT error on either arm — it
-    // returns every row (the filter drops), while the stored-query invoke
-    // path hard-errors 'parameter not provided'. Pinned here as agreeing
-    // behavior; the cross-path asymmetry is filed separately.
+    // Required parameters fail closed on both transports, including when the
+    // parameter is consumed by an inline node-property match.
     let (l, r) = p.run(&[
         "query",
         "--query",
@@ -616,8 +613,8 @@ fn parity_errors_share_exit_codes() {
     ]);
     assert_eq!(
         (l.status.success(), r.status.success()),
-        (true, true),
-        "unbound-param inline query currently SUCCEEDS on both arms (matches-all)"
+        (false, false),
+        "unbound required param must fail on both arms\nlocal {l:?}\nremote {r:?}"
     );
 }
 

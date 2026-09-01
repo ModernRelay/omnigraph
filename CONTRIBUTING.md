@@ -9,8 +9,8 @@ rules and decision authority behind it live in [GOVERNANCE.md](GOVERNANCE.md).
 |---|---|---|
 | **Report a bug** or wrong behavior | **[Open an Issue](../../issues/new/choose)** — bug form | Concrete and reproducible. A maintainer triages it; once labelled **`accepted`** it's open for a PR. |
 | **Propose a feature / share an idea** | **[Open an Issue](../../issues/new/choose)** — feature form | A maintainer triages it. **`accepted`** means a PR may follow; a larger design gets **`needs-rfc`** and goes through an RFC first. |
-| **Propose a design / RFC** | **An Issue first**, then an RFC pull request | Get the issue `accepted` before investing in the RFC document. A maintainer merging the RFC PR is acceptance; the merged RFC then sanctions implementation PRs — see [docs/rfcs/README.md](docs/rfcs/README.md). |
-| **Fix something / implement a change** | **A pull request** | Must link an `accepted` issue or a merged RFC — unless it's trivial (below). |
+| **Propose a design / RFC** | **An Issue first**, then an RFC pull request | Get the issue `accepted` before investing in the RFC. Merge may publish a draft for review; only `status: accepted` authorizes implementation — see [docs/rfcs/README.md](docs/rfcs/README.md). |
+| **Fix something / implement a change** | **A pull request** | Must link an `accepted` issue or accepted RFC — unless it's trivial (below). |
 | **Report a security vulnerability** | **[SECURITY.md](SECURITY.md)** | Do **not** open a public Issue. |
 
 GitHub Discussions are not used — Issues are the only inbound channel.
@@ -21,7 +21,7 @@ change is clearly broken-fixing with small blast radius and no design impact:
 typo and wording fixes, doc corrections, dependency bumps, comment fixes,
 obvious one-line CI tweaks. **If you cannot tell trivial from real, it is real
 — open the issue.** Anything more substantial needs a backing `accepted` issue
-or merged RFC first, so the *why* is agreed before the *how* is reviewed. A PR
+or accepted RFC first, so the *why* is agreed before the *how* is reviewed. A PR
 that turns out to be non-trivial will be redirected — that's about process, not
 the merit of the change.
 
@@ -35,9 +35,23 @@ brew install protobuf                                  # macOS
 sudo apt-get install -y protobuf-compiler libprotobuf-dev   # Debian/Ubuntu
 ```
 
+The first clean build compiles the Arrow/Lance storage stack and can take many
+minutes depending on hardware and network cache state. For the shortest edit
+loop, check or test only the package you changed before running the workspace
+gate:
+
 ```bash
-cargo build --workspace
-cargo test --workspace
+cargo check -p omnigraph-engine --locked
+cargo test -p omnigraph-engine --test traversal
+```
+
+Substitute the owning package and existing test target; the coverage map in
+[`docs/dev/testing.md`](docs/dev/testing.md) identifies them. Before merging a
+non-trivial change, run the canonical feature-superset gate:
+
+```bash
+cargo test --workspace --locked \
+  --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
 If you touch S3-backed flows, the CI model uses a local RustFS instance for
@@ -73,7 +87,7 @@ CI runs both.
 
 ## Pull Requests
 
-- **Link the backing `accepted` issue or merged RFC** (`Closes #123`, or
+- **Link the backing `accepted` issue or accepted RFC** (`Closes #123`, or
   reference the RFC) — or mark the PR as trivial per the fast-lane.
 - Keep changes focused; one logical change per PR.
 - Include tests for behavior changes when practical.

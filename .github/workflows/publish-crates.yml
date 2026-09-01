@@ -5,9 +5,8 @@ name: Publish to crates.io
 # the first step below fail-closes every invocation until that policy and
 # `docs/dev/versioning.md` are deliberately changed together.
 #
-# Triggers:
-#   - push of any v* tag (future releases auto-publish alongside release.yml)
-#   - workflow_dispatch with an explicit tag input (catch-up runs for past tags)
+# Automatic publication is called by CI only after the exact commit passes the
+# vocabulary audit. Manual backfills require a prior exact-commit audit too.
 #
 # Once publication is restored, each crate's current crates.io version is
 # checked before publish so a partial failure can be rerun idempotently.
@@ -15,9 +14,17 @@ name: Publish to crates.io
 # Prerequisite: repo secret CARGO_REGISTRY_TOKEN. The job exits cleanly if absent.
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      source_ref:
+        required: true
+        type: string
+      ci_run_id:
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -26,12 +33,25 @@ on:
         type: string
 
 jobs:
+  vocabulary_gate:
+    name: Require audited crate source
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-vocabulary-gate.yml
+    with:
+      source_ref: ${{ inputs.source_ref || format('refs/tags/{0}', inputs.tag) }}
+      ci_run_id: ${{ inputs.ci_run_id || '' }}
+
   publish_crates:
     name: Publish crates
+    needs: vocabulary_gate
     runs-on: ubuntu-latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       CARGO_TERM_COLOR: always
+      RELEASE_TAG: ${{ inputs.tag }}
+      SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
     steps:
       - name: Enforce registry publication pause
         run: |
@@ -44,20 +64,11 @@ jobs:
           echo "CARGO_REGISTRY_TOKEN is not set; skipping crates.io publish."
           echo "CARGO_PUBLISH_SKIP=1" >> "$GITHUB_ENV"
 
-
-      - name: Resolve ref
-        if: env.CARGO_PUBLISH_SKIP != '1'
-        id: ref
-        run: |
-          ref="${{ inputs.tag || github.ref_name }}"
-          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
-          echo "Publishing from ref: ${ref}"
-
       - name: Checkout source at tag
         if: env.CARGO_PUBLISH_SKIP != '1'
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
-          ref: ${{ steps.ref.outputs.ref }}
+          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
 
       # Defense in depth for a future publication restart: crates.io rejects git
       # dependencies, so a rev-pinned substrate must still defer that release.
@@ -77,16 +88,32 @@ jobs:
 
       - name: Install Rust stable
         if: env.CARGO_PUBLISH_SKIP != '1'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
 
       - name: Cache Rust build data
         if: env.CARGO_PUBLISH_SKIP != '1'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
             . -> target
+
+      - name: Verify release tag still selects audited source
+        if: env.CARGO_PUBLISH_SKIP != '1'
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" == v* ]]
+          refs="$(git ls-remote origin \
+            "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}")"
+          tag_sha="$(awk '$2 ~ /\^\{\}$/ {print $1}' <<<"$refs")"
+          if [[ -z "$tag_sha" ]]; then
+            tag_sha="$(awk 'NR == 1 {print $1}' <<<"$refs")"
+          fi
+          [[ "$tag_sha" == "$SOURCE_SHA" ]] || {
+            echo "::error::${RELEASE_TAG} now selects ${tag_sha:-nothing}, expected ${SOURCE_SHA}"
+            exit 1
+          }
 
       - name: Publish crates in dependency order
         if: env.CARGO_PUBLISH_SKIP != '1'

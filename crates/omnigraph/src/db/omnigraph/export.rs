@@ -38,6 +38,7 @@ impl ExportCut {
             &self.snapshot,
             self.catalog.as_ref(),
             &self.selected_tables,
+            ExportRowOrder::ById,
             emit,
         )
         .await
@@ -201,6 +202,38 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
         &resolved.snapshot,
         catalog.as_ref(),
         &selected_tables,
+        ExportRowOrder::ById,
+        &mut emit,
+    )
+    .await
+}
+
+/// Stream the same logical row encoding as ordinary export without imposing a
+/// physical row order. This is for commutative consumers such as fixture
+/// multiset hashing; callers must not infer meaning from emission order.
+pub(super) async fn export_jsonl_unordered_to_writer<W: Write>(
+    db: &Omnigraph,
+    branch: &str,
+    type_names: &[String],
+    writer: &mut W,
+) -> Result<()> {
+    let _export_cut = db.write_queue().try_acquire_export_cut().ok_or_else(|| {
+        OmniError::ResourceLimitExceeded {
+            resource: "stream_export_slots".to_string(),
+            limit: 1,
+            actual: 2,
+        }
+    })?;
+    let (resolved, catalog) = db.capture_read_view(ReadTarget::branch(branch)).await?;
+    let selected_tables = export_type_keys(&resolved.snapshot, type_names)?;
+    let mut emit =
+        |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));
+    export_selected_tables(
+        db,
+        &resolved.snapshot,
+        catalog.as_ref(),
+        &selected_tables,
+        ExportRowOrder::Unspecified,
         &mut emit,
     )
     .await
@@ -313,6 +346,7 @@ pub(super) async fn capture_change_baseline<W: Write>(
         &parts.snapshot,
         parts.catalog.as_ref(),
         &parts.selected_tables,
+        ExportRowOrder::ById,
         &mut emit,
     )
     .await?;
@@ -344,11 +378,18 @@ async fn entity_from_snapshot(
     Ok(Some(record_batch_row_to_json(batch, 0)?))
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ExportRowOrder {
+    ById,
+    Unspecified,
+}
+
 async fn export_selected_tables<Emit, EmitFuture>(
     db: &Omnigraph,
     snapshot: &Snapshot,
     catalog: &Catalog,
     selected_tables: &[String],
+    row_order: ExportRowOrder,
     emit: &mut Emit,
 ) -> Result<()>
 where
@@ -356,7 +397,7 @@ where
     EmitFuture: Future<Output = Result<()>>,
 {
     for table_key in selected_tables {
-        export_table(db, snapshot, catalog, table_key, emit).await?;
+        export_table(db, snapshot, catalog, table_key, row_order, emit).await?;
     }
     Ok(())
 }
@@ -400,6 +441,7 @@ async fn export_table<Emit, EmitFuture>(
     snapshot: &Snapshot,
     catalog: &Catalog,
     table_key: &str,
+    row_order: ExportRowOrder,
     emit: &mut Emit,
 ) -> Result<()>
 where
@@ -410,7 +452,10 @@ where
         .storage()
         .open_snapshot_at_table(snapshot, table_key)
         .await?;
-    let ordering = Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]);
+    let ordering = match row_order {
+        ExportRowOrder::ById => Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
+        ExportRowOrder::Unspecified => None,
+    };
     let blob_properties = blob_properties_for_table_key(catalog, table_key)?;
 
     if blob_properties.is_empty() {
@@ -490,7 +535,9 @@ pub(crate) async fn export_blob_values(
     blob_properties: &std::collections::HashSet<String>,
 ) -> Result<HashMap<String, Vec<Option<String>>>> {
     let mut values = HashMap::with_capacity(blob_properties.len());
-    for property in blob_properties {
+    let mut __dst_props: Vec<_> = blob_properties.iter().collect();
+    __dst_props.sort();
+    for property in __dst_props {
         let descriptions = batch
             .column_by_name(property)
             .and_then(|col| col.as_any().downcast_ref::<StructArray>())
