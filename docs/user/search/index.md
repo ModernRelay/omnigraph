@@ -17,6 +17,11 @@ for nearest-neighbor ordering.
 Filters in the `match` block are applied before ranking, so `limit 10` means the
 top ten matches that satisfy the graph and property filters.
 
+Search and rank functions must target a *scan-rooted* binding — the
+first-declared binding of its match component. A traversal-introduced target
+(`$d knows $t` then `nearest($t.…)`) fails compile with `T26`: the search has
+no node scan to run on, and older versions silently returned unranked rows.
+
 Full-text functions on a column with **no** FTS index still serve results
 through a flat scan, but that fallback tokenizes case-sensitively — an exact
 token matches, `"anthropic"` does not find a stored `"Anthropic"`. Such reads

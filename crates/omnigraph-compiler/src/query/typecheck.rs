@@ -159,6 +159,85 @@ fn parse_declared_param_types(params: &[Param]) -> Result<HashMap<String, PropTy
     Ok(out)
 }
 
+fn t26_error(func: &str, variable: &str) -> CompilerError {
+    CompilerError::Type(format!(
+        "T26: {func}() cannot target `${variable}`: `${variable}` is introduced by a \
+         traversal, so the search cannot run on its node scan and would be silently \
+         dropped; make `${variable}` the first-declared binding of its match component, \
+         or target the scan-rooted variable"
+    ))
+}
+
+fn search_field_variable(expr: &Expr) -> Option<&str> {
+    if let Expr::PropAccess { variable, .. } = expr {
+        Some(variable.as_str())
+    } else {
+        None
+    }
+}
+
+/// T26 (see `typecheck_read_query`): every search filter and every rank
+/// expression must target a scan-rooted binding of its clause scope. Negation
+/// scopes are checked with their own roots — an inner search on an outer
+/// binding has no inner scan either.
+fn reject_expand_introduced_search_targets(query: &QueryDecl) -> Result<()> {
+    check_scope_search_targets(&query.match_clause)?;
+    let roots = crate::ir::lower::scan_root_variables(&query.match_clause);
+    for ord in &query.order_clause {
+        check_rank_expr_target(&ord.expr, &roots)?;
+    }
+    Ok(())
+}
+
+fn check_scope_search_targets(clauses: &[Clause]) -> Result<()> {
+    let roots = crate::ir::lower::scan_root_variables(clauses);
+    for clause in clauses {
+        match clause {
+            Clause::Filter(filter) => {
+                let (func, field) = match &filter.left {
+                    Expr::Search { field, .. } => ("search", field),
+                    Expr::MatchText { field, .. } => ("match_text", field),
+                    _ => continue,
+                };
+                if let Some(variable) = search_field_variable(field) {
+                    if !roots.contains(variable) {
+                        return Err(t26_error(func, variable));
+                    }
+                }
+            }
+            Clause::Negation(inner) => check_scope_search_targets(inner)?,
+            Clause::Binding(_) | Clause::Traversal(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_rank_expr_target(expr: &Expr, roots: &HashSet<String>) -> Result<()> {
+    match expr {
+        Expr::Nearest { variable, .. } => {
+            if !roots.contains(variable) {
+                return Err(t26_error("nearest", variable));
+            }
+            Ok(())
+        }
+        Expr::Bm25 { field, .. } => {
+            if let Some(variable) = search_field_variable(field) {
+                if !roots.contains(variable) {
+                    return Err(t26_error("bm25", variable));
+                }
+            }
+            Ok(())
+        }
+        Expr::Rrf {
+            primary, secondary, ..
+        } => {
+            check_rank_expr_target(primary, roots)?;
+            check_rank_expr_target(secondary, roots)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
     let mut ctx = TypeContext {
         bindings: HashMap::new(),
@@ -217,6 +296,14 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
                 .to_string(),
         ));
     }
+
+    // T26: a search or rank function can only target a scan-rooted binding.
+    // Lowering gives only each match component's first-declared binding a
+    // NodeScan; a traversal-introduced (Expand-bound) target has no scan for
+    // the search to run on, so accepting one would silently drop the filter
+    // or rank the result set not at all. Shares lowering's exact
+    // component-root computation so the rule cannot drift.
+    reject_expand_introduced_search_targets(query)?;
 
     // T9: If any return expression is an aggregate, non-aggregate expressions
     // must be valid group-by keys (PropAccess or Variable).

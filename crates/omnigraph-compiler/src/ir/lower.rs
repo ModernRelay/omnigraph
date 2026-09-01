@@ -182,6 +182,90 @@ fn lower_bm25_leaf(field: &IRExpr, query: &IRExpr, scan_cap: Option<u64>) -> Res
     })
 }
 
+/// Bindings that lowering DEFERS within one clause scope.
+///
+/// When multiple bindings in the same match clause are connected by
+/// traversals, only the first-declared binding of each connected component
+/// needs a NodeScan; the rest are introduced by Expand operations (making
+/// them all NodeScans would trigger expensive cross-joins followed by
+/// cycle-closing filters). Algorithm: build an undirected graph of variables
+/// connected by traversals (the anonymous wildcard `_` never bridges
+/// components), then walk components in binding declaration order — the
+/// first binding in each component is the root; the rest are deferred.
+pub(crate) fn deferred_binding_variables(clauses: &[Clause]) -> HashSet<String> {
+    let mut bindings = Vec::new();
+    let mut traversals = Vec::new();
+    for clause in clauses {
+        match clause {
+            Clause::Binding(b) => bindings.push(b),
+            Clause::Traversal(t) => traversals.push(t),
+            Clause::Filter(_) | Clause::Negation(_) => {}
+        }
+    }
+
+    let binding_set: HashSet<&str> = bindings.iter().map(|b| b.variable.as_str()).collect();
+
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for t in &traversals {
+        let src = t.src.as_str();
+        let dst = t.dst.as_str();
+        if src != "_" && dst != "_" {
+            adj.entry(src).or_default().push(dst);
+            adj.entry(dst).or_default().push(src);
+        }
+    }
+
+    let mut deferred_set: HashSet<String> = HashSet::new();
+    let mut component_visited: HashSet<&str> = HashSet::new();
+
+    for binding in &bindings {
+        if component_visited.contains(binding.variable.as_str()) {
+            continue;
+        }
+        let mut queue = VecDeque::new();
+        queue.push_back(binding.variable.as_str());
+        let mut component_bindings: Vec<&str> = Vec::new();
+
+        while let Some(var) = queue.pop_front() {
+            if !component_visited.insert(var) {
+                continue;
+            }
+            if binding_set.contains(var) {
+                component_bindings.push(var);
+            }
+            if let Some(neighbours) = adj.get(var) {
+                for &n in neighbours {
+                    if !component_visited.contains(n) {
+                        queue.push_back(n);
+                    }
+                }
+            }
+        }
+
+        for var in component_bindings.into_iter().skip(1) {
+            deferred_set.insert(var.to_string());
+        }
+    }
+    deferred_set
+}
+
+/// Scan-rooted variables of one clause scope: the declared bindings lowering
+/// gives a NodeScan (declared minus deferred). A search or rank function can
+/// only run on a scan-rooted target — everything else is Expand-introduced
+/// and has no scan to attach to. Consumed by typecheck's T26 rule.
+pub(crate) fn scan_root_variables(clauses: &[Clause]) -> HashSet<String> {
+    let deferred = deferred_binding_variables(clauses);
+    clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            Clause::Binding(b) if !deferred.contains(b.variable.as_str()) => {
+                Some(b.variable.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
     if query.mutations.is_empty() {
         return Err(crate::error::CompilerError::Plan(
@@ -271,68 +355,10 @@ fn lower_clauses(
     }
 
     // ── Determine which bindings are "deferred" ─────────────────────────
-    //
-    // When multiple bindings in the same match clause are connected by
-    // traversals, only the first-declared binding needs a NodeScan; the
-    // rest will be introduced by Expand operations.  Making them all
-    // NodeScans triggers expensive cross-joins followed by cycle-closing
-    // filters.
-    //
-    // Algorithm: build an undirected graph of variables connected by
-    // traversals, then walk connected components in binding declaration
-    // order.  The first binding in each component becomes the root (gets
-    // a NodeScan); all other bindings in the same component are deferred
-    // — their inline filters become post-Expand Filter ops.
-
-    let binding_set: HashSet<&str> = bindings.iter().map(|b| b.variable.as_str()).collect();
-
-    // Build undirected traversal adjacency (variable → neighbours).
-    // Exclude the anonymous wildcard "_" so it cannot falsely bridge
-    // otherwise-independent components.
-    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-    for t in &traversals {
-        let src = t.src.as_str();
-        let dst = t.dst.as_str();
-        if src != "_" && dst != "_" {
-            adj.entry(src).or_default().push(dst);
-            adj.entry(dst).or_default().push(src);
-        }
-    }
-
-    // Walk components to find deferred binding variables
-    let mut deferred_set: HashSet<String> = HashSet::new();
-    let mut component_visited: HashSet<&str> = HashSet::new();
-
-    for binding in &bindings {
-        if component_visited.contains(binding.variable.as_str()) {
-            continue;
-        }
-        // BFS from this binding through the traversal graph
-        let mut queue = VecDeque::new();
-        queue.push_back(binding.variable.as_str());
-        let mut component_bindings: Vec<&str> = Vec::new();
-
-        while let Some(var) = queue.pop_front() {
-            if !component_visited.insert(var) {
-                continue;
-            }
-            if binding_set.contains(var) {
-                component_bindings.push(var);
-            }
-            if let Some(neighbours) = adj.get(var) {
-                for &n in neighbours {
-                    if !component_visited.contains(n) {
-                        queue.push_back(n);
-                    }
-                }
-            }
-        }
-
-        // First binding in the component is the root; defer the rest.
-        for var in component_bindings.into_iter().skip(1) {
-            deferred_set.insert(var.to_string());
-        }
-    }
+    // The component-root computation is shared with typecheck's T26 pass
+    // (`scan_root_variables`) so lowering and the compile-time rule cannot
+    // drift; see `deferred_binding_variables` for the algorithm.
+    let deferred_set = deferred_binding_variables(clauses);
 
     // Build deferred filters map for variables introduced by traversals
     let mut deferred_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();

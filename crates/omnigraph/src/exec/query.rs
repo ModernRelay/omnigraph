@@ -250,6 +250,37 @@ impl NoticeSink {
 /// tokenizer instead of the indexed analyzer.
 const NOTICE_FULL_TEXT_SEARCH_UNINDEXED: &str = "full_text_search_unindexed";
 
+/// The first retrieval target variable (including rrf arms) that no
+/// top-level `NodeScan` introduces, if any. Anti-join inner pipelines never
+/// carry the query's retrieval, so only the outer pipeline is consulted.
+fn retrieval_target_without_scan<'a>(ir: &'a QueryIR, mode: &'a SearchMode) -> Option<&'a str> {
+    let scan_vars: HashSet<&str> = ir
+        .pipeline
+        .iter()
+        .filter_map(|op| match op {
+            IROp::NodeScan { variable, .. } => Some(variable.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut targets: Vec<&str> = Vec::new();
+    let mut collect = |leaf: &'a SearchMode| {
+        if let Some((var, ..)) = leaf.nearest.as_ref() {
+            targets.push(var.as_str());
+        }
+        if let Some((var, ..)) = leaf.bm25.as_ref() {
+            targets.push(var.as_str());
+        }
+    };
+    collect(mode);
+    if let Some(rrf) = mode.rrf.as_ref() {
+        collect(&rrf.primary);
+        collect(&rrf.secondary);
+    }
+    targets
+        .into_iter()
+        .find(|target| !scan_vars.contains(target))
+}
+
 /// Resolve the lowered retrieval plan into the executable `SearchMode`.
 ///
 /// The retrieval SHAPE — which source, which variable/property, the bm25
@@ -523,6 +554,15 @@ pub async fn execute_query(
     let params = resolved_params.as_ref().unwrap_or(params);
 
     let search_mode = resolve_retrieval(ir, params, catalog, embedding).await?;
+    // T26's engine backstop: the compiler owns the scan-rooted-target rule;
+    // a hand-built IR that ranks a binding with no NodeScan must still fail
+    // loudly instead of returning silently unranked rows.
+    if let Some(bad) = retrieval_target_without_scan(ir, &search_mode) {
+        return Err(OmniError::manifest(format!(
+            "search target `${bad}` has no node scan in the pipeline; refusing to run \
+             unranked (compile-time owner: T26)"
+        )));
+    }
     let mut notices = NoticeSink::default();
 
     // RRF requires forked execution. Its bm25 arms are never capped (see
@@ -1709,6 +1749,16 @@ fn execute_pipeline<'a>(
             let IROp::Filter(filter) = op else { continue };
             if is_search_filter(filter) {
                 if let Some(var) = search_filter_variable(filter) {
+                    // T26's engine backstop: the compiler rejects search
+                    // filters on non-scan-rooted targets; an IR that reaches
+                    // here anyway must fail loudly, never hoist into the void
+                    // (the pre-T26 executor silently dropped the predicate).
+                    if !scan_vars.contains(var) {
+                        return Err(OmniError::manifest(format!(
+                            "search filter on `${var}` has no node scan to run on; \
+                             refusing to drop it silently (compile-time owner: T26)"
+                        )));
+                    }
                     hoisted_search_filters
                         .entry(var.to_string())
                         .or_default()

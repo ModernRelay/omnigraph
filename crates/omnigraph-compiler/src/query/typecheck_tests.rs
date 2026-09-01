@@ -1967,3 +1967,133 @@ return { $w }
     assert!(msg.contains("T23"), "{msg}");
     assert!(msg.contains("propert"), "points at property access: {msg}");
 }
+
+// ─── T26: search/rank targets must be scan-rooted ───────────────────────────
+
+fn setup_linked_vector() -> Catalog {
+    let schema = parse_schema(
+        r#"
+node LinkedDoc {
+name: String
+embedding: Vector(3)
+}
+edge Related: LinkedDoc -> LinkedDoc
+"#,
+    )
+    .unwrap();
+    build_catalog(&schema).unwrap()
+}
+
+#[test]
+fn t26_rejects_nearest_on_traversal_introduced_binding() {
+    let catalog = setup_linked_vector();
+    let qf = parse_query(
+        r#"
+query q($q: Vector(3)) {
+match {
+    $d: LinkedDoc
+    $d related $t
+}
+return { $d.name }
+order { nearest($t.embedding, $q) }
+limit 3
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T26"), "expected T26, got: {msg}");
+    assert!(msg.contains("nearest"), "got: {msg}");
+}
+
+#[test]
+fn t26_rejects_search_filter_on_traversal_introduced_binding() {
+    let catalog = setup_linked_vector();
+    let qf = parse_query(
+        r#"
+query q($q: String) {
+match {
+    $d: LinkedDoc
+    $d related $t
+    search($t.name, $q)
+}
+return { $d.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T26"), "expected T26, got: {msg}");
+    assert!(msg.contains("search"), "got: {msg}");
+}
+
+#[test]
+fn t26_rejects_rrf_arm_on_traversal_introduced_binding() {
+    let catalog = setup_linked_vector();
+    let qf = parse_query(
+        r#"
+query q($q: Vector(3), $s: String) {
+match {
+    $d: LinkedDoc
+    $d related $t
+}
+return { $d.name }
+order { rrf(nearest($t.embedding, $q), bm25($d.name, $s)) }
+limit 3
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T26"), "expected T26, got: {msg}");
+}
+
+// The naive "declared = scanned" rule would miss this: $t is EXPLICITLY
+// declared, but as the second binding of its connected component it is
+// deferred — Expand-introduced, no NodeScan. The shared scan-root helper
+// keeps typecheck aligned with lowering here.
+#[test]
+fn t26_rejects_deferred_explicit_binding_target() {
+    let catalog = setup_linked_vector();
+    let qf = parse_query(
+        r#"
+query q($q: String) {
+match {
+    $d: LinkedDoc
+    $t: LinkedDoc
+    $d related $t
+    search($t.name, $q)
+}
+return { $d.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T26"), "expected T26, got: {msg}");
+}
+
+#[test]
+fn t26_allows_scan_rooted_target_alongside_traversal() {
+    let catalog = setup_linked_vector();
+    let qf = parse_query(
+        r#"
+query q($q: String) {
+match {
+    $d: LinkedDoc
+    $d related $t
+    search($d.name, $q)
+}
+return { $d.name, $t.name }
+}
+"#,
+    )
+    .unwrap();
+    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    assert!(ctx.bindings.contains_key("d"));
+    assert!(ctx.bindings.contains_key("t"));
+}

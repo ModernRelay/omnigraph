@@ -536,6 +536,50 @@ async fn text_search_no_results() {
     assert_eq!(result.num_rows(), 0);
 }
 
+// ─── T26 through the public engine API ──────────────────────────────────────
+
+// The dev-graph reproduction (iss-nearest-dropped-by-traversal, restated):
+// ranking a traversal-introduced binding used to run SILENTLY unranked — no
+// NodeScan carries the search, and ordering was skipped too. T26 now rejects
+// it at typecheck, through every public entry point.
+#[tokio::test]
+#[serial]
+async fn nearest_on_traversal_introduced_binding_fails_t26() {
+    use omnigraph::error::OmniError;
+
+    const T26_QUERY: &str = r#"
+query t26($q: Vector(4)) {
+    match {
+        $d: RankedDoc
+        $d rankedLink $t
+    }
+    return { $t.slug }
+    order { nearest($t.embedding, $q) }
+    limit 2
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_ranked_edge_db(&dir).await;
+
+    let error = query_main(
+        &mut db,
+        T26_QUERY,
+        "t26",
+        &vector_param("q", &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        matches!(error, OmniError::Compiler(_)),
+        "the silent-unranked shape must die at typecheck: {error}"
+    );
+    assert!(
+        message.contains("T26"),
+        "expected the stable T26 diagnostic, got: {message}"
+    );
+}
+
 // ─── Characterization goldens (equivalence baseline for the retrieval IR) ───
 
 const TIE_SCHEMA: &str = r#"
