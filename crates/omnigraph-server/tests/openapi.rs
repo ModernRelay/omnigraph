@@ -964,8 +964,11 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ReadOutput",
     "ReadRequest",
     "ReadSetConflictOutput",
+    "EmbeddingCoverageOutput",
+    "MetricOutput",
     "ReadTargetOutput",
     "ReadWarningOutput",
+    "RetrievalOutput",
     "PreconditionFailureOutput",
     "RecoveryRequiredOutput",
     "ResourceLimitOutput",
@@ -1066,9 +1069,15 @@ fn read_output_schema_has_expected_fields() {
         .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
         .unwrap_or_default();
     assert!(!required.contains(&"warnings"));
+    assert!(props.contains_key("metrics"));
+    assert!(props.contains_key("retrievals"));
+    assert!(!required.contains(&"metrics"));
+    assert!(!required.contains(&"retrievals"));
     let legacy = &doc["components"]["schemas"]["LegacyReadOutput"];
     let legacy_props = legacy["properties"].as_object().unwrap();
     assert!(!legacy_props.contains_key("warnings"));
+    assert!(!legacy_props.contains_key("metrics"));
+    assert!(!legacy_props.contains_key("retrievals"));
     assert!(!legacy_props.contains_key("graph_commit_id"));
 }
 

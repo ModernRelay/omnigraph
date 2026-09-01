@@ -779,6 +779,191 @@ async fn aggregated_search_ordered_sorts_tail_and_notes() {
     );
 }
 
+// ─── Retrieval metadata: metrics, retrievals, embedding coverage ────────────
+
+const EMBED_COVERAGE_SCHEMA: &str = r#"
+node EDoc {
+    slug: String @key
+    flag: Bool
+    body: String?
+    embedding: Vector(4)? @embed("body")
+}
+"#;
+
+const EMBED_COVERAGE_DATA: &str = r#"{"type":"EDoc","data":{"slug":"e1","flag":true,"body":"alpha","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"EDoc","data":{"slug":"e2","flag":true,"body":"beta","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"EDoc","data":{"slug":"e3","flag":false,"body":"gamma"}}
+{"type":"EDoc","data":{"slug":"e4","flag":false}}"#;
+
+const EMBED_COVERAGE_QUERIES: &str = r#"
+query cover_all($q: Vector(4)) {
+    match { $e: EDoc }
+    return { $e.slug }
+    order { nearest($e.embedding, $q) }
+    limit 4
+}
+
+query cover_flagged($q: Vector(4)) {
+    match { $e: EDoc { flag: true } }
+    return { $e.slug }
+    order { nearest($e.embedding, $q) }
+    limit 4
+}
+"#;
+
+async fn init_embed_coverage_db(dir: &tempfile::TempDir) -> Omnigraph {
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), EMBED_COVERAGE_SCHEMA)
+        .await
+        .unwrap();
+    load_jsonl(&db, EMBED_COVERAGE_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db
+}
+
+// e3 has source text but no derived vector: the retrieval must report it as
+// exact pending coverage (with the notice), never silently rank without it.
+// e4 has neither — ordinary missing data, not pending.
+#[tokio::test]
+#[serial]
+async fn nearest_embed_backed_reports_exact_coverage() {
+    use omnigraph_compiler::result::{MetricRecall, RetrievalKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_embed_coverage_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        EMBED_COVERAGE_QUERIES,
+        "cover_all",
+        &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result_slugs(&result), vec!["e1", "e2"]);
+    let retrievals = result.retrievals();
+    assert_eq!(retrievals.len(), 1, "{retrievals:?}");
+    assert_eq!(retrievals[0].kind, RetrievalKind::Nearest);
+    assert_eq!(
+        retrievals[0].recall,
+        MetricRecall::Exact,
+        "no vector index on this fixture — flat scan is the exact contract"
+    );
+    let coverage = retrievals[0].embedding.expect("@embed-backed coverage");
+    assert_eq!((coverage.ready, coverage.pending), (2, 1));
+    assert!(
+        result
+            .notices()
+            .iter()
+            .any(|notice| notice.code == "embedding_coverage_pending"),
+        "pending coverage must be loud: {:?}",
+        result.notices()
+    );
+}
+
+// The prefilter excludes the pending row, so coverage is complete and quiet:
+// coverage describes the PREFILTERED population, not the whole table.
+#[tokio::test]
+#[serial]
+async fn coverage_respects_prefilter_population() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_embed_coverage_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        EMBED_COVERAGE_QUERIES,
+        "cover_flagged",
+        &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result_slugs(&result), vec!["e1", "e2"]);
+    let coverage = result.retrievals()[0].embedding.expect("coverage");
+    assert_eq!((coverage.ready, coverage.pending), (2, 0));
+    assert!(
+        result
+            .notices()
+            .iter()
+            .all(|notice| notice.code != "embedding_coverage_pending"),
+        "complete coverage must not warn: {:?}",
+        result.notices()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn bm25_reports_score_metric_descriptor() {
+    use omnigraph_compiler::result::{MetricKind, MetricRecall, RetrievalKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "bm25_projected",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
+    let metrics = result.metrics();
+    assert_eq!(metrics.len(), 1, "{metrics:?}");
+    assert_eq!(metrics[0].column, "score");
+    assert_eq!(metrics[0].kind, MetricKind::Score);
+    assert_eq!(metrics[0].source, RetrievalKind::Bm25);
+    assert!(metrics[0].descending);
+    assert_eq!(metrics[0].recall, MetricRecall::Exact);
+    assert!(
+        result
+            .retrievals()
+            .iter()
+            .any(|r| r.kind == RetrievalKind::Bm25 && r.recall == MetricRecall::Exact),
+        "{:?}",
+        result.retrievals()
+    );
+}
+
+// Fused metric descriptor + retrievals recorded even when no metric is
+// projected (coverage cannot live only on a projected column).
+#[tokio::test]
+#[serial]
+async fn rrf_reports_fused_metric_and_arm_retrievals() {
+    use omnigraph_compiler::result::{MetricKind, RetrievalKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        METRIC_QUERIES,
+        "rrf_projected",
+        &two_vector_params("$q1", &[0.1, 0.2, 0.3, 0.4], "$q2", &[0.5, 0.6, 0.7, 0.8]),
+    )
+    .await
+    .unwrap();
+    let metrics = result.metrics();
+    assert_eq!(metrics.len(), 1, "{metrics:?}");
+    assert_eq!(metrics[0].column, "fusion");
+    assert_eq!(metrics[0].kind, MetricKind::Score);
+    assert_eq!(metrics[0].source, RetrievalKind::Rrf);
+    // Both arms rank the same (variable, property): one deduped descriptor.
+    assert_eq!(result.retrievals().len(), 1, "{:?}", result.retrievals());
+    assert_eq!(result.retrievals()[0].kind, RetrievalKind::Nearest);
+
+    // A vector+text fusion records both arm sources — without any projected
+    // metric column.
+    let hybrid = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "hybrid_search",
+        &vector_and_string_params("$vq", &[0.1, 0.2, 0.3, 0.4], "$tq", "Learning"),
+    )
+    .await
+    .unwrap();
+    assert!(hybrid.metrics().is_empty());
+    let kinds: Vec<RetrievalKind> = hybrid.retrievals().iter().map(|r| r.kind).collect();
+    assert!(
+        kinds.contains(&RetrievalKind::Nearest) && kinds.contains(&RetrievalKind::Bm25),
+        "{kinds:?}"
+    );
+}
+
 // ─── T26 through the public engine API ──────────────────────────────────────
 
 // The dev-graph reproduction (iss-nearest-dropped-by-traversal, restated):

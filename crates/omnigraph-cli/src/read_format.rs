@@ -313,6 +313,8 @@ mod tests {
             rows: serde_json::json!([{ "name": "Alice", "age": 30 }]),
             graph_commit_id: None,
             warnings: Vec::new(),
+            metrics: Vec::new(),
+            retrievals: Vec::new(),
         }
     }
 

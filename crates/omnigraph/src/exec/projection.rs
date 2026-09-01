@@ -428,7 +428,7 @@ fn evaluate_projection(
             })?;
             Ok((col_name, col.clone()))
         }
-        IRExpr::Bm25 { field, .. } => {
+        IRExpr::Bm25 { .. } => {
             let variable = rank_expr_variable(expr).ok_or_else(|| {
                 OmniError::manifest("bm25 field must be a property access".to_string())
             })?;
@@ -464,7 +464,7 @@ fn evaluate_projection(
 
 /// The binding variable a rank expression targets, when its field shape
 /// allows one (`nearest($v.prop, …)` / `bm25($v.prop, …)`).
-fn rank_expr_variable(expr: &IRExpr) -> Option<&str> {
+pub(super) fn rank_expr_variable(expr: &IRExpr) -> Option<&str> {
     match expr {
         IRExpr::Nearest { variable, .. } => Some(variable.as_str()),
         IRExpr::Bm25 { field, .. } => match field.as_ref() {

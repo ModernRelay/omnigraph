@@ -17,6 +17,14 @@ for nearest-neighbor ordering.
 Filters in the `match` block are applied before ranking, so `limit 10` means the
 top ten matches that satisfy the graph and property filters.
 
+Ranked responses describe themselves: the `/query` envelope's `metrics`
+array explains each projected metric column (kind, source, direction, and
+its recall contract), and `retrievals` lists every executed source — for
+`nearest()` on an `@embed`-backed property including exact `ready`/`pending`
+embedding coverage of the filtered population, with an
+`embedding_coverage_pending` warning whenever rows the ranking could not see
+still await their embedding.
+
 A rank function in the `return` clause projects the score the ordering used:
 `bm25($d.body, $q) as score`, `nearest($d.embedding, $q) as distance`,
 `rrf(...) as fusion`. The projection observes the executed retrieval — the

@@ -4208,6 +4208,31 @@
           }
         }
       },
+      "EmbeddingCoverageOutput": {
+        "type": "object",
+        "description": "Exact snapshot-pinned embedding representation coverage of one vector\nretrieval's prefiltered population. `pending` rows have source text but no\nderived vector yet — data the ranking could not see (orthogonal to ANN\nrecall).",
+        "required": [
+          "ready",
+          "pending",
+          "complete"
+        ],
+        "properties": {
+          "complete": {
+            "type": "boolean",
+            "description": "`pending == 0` — every expected representation was ready."
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ready": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "EntityChangeOutput": {
         "type": "object",
         "description": "One entity change. Cause is stated once on the enclosing block, never here.\nAn insert carries only `after`, an update exact `before` and `after`, a\ndelete only `before`.",
@@ -4863,6 +4888,45 @@
           }
         }
       },
+      "MetricOutput": {
+        "type": "object",
+        "description": "Describes one projected metric column of a ranked read. Explanatory only:\nit adds no second value and promises no cross-query score calibration.\n`kind` is `score` or `distance`; `source` is `nearest`, `bm25`, or `rrf`;\n`recall` is the source CONTRACT (`exact` or `approximate`), not the\nphysical plan taken. Unknown future strings must be tolerated.",
+        "required": [
+          "column",
+          "kind",
+          "source",
+          "variable",
+          "descending",
+          "recall"
+        ],
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "descending": {
+            "type": "boolean",
+            "description": "`true` = larger is better (scores); `false` = smaller is better."
+          },
+          "kind": {
+            "type": "string"
+          },
+          "property": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recall": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "variable": {
+            "type": "string"
+          }
+        }
+      },
       "ParamDescriptor": {
         "type": "object",
         "description": "One declared parameter of a stored query, projected for the catalog.",
@@ -5083,8 +5147,22 @@
             ],
             "description": "Effective graph head commit id of the exact snapshot this read was\nserved from. On a fresh named branch this is the inherited source head,\nso it is immediately usable as `Omnigraph-If-Graph-Commit` (CLI:\n`--if-commit`) for the branch's first conditional write. The id and rows\ncome from one pinned version, so no separate id fetch is needed."
           },
+          "metrics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MetricOutput"
+            },
+            "description": "Descriptors for projected metric columns (ranked reads only)."
+          },
           "query_name": {
             "type": "string"
+          },
+          "retrievals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RetrievalOutput"
+            },
+            "description": "Every executed retrieval source, including embedding coverage for\n`@embed`-backed vector retrievals."
           },
           "row_count": {
             "type": "integer",
@@ -5228,6 +5306,40 @@
             "minimum": 0
           },
           "resource": {
+            "type": "string"
+          }
+        }
+      },
+      "RetrievalOutput": {
+        "type": "object",
+        "description": "One executed retrieval source (standalone, or an rrf arm), present even\nwhen its metric is not projected.",
+        "required": [
+          "variable",
+          "property",
+          "kind",
+          "recall"
+        ],
+        "properties": {
+          "embedding_coverage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EmbeddingCoverageOutput"
+              }
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "property": {
+            "type": "string"
+          },
+          "recall": {
+            "type": "string"
+          },
+          "variable": {
             "type": "string"
           }
         }

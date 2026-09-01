@@ -1506,6 +1506,36 @@ async fn query_carries_unindexed_text_warning_and_legacy_read_drops_it() {
         body.get("warnings").is_none(),
         "legacy /read must not grow the additive field: {body}"
     );
+
+    // A ranked read additionally carries `metrics` + `retrievals` metadata on
+    // the canonical envelope.
+    const RANKED_QUERY: &str = "query note_rank($q: String) {\n    match { $n: Note }\n    return { $n.slug, bm25($n.summary, $q) as score }\n    order { bm25($n.summary, $q) }\n    limit 3\n}\n";
+    let ranked = QueryRequest {
+        query: RANKED_QUERY.to_string(),
+        name: Some("note_rank".to_string()),
+        params: Some(json!({ "q": "Anthropic" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/query"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&ranked).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let metrics = body["metrics"].as_array().expect("metrics array");
+    assert_eq!(metrics[0]["column"], "score");
+    assert_eq!(metrics[0]["kind"], "score");
+    assert_eq!(metrics[0]["source"], "bm25");
+    assert_eq!(metrics[0]["recall"], "exact");
+    let retrievals = body["retrievals"].as_array().expect("retrievals array");
+    assert_eq!(retrievals[0]["kind"], "bm25");
+    assert!(retrievals[0].get("embedding_coverage").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]

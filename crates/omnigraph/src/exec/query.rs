@@ -223,25 +223,43 @@ struct RrfMode {
 /// which also keeps RRF's two forked arms from double-reporting a shared
 /// condition. Notices never change rows, membership, or order.
 #[derive(Default)]
-struct NoticeSink(Vec<QueryNotice>);
+struct NoticeSink {
+    notices: Vec<QueryNotice>,
+    retrievals: Vec<RetrievalDescriptor>,
+}
 
 impl NoticeSink {
     fn emit(&mut self, code: &'static str, message: String) {
         if self
-            .0
+            .notices
             .iter()
             .any(|notice| notice.code == code && notice.message == message)
         {
             return;
         }
-        self.0.push(QueryNotice {
+        self.notices.push(QueryNotice {
             code: code.to_string(),
             message,
         });
     }
 
-    fn into_notices(self) -> Vec<QueryNotice> {
-        self.0
+    /// Record an executed retrieval source, upserting on (variable,
+    /// property, kind): the bm25 uncapped retry and RRF's forked arms
+    /// recompute identical facts, not duplicates.
+    fn record_retrieval(&mut self, descriptor: RetrievalDescriptor) {
+        if let Some(existing) = self.retrievals.iter_mut().find(|existing| {
+            existing.variable == descriptor.variable
+                && existing.property == descriptor.property
+                && existing.kind == descriptor.kind
+        }) {
+            *existing = descriptor;
+        } else {
+            self.retrievals.push(descriptor);
+        }
+    }
+
+    fn into_parts(self) -> (Vec<QueryNotice>, Vec<RetrievalDescriptor>) {
+        (self.notices, self.retrievals)
     }
 }
 
@@ -253,6 +271,10 @@ const NOTICE_FULL_TEXT_SEARCH_UNINDEXED: &str = "full_text_search_unindexed";
 /// Stable notice code: a search-ordered aggregation ran — the rank cannot
 /// order grouped rows, only the trailing keys applied.
 const NOTICE_SEARCH_ORDER_IGNORED_BY_AGGREGATION: &str = "search_order_ignored_by_aggregation";
+
+/// Stable notice code: an `@embed`-backed vector retrieval ran while some of
+/// its prefiltered population still awaits a derived embedding.
+const NOTICE_EMBEDDING_COVERAGE_PENDING: &str = "embedding_coverage_pending";
 
 /// The first retrieval target variable (including rrf arms) that no
 /// top-level `NodeScan` introduces, if any. Anti-join inner pipelines never
@@ -582,7 +604,11 @@ pub async fn execute_query(
             &mut notices,
         )
         .await?;
-        return Ok(result.with_notices(notices.into_notices()));
+        let (emitted, retrievals) = notices.into_parts();
+        let metrics = build_metric_descriptors(ir, &retrievals);
+        return Ok(result
+            .with_notices(emitted)
+            .with_retrieval_metadata(metrics, retrievals));
     }
 
     let result_batch = execute_query_once(
@@ -625,13 +651,96 @@ pub async fn execute_query(
             &mut notices,
         )
         .await?;
-        return Ok(
-            QueryResult::new(retried.schema(), vec![retried]).with_notices(notices.into_notices())
-        );
+        let (emitted, retrievals) = notices.into_parts();
+        let metrics = build_metric_descriptors(ir, &retrievals);
+        return Ok(QueryResult::new(retried.schema(), vec![retried])
+            .with_notices(emitted)
+            .with_retrieval_metadata(metrics, retrievals));
     }
 
+    let (emitted, retrievals) = notices.into_parts();
+    let metrics = build_metric_descriptors(ir, &retrievals);
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch])
-        .with_notices(notices.into_notices()))
+        .with_notices(emitted)
+        .with_retrieval_metadata(metrics, retrievals))
+}
+
+/// Metric descriptors for the projected rank columns, resolved from the
+/// return clause against the executed retrievals' recall facts. Explanatory
+/// metadata only — the values live in the projected columns.
+fn build_metric_descriptors(
+    ir: &QueryIR,
+    retrievals: &[RetrievalDescriptor],
+) -> Vec<MetricDescriptor> {
+    use omnigraph_compiler::result::{MetricKind, MetricRecall, RetrievalKind};
+    let recall_of = |variable: &str, property: &str, kind: RetrievalKind| {
+        retrievals
+            .iter()
+            .find(|r| r.variable == variable && r.property == property && r.kind == kind)
+            .map(|r| r.recall)
+            .unwrap_or(MetricRecall::Exact)
+    };
+    let mut metrics = Vec::new();
+    for projection in &ir.return_exprs {
+        let descriptor = match &projection.expr {
+            IRExpr::Nearest {
+                variable, property, ..
+            } => Some(MetricDescriptor {
+                column: projection
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| format!("{variable}._distance")),
+                kind: MetricKind::Distance,
+                source: RetrievalKind::Nearest,
+                variable: variable.clone(),
+                property: Some(property.clone()),
+                descending: false,
+                recall: recall_of(variable, property, RetrievalKind::Nearest),
+            }),
+            IRExpr::Bm25 { field, .. } => match field.as_ref() {
+                IRExpr::PropAccess { variable, property } => Some(MetricDescriptor {
+                    column: projection
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| format!("{variable}._score")),
+                    kind: MetricKind::Score,
+                    source: RetrievalKind::Bm25,
+                    variable: variable.clone(),
+                    property: Some(property.clone()),
+                    descending: true,
+                    recall: recall_of(variable, property, RetrievalKind::Bm25),
+                }),
+                _ => None,
+            },
+            IRExpr::Rrf { primary, .. } => {
+                super::projection::rank_expr_variable(primary).map(|variable| MetricDescriptor {
+                    column: projection
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| format!("{variable}._score")),
+                    kind: MetricKind::Score,
+                    source: RetrievalKind::Rrf,
+                    variable: variable.to_string(),
+                    property: None,
+                    descending: true,
+                    // Fusion is approximate whenever any contributing arm is.
+                    recall: if retrievals
+                        .iter()
+                        .any(|r| r.recall == MetricRecall::Approximate)
+                    {
+                        MetricRecall::Approximate
+                    } else {
+                        MetricRecall::Exact
+                    },
+                })
+            }
+            _ => None,
+        };
+        if let Some(descriptor) = descriptor {
+            metrics.push(descriptor);
+        }
+    }
+    metrics
 }
 
 /// One pass of a non-RRF query: pipeline, projection, ordering, limit.
@@ -3912,6 +4021,76 @@ async fn execute_node_scan(
                     ),
                 );
             }
+        }
+    }
+
+    // Retrieval descriptors (search-contracts RFC P1): record each executed
+    // source with its recall CONTRACT and — for `@embed`-backed vector
+    // retrievals — exact ready/pending representation coverage of the
+    // prefiltered population, computed from the same structured predicate
+    // the scan pushes down. A pending row is data the ranking could not
+    // see; reporting it beats a confident short answer.
+    if let Some((var, prop, _, _)) = search_mode.nearest.as_ref() {
+        if var == variable {
+            use omnigraph_compiler::result::{EmbeddingCoverage, MetricRecall, RetrievalKind};
+            let recall = if crate::table_store::TableStore::has_vector_index_on(&ds, prop).await? {
+                MetricRecall::Approximate
+            } else {
+                MetricRecall::Exact
+            };
+            let embedding = if let Some(embed) = node_type.embed_sources.get(prop) {
+                use datafusion::prelude::col;
+                let and_base = |extra: datafusion::prelude::Expr| match &filter_expr {
+                    Some(base) => base.clone().and(extra),
+                    None => extra,
+                };
+                let ready = crate::table_store::TableStore::count_rows_matching(
+                    &ds,
+                    and_base(col(prop.as_str()).is_not_null()),
+                )
+                .await?;
+                let pending = crate::table_store::TableStore::count_rows_matching(
+                    &ds,
+                    and_base(
+                        col(embed.source.as_str())
+                            .is_not_null()
+                            .and(col(prop.as_str()).is_null()),
+                    ),
+                )
+                .await?;
+                if pending > 0 {
+                    notices.emit(
+                        NOTICE_EMBEDDING_COVERAGE_PENDING,
+                        format!(
+                            "{pending} row(s) of {type_name}.{prop} have source text but no \
+                             derived embedding yet; the ranking could not see them. Re-run \
+                             embedding generation to close the gap."
+                        ),
+                    );
+                }
+                Some(EmbeddingCoverage { ready, pending })
+            } else {
+                None
+            };
+            notices.record_retrieval(RetrievalDescriptor {
+                variable: variable.to_string(),
+                property: prop.clone(),
+                kind: RetrievalKind::Nearest,
+                recall,
+                embedding,
+            });
+        }
+    }
+    if let Some((var, prop, _)) = search_mode.bm25.as_ref() {
+        if var == variable {
+            use omnigraph_compiler::result::{MetricRecall, RetrievalKind};
+            notices.record_retrieval(RetrievalDescriptor {
+                variable: variable.to_string(),
+                property: prop.clone(),
+                kind: RetrievalKind::Bm25,
+                recall: MetricRecall::Exact,
+                embedding: None,
+            });
         }
     }
 

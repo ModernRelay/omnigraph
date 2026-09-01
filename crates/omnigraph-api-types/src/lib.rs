@@ -277,6 +277,48 @@ pub struct ReadWarningOutput {
     pub message: String,
 }
 
+/// Exact snapshot-pinned embedding representation coverage of one vector
+/// retrieval's prefiltered population. `pending` rows have source text but no
+/// derived vector yet — data the ranking could not see (orthogonal to ANN
+/// recall).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EmbeddingCoverageOutput {
+    pub ready: u64,
+    pub pending: u64,
+    /// `pending == 0` — every expected representation was ready.
+    pub complete: bool,
+}
+
+/// Describes one projected metric column of a ranked read. Explanatory only:
+/// it adds no second value and promises no cross-query score calibration.
+/// `kind` is `score` or `distance`; `source` is `nearest`, `bm25`, or `rrf`;
+/// `recall` is the source CONTRACT (`exact` or `approximate`), not the
+/// physical plan taken. Unknown future strings must be tolerated.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetricOutput {
+    pub column: String,
+    pub kind: String,
+    pub source: String,
+    pub variable: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property: Option<String>,
+    /// `true` = larger is better (scores); `false` = smaller is better.
+    pub descending: bool,
+    pub recall: String,
+}
+
+/// One executed retrieval source (standalone, or an rrf arm), present even
+/// when its metric is not projected.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RetrievalOutput {
+    pub variable: String,
+    pub property: String,
+    pub kind: String,
+    pub recall: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_coverage: Option<EmbeddingCoverageOutput>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadOutput {
     pub query_name: String,
@@ -296,6 +338,13 @@ pub struct ReadOutput {
     /// `POST /read` envelope deliberately drops them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarningOutput>,
+    /// Descriptors for projected metric columns (ranked reads only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<MetricOutput>,
+    /// Every executed retrieval source, including embedding coverage for
+    /// `@embed`-backed vector retrievals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retrievals: Vec<RetrievalOutput>,
 }
 
 /// Indefinitely byte-stable response shape for the deprecated `POST /read`
@@ -1496,6 +1545,55 @@ pub fn read_output(
             message: notice.message.clone(),
         })
         .collect();
+    fn kind_str(kind: omnigraph_compiler::result::RetrievalKind) -> String {
+        use omnigraph_compiler::result::RetrievalKind;
+        match kind {
+            RetrievalKind::Nearest => "nearest",
+            RetrievalKind::Bm25 => "bm25",
+            RetrievalKind::Rrf => "rrf",
+        }
+        .to_string()
+    }
+    fn recall_str(recall: omnigraph_compiler::result::MetricRecall) -> String {
+        use omnigraph_compiler::result::MetricRecall;
+        match recall {
+            MetricRecall::Exact => "exact",
+            MetricRecall::Approximate => "approximate",
+        }
+        .to_string()
+    }
+    let metrics = result
+        .metrics()
+        .iter()
+        .map(|metric| MetricOutput {
+            column: metric.column.clone(),
+            kind: match metric.kind {
+                omnigraph_compiler::result::MetricKind::Score => "score",
+                omnigraph_compiler::result::MetricKind::Distance => "distance",
+            }
+            .to_string(),
+            source: kind_str(metric.source),
+            variable: metric.variable.clone(),
+            property: metric.property.clone(),
+            descending: metric.descending,
+            recall: recall_str(metric.recall),
+        })
+        .collect();
+    let retrievals = result
+        .retrievals()
+        .iter()
+        .map(|retrieval| RetrievalOutput {
+            variable: retrieval.variable.clone(),
+            property: retrieval.property.clone(),
+            kind: kind_str(retrieval.kind),
+            recall: recall_str(retrieval.recall),
+            embedding_coverage: retrieval.embedding.map(|coverage| EmbeddingCoverageOutput {
+                ready: coverage.ready,
+                pending: coverage.pending,
+                complete: coverage.pending == 0,
+            }),
+        })
+        .collect();
     ReadOutput {
         query_name,
         target: read_target_output(target),
@@ -1504,6 +1602,8 @@ pub fn read_output(
         rows: result.to_rust_json(),
         graph_commit_id,
         warnings,
+        metrics,
+        retrievals,
     }
 }
 

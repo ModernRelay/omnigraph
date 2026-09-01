@@ -27,11 +27,81 @@ pub struct QueryNotice {
     pub message: String,
 }
 
+/// What a projected metric column measures. Serialized snake_case on the
+/// wire; scores rank descending-better, distances ascending-better.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricKind {
+    Score,
+    Distance,
+}
+
+/// Which retrieval produced a metric or ranked a population.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalKind {
+    Nearest,
+    Bm25,
+    Rrf,
+}
+
+/// The source CONTRACT, not the physical plan taken: an index-accelerated
+/// nearest reports `approximate` even when execution happened to be exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricRecall {
+    Exact,
+    Approximate,
+}
+
+/// Describes one projected metric column of a ranked read: which retrieval
+/// produced it and how to interpret the number. Explanatory only — it adds
+/// no second value and promises no cross-query score calibration.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MetricDescriptor {
+    /// Result column name (the alias, or the synthesized metric name).
+    pub column: String,
+    pub kind: MetricKind,
+    pub source: RetrievalKind,
+    /// The ranked binding (for `rrf`, the fused/primary binding).
+    pub variable: String,
+    /// The ranked property; `None` for a fused score.
+    pub property: Option<String>,
+    /// `true` = larger is better (scores); `false` = smaller is better
+    /// (distances).
+    pub descending: bool,
+    pub recall: MetricRecall,
+}
+
+/// Exact snapshot-pinned embedding representation coverage of a retrieval's
+/// prefiltered population: `ready` rows carry a derived vector, `pending`
+/// rows have source text but no vector yet. Orthogonal to ANN recall — a
+/// pending row is missing data, not an approximation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct EmbeddingCoverage {
+    pub ready: u64,
+    pub pending: u64,
+}
+
+/// One executed retrieval source (standalone, or an rrf arm).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RetrievalDescriptor {
+    pub variable: String,
+    pub property: String,
+    pub kind: RetrievalKind,
+    pub recall: MetricRecall,
+    /// Present only for a vector retrieval on an `@embed`-backed property.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<EmbeddingCoverage>,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
     notices: Vec<QueryNotice>,
+    metrics: Vec<MetricDescriptor>,
+    retrievals: Vec<RetrievalDescriptor>,
 }
 
 impl QueryResult {
@@ -40,7 +110,30 @@ impl QueryResult {
             schema,
             batches,
             notices: Vec::new(),
+            metrics: Vec::new(),
+            retrievals: Vec::new(),
         }
+    }
+
+    /// Attach metric and retrieval descriptors to this result.
+    pub fn with_retrieval_metadata(
+        mut self,
+        metrics: Vec<MetricDescriptor>,
+        retrievals: Vec<RetrievalDescriptor>,
+    ) -> Self {
+        self.metrics = metrics;
+        self.retrievals = retrievals;
+        self
+    }
+
+    /// Descriptors for the projected metric columns (possibly empty).
+    pub fn metrics(&self) -> &[MetricDescriptor] {
+        &self.metrics
+    }
+
+    /// Descriptors for every executed retrieval source (possibly empty).
+    pub fn retrievals(&self) -> &[RetrievalDescriptor] {
+        &self.retrievals
     }
 
     /// Attach advisory notices to this result.

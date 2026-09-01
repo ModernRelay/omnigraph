@@ -633,7 +633,7 @@ gateway_surfaces! {
         "scan_edges_by_endpoint",
         "scan_edges_by_endpoint_projected",
         "key_column_index_coverage", "fts_covers_all_fragments", "has_unindexed_fragments",
-        "count_rows",
+        "count_rows", "count_rows_matching",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",
         "has_btree_index", "has_btree_index_on", "has_fts_index", "has_fts_index_on",
