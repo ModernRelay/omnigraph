@@ -25,11 +25,13 @@
 
 mod helpers;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
+use arrow_array::{
+    Array, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::dataset::BlobRangeRequest;
@@ -57,7 +59,7 @@ use lance_core::{
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
@@ -3921,4 +3923,215 @@ async fn second_generation_branch_index_reads_fail_upstream() {
              companion BTREE dispatch, and re-validate the branch-merge topology tests."
         ),
     }
+}
+
+/// Runtime guard — the rrf prefilter gate's linchpin (PR #587): BM25 scores
+/// come from index-wide statistics (IDF, avgdl), so an id prefilter under
+/// `prefilter(true)` restricts which documents are RANKED but never changes a
+/// surviving document's score, even when the FTS index covers every fragment.
+/// The gate's plan-equivalence claim is derived from exactly this contract.
+///
+/// The fixture is deliberately stats-sensitive where the gate's oracle
+/// fixtures are not: multi-term docs, varying doc lengths, and an eligible
+/// subset whose per-term document frequencies and average length diverge from
+/// the corpus. A Lance regression to filter-dependent scoring (IDF/avgdl
+/// derived from the filtered subset) would move every surviving score and
+/// fail the bit-equality below — a rank-order oracle over symmetric fixtures
+/// cannot see that regression (ragnorc, PR #587 review r1).
+#[tokio::test]
+async fn fts_prefilter_does_not_change_covered_fragment_scores() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard-fts-prefilter.lance");
+    let uri = uri.to_str().unwrap();
+
+    // (tf_alpha, tf_beta, padding words) per doc. Irregular term profiles and
+    // lengths; d-08/d-09 match neither term but shape the corpus statistics.
+    // The eligible subset below skews both stats channels: alpha is rarer
+    // inside it than in the corpus, and its average length differs.
+    let profiles: [(usize, usize, usize); 10] = [
+        (5, 0, 2),
+        (3, 1, 5),
+        (0, 4, 1),
+        (1, 3, 8),
+        (2, 2, 3),
+        (4, 0, 11),
+        (0, 2, 6),
+        (1, 1, 0),
+        (0, 0, 9),
+        (0, 0, 4),
+    ];
+    let ids: Vec<String> = (0..profiles.len()).map(|i| format!("d-{i:02}")).collect();
+    let texts: Vec<String> = profiles
+        .iter()
+        .enumerate()
+        .map(|(i, &(alpha, beta, pad))| {
+            let mut words: Vec<String> = Vec::new();
+            words.extend(std::iter::repeat_n("alpha".to_string(), alpha));
+            words.extend(std::iter::repeat_n("beta".to_string(), beta));
+            words.extend((0..pad).map(|j| format!("pad{i:02}x{j}")));
+            words.join(" ")
+        })
+        .collect();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids.clone())),
+            Arc::new(StringArray::from(texts.clone())),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    // Production shape: inverted index on the text, BTREE on the id (the
+    // gate's `id IN (...)` prefilter resolves through the BTREE).
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    fn scores_by_id(batch: &RecordBatch) -> Vec<(String, f32)> {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let scores = batch
+            .column_by_name("_score")
+            .expect("an FTS scan autoprojects its `_score` column")
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        (0..ids.len())
+            .map(|row| (ids.value(row).to_string(), scores.value(row)))
+            .collect()
+    }
+    let fts_query = || {
+        FullTextSearchQuery::new("alpha beta".to_string())
+            .with_column("text".to_string())
+            .unwrap()
+    };
+
+    // Unfiltered ranking over the whole corpus.
+    let mut scan = dataset.scan();
+    scan.full_text_search(fts_query()).unwrap();
+    scan.project(&["id"]).unwrap();
+    let unfiltered: HashMap<String, f32> = scores_by_id(&scan.try_into_batch().await.unwrap())
+        .into_iter()
+        .collect();
+    assert_eq!(unfiltered.len(), 8, "eight docs carry alpha and/or beta");
+
+    // The gate's shape: an id IN-list under prefilter(true). Restricting the
+    // candidates must not re-derive the statistics.
+    let eligible = ["d-00", "d-02", "d-03", "d-05", "d-07"];
+    let mut scan = dataset.scan();
+    scan.full_text_search(fts_query()).unwrap();
+    scan.filter("id IN ('d-00', 'd-02', 'd-03', 'd-05', 'd-07')")
+        .unwrap();
+    scan.prefilter(true);
+    scan.project(&["id"]).unwrap();
+    let filtered = scores_by_id(&scan.try_into_batch().await.unwrap());
+
+    let returned: HashSet<&str> = filtered.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(
+        returned,
+        HashSet::from(eligible),
+        "the prefilter must restrict ranking to exactly the eligible matches \
+         (and all five eligible docs match)"
+    );
+    for (id, filtered_score) in &filtered {
+        let unfiltered_score = unfiltered[id];
+        assert_eq!(
+            filtered_score.to_bits(),
+            unfiltered_score.to_bits(),
+            "prefiltered score for {id} diverged from its unfiltered score \
+             ({filtered_score} vs {unfiltered_score}): BM25 statistics are no \
+             longer index-wide — filter-dependent scoring breaks the rrf \
+             prefilter gate's plan-equivalence claim (exec::query::rrf_prefilter_gate)"
+        );
+    }
+
+    // Stats-sensitivity control: the equality above is only meaningful if
+    // subset-derived statistics WOULD move these scores. A corpus physically
+    // reduced to the eligible docs is exactly what filter-dependent stats
+    // would score against; at least one eligible doc must score differently
+    // there (df and avgdl both shift), or the fixture is too symmetric to
+    // distinguish index-wide from filter-dependent stats and this guard is
+    // vacuous.
+    let subset_uri = dir.path().join("guard-fts-prefilter-subset.lance");
+    let subset_uri = subset_uri.to_str().unwrap();
+    let subset_rows: (Vec<String>, Vec<String>) = ids
+        .iter()
+        .zip(texts.iter())
+        .filter(|(id, _)| eligible.contains(&id.as_str()))
+        .map(|(id, text)| (id.clone(), text.clone()))
+        .unzip();
+    let subset_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(subset_rows.0)),
+            Arc::new(StringArray::from(subset_rows.1)),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(subset_batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut subset_dataset = Dataset::write(reader, subset_uri, Some(params))
+        .await
+        .unwrap();
+    subset_dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let mut scan = subset_dataset.scan();
+    scan.full_text_search(fts_query()).unwrap();
+    scan.project(&["id"]).unwrap();
+    let subset_scores: HashMap<String, f32> = scores_by_id(&scan.try_into_batch().await.unwrap())
+        .into_iter()
+        .collect();
+    assert!(
+        eligible
+            .iter()
+            .any(|id| subset_scores[*id].to_bits() != unfiltered[*id].to_bits()),
+        "every eligible doc scored identically against subset-only statistics — \
+         the fixture cannot detect filter-dependent scoring and this guard is vacuous"
+    );
 }

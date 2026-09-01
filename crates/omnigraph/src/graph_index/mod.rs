@@ -145,6 +145,15 @@ impl CsrIndex {
         }
         Ok(Self { offsets, targets })
     }
+
+    /// The dense id space this adjacency was built over. `has_neighbors`
+    /// indexes `offsets[node + 1]` unchecked, so callers walking a
+    /// `TypeIndex`'s dense space must verify it matches this width first.
+    /// The subtraction cannot underflow: `build` always pushes the leading
+    /// 0 offset, so `offsets` holds at least one entry.
+    pub fn num_nodes(&self) -> usize {
+        self.offsets.len() - 1
+    }
 }
 
 /// Borrowed views of a `GraphIndex`'s three maps (dictionaries, outgoing,

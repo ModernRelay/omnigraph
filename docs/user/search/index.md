@@ -25,7 +25,11 @@ bound, so results are never truncated. Full-text rankings inside `rrf()` are
 never bounded this way: each full-text arm scans every matching entity, and
 fusion ranks the entities that satisfy the graph and property filters, so
 bounding an arm could silently drop an entity's contribution and shift fused
-results. A `nearest()` ranking inside `rrf()` is inherently top-k, as vector
+results. When a traversal constrains the ranked variable and the graph shows
+few entities could satisfy it, the full-text arms instead rank only those
+entities (an unbounded, index-served prefilter — results are identical, the
+scan is just smaller); broad traversals keep the full scan. A `nearest()`
+ranking inside `rrf()` is inherently top-k, as vector
 search always is: an entity outside its window adds no vector contribution
 to its fused score, so a traversal that drops the window's top matches can
 shift fused ranks.
