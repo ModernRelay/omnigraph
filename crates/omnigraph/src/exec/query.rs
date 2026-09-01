@@ -729,6 +729,9 @@ fn is_search_ordered(search_mode: &SearchMode) -> bool {
     search_mode.nearest.is_some() || search_mode.bm25.is_some()
 }
 
+/// Whether a scalar predicate can remove rows associated with the nearest
+/// binding after the bounded ANN pass. This includes cross-variable filters
+/// and anti-joins: both can leave the initial top-k candidate window short.
 fn has_scalar_filter_for_variable(pipeline: &[IROp], variable: &str) -> bool {
     pipeline.iter().any(|op| match op {
         IROp::NodeScan {
@@ -738,9 +741,11 @@ fn has_scalar_filter_for_variable(pipeline: &[IROp], variable: &str) -> bool {
         } if bound == variable => filters.iter().any(|filter| !is_search_filter(filter)),
         IROp::Filter(filter) if !is_search_filter(filter) => {
             let variables = filter_variables(filter);
-            variables.len() == 1 && variables.contains(variable)
+            variables.contains(variable)
         }
-        IROp::AntiJoin { inner, .. } => has_scalar_filter_for_variable(inner, variable),
+        IROp::AntiJoin { outer_var, inner } => {
+            outer_var == variable || has_scalar_filter_for_variable(inner, variable)
+        }
         _ => false,
     })
 }
