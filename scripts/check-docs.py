@@ -42,6 +42,13 @@ RFC_IMPLEMENTATION = {
     "n/a",
 }
 
+# Leftover merge-conflict markers at line start. git always labels them; the
+# `\s|$` arm also catches hand-mangled label-less leftovers. A lone `=======`
+# is excluded (legal setext heading underline). Twin pattern: the marker step
+# in .github/workflows/ci.yml — keep the two in sync. A doc quoting a
+# conflict block indents the markers one space; there is no exemption.
+CONFLICT_MARKER = re.compile(r"^(?:<{7,}|>{7,}|\|{7,})(?:\s|$)")
+
 USER_FORBIDDEN = {
     r"\b__manifest\b": "internal table names belong in developer docs",
     r"\bManifestCoordinator\b": "code symbols belong in developer docs",
@@ -391,6 +398,16 @@ def check_locations(files: list[Path], errors: list[str]) -> None:
                 )
 
 
+def check_conflict_markers(files: list[Path], errors: list[str]) -> None:
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for number, line in enumerate(text.splitlines(), start=1):
+            if CONFLICT_MARKER.match(line):
+                errors.append(
+                    f"{path.relative_to(ROOT)}:{number}: committed merge-conflict marker"
+                )
+
+
 def check_user_boundary(files: list[Path], errors: list[str]) -> None:
     for path in files:
         try:
@@ -461,6 +478,7 @@ def main() -> int:
     ]
     check_links(link_files, errors)
     check_rfcs(errors)
+    check_conflict_markers(files, errors)
     check_user_boundary(files, errors)
     check_skill_version(errors)
 

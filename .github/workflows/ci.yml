@@ -94,6 +94,29 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
+      # Whole-tree belt over check-docs.py's Markdown scan: markers in data
+      # files (fixtures, cost tables, inventories) are caught by no other PR
+      # gate. Runs before the documentation checks so every hit is annotated
+      # inline even when the Markdown scan would fail the job first.
+      # Twin pattern: CONFLICT_MARKER in scripts/check-docs.py — keep in sync.
+      - name: Verify no committed merge-conflict markers
+        run: |
+          set -euo pipefail
+          status=0
+          hits=$(git grep -nIE '^(<{7,}|>{7,}|\|{7,})([[:space:]]|$)') || status=$?
+          if [ "$status" -gt 1 ]; then
+            echo "::error::git grep failed (exit $status)"
+            exit "$status"
+          fi
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits" | while IFS=: read -r file line rest; do
+              printf '::error file=%s,line=%s::Committed merge-conflict marker\n' "$file" "$line"
+            done
+            count=$(printf '%s\n' "$hits" | wc -l | tr -d ' ')
+            echo "::error::found $count committed merge-conflict marker line(s)"
+            exit 1
+          fi
+
       - name: Verify AGENTS.md ↔ docs/ cross-links
         run: bash scripts/check-agents-md.sh
 
