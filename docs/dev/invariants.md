@@ -476,7 +476,10 @@ them explicit.
   can be served stale topology from the artifact until the next edge-committing
   `optimize` rewrites it. Same acceptability argument (dev/test substrate only;
   production e_tags distinguish the incarnations), documented here so a future
-  hardening pass treats the two sites together.
+  hardening pass treats the two sites together. The runtime cache's shared
+  full-catalog decode slot (the `shelf` field: one artifact decode shared
+  across scoped entries) verifies the same stamps per request and therefore
+  inherits exactly this residual, no wider.
 - **Commit-graph parent under concurrency — CLOSED (RFC-013 Phase 7):** the graph
   commit is now recorded in the graph-manifest publication CAS, and the publisher resolves
   the new commit's parent INSIDE its retry loop, per attempt, from the just-loaded

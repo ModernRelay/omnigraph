@@ -101,7 +101,8 @@ const RANKED_EDGE_DATA: &str = r#"{"type":"RankedDoc","data":{"slug":"rank-1","e
 {"edge":"RankedLink","from":"rank-3","to":"sink","data":{"id":"edge-c","label":"C"}}
 {"edge":"RankedLink","from":"rank-2","to":"sink","data":{"id":"edge-b","label":"B"}}
 {"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a2","label":"A2"}}
-{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a1","label":"A1"}}"#;
+{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a1","label":"A1"}}
+{"edge":"RankedLink","from":"sink","to":"rank-3","data":{"id":"edge-d","label":"D"}}"#;
 
 const RANKED_EDGE_QUERIES: &str = r#"
 query nearest_edges($q: Vector(4)) {
@@ -122,6 +123,16 @@ query rrf_edges($q1: Vector(4), $q2: Vector(4)) {
     return { $d.slug, $w.label }
     order { rrf(nearest($d.embedding, $q1), nearest($d.embedding, $q2)) }
     limit 4
+}
+
+query nearest_hops($q: Vector(4)) {
+    match {
+        $d: RankedDoc
+        $d rankedLink{1,2} $target
+    }
+    return { $d.slug, $target.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
 }
 "#;
 
@@ -950,8 +961,8 @@ async fn bm25_returns_ranked_results() {
 
 // Full rank-ORDER golden (not just top-1 / non-empty): pins ranks 2..k so a
 // regression corrupting the tail or reversing the sort direction fails loudly.
-// nearest skips apply_ordering (is_search_ordered) and returns Lance native
-// order, so result_slugs row order == rank order.
+// Search-ordered plans sort on the appended `_distance` column with the id
+// tie-break, so result_slugs row order == rank order.
 #[tokio::test]
 #[serial]
 async fn nearest_full_rank_order() {
@@ -985,10 +996,15 @@ async fn bm25_full_rank_order() {
     )
     .await
     .unwrap();
-    // Descending BM25 score order.
+    // All three matches tie on BM25 score here (probe-verified equal `_score`
+    // values, 2026-08-31), so this golden pins the equal-score contract: the
+    // deterministic id tie-break. If a Lance scoring change breaks the tie,
+    // this expectation changes meaning — re-probe before updating it. The
+    // distinct-score ordering itself is pinned by
+    // `bm25_distinct_scores_rank_descending`.
     assert_eq!(
         result_slugs(&result),
-        vec!["rl-intro", "ml-intro", "dl-basics"]
+        vec!["dl-basics", "ml-intro", "rl-intro"]
     );
 }
 
@@ -1015,6 +1031,114 @@ async fn nearest_rank_survives_bound_edge_fanout() {
             ("rank-3".to_string(), "C".to_string()),
         ],
         "edge-table storage order must not replace the incoming ANN rank"
+    );
+}
+
+// Multi-hop regression for the hop-major BFS (PR #544 review finding 1): the
+// unified core emits every seed's hop 1 before any seed's hop 2, so without
+// the `_distance` sort the final `limit 2` would return (rank-1, sink),
+// (rank-2, sink) instead of both rows of the best-ranked seed. The two
+// surviving rows tie on `_distance`, so their relative order is the id
+// tie-break and deliberately unasserted here. Covers the `_distance` asc leg;
+// `_score` desc runs the same branch and is pinned single-hop by
+// `bm25_distinct_scores_rank_descending`.
+#[tokio::test]
+#[serial]
+async fn nearest_rank_survives_multi_hop_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_ranked_edge_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        RANKED_EDGE_QUERIES,
+        "nearest_hops",
+        &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+
+    let rows = first_two_strings(&result);
+    assert_eq!(rows.len(), 2, "limit 2 must return exactly two rows");
+    assert!(
+        rows.iter().all(|(d, _)| d == "rank-1"),
+        "both top rows must come from the best-ranked seed, got {rows:?}"
+    );
+    let targets: std::collections::HashSet<&str> =
+        rows.iter().map(|(_, target)| target.as_str()).collect();
+    assert_eq!(
+        targets,
+        std::collections::HashSet::from(["sink", "rank-3"]),
+        "the best seed's hop-1 and hop-2 reach must both survive the limit"
+    );
+}
+
+// Secondary order keys after the search function are honored: on the all-tie
+// bm25 fixture the user's `$d.slug desc` must decide the order (reverse of
+// the id tie-break, which only applies after all user keys).
+#[tokio::test]
+#[serial]
+async fn search_order_secondary_keys_are_honored() {
+    const QUERY: &str = r#"
+query bm25_then_slug($q: String) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { bm25($d.title, $q), $d.slug desc }
+    limit 3
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        QUERY,
+        "bm25_then_slug",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result_slugs(&result),
+        vec!["rl-intro", "ml-intro", "dl-basics"],
+        "tied scores must fall to the user's secondary key, not the id tie-break"
+    );
+}
+
+// Distinct-score descending golden: BM25 term-frequency monotonicity gives
+// three strictly different scores (1x/2x/3x "tensor"), so this pins the
+// score ordering itself — the tie-break golden above structurally cannot
+// (its scores are equal). Slugs are chosen so the id tie-break order (n1,
+// n2, n3) is the REVERSE of score order: a broken score sort cannot pass.
+#[tokio::test]
+#[serial]
+async fn bm25_distinct_scores_rank_descending() {
+    const SCHEMA: &str = r#"
+node Note {
+    slug: String @key
+    body: String @index
+}
+"#;
+    const DATA: &str = r#"{"type":"Note","data":{"slug":"n1","body":"tensor"}}
+{"type":"Note","data":{"slug":"n2","body":"tensor tensor"}}
+{"type":"Note","data":{"slug":"n3","body":"tensor tensor tensor"}}"#;
+    const QUERY: &str = r#"
+query bm25_ranked($q: String) {
+    match { $n: Note }
+    return { $n.slug }
+    order { bm25($n.body, $q) }
+    limit 3
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+    let result = query_main(&mut db, QUERY, "bm25_ranked", &params(&[("$q", "tensor")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        result_slugs(&result),
+        vec!["n3", "n2", "n1"],
+        "descending BM25 score order must beat the id tie-break"
     );
 }
 

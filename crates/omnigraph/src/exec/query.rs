@@ -489,13 +489,47 @@ pub async fn execute_query(
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
     let mut result_batch = project_return(&wide_batch, &ir.return_exprs, params)?;
 
-    // Apply ordering (skip if search mode already ordered the results)
+    // Apply ordering. Search-ordered plans sort on the appended score column
+    // (mechanism and contract: `search_score_orderings`). Aggregated
+    // search-ordered queries keep the historical no-sort behavior: the score
+    // column does not survive aggregation. `fetch` is safe to pass on every
+    // path here because the only step after ordering is the limit slice.
+    let fetch = ir.limit.and_then(|limit| usize::try_from(limit).ok());
     if !ir.order_by.is_empty() && !is_search_ordered(&search_mode) {
         result_batch = if has_aggregates {
-            apply_ordering(result_batch.clone(), &ir.order_by, &result_batch, params)?
+            apply_ordering(
+                result_batch.clone(),
+                &ir.order_by,
+                &result_batch,
+                params,
+                fetch,
+            )?
         } else {
-            apply_ordering(result_batch, &ir.order_by, &wide_batch, params)?
+            apply_ordering(result_batch, &ir.order_by, &wide_batch, params, fetch)?
         };
+    } else if !has_aggregates {
+        if let Some(mut orderings) = search_score_orderings(&search_mode) {
+            // Guard on the invariant itself (score column present), not row
+            // count: an empty scan's fallback schema legitimately lacks the
+            // column (zero rows, nothing to order); rows WITHOUT the column
+            // would mean the ranking is unrecoverable, and returning them
+            // unranked would be a silent wrong answer — refuse instead.
+            let score_col = match &orderings[0].expr {
+                IRExpr::PropAccess { variable, property } => format!("{variable}.{property}"),
+                _ => String::new(),
+            };
+            if wide_batch.column_by_name(&score_col).is_some() {
+                // User-stated secondary keys (`order { nearest(...), $p.name
+                // desc }`) apply after the score, before the id tie-break.
+                orderings.extend(ir.order_by.iter().skip(1).cloned());
+                result_batch =
+                    apply_ordering(result_batch, &orderings, &wide_batch, params, fetch)?;
+            } else if result_batch.num_rows() > 0 {
+                return Err(OmniError::manifest(format!(
+                    "search-ordered query produced rows without its '{score_col}' ranking column"
+                )));
+            }
+        }
     }
 
     // Apply limit
@@ -507,9 +541,38 @@ pub async fn execute_query(
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
 }
 
-/// Check if the search mode already returns results in the correct order.
+/// Check if the query's ordering is search-imposed (`nearest()`/`bm25`).
 fn is_search_ordered(search_mode: &SearchMode) -> bool {
     search_mode.nearest.is_some() || search_mode.bm25.is_some()
+}
+
+/// Synthetic orderings for a search-ordered plan: sort on the score column
+/// Lance appended to the scan (`nearest` ranks by ascending `_distance`,
+/// `bm25` by descending `_score`). The column rides the wide batch under the
+/// search binding's prefix like any other property — hydration replicates it
+/// onto every traversal row, so ranking is data on the rows and Expand
+/// emission order is not load-bearing — and `apply_ordering`'s `.id`
+/// tie-break makes the order total and deterministic. The bare names are
+/// reserved property names at schema validation, so a user column can never
+/// shadow them. Latent nulls note: `apply_ordering` places nulls first under
+/// asc; no in-tree path produces a null score (T23 blocks edge-binding
+/// nearest, hydration replicates non-null seed columns) — if one ever
+/// appears, rank nulls last explicitly here.
+fn search_score_orderings(search_mode: &SearchMode) -> Option<Vec<IROrdering>> {
+    let (variable, property, descending) = if let Some((var, ..)) = &search_mode.nearest {
+        (var.clone(), "_distance", false)
+    } else if let Some((var, ..)) = &search_mode.bm25 {
+        (var.clone(), "_score", true)
+    } else {
+        return None;
+    };
+    Some(vec![IROrdering {
+        expr: IRExpr::PropAccess {
+            variable,
+            property: property.to_string(),
+        },
+        descending,
+    }])
 }
 
 /// Execute a query with RRF (Reciprocal Rank Fusion) ordering.
@@ -604,7 +667,14 @@ async fn execute_rrf_query(
         }
     }
 
-    // Compute RRF scores
+    // Compute RRF scores. NOTE: each arm's rank is derived from the arm
+    // batch's first-seen row order, which equals search rank today only
+    // because the BFS emits each hop's rows in seed input order and every
+    // seed's first in-bounds row lands at its first emitting hop. Under
+    // `min_hops >= 2` with heterogeneous per-seed reach that coincidence
+    // breaks and fused ranks drift; the durable fix is deriving arm ranks
+    // from the arms' `_distance`/`_score` columns like the single-search
+    // path.
     let k = rrf.k as f64;
     let mut scored: Vec<(String, f64)> = all_ids
         .iter()

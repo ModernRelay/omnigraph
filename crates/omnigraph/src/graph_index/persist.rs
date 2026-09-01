@@ -12,7 +12,7 @@
 //! ```text
 //! [8B magic "OGCSRIDX"] [u32 LE format version] [u64 LE header length]
 //! [header: JSON (stamps, payload digest, section lengths)]
-//! [payload: dictionaries + adjacency arrays, verbatim little-endian]
+//! [payload: self-describing sections, verbatim little-endian]
 //! ```
 //!
 //! The payload is the in-memory representation dumped as-is: each `u32` array
@@ -21,6 +21,15 @@
 //! UTF-8 bytes). Section order is fixed by the header's metadata order: every
 //! dictionary, then per edge type its csr-offsets / csr-targets / csc-offsets
 //! / csc-targets.
+//!
+//! **Sections are self-describing (format v2):** every section opens with a
+//! prelude INSIDE the digested payload — a kind byte and the section's name,
+//! and for adjacencies the edge's full identity stamp. The header is thereby
+//! an advisory index only: everything that gives bytes meaning (which edge,
+//! which orientation group, which identity) lives under the digest, and the
+//! loader cross-checks each header claim against the digested prelude it
+//! points at. A header lie (a label swap, a stamp swap, a shifted offset) is
+//! a cross-check rejection and a fall-open, never wrong topology.
 //!
 //! One artifact per store, at a fixed name, covering every edge type in the
 //! catalog at persist time. A query asks for a SCOPED edge set (only the
@@ -62,7 +71,12 @@ const MAGIC: &[u8; 8] = b"OGCSRIDX";
 
 /// Bump when the layout changes; a version mismatch is a miss (the loader
 /// rejects and rebuilds in memory, and the next optimize rewrites current).
-const FORMAT_VERSION: u32 = 1;
+/// v2: self-describing section preludes inside the digested payload.
+const FORMAT_VERSION: u32 = 2;
+
+/// Section prelude kind bytes (see the module contract).
+const SECTION_DICT: u8 = 1;
+const SECTION_ADJ: u8 = 2;
 
 /// Ceiling on the artifact body accepted at load. Guards the fail-open read
 /// path against a corrupt object materializing unbounded memory before parse.
@@ -105,8 +119,8 @@ struct AdjMeta {
 /// The physical identity of one edge table at persist time. Field set mirrors
 /// `runtime_cache::GraphIndexCacheKey`; the two must stay in lockstep or the
 /// artifact outlives the in-memory key's invalidation rules.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
-struct TableStamp {
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
+pub(crate) struct TableStamp {
     edge_name: String,
     /// `TableIdentity` rendered via its stable `Display` (`stable:incarnation`).
     identity: String,
@@ -142,6 +156,23 @@ fn snapshot_stamp(
         e_tag: entry.version_metadata.e_tag().map(str::to_string),
         from_type: from_type.to_string(),
         to_type: to_type.to_string(),
+    })
+}
+
+/// Whether a decoded artifact's identity stamps are fresh for every requested
+/// edge under this snapshot — the shelf's per-request freshness check
+/// (`runtime_cache`): same authority as the load-time stamp verification,
+/// applied to an already-decoded index.
+pub(crate) fn stamps_cover_and_match(
+    snapshot: &Snapshot,
+    edge_types: &HashMap<String, (String, String)>,
+    stamps: &[TableStamp],
+) -> bool {
+    edge_types.iter().all(|(edge_name, (from_type, to_type))| {
+        match snapshot_stamp(snapshot, edge_name, from_type, to_type) {
+            Some(expected) => stamps.contains(&expected),
+            None => false,
+        }
     })
 }
 
@@ -181,6 +212,49 @@ fn take<'a>(payload: &'a [u8], cursor: &mut usize, len: u64) -> Result<&'a [u8]>
     Ok(&payload[start..end])
 }
 
+/// Write a section prelude into the digested payload: kind byte, u32 LE name
+/// length, name bytes, and (adjacency sections only) the u32-LE-length-framed
+/// JSON identity stamp.
+fn push_prelude(payload: &mut Vec<u8>, kind: u8, name: &str, stamp_json: Option<&[u8]>) {
+    payload.push(kind);
+    payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    payload.extend_from_slice(name.as_bytes());
+    if let Some(stamp) = stamp_json {
+        payload.extend_from_slice(&(stamp.len() as u32).to_le_bytes());
+        payload.extend_from_slice(stamp);
+    }
+}
+
+/// Read one section prelude at the cursor, bounds-checked. Returns the kind,
+/// the section's own name, and (for adjacency preludes) its digested identity
+/// stamp.
+fn read_prelude(payload: &[u8], cursor: &mut usize) -> Result<(u8, String, Option<TableStamp>)> {
+    let kind = take(payload, cursor, 1)?[0];
+    if kind != SECTION_DICT && kind != SECTION_ADJ {
+        return Err(OmniError::manifest(format!(
+            "graph index artifact section prelude has unknown kind {kind}"
+        )));
+    }
+    let name_len = u32::from_le_bytes(take(payload, cursor, 4)?.try_into().expect("fixed slice"));
+    let name = std::str::from_utf8(take(payload, cursor, name_len as u64)?)
+        .map_err(|_| {
+            OmniError::manifest("graph index artifact section name is not UTF-8".to_string())
+        })?
+        .to_string();
+    let stamp = if kind == SECTION_ADJ {
+        let stamp_len =
+            u32::from_le_bytes(take(payload, cursor, 4)?.try_into().expect("fixed slice"));
+        let stamp: TableStamp = serde_json::from_slice(take(payload, cursor, stamp_len as u64)?)
+            .map_err(|e| {
+                OmniError::manifest(format!("graph index artifact section stamp parse: {e}"))
+            })?;
+        Some(stamp)
+    } else {
+        None
+    };
+    Ok((kind, name, stamp))
+}
+
 /// Serialize an index with the given per-edge stamps to the artifact bytes.
 fn serialize(index: &GraphIndex, tables: Vec<TableStamp>) -> Result<Vec<u8>> {
     let (types, csr, csc) = index.parts();
@@ -194,6 +268,7 @@ fn serialize(index: &GraphIndex, tables: Vec<TableStamp>) -> Result<Vec<u8>> {
     let mut payload: Vec<u8> = Vec::new();
     let mut dicts = Vec::with_capacity(type_names.len());
     for name in &type_names {
+        push_prelude(&mut payload, SECTION_DICT, name, None);
         let ids = types[*name].ids();
         let before = payload.len();
         for id in ids {
@@ -212,6 +287,21 @@ fn serialize(index: &GraphIndex, tables: Vec<TableStamp>) -> Result<Vec<u8>> {
         let csc_adj = csc.get(*name).ok_or_else(|| {
             OmniError::manifest(format!("graph index misses csc for edge '{name}'"))
         })?;
+        // The prelude carries the digested truth for this adjacency group:
+        // its edge name and full identity stamp. Written before the arrays,
+        // outside the header-declared lens.
+        let stamp = tables
+            .iter()
+            .find(|t| &t.edge_name == *name)
+            .ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "graph index adjacency '{name}' has no identity stamp to persist"
+                ))
+            })?;
+        let stamp_json = serde_json::to_vec(stamp).map_err(|e| {
+            OmniError::manifest(format!("graph index artifact stamp serialize: {e}"))
+        })?;
+        push_prelude(&mut payload, SECTION_ADJ, name, Some(&stamp_json));
         let mut lens = [0u64; 4];
         for (slot, section) in [
             (0, csr_adj.offsets()),
@@ -255,7 +345,7 @@ fn deserialize_verified(
     bytes: &[u8],
     snapshot: &Snapshot,
     edge_types: &HashMap<String, (String, String)>,
-) -> Result<GraphIndex> {
+) -> Result<(GraphIndex, Vec<TableStamp>)> {
     let fixed = MAGIC.len() + 4 + 8;
     if bytes.len() < fixed || &bytes[..MAGIC.len()] != MAGIC {
         return Err(OmniError::manifest(
@@ -318,7 +408,7 @@ fn deserialize_verified(
 
     let index = decode_body(&header, payload)?;
     verify_stamped_adjacencies(&header, &index)?;
-    Ok(index)
+    Ok((index, header.tables))
 }
 
 /// A stamp is a freshness claim, not proof the adjacency was serialized. An
@@ -361,6 +451,16 @@ fn decode_body(header: &Header, payload: &[u8]) -> Result<GraphIndex> {
     let mut cursor = 0usize;
     let mut type_indices: HashMap<String, TypeIndex> = HashMap::with_capacity(header.dicts.len());
     for dict in &header.dicts {
+        // The digested prelude is the section's own claim of what it is; the
+        // header entry is only the pointer that got us here.
+        let (kind, name, _) = read_prelude(payload, &mut cursor)?;
+        if kind != SECTION_DICT || name != dict.type_name {
+            return Err(OmniError::manifest(format!(
+                "graph index artifact header dictionary '{}' does not match the digested \
+                 section prelude '{name}'",
+                dict.type_name
+            )));
+        }
         let section = take(payload, &mut cursor, dict.len)?;
         // Every id costs at least its 4-byte length prefix, so the section
         // bounds the possible id count regardless of what `count` claims.
@@ -447,6 +547,31 @@ fn decode_body(header: &Header, payload: &[u8]) -> Result<GraphIndex> {
                     adj.edge_name
                 ))
             })?;
+        // Cross-check the header's claims against the digested prelude: the
+        // section's own name and identity stamp are the truth; a header that
+        // disagrees (label swap, stamp swap, shifted offsets) is rejected.
+        let (kind, name, prelude_stamp) = read_prelude(payload, &mut cursor)?;
+        if kind != SECTION_ADJ || name != adj.edge_name {
+            return Err(OmniError::manifest(format!(
+                "graph index artifact header adjacency '{}' does not match the digested \
+                 section prelude '{name}'",
+                adj.edge_name
+            )));
+        }
+        // Unreachable after the kind check above, but the loader is fail-open
+        // end to end: a typed reject beats a panic even for impossible states.
+        let Some(prelude_stamp) = prelude_stamp else {
+            return Err(OmniError::manifest(format!(
+                "graph index artifact adjacency section '{name}' prelude misses its stamp"
+            )));
+        };
+        if prelude_stamp != *stamp {
+            return Err(OmniError::manifest(format!(
+                "graph index artifact header stamp for edge '{}' disagrees with its \
+                 digested section prelude",
+                adj.edge_name
+            )));
+        }
         let from_len = dict_len(&stamp.from_type)?;
         let to_len = dict_len(&stamp.to_type)?;
 
@@ -477,7 +602,7 @@ pub(crate) async fn load(
     snapshot: &Snapshot,
     edge_types: &HashMap<String, (String, String)>,
     adapter: Option<&dyn StorageAdapter>,
-) -> Option<GraphIndex> {
+) -> Option<(GraphIndex, Vec<TableStamp>)> {
     let root = snapshot.root_uri();
     let uri = artifact_uri(root);
     // Prefer the caller's adapter (the db's own, possibly instrumented or
@@ -512,10 +637,10 @@ pub(crate) async fn load(
         }
     };
     match deserialize_verified(&bytes, snapshot, edge_types) {
-        Ok(index) => {
+        Ok(loaded) => {
             tracing::debug!(target: "omnigraph::graph_index", uri = %uri,
                 "graph index loaded from persisted artifact");
-            Some(index)
+            Some(loaded)
         }
         Err(e) => {
             tracing::debug!(target: "omnigraph::graph_index", error = %e, uri = %uri,
@@ -620,8 +745,13 @@ mod tests {
         // check, which needs a live snapshot).
         let mut cursor = 0usize;
         let dict = &header.dicts[0];
+        let (kind, name, _) = read_prelude(payload, &mut cursor).unwrap();
+        assert_eq!((kind, name.as_str()), (SECTION_DICT, "Person"));
         let _ = take(payload, &mut cursor, dict.len).unwrap();
         let adj = &header.adjacencies[0];
+        let (kind, name, stamp) = read_prelude(payload, &mut cursor).unwrap();
+        assert_eq!((kind, name.as_str()), (SECTION_ADJ, "Knows"));
+        assert_eq!(stamp.unwrap(), sample_stamp());
         let offs = parse_u32s(take(payload, &mut cursor, adj.lens[0]).unwrap()).unwrap();
         let tgts = parse_u32s(take(payload, &mut cursor, adj.lens[1]).unwrap()).unwrap();
         let rebuilt = CsrIndex::from_parts(offs, tgts).unwrap();
@@ -749,6 +879,91 @@ mod tests {
         header.tables.clear();
         let err = decode_body(&header, &payload).unwrap_err();
         assert!(err.to_string().contains("identity stamp"), "{err}");
+    }
+
+    /// Two same-endpoint edge types plus a stamp for each — the label-swap
+    /// counterexample's setting (PR #544 review finding 2).
+    fn two_edge_index_and_stamps() -> (GraphIndex, Vec<TableStamp>) {
+        let mut types = HashMap::new();
+        types.insert(
+            "Person".to_string(),
+            TypeIndex::from_ids(vec!["a".into(), "b".into(), "c".into()]).unwrap(),
+        );
+        let mut csr = HashMap::new();
+        let mut csc = HashMap::new();
+        csr.insert("Knows".to_string(), CsrIndex::build(3, &[(0, 1), (0, 2)]));
+        csc.insert("Knows".to_string(), CsrIndex::build(3, &[(1, 0), (2, 0)]));
+        csr.insert("Likes".to_string(), CsrIndex::build(3, &[(1, 2)]));
+        csc.insert("Likes".to_string(), CsrIndex::build(3, &[(2, 1)]));
+        let index = GraphIndex::from_parts(types, csr, csc).unwrap();
+        let mut likes_stamp = sample_stamp();
+        likes_stamp.edge_name = "Likes".to_string();
+        likes_stamp.table_version = 9;
+        (index, vec![sample_stamp(), likes_stamp])
+    }
+
+    // The label swap: exchange the two adjacency labels in the header only.
+    // Payload, digest, lengths, and stamps all stay intact; the digested
+    // section preludes are what catches the reinterpretation.
+    #[test]
+    fn header_label_swap_is_rejected_by_the_section_prelude() {
+        let (index, stamps) = two_edge_index_and_stamps();
+        let bytes = serialize(&index, stamps).unwrap();
+        let (mut header, payload) = split(&bytes);
+        assert_eq!(header.adjacencies.len(), 2);
+        header.adjacencies.swap(0, 1);
+        let err = decode_body(&header, &payload).unwrap_err();
+        assert!(err.to_string().contains("section prelude"), "{err}");
+    }
+
+    // The stamp swap: reassign the two edges' identity stamps to each other in
+    // the header. Every stamp is individually valid, so freshness would pass;
+    // the digested prelude stamp is what catches the reassignment.
+    #[test]
+    fn header_stamp_swap_is_rejected_by_the_section_prelude() {
+        let (index, stamps) = two_edge_index_and_stamps();
+        let bytes = serialize(&index, stamps).unwrap();
+        let (mut header, payload) = split(&bytes);
+        assert_eq!(header.tables.len(), 2);
+        let knows_pos = header
+            .tables
+            .iter()
+            .position(|t| t.edge_name == "Knows")
+            .unwrap();
+        let likes_pos = header
+            .tables
+            .iter()
+            .position(|t| t.edge_name == "Likes")
+            .unwrap();
+        header.tables[knows_pos].table_version = 9;
+        header.tables[likes_pos].table_version = 7;
+        let err = decode_body(&header, &payload).unwrap_err();
+        assert!(err.to_string().contains("disagrees"), "{err}");
+    }
+
+    // The whole-index differential oracle: serialize -> decode_body must
+    // reconstruct every dictionary and both orientations of every adjacency
+    // byte-for-byte, not just the first sections (which the round-trip walk
+    // above spot-checks).
+    #[test]
+    fn v2_round_trip_reconstructs_the_whole_index() {
+        let (index, stamps) = two_edge_index_and_stamps();
+        let bytes = serialize(&index, stamps).unwrap();
+        let (header, payload) = split(&bytes);
+        let decoded = decode_body(&header, &payload).unwrap();
+        for edge in ["Knows", "Likes"] {
+            for (orig, dec) in [
+                (index.csr(edge).unwrap(), decoded.csr(edge).unwrap()),
+                (index.csc(edge).unwrap(), decoded.csc(edge).unwrap()),
+            ] {
+                assert_eq!(orig.offsets(), dec.offsets(), "offsets for {edge}");
+                assert_eq!(orig.targets(), dec.targets(), "targets for {edge}");
+            }
+        }
+        assert_eq!(
+            index.type_index("Person").unwrap().ids(),
+            decoded.type_index("Person").unwrap().ids(),
+        );
     }
 
     #[test]

@@ -273,8 +273,8 @@ async fn optimize_persists_the_graph_index_artifact() {
     assert_eq!(&body[..8], b"OGCSRIDX", "binary artifact magic");
     assert_eq!(
         u32::from_le_bytes(body[8..12].try_into().unwrap()),
-        1,
-        "format version 1"
+        2,
+        "format version 2 (self-describing section preludes)"
     );
     // The header is JSON and carries the digest + identity stamps.
     let header_len = u64::from_le_bytes(body[12..20].try_into().unwrap()) as usize;

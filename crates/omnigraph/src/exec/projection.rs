@@ -422,6 +422,10 @@ pub(super) fn apply_ordering(
     orderings: &[IROrdering],
     source: &RecordBatch,
     _params: &ParamMap,
+    // Top-k bound: `Some(n)` runs arrow's partial sort (O(rows log n)) and
+    // returns at most n indices, discarding the rest. The CALLER owns the
+    // precondition that nothing after the sort consumes rows beyond n.
+    fetch: Option<usize>,
 ) -> Result<RecordBatch> {
     use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 
@@ -492,7 +496,7 @@ pub(super) fn apply_ordering(
         }
     }
 
-    let indices = lexsort_to_indices(&sort_columns, None).map_err(OmniError::arrow_internal)?;
+    let indices = lexsort_to_indices(&sort_columns, fetch).map_err(OmniError::arrow_internal)?;
 
     let columns: Vec<ArrayRef> = batch
         .columns()

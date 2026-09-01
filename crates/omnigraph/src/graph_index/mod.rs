@@ -267,10 +267,23 @@ impl GraphIndex {
         edge_types: &HashMap<String, (String, String)>,
         adapter: Option<&dyn crate::storage::StorageAdapter>,
     ) -> Result<Self> {
-        if let Some(index) = persist::load(snapshot, edge_types, adapter).await {
+        if let Some((index, _)) = persist::load(snapshot, edge_types, adapter).await {
             return Ok(index);
         }
         Self::build(snapshot, edge_types).await
+    }
+
+    /// Load the persisted artifact fresh for `edge_types`, returning the full
+    /// decoded index together with its identity stamps — the shelf's key in
+    /// `RuntimeCache` (one decode Arc-shared across every scope it can
+    /// serve). `None` on any miss, exactly like the loader inside
+    /// [`Self::load_or_build`].
+    pub(crate) async fn load_persisted(
+        snapshot: &Snapshot,
+        edge_types: &HashMap<String, (String, String)>,
+        adapter: Option<&dyn crate::storage::StorageAdapter>,
+    ) -> Option<(Self, Vec<persist::TableStamp>)> {
+        persist::load(snapshot, edge_types, adapter).await
     }
 
     pub fn type_index(&self, type_name: &str) -> Option<&TypeIndex> {
