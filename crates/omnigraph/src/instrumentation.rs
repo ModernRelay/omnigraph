@@ -109,6 +109,13 @@ pub struct QueryIoProbes {
     /// path). A cost test asserts a fresh branch whose edge tables are unchanged
     /// from main reuses main's cached index (0 builds) rather than rebuilding it.
     pub graph_build_count: Arc<AtomicU64>,
+    /// Mid-traversal Indexed→CSR switches (the per-hop re-decision firing).
+    /// Lets the switch tests assert the mechanism actually ran — mode
+    /// equivalence alone stays green with the switch disabled.
+    pub traversal_mid_switches: Arc<AtomicU64>,
+    /// Expand emissions stopped early by a pushed-down `limit` cap. Same
+    /// rationale: capped-subset validity alone cannot prove the cap fired.
+    pub expand_cap_stops: Arc<AtomicU64>,
     /// Edge tables included in topology builds this query (summed over build
     /// invocations). A cost test asserts a query referencing one edge builds only
     /// that edge, not every catalog edge (the cold-build shrink A2 ships).
@@ -423,6 +430,18 @@ pub(crate) fn record_graph_build(edges: usize) {
         p.graph_edges_built
             .fetch_add(edges as u64, Ordering::Relaxed);
     });
+}
+
+/// Record one mid-traversal Indexed→CSR switch. No-op when no probes are
+/// installed (production).
+pub(crate) fn record_traversal_mid_switch() {
+    let _ = current(|p| p.traversal_mid_switches.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one Expand stopping early at its pushed-down limit cap. No-op when
+/// no probes are installed (production).
+pub(crate) fn record_expand_cap_stop() {
+    let _ = current(|p| p.expand_cap_stops.fetch_add(1, Ordering::Relaxed));
 }
 
 /// Record `n` IR filters lowered into a scan-level `filter_expr`. No-op when
@@ -1091,11 +1110,13 @@ pub(crate) async fn open_dataset(
 pub struct StorageReadCounts {
     pub read_text: AtomicU64,
     pub read_text_if_exists: AtomicU64,
+    pub read_bytes_if_exists: AtomicU64,
     pub exists: AtomicU64,
     pub read_text_versioned: AtomicU64,
     pub list_dir: AtomicU64,
     pub mutation_calls: AtomicU64,
     pub write_text: AtomicU64,
+    pub write_bytes: AtomicU64,
     pub delete: AtomicU64,
 }
 
@@ -1105,6 +1126,9 @@ impl StorageReadCounts {
     }
     pub fn read_text_if_exists(&self) -> u64 {
         self.read_text_if_exists.load(Ordering::Relaxed)
+    }
+    pub fn read_bytes_if_exists(&self) -> u64 {
+        self.read_bytes_if_exists.load(Ordering::Relaxed)
     }
     pub fn exists(&self) -> u64 {
         self.exists.load(Ordering::Relaxed)
@@ -1120,6 +1144,9 @@ impl StorageReadCounts {
     }
     pub fn write_text(&self) -> u64 {
         self.write_text.load(Ordering::Relaxed)
+    }
+    pub fn write_bytes(&self) -> u64 {
+        self.write_bytes.load(Ordering::Relaxed)
     }
     pub fn delete(&self) -> u64 {
         self.delete.load(Ordering::Relaxed)
@@ -1178,10 +1205,29 @@ impl StorageAdapter for CountingStorageAdapter {
         self.inner.read_text_if_exists_bounded(uri, max_bytes).await
     }
 
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.counts
+            .read_bytes_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await
+    }
+
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
         self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.counts.write_text.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text(uri, contents).await
+    }
+
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.counts.write_bytes.fetch_add(1, Ordering::Relaxed);
+        self.inner.write_bytes(uri, contents).await
     }
 
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {

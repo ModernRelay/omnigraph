@@ -1223,3 +1223,35 @@ fn test_reject_lance_virtual_system_column_property_names() {
     parse_schema("node N { _row_id: String _rowid2: String _ROWID: String }")
         .expect("only the five exact, case-sensitive Lance names are reserved");
 }
+
+// The split is load-bearing for upgrades: a stored catalog that legally
+// declared `_distance`/`_score` before the reservation must keep opening, so
+// the load-side predicate (enforced in `validate_schema_ir` on every catalog
+// load) must NEVER absorb the search-output names.
+#[test]
+fn test_search_output_names_are_not_storage_system_columns() {
+    for name in ["_distance", "_score"] {
+        assert!(!crate::schema::is_reserved_storage_system_column(name));
+        assert!(crate::schema::is_reserved_search_output_column(name));
+    }
+}
+
+// New declarations of Lance's search output names are refused with the
+// ranking rationale, NOT the pre-RC export remedy; the reservation is
+// parse-time only (see the load-side twin in schema_ir tests: stored
+// catalogs carrying these names keep opening).
+#[test]
+fn test_reject_search_output_column_property_names_at_parse_only() {
+    for name in ["_distance", "_score"] {
+        let error = parse_schema(&format!("node N {{ {name}: String }}"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved"), "unexpected error: {error}");
+        assert!(error.contains(name), "unexpected error: {error}");
+        assert!(
+            error.contains("search"),
+            "search-output reservation must carry the ranking rationale, not the \
+             pre-RC Lance remedy: {error}"
+        );
+    }
+}

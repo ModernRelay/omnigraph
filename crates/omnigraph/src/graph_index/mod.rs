@@ -1,3 +1,5 @@
+pub(crate) mod persist;
+
 use std::collections::HashMap;
 
 use arrow_array::StringArray;
@@ -45,6 +47,28 @@ impl TypeIndex {
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.dense_to_id.len()
+    }
+
+    /// The dense-ordered id dictionary (index `i` holds the id of dense `i`).
+    pub(crate) fn ids(&self) -> &[String] {
+        &self.dense_to_id
+    }
+
+    /// Rebuild from a dense-ordered dictionary (persisted-artifact load).
+    /// Duplicate ids would silently alias two dense slots, so they are refused.
+    pub(crate) fn from_ids(ids: Vec<String>) -> Result<Self> {
+        let mut id_to_dense = HashMap::with_capacity(ids.len());
+        for (dense, id) in ids.iter().enumerate() {
+            if id_to_dense.insert(id.clone(), dense as u32).is_some() {
+                return Err(OmniError::manifest(format!(
+                    "graph index dictionary holds duplicate id '{id}'"
+                )));
+            }
+        }
+        Ok(Self {
+            id_to_dense,
+            dense_to_id: ids,
+        })
     }
 }
 
@@ -97,7 +121,39 @@ impl CsrIndex {
         let n = node as usize;
         self.offsets[n + 1] > self.offsets[n]
     }
+
+    pub(crate) fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    pub(crate) fn targets(&self) -> &[u32] {
+        &self.targets
+    }
+
+    /// Rebuild from persisted arrays, enforcing the structural invariants
+    /// `neighbors` relies on: a non-empty, zero-based, monotone offsets array
+    /// whose final entry covers exactly the targets array.
+    pub(crate) fn from_parts(offsets: Vec<u32>, targets: Vec<u32>) -> Result<Self> {
+        let valid = offsets.first() == Some(&0)
+            && offsets.windows(2).all(|w| w[0] <= w[1])
+            && offsets.last().copied() == Some(targets.len() as u32)
+            && targets.len() <= u32::MAX as usize;
+        if !valid {
+            return Err(OmniError::manifest(
+                "graph index adjacency arrays are structurally invalid".to_string(),
+            ));
+        }
+        Ok(Self { offsets, targets })
+    }
 }
+
+/// Borrowed views of a `GraphIndex`'s three maps (dictionaries, outgoing,
+/// incoming), for artifact serialization.
+pub(crate) type GraphIndexParts<'a> = (
+    &'a HashMap<String, TypeIndex>,
+    &'a HashMap<String, CsrIndex>,
+    &'a HashMap<String, CsrIndex>,
+);
 
 /// Topology-only graph index. No node data cached — just adjacency.
 #[derive(Debug, Clone)]
@@ -116,6 +172,9 @@ impl GraphIndex {
         snapshot: &Snapshot,
         edge_types: &HashMap<String, (String, String)>, // edge_name → (from_type, to_type)
     ) -> Result<Self> {
+        // Counted here — not at the cache-miss site — so the probe counts
+        // actual edge-table scan builds, never persisted-artifact loads.
+        crate::instrumentation::record_graph_build(edge_types.len());
         // INVARIANT (A1 graph-index cache key): the topology is a pure function of
         // the edge tables' `src`/`dst` columns and nothing else. `RuntimeCache`
         // keys `GraphIndexCacheKey` on each edge table's physical identity
@@ -201,6 +260,36 @@ impl GraphIndex {
         })
     }
 
+    /// Load the persisted adjacency artifact when one matches this snapshot's
+    /// physical identity; fall back to the in-memory scan build. The load path
+    /// is fail-open — a rejected artifact logs and builds, never errors.
+    /// `adapter` is the owning db's storage adapter when one exists (so
+    /// instrumented/injected adapters observe the artifact GET); `None` lets
+    /// the loader derive one from the store root.
+    pub async fn load_or_build(
+        snapshot: &Snapshot,
+        edge_types: &HashMap<String, (String, String)>,
+        adapter: Option<&dyn crate::storage::StorageAdapter>,
+    ) -> Result<Self> {
+        if let Some((index, _)) = persist::load(snapshot, edge_types, adapter).await {
+            return Ok(index);
+        }
+        Self::build(snapshot, edge_types).await
+    }
+
+    /// Load the persisted artifact fresh for `edge_types`, returning the full
+    /// decoded index together with its identity stamps — the shelf's key in
+    /// `RuntimeCache` (one decode Arc-shared across every scope it can
+    /// serve). `None` on any miss, exactly like the loader inside
+    /// [`Self::load_or_build`].
+    pub(crate) async fn load_persisted(
+        snapshot: &Snapshot,
+        edge_types: &HashMap<String, (String, String)>,
+        adapter: Option<&dyn crate::storage::StorageAdapter>,
+    ) -> Option<(Self, Vec<persist::TableStamp>)> {
+        persist::load(snapshot, edge_types, adapter).await
+    }
+
     pub fn type_index(&self, type_name: &str) -> Option<&TypeIndex> {
         self.type_indices.get(type_name)
     }
@@ -211,6 +300,41 @@ impl GraphIndex {
 
     pub fn csc(&self, edge_type: &str) -> Option<&CsrIndex> {
         self.csc.get(edge_type)
+    }
+
+    /// Internal views for artifact serialization.
+    pub(crate) fn parts(&self) -> GraphIndexParts<'_> {
+        (&self.type_indices, &self.csr, &self.csc)
+    }
+
+    /// Rebuild from artifact parts. Structural validation of each adjacency
+    /// happened in `CsrIndex::from_parts`; here the cross-map invariant is
+    /// enforced: every edge type carries BOTH orientations, since traversal
+    /// dispatch assumes csr and csc exist together.
+    pub(crate) fn from_parts(
+        type_indices: HashMap<String, TypeIndex>,
+        csr: HashMap<String, CsrIndex>,
+        csc: HashMap<String, CsrIndex>,
+    ) -> Result<Self> {
+        for edge in csr.keys() {
+            if !csc.contains_key(edge) {
+                return Err(OmniError::manifest(format!(
+                    "graph index artifact misses the csc orientation for edge '{edge}'"
+                )));
+            }
+        }
+        for edge in csc.keys() {
+            if !csr.contains_key(edge) {
+                return Err(OmniError::manifest(format!(
+                    "graph index artifact misses the csr orientation for edge '{edge}'"
+                )));
+            }
+        }
+        Ok(Self {
+            type_indices,
+            csr,
+            csc,
+        })
     }
 
     #[cfg(test)]

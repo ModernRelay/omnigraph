@@ -517,6 +517,12 @@ fn parse_prop_decl(pair: pest::iterators::Pair<Rule>) -> Result<PropDecl> {
              renamed, and rebuilt"
         )));
     }
+    if super::is_reserved_search_output_column(&name) {
+        return Err(CompilerError::Parse(format!(
+            "property name '{name}' is reserved: search-ordered queries rank results by \
+             the '{name}' column Lance appends to search output; choose another property name"
+        )));
+    }
     let type_ref = inner.next().unwrap();
     let prop_type = parse_type_ref(type_ref)?;
 

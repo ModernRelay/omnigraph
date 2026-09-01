@@ -6,9 +6,9 @@ use lance::Dataset;
 use lance::session::Session;
 use tokio::sync::Mutex;
 
-use crate::db::ResolvedTarget;
+use crate::db::{ResolvedTarget, Snapshot};
 use crate::error::Result;
-use crate::graph_index::GraphIndex;
+use crate::graph_index::{GraphIndex, persist};
 
 /// Cache key for a built `GraphIndex`. Keyed (A1) by the physical identity of the
 /// edge tables the topology is derived from, NOT by the resolved snapshot id. The
@@ -49,17 +49,60 @@ struct GraphIndexTableState {
 #[derive(Debug, Default)]
 pub struct RuntimeCache {
     graph_indices: Mutex<GraphIndexCache>,
+    /// Single-flight gate for the persisted-artifact decode: simultaneous
+    /// misses serialize here, so on the fresh-artifact path the full-catalog
+    /// GET + decode runs once and waiters are served from the shared decode
+    /// by the post-acquisition re-check. A FAILED attempt records its scope
+    /// key in `artifact_negative`, so a stale/absent artifact costs one gated
+    /// GET per distinct key — never a repeated queue of doomed downloads —
+    /// and later misses for that key go straight to the scan build. Scan
+    /// builds themselves run outside this gate.
+    artifact_admission: Mutex<()>,
 }
 
 #[derive(Debug)]
 struct GraphIndexCache {
     entries: LruMap<GraphIndexCacheKey, Arc<GraphIndex>>,
+    /// The shared full-catalog decode slot ("shelf"): the most recent
+    /// artifact decode, keyed by its identity stamps and Arc-shared into
+    /// every scope entry it can serve — N scoped misses cost one decode and
+    /// one allocation instead of N full copies (the LRU could otherwise pin
+    /// `capacity` complete catalogs). Freshness stays per-request:
+    /// `shelf_serve` re-verifies every requested edge's current stamp, so a
+    /// written edge stops the slot serving scopes that touch it while
+    /// untouched scopes keep hitting. Retention: replaced only by a newer
+    /// successful decode or `invalidate_all` — if edges keep changing and no
+    /// fresh artifact ever loads, the slot pins one stale catalog decode for
+    /// the handle's lifetime (deliberate; bounded at one).
+    shelf: Option<(Vec<persist::TableStamp>, Arc<GraphIndex>)>,
+    /// Scope keys whose artifact load attempt FAILED (absent/stale/corrupt
+    /// for exactly those stamps). A key embeds its edge stamps, so the
+    /// verdict cannot go stale: new stamps make a new key. Cleared when a
+    /// new decode lands (a fresh artifact may serve previously-doomed keys)
+    /// and on `invalidate_all`.
+    artifact_negative: LruMap<GraphIndexCacheKey, ()>,
 }
 
 impl RuntimeCache {
+    /// A fresh artifact was just written (optimize): failed-load verdicts may
+    /// now be satisfiable, including under UNCHANGED stamp keys when the
+    /// write advanced no table version — drop them all so the next miss
+    /// re-attempts the load.
+    pub(crate) async fn note_artifact_replaced(&self) {
+        let mut cache = self.graph_indices.lock().await;
+        cache.artifact_negative.invalidate_all();
+    }
+
+    /// Note on in-flight loaders: an artifact decode already running under
+    /// `artifact_admission` can repopulate the shelf and one entry AFTER this
+    /// returns. That is safe, not racy: every serve re-verifies stamps
+    /// against the caller's CURRENT snapshot, and entry keys embed stamps —
+    /// stale state parked by a straggler is simply never served.
     pub async fn invalidate_all(&self) {
         let mut cache = self.graph_indices.lock().await;
         cache.entries.invalidate_all();
+        cache.shelf = None;
+        cache.artifact_negative.invalidate_all();
     }
 
     /// Build (or fetch) the CSR/CSC graph index scoped to exactly `edge_types` —
@@ -72,6 +115,7 @@ impl RuntimeCache {
         &self,
         resolved: &ResolvedTarget,
         edge_types: &HashMap<String, (String, String)>,
+        adapter: &dyn crate::storage::StorageAdapter,
     ) -> Result<Arc<GraphIndex>> {
         let key = graph_index_cache_key(resolved, edge_types);
         {
@@ -79,9 +123,63 @@ impl RuntimeCache {
             if let Some(index) = cache.entries.get(&key).cloned() {
                 return Ok(index);
             }
+            if let Some(index) = cache.shelf_serve(&resolved.snapshot, edge_types) {
+                cache.insert(key, Arc::clone(&index));
+                return Ok(index);
+            }
         }
 
-        crate::instrumentation::record_graph_build(edge_types.len());
+        // Miss for both the scope entry and the shelf: try the persisted
+        // artifact once, single-flight, so concurrent misses never duplicate
+        // the full-catalog decode. A key whose attempt already failed skips
+        // the gate entirely (the key embeds the stamps, so the failure
+        // verdict holds until the stamps move or a fresh decode lands).
+        let known_doomed = {
+            let mut cache = self.graph_indices.lock().await;
+            cache.artifact_negative.get(&key).is_some()
+        };
+        if !known_doomed {
+            let _admission = self.artifact_admission.lock().await;
+            let doomed_while_waiting = {
+                let mut cache = self.graph_indices.lock().await;
+                if let Some(index) = cache.entries.get(&key).cloned() {
+                    return Ok(index);
+                }
+                if let Some(index) = cache.shelf_serve(&resolved.snapshot, edge_types) {
+                    cache.insert(key.clone(), Arc::clone(&index));
+                    return Ok(index);
+                }
+                // A same-key waiter whose winner just FAILED shares that
+                // verdict instead of repeating the doomed GET.
+                cache.artifact_negative.get(&key).is_some()
+            };
+            if doomed_while_waiting {
+                // fall through to the scan build below
+            } else {
+                match GraphIndex::load_persisted(&resolved.snapshot, edge_types, Some(adapter))
+                    .await
+                {
+                    Some((index, stamps)) => {
+                        let index = Arc::new(index);
+                        let mut cache = self.graph_indices.lock().await;
+                        cache.shelf = Some((stamps, Arc::clone(&index)));
+                        cache.artifact_negative.invalidate_all();
+                        cache.insert(key, Arc::clone(&index));
+                        return Ok(index);
+                    }
+                    None => {
+                        let mut cache = self.graph_indices.lock().await;
+                        cache.artifact_negative.insert(key.clone(), ());
+                    }
+                }
+            }
+        }
+
+        // No usable artifact: scan-build the SCOPED index (small, never
+        // shelved), outside the admission gate so unrelated scopes still
+        // build concurrently. The graph-build probe fires inside
+        // `GraphIndex::build` itself, so a persisted-artifact load is never
+        // counted as a build.
         let index = Arc::new(GraphIndex::build(&resolved.snapshot, edge_types).await?);
         let mut cache = self.graph_indices.lock().await;
         if let Some(existing) = cache.entries.get(&key).cloned() {
@@ -95,6 +193,25 @@ impl RuntimeCache {
 impl GraphIndexCache {
     fn insert(&mut self, key: GraphIndexCacheKey, value: Arc<GraphIndex>) {
         self.entries.insert(key, value);
+    }
+
+    /// Serve a scope from the shelved full-catalog decode when every
+    /// requested edge's CURRENT stamp matches the shelf's identity. A stale
+    /// or uncovered edge returns `None` (that request re-admits); the shelf
+    /// itself is kept — other scopes not touching the written edge stay
+    /// fresh against it.
+    fn shelf_serve(
+        &self,
+        snapshot: &Snapshot,
+        edge_types: &HashMap<String, (String, String)>,
+    ) -> Option<Arc<GraphIndex>> {
+        // An empty scope would match vacuously (`all` over nothing); refuse
+        // rather than hand out the full catalog with zero verification.
+        if edge_types.is_empty() {
+            return None;
+        }
+        let (stamps, index) = self.shelf.as_ref()?;
+        persist::stamps_cover_and_match(snapshot, edge_types, stamps).then(|| Arc::clone(index))
     }
 
     #[cfg(test)]
@@ -170,6 +287,8 @@ impl Default for GraphIndexCache {
     fn default() -> Self {
         Self {
             entries: LruMap::new(8),
+            shelf: None,
+            artifact_negative: LruMap::new(32),
         }
     }
 }
@@ -440,5 +559,54 @@ mod tests {
 
         map.invalidate_all();
         assert_eq!(map.len(), 0);
+    }
+
+    /// PR #544 review finding 3 regression: two different edge scopes served
+    /// from the persisted artifact must share ONE decoded allocation (the
+    /// shelf), never retain independent full-catalog copies per scope key.
+    #[tokio::test]
+    async fn scoped_requests_share_one_persisted_artifact_decode() {
+        const SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {}
+edge Likes: Person -> Person {}
+"#;
+        const DATA: &str = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Likes","from":"b","to":"a"}"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+        crate::loader::load_jsonl(&db, DATA, crate::loader::LoadMode::Overwrite)
+            .await
+            .unwrap();
+        db.optimize().await.unwrap();
+        // Fresh handle: cold in-memory caches, the artifact stays on the store.
+        let db = crate::db::Omnigraph::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let (resolved, catalog) = db.capture_current_read_view().await.unwrap();
+        let scope = |edge: &str| {
+            let et = &catalog.edge_types[edge];
+            HashMap::from([(edge.to_string(), (et.from_type.clone(), et.to_type.clone()))])
+        };
+        let knows = db
+            .graph_index_for_resolved(&resolved, &scope("Knows"))
+            .await
+            .unwrap();
+        let likes = db
+            .graph_index_for_resolved(&resolved, &scope("Likes"))
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&knows, &likes),
+            "scoped requests must share the shelved full-catalog decode"
+        );
+        // Sanity that the shared index really is the artifact's full catalog.
+        assert!(knows.csr("Knows").is_some() && knows.csr("Likes").is_some());
     }
 }

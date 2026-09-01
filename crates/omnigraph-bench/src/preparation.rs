@@ -149,6 +149,23 @@ impl StorageAdapter for PreparationStorageAdapter {
         self.inner.read_text_if_exists_bounded(uri, max_bytes).await
     }
 
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> omnigraph::error::Result<Option<Vec<u8>>> {
+        self.inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await
+    }
+
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> omnigraph::error::Result<()> {
+        if !self.measuring()? {
+            return Err(self.denied("write_bytes", uri));
+        }
+        self.inner.write_bytes(uri, contents).await
+    }
+
     async fn write_text(&self, uri: &str, contents: &str) -> omnigraph::error::Result<()> {
         if !self.measuring()? {
             return Err(self.denied("write_text", uri));

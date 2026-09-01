@@ -85,9 +85,10 @@ query hybrid($vector: Vector(4), $text: String) {
 }
 ```
 
-Ranking order is preserved through ordinary node projections and single-hop edge
-expansion. More complex plans may not expose every intermediate score as a
-normal column; order directly by the search expression when ranking is the goal.
+Ranking order is a contract, not a side effect: search-ordered results are
+sorted on the search score itself, including through multi-hop traversals, with
+secondary keys and the entity-id tie-break applied after the score. The full
+ordering contract lives on the [queries page](../queries/index.md).
 
 ## Indexes
 
