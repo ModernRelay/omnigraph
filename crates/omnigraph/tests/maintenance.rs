@@ -21,7 +21,7 @@ use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
-    mixed_params, mutate_main, snapshot_main,
+    mixed_params, mutate_main, query_main, snapshot_main, vector_param,
 };
 
 /// Filesystem URI of the live main-branch incarnation of a node table.
@@ -508,6 +508,124 @@ node Doc {
     assert_eq!(
         ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed
+    );
+}
+
+// Lance 11 graph-level twin of `lance_surface_guards.rs::
+// vector_optimize_after_update_serves_only_current_vectors`: `optimize` feeds
+// vector indexes through `optimize_indices` (they are foldable, unlike FTS —
+// RFC 0043), so an in-place embedding update followed by `optimize` must serve
+// nearest() rankings from the NEW embedding, exactly once per row. On Lance 10
+// the folded index could retain the pre-update vector (upstream lance#8342 /
+// lance#7371).
+#[tokio::test]
+async fn optimize_after_vector_update_serves_updated_ranking() {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+}
+"#;
+    const NEAREST_QUERY: &str = r#"
+query nn($v: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $v) }
+    limit 4
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+
+    load_jsonl(
+        &db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"embedding\":[1.0,0.0,0.0,0.0]}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"embedding\":[2.0,0.0,0.0,0.0]}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"embedding\":[3.0,0.0,0.0,0.0]}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"embedding\":[10.0,0.0,0.0,0.0]}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices().await.unwrap();
+
+    // In-place update through the keyed merge route: d1 moves past every other
+    // row. The rewritten fragment sits outside the vector index's coverage
+    // until `optimize` folds it back in.
+    load_jsonl(
+        &db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"embedding\":[11.0,0.0,0.0,0.0]}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.optimize().await.unwrap();
+
+    // Prove the vector index actually folded the rewritten fragment: the
+    // embedding index's fragment bitmap must claim every live fragment.
+    {
+        use lance::index::DatasetIndexExt;
+        let raw = Dataset::open(&node_table_uri(&db, "Doc").await)
+            .await
+            .unwrap();
+        let fragment_ids = raw
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let indices = raw.load_indices().await.unwrap();
+        let embedding_segments = indices
+            .iter()
+            .filter(|index| index.name.starts_with("embedding"))
+            .collect::<Vec<_>>();
+        assert!(
+            !embedding_segments.is_empty(),
+            "reconciler must have built a vector index on 'embedding'"
+        );
+        // Coverage is per-name aggregate: a fold may land as a delta segment
+        // under the same index name with its own fragment bitmap.
+        let uncovered = fragment_ids
+            .iter()
+            .filter(|id| {
+                !embedding_segments.iter().any(|segment| {
+                    segment
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| bitmap.contains(**id))
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            uncovered.is_empty(),
+            "optimize must fold the rewritten fragment back into the vector index; \
+             uncovered: {uncovered:?}, segments: {}",
+            embedding_segments.len()
+        );
+    }
+
+    let result = query_main(
+        &mut db,
+        NEAREST_QUERY,
+        "nn",
+        &vector_param("v", &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let slugs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|value| value.unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        slugs,
+        vec!["d2", "d3", "d4", "d1"],
+        "d1 must rank by its NEW embedding, exactly once — a pre-update vector \
+         surviving the fold would rank it first or serve it twice"
     );
 }
 

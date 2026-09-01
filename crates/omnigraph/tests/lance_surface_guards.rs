@@ -2295,6 +2295,163 @@ async fn vector_optimize_after_delete_keeps_stable_ids_and_addresses_aligned() {
     }
 }
 
+// --- Lance 11 fence: update→optimize serves only current vectors -----------
+//
+// Lance 10 could keep a row's pre-update vector alive through vector-index
+// maintenance: merging delta segments retained rows updated in place
+// (upstream lance#8342), and per-segment search served stale rows after an
+// in-place column update (lance#7371) — KNN then returned a row twice, once
+// mis-ranked at its old position. Lance 11 fixed both. OmniGraph's `optimize`
+// feeds every foldable index — vector indexes included, per
+// `TableStore::can_fold_index` — into `optimize_indices`, so this fence pins
+// the fixed behavior on the exact route the engine stages: an indexed
+// merge-insert update, a default `optimize_indices` fold, then an indexed
+// read that must serve every row exactly once at its NEW position.
+#[tokio::test]
+async fn vector_optimize_after_update_serves_only_current_vectors() {
+    use arrow_array::types::{Float32Type, Int32Type};
+    use arrow_array::{FixedSizeListArray, Float32Array};
+    use datafusion::physical_plan::displayable;
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const ROWS: usize = 20_000;
+    const DIMENSION: usize = 32;
+    const INDEX_NAME: &str = "vector_idx";
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("update_optimize_vector.lance");
+    let uri = uri.to_str().unwrap();
+    let mut dataset = linear_vector_dataset(uri, ROWS, DIMENSION, ROWS).await;
+
+    let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+    dataset
+        .create_index_builder(&["vector"], IndexType::Vector, &params)
+        .name(INDEX_NAME.to_string())
+        .replace(true)
+        .await
+        .unwrap();
+
+    // Move every fifth row from `[id, 0, ..]` to `[ROWS + id, 0, ..]` through
+    // the same staged merge-insert update route the engine uses. Every updated
+    // row is then strictly farther from the origin than every untouched row,
+    // so a surviving pre-update vector or a duplicated row is visible in the
+    // exact result order.
+    let updated_ids = (0..ROWS as i32)
+        .filter(|id| id % 5 == 0)
+        .collect::<Vec<_>>();
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let update_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item.clone(), DIMENSION as i32),
+            false,
+        ),
+    ]));
+    let mut update_values = vec![0.0_f32; updated_ids.len() * DIMENSION];
+    for (row, vector) in update_values.chunks_exact_mut(DIMENSION).enumerate() {
+        vector[0] = (ROWS as i32 + updated_ids[row]) as f32;
+    }
+    let update_vectors = FixedSizeListArray::new(
+        item,
+        DIMENSION as i32,
+        Arc::new(Float32Array::from(update_values)),
+        None,
+    );
+    let update_batch = RecordBatch::try_new(
+        update_schema,
+        vec![
+            Arc::new(Int32Array::from(updated_ids.clone())),
+            Arc::new(update_vectors),
+        ],
+    )
+    .unwrap();
+    let dataset = Arc::new(dataset);
+    let staged = stage_pk_merge(
+        dataset.clone(),
+        update_batch,
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::DoNothing,
+        None,
+    )
+    .await;
+    assert_eq!(staged.stats.num_updated_rows, updated_ids.len() as u64);
+    assert_eq!(staged.stats.num_inserted_rows, 0);
+    let mut commit = CommitBuilder::new(dataset.clone());
+    if let Some(affected_rows) = staged.affected_rows {
+        commit = commit.with_affected_rows(affected_rows);
+    }
+    let mut dataset = commit.execute(staged.transaction).await.unwrap();
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    let stats: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics(INDEX_NAME)
+            .await
+            .expect("the folded IVF_FLAT index must expose statistics"),
+    )
+    .unwrap();
+    let partition_count = stats["indices"][0]["num_partitions"]
+        .as_u64()
+        .expect("IVF statistics must expose num_partitions") as usize;
+
+    // Expected exact order: untouched rows by id (distance id²), then updated
+    // rows by id (distance (ROWS + id)²) — every id exactly once.
+    let mut expected_ids = (0..ROWS as i32)
+        .filter(|id| id % 5 != 0)
+        .collect::<Vec<_>>();
+    expected_ids.extend(updated_ids.iter().copied());
+    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vector", &query, expected_ids.len())
+        .unwrap();
+    scanner.nprobes(partition_count.max(1));
+    scanner.target_parallelism(1);
+
+    let plan = scanner.create_plan().await.unwrap();
+    let plan = format!("{}", displayable(plan.as_ref()).indent(true));
+    assert!(
+        plan.contains("ANNIvfPartition"),
+        "the parity check must read through the folded vector index, got:\n{plan}"
+    );
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        batch.num_rows(),
+        expected_ids.len(),
+        "every row must be served exactly once through the folded index"
+    );
+    let ids = batch["id"].as_primitive::<Int32Type>();
+    let distances = batch["_distance"].as_primitive::<Float32Type>();
+    let mut seen = HashSet::new();
+    for (position, expected_id) in expected_ids.iter().copied().enumerate() {
+        let id = ids.value(position);
+        assert!(
+            seen.insert(id),
+            "row {id} served more than once — a stale pre-update copy survived the fold"
+        );
+        assert_eq!(
+            id, expected_id,
+            "row at rank {position} must sit at its post-update position, not its pre-update one"
+        );
+    }
+    for pair in distances.values().windows(2) {
+        assert!(
+            pair[0] <= pair[1],
+            "folded-index results must remain globally distance-ordered: {} before {}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
 // --- Lance 10 compatibility: fence late-hydrated KNN ordering --------------
 //
 // lance#7868 makes execute_plan preserve order when the plan still advertises
