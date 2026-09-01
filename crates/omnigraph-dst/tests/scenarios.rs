@@ -1719,11 +1719,17 @@ fn dst_sidecar_weather_lost_and_misdirected() {
 #[test]
 #[serial]
 fn dst_stale_sidecar_bricks_recovery() {
+    // Seed re-pinned 103 -> 100 (2026-09-01): the graph-index artifact
+    // write (`__graph_index/csr-current.bin`, write_bytes) now consumes a
+    // fault-plan roll, shifting every seed's fault schedule; seed 103 no
+    // longer strands a stale sidecar. Seed 100 reproduces the pinned
+    // intent (both runs brick with the same OCC refusal); found by the
+    // bounded 100..150 search at these exact parameters.
     let sc = Scenario {
-        seed: 103,
+        seed: 100,
         ops: 30,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 10300,
+            seed: 10000,
             error_pct: 10,
             lose_write_pct: 25,
             ..Default::default()
@@ -1762,11 +1768,18 @@ fn dst_stale_sidecar_bricks_recovery() {
 #[test]
 #[serial]
 fn dst_corrupt_write_first_contact() {
+    // Seed re-pinned 101 -> 112 (2026-09-01): the graph-index artifact
+    // write (`__graph_index/csr-current.bin`, write_bytes) now consumes a
+    // fault-plan roll, shifting every seed's fault schedule; seed 101's
+    // universe stopped completing (recovery left sidecar residue). Seed
+    // 112 reproduces the pinned intent (corrupt writes bite, recovery
+    // parses stored garbage, a detection row is recorded); found by the
+    // bounded 100..150 search at these exact parameters.
     let sc = Scenario {
-        seed: 101,
+        seed: 112,
         ops: 30,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 10100,
+            seed: 11200,
             error_pct: 12,
             corrupt_write_pct: 25,
             ..Default::default()
@@ -2170,6 +2183,13 @@ fn dst_predict_triage() {
 /// three schema GETs, plus the unnecessary manifest/index reads (Lance GET
 /// 642 -> 622, LIST 72 -> 71). Lance PUT stays 66 and every other op's counts
 /// stay identical: useful maintenance work and verification are unchanged.
+///
+/// The graph-index artifact (`__graph_index/csr-current.bin`) adds one
+/// Optimize adapter PUT (write_bytes, 2 -> 3); its probes surface as adapter
+/// GETs (`read_bytes_if_exists_bounded` tallies as a.get: Optimize 60 -> 63
+/// plus EXISTS 38 -> 42, _audit 114 -> 116, _verify 564 -> 575) and stamp-fresh
+/// loads shave a few cold-build Lance GETs (_audit 1222 -> 1221,
+/// _verify 2079 -> 2074; Optimize l.get 622 -> 628 from the save-side stamping).
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {
