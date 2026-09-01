@@ -11,7 +11,8 @@ updated: 2026-08-31
 discussion: https://github.com/ModernRelay/omnigraph/issues/583
 supersedes: []
 superseded_by: []
-blocked_on: []
+blocked_on:
+  - https://github.com/ModernRelay/omnigraph/pull/546
 ---
 
 # RFC 0044: Edge keys: derived edge identity
@@ -116,9 +117,11 @@ edge Knows: Person -> Person {
   destructive, never both (the existing engine-wide refusal), so
   delete-then-reinsert spans two mutations, where the later commit wins;
   both the refusal and the re-creation are pinned by the write-path tests.
-- **Key columns are immutable.** The key columns of a keyed edge, `src` and
-  `dst` included, cannot be changed by an update; delete and re-insert
-  instead (the node rule in the mutations guide, extended verbatim).
+- **Key columns are immutable.** Edge types accept no update at all (the
+  typechecker refuses every edge update, so key immutability is structural):
+  a keyed edge changes by inserting its key again with the new values (an
+  upsert), an unkeyed edge by delete and re-insert. The mutations guide
+  states this rule.
   `@rename_from` on a key property keeps existing ids: the id derives from
   values, never from property names.
 - **Load.** The load path derives keyed-edge ids identically, so a keyed
@@ -177,7 +180,14 @@ Six localized changes:
    annotation is refused at `parser.rs:734`, the node twin at
    `parser.rs:704`), and a property-level `@key` on an edge property stays
    refused (`parser.rs:827`), because a single-property key can never include
-   both endpoints. Every edge key must include both `src`
+   both endpoints. Two parser strictness rules ride along: the property
+   names `id`, `src`, `dst`, `from`, and `to` become reserved on edge
+   declarations (such a property would shadow a physical column or collide
+   with the insert's from/to parameters, splitting identity between write
+   doors), and a repeated `@key` member is refused at parse time on nodes
+   and edges alike (shape normalization previously collapsed the repeat
+   silently). Both are parse-time refusals of new declarations only.
+   Every edge key must include both `src`
    and `dst` and may add scalar properties; a key omitting an endpoint is
    refused at declaration time, so two edges between different endpoint
    pairs can never collide on one id. Key columns obey exactly the node
@@ -214,7 +224,7 @@ Six localized changes:
    `Constraint::Unique { is_key: true }`, dropping the committed lookup the
    equivalent `@unique` group pays today.
 5. **Load path.** Both loader edge-id sites (`build_edge_batch`,
-   `loader/mod.rs:1519`; `normalize_strict_edge_rows`, `loader/mod.rs:1724`)
+   `loader/mod.rs:1508`; `normalize_strict_edge_rows`, `loader/mod.rs:1703`)
    derive the id for keyed edge types, and an explicit id that does not
    equal the derivation is refused with a typed error on both surfaces,
    with exact equality (mirroring `normalize_strict_node_rows`,
@@ -301,7 +311,7 @@ introduced.
   the existing schema-plan refusal covers every existing type, empty ones
   included (drop and re-add an empty type to key it). The id rewrite a
   populated type would require is a migration and out of scope.
-- **Released versions.** v0.9.0 and every earlier version carry the #583
+- **Released versions.** v0.10.0 and every earlier version carry the #583
   behavior. The workaround for released versions is `@unique(src, dst)`,
   which their merge path already enforces; the documentation half of this
   change (schema page and branching guide naming the multiset default and
@@ -385,7 +395,8 @@ Owners to extend, per the testing map:
   scenario only if its release-binary surface needs one.
 - Write-path tests extend the existing owners `tests/writes.rs` (insert
   modes) and `tests/validators.rs` (constraint outcomes): keyed insert
-  upsert on one branch, null key column refusal, supplied-id refusal on
+  upsert on one branch, null key column refusal (on the load surface, where
+  the column builder refuses before derivation), supplied-id refusal on
   load, the constructive-or-destructive refusal of a mixed delete+insert
   mutation and the across-mutations delete-then-reinsert re-creation,
   `@unique` subsumption.
@@ -399,8 +410,8 @@ with no conflict. The unkeyed control keeps its current behavior, which
 is the documented multiset outcome: 4 from the plain traversal (the visited
 gate suppresses the duplicate) and 5 from the bound-edge traversal. Until
 the keyed variant lands, the in-tree anchor for today's behavior is the DST
-pin `dst_merge_duplicates_born_on_both_edge` (`scenarios.rs:3652`; on its
-own fixture: row count 3 to 5, gated 1 vs bound 2).
+pin `dst_merge_duplicates_born_on_both_edge` (`scenarios.rs`; its fixture
+asserts gated 1 vs bound 2).
 
 ## Rollout
 
@@ -412,7 +423,9 @@ own fixture: row count 3 to 5, gated 1 vs bound 2).
    multiset default, the released-versions workaround, a keyed-edge
    conflict example; mutations guide: the insert-identity bullets and the
    load-mode table). Existing graphs and unkeyed types are bit-for-bit
-   unaffected. Issue #583 closes with it; `implementation` advances to
+   unaffected at runtime; the one new refusal is parse-time only, on new
+   declarations (the reserved edge property names and the repeated key
+   member, change 1). Issue #583 closes with it; `implementation` advances to
    `complete` on merge.
 2. **Out of scope, later work:** migrating an existing populated edge type to
    a key (id rewrite), and any revisit of the unkeyed default.
@@ -422,7 +435,8 @@ own fixture: row count 3 to 5, gated 1 vs bound 2).
 None. The one settle-before-acceptance candidate (whether every edge key
 must include both endpoints) is settled in Design change 1: it must. The
 `ir_version` number assignment is a dependency gate on PR #546, stated in
-Compatibility.
+Compatibility; the implementation mints 3 and renumbers if #546's
+implementation takes it first.
 
 ## Decision log
 
