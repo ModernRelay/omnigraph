@@ -1,0 +1,22 @@
+# issue: none
+# notes: pins the order-clause refusal shape: an aggregate written out in
+#   full inside order { } is refused; ordering by its projection alias is the
+#   supported spelling. The refusal message carries no error-code prefix, so
+#   the raw fragment is the pin.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- query
+query count_ordered() {
+    match { $p: Person }
+    return { count($p) as total }
+    order { count($p) }
+}
+
+--- expect error: unsupported ordering expression

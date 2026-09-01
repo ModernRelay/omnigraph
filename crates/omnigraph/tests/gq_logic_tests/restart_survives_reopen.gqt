@@ -1,0 +1,39 @@
+# issue: none
+# notes: pins that committed mutations survive a store reopen; exercises
+#   mutate, loop, restart, and read steps in one case.
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- foreach $who bob carol
+
+--- mutate
+query insert_person($name: String) {
+    insert Person { name: $name, age: 40 }
+}
+
+--- params
+{"name": "${who}"}
+
+--- expect affected: nodes=1 edges=0
+
+--- endloop
+
+--- restart
+
+--- query
+query all_names() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}

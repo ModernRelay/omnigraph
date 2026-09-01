@@ -35,7 +35,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Concern | Existing owners |
 |---|---|
 | Initialization and representative journeys | `lifecycle.rs`, `end_to_end.rs`, `composite_flow.rs`, `consistency.rs` |
-| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs` |
+| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs`, `gq_logic_tests.rs` (walks the `.gqt` cases under `tests/gq_logic_tests/`) |
 | Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs`, `rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
 | Branches, snapshots, diffs, and merges | `branching.rs`, `point_in_time.rs`, `changes.rs`, `merge_truth_table.rs`, `merge_fast_forward.rs` |
@@ -96,11 +96,16 @@ Focused iteration:
 ```bash
 cargo test -p omnigraph-engine --test traversal
 cargo test -p omnigraph-engine --test writes concurrent
+cargo test -p omnigraph-engine --test gq_logic_tests
 cargo test -p omnigraph-server --test data_routes
 cargo test -p omnigraph-cli --test cli_data
 cargo test -p omnigraph-cluster --test failpoints --features failpoints
 cargo test -p omnigraph-bench --locked
 ```
+
+`OMNIGRAPH_GQ_LOGIC_TESTS=<substr>[,<substr>]` restricts the gq logic-test run
+to case files whose name contains a value; `OMNIGRAPH_GQ_BLESS=1` rewrites the
+failing step's expect rows in place (local workflow only, never CI).
 
 Canonical workspace graph:
 
