@@ -93,11 +93,14 @@ pub fn record(realm: &'static str, op: &str, uri: &str, counting: bool) {
 }
 
 /// The complete inventory of write primitives the two wrappers can
-/// intercept, as "realm:op" labels: the adapter realm's six
+/// intercept, as "realm:op" labels: the adapter realm's seven
 /// `StorageAdapter` write methods and the Lance proxy's write set.
 /// Audited against both trait definitions 2026-08-24 (StorageAdapter in
 /// omnigraph-storage/src/lib.rs; object_store 0.13.2, where every
-/// defaulted write method routes through these four proxy arms).
+/// defaulted write method routes through these four proxy arms);
+/// `write_bytes` added when the graph-index artifact I/O landed (its
+/// read half, `read_bytes_if_exists_bounded`, is a read primitive and
+/// stays outside this write inventory).
 /// The census asserts observed ⊆ inventory — a NOVEL op is an arm the
 /// audit never saw, a staleness red. The reverse direction (inventory
 /// arms a run never fired) is REPORT-ONLY: no single workload exercises
@@ -107,6 +110,7 @@ pub const WRITE_PRIMITIVES: &[&str] = &[
     "adapter:write_text",
     "adapter:write_text_if_absent",
     "adapter:write_text_if_match",
+    "adapter:write_bytes",
     "adapter:rename_text",
     "adapter:delete",
     "adapter:delete_prefix",
@@ -228,6 +232,17 @@ pub fn classify(uri: &str) -> &'static str {
     // Order matters: most specific first.
     if uri.contains("__recovery/") {
         return "recovery-sidecar";
+    }
+    // TRIAGED (derived cache, fail-open): `__graph_index/csr-current.bin`
+    // — the persisted CSR graph-index artifact, written via write_bytes by
+    // graph_index/persist.rs::save (optimize-only writer). Purely DERIVED
+    // and regenerable: every load path stamp-verifies the artifact against
+    // the live snapshot and falls back to the in-memory build on absence,
+    // read error, or rejection, so no corruption verb can wound the store
+    // through it and no recovery obligation attaches — a lost or corrupt
+    // artifact costs one cold build, nothing else.
+    if uri.contains("__graph_index/") {
+        return "graph-index-artifact";
     }
     // TRIAGE OPEN: the init-claim file —
     // written write_text_if_absent during store birth, deleted when init
