@@ -147,7 +147,16 @@ jobs:
           Copy-Item target/release/omnigraph-azure-admission.exe release/omnigraph-azure-admission.exe
           Compress-Archive -Path release/omnigraph.exe, release/omnigraph-server.exe, release/omnigraph-azure-admission.exe -DestinationPath "${{ matrix.asset_name }}.zip" -Force
           $hash = (Get-FileHash "${{ matrix.asset_name }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  ${{ matrix.asset_name }}.zip" | Out-File -FilePath "${{ matrix.asset_name }}.sha256" -Encoding ascii
+          $checksumPath = Join-Path (Get-Location) "${{ matrix.asset_name }}.sha256"
+          [System.IO.File]::WriteAllText(
+            $checksumPath,
+            "$hash  ${{ matrix.asset_name }}.zip`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          $checksumBytes = [System.IO.File]::ReadAllBytes($checksumPath)
+          if ($checksumBytes -contains 13) {
+            throw "Windows checksum manifest contains CR; expected LF-only"
+          }
           New-Item -ItemType Directory -Force -Path verify | Out-Null
           Expand-Archive -Path "${{ matrix.asset_name }}.zip" -DestinationPath verify -Force
           $items = Get-ChildItem -Path verify -File
