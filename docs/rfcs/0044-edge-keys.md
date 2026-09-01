@@ -7,12 +7,11 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-08-31
-updated: 2026-08-31
+updated: 2026-09-01
 discussion: https://github.com/ModernRelay/omnigraph/issues/583
 supersedes: []
 superseded_by: []
-blocked_on:
-  - https://github.com/ModernRelay/omnigraph/pull/546
+blocked_on: []
 ---
 
 # RFC 0044: Edge keys: derived edge identity
@@ -243,18 +242,21 @@ Six localized changes:
    is a pure function of the key) holds only because every id source
    derives, from canonical inputs.
 6. **Version acceptance.** `validate_schema_ir` moves from exact equality
-   (`schema_ir.rs:1067`) to accepting the supported version set: today's
-   number 2 plus the edge-key number. The deliberate v1 rejection is
-   unchanged (pinned by the v1-rejection test beside `validate_schema_ir`,
-   `schema_ir.rs:1735`). One stamping rule owns every case: an
-   accepted schema is stamped with the highest `ir_version` its declared
-   features require. Everything else derives from it: the new number is
-   minted only when a schema declares an edge key; an unkeyed schema
-   accepted by the new binary stamps the base number, as does a fresh init
-   without edge keys; and a schema apply that removes the last keyed edge
-   type (by drop-and-re-add) re-stamps the base number, restoring
-   downgrade-safety. Coordination with PR #546 assigns the concrete numbers to each
-   feature.
+   (`schema_ir.rs:1067`) to accepting the supported version set {2, 3};
+   3 is the edge-key number, assigned here at acceptance. The
+   deliberate v1 rejection is unchanged (pinned by the v1-rejection test
+   beside `validate_schema_ir`, `schema_ir.rs:1735`). One stamping rule
+   owns every case: an accepted schema is stamped with the highest
+   `ir_version` its declared features require. Everything else derives
+   from it: 3 is minted only when a schema declares an edge key; an
+   unkeyed schema accepted by the new binary stamps the base number, as
+   does a fresh init without edge keys; and a schema apply that removes
+   the last keyed edge type (by drop-and-re-add) re-stamps the base
+   number, restoring downgrade-safety. How `ir_version` composes with
+   other in-flight schema features is deliberately not decided here: a
+   single linear scalar cannot express independent schema features
+   (raised in review on #546), and the joint scheme is deferred to a
+   dedicated versioning RFC.
 
 The merge is deliberately not on the list. Convergence and conflict for
 same-id rows are existing, tested walk behavior; feeding edges deterministic
@@ -292,17 +294,19 @@ introduced.
 
 - **Schema vintage.** Design change 6 carries the guarantees. To the
   operator of an existing graph: the new binary accepts both supported
-  numbers (2 and the edge-key number, with the deliberate v1 rejection
+  numbers (2 and 3, with the deliberate v1 rejection
   unchanged), so existing graphs open unchanged, and a schema that
   declares no edge key stamps the base number even when applied by
   the new binary (change 6's single stamping rule), so an unkeyed
   deployment stays downgrade-safe. Only a
-  schema that declares an edge key mints the new number; from that point an
+  schema that declares an edge key mints version 3; from that point an
   old binary refuses the graph with the existing hard error
   (`schema_ir.rs:1067`), so downgrade after keying fails closed instead of
-  misreading identity. The concrete version number is assigned at
-  implementation time and must coordinate with in-flight PR #546, which
-  also advances `ir_version`.
+  misreading identity. The edge-key number is fixed here at acceptance,
+  not at implementation time: 3. How the version composes with PR #546's
+  system columns and later schema features is deferred to a dedicated
+  versioning RFC, per change 6; RFC 0040's unresolved question 1 tracks
+  it.
 - **Existing graphs** are unaffected until a schema apply introduces an edge
   key. In this RFC's scope, a key may be declared only when the edge type is
   created (at init, or in a schema apply that adds the type). Declaring,
@@ -434,10 +438,17 @@ asserts gated 1 vs bound 2).
 
 None. The one settle-before-acceptance candidate (whether every edge key
 must include both endpoints) is settled in Design change 1: it must. The
-`ir_version` number assignment is a dependency gate on PR #546, stated in
-Compatibility; the implementation mints 3 and renumbers if #546's
-implementation takes it first.
+edge-key `ir_version` is fixed at acceptance: 3 (change 6, Compatibility).
+The cross-feature versioning scheme is out of this RFC's scope and
+deferred to a dedicated versioning RFC, per change 6; RFC 0040's
+unresolved question 1 tracks it.
 
 ## Decision log
 
 - 2026-08-31: drafted from issue #583.
+- 2026-09-01: review (ragnorc, #592 and #546): implementation-time
+  assignment of the `ir_version` rejected; the edge-key number is fixed
+  at acceptance as 3. The cross-feature scheme (a linear scalar cannot
+  express independent features, such as RFC 0040's spellings beside edge
+  keys) is deliberately not solved in this RFC and is deferred to a
+  dedicated versioning RFC.
