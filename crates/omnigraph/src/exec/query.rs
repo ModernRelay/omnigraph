@@ -1276,6 +1276,23 @@ fn traversal_indexed_override() -> Option<bool> {
     }
 }
 
+/// Lance's Rust scanner leaves the maximum IVF probe count unset by default,
+/// which makes an ANN query probe every partition. Keep the default aligned
+/// with pylance while allowing deployments to trade recall for latency.
+const DEFAULT_ANN_NPROBES: usize = 20;
+
+fn ann_nprobes_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_ANN_NPROBES)
+}
+
+fn ann_nprobes() -> usize {
+    let value = std::env::var("OMNIGRAPH_ANN_NPROBES").ok();
+    ann_nprobes_from(value.as_deref())
+}
+
 /// Max source-row frontier for which Expand uses the BTREE-indexed path.
 /// Larger frontiers fall back to the in-memory CSR (dense / whole-graph). See
 /// `docs/dev/execution.md`.
@@ -2771,6 +2788,10 @@ async fn execute_node_scan(
                     scanner
                         .nearest(prop, &query_arr, k)
                         .map_err(|error| OmniError::storage_context("nearest", error))?;
+                    // Lance's Rust scanner has no maximum probe default on
+                    // this revision, so without an explicit budget ANN can
+                    // probe every IVF partition and become a full scan.
+                    scanner.nprobes(ann_nprobes());
                     // Lance 11's late payload `LanceRead` drops the sorted
                     // candidate stream's ordering metadata. With more than
                     // one output partition, execute_plan may therefore use a
@@ -3251,6 +3272,28 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch>
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(OmniError::arrow_internal)?;
     RecordBatch::try_new(batch.schema(), columns).map_err(OmniError::arrow_internal)
+}
+
+#[cfg(test)]
+mod ann_probe_budget_tests {
+    use super::{DEFAULT_ANN_NPROBES, ann_nprobes_from};
+
+    #[test]
+    fn missing_value_uses_pylance_aligned_default() {
+        assert_eq!(ann_nprobes_from(None), DEFAULT_ANN_NPROBES);
+    }
+
+    #[test]
+    fn positive_value_is_used_as_configured() {
+        assert_eq!(ann_nprobes_from(Some("7")), 7);
+    }
+
+    #[test]
+    fn zero_and_invalid_values_use_default() {
+        for value in [Some("0"), Some("not-a-number"), Some("")] {
+            assert_eq!(ann_nprobes_from(value), DEFAULT_ANN_NPROBES);
+        }
+    }
 }
 
 #[cfg(test)]

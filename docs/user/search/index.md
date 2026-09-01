@@ -34,6 +34,10 @@ embedding client are normalized, so L2 and cosine similarity produce the same
 ordering for those generated vectors. See [Embeddings](embeddings.md) for text
 queries and provider configuration.
 
+IVF vector searches use 20 probes by default. Set `OMNIGRAPH_ANN_NPROBES` to a
+positive integer to tune the probe budget for a deployment; larger values can
+improve recall at the cost of latency.
+
 ## Full-text search
 
 Use full-text functions for token search, fuzzy terms, and relevance. Use the
