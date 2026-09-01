@@ -2150,7 +2150,10 @@ fn expects_merge_conflict(world: &WorldModel, wop: &WorldOp) -> bool {
             .map(|slot| {
                 // Merge-and-close: prediction is undefined for a second
                 // merge; an emitter bug would surface here as a stale-base
-                // misprediction red instead of naming the emitter.
+                // misprediction red instead of naming the emitter. The
+                // keep-serving post-ruling re-derive never predicts an op
+                // the ruling itself judged (the ruling's world holds that
+                // op's own effect), so a merged slot here names an emitter.
                 debug_assert!(
                     !slot.merged,
                     "emitter bug: predicting a second BranchMerge of merged branch {source:?}"
@@ -5642,8 +5645,20 @@ pub fn run_universe_caught(
                         // Stale-capture rule on
                         // [`resolve_keep_serving_watch`]: re-derive the
                         // merge prediction from the post-ruling model for
-                        // every judgment of THIS op below.
-                        let expected_conflict = if watch_resolved {
+                        // every judgment of THIS op below — only when the
+                        // resolution did NOT judge this op. A judged
+                        // interrupt's fate is final (exactly-once contract
+                        // on [`WatchRuling::e_outcome`]): every judgment
+                        // below legalizes a judged interrupt before the
+                        // merge-conflict member reads the flag (typed
+                        // `RecoveryRequired`, marked, or damage-attributed
+                        // failures), and the ruling's world already
+                        // holds the op's OWN effect, so re-predicting a
+                        // `BranchMerge` the ruling folded would meet the
+                        // merge-and-close sentinel in
+                        // `expects_merge_conflict` (specimen seed 24, op10:
+                        // the interrupting op is the merge, matched `E+A`).
+                        let expected_conflict = if watch_resolved && interrupt_judged.is_none() {
                             expects_merge_conflict(&world, &wop)
                         } else {
                             expected_conflict
