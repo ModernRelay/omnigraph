@@ -781,6 +781,11 @@ pub struct MergeWriteProbes {
     pub ordered_cursor_hydration_calls: Arc<AtomicU64>,
     pub ordered_cursor_hydration_rows: Arc<AtomicU64>,
     pub ordered_cursor_hydration_bytes: Arc<AtomicU64>,
+    /// Largest single hydration take observed, in measured decoded bytes.
+    /// This is the cursor's per-take transient memory contract: bounded-chunk
+    /// tests assert it stays near the chunk byte target instead of scaling
+    /// with a table's planned row count.
+    pub ordered_cursor_hydration_max_chunk_bytes: Arc<AtomicU64>,
     /// Projected scalar batches fetched by merge validation before the shared
     /// aggregate-retention budget decides whether each one may be kept.
     pub validation_scan_batches: Arc<AtomicU64>,
@@ -862,6 +867,10 @@ impl MergeWriteProbes {
     }
     pub fn ordered_cursor_hydration_bytes(&self) -> u64 {
         self.ordered_cursor_hydration_bytes.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_max_chunk_bytes(&self) -> u64 {
+        self.ordered_cursor_hydration_max_chunk_bytes
+            .load(Ordering::Relaxed)
     }
     pub fn validation_scan_batches(&self) -> u64 {
         self.validation_scan_batches.load(Ordering::Relaxed)
@@ -1090,6 +1099,8 @@ pub(crate) fn record_ordered_cursor_hydration(rows: usize, bytes: u64) {
             .fetch_add(rows as u64, Ordering::Relaxed);
         p.ordered_cursor_hydration_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+        p.ordered_cursor_hydration_max_chunk_bytes
+            .fetch_max(bytes, Ordering::Relaxed);
     });
 }
 

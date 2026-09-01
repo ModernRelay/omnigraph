@@ -398,17 +398,34 @@ async fn cursor_rows_equal(a: Option<&CursorRow>, b: Option<&CursorRow>) -> Resu
 }
 
 /// Per-chunk decoded-byte target when hydrating sorted keys back into
-/// complete logical rows. Row widths are unknowable before the take, so chunk
-/// sizing is adaptive: seeded small, then steered by the measured bytes of
-/// the previous chunk. A single indivisible row wider than the target still
-/// hydrates alone — that is the point of the two-phase cursor; the staging
-/// writer's per-row envelope remains the authority for what a merge may
-/// actually write.
+/// complete logical rows. Row widths are unknowable before a take
+/// materializes, so chunk sizing is pessimistic: rows are planned from the
+/// widest per-row average this cursor has measured (decayed geometrically so
+/// one wide region does not force single-row takes over a later narrow
+/// tail), and any large planned chunk is first probed with a small take
+/// spread across its key range so sizing reflects the chunk's own data, not
+/// only the preceding chunk's. A single indivisible row wider than the
+/// target still hydrates alone — that is the point of the two-phase cursor;
+/// the staging writer's per-row envelope remains the authority for what a
+/// merge may actually write. Residual exposure: rows so sparsely interleaved
+/// that a spread probe cannot see them can still overshoot one chunk; a
+/// decoded-byte-bounded take upstream in Lance is the complete closure.
 const HYDRATION_CHUNK_TARGET_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 /// First-chunk row count before any width measurement exists. Bounds the
 /// worst-case transient allocation to a few rows of the table's widest
 /// payload.
 const HYDRATION_CHUNK_SEED_ROWS: usize = 4;
+/// Planned chunks above this row count hydrate a spread probe first; at or
+/// below it, the planned chunk itself is small enough to serve as its own
+/// measurement. Together with the probe this caps any unprobed take at the
+/// probe row count, so the per-take transient is bounded by
+/// `max(2 x chunk target, probe rows x widest row)` rather than the planned
+/// row count.
+const HYDRATION_PROBE_THRESHOLD_ROWS: usize = 16;
+/// Rows in a spread probe. Evenly sampled across the planned key range, so a
+/// contiguous run of wide rows anywhere in the chunk resizes the chunk before
+/// the bulk take materializes it.
+const HYDRATION_PROBE_ROWS: usize = 16;
 
 /// An id-ordered stream of one snapshot's complete rows, produced in two
 /// phases so no payload column ever reaches a SortExec input:
@@ -429,7 +446,10 @@ struct OrderedTableCursor {
     key_row: usize,
     hydrated: Option<RecordBatch>,
     hydrated_row: usize,
-    next_chunk_rows: usize,
+    /// Widest measured per-row average, decayed by half at each observation
+    /// so sizing recovers geometrically after a wide region. Zero until the
+    /// first measurement; the seed row count governs until then.
+    max_row_bytes: u64,
     peeked: Option<CursorRow>,
     /// When false, the adopt path builds the typed comparison unit only for
     /// common rows. New/deleted rows therefore avoid comparison work, while
@@ -529,7 +549,7 @@ impl OrderedTableCursor {
             key_row: 0,
             hydrated: None,
             hydrated_row: 0,
-            next_chunk_rows: HYDRATION_CHUNK_SEED_ROWS,
+            max_row_bytes: 0,
             peeked: None,
             eager_signatures,
         })
@@ -568,7 +588,9 @@ impl OrderedTableCursor {
     }
 
     /// Like [`Self::with_scan_context`], additionally naming the sorted-key id
-    /// range of the failing hydration chunk.
+    /// range of the failing hydration take. Storage and manifest failures —
+    /// the shapes a take actually produces — keep their classification and
+    /// gain the context in-message via `with_context`.
     fn with_hydration_context(&self, error: OmniError, first_id: &str, last_id: &str) -> OmniError {
         match error {
             OmniError::ResourceLimitExceeded {
@@ -583,7 +605,10 @@ impl OrderedTableCursor {
                 limit,
                 actual,
             },
-            other => other,
+            other => other.with_context(format!(
+                "branch-merge hydration for {} ({} snapshot, rows '{first_id}'..='{last_id}')",
+                self.table_key, self.role
+            )),
         }
     }
 
@@ -643,34 +668,33 @@ impl OrderedTableCursor {
         }
     }
 
-    /// Hydrate the next bounded chunk of sorted keys into complete rows via a
-    /// row-address take against the pinned dataset. Blob columns come back as
-    /// descriptors (the typed comparator's identity unit); `_rowid` and
-    /// `_rowaddr` ride along for the comparator's Blob tie-break and
-    /// fragment-identity mapping.
-    async fn hydrate_next_chunk(&mut self) -> Result<()> {
-        let dataset = self
-            .dataset
-            .clone()
-            .ok_or_else(|| OmniError::manifest("cursor keys missing source dataset".to_string()))?;
-        let keys = self
-            .key_batch
-            .as_ref()
-            .ok_or_else(|| OmniError::manifest_internal("hydration without a key batch"))?;
-        let start = self.key_row;
-        let len = self
-            .next_chunk_rows
-            .clamp(1, keys.num_rows().saturating_sub(start).max(1));
-        let addresses_column = keys
-            .column_by_name(lance_core::ROW_ADDR)
-            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::manifest_internal("ordered cursor key batch is missing row addresses")
-            })?;
-        let addresses: Vec<u64> = (start..start + len)
-            .map(|row| addresses_column.value(row))
-            .collect();
+    /// Rows the next take may plan, from the pessimistic width estimate.
+    /// Before any measurement the seed bounds the first transient to a few
+    /// rows of the table's widest payload.
+    fn planned_chunk_rows(&self) -> usize {
+        if self.max_row_bytes == 0 {
+            return HYDRATION_CHUNK_SEED_ROWS;
+        }
+        usize::try_from(HYDRATION_CHUNK_TARGET_BYTES / self.max_row_bytes)
+            .unwrap_or(KEYED_WRITE_MAX_ROWS)
+            .clamp(1, KEYED_WRITE_MAX_ROWS)
+    }
 
+    /// One bounded row-address take against the pinned dataset. Blob columns
+    /// come back as descriptors (the typed comparator's identity unit);
+    /// `_rowid` and `_rowaddr` ride along for the comparator's Blob tie-break
+    /// and fragment-identity mapping.
+    ///
+    /// `&mut self` deliberately: a shared `&self` held across the take await
+    /// would demand `Sync` from the key stream and strip `Send` from every
+    /// caller up through `branch_merge`.
+    async fn take_rows_by_address(
+        &mut self,
+        dataset: &Dataset,
+        addresses: Vec<u64>,
+        first_id: &str,
+        last_id: &str,
+    ) -> Result<RecordBatch> {
         let shared = Arc::new(dataset.clone());
         let mut plan = lance::dataset::ProjectionRequest::from_schema(shared.schema().clone())
             .into_projection_plan(Arc::clone(&shared))
@@ -688,20 +712,87 @@ impl OrderedTableCursor {
                 )),
                 name: lance_core::ROW_ID.to_string(),
             });
+        lance::dataset::TakeBuilder::try_new_from_addresses(shared, addresses, Arc::new(plan))
+            .map_err(OmniError::storage)?
+            .with_row_address(true)
+            .execute()
+            .await
+            .map_err(|error| {
+                self.with_hydration_context(OmniError::storage(error), first_id, last_id)
+            })
+    }
+
+    /// Hydrate the next bounded chunk of sorted keys into complete rows.
+    ///
+    /// Sizing is pessimistic and probe-guarded: the planned row count comes
+    /// from the decayed widest measured per-row width, and any plan larger
+    /// than the probe threshold first takes a small spread of rows across the
+    /// planned key range, folding the *exact* widest probed row into the
+    /// estimate before the bulk take materializes anything. A contiguous run
+    /// of wide rows anywhere in the plan therefore resizes the chunk first;
+    /// the residual transient is bounded by the probe rows themselves plus
+    /// one resized chunk, not by the plan's full row count.
+    async fn hydrate_next_chunk(&mut self) -> Result<()> {
+        let dataset = self
+            .dataset
+            .clone()
+            .ok_or_else(|| OmniError::manifest("cursor keys missing source dataset".to_string()))?;
+        let keys = self
+            .key_batch
+            .clone()
+            .ok_or_else(|| OmniError::manifest_internal("hydration without a key batch"))?;
+        let start = self.key_row;
+        let available = keys.num_rows().saturating_sub(start).max(1);
+        let addresses_column = keys
+            .column_by_name(lance_core::ROW_ADDR)
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::manifest_internal("ordered cursor key batch is missing row addresses")
+            })?;
+
+        let mut len = self.planned_chunk_rows().min(available);
+        if len > HYDRATION_PROBE_THRESHOLD_ROWS {
+            let mut probe_rows: Vec<usize> = (0..HYDRATION_PROBE_ROWS)
+                .map(|index| start + index * (len - 1) / (HYDRATION_PROBE_ROWS - 1))
+                .collect();
+            probe_rows.dedup();
+            let probe_addresses: Vec<u64> = probe_rows
+                .iter()
+                .map(|&row| addresses_column.value(row))
+                .collect();
+            let probe_first = row_id_at(&keys, probe_rows[0])?;
+            let probe_last = row_id_at(&keys, *probe_rows.last().expect("probe is non-empty"))?;
+            let probe = self
+                .take_rows_by_address(&dataset, probe_addresses, &probe_first, &probe_last)
+                .await?;
+            let probe_bytes = u64::try_from(probe.get_array_memory_size()).unwrap_or(u64::MAX);
+            crate::instrumentation::record_ordered_cursor_hydration(probe.num_rows(), probe_bytes);
+            // The probe is small enough to size per row exactly: copy each row
+            // out (a slice would report shared parent buffers) and keep the
+            // widest. An averaged estimate would dilute one wide row across
+            // the probe and undersize by the probe's row count.
+            for row in 0..probe.num_rows() {
+                let indices = UInt64Array::from(vec![row as u64]);
+                let single = arrow_select::take::take_record_batch(&probe, &indices)
+                    .map_err(OmniError::arrow_internal)?;
+                let single_bytes =
+                    u64::try_from(single.get_array_memory_size()).unwrap_or(u64::MAX);
+                self.max_row_bytes = self.max_row_bytes.max(single_bytes.max(1));
+            }
+            len = self.planned_chunk_rows().min(available);
+        }
+
+        let addresses: Vec<u64> = (start..start + len)
+            .map(|row| addresses_column.value(row))
+            .collect();
         // The failing chunk's sorted key range is the only stable row identity
         // safely available at this layer; carry it so an operator can find the
         // offending rows without replaying the merge.
-        let first_id = row_id_at(keys, start)?;
-        let last_id = row_id_at(keys, start + len - 1)?;
-        let hydrated =
-            lance::dataset::TakeBuilder::try_new_from_addresses(shared, addresses, Arc::new(plan))
-                .map_err(OmniError::storage)?
-                .with_row_address(true)
-                .execute()
-                .await
-                .map_err(|error| {
-                    self.with_hydration_context(OmniError::storage(error), &first_id, &last_id)
-                })?;
+        let first_id = row_id_at(&keys, start)?;
+        let last_id = row_id_at(&keys, start + len - 1)?;
+        let hydrated = self
+            .take_rows_by_address(&dataset, addresses, &first_id, &last_id)
+            .await?;
 
         // `with_row_address` already makes Lance refuse a take that lost rows;
         // re-check key identity so a misaligned hydration can never feed the
@@ -716,7 +807,7 @@ impl OrderedTableCursor {
             )));
         }
         for row in 0..len {
-            if row_id_at(&hydrated, row)? != row_id_at(keys, start + row)? {
+            if row_id_at(&hydrated, row)? != row_id_at(&keys, start + row)? {
                 return Err(OmniError::manifest_internal(format!(
                     "ordered cursor hydration for {} ({} snapshot) returned a row out of key \
                      order",
@@ -727,13 +818,12 @@ impl OrderedTableCursor {
 
         let bytes = u64::try_from(hydrated.get_array_memory_size()).unwrap_or(u64::MAX);
         crate::instrumentation::record_ordered_cursor_hydration(len, bytes);
-        // Steer the next chunk toward the byte target with the measured
-        // average width. A wide row shrinks the next chunk (down to a single
-        // indivisible row); cheap rows grow it back toward the row ceiling.
+        // Fold the measured chunk into the pessimistic estimate with decay:
+        // one wide region shrinks later chunks immediately, while a narrow
+        // tail recovers the plan geometrically instead of staying at
+        // single-row takes forever.
         let average = (bytes / len as u64).max(1);
-        self.next_chunk_rows = usize::try_from(HYDRATION_CHUNK_TARGET_BYTES / average)
-            .unwrap_or(KEYED_WRITE_MAX_ROWS)
-            .clamp(1, KEYED_WRITE_MAX_ROWS);
+        self.max_row_bytes = average.max(self.max_row_bytes / 2);
 
         self.key_row = start + len;
         self.hydrated = Some(hydrated);

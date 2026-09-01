@@ -1027,6 +1027,90 @@ async fn divergent_merge_succeeds_despite_unrelated_wide_row() {
     assert_eq!(count_rows(&main, "node:Doc").await, 4);
 }
 
+/// A narrow prefix must not let the hydration plan ramp up and then
+/// materialize a run of wide rows in one oversized take: chunk sizing is
+/// probe-guarded, so the transient per take stays near the 32 MiB chunk
+/// target (bounded by the probe rows times the widest row) instead of
+/// scaling with the planned row count. Without the spread probe, the chunk
+/// crossing into the wide run below would take ~2,000 narrow plus all 24
+/// wide rows at once (~100 MiB); adversarially wide tables previously meant
+/// an unbounded allocation where the pre-hydration cursor failed typed.
+#[tokio::test]
+async fn hydration_chunks_stay_bounded_when_row_widths_step_up() {
+    const NARROW_ROWS: usize = 2_000;
+    const NARROW_PAYLOAD_BYTES: usize = 2 * 1024;
+    const WIDE_ROWS: usize = 24;
+    const WIDE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+    // max(2x chunk target, probe rows x widest row) plus margin; the pre-probe
+    // sizing produced a single ~100 MiB take on this fixture.
+    const MAX_CHUNK_BYTES: u64 = 80 * 1024 * 1024;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = Omnigraph::init(uri, WIDE_ROW_SCHEMA).await.unwrap();
+    let mut rows = String::new();
+    for index in 0..NARROW_ROWS {
+        rows.push_str(
+            &serde_json::json!({
+                "type": "Doc",
+                "data": {
+                    "key": format!("a-{index:05}"),
+                    "payload": "n".repeat(NARROW_PAYLOAD_BYTES),
+                },
+            })
+            .to_string(),
+        );
+        rows.push('\n');
+    }
+    for index in 0..WIDE_ROWS {
+        rows.push_str(
+            &serde_json::json!({
+                "type": "Doc",
+                "data": {
+                    "key": format!("z-wide-{index:02}"),
+                    "payload": "x".repeat(WIDE_PAYLOAD_BYTES),
+                },
+            })
+            .to_string(),
+        );
+        rows.push('\n');
+    }
+    main.load("main", &rows, LoadMode::Overwrite).await.unwrap();
+
+    main.branch_create("feature").await.unwrap();
+    let feature = Omnigraph::open(uri).await.unwrap();
+    feature
+        .mutate(
+            "feature",
+            WIDE_ROW_SET_PAYLOAD,
+            "set_payload",
+            &mixed_params(&[("$key", "a-00000"), ("$payload", "edited")], &[]),
+        )
+        .await
+        .unwrap();
+
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    let max_chunk = probes.ordered_cursor_hydration_max_chunk_bytes();
+    assert!(
+        max_chunk <= MAX_CHUNK_BYTES,
+        "one hydration take materialized {max_chunk} bytes; the probe-guarded plan must keep \
+         takes near the chunk target instead of scaling with planned rows"
+    );
+    assert!(
+        probes.ordered_cursor_hydration_rows() >= ((NARROW_ROWS + WIDE_ROWS) * 2) as u64,
+        "both adopt cursors must still hydrate every row"
+    );
+    assert_eq!(
+        node_string_value(&main, "Doc", "a-00000", "payload").await,
+        Some(Some("edited".to_string()))
+    );
+    assert_eq!(count_rows(&main, "node:Doc").await, NARROW_ROWS + WIDE_ROWS);
+}
+
 /// Functional correctness: a fast-forward merge of an append-only branch leaves
 /// main equal to the source branch. The fixture changes both a node and an edge
 /// table so the operation-level publish interval cannot accidentally become a
