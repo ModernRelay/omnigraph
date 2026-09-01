@@ -34,7 +34,10 @@ Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
 scanning every edge dataset. The artifact is derived and regenerable: optimize
 is its only writer, every load is verified and falls back to the in-memory
-build, and a failed write is a warning, not an optimize error.
+build, and a failed write is a warning, not an optimize error. The artifact is
+rewritten by optimize runs that advance an edge dataset; on a store with no
+edge work it is left as-is, and a stale copy costs only the artifact's speedup,
+never correctness.
 
 Existing full-text indexes are preserved rather than incrementally merged.
 Unindexed rows remain searchable, but a growing uncovered tail can cost more to

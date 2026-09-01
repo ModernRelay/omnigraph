@@ -84,6 +84,15 @@ struct GraphIndexCache {
 }
 
 impl RuntimeCache {
+    /// A fresh artifact was just written (optimize): failed-load verdicts may
+    /// now be satisfiable, including under UNCHANGED stamp keys when the
+    /// write advanced no table version — drop them all so the next miss
+    /// re-attempts the load.
+    pub(crate) async fn note_artifact_replaced(&self) {
+        let mut cache = self.graph_indices.lock().await;
+        cache.artifact_negative.invalidate_all();
+    }
+
     /// Note on in-flight loaders: an artifact decode already running under
     /// `artifact_admission` can repopulate the shelf and one entry AFTER this
     /// returns. That is safe, not racy: every serve re-verifies stamps

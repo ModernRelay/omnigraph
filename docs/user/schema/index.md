@@ -55,6 +55,10 @@ letter (`worksAt` for `WorksAt`); lookup is otherwise case-insensitive.
 
 The names `_rowid`, `_rowaddr`, `_rowoffset`,
 `_row_created_at_version`, and `_row_last_updated_at_version` are reserved.
+`_distance` and `_score` are also reserved for new declarations: search-ordered
+queries rank results by those columns. A graph whose schema already declared
+either name before this reservation keeps opening; only new schemas are
+refused.
 
 ## Constraints
 

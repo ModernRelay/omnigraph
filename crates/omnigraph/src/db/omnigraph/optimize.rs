@@ -456,13 +456,20 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
 
 /// Build the full-catalog graph index from a fresh main snapshot and write it
 /// as the persisted adjacency artifact. Skipped when the catalog declares no
-/// edge types (nothing to traverse), and when this run advanced no edge table
-/// AND an artifact already exists: a no-work optimize must not pay a full
-/// edge scan plus a PUT. Accepted tradeoff: edge
-/// data written since the last artifact WITHOUT compaction work leaves the
-/// artifact stale until an edge-committing optimize; stale is safe (loads
-/// reject on the identity stamps and rebuild in memory), it only forgoes the
-/// artifact's speedup for that window.
+/// edge types (nothing to traverse), when any declared edge table is not yet
+/// materialized (`save` would refuse the incomplete identity set — checked
+/// BEFORE the full edge scan, so a partially-materialized store pays nothing),
+/// and when this run advanced no edge table AND an artifact already exists: a
+/// no-work optimize must not pay a full edge scan plus a PUT. Accepted
+/// tradeoffs of the existence gate, both safe (loads reject on identity
+/// stamps or the format version and rebuild in memory), costing only the
+/// artifact's speedup for the window: (a) edge data written since the last
+/// artifact WITHOUT compaction work leaves the artifact stale until an
+/// edge-committing optimize; (b) an artifact in an older FORMAT on a store
+/// with no edge writes is likewise rewritten only by the next edge-committing
+/// optimize — the gate cannot cheaply see inside the object (a bounded read
+/// of the whole body is the only primitive; a ranged header read is the
+/// planned follow-up).
 async fn persist_graph_index_artifact(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
@@ -485,11 +492,28 @@ async fn persist_graph_index_artifact(
         .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
         .collect();
     let snapshot = db.snapshot_for_branch(None).await?;
+    // `save` refuses a partially-materialized store (no complete identity to
+    // stamp); check that BEFORE paying the full-catalog edge scan.
+    if edge_types
+        .keys()
+        .any(|edge| snapshot.dataset(&format!("edge:{edge}")).is_none())
+    {
+        tracing::debug!(
+            target: "omnigraph::optimize",
+            "graph index artifact skipped: not every declared edge table is materialized yet"
+        );
+        return Ok(());
+    }
     let index = crate::graph_index::GraphIndex::build(&snapshot, &edge_types).await?;
     let written =
         crate::graph_index::persist::save(&snapshot, db.storage_adapter(), &edge_types, &index)
             .await?;
     if let Some(uri) = written {
+        // A fresh artifact may serve scope keys whose earlier load attempt
+        // failed; those negative verdicts are stamp-keyed, and when this
+        // optimize advanced no table version the stamps (hence keys) are
+        // unchanged — drop them so the new object gets loaded.
+        db.runtime_cache.note_artifact_replaced().await;
         tracing::debug!(
             target: "omnigraph::optimize",
             uri = %uri,

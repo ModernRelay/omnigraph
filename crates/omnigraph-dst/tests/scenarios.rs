@@ -1768,13 +1768,11 @@ fn dst_stale_sidecar_bricks_recovery() {
 #[test]
 #[serial]
 fn dst_corrupt_write_first_contact() {
-    // Seed re-pinned 101 -> 112 (2026-09-01): the graph-index artifact
-    // write (`__graph_index/csr-current.bin`, write_bytes) now consumes a
-    // fault-plan roll, shifting every seed's fault schedule; seed 101's
-    // universe stopped completing (recovery left sidecar residue). Seed
-    // 112 reproduces the pinned intent (corrupt writes bite, recovery
-    // parses stored garbage, a detection row is recorded); found by the
-    // bounded 100..150 search at these exact parameters.
+    // Seed re-pinned 101 -> 112 (2026-09-01), for the same reason as the
+    // stale-sidecar pin above. Seed 112 reproduces the pinned intent
+    // (corrupt writes bite, recovery parses stored garbage, a detection
+    // row is recorded); found by the bounded 100..150 search at these
+    // exact parameters.
     let sc = Scenario {
         seed: 112,
         ops: 30,

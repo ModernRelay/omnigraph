@@ -17,7 +17,10 @@ mod helpers;
 use std::collections::HashSet;
 
 use omnigraph::db::Omnigraph;
-use omnigraph::instrumentation::with_traversal_mode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::*;
@@ -104,13 +107,29 @@ async fn adaptive_switch_returns_identical_rows() {
             .await
             .unwrap(),
     );
-    let auto = first_column_sorted(&query_main(&mut db, REACH_3, "reach", &p).await.unwrap());
+    // Probe the switch itself: mode equivalence alone stays green with the
+    // re-decision disabled (all three paths would agree on the same rows), so
+    // this counter is what proves the mechanism ran.
+    let switches = Arc::new(AtomicU64::new(0));
+    let probes = QueryIoProbes {
+        traversal_mid_switches: Arc::clone(&switches),
+        ..Default::default()
+    };
+    let auto = first_column_sorted(
+        &with_query_io_probes(probes, query_main(&mut db, REACH_3, "reach", &p))
+            .await
+            .unwrap(),
+    );
 
     assert_eq!(csr.len(), 49, "p0 reaches every other clique member");
     assert_eq!(indexed, csr, "forced modes agree");
     assert_eq!(
         auto, csr,
         "auto (dispatch + mid-traversal re-decision) must match the forced paths"
+    );
+    assert!(
+        switches.load(Ordering::Relaxed) >= 1,
+        "the mid-traversal Indexed→CSR switch must actually fire on this shape"
     );
 }
 
@@ -214,11 +233,25 @@ async fn capped_unordered_limit_returns_valid_subset() {
     assert_eq!(full.len(), 49);
 
     for mode in [None, Some("csr"), Some("indexed")] {
-        let fut = query_main(&mut db, REACH_3_CAPPED, "reach_capped", &p);
+        // Prove the cap actually stopped the traversal (subset validity alone
+        // stays green with pushdown disabled).
+        let cap_stops = Arc::new(AtomicU64::new(0));
+        let probes = QueryIoProbes {
+            expand_cap_stops: Arc::clone(&cap_stops),
+            ..Default::default()
+        };
+        let fut = with_query_io_probes(
+            probes,
+            query_main(&mut db, REACH_3_CAPPED, "reach_capped", &p),
+        );
         let result = match mode {
             Some(m) => with_traversal_mode(m, fut).await.unwrap(),
             None => fut.await.unwrap(),
         };
+        assert!(
+            cap_stops.load(Ordering::Relaxed) >= 1,
+            "the pushed-down limit must stop the traversal early (mode {mode:?})"
+        );
         let rows = first_column_sorted(&result);
         assert_eq!(
             rows.len(),

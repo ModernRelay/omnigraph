@@ -89,11 +89,15 @@ final tie-breaker when user keys are equal. Ascending order places nulls first;
 descending order places them last. `nearest(...)` ordering requires a `limit`.
 
 Search orderings share that contract: `nearest(...)` ranks by ascending vector
-distance and `bm25(...)` by descending relevance score, so the score — never
-any internal scan or traversal order — is what the row order means, including
+distance and `bm25(...)` by descending relevance score, so the score (never
+any internal scan or traversal order) is what the row order means, including
 through multi-hop traversals. Keys after the search function apply as
-secondary sorts before the id tie-breaker. Aggregated queries are outside
-search ordering: group results are not score-ranked.
+secondary sorts before the id tie-breaker; the search function itself must
+lead the order clause. Aggregated queries are outside search ordering: group
+results are not score-ranked. One bound on the tie-break: a `bm25()` ordering
+with no secondary keys reads a bounded set of top-scoring matches, so among
+rows tied exactly at that bound's cut, which rows enter the result follows
+the scan bound rather than entity ids.
 
 ## Blobs
 

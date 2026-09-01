@@ -1125,8 +1125,10 @@ async fn bm25_full_rank_order() {
     )
     .await
     .unwrap();
-    // All three matches tie on BM25 score here (probe-verified equal `_score`
-    // values, 2026-08-31), so this golden pins the equal-score contract: the
+    // All three matches tie on BM25 score here (each doc matches the query
+    // term once per title over similar lengths, and their `_score` values are
+    // equal — print `_score` to re-verify), so this golden pins the
+    // equal-score contract: the
     // deterministic id tie-break. If a Lance scoring change breaks the tie,
     // this expectation changes meaning — re-probe before updating it. The
     // distinct-score ordering itself is pinned by

@@ -198,6 +198,13 @@ fn bm25_scan_limit(ir: &QueryIR) -> Option<usize> {
     if projections_have_aggregates(&ir.return_exprs) {
         return None;
     }
+    // Secondary order keys disqualify the cap: they rank WITHIN score ties,
+    // and a bounded scan chooses which tied rows exist at all — the secondary
+    // sort over a cap-arbitrary subset would be a silently wrong answer the
+    // under-fill retry cannot see (exactly `limit` rows still come back).
+    if ir.order_by.len() > 1 {
+        return None;
+    }
     ir.limit.map(|rows| {
         usize::try_from(rows)
             .unwrap_or(usize::MAX)
@@ -627,7 +634,22 @@ async fn execute_query_once(
             };
             if wide_batch.column_by_name(&score_col).is_some() {
                 // User-stated secondary keys (`order { nearest(...), $p.name
-                // desc }`) apply after the score, before the id tie-break.
+                // desc }`) apply after the score, before the id tie-break. A
+                // search function in a non-leading position is refused with
+                // its constraint named, not fed to `apply_ordering`'s opaque
+                // unsupported-expression arm.
+                for extra in ir.order_by.iter().skip(1) {
+                    if matches!(
+                        extra.expr,
+                        IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Rrf { .. }
+                    ) {
+                        return Err(OmniError::manifest(
+                            "search functions must lead the order clause; keys after the \
+                             search function must be plain expressions"
+                                .to_string(),
+                        ));
+                    }
+                }
                 orderings.extend(ir.order_by.iter().skip(1).cloned());
                 result_batch =
                     apply_ordering(result_batch, &orderings, &wide_batch, params, fetch)?;
@@ -1855,6 +1877,12 @@ async fn execute_expand(
             Some(cap),
         )
         .await?;
+        // The cap is only legal when there are no `dst_filters`, so an
+        // under-fill here can only mean a hydrated dst id had no row — which
+        // loader and mutation referential integrity make unreachable. The
+        // rerun is deliberate defense-in-depth for out-of-band writes or
+        // historical stores, and is intentionally untested: no fixture can
+        // produce a dangling edge through the supported write paths.
         if stopped_early && wide.num_rows() < cap {
             tracing::debug!(
                 target: "omnigraph::traverse",
@@ -2571,6 +2599,7 @@ async fn execute_expand_bfs(
                 ),
             };
             if switch {
+                crate::instrumentation::record_traversal_mid_switch();
                 let gi = graph_index.get().await?.ok_or_else(|| {
                     OmniError::manifest("graph index required for CSR traversal".to_string())
                 })?;
@@ -2721,6 +2750,7 @@ async fn execute_expand_bfs(
                             emitted_dst.push(dst_id);
                             if emitted_src.len() >= cap {
                                 stopped_early = true;
+                                crate::instrumentation::record_expand_cap_stop();
                                 frontiers[i] = next;
                                 break 'hops;
                             }
