@@ -188,6 +188,13 @@ pub struct QueryIoProbes {
     /// regression changes this count while every result assertion still
     /// passes.
     pub bm25_scan_rows: Arc<AtomicU64>,
+    /// Uncapped retries taken after a maximum-bounded ANN scan under-filled
+    /// its requested candidate count. Includes standalone nearest queries and
+    /// individual RRF nearest arms.
+    pub ann_uncapped_retries: Arc<AtomicU64>,
+    /// Effective maximum probe budget recorded by the most recent ANN scan.
+    /// Zero represents Lance's `None` (the uncapped retry).
+    pub ann_max_nprobes: Arc<AtomicU64>,
     /// Plan verdicts recorded by the rrf prefilter gate
     /// (`execute_rrf_fusion`), one per rrf execution in scope order. The
     /// gate's two plans are answer-identical by design, so a gate that
@@ -596,6 +603,20 @@ pub(crate) fn record_bm25_uncapped_retry() {
 /// installed (production).
 pub(crate) fn record_bm25_scan_rows(rows: u64) {
     let _ = current(|p| p.bm25_scan_rows.fetch_add(rows, Ordering::Relaxed));
+}
+
+/// Record the effective ANN maximum. No-op when no probes are installed.
+pub(crate) fn record_ann_probe_budget(maximum: Option<usize>) {
+    let _ = current(|p| {
+        p.ann_max_nprobes
+            .store(maximum.unwrap_or_default() as u64, Ordering::Relaxed);
+    });
+}
+
+/// Record one uncapped ANN retry after a bounded scan under-filled. No-op when
+/// no probes are installed.
+pub(crate) fn record_ann_uncapped_retry() {
+    let _ = current(|p| p.ann_uncapped_retries.fetch_add(1, Ordering::Relaxed));
 }
 
 /// Record one rrf prefilter-gate verdict. No-op when no probes are installed

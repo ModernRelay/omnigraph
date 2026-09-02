@@ -735,6 +735,131 @@ async fn filtered_nearest_clause_spelling_prefilters_like_inline() {
     assert_filtered_nearest_returns_hits("filtered_nearest_clause_range").await;
 }
 
+/// The engine's maximum-only IVF guard must not lower the requested candidate
+/// count. A short standalone scan and each short RRF vector arm retry without
+/// a maximum. The graph-level optimize path creates the multi-partition shape
+/// here, so this covers the real engine scanner rather than only Lance's API.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_bounded_nearest_and_rrf_retry_after_optimized_ivf_underfill() {
+    const ROWS: usize = 20_000;
+
+    fn rows() -> String {
+        (0..ROWS)
+            .map(|row| {
+                let keep = row >= 19_000;
+                let drop = (16_000..19_000).contains(&row);
+                format!(
+                    r#"{{"type":"Doc","data":{{"slug":"n{row:05}","keep":{keep},"drop":{drop},"embedding":[{row}.0,0.0,0.0,0.0]}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    let schema = r#"
+node Doc {
+    slug: String @key
+    keep: Bool @index
+    drop: Bool @index
+    embedding: Vector(4) @index
+}
+"#;
+    let queries = r#"
+query filtered_nearest($q: Vector(4)) {
+    match { $d: Doc { keep: true } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+
+query rrf_all($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $q)) }
+    limit 17000
+}
+"#;
+    let delete_query = r#"
+query delete_middle() {
+    delete Doc where drop = true
+}
+"#;
+
+    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, &rows(), LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+    let deleted = mutate_main(&mut db, delete_query, "delete_middle", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(deleted.affected_nodes, 3_000);
+    db.optimize().await.unwrap();
+
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "filtered_nearest",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.num_rows(), 10);
+    assert_eq!(
+        probes
+            .ann_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a short bounded nearest scan must retry without a maximum"
+    );
+    assert_eq!(
+        probes
+            .ann_max_nprobes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the effective retry plan must record maximum_nprobes=None"
+    );
+    assert_eq!(
+        result_slugs(&result),
+        (19_000..19_010)
+            .map(|row| format!("n{row:05}"))
+            .collect::<Vec<_>>()
+    );
+
+    let rrf_probes = QueryIoProbes::default();
+    let rrf = with_query_io_probes(rrf_probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "rrf_all",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rrf.num_rows(),
+        ROWS - 3_000,
+        "RRF retries must preserve every available candidate"
+    );
+    assert_eq!(
+        rrf_probes
+            .ann_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "both short nearest arms must retry independently"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn nearest_returns_k_closest() {

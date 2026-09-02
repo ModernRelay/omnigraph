@@ -169,6 +169,11 @@ impl ScanTuning<'_> {
         Ok(self)
     }
 
+    pub(crate) fn maximum_nprobes(&mut self, n: usize) -> &mut Self {
+        self.scanner.maximum_nprobes(n);
+        self
+    }
+
     pub(crate) fn target_parallelism(&mut self, target_parallelism: usize) -> &mut Self {
         self.scanner.target_parallelism(target_parallelism);
         self
