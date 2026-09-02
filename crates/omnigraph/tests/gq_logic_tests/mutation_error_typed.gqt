@@ -1,0 +1,34 @@
+# issue: none
+# notes: a mutation inserting a node that omits its non-nullable @key property
+# notes: is refused at typecheck, pinned by its stable code. A mutation whose match
+# notes: merely misses is not an error: delete on an absent key succeeds with zero
+# notes: affected counts.
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query insert_missing_key($age: I32) {
+    insert Person { age: $age }
+}
+
+--- params
+{"age": 41}
+
+--- expect error: T12
+
+--- mutate
+query delete_absent($name: String) {
+    delete Person where name = $name
+}
+
+--- params
+{"name": "ghost"}
+
+--- expect affected: nodes=0 edges=0

@@ -1,0 +1,30 @@
+# issue: none
+# notes: an `expect ordered` step's `order` keys must be total over the rows it
+# notes: returns. The engine's `<var>.id` tie-break is an implementation detail no
+# notes: expect may depend on: it is the `@key` value for keyed node types and a
+# notes: per-load ULID otherwise; the second key here is what makes the order total.
+
+--- schema
+node Person {
+    name: String @key
+    rank: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","rank":2}}
+{"type":"Person","data":{"name":"bob","rank":1}}
+{"type":"Person","data":{"name":"carol","rank":2}}
+{"type":"Person","data":{"name":"dave","rank":1}}
+
+--- query
+query ranked() {
+    match { $p: Person }
+    return { $p.name, $p.rank }
+    order { $p.rank asc, $p.name asc }
+}
+
+--- expect ordered
+{"p.name": "bob", "p.rank": 1}
+{"p.name": "dave", "p.rank": 1}
+{"p.name": "alice", "p.rank": 2}
+{"p.name": "carol", "p.rank": 2}

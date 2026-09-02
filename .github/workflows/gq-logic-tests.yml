@@ -1,0 +1,147 @@
+name: GQ Logic Tests
+
+on:
+  # Code-bearing events only. The body and label events belong to
+  # `fix-regression-gate.yml`, which builds nothing; listing them here
+  # would re-run this Rust build on every label change.
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: gq-logic-tests-${{ github.ref }}
+  # Superseded PR runs are safe to cancel; post-merge main runs stay alive.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # A job cannot depend on another workflow's job, so this is a verbatim
+  # copy of `ci.yml`'s `classify_changes`; `ci.yml` is the source of truth,
+  # and an unconditional step at the top of the test job, right after
+  # checkout, asserts the two stay identical.
+  classify_changes:
+    name: Classify Changes (GQ Logic Tests)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run_full_ci: ${{ steps.filter.outputs.run_full_ci }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect documentation-only changes
+        id: filter
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+          else
+            base="$BEFORE_SHA"
+            head="$GITHUB_SHA"
+            if [[ "$base" == "0000000000000000000000000000000000000000" ]]; then
+              base="$(git rev-parse "${head}^" 2>/dev/null || true)"
+            fi
+          fi
+
+          if [[ -z "${base:-}" ]]; then
+            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Disable rename collapsing so moving source into docs still reports
+          # the source-side deletion and cannot become a docs-only false skip.
+          mapfile -t changed < <(git diff --name-only --no-renames "$base" "$head")
+          if [[ "${#changed[@]}" -eq 0 ]]; then
+            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          run_full_ci=false
+          for path in "${changed[@]}"; do
+            case "$path" in
+              docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc) ;;
+              README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
+              LICENSE|LICENSE.md) ;;
+              *)
+                run_full_ci=true
+                ;;
+            esac
+          done
+
+          printf 'Changed files:\n'
+          printf '  %s\n' "${changed[@]}"
+          echo "run_full_ci=$run_full_ci" >> "$GITHUB_OUTPUT"
+
+  gq_logic_tests:
+    name: GQ Logic Tests
+    needs: classify_changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      # Same floor as the Test Workspace job: unoptimized builds keep every
+      # nested async engine frame, deeper than a default 2 MiB thread stack.
+      RUST_MIN_STACK: 16777216
+    steps:
+      # Unconditional: the copy assertion below must run on every PR, the
+      # documentation-only ones included, inside this required context.
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Assert the classification copy matches ci.yml
+        run: python3 scripts/check-classify-copy.py
+
+      # Documentation-only change: report success without building, so the
+      # required context is never left pending.
+      - name: Skip for documentation-only changes
+        if: needs.classify_changes.outputs.run_full_ci != 'true'
+        run: echo "Documentation-only change detected; skipping the GQ logic tests."
+
+      - name: Install system dependencies
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust stable
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build data
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          # PR runs only restore; saving per-PR caches would evict the
+          # main-branch entries every warm run depends on.
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Run GQ logic tests
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        run: cargo test -p omnigraph-engine --test gq_logic_tests --locked -- --nocapture

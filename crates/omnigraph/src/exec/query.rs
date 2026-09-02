@@ -2634,6 +2634,7 @@ async fn execute_expand_dispatch(
             mode = "csr",
             "expand mode chosen",
         );
+        crate::instrumentation::record_expand_path(false);
         return execute_expand_bfs(
             wide,
             graph_index,
@@ -2694,6 +2695,7 @@ async fn execute_expand_dispatch(
                     reason = "index coverage degraded",
                     "expand mode chosen",
                 );
+                crate::instrumentation::record_expand_path(false);
                 return execute_expand_bfs(
                     wide,
                     graph_index,
@@ -2725,6 +2727,7 @@ async fn execute_expand_dispatch(
         mode = "indexed",
         "expand mode chosen",
     );
+    crate::instrumentation::record_expand_path(true);
     // Surface the C6 silent scalar-index fallback once, now that coverage is known.
     warn_on_degraded_coverage(&coverage, key_col, edge_type);
     // Per-hop re-decision policy (issue #533): a forced mode is a contract and
@@ -3213,6 +3216,7 @@ async fn execute_expand_bfs(
             };
             if switch {
                 crate::instrumentation::record_traversal_mid_switch();
+                crate::instrumentation::record_expand_path(false);
                 let gi = graph_index.get().await?.ok_or_else(|| {
                     OmniError::manifest("graph index required for CSR traversal".to_string())
                 })?;
