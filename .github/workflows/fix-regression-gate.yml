@@ -1,0 +1,58 @@
+name: Fix Regression Gate
+
+# This is a policy check on the pull request, so it must run code the pull
+# request cannot edit. `pull_request_target` takes this workflow file and
+# the scripts it runs from the base branch; the head is fetched only as
+# data for the diff range and is never checked out or executed. Under a
+# plain `pull_request` trigger a PR could replace the check with `true`
+# while keeping the required context name. The metadata events re-run the
+# gate when a body edit or the `no-repro` label changes its answer; this
+# workflow builds nothing, so those re-runs cost seconds.
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+      - labeled
+      - unlabeled
+
+concurrency:
+  group: fix-regression-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  fix_regression_gate:
+    name: Fix Regression Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # Base branch, full history: the checker and this diff's merge base.
+      - name: Checkout base
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+
+      # The head as data only. `refs/pull/N/head` resolves for fork PRs too.
+      - name: Fetch the pull request head
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+
+      - name: Check closed issues carry regressions
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/check-fix-regression.py --self-test
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
+          python3 scripts/check-fix-regression.py \
+            --body-file "$RUNNER_TEMP/pr-body.txt" \
+            --labels "$PR_LABELS" \
+            --range "$BASE_SHA...$HEAD_SHA"

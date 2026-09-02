@@ -113,6 +113,15 @@ pub struct QueryIoProbes {
     /// Lets the switch tests assert the mechanism actually ran — mode
     /// equivalence alone stays green with the switch disabled.
     pub traversal_mid_switches: Arc<AtomicU64>,
+    /// Path commitments per Expand: the indexed scan, the CSR walk chosen up
+    /// front, or the CSR walk switched to mid-traversal (an Expand that
+    /// switches counts once on each). A logic test pinned with
+    /// `# traversal:` asserts the other path's counter stayed zero and, for
+    /// a query that expands, the pinned one moved: the pin is a task-local
+    /// override, and mode equivalence alone cannot see a pin the executor
+    /// ignored or a scope that dropped it.
+    pub expand_indexed_runs: Arc<AtomicU64>,
+    pub expand_csr_runs: Arc<AtomicU64>,
     /// Expand emissions stopped early by a pushed-down `limit` cap. Same
     /// rationale: capped-subset validity alone cannot prove the cap fired.
     pub expand_cap_stops: Arc<AtomicU64>,
@@ -542,6 +551,19 @@ pub(crate) fn record_graph_build(edges: usize) {
 /// installed (production).
 pub(crate) fn record_traversal_mid_switch() {
     let _ = current(|p| p.traversal_mid_switches.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record which path one Expand ran (`indexed` true = the indexed scan,
+/// false = the CSR walk). No-op when no probes are installed (production).
+pub(crate) fn record_expand_path(indexed: bool) {
+    let _ = current(|p| {
+        let counter = if indexed {
+            &p.expand_indexed_runs
+        } else {
+            &p.expand_csr_runs
+        };
+        counter.fetch_add(1, Ordering::Relaxed)
+    });
 }
 
 /// Record one Expand stopping early at its pushed-down limit cap. No-op when

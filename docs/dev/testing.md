@@ -5,7 +5,7 @@ This is the ownership map for OmniGraph's tests. Read it before changing code: f
 ## Rules
 
 1. Test at the boundary that owns the promise. Compiler behavior belongs in compiler tests; engine guarantees belong at the public engine API; HTTP and CLI behavior belongs at those transports.
-2. Prefer one new assertion, fixture row, or parameter over another `init_and_load` test.
+2. Prefer one new assertion, fixture row, or parameter over another `init_and_load` test. When the change fixes an issue, the `Fix Regression Gate` keys on `issue_N` in the test's name or the `.gqt` case's file name: extend an owner test by renaming it to carry `issue_N` in the same change, or add a row to the `issue_N_*.gqt` case (`docs/dev/ci.md`).
 3. Test logical results and durable state. Inspect Lance internals only for a compatibility fence, recovery fault, or physical-cost contract.
 4. Every failure path must prove what did *not* move: manifest head, table head, lineage, sidecar, or external I/O as appropriate.
 5. Time and RSS measurements are decision instruments, not ordinary correctness gates. Deterministic operation counts may be CI contracts.
@@ -35,7 +35,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Concern | Existing owners |
 |---|---|
 | Initialization and representative journeys | `lifecycle.rs`, `end_to_end.rs`, `composite_flow.rs`, `consistency.rs` |
-| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs` |
+| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs`, `gq_logic_tests.rs` (walks the `.gqt` cases under `tests/gq_logic_tests/`) |
 | Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs`, `rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
 | Branches, snapshots, diffs, and merges | `branching.rs`, `point_in_time.rs`, `changes.rs`, `merge_truth_table.rs`, `merge_fast_forward.rs` |
@@ -96,11 +96,22 @@ Focused iteration:
 ```bash
 cargo test -p omnigraph-engine --test traversal
 cargo test -p omnigraph-engine --test writes concurrent
+cargo test -p omnigraph-engine --test gq_logic_tests
 cargo test -p omnigraph-server --test data_routes
 cargo test -p omnigraph-cli --test cli_data
 cargo test -p omnigraph-cluster --test failpoints --features failpoints
 cargo test -p omnigraph-bench --locked
 ```
+
+`OMNIGRAPH_GQ_LOGIC_TESTS=<substr>[,<substr>]` restricts the gq logic-test run
+to case files whose name contains a value; `OMNIGRAPH_GQ_BLESS=1` rewrites the
+failing step's expect rows in place (local workflow only, never CI). The walker
+keeps at most `OMNIGRAPH_GQ_JOBS=<n>` cases in flight (default: the machine's
+available parallelism) and fails a case that exceeds
+`OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>` seconds (default 10); every `ok`/`FAIL`
+line carries the case's elapsed time, and a case over budget belongs in a
+`heavy-repro:` `#[ignore]`d test under `tests/repro_issue_*.rs`, not the
+corpus.
 
 Canonical workspace graph:
 

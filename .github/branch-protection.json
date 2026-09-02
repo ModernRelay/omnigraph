@@ -9,7 +9,9 @@
       "Graph Vocabulary Guard",
       "Test omnigraph-server --features aws",
       "Format (rustfmt)",
-      "Lint (clippy)"
+      "Lint (clippy)",
+      "GQ Logic Tests",
+      "Fix Regression Gate"
     ]
   },
   "enforce_admins": false,
