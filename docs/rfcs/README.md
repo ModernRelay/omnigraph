@@ -38,14 +38,9 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-<<<<<<< HEAD
-The next available number is **0045**. RFC 0040 is reserved by
-[PR #546](https://github.com/ModernRelay/omnigraph/pull/546); lower gaps are
+The next available number is **0047**. RFC 0045 is reserved by
+[PR #584](https://github.com/ModernRelay/omnigraph/pull/584); lower gaps are
 historical and must not be reused.
-=======
-The next available number is **0045**; lower gaps are historical and must
-not be reused.
->>>>>>> 463fd70e (review)
 
 ## Required frontmatter
 
@@ -176,3 +171,5 @@ This table is the human index for the canonical RFC corpus.
 | [0042](0042-incarnation-suffixed-branch-refs.md) | Incarnation-suffixed native branch refs | maintainer | accepted | complete |
 | [0043](0043-full-text-index-compatibility.md) | Full-text index compatibility and explicit rebuild | maintainer | accepted | complete |
 | [0044](0044-edge-keys.md) | Edge keys: derived edge identity | maintainer | draft | in-progress |
+| [0045](0045-gq-logic-tests.md) | GQ logic tests | maintainer | draft | in-progress |
+| [0046](0046-index-status.md) | Read-only index status | maintainer | draft | not-started |

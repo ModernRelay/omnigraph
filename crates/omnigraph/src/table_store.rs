@@ -213,14 +213,32 @@ fn mark_ordered_scan_resource_error(
             .into_datafusion_external();
     }
     if message.contains("single row is") && message.contains("maximum allowed batch size") {
+        // Report the byte count Lance actually measured, not a synthetic
+        // `limit + 1`: the measured size is the only evidence that tells a
+        // genuinely oversized decoded row from an inflated shared-buffer
+        // measurement (Lance sizes an un-split single-row batch with
+        // `get_array_memory_size`, which counts shared parent buffers). The
+        // sentinel remains only for an unparseable upstream message.
+        let actual = parse_single_row_batch_bytes(&message)
+            .unwrap_or_else(|| input_batch_limit.saturating_add(1));
         return OmniError::resource_limit(
             "ordered_scan_input_batch_bytes",
             input_batch_limit,
-            input_batch_limit.saturating_add(1),
+            actual,
         )
         .into_datafusion_external();
     }
     error
+}
+
+/// Defensively extract `N` from Lance's `"a single row is N bytes which
+/// exceeds the maximum allowed batch size of M bytes"` message. Lance exposes
+/// no typed variant for this hard-cap failure yet; keep the parse tolerant so
+/// an upstream wording drift degrades to the sentinel, never to a panic.
+fn parse_single_row_batch_bytes(message: &str) -> Option<u64> {
+    let after = message.split("single row is ").nth(1)?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 fn collect_ordered_scan_spills(plan: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
@@ -6117,6 +6135,94 @@ mod tests {
                 actual: 1,
             }) if resource == "ordered_scan_spilling_disabled"
         ));
+    }
+
+    #[test]
+    fn single_row_cap_message_parse_is_defensive() {
+        assert_eq!(
+            parse_single_row_batch_bytes(
+                "External error: a single row is 41943040 bytes which exceeds the maximum \
+                 allowed batch size of 39321600 bytes"
+            ),
+            Some(41_943_040)
+        );
+        assert_eq!(parse_single_row_batch_bytes("a single row is huge"), None);
+        assert_eq!(parse_single_row_batch_bytes("no marker at all"), None);
+    }
+
+    /// An indivisible decoded row over the hard cap must surface the byte
+    /// count Lance measured, not the historical `limit + 1` sentinel: the
+    /// measured size is what tells a genuinely wide row from an inflated
+    /// shared-buffer measurement after the fact.
+    #[tokio::test]
+    async fn ordered_scan_single_row_cap_reports_measured_bytes() {
+        const WIDE_BYTES: usize = 3 * 1024 * 1024;
+        // input_batch_limit = mem_pool / 4.
+        const POOL_BYTES: u64 = 4 * 1024 * 1024;
+        const CAP_BYTES: u64 = POOL_BYTES / 4;
+
+        let ids: Vec<String> = (0..9).rev().map(|row| format!("row-{row}")).collect();
+        let payloads: Vec<String> = (0..9)
+            .map(|row| {
+                if row == 3 {
+                    "x".repeat(WIDE_BYTES)
+                } else {
+                    "tiny".to_string()
+                }
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(payloads)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let dataset =
+            TableStore::write_dataset(directory.path().join("wide.lance").to_str().unwrap(), batch)
+                .await
+                .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]))
+            .unwrap();
+        let mut stream = TableStore::execute_bounded_ordered_scan(
+            scanner,
+            LanceExecutionOptions {
+                use_spilling: true,
+                mem_pool_size: Some(POOL_BYTES),
+                max_temp_directory_size: Some(64 * 1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let error = loop {
+            match stream.try_next().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("an over-cap indivisible row unexpectedly sorted"),
+                Err(error) => break TableStore::ordered_scan_error(error),
+            }
+        };
+        assert!(
+            matches!(
+                &error,
+                OmniError::ResourceLimitExceeded {
+                    resource,
+                    limit: CAP_BYTES,
+                    actual,
+                } if resource == "ordered_scan_input_batch_bytes"
+                    && *actual >= WIDE_BYTES as u64
+            ),
+            "hard-cap failure must carry the measured row bytes: {error:?}"
+        );
     }
 
     fn logical_blob_batch(values: &[&str]) -> RecordBatch {

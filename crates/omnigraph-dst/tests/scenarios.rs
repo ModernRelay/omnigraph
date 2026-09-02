@@ -2159,6 +2159,50 @@ fn dst_predict_triage() {
         .store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// MILESTONE RE-MERGE pin (nightly 2026-09-01, seed 218120): the milestone
+/// driver's `MergeBranch` step gated only on branch EXISTENCE, bypassing the
+/// merge-and-close invariant (`BranchSlot::merged`) the sampler honors. In
+/// this universe the sampler emits its own merge of the milestone branch
+/// first (the window arm matches it, but the adopt path never crosses the
+/// failpoint site — the merge applies cleanly, zero crashes, `merged` set);
+/// the still-pending milestone step then emitted a SECOND merge of the
+/// merged branch — the shape the model declares unpredictable — and
+/// `predict_merge` mispredicted conflict on the rows the first merge
+/// adopted, while the engine correctly accepts the no-op re-merge. Harness
+/// false alarm, no engine defect. The driver now skips the step as
+/// satisfied; this pins the exact nightly universe green, replay-stable.
+#[cfg(feature = "failpoints")]
+#[test]
+#[serial]
+fn dst_milestone_never_remerges_merged_branch() {
+    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let window = "branch_merge.adopt_between_insert_chunks";
+    let sc = Scenario {
+        seed: 218120,
+        ops: 30,
+        crash_on_match: Some((window, 0)),
+        reach_target: Some(window),
+        wide: omnigraph_dst::harness::window_needs_wide(window),
+        ..Default::default()
+    };
+    let a = run_universe("shared-memory://dst-milestone-remerge-a", &sc);
+    // Sanity only: the milestone branch's rows are on main. The pin's real
+    // teeth is the MergePrediction detector — with the guard reverted this
+    // universe dies at op 9 (red control, task 0094).
+    assert!(
+        a.end_state.iter().any(|(name, _, _)| name == "ms1"),
+        "milestone-remerge pin: the milestone branch's merge must reach main"
+    );
+    // Pin the claimed shape: the window arm matches the first merge but the
+    // failpoint site is never crossed — this universe has zero crashes.
+    assert_eq!(
+        a.crashes, 0,
+        "milestone-remerge pin: the scheduled window must never be hit (merge applies cleanly)"
+    );
+    let b = run_universe("shared-memory://dst-milestone-remerge-b", &sc);
+    omnigraph_dst::harness::assert_strict_replay(&a, &b, "milestone-remerge pin: strict replay");
+}
+
 /// BENCH HARNESS — the COUNTING PASS golden: one standard universe's
 /// storage actions, tallied per op kind and per realm-verb at both
 /// interposition points, compared byte-for-byte against the checked-in
