@@ -179,15 +179,12 @@ pub struct QueryIoProbes {
     /// regression changes this count while every result assertion still
     /// passes.
     pub bm25_scan_rows: Arc<AtomicU64>,
-    /// Uncapped retries taken after a bounded ANN scan under-filled its
-    /// requested limit. The retry keeps the same minimum probe budget but
-    /// leaves Lance's maximum unset so late search can reach every partition.
+    /// Uncapped retries taken after a maximum-bounded ANN scan under-filled
+    /// its requested candidate count. Includes standalone nearest queries and
+    /// individual RRF nearest arms.
     pub ann_uncapped_retries: Arc<AtomicU64>,
-    /// Effective minimum probe budget recorded by the most recent ANN scan.
-    pub ann_min_nprobes: Arc<AtomicU64>,
     /// Effective maximum probe budget recorded by the most recent ANN scan.
-    /// Zero represents Lance's `None` (all partitions may be searched during
-    /// late search); configured budgets are always positive.
+    /// Zero represents Lance's `None` (the uncapped retry).
     pub ann_max_nprobes: Arc<AtomicU64>,
     /// Plan verdicts recorded by the rrf prefilter gate
     /// (`execute_rrf_fusion`), one per rrf execution in scope order. The
@@ -586,18 +583,16 @@ pub(crate) fn record_bm25_scan_rows(rows: u64) {
     let _ = current(|p| p.bm25_scan_rows.fetch_add(rows, Ordering::Relaxed));
 }
 
-/// Record the effective ANN probe budget for one scan. No-op when no probes
-/// are installed (production).
-pub(crate) fn record_ann_probe_budget(minimum: usize, maximum: Option<usize>) {
+/// Record the effective ANN maximum. No-op when no probes are installed.
+pub(crate) fn record_ann_probe_budget(maximum: Option<usize>) {
     let _ = current(|p| {
-        p.ann_min_nprobes.store(minimum as u64, Ordering::Relaxed);
         p.ann_max_nprobes
             .store(maximum.unwrap_or_default() as u64, Ordering::Relaxed);
     });
 }
 
-/// Record one unbounded ANN retry after a bounded scan under-filled. No-op
-/// when no probes are installed (production).
+/// Record one uncapped ANN retry after a bounded scan under-filled. No-op when
+/// no probes are installed.
 pub(crate) fn record_ann_uncapped_retry() {
     let _ = current(|p| p.ann_uncapped_retries.fetch_add(1, Ordering::Relaxed));
 }

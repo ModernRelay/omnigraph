@@ -735,14 +735,13 @@ async fn filtered_nearest_clause_spelling_prefilters_like_inline() {
     assert_filtered_nearest_returns_hits("filtered_nearest_clause_range").await;
 }
 
-/// A bounded IVF search may exhaust its probe cap before Lance's late search
-/// reaches partitions containing filtered rows. The graph-level optimize path
-/// creates the multi-partition shape here (one initial IVF partition, a range
-/// delete, then optimize), so this covers the real engine scanner rather than
-/// only the Lance API surface.
+/// The engine's maximum-only IVF guard must not lower the requested candidate
+/// count. A short standalone scan and each short RRF vector arm retry without
+/// a maximum. The graph-level optimize path creates the multi-partition shape
+/// here, so this covers the real engine scanner rather than only Lance's API.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn filtered_nearest_retries_after_optimized_ivf_underfill() {
+async fn issue_567_bounded_nearest_and_rrf_retry_after_optimized_ivf_underfill() {
     const ROWS: usize = 20_000;
 
     fn rows() -> String {
@@ -772,6 +771,13 @@ query filtered_nearest($q: Vector(4)) {
     return { $d.slug }
     order { nearest($d.embedding, $q) }
     limit 10
+}
+
+query rrf_all($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $q)) }
+    limit 17000
 }
 "#;
     let delete_query = r#"
@@ -812,26 +818,45 @@ query delete_middle() {
             .ann_uncapped_retries
             .load(std::sync::atomic::Ordering::Relaxed),
         1,
-        "a short bounded IVF pass must retry without a maximum probe cap"
-    );
-    assert_eq!(
-        probes
-            .ann_min_nprobes
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1
+        "a short bounded nearest scan must retry without a maximum"
     );
     assert_eq!(
         probes
             .ann_max_nprobes
             .load(std::sync::atomic::Ordering::Relaxed),
         0,
-        "the effective retry budget must record maximum_nprobes=None"
+        "the effective retry plan must record maximum_nprobes=None"
     );
     assert_eq!(
         result_slugs(&result),
         (19_000..19_010)
             .map(|row| format!("n{row:05}"))
             .collect::<Vec<_>>()
+    );
+
+    let rrf_probes = QueryIoProbes::default();
+    let rrf = with_query_io_probes(rrf_probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "rrf_all",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rrf.num_rows(),
+        ROWS - 3_000,
+        "RRF retries must preserve every available candidate"
+    );
+    assert_eq!(
+        rrf_probes
+            .ann_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "both short nearest arms must retry independently"
     );
 }
 

@@ -50,12 +50,19 @@ embedding client are normalized, so L2 and cosine similarity produce the same
 ordering for those generated vectors. See [Embeddings](embeddings.md) for text
 queries and provider configuration.
 
-IVF vector searches use 20 probes by default. Set `OMNIGRAPH_ANN_NPROBES` to a
-positive integer to tune the probe budget for a deployment; larger values can
-improve recall at the cost of latency. A filtered nearest query that still
-returns fewer than its requested limit after the bounded pass retries once
-without a maximum probe cap, so filtering cannot silently turn the limit into
-a lower row budget.
+IVF vector searches keep Lance's adaptive one-partition minimum and use a
+maximum of 20 payload partitions by default. This prevents Lance's
+centroid-distance heuristic from expanding an otherwise small search across
+the entire index. Set `OMNIGRAPH_ANN_NPROBES` to a positive integer to tune
+the maximum: larger values can improve recall at the cost of latency and
+object-store I/O.
+
+If that maximum leaves a standalone nearest query or an RRF nearest arm with
+fewer candidates than requested, OmniGraph retries that scan once without a
+maximum. The retry preserves the requested row budget when enough matches
+exist, but a highly selective query can therefore still take the uncapped
+path. As with every IVF search, a full candidate count does not make the ANN
+ranking exact; the maximum remains a recall/latency tradeoff.
 
 ## Full-text search
 

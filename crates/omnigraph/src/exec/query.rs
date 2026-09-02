@@ -155,11 +155,10 @@ impl Omnigraph {
 struct SearchMode {
     /// Vector ANN search: (variable, property, query_vector, k).
     nearest: Option<(String, String, Vec<f32>, usize)>,
-    /// Probe budget for the nearest scan. `maximum = None` is the completeness
-    /// retry: Lance may search every partition when the minimum pass is short.
+    /// Maximum number of IVF payload partitions a nearest scan may search.
+    /// Lance retains its adaptive minimum (one by default); `maximum = None`
+    /// is used by the completeness retry.
     ann_probe_budget: Option<AnnProbeBudget>,
-    /// Whether a scalar filter is pushed into the nearest scan's prefilter.
-    ann_prefiltered: bool,
     /// BM25 full-text search: (variable, property, query_text).
     bm25: Option<(String, String, String)>,
     /// Row cap for the BM25 scan, the counterpart of `nearest`'s `k`; see
@@ -191,15 +190,13 @@ impl std::fmt::Debug for EligibleIds {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AnnProbeBudget {
-    minimum: usize,
     maximum: Option<usize>,
 }
 
 impl AnnProbeBudget {
-    fn bounded(n: usize) -> Self {
+    fn bounded(maximum: usize) -> Self {
         Self {
-            minimum: n,
-            maximum: Some(n),
+            maximum: Some(maximum),
         }
     }
 }
@@ -213,10 +210,9 @@ impl SearchMode {
     fn to_uncapped(&self) -> Self {
         Self {
             bm25_scan_limit: None,
-            ann_probe_budget: self.ann_probe_budget.map(|budget| AnnProbeBudget {
-                maximum: None,
-                ..budget
-            }),
+            ann_probe_budget: self
+                .ann_probe_budget
+                .map(|_| AnnProbeBudget { maximum: None }),
             ..self.clone()
         }
     }
@@ -294,7 +290,6 @@ async fn extract_search_mode(
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
                 ann_probe_budget: Some(AnnProbeBudget::bounded(ann_nprobes())),
-                ann_prefiltered: has_scalar_filter_for_variable(&ir.pipeline, variable),
                 ..Default::default()
             })
         }
@@ -613,17 +608,14 @@ pub async fn execute_query(
         return Ok(QueryResult::new(retried.schema(), vec![retried]));
     }
 
-    // A bounded ANN scan can under-fill after prefiltering: Lance's late
-    // search is allowed to stop at maximum_nprobes even when fewer than k
-    // matching rows were found. Retry once with the same minimum budget and
-    // no maximum so a filtered nearest query preserves the limit contract.
-    // The row count cannot distinguish cap starvation from a corpus with
-    // fewer matches than `limit`, so short nearest queries pay the second
-    // scan just like capped BM25 queries do.
+    // A maximum probe guard can return fewer than k rows when the selected
+    // IVF partitions do not contain enough candidates (large k or a selective
+    // prefilter). Retry once without the maximum so the guard cannot silently
+    // lower the query's row limit. Short corpora pay the second scan because
+    // row count alone cannot distinguish them from cap starvation.
     if search_mode
         .ann_probe_budget
         .is_some_and(|budget| budget.maximum.is_some())
-        && search_mode.ann_prefiltered
         && ir
             .limit
             .is_some_and(|limit| (result_batch.num_rows() as u64) < limit)
@@ -757,27 +749,6 @@ async fn execute_query_once(
 /// Check if the query's ordering is search-imposed (`nearest()`/`bm25`).
 fn is_search_ordered(search_mode: &SearchMode) -> bool {
     search_mode.nearest.is_some() || search_mode.bm25.is_some()
-}
-
-/// Whether a scalar predicate can remove rows associated with the nearest
-/// binding after the bounded ANN pass. This includes cross-variable filters
-/// and anti-joins: both can leave the initial top-k candidate window short.
-fn has_scalar_filter_for_variable(pipeline: &[IROp], variable: &str) -> bool {
-    pipeline.iter().any(|op| match op {
-        IROp::NodeScan {
-            variable: bound,
-            filters,
-            ..
-        } if bound == variable => filters.iter().any(|filter| !is_search_filter(filter)),
-        IROp::Filter(filter) if !is_search_filter(filter) => {
-            let variables = filter_variables(filter);
-            variables.contains(variable)
-        }
-        IROp::AntiJoin { outer_var, inner } => {
-            outer_var == variable || has_scalar_filter_for_variable(inner, variable)
-        }
-        _ => false,
-    })
 }
 
 /// Synthetic orderings for a search-ordered plan: sort on the score column
@@ -1227,10 +1198,90 @@ fn arm_with_bm25_prefilter(arm: &SearchMode, ids: &EligibleIds) -> SearchMode {
     }
 }
 
+/// Execute one RRF arm with its selected search mode.
+async fn execute_rrf_arm_once(
+    ir: &QueryIR,
+    params: &ParamMap,
+    snapshot: &Snapshot,
+    graph_index: &GraphIndexHandle<'_>,
+    catalog: &Catalog,
+    mode: &SearchMode,
+    needed_columns: &HashMap<String, NeededColumns>,
+) -> Result<Option<RecordBatch>> {
+    let mut wide = None;
+    execute_pipeline(
+        &ir.pipeline,
+        params,
+        snapshot,
+        graph_index,
+        catalog,
+        &mut wide,
+        mode,
+        None,
+        needed_columns,
+    )
+    .await?;
+    Ok(wide)
+}
+
+/// Execute one RRF arm and retry a detectably short bounded nearest scan.
+async fn execute_rrf_arm(
+    ir: &QueryIR,
+    params: &ParamMap,
+    snapshot: &Snapshot,
+    graph_index: &GraphIndexHandle<'_>,
+    catalog: &Catalog,
+    mode: &SearchMode,
+    needed_columns: &HashMap<String, NeededColumns>,
+    limit: usize,
+) -> Result<Option<RecordBatch>> {
+    let mut wide = execute_rrf_arm_once(
+        ir,
+        params,
+        snapshot,
+        graph_index,
+        catalog,
+        mode,
+        needed_columns,
+    )
+    .await?;
+    let bounded_nearest = mode
+        .ann_probe_budget
+        .is_some_and(|budget| budget.maximum.is_some());
+    let unique_candidates = match (&mode.nearest, &wide) {
+        (Some((variable, ..)), Some(batch)) => {
+            let ids = extract_id_column_by_name(batch, &format!("{variable}.id"))?;
+            ids.into_iter().collect::<HashSet<_>>().len()
+        }
+        (Some(_), None) => 0,
+        (None, _) => limit,
+    };
+    if bounded_nearest && unique_candidates < limit {
+        tracing::debug!(
+            limit,
+            capped_candidates = unique_candidates,
+            "RRF ANN arm under-filled; retrying without a maximum probe cap"
+        );
+        crate::instrumentation::record_ann_uncapped_retry();
+        wide = execute_rrf_arm_once(
+            ir,
+            params,
+            snapshot,
+            graph_index,
+            catalog,
+            &mode.to_uncapped(),
+            needed_columns,
+        )
+        .await?;
+    }
+    Ok(wide)
+}
+
 /// One RRF pass: run both arms, fuse their ranks, reconstruct and limit.
 ///
 /// INPUT CONTRACT: bm25 arms are complete rankings, never capped — see
-/// `extract_sub_search_mode`. (The `nearest` arm was always truncated at `k`.)
+/// `extract_sub_search_mode`. Nearest arms are truncated at `k`; a bounded arm
+/// that returns fewer than `k` distinct candidates retries uncapped.
 async fn execute_rrf_fusion(
     ir: &QueryIR,
     params: &ParamMap,
@@ -1266,33 +1317,26 @@ async fn execute_rrf_fusion(
         None => (rrf.primary.as_ref(), rrf.secondary.as_ref()),
     };
 
-    // Execute primary search
-    let mut primary_wide: Option<RecordBatch> = None;
-    execute_pipeline(
-        &ir.pipeline,
+    let primary_wide = execute_rrf_arm(
+        ir,
         params,
         snapshot,
         graph_index,
         catalog,
-        &mut primary_wide,
         primary_mode,
-        None,
         &needed_columns,
+        rrf.limit,
     )
     .await?;
-
-    // Execute secondary search
-    let mut secondary_wide: Option<RecordBatch> = None;
-    execute_pipeline(
-        &ir.pipeline,
+    let secondary_wide = execute_rrf_arm(
+        ir,
         params,
         snapshot,
         graph_index,
         catalog,
-        &mut secondary_wide,
         secondary_mode,
-        None,
         &needed_columns,
+        rrf.limit,
     )
     .await?;
 
@@ -2062,9 +2106,9 @@ fn traversal_indexed_override() -> Option<bool> {
     }
 }
 
-/// Lance's Rust scanner leaves the maximum IVF probe count unset by default,
-/// which makes an ANN query probe every partition. Keep the default aligned
-/// with pylance while allowing deployments to trade recall for latency.
+/// Guard Lance's IVF search against loading every payload partition when its
+/// centroid-distance heuristic expands the adaptive minimum. This is a
+/// maximum only: easy queries retain Lance's one-partition default.
 const DEFAULT_ANN_NPROBES: usize = 20;
 
 fn ann_nprobes_from(value: Option<&str>) -> usize {
@@ -3869,17 +3913,17 @@ async fn execute_node_scan(
                     scanner
                         .nearest(prop, &query_arr, k)
                         .map_err(|error| OmniError::storage_context("nearest", error))?;
-                    // Lance's Rust scanner has no maximum probe default on
-                    // this revision, so without an explicit budget ANN can
-                    // probe every IVF partition and become a full scan.
+                    // Keep Lance's adaptive minimum (one payload partition by
+                    // default) but clamp its centroid-distance heuristic. On
+                    // high-dimensional data that heuristic can otherwise
+                    // promote the minimum to every IVF partition.
                     let budget = search_mode
                         .ann_probe_budget
                         .unwrap_or_else(|| AnnProbeBudget::bounded(ann_nprobes()));
-                    scanner.minimum_nprobes(budget.minimum);
                     if let Some(maximum) = budget.maximum {
                         scanner.maximum_nprobes(maximum);
                     }
-                    crate::instrumentation::record_ann_probe_budget(budget.minimum, budget.maximum);
+                    crate::instrumentation::record_ann_probe_budget(budget.maximum);
                     // Lance 11's late payload `LanceRead` drops the sorted
                     // candidate stream's ordering metadata. With more than
                     // one output partition, execute_plan may therefore use a
@@ -4395,7 +4439,7 @@ mod ann_probe_budget_tests {
     use super::{AnnProbeBudget, DEFAULT_ANN_NPROBES, SearchMode, ann_nprobes_from};
 
     #[test]
-    fn missing_value_uses_pylance_aligned_default() {
+    fn missing_value_uses_default_maximum() {
         assert_eq!(ann_nprobes_from(None), DEFAULT_ANN_NPROBES);
     }
 
@@ -4412,7 +4456,7 @@ mod ann_probe_budget_tests {
     }
 
     #[test]
-    fn uncapped_retry_preserves_minimum_and_clears_only_maximum() {
+    fn uncapped_retry_clears_only_the_maximum() {
         let mode = SearchMode {
             nearest: Some(("d".into(), "embedding".into(), vec![0.0], 10)),
             ann_probe_budget: Some(AnnProbeBudget::bounded(7)),
@@ -4422,10 +4466,7 @@ mod ann_probe_budget_tests {
         let retry = mode.to_uncapped();
         assert_eq!(
             retry.ann_probe_budget,
-            Some(AnnProbeBudget {
-                minimum: 7,
-                maximum: None,
-            })
+            Some(AnnProbeBudget { maximum: None })
         );
     }
 }

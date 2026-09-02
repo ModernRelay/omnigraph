@@ -2247,35 +2247,32 @@ async fn vector_optimize_after_delete_keeps_stable_ids_and_addresses_aligned() {
         "the guard must exercise the split/reshuffle path fixed by lance#7704; stats: {stats}"
     );
 
-    // `nprobes` is a hard cap, while a minimum-only budget permits Lance's
-    // late search to continue when a prefilter leaves the initial probes short.
-    // Pin both plan shapes because the engine uses the former for its bounded
-    // pass and the latter for its completeness retry.
+    // Lance starts at one partition with no maximum. The engine's guard sets
+    // only the maximum: easy queries keep the one-partition minimum, while
+    // Lance's centroid-distance heuristic cannot promote it past the ceiling.
     let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+    let mut adaptive = dataset.scan();
+    adaptive.nearest("vector", &query, 10).unwrap();
+    let adaptive_plan = adaptive.create_plan().await.unwrap();
+    let adaptive_plan = format!("{}", displayable(adaptive_plan.as_ref()).indent(true));
+    assert!(
+        adaptive_plan.contains("minimum_nprobes=1, maximum_nprobes=None"),
+        "Lance's default ANN plan must remain adaptive and uncapped; plan:\n{adaptive_plan}"
+    );
+
     let mut bounded = dataset.scan();
     bounded.nearest("vector", &query, 10).unwrap();
-    bounded.minimum_nprobes(1).maximum_nprobes(1);
+    bounded.maximum_nprobes(1);
     let bounded_plan = bounded.create_plan().await.unwrap();
     let bounded_plan = format!("{}", displayable(bounded_plan.as_ref()).indent(true));
     assert!(
         bounded_plan.contains("minimum_nprobes=1, maximum_nprobes=Some(1)"),
-        "bounded ANN scans must carry an explicit maximum probe cap; plan:\n{bounded_plan}"
-    );
-
-    let mut late = dataset.scan();
-    late.nearest("vector", &query, 10).unwrap();
-    late.minimum_nprobes(1);
-    let late_plan = late.create_plan().await.unwrap();
-    let late_plan = format!("{}", displayable(late_plan.as_ref()).indent(true));
-    assert!(
-        late_plan.contains("minimum_nprobes=1, maximum_nprobes=None"),
-        "minimum-only ANN retries must leave late search uncapped; plan:\n{late_plan}"
+        "a maximum-only guard must preserve Lance's adaptive minimum; plan:\n{bounded_plan}"
     );
 
     let expected_ids = (0..ROWS as i32)
         .filter(|id| id % 5 != 0)
         .collect::<Vec<_>>();
-    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
     let mut scanner = dataset.scan();
     scanner
         .nearest("vector", &query, expected_ids.len())
