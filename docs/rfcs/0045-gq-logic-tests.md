@@ -3,7 +3,7 @@ rfc: "0045"
 title: "GQ logic tests"
 track: maintainer
 status: draft
-implementation: in-progress
+implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
@@ -824,3 +824,64 @@ listed in Compatibility and reversibility.
   flight and budgets each case (10 seconds by default, env-overridable);
   the per-PR corpus is the fast tier; a case runs on the production
   traversal path unless `# traversal:` pins one.
+- 2026-09-02, amendment from the implementation PR (#596), after this RFC
+  merged. Where the body above or an earlier entry differs from this
+  entry, this entry holds. Each item names the section and the sentences
+  it supersedes.
+  - Fix-PR gate, Rust shape (User and operational behavior: "an added
+    Rust line defining a function whose name carries `issue_N`", "a Rust
+    shape is a naming check only", "no Rust test target other than
+    `gq_logic_tests` runs on a pull request", the quotable guarantee; and
+    the first 2026-09-02 entry's "a Rust match is a naming check"). An
+    added function named for `issue_N` counts only when an added `#[test]`
+    or `#[<path>::test]` attribute line (`#[tokio::test(...)]` included)
+    sits directly above it in the same hunk. Other `#[...]` attribute and
+    `//` comment lines may sit between; a blank line, a block comment, or
+    an attribute split across lines breaks adjacency. A plain function,
+    however named, never satisfies the gate. The merged shape accepted a
+    plain `fn` named for the issue, which no pull-request job ever runs,
+    so the gate could pass on a function that asserted nothing. The Rust
+    shape is thereby a test-attributed definition, not a run. A pull
+    request runs only the corpus walker and `Test omnigraph-server
+    --features aws` among Rust test targets (`Test Workspace` runs
+    post-merge). Workspace clippy on the pull request refuses an
+    unreferenced private function but not an `#[ignore]`d or cfg-gated
+    one, so whether that test runs in the suite and asserts the right
+    thing stays with review. One named residue stays with review too: a
+    definition inside an added multi-line block comment or raw string
+    still matches, since the parse is line-based. The quotable guarantee
+    reads, as amended: exit 0 exactly when every issue the body closes by
+    keyword has an added `issue_N_*.gqt`, an added `# issue: N` line, or
+    an added `#[test]`-attributed `issue_N` function, or the PR carries
+    `no-repro`, and the AGENTS.md contract sentence is present; a corpus
+    match means the case ran green in the required job, and a Rust match
+    means a test-attributed function of that name was added.
+  - Workflow layout (User and operational behavior: "a second job in the
+    same workflow", "honors the docs-only classification that `ci.yml`'s
+    `Classify Changes` job defines"; Rollout: "the workflow with both
+    jobs"). GitHub Actions cannot make a job depend on another workflow's
+    job, so `gq-logic-tests.yml` carries a verbatim copy of `ci.yml`'s
+    classification as a job of its own, `Classify Changes (GQ Logic
+    Tests)`, and the required `Classify Changes` context keeps one
+    reporter. The workflow carries three jobs. `ci.yml` is the source of
+    truth; `scripts/check-classify-copy.py`, a gate step, refuses drift.
+  - Runner mechanics and Execution semantics (Runner mechanics: "the cap
+    is a walker implementation detail, not format contract", "an
+    environment variable overrides the default"; Execution semantics:
+    "the `OMNIGRAPH_TRAVERSAL_MODE` process variable never reaches a logic
+    test either way"). The in-flight cap defaults to the machine's
+    available parallelism and `OMNIGRAPH_GQ_JOBS` overrides it; the cap is
+    a documented runner knob, still no format contract.
+    `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` overrides the per-case budget. The
+    variable does reach an unpinned case, so the walker refuses to run
+    while `OMNIGRAPH_TRAVERSAL_MODE` is set.
+  - Comparison semantics, `ordered` (qualifies "the engine's order is
+    total: an `order` clause qualifies when the source batch carries
+    `<var>.id` columns"). Authoring rule for every `ordered` step: the
+    `order` keys must be total over the rows the step returns. The
+    `<var>.id` tie-break is an implementation detail no expect may depend
+    on: it is the `@key` value for keyed node types and a per-load ULID
+    otherwise, so an unkeyed type's order changes across runs. A tie on
+    the sort keys is an authoring error that surfaces as flakiness, and
+    the harness cannot see it statically (`ordered_two_key_sort.gqt` is
+    the corpus example).

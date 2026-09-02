@@ -26,7 +26,8 @@ verbatim copy of the `Classify Changes` job under the name
 `Classify Changes (GQ Logic Tests)`, and `scripts/check-classify-copy.py`
 holds that copy identical to `ci.yml`. `Fix Regression Gate` (same workflow,
 every PR event, no documentation-only skip) holds every issue the PR body
-closes by keyword to a matching `issue_N` function or `.gqt` case in the diff,
+closes by keyword to a matching `.gqt` case or `#[test]`-attributed `issue_N`
+function in the diff,
 waivable per PR with the `no-repro` label; `scripts/check-fix-regression.py`
 is the check.
 

@@ -1,8 +1,8 @@
 # issue: none
 # notes: an `expect ordered` step's `order` keys must be total over the rows it
-#   returns. Node ids are minted per load, so the engine's `<var>.id` tie-break
-#   is stable within a run but not across runs; the second key here is what
-#   makes the order reproducible.
+#   returns. The engine's `<var>.id` tie-break is an implementation detail no
+#   expect may depend on: it is the `@key` value for keyed node types and a
+#   per-load ULID otherwise; the second key here is what makes the order total.
 
 --- schema
 node Person {

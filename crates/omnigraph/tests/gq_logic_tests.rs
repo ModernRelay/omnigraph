@@ -10,6 +10,12 @@
 //! `OMNIGRAPH_GQ_LOGIC_TESTS=<substr>[,<substr>]` restricts the run to
 //! matching case files; `OMNIGRAPH_GQ_BLESS=1` rewrites the failing step's
 //! `--- expect` rows in place.
+//!
+//! Layout of the `run_query_step` future (an engine query under the traversal
+//! task-local, the timeout, and `catch_unwind`) exceeds the default
+//! `recursion_limit` on Linux CI; the same raise the other engine
+//! integration tests carry.
+#![recursion_limit = "512"]
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
