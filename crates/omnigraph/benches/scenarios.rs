@@ -21,6 +21,9 @@
 //!   cargo bench -p omnigraph-engine --bench scenarios -- \
 //!     --scenario nearest-prefilter --rows 100000 --dims 64 --selectivity 0.05
 //!   cargo bench -p omnigraph-engine --bench scenarios -- \
+//!     --scenario ann-probe-budget --rows 10000 --dims 32 --selectivity 0.01 \
+//!     --k 50 --ann-partitions 100 --ann-probes 20
+//!   cargo bench -p omnigraph-engine --bench scenarios -- \
 //!     --scenario fenced-small-upsert --rows 100000 --dims 256
 //!   cargo bench -p omnigraph-engine --bench scenarios -- \
 //!     --scenario fenced-adopt-all-new --rows 100000 --dims 256
@@ -83,6 +86,10 @@ struct Args {
     /// ANN k (the query's `limit`) for nearest-prefilter; the rrf `limit`
     /// for rrf-gate.
     k: usize,
+    /// IVF partition count for the Lance ANN probe-budget reproduction.
+    ann_partitions: usize,
+    /// Minimum/maximum probe count used by the bounded comparator.
+    ann_probes: usize,
     /// Per-row text payload for rrf-gate: 200 KiB reproduces the issue-#563
     /// overflow-scale corpus, ~2 KiB the wide variant, and a tiny value turns
     /// the same scenario into the in-list build + BTREE probe microbench.
@@ -127,6 +134,8 @@ impl Args {
             runs: 1,
             selectivity: 0.05,
             k: 10,
+            ann_partitions: 100,
+            ann_probes: 20,
             text_bytes: 2048,
             delta_rows: 50,
             source_mode: "update".to_string(),
@@ -153,6 +162,13 @@ impl Args {
                     args.selectivity = take("--selectivity").parse().expect("--selectivity")
                 }
                 "--k" => args.k = take("--k").parse().expect("--k"),
+                "--ann-partitions" => {
+                    args.ann_partitions =
+                        take("--ann-partitions").parse().expect("--ann-partitions")
+                }
+                "--ann-probes" => {
+                    args.ann_probes = take("--ann-probes").parse().expect("--ann-probes")
+                }
                 "--text-bytes" => {
                     args.text_bytes = take("--text-bytes").parse().expect("--text-bytes")
                 }
@@ -190,6 +206,10 @@ impl Args {
             self.selectivity.to_string(),
             "--k".into(),
             self.k.to_string(),
+            "--ann-partitions".into(),
+            self.ann_partitions.to_string(),
+            "--ann-probes".into(),
+            self.ann_probes.to_string(),
             "--text-bytes".into(),
             self.text_bytes.to_string(),
             "--delta-rows".into(),
@@ -231,9 +251,10 @@ fn main() {
     let args = Args::parse();
     if args.scenario.is_empty() {
         eprintln!(
-            "usage: --scenario <merge-all-changed|nearest-prefilter|fenced-small-upsert|\
+            "usage: --scenario <merge-all-changed|nearest-prefilter|ann-probe-budget|fenced-small-upsert|\
              fenced-adopt-all-new|general-merge-updates|rrf-gate> [--rows N] [--dims D] \
-             [--seed S] [--runs K] [--selectivity F] [--k K] [--text-bytes B] [--delta-rows N] \
+             [--seed S] [--runs K] [--selectivity F] [--k K] [--ann-partitions N] \
+             [--ann-probes N] [--text-bytes B] [--delta-rows N] \
              [--source-mode update|insert] [--memory-cap-mb M]"
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
@@ -472,6 +493,8 @@ fn run_once(args: &Args, run: usize) -> serde_json::Value {
             "seed": args.seed,
             "selectivity": args.selectivity,
             "k": args.k,
+            "ann_partitions": args.ann_partitions,
+            "ann_probes": args.ann_probes,
             "text_bytes": args.text_bytes,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
@@ -756,6 +779,7 @@ fn run_child(args: &Args) {
             }
             ("merge-all-changed", None) => merge_all_changed(args).await,
             ("nearest-prefilter", None) => nearest_prefilter(args).await,
+            ("ann-probe-budget", None) => ann_probe_budget(args).await,
             ("rrf-gate", None) => rrf_gate(args).await,
             ("fenced-small-upsert", None) => rfc023_scenarios::fenced_small_upsert(args).await,
             (other, phase) => panic!("unknown scenario/phase '{other}/{phase:?}'"),
@@ -1036,6 +1060,480 @@ async fn load_vector_rows(
             .expect("load batch");
         row = end;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: ann-probe-budget
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[derive(Debug, serde::Serialize)]
+struct AnnScanMeasurement {
+    rows_returned: usize,
+    elapsed_us: u64,
+    partitions_searched: usize,
+    partitions_ranked: usize,
+    index_parts_loaded: usize,
+    index_bytes_read: usize,
+    index_iops: usize,
+    storage_requests: usize,
+}
+
+#[cfg(unix)]
+async fn measure_ann_scan(
+    dataset: &lance::Dataset,
+    query: &arrow_array::Float32Array,
+    k: usize,
+    filtered: bool,
+    minimum_nprobes: usize,
+    maximum_nprobes: Option<usize>,
+) -> AnnScanMeasurement {
+    use std::sync::{Arc, Mutex};
+
+    use lance::dataset::scanner::ExecutionSummaryCounts;
+    use lance_datafusion::utils::{PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC};
+
+    let collected = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let callback_target = collected.clone();
+    let mut scanner = dataset.scan();
+    scanner.nearest("vector", query, k).expect("nearest");
+    scanner.minimum_nprobes(minimum_nprobes);
+    if let Some(maximum) = maximum_nprobes {
+        scanner.maximum_nprobes(maximum);
+    }
+    if filtered {
+        scanner.prefilter(true);
+        scanner.filter("eligible = true").expect("eligible filter");
+    }
+    scanner
+        .project(&["id".to_string()])
+        .expect("project id")
+        .target_parallelism(1)
+        .scan_stats_callback(Arc::new(move |summary| {
+            *callback_target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary.clone());
+        }));
+
+    let started = Instant::now();
+    let batch = scanner.try_into_batch().await.expect("ANN scan");
+    let elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
+    let summary = collected
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("Lance scan statistics callback");
+
+    AnnScanMeasurement {
+        rows_returned: batch.num_rows(),
+        elapsed_us,
+        partitions_searched: summary
+            .all_counts
+            .get(PARTITIONS_SEARCHED_METRIC)
+            .copied()
+            .unwrap_or_default(),
+        partitions_ranked: summary
+            .all_counts
+            .get(PARTITIONS_RANKED_METRIC)
+            .copied()
+            .unwrap_or_default(),
+        index_parts_loaded: summary.parts_loaded,
+        index_bytes_read: summary.bytes_read,
+        index_iops: summary.iops,
+        storage_requests: summary.requests,
+    }
+}
+
+#[cfg(unix)]
+async fn measure_fresh_ann_scan(
+    uri: &str,
+    query: &arrow_array::Float32Array,
+    k: usize,
+    filtered: bool,
+    minimum_nprobes: usize,
+    maximum_nprobes: Option<usize>,
+) -> AnnScanMeasurement {
+    let dataset = lance::Dataset::open(uri).await.expect("reopen ANN fixture");
+    measure_ann_scan(
+        &dataset,
+        query,
+        k,
+        filtered,
+        minimum_nprobes,
+        maximum_nprobes,
+    )
+    .await
+}
+
+#[cfg(unix)]
+/// A current-Lance structural reproduction for issue #567 and PR #591. The
+/// fixture gives every IVF partition the same row count and the same number of
+/// filter-eligible rows. Precomputed centroids remove k-means randomness, so
+/// the reported partition counts distinguish Lance's adaptive search from a
+/// hard maximum and from the PR's whole-query retry.
+async fn ann_probe_budget(args: &Args) -> serde_json::Value {
+    use std::sync::Arc;
+
+    use arrow_array::{
+        BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
+        UInt64Array,
+    };
+    use arrow_schema::{DataType, Field, Schema};
+    use lance::Dataset;
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance::index::DatasetIndexExt;
+    use lance::index::vector::VectorIndexParams;
+    use lance_file::version::LanceFileVersion;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_linalg::distance::MetricType;
+
+    const BATCH_ROWS: usize = 8_192;
+    const VECTOR_INDEX_NAME: &str = "vector_idx";
+
+    assert!(args.dims >= 3, "ann-probe-budget requires --dims >= 3");
+    assert!(
+        args.selectivity > 0.0 && args.selectivity <= 1.0,
+        "ann-probe-budget requires 0 < --selectivity <= 1"
+    );
+    assert!(args.ann_partitions > 1, "--ann-partitions must exceed 1");
+    assert!(args.ann_probes > 0, "--ann-probes must be positive");
+    assert!(
+        args.ann_probes < args.ann_partitions,
+        "--ann-probes must be lower than --ann-partitions"
+    );
+    assert_eq!(
+        args.rows % args.ann_partitions,
+        0,
+        "--rows must be divisible by --ann-partitions"
+    );
+
+    let rows_per_partition = args.rows / args.ann_partitions;
+    let eligibility_stride = (1.0 / args.selectivity).round().max(1.0) as usize;
+    let eligible_per_partition = rows_per_partition.div_ceil(eligibility_stride);
+    let eligible_rows = eligible_per_partition * args.ann_partitions;
+    assert!(
+        args.k <= rows_per_partition,
+        "choose --k <= rows per partition so unfiltered Lance-default search can stop after one probe"
+    );
+    assert!(
+        args.k <= eligible_rows,
+        "the fixture must contain at least k eligible rows"
+    );
+    assert!(
+        args.ann_probes * eligible_per_partition < args.k,
+        "choose k/selectivity so the hard probe cap deterministically under-fills"
+    );
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("eligible", DataType::Boolean, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item.clone(), args.dims as i32),
+            false,
+        ),
+    ]));
+
+    let dir = tempfile::tempdir().expect("ANN fixture tempdir");
+    let uri = dir.path().join("ann-probe-budget.lance");
+    let uri = uri.to_str().expect("UTF-8 fixture path");
+
+    let starts = (0..args.rows).step_by(BATCH_ROWS).collect::<Vec<_>>();
+    let batch_schema = schema.clone();
+    let batch_item = item.clone();
+    let rows = args.rows;
+    let dims = args.dims;
+    let partitions = args.ann_partitions;
+    let seed = args.seed;
+    let batches = starts.into_iter().map(move |start| {
+        let end = (start + BATCH_ROWS).min(rows);
+        let mut vector_values = vec![0.0_f32; (end - start) * dims];
+        let mut eligible = Vec::with_capacity(end - start);
+        for (offset, row) in (start..end).enumerate() {
+            let partition = row % partitions;
+            let round = row / partitions;
+            let angle = std::f32::consts::TAU * partition as f32 / partitions as f32;
+            let vector = &mut vector_values[offset * dims..(offset + 1) * dims];
+            vector[0] = angle.cos();
+            vector[1] = angle.sin();
+            let mut state = seed ^ (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            for value in &mut vector[2..] {
+                *value =
+                    ((xorshift64(&mut state) >> 40) as f32 / (1_u32 << 24) as f32 - 0.5) * 0.0001;
+            }
+            eligible.push(round.is_multiple_of(eligibility_stride));
+        }
+        let vectors = FixedSizeListArray::new(
+            batch_item.clone(),
+            dims as i32,
+            Arc::new(Float32Array::from(vector_values)),
+            None,
+        );
+        RecordBatch::try_new(
+            batch_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(start as u64..end as u64)),
+                Arc::new(BooleanArray::from(eligible)),
+                Arc::new(vectors),
+            ],
+        )
+    });
+    let reader = RecordBatchIterator::new(batches, schema);
+
+    let setup_started = Instant::now();
+    let mut dataset = Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("write ANN fixture");
+
+    dataset
+        .create_index_builder(
+            &["eligible"],
+            IndexType::BTree,
+            &ScalarIndexParams::default(),
+        )
+        .name("eligible_idx".to_string())
+        .replace(true)
+        .await
+        .expect("build eligible BTREE");
+
+    let mut centroid_values = vec![0.0_f32; args.ann_partitions * args.dims];
+    for partition in 0..args.ann_partitions {
+        let angle = std::f32::consts::TAU * partition as f32 / args.ann_partitions as f32;
+        let centroid = &mut centroid_values[partition * args.dims..(partition + 1) * args.dims];
+        centroid[0] = angle.cos();
+        centroid[1] = angle.sin();
+    }
+    let centroids = FixedSizeListArray::new(
+        item,
+        args.dims as i32,
+        Arc::new(Float32Array::from(centroid_values)),
+        None,
+    );
+    let ivf = IvfBuildParams::try_with_centroids(args.ann_partitions, Arc::new(centroids))
+        .expect("valid fixed centroids");
+    let vector_params = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf);
+    dataset
+        .create_index_builder(&["vector"], IndexType::Vector, &vector_params)
+        .name(VECTOR_INDEX_NAME.to_string())
+        .replace(true)
+        .await
+        .expect("build IVF_FLAT index");
+    let setup_ms = setup_started.elapsed().as_millis() as u64;
+
+    let index_stats: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics(VECTOR_INDEX_NAME)
+            .await
+            .expect("vector index statistics"),
+    )
+    .expect("vector index statistics JSON");
+    let actual_partitions = index_stats["indices"][0]["num_partitions"]
+        .as_u64()
+        .expect("IVF statistics expose num_partitions") as usize;
+    assert_eq!(actual_partitions, args.ann_partitions);
+
+    if args.baseline {
+        return serde_json::json!({
+            "baseline": true,
+            "setup_ms": setup_ms,
+            "actual_partitions": actual_partitions,
+            "eligible_rows": eligible_rows,
+        });
+    }
+
+    // Two query shapes expose both sides of Lance's heuristic. A query equal
+    // to centroid 0 has nearest-centroid distance zero, so the adaptive
+    // minimum remains one. The orthogonal query is equidistant from every
+    // centroid, so Lance 11's k>=11 distance threshold promotes the minimum
+    // to every partition unless a maximum clamps it.
+    let mut aligned_values = vec![0.0_f32; args.dims];
+    aligned_values[0] = 1.0;
+    let aligned_query = Float32Array::from(aligned_values);
+    let mut equidistant_values = vec![0.0_f32; args.dims];
+    equidistant_values[2] = 1.0;
+    let equidistant_query = Float32Array::from(equidistant_values);
+
+    let aligned_adaptive =
+        measure_fresh_ann_scan(uri, &aligned_query, args.k, false, 1, None).await;
+    let aligned_maximum_only =
+        measure_fresh_ann_scan(uri, &aligned_query, args.k, false, 1, Some(args.ann_probes)).await;
+    let aligned_fixed = measure_fresh_ann_scan(
+        uri,
+        &aligned_query,
+        args.k,
+        false,
+        args.ann_probes,
+        Some(args.ann_probes),
+    )
+    .await;
+    let equidistant_adaptive =
+        measure_fresh_ann_scan(uri, &equidistant_query, args.k, false, 1, None).await;
+    let equidistant_maximum_only = measure_fresh_ann_scan(
+        uri,
+        &equidistant_query,
+        args.k,
+        false,
+        1,
+        Some(args.ann_probes),
+    )
+    .await;
+
+    let unfiltered_large_k = args.ann_probes * rows_per_partition + 1;
+    let unfiltered_large_k_adaptive =
+        measure_fresh_ann_scan(uri, &aligned_query, unfiltered_large_k, false, 1, None).await;
+    let unfiltered_large_k_bounded = measure_fresh_ann_scan(
+        uri,
+        &aligned_query,
+        unfiltered_large_k,
+        false,
+        1,
+        Some(args.ann_probes),
+    )
+    .await;
+    let filtered_adaptive =
+        measure_fresh_ann_scan(uri, &aligned_query, args.k, true, 1, None).await;
+    let filtered_bounded =
+        measure_fresh_ann_scan(uri, &aligned_query, args.k, true, 1, Some(args.ann_probes)).await;
+
+    let retry_dataset = Dataset::open(uri).await.expect("reopen retry fixture");
+    let retry_first = measure_ann_scan(
+        &retry_dataset,
+        &aligned_query,
+        args.k,
+        true,
+        1,
+        Some(args.ann_probes),
+    )
+    .await;
+    let retry_second = if retry_first.rows_returned < args.k {
+        Some(measure_ann_scan(&retry_dataset, &aligned_query, args.k, true, 1, None).await)
+    } else {
+        None
+    };
+    let retry_totals = serde_json::json!({
+        "elapsed_us": retry_first.elapsed_us
+            + retry_second.as_ref().map_or(0, |m| m.elapsed_us),
+        "partitions_searched": retry_first.partitions_searched
+            + retry_second.as_ref().map_or(0, |m| m.partitions_searched),
+        "index_parts_loaded": retry_first.index_parts_loaded
+            + retry_second.as_ref().map_or(0, |m| m.index_parts_loaded),
+        "index_bytes_read": retry_first.index_bytes_read
+            + retry_second.as_ref().map_or(0, |m| m.index_bytes_read),
+        "index_iops": retry_first.index_iops
+            + retry_second.as_ref().map_or(0, |m| m.index_iops),
+        "storage_requests": retry_first.storage_requests
+            + retry_second.as_ref().map_or(0, |m| m.storage_requests),
+        "final_rows_returned": retry_second
+            .as_ref()
+            .map_or(retry_first.rows_returned, |m| m.rows_returned),
+    });
+
+    assert_eq!(aligned_adaptive.rows_returned, args.k);
+    assert_eq!(aligned_maximum_only.rows_returned, args.k);
+    assert_eq!(
+        aligned_adaptive.partitions_searched, 1,
+        "a centroid-aligned query must expose Lance's one-partition fast path"
+    );
+    assert_eq!(
+        aligned_maximum_only.partitions_searched, 1,
+        "a maximum-only guard must preserve the one-partition fast path"
+    );
+    assert_eq!(
+        aligned_fixed.partitions_searched, args.ann_probes,
+        "setting both minimum and maximum must force needless easy-query work"
+    );
+
+    assert_eq!(equidistant_adaptive.rows_returned, args.k);
+    assert_eq!(equidistant_maximum_only.rows_returned, args.k);
+    assert_eq!(
+        equidistant_adaptive.partitions_searched, actual_partitions,
+        "the off-centroid query must reproduce Lance's all-partition expansion"
+    );
+    assert_eq!(
+        equidistant_maximum_only.partitions_searched, args.ann_probes,
+        "the maximum-only guard must clamp the all-partition expansion"
+    );
+    assert!(
+        equidistant_maximum_only.index_parts_loaded < equidistant_adaptive.index_parts_loaded,
+        "the maximum-only guard must reduce payload partition reads"
+    );
+
+    assert_eq!(
+        unfiltered_large_k_adaptive.rows_returned,
+        unfiltered_large_k
+    );
+    assert!(
+        unfiltered_large_k_bounded.rows_returned < unfiltered_large_k,
+        "the hard probe cap must expose unfiltered large-k underfill"
+    );
+    assert_eq!(
+        unfiltered_large_k_bounded.partitions_searched, args.ann_probes,
+        "the hard probe cap must stop unfiltered large-k search at the requested ceiling"
+    );
+
+    assert_eq!(filtered_adaptive.rows_returned, args.k);
+    assert_eq!(
+        filtered_bounded.partitions_searched, args.ann_probes,
+        "maximum_nprobes must impose the requested filtered probe ceiling"
+    );
+    assert!(
+        filtered_bounded.rows_returned < args.k,
+        "the deterministic selective fixture must expose hard-cap underfill"
+    );
+    let retry_second = retry_second.expect("hard-cap underfill must trigger the PR retry");
+    assert_eq!(retry_second.rows_returned, args.k);
+    assert!(
+        retry_first.partitions_searched + retry_second.partitions_searched
+            > filtered_adaptive.partitions_searched,
+        "capped-then-retry must repeat IVF work compared with one adaptive scan"
+    );
+
+    serde_json::json!({
+        "scope": "synthetic local structural reproduction; timing is diagnostic, not the issue's S3 production measurement",
+        "lance_version": "11.0.0",
+        "index_type": "IVF_FLAT",
+        "setup_ms": setup_ms,
+        "fixture": {
+            "rows": args.rows,
+            "dims": args.dims,
+            "partitions": actual_partitions,
+            "rows_per_partition": rows_per_partition,
+            "requested_selectivity": args.selectivity,
+            "actual_selectivity": eligible_rows as f64 / args.rows as f64,
+            "eligible_rows": eligible_rows,
+            "eligible_per_partition": eligible_per_partition,
+            "k": args.k,
+            "maximum_nprobes": args.ann_probes,
+        },
+        "modes": {
+            "centroid_aligned_lance_default": aligned_adaptive,
+            "centroid_aligned_maximum_only": aligned_maximum_only,
+            "centroid_aligned_fixed_minimum_and_maximum": aligned_fixed,
+            "equidistant_lance_default": equidistant_adaptive,
+            "equidistant_maximum_only": equidistant_maximum_only,
+            "unfiltered_large_k": unfiltered_large_k,
+            "unfiltered_large_k_lance_default_min1_no_max": unfiltered_large_k_adaptive,
+            "unfiltered_large_k_maximum_only": unfiltered_large_k_bounded,
+            "filtered_lance_default_min1_no_max": filtered_adaptive,
+            "filtered_maximum_only_first_pass": filtered_bounded,
+            "filtered_maximum_only_then_retry": {
+                "first_pass": retry_first,
+                "retry": retry_second,
+                "totals": retry_totals,
+            },
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
