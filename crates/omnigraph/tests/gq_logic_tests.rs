@@ -4,14 +4,25 @@
 //! workflow are specified in `docs/rfcs/0045-gq-logic-tests.md`.
 //!
 //! To libtest the whole walker is one test; case concurrency comes from a
-//! `JoinSet`. `OMNIGRAPH_GQ_LOGIC_TESTS=<substr>[,<substr>]` restricts the run
-//! to matching case files; `OMNIGRAPH_GQ_BLESS=1` rewrites the failing step's
+//! `JoinSet` bounded by a semaphore (`OMNIGRAPH_GQ_JOBS=<n>` overrides the
+//! default of the machine's available parallelism), and every case runs under
+//! a per-case budget (`OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>`, default 10).
+//! `OMNIGRAPH_GQ_LOGIC_TESTS=<substr>[,<substr>]` restricts the run to
+//! matching case files; `OMNIGRAPH_GQ_BLESS=1` rewrites the failing step's
 //! `--- expect` rows in place.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
+use futures::FutureExt as _;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::with_traversal_mode;
 use omnigraph::loader::{LoadMode, load_jsonl};
@@ -21,13 +32,19 @@ use omnigraph_compiler::schema::ast::{Annotation, PropDecl, SchemaDecl};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{JsonParamMode, json_params_to_param_map};
 use serde_json::Value;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+
+const CASE_TIMEOUT_ENV: &str = "OMNIGRAPH_GQ_CASE_TIMEOUT_SECS";
+const DEFAULT_CASE_TIMEOUT_SECS: u64 = 10;
+const JOBS_ENV: &str = "OMNIGRAPH_GQ_JOBS";
 
 #[derive(Debug)]
 struct Case {
     schema: String,
     seed: String,
-    traversal: &'static str,
+    /// The `# traversal:` pin; `None` runs the production path unscoped.
+    traversal: Option<&'static str>,
     items: Vec<Item>,
     needs_indices: bool,
 }
@@ -553,6 +570,43 @@ fn walk_clauses(
     Ok(())
 }
 
+/// Why `expect ordered` is refused for this declaration, if it is. The
+/// engine's order is total only where `apply_ordering` appends the `<var>.id`
+/// tie-breaks (RFC 0045, Comparison semantics): no `order` clause, an
+/// `rrf()`-led one (fusion sorts by score alone), or an aggregate in the
+/// `return` list (group rows carry no `<var>.id`) each fail that condition.
+/// The tie-break is stable within a run only (ids are minted per load), so
+/// a case's `order` keys must be total over its rows: an authoring rule the
+/// parser cannot check.
+fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
+    if decl.order_clause.is_empty() {
+        return Some("`expect ordered` is refused for a query without an `order` clause".into());
+    }
+    if matches!(
+        decl.order_clause.first().map(|o| &o.expr),
+        Some(Expr::Rrf { .. })
+    ) {
+        return Some(
+            "`expect ordered` is refused for an `order` clause led by `rrf()`; fusion sorts by \
+             score alone, with no tie-break"
+                .into(),
+        );
+    }
+    if decl
+        .return_clause
+        .iter()
+        .any(|p| matches!(p.expr, Expr::Aggregate { .. }))
+    {
+        return Some(
+            "`expect ordered` is refused for a query with an aggregate in its `return` list; \
+             group rows carry no `<var>.id` tie-break, and a search-led aggregate query is \
+             not ordered at all"
+                .into(),
+        );
+    }
+    None
+}
+
 fn inspect_decl(decl: &QueryDecl, needs_indices: &mut bool) -> Result<(), String> {
     walk_clauses(&decl.match_clause, &decl.params, needs_indices)?;
     for projection in &decl.return_clause {
@@ -597,7 +651,7 @@ struct PendingStep {
     source: String,
     name: String,
     ast_params: Vec<Param>,
-    has_order_clause: bool,
+    ordered_refusal: Option<String>,
     params_raw: Option<String>,
 }
 
@@ -714,7 +768,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     source: source.clone(),
                     name: decl.name.clone(),
                     ast_params: decl.params.clone(),
-                    has_order_clause: !decl.order_clause.is_empty(),
+                    ordered_refusal: ordered_refusal(decl),
                     params_raw: None,
                 });
             }
@@ -764,11 +818,10 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     }
                     (ExpectHeader::Unordered | ExpectHeader::Ordered, false) => {
                         let ordered = matches!(mode, ExpectHeader::Ordered);
-                        if ordered && !step.has_order_clause {
-                            return Err(
-                                "`expect ordered` is refused for a query without an `order` clause"
-                                    .into(),
-                            );
+                        if ordered {
+                            if let Some(reason) = step.ordered_refusal {
+                                return Err(reason);
+                            }
                         }
                         refuse_comment_lines(&section.body, "expect")?;
                         let body: String = section
@@ -928,7 +981,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     Ok(Case {
         schema,
         seed,
-        traversal: header.traversal.unwrap_or("indexed"),
+        traversal: header.traversal,
         items,
         needs_indices,
     })
@@ -1092,9 +1145,18 @@ fn build_params(
         .map_err(|e| format!("params rejected: {e}"))
 }
 
+/// Runs `fut` under the case's `# traversal:` pin, or unscoped on the
+/// production path when the case pins nothing.
+async fn under_traversal<F: Future>(mode: Option<&'static str>, fut: F) -> F::Output {
+    match mode {
+        Some(mode) => with_traversal_mode(mode, fut).await,
+        None => fut.await,
+    }
+}
+
 async fn run_query_step(
     db: &Omnigraph,
-    mode: &'static str,
+    mode: Option<&'static str>,
     step: &QueryStep,
     binding: Option<(&str, &str)>,
 ) -> Result<(), StepFail> {
@@ -1118,7 +1180,7 @@ async fn run_query_step(
             };
         }
     };
-    let outcome = with_traversal_mode(
+    let outcome = under_traversal(
         mode,
         db.query(
             ReadTarget::branch("main"),
@@ -1163,7 +1225,7 @@ async fn run_query_step(
 
 async fn run_mutate_step(
     db: &Omnigraph,
-    mode: &'static str,
+    mode: Option<&'static str>,
     step: &MutateStep,
     binding: Option<(&str, &str)>,
 ) -> Result<(), StepFail> {
@@ -1185,8 +1247,7 @@ async fn run_mutate_step(
             };
         }
     };
-    let outcome =
-        with_traversal_mode(mode, db.mutate("main", &step.source, &step.name, &params)).await;
+    let outcome = under_traversal(mode, db.mutate("main", &step.source, &step.name, &params)).await;
     match &step.expect {
         MutateExpect::Ok => outcome
             .map(|_| ())
@@ -1361,6 +1422,116 @@ fn list_cases(root: &Path) -> (Vec<PathBuf>, Vec<String>) {
     (files, foreign)
 }
 
+fn stem_of(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("<non-utf8>")
+        .to_string()
+}
+
+/// A positive-integer environment override; unset or empty means none.
+fn env_positive(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    if value.trim().is_empty() {
+        return None;
+    }
+    match value.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => panic!("{name} takes a positive integer, got `{value}`"),
+    }
+}
+
+/// The production traversal path consults `OMNIGRAPH_TRAVERSAL_MODE`, so a set
+/// variable would silently decide which path an unpinned case exercises.
+fn traversal_override_refusal(value: Option<&OsStr>) -> Option<String> {
+    value.map(|v| {
+        format!(
+            "OMNIGRAPH_TRAVERSAL_MODE={} is set; logic tests run the production traversal \
+             path, unset it (a case that must run one path pins it with `# traversal:`)",
+            v.to_string_lossy()
+        )
+    })
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+type CaseFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+type CaseRunner = Arc<dyn Fn(PathBuf) -> CaseFuture + Send + Sync>;
+
+#[derive(Debug)]
+struct CaseOutcome {
+    stem: String,
+    elapsed: Duration,
+    result: Result<(), String>,
+}
+
+/// Runs every case as its own task with at most `permits` in flight (each
+/// case holds a store and may build indexes) and `budget` of wall time per
+/// case, timed from the moment it holds a permit; a case over budget is
+/// dropped, store included, before its permit is released. A panic or a
+/// timeout is an ordinary failed case, so the whole corpus always runs.
+/// `report` sees each outcome as it completes; the returned list is sorted
+/// by case name.
+async fn run_bounded(
+    cases: Vec<(String, PathBuf)>,
+    permits: usize,
+    budget: Duration,
+    run: CaseRunner,
+    report: &(dyn Fn(&CaseOutcome) + Sync),
+) -> Vec<CaseOutcome> {
+    let semaphore = Arc::new(Semaphore::new(permits));
+    let mut set: JoinSet<CaseOutcome> = JoinSet::new();
+    for (stem, path) in cases {
+        let semaphore = Arc::clone(&semaphore);
+        let run = Arc::clone(&run);
+        set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("the case semaphore is never closed");
+            let started = Instant::now();
+            let case = AssertUnwindSafe(run(path)).catch_unwind();
+            let result = match tokio::time::timeout(budget, case).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(payload)) => Err(format!(
+                    "case panicked: {}",
+                    panic_message(payload.as_ref())
+                )),
+                Err(_) => Err(format!(
+                    "case exceeded its budget of {:.2}s while up to {permits} cases ran \
+                     concurrently ({CASE_TIMEOUT_ENV} overrides the default of \
+                     {DEFAULT_CASE_TIMEOUT_SECS}s, {JOBS_ENV} the concurrency; a case over \
+                     budget belongs in a `heavy-repro:` `#[ignore]`d test, not the corpus)",
+                    budget.as_secs_f64()
+                )),
+            };
+            CaseOutcome {
+                stem,
+                elapsed: started.elapsed(),
+                result,
+            }
+        });
+    }
+    let mut outcomes = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        // The case itself is caught by `catch_unwind`; the task around it
+        // holds nothing that can panic.
+        let outcome = joined.expect("a case task never panics");
+        report(&outcome);
+        outcomes.push(outcome);
+    }
+    outcomes.sort_by(|a, b| a.stem.cmp(&b.stem));
+    outcomes
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn gq_logic_tests() {
     let root = corpus_root();
@@ -1402,42 +1573,47 @@ async fn gq_logic_tests() {
         Ok(v) => panic!("OMNIGRAPH_GQ_BLESS takes 1 (or 0/unset), got `{v}`"),
     };
 
-    let total = files.len();
-    let mut names: std::collections::HashMap<tokio::task::Id, String> =
-        std::collections::HashMap::new();
-    let mut set: JoinSet<(String, Result<(), String>)> = JoinSet::new();
-    for path in files {
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("<non-utf8>")
-            .to_string();
-        let task_stem = stem.clone();
-        let handle = set.spawn(async move {
-            let result = run_case(path, bless).await;
-            (task_stem, result)
+    if let Some(reason) =
+        traversal_override_refusal(std::env::var_os("OMNIGRAPH_TRAVERSAL_MODE").as_deref())
+    {
+        panic!("{reason}");
+    }
+    let permits = env_positive(JOBS_ENV)
+        .map(|n| {
+            usize::try_from(n)
+                .unwrap_or(usize::MAX)
+                .min(Semaphore::MAX_PERMITS)
+        })
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
         });
-        names.insert(handle.id(), stem);
-    }
+    let budget =
+        Duration::from_secs(env_positive(CASE_TIMEOUT_ENV).unwrap_or(DEFAULT_CASE_TIMEOUT_SECS));
 
-    let mut failures: Vec<(String, String)> = Vec::new();
-    while let Some(joined) = set.join_next_with_id().await {
-        match joined {
-            Ok((_, (stem, Ok(())))) => println!("ok {stem}"),
-            Ok((_, (stem, Err(detail)))) => {
-                println!("FAIL {stem}");
-                failures.push((stem, detail));
-            }
-            Err(join_err) => {
-                let stem = names
-                    .get(&join_err.id())
-                    .cloned()
-                    .unwrap_or_else(|| "<unknown case>".to_string());
-                println!("FAIL {stem}");
-                failures.push((stem, format!("case panicked: {join_err}")));
-            }
+    let total = files.len();
+    let cases = files
+        .into_iter()
+        .map(|path| (stem_of(&path), path))
+        .collect();
+    let runner: CaseRunner = Arc::new(move |path| Box::pin(run_case(path, bless)));
+    let report = |outcome: &CaseOutcome| {
+        let secs = outcome.elapsed.as_secs_f64();
+        match &outcome.result {
+            Ok(()) => println!("ok {} {secs:.2}s", outcome.stem),
+            Err(_) => println!("FAIL {} {secs:.2}s", outcome.stem),
         }
-    }
+    };
+    let outcomes = run_bounded(cases, permits, budget, runner, &report).await;
+
+    let mut failures: Vec<(String, String)> = outcomes
+        .into_iter()
+        .filter_map(|outcome| {
+            let CaseOutcome { stem, result, .. } = outcome;
+            result.err().map(|detail| (stem, detail))
+        })
+        .collect();
 
     if !failures.is_empty() {
         failures.sort();
@@ -1472,7 +1648,7 @@ fn parses_a_minimal_case() {
     let case = parse_case("minimal", &text).unwrap();
     assert_eq!(case.items.len(), 1);
     assert!(!case.needs_indices);
-    assert_eq!(case.traversal, "indexed");
+    assert_eq!(case.traversal, None);
 }
 
 #[test]
@@ -2010,6 +2186,181 @@ fn traversal_header_forces_index_builds() {
     let text = format!("{HDR}# traversal: indexed\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
     let case = parse_case("x", &text).unwrap();
     assert!(case.needs_indices);
+    assert_eq!(case.traversal, Some("indexed"));
+}
+
+#[test]
+fn refuses_ordered_expect_on_an_rrf_led_order() {
+    let query = "--- query\nquery q($v: Vector(4), $t: String) {\n    match { $p: Person }\n    \
+                 return { $p.name }\n    order { rrf(nearest($p.vec, $v), bm25($p.name, $t)) }\n}\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
+    let message = refusal("x", &text);
+    assert!(message.contains("led by `rrf()`"), "{message}");
+    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
+    parse_case("x", &text).unwrap();
+}
+
+#[test]
+fn refuses_ordered_expect_with_an_aggregate_in_return() {
+    let query = "--- query\nquery q($t: String) {\n    match { $p: Person\n        search($p.name, $t) }\n    \
+                 return { count($p) as total }\n    order { bm25($p.name, $t) }\n}\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
+    assert!(refusal("x", &text).contains("aggregate in its `return` list"));
+    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
+    parse_case("x", &text).unwrap();
+}
+
+fn synthetic_cases(names: &[&str]) -> Vec<(String, PathBuf)> {
+    names
+        .iter()
+        .map(|n| ((*n).to_string(), PathBuf::from(format!("{n}.gqt"))))
+        .collect()
+}
+
+fn no_report(_: &CaseOutcome) {}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn walker_bounds_cases_in_flight() {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let names: Vec<String> = (0..12).map(|i| format!("c{i:02}")).collect();
+    let cases = synthetic_cases(&names.iter().map(String::as_str).collect::<Vec<_>>());
+    // Every permit holder waits at a 3-party barrier, so the three are in
+    // flight together (max == 3) or the walker admitted fewer than three
+    // and the barrier never releases: the outer timeout turns that hang
+    // into a failure instead of a stall. Twelve cases = four generations.
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let (counter, max) = (Arc::clone(&in_flight), Arc::clone(&max_seen));
+    let runner: CaseRunner = Arc::new(move |_| {
+        let (counter, max, barrier) =
+            (Arc::clone(&counter), Arc::clone(&max), Arc::clone(&barrier));
+        Box::pin(async move {
+            let now = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            max.fetch_max(now, Ordering::SeqCst);
+            barrier.wait().await;
+            counter.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        })
+    });
+    let outcomes = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_bounded(cases, 3, Duration::from_secs(10), runner, &no_report),
+    )
+    .await
+    .expect("fewer than three cases in flight: the barrier never released");
+    assert_eq!(outcomes.len(), 12);
+    assert!(outcomes.iter().all(|o| o.result.is_ok()), "{outcomes:?}");
+    assert_eq!(max_seen.load(Ordering::SeqCst), 3);
+    assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn walker_reports_in_completion_order_and_returns_sorted() {
+    // Completion is forced into the order c2, c1, c0 by hand-offs, not by
+    // sleep lengths: c2 returns at once; c1 waits until c2 is reported;
+    // c0 waits until c1 is reported.
+    let gates: Arc<[tokio::sync::Notify; 2]> =
+        Arc::new([tokio::sync::Notify::new(), tokio::sync::Notify::new()]);
+    let runner_gates = Arc::clone(&gates);
+    let runner: CaseRunner = Arc::new(move |path| {
+        let gates = Arc::clone(&runner_gates);
+        let idx: usize = path.file_stem().unwrap().to_str().unwrap()[1..]
+            .parse()
+            .unwrap();
+        Box::pin(async move {
+            if idx < 2 {
+                gates[idx].notified().await;
+            }
+            Ok(())
+        })
+    });
+    let reported = std::sync::Mutex::new(Vec::new());
+    let report = |o: &CaseOutcome| {
+        reported.lock().unwrap().push(o.stem.clone());
+        match o.stem.as_str() {
+            "c2" => gates[1].notify_one(),
+            "c1" => gates[0].notify_one(),
+            _ => {}
+        }
+    };
+    let cases = synthetic_cases(&["c0", "c1", "c2"]);
+    let outcomes = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_bounded(cases, 3, Duration::from_secs(10), runner, &report),
+    )
+    .await
+    .expect("a hand-off never arrived");
+    let returned: Vec<&str> = outcomes.iter().map(|o| o.stem.as_str()).collect();
+    assert_eq!(returned, ["c0", "c1", "c2"]);
+    assert_eq!(*reported.lock().unwrap(), ["c2", "c1", "c0"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn walker_budget_starts_at_the_permit_not_at_spawn() {
+    let runner: CaseRunner = Arc::new(|_| {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(())
+        })
+    });
+    let cases = synthetic_cases(&["a", "b", "c"]);
+    // One permit: the third case waits ~600 ms in the queue, past the
+    // 500 ms budget that its own 300 ms of work stays under; the margins
+    // are wide because libtest runs this beside the corpus walker.
+    let outcomes = run_bounded(cases, 1, Duration::from_millis(500), runner, &no_report).await;
+    assert!(outcomes.iter().all(|o| o.result.is_ok()), "{outcomes:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn walker_fails_a_case_over_its_budget_and_runs_the_rest() {
+    let runner: CaseRunner = Arc::new(|path| {
+        Box::pin(async move {
+            if path.starts_with("slow.gqt") {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            Ok(())
+        })
+    });
+    let cases = synthetic_cases(&["slow", "quick"]);
+    let outcomes = run_bounded(cases, 1, Duration::from_millis(50), runner, &no_report).await;
+    let quick = &outcomes[0];
+    assert_eq!(quick.stem, "quick");
+    assert!(quick.result.is_ok(), "{quick:?}");
+    let slow = &outcomes[1];
+    assert_eq!(slow.stem, "slow");
+    assert!(
+        slow.elapsed < Duration::from_secs(5),
+        "timeout did not cut the case short"
+    );
+    let err = slow.result.as_ref().unwrap_err();
+    assert!(err.contains("budget of 0.05s"), "{err}");
+    assert!(err.contains("up to 1 cases"), "{err}");
+    assert!(err.contains(CASE_TIMEOUT_ENV), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn walker_records_a_panicking_case_and_runs_the_rest() {
+    let runner: CaseRunner = Arc::new(|path| {
+        Box::pin(async move {
+            if path.starts_with("p.gqt") {
+                panic!("boom");
+            }
+            Ok(())
+        })
+    });
+    let cases = synthetic_cases(&["p", "q"]);
+    let outcomes = run_bounded(cases, 1, Duration::from_secs(10), runner, &no_report).await;
+    let err = outcomes[0].result.as_ref().unwrap_err();
+    assert!(err.starts_with("case panicked: boom"), "{err}");
+    assert!(outcomes[1].result.is_ok(), "{:?}", outcomes[1]);
+}
+
+#[test]
+fn walker_refuses_a_process_traversal_override() {
+    assert!(traversal_override_refusal(None).is_none());
+    let reason = traversal_override_refusal(Some(OsStr::new("csr"))).unwrap();
+    assert!(reason.contains("OMNIGRAPH_TRAVERSAL_MODE=csr"), "{reason}");
+    assert!(reason.contains("# traversal:"), "{reason}");
 }
 
 #[test]

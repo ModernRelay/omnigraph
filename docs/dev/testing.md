@@ -105,7 +105,13 @@ cargo test -p omnigraph-bench --locked
 
 `OMNIGRAPH_GQ_LOGIC_TESTS=<substr>[,<substr>]` restricts the gq logic-test run
 to case files whose name contains a value; `OMNIGRAPH_GQ_BLESS=1` rewrites the
-failing step's expect rows in place (local workflow only, never CI).
+failing step's expect rows in place (local workflow only, never CI). The walker
+keeps at most `OMNIGRAPH_GQ_JOBS=<n>` cases in flight (default: the machine's
+available parallelism) and fails a case that exceeds
+`OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>` seconds (default 10); every `ok`/`FAIL`
+line carries the case's elapsed time, and a case over budget belongs in a
+`heavy-repro:` `#[ignore]`d test under `tests/repro_issue_*.rs`, not the
+corpus.
 
 Canonical workspace graph:
 

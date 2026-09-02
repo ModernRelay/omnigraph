@@ -15,12 +15,19 @@ contains a comma could smuggle the waiver token; creating labels needs the
 same triage rights as applying the real one. Run from the repository root:
 AGENTS.md and git are resolved relative to the working directory.
 
-A closed issue N is satisfied only by an EXECUTABLE addition under
-`crates/*/tests/**`: an added `.gqt` case in the logic-test corpus whose
-file name carries `issue_N` (the harness executes it and enforces the
-name-to-header agreement), an added `# issue: N` header line in a corpus
-`.gqt`, or an added Rust function definition whose name carries `issue_N`
-(the `_issue_NNN` convention; workspace clippy refuses a dead fn).
+A closed issue N is satisfied by an added `.gqt` case named `issue_N_*` at
+the top level of the logic-test corpus, an added `# issue: N` header line
+in a corpus `.gqt`, or an added Rust function definition whose name
+carries `issue_N` in a top-level test target `crates/*/tests/<name>.rs` or
+an in-source module under `crates/*/src/`; helper and fixture modules
+under `tests/<dir>/` never match. What a match guarantees differs by
+shape: a corpus match ran green in the required `GQ Logic Tests` job; a
+Rust match is a naming check. A pull request runs only the corpus walker
+and the `omnigraph-server` aws-feature suite among Rust test targets
+(`Test Workspace` runs post-merge), and workspace clippy refuses an
+unreferenced private function but not an `#[ignore]`d or cfg-gated one,
+so whether that test is registered, runs, and asserts the right thing
+stays with review.
 Comments, strings, and fixture lines mentioning the issue do not count.
 N is always followed by a non-digit or the end. Named residue: a
 definition inside an added block comment or raw string still matches
@@ -49,7 +56,7 @@ CLOSING_KEYWORD = re.compile(
 )
 CORPUS_PATH_SENTENCE = "crates/omnigraph/tests/gq_logic_tests/"
 WAIVER_LABEL = "no-repro"
-TEST_PATHSPEC = ":(glob)crates/*/tests/**"
+PATHSPECS = (":(glob)crates/*/tests/**", ":(glob)crates/*/src/**")
 
 
 def closed_issues(body: str) -> list[str]:
@@ -61,6 +68,8 @@ def issue_token(n: str) -> re.Pattern[str]:
 
 
 CORPUS_DIR_PREFIX = "crates/omnigraph/tests/gq_logic_tests/"
+# One path segment after `tests/` (a top-level target) or any `.rs` under `src/`.
+RUST_FN_PATH = re.compile(r"^crates/[^/]+/(?:tests/[^/]+\.rs|src/.+\.rs)$")
 RUST_FN_DEF = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
     r'(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z0-9_]+)'
@@ -78,7 +87,7 @@ def added_files(range_: str) -> list[str]:
             "--diff-filter=A",
             range_,
             "--",
-            TEST_PATHSPEC,
+            *PATHSPECS,
         ],
         check=True,
         capture_output=True,
@@ -109,7 +118,7 @@ def parse_diff(diff_text: str) -> tuple[list[tuple[str, str]], list[str]]:
 
 def diff_changes(range_: str) -> tuple[list[tuple[str, str]], list[str]]:
     out = subprocess.run(
-        ["git", "-c", "core.quotePath=false", "diff", "-U0", range_, "--", TEST_PATHSPEC],
+        ["git", "-c", "core.quotePath=false", "diff", "-U0", range_, "--", *PATHSPECS],
         check=True,
         capture_output=True,
         text=True,
@@ -137,12 +146,11 @@ def issue_satisfied(
         if corpus_case(path) and Path(path).name.startswith(f"issue_{n}_"):
             return True
     header = re.compile(rf"^\s*#\s*issue:\s*{n}(?!\d)\s*$")
-    test_target = re.compile(r"^crates/[^/]+/tests/[^/]+\.rs$")
     for path, text in lines:
         if corpus_case(path):
             if header.match(text):
                 return True
-        elif test_target.match(path):
+        elif RUST_FN_PATH.match(path):
             m = RUST_FN_DEF.match(text)
             if (
                 m
@@ -193,8 +201,10 @@ def run_gate(body: str, labels: list[str], range_: str) -> int:
             print(f"ok: issue #{n} has a matching regression addition")
         else:
             print(
-                f"FAIL: the body closes #{n} but the diff adds no `issue_{n}` "
-                f"test or `.gqt` case under crates/*/tests/; add one or apply "
+                f"FAIL: the body closes #{n} but the diff adds no `.gqt` case "
+                f"named `issue_{n}_*` or carrying `# issue: {n}` under "
+                f"{CORPUS_DIR_PREFIX}, and no function named for `issue_{n}` in "
+                f"crates/*/tests/<name>.rs or crates/*/src/; add one or apply "
                 f"the `{WAIVER_LABEL}` label"
             )
             ok = False
@@ -259,6 +269,19 @@ def self_test() -> int:
     assert not issue_satisfied(
         "563", [], [(rust, "fn t_issue_563_case() {")], removed_fns={"t_issue_563_case"}
     )
+    src = "crates/omnigraph/src/exec/query.rs"
+    assert issue_satisfied("563", [], [(src, "    fn regression_issue_563() {")])
+    assert issue_satisfied("563", [], [("crates/omnigraph-dst/src/lib.rs", "async fn issue_563() {")])
+    assert not issue_satisfied("563", [], [(src, "// regression_issue_563 lives below")])
+    assert not issue_satisfied("563", [], [("crates/omnigraph/src/query.pest", "fn t_issue_563() {")])
+    assert not issue_satisfied("563", [], [("crates/omnigraph/benches/b.rs", "fn t_issue_563() {")])
+    assert not issue_satisfied("563", ["crates/omnigraph/src/gq_logic_tests/issue_563_x.gqt"], [])
+    assert RUST_FN_PATH.match("crates/omnigraph/tests/search.rs")
+    assert RUST_FN_PATH.match("crates/omnigraph/src/a/b/c.rs")
+    assert not RUST_FN_PATH.match("crates/omnigraph/tests/helpers/mod.rs")
+    assert not RUST_FN_PATH.match("crates/omnigraph/src/lib.md")
+    assert RUST_FN_PATH.match("crates/omnigraph/src/bin/omnigraph.rs")
+    assert not RUST_FN_PATH.match("crates/omnigraph/tests/search/main.rs")
 
     spoof_diff = "\n".join(
         [

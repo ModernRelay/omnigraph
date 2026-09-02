@@ -62,5 +62,5 @@ query recall_count($q: String) {
 --- params
 {"q": "needle"}
 
---- expect ordered
+--- expect unordered
 {"total": 20}

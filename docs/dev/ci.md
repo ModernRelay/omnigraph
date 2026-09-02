@@ -20,10 +20,15 @@ Branch protection currently requires these reporting contexts:
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) runs the `.gqt` logic-test corpus on
 every pull request; `Test Workspace` still picks the same target up post-merge
-inside the full workspace suite. `Fix Regression Gate` (same workflow, PR
-events only) holds every issue the PR body closes by keyword to a matching
-`issue_N` test or `.gqt` case in the diff, waivable per PR with the `no-repro`
-label; `scripts/check-fix-regression.py` is the check.
+inside the full workspace suite. It takes the documentation-only skip the way
+the AWS job does and reports success without building; its workflow carries a
+verbatim copy of the `Classify Changes` job under the name
+`Classify Changes (GQ Logic Tests)`, and `scripts/check-classify-copy.py`
+holds that copy identical to `ci.yml`. `Fix Regression Gate` (same workflow,
+every PR event, no documentation-only skip) holds every issue the PR body
+closes by keyword to a matching `issue_N` function or `.gqt` case in the diff,
+waivable per PR with the `no-repro` label; `scripts/check-fix-regression.py`
+is the check.
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC
