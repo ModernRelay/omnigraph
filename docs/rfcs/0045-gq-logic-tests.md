@@ -3,12 +3,12 @@ rfc: "0045"
 title: "GQ logic tests"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-08-30
-discussion: null
+updated: 2026-09-02
+discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
 blocked_on: []
@@ -92,8 +92,9 @@ Running:
 cargo test -p omnigraph-engine --test gq_logic_tests
 ```
 
-The target prints one line per case (`ok issue_563_aggregate_uncapped` /
-`FAIL issue_563_underfill_retry`) and fails at the end with the list of
+The target prints one line per case with its elapsed time
+(`ok issue_563_aggregate_uncapped 0.12s` /
+`FAIL issue_563_underfill_retry 0.09s`) and fails at the end with the list of
 failing cases and, per failure, the failing step named by ordinal and kind
 (`step 3 (mutate)`), the iteration binding when the step sits in a loop
 (`$who=carol`), and the expected-versus-actual row diff, count mismatch,
@@ -137,9 +138,15 @@ on every PR. The workflow triggers on push to `main`, `workflow_dispatch`,
 and `pull_request` with its types declared explicitly (`opened`,
 `synchronize`, `reopened`, `edited`, `labeled`, `unlabeled`), because the
 gate job below must re-run when a body edit or the waiver label changes
-its answer; the types list is workflow-level, so label and body-edit
-events also re-run the test job, and both jobs run on docs-only PRs
-(seconds-scale cost accepted). Action references are pinned, per the
+its answer. The types list is workflow-level, so label and body-edit
+events also re-run the test job, and that job compiles the engine crate
+and the test binary: minutes with a warm cache, tens of minutes cold. The
+test job honors the docs-only classification that `ci.yml`'s
+`Classify Changes` job defines, the way the other required Rust jobs do:
+on a docs-only PR it skips its build and reports success (the
+`Test omnigraph-server --features aws` job's pattern), so the required
+context never stays pending. The gate job always runs, at seconds-scale.
+Action references are pinned, per the
 repo's workflow-pin check; no failpoints features are needed. What a
 green `GQ Logic Tests` job promises, quotable: every `.gqt` case parsed,
 ran, and matched its expects, none refused.
@@ -153,17 +160,31 @@ own parser matches them: case-insensitive, a word boundary before the
 keyword (so "hotfix #563" never fires on `fix`), an optional colon, then
 whitespace (optional when the colon is present) and `#N`, with leading
 zeros in `N` normalized away. Every issue so closed needs a matching
-executable addition in the diff under `crates/*/tests/**`, checked
+addition in the diff (the two owner locations `docs/dev/testing.md`
+lists per package: `tests/` targets and in-source test modules), checked
 independently per issue: an added `.gqt` case in the logic test corpus
 whose file name carries `issue_N`, an added `# issue: N` header line in a
 corpus case, or an added Rust line defining a function whose name carries
 `issue_N`, where `N` must be followed by a non-digit or by the end of the
 line or path (`issue_5630` never matches issue 563; `issue_563_underfill`
-does). A comment, string, or fixture line mentioning the issue never
-satisfies the gate. Each accepted shape executes: the corpus walker runs
-every case and refuses a malformed one, and the workspace clippy gate
-refuses a dead test function; whether the test asserts the right thing
-stays with review. The gate reads only that form in the PR body: closings
+does). The Rust shape matches only in top-level test targets,
+`crates/*/tests/<name>.rs`, and in-source modules, `crates/*/src/**`;
+helper and fixture modules under `tests/` never match (a helper named for
+an issue is not a test). A Rust definition is skipped when its name starts
+with `_`, when the line is a declaration ending in `;`, or when the same
+name is removed elsewhere in the diff (a rename, not an addition).
+A comment, string, or fixture line mentioning the issue never satisfies
+the gate. The gate is a diff check, and what it guarantees about
+execution differs by shape: a corpus shape executes, since the walker
+runs every `.gqt` in the directory, refuses a malformed one, and the
+`GQ Logic Tests` job is required; a Rust shape is a naming check only,
+since no Rust test target other than `gq_logic_tests` runs on a pull
+request (`Test Workspace` runs post-merge, CI above), and a defined
+function can besides be `#[ignore]`d or cfg-gated, so whether that test
+is registered, runs in the suite, and asserts the right thing stays with
+review, which the first AGENTS.md sentence primes: a Rust test needs a
+reason the format cannot express. The gate reads only that form in the
+PR body: closings
 by full URL, `owner/repo#N` reference, a bare no-space `fixes#N`,
 commit-message keyword, or manual close after merge pass unexamined; that
 residue is accepted and belongs to review under the AGENTS.md regression
@@ -177,7 +198,13 @@ input-to-output logic test, and a gate without an escape hatch gets
 deleted. The gate's guarantee, quotable: exit 0 exactly when every issue
 the body closes by keyword has its matching addition or the PR carries
 `no-repro`, and the AGENTS.md contract sentence is present (the grep in
-the Enforcement ladder).
+the Enforcement ladder); a corpus match means the case ran green in the
+required job, and a Rust match means only that a function of that name
+was added. The guarantee holds over the PR's own tree and the labels
+triage rights control: the check runs the PR's own copy of the script
+and workflow file, and labels reach it comma-joined, so a label name
+containing a comma could carry the waiver token; creating a label needs
+the same triage rights as applying one, and that residue is accepted.
 
 ## Design
 
@@ -263,7 +290,8 @@ query all_names() {
 Grammar, fail-closed throughout: a section starts at a line beginning `--- `
 and runs to the next such line or end of file, so no line inside a
 section may begin with `--- ` (refused; neither `.pg` nor GQ text ever
-needs one). Files are UTF-8 with `\n` endings; a trailing newline is
+needs one). Files are UTF-8 with `\n` endings (a `\r` anywhere is
+refused); a trailing newline is
 insignificant; blank lines in the JSONL sections (seed, expect) are
 ignored; a `#` line inside a JSONL section is refused (comments live in
 the header); `//` comments inside query and mutate sections are simply GQ
@@ -272,9 +300,12 @@ text. Header lines are `#` lines before the first section, keys
 required; `# red_on:` is required when `# issue:` names a number and
 optional under `# issue: none`; a `#` line not starting a key continues
 the previous entry (a first header line starting no key is refused); any
-other `# <word>:` key is refused; `# notes:` and `# traversal:` are
-optional. `# traversal:` takes `indexed` or `csr` and pins every step to
-that mode, for cases whose subject is one traversal path.
+other `# <word>:` key is refused; a key given twice is refused; `# notes:`
+and `# traversal:` are optional. `# issue:` takes a number in canonical
+spelling (no sign, no leading zeros) or `none`; any other spelling is
+refused. `# traversal:` takes `indexed` or `csr` and pins every step to
+that mode, for cases whose subject is one traversal path (Execution
+semantics owns the default).
 
 A file is: `--- schema`, then `--- seed`, then one or more steps, of
 which at least one is a query or mutate step; a file missing either
@@ -316,7 +347,8 @@ for one step) is refused the same way.
 Loops repeat a run of steps (DuckDB's shape):
 `--- loop $i <start> <end>` iterates the integer half-open range
 `[start, end)` over non-negative decimal bounds (a negative bound is
-refused); `--- foreach $x <v1> <v2> ...` iterates the
+refused; a range over 10 000 iterations is refused, and a case needing
+more stays a Rust test); `--- foreach $x <v1> <v2> ...` iterates the
 whitespace-separated values, each over `[A-Za-z0-9_.-]` (no quoting
 exists; a value needing more stays a Rust test); both close with
 `--- endloop`. An empty iteration (`start >= end`, or a `--- foreach`
@@ -357,8 +389,8 @@ grammar in `crates/omnigraph-compiler`); the format adds nothing on top.
 Seed rows are `loader::load_jsonl`'s own shape, owned there:
 `{"type": ..., "data": {...}}` for a node row,
 `{"edge": ..., "from": ..., "to": ..., "data": {...}}` for an edge row. A
-seed too large to sit inline belongs to the heavy tier below, not this
-format; there are deliberately no external-file references, or single
+seed too large to sit inline belongs to the heavy-repro tier below, not
+this format; there are deliberately no external-file references, or single
 files decay back into directories.
 
 ### Execution semantics
@@ -371,7 +403,8 @@ vector index builds; deferral is not failure, and reads stay correct
 through brute-force search; BM25 has no such fallback). The index step is
 skipped when no step's declaration uses any FTS or vector construct
 (`search`, `fuzzy`, `match_text` in the match clause; `nearest`, `bm25`,
-`rrf` in the order clause), implemented as an exhaustive match over the
+`rrf` in the order clause) and the case pins no traversal mode (below),
+implemented as an exhaustive match over the
 compiler's expression variants so a newly added construct is a compile
 error, never a silent skip; index builds dominate per-case cost, and
 scalar-index fallbacks keep non-search results correct, only slower.
@@ -387,12 +420,17 @@ Then the steps run in file order against the case's handle:
   later steps use the reopened handle. What survives the reopen is exactly
   what the store committed, which is what the step exists to pin.
 
-Traversal mode is pinned, never ambient: every step executes through the
-scoped seam `instrumentation::with_traversal_mode("indexed" | "csr", fut)`,
-under the case's `# traversal:` mode when present and under `indexed`
-otherwise, so the `OMNIGRAPH_TRAVERSAL_MODE` process variable never
-reaches a logic test. The seam is task-local and scope-bound, so
-concurrent cases never interfere; it is public
+Traversal mode: by default a case runs on the production traversal
+path, with no override, so the corpus exercises the path that ships. A
+`# traversal:` header is an opt-in pin: every step of that case executes
+through the scoped seam
+`instrumentation::with_traversal_mode("indexed" | "csr", fut)`, and the
+index step runs for it regardless of the constructs the steps use, so the
+pinned path runs covered rather than on a fallback. The trade-off in one
+sentence: the default corpus exercises the shipped path, and a pin
+reproduces a mode-specific defect. The `OMNIGRAPH_TRAVERSAL_MODE` process
+variable never reaches a logic test either way. The seam is task-local
+and scope-bound, so concurrent cases never interfere; it is public
 today, used by `tests/proptest_equivalence.rs` and
 `tests/traversal_indexed.rs`, which keep owning the engine's
 modes-are-equivalent check (Compatibility below for the deferred
@@ -447,12 +485,33 @@ expect section is JSONL, one object per row, same keys.
   duplicate rows are legal and compare by multiplicity. GQ guarantees no
   order without an `order` clause, and ordering assertions are a
   documented flakiness source in comparable suites.
-- `expect ordered`: positional comparison, allowed only when the query has an
-  `order` clause; the harness checks the parsed declaration and refuses
-  `ordered` without one. With an explicit `order` the engine's output order is
-  a total, deterministic, shipped contract (`apply_ordering` appends the bound
-  entities' key columns as an ascending tie-break), so positional comparison
-  is stable.
+- `expect ordered`: positional comparison. A stable positional comparison
+  needs two conditions, and `ordered` is accepted only where both hold.
+  First, the row set is a deterministic function of the store and the
+  params: true of every read operation today (`nearest` is exact, the
+  vector index is built as `ivf_flat(1)`; `bm25` is a formula over
+  index-global statistics; `rrf` fuses ranks the engine derives from arm
+  row order, an assumption `query.rs` names), provided the case seeds
+  distinct scores at any `limit` or scan-cap cutoff, for `nearest`,
+  `bm25`, and `rrf` alike, where a tie would change the set itself (an
+  authoring rule, since no expect mode can absorb a varying set); an
+  operation that later stops being deterministic is refused by name in
+  the harness, the way `@embed` is today. Second, given that set, the
+  engine's order is total: an `order` clause qualifies when the source
+  batch carries `<var>.id` columns, which is every non-aggregate query,
+  since `apply_ordering` appends each bound variable's `<var>.id` column
+  as an ascending tie-break (plain orderings and `nearest`/`bm25`-led
+  orderings alike); an aggregate result batch carries no `<var>.id`
+  column, so group rows tied on the sort key keep first-seen order. The
+  harness checks the parsed declaration and refuses `ordered` where the
+  second condition fails: no `order` clause; an `order` clause led by
+  `rrf()`, whose fusion sorts by score alone; and any aggregate in the
+  `return` list (an `Aggregate` expression, the engine's own
+  `projections_have_aggregates` definition). One authoring rule follows
+  for `bm25`-led `ordered` steps: such a step must not follow a `mutate`
+  step that adds or changes indexed text, because rows in fragments the
+  index does not cover are scored by a different scorer and two score
+  scales would rank together; such a case asserts with `unordered`.
 - `expect error: <substring>`: the query must fail, and the error's rendered
   message must contain the substring. The substring is mandatory; a bare
   any-error expectation silently accepts the wrong error,
@@ -478,17 +537,31 @@ point (tokio is already every engine integration test's runtime) that
 lists `tests/gq_logic_tests/*.gqt` rooted at `CARGO_MANIFEST_DIR`
 (the `forbidden_apis.rs` walk precedent) and spawns each case as a task
 into a `tokio::task::JoinSet`. Case concurrency comes from that task set,
-not from libtest: to libtest the whole walker is one test. Each case's
+not from libtest: to libtest the whole walker is one test. Case execution
+is bounded: each case opens its own store and may build its indexes, so
+the number of cases in flight at once is capped independently of corpus
+size; the cap is a walker implementation detail, not format contract.
+The per-PR corpus is the ***fast tier***: a case is expected to finish
+in well under a second. The walker's per-case budget defaults to 10
+seconds, generous against that expectation so a slow CI runner never
+trips it; an environment variable overrides the default, and the timeout
+failure message prints the budget in force. The elapsed time on each
+ok/FAIL line, not the timeout, is the drift signal a reviewer reads. A
+case that trips the budget belongs to the nightly tier defined in the
+Enforcement ladder below, so slowness fails the PR introducing it instead
+of accumulating in the required job. Each case's
 outcome, a panic included, is caught and recorded (the `JoinSet` surfaces
 task panics as join errors), which lets the target run every case before
 failing. The walker fails when its glob matches no files (a broken
-checkout or a bad rename, never a green run). Zero new dependencies and
+checkout or a bad rename, never a green run) and when the corpus
+directory holds any entry that is not a `.gqt` file (a mis-renamed or
+nested case must never silently skip). Zero new dependencies and
 an ordinary libtest harness, so the workspace invocation (including its
 `-- --nocapture`) is
 untouched; per-file test identity via libtest-mimic is the recorded
 upgrade path (Alternatives).
 
-### Enforcement ladder and the heavy tier
+### Enforcement ladder
 
 The contract enters `AGENTS.md`'s Change discipline section verbatim as
 three sentences (these exact lines are what a reviewer approves and what
@@ -523,7 +596,11 @@ tests); the nightly job instead enumerates the `tests/repro_issue_*.rs`
 files with a shell glob and runs each one as
 `cargo test -p omnigraph-engine --test <name> -- --ignored` (one
 invocation per target, so nothing depends on glob support inside cargo's
-`--test` flag), with `dst-nightly.yml` as the workflow shape. A red
+`--test` flag), with `dst-nightly.yml` as the workflow shape. Enrollment
+has one rule: the filename glob discovers the targets, and the job
+asserts that every `#[ignore]` message in a discovered target opens with
+`heavy-repro:`, failing otherwise, so the third AGENTS.md sentence is
+enforced rather than advisory. A red
 nightly means a heavy repro regressed at a scale the logic test tier
 cannot reach; the failing target names its issue, and the failure is
 triaged against that issue. Glob-discovered targets run under a default
@@ -534,14 +611,18 @@ fails the job, so the table can never drift from the tier. The job fails
 when its glob matches no `tests/repro_issue_*.rs` target, so a renamed
 tier can never turn the nightly silently green. The tier is
 engine-crate-scoped until a member elsewhere forces more; its first
-member, `repro_issue_563`, arrives with the #563 fix PR, and the nightly
-job lands only after that PR does.
+member, `repro_issue_563`, landed with the #563 fix, so the nightly job's
+precondition is met. That member's ignore messages open with `expensive:`
+today; they are renamed to `heavy-repro:` in the PR that lands the
+nightly job (Rollout).
 
 The CI gate check and the `no-repro` waiver close the ladder (behavior in
-the previous section). The gate script also asserts the first contract
-sentence is still present in `AGENTS.md` (a literal grep for the corpus
-path `crates/omnigraph/tests/gq_logic_tests/`), so deleting the contract
-without deleting the gate fails closed. The ladder's recurring human
+the previous section). The gate is `scripts/check-fix-regression.py`, a
+Python script beside `check-agents-md.sh`, run by the `Fix Regression
+Gate` job after its own self-test. The gate script also asserts the first
+contract sentence is still present in `AGENTS.md` (a literal grep for the
+corpus path `crates/omnigraph/tests/gq_logic_tests/`), so deleting the
+contract without deleting the gate fails closed. The ladder's recurring human
 costs are named and accepted: maintainers apply `no-repro` and adjudicate
 when an author believes no repro is possible; reviewers own the
 plausibility of `red_on:` lines (the harness cannot check provenance) and
@@ -571,18 +652,32 @@ header keys, and missing required headers are refusals, never silent
 skips, so an older harness refuses a newer logic test rather than
 mis-running it.
 
-Named compatible extensions, deferred until a real case demands each:
-`require <capability>` guards for optional engine features, loop nesting,
-a per-case float-precision override (unresolved questions), per-file test
-identity via libtest-mimic (Alternatives), and run-twice verification:
-each query step re-run under a second execution configuration (the other
-traversal mode, index absence, or a forced canonical execution) with the
-row sets compared. Run-twice is deferred deliberately, not for lack of a
-seam: PR #544's adaptive mid-traversal switching replaces the
-once-per-query mode choice such a check would pin, so the check is
-specified once, against the execution model that lands there; until then
-the modes-are-equivalent contract keeps its existing owner,
-`tests/proptest_equivalence.rs`. Multi-connection interleaving stays out
+Named compatible extensions, deferred until a real case demands each,
+with maintainers deciding each one when the first case that needs it
+forces the question:
+
+- `require <capability>` guards for optional engine features.
+- Loop nesting.
+- A per-case float-precision override; scale 12 for every number is the
+  contract until a case a fixed scale cannot express appears.
+- A schema-IR vintage pin, for bugs that reproduce only on a legacy
+  vintage.
+- A heavy `.gqt` case: a header tier marker routing a scale-sized case to
+  the nightly job instead of the per-PR job, with its own concurrency
+  bound and timeout. Out of v1; the heavy-repro tier stays Rust until a
+  case that trips the fast-tier budget has a reason to stay in the
+  format.
+- Per-file test identity via libtest-mimic (Alternatives).
+- Run-twice verification: each query step re-run under a second
+  execution configuration (a pinned traversal mode, index absence, or a
+  forced canonical execution) with the row sets compared. Run-twice is
+  deferred deliberately, not for lack of a seam: the engine's adaptive
+  mid-traversal switching replaced the once-per-query mode choice such a
+  check would have pinned, so the check is specified once, against that
+  execution model; until then the modes-are-equivalent contract keeps its
+  existing owner, `tests/proptest_equivalence.rs`.
+
+Multi-connection interleaving stays out
 permanently rather than deferred (DST's domain, per Execution semantics).
 
 ## Alternatives
@@ -598,6 +693,18 @@ permanently rather than deferred (DST's domain, per Execution semantics).
 - **Do nothing** (the `_issue_NNN` convention plus review vigilance): the
   cost stays Rust-sized, the obligation stays review-only, and #563
   demonstrates what slips through.
+- **An execution-proving gate for the Rust shape** (per closed issue, a
+  filtered `cargo test --workspace -- issue_N` run beside the diff check,
+  passing only when at least one matching test ran and passed): closes
+  the Rust-shape gap above. Corpus shapes need no such gate: the required
+  job proves them, and `OMNIGRAPH_GQ_LOGIC_TESTS=issue_N` selects one
+  locally. Two costs: the gate re-runs on PR-body edits and label events,
+  and where the diff check costs seconds, a filtered run compiles every
+  crate's test targets (`--workspace`), not the one engine target the
+  test job already builds; and libtest's substring filter has no word
+  boundary, so `issue_563` also selects `issue_5630`. Deferred as the
+  upgrade path, taken if review ever finds a named regression that never
+  executed.
 - **Dedicated `tests/regressions/issue_NNN.rs` Rust files:** greppable,
   but the marginal cost does not move, and regression tests drift away
   from the boundary that owns the behavior.
@@ -626,16 +733,19 @@ permanently rather than deferred (DST's domain, per Execution semantics).
 
 The harness proves itself on two fronts: the logic-test-expressible #563
 regressions as the first corpus entries, each with a red state recorded
-during the development of the #563 fix (their Rust twins arrive with that
-fix), and feature cases exercising every step kind the format defines:
+during the development of the #563 fix (their Rust twins landed with that
+fix in `tests/search.rs`), and feature cases exercising every step kind
+the format defines:
 
 - `issue_563_aggregate_uncapped.gqt`: twenty matching chunks, `limit 2`,
-  aggregate return; red produced `total: 8` (the capped window), green
-  produces `total: 20`.
+  aggregate return, asserted with `unordered` (a single aggregate row has
+  no order to assert, and `ordered` is refused on aggregates); red
+  produced `total: 8` (the capped window), green produces `total: 20`.
 - `issue_563_underfill_retry.gqt`: edges only on the middle band the capped
   scan window excludes; red (retry disabled) returned zero rows, green
   returns exactly `chunk-08` and `chunk-09`.
-- One `expect error` case pinning a refusal on the order clause: an aggregate
+- `order_clause_aggregate_refused.gqt`, an `expect error` case pinning a
+  refusal on the order clause: an aggregate
   written out in full in `order { }` rather than by its projection alias is
   refused with the bare message `unsupported ordering expression` (the #566
   shape), so the error path is exercised from day one.
@@ -653,8 +763,8 @@ fix), and feature cases exercising every step kind the format defines:
   `expect affected: nodes=0 edges=0` pins.
 
 The third #563 regression (the 2 GiB offset-overflow repro) is deliberately
-not a logic test: its symptom is a byte count, and it arrives with the #563
-fix PR as the `#[ignore]`d `repro_issue_563`, the heavy-repro tier's first
+not a logic test: its symptom is a byte count, and it landed with the #563
+fix as the `#[ignore]`d `repro_issue_563`, the heavy-repro tier's first
 member.
 
 Harness self-tests pin every refusal this RFC specifies (the File
@@ -668,39 +778,49 @@ the docs indexes honest, so no new orphan doc file).
 
 ## Rollout
 
-1. **Harness and first corpus** (one PR): the `gq_logic_tests` test target
-   with the full format (steps, loops, restart), the five cases
-   above, the self-tests, and the `docs/dev/testing.md` rows. Independently
-   safe; ships regression value with zero workflow change. `implementation`
-   advances to `partial`.
-2. **Enforcement and tiers** (one PR): the AGENTS.md sentences
-   (logic-tests-by-default, regression per fix, `#[ignore]`
-   species-in-message, heavy-repro tier), the per-change logic-test CI job,
-   the closing-keyword gate check with the `no-repro` label (the label
-   itself is created in the repo in this phase), and the nightly
-   heavy-repro job. Requiredness is wired the way this repo wires it: the
-   `GQ Logic Tests` and `Fix Regression Gate` job names enter the
-   `contexts` list in `.github/branch-protection.json` (applied via
-   `scripts/apply-branch-protection.sh`, rationale recorded in
-   `docs/dev/branch-protection.md`); both become required (seconds of
-   hermetic cases should block a regression before merge).
-   `implementation` advances to `complete`.
-
-The nightly heavy-repro job is one workflow file, separable from phase 2,
-but lands only after the #563 fix PR delivers the tier's first member.
+1. **The implementation PR** (one PR, merged only after this RFC is
+   accepted): the `gq_logic_tests` test target with the full format
+   (steps, loops, restart), the bounded walker with its per-case budget
+   and elapsed-time lines, the five cases above, the self-tests, the
+   three AGENTS.md sentences (logic-tests-by-default, regression per fix,
+   `#[ignore]` species-in-message), the gate script, the workflow with
+   both jobs (the test job honoring the docs-only classification, the
+   gate job on `pull_request` events), and the docs (`docs/dev/testing.md`
+   rows, `docs/dev/ci.md`). Requiredness is wired the way this repo wires
+   it: the `GQ Logic Tests` and `Fix Regression Gate` job names enter the
+   `contexts` list in `.github/branch-protection.json` in the same PR
+   (rationale recorded in `docs/dev/branch-protection.md`); both become
+   required (seconds of hermetic cases should block a regression before
+   merge). Two operator steps surround the merge, in order: before it, a
+   maintainer with triage rights creates the `no-repro` label; after it,
+   an admin runs `scripts/apply-branch-protection.sh`, which makes the two
+   contexts required. Until both happen, a waiver PR has no label to
+   carry and the contexts are not yet required. `implementation` advances
+   to `partial`.
+2. **The nightly heavy-repro job** (one workflow file): the glob-driven
+   job in the Enforcement ladder, plus the rename of `repro_issue_563`'s
+   ignore messages from `expensive:` to `heavy-repro:` so the tier's first
+   member passes the job's prefix assertion. Its precondition (a first
+   tier member on `main`) is met. `implementation` advances to
+   `complete`.
 
 ## Unresolved questions
 
-- Float policy: fixed scale 12 for all numbers, or a per-case precision
-  override? Scale 12 is the draft's default; the author decides, forced
-  by the first corpus case a fixed scale cannot express.
-- Where the gate check's script lives: `scripts/` shell alongside
-  `check-agents-md.sh`, or a workflow-inline step. The phase-2 PR review
-  decides.
-- Whether a case may pin a schema-IR vintage for bugs that only reproduce on a
-  legacy vintage. The author decides, forced by the first real case that
-  needs it.
+None before acceptance. The deferred extensions and their decider are
+listed in Compatibility and reversibility.
 
 ## Decision log
 
-None yet.
+- 2026-09-02, from review of the RFC PR: the fix-PR gate is a diff check
+  whose execution guarantee differs by shape (a corpus match ran green in
+  the required job; a Rust match is a naming check), and the Rust shape
+  matches only top-level `crates/*/tests/<name>.rs` targets and
+  `crates/*/src/**`, never helper or fixture modules.
+- 2026-09-02, from review of the RFC PR: `expect ordered` is accepted
+  only where the row set is deterministic and the engine's order is
+  total; the harness refuses it on a query with no `order` clause, an
+  `order` clause led by `rrf()`, or any aggregate in the `return` list.
+- 2026-09-02, from review of the RFC PR: the walker bounds cases in
+  flight and budgets each case (10 seconds by default, env-overridable);
+  the per-PR corpus is the fast tier; a case runs on the production
+  traversal path unless `# traversal:` pins one.
