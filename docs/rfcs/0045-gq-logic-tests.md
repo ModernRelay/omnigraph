@@ -856,15 +856,100 @@ listed in Compatibility and reversibility.
     `no-repro`, and the AGENTS.md contract sentence is present; a corpus
     match means the case ran green in the required job, and a Rust match
     means a test-attributed function of that name was added.
+  - Fix-PR gate, owners and strengthened regressions (User and operational
+    behavior: "an added `.gqt` case", "`crates/*/tests/<name>.rs`",
+    "`crates/*/src/**`"; the first 2026-09-02 entry's "matches only
+    top-level `crates/*/tests/<name>.rs` targets and `crates/*/src/**`").
+    The gate's paths cover `tools/*` workspace members the same way as
+    `crates/*`. A regression counts when added or strengthened: a `.gqt`
+    case named `issue_N_*`, new, or modified with at least one added body
+    line (not a `#` header line or a `//` comment), or an added line
+    carrying an alphanumeric character, not a comment or attribute, inside
+    the body of an existing test-attributed function named for `issue_N`,
+    located by the hunk's new-file line number in the file at the head
+    commit (the enclosing item found by brace counting with literals and
+    `//` comments blanked; raw strings and block comments are a named
+    residue, and a non-function item found open first ends the search).
+    An owner test not named for the issue is extended by renaming it to
+    carry `issue_N` in the same change: the rename alone never counts, the
+    rename plus the assertion does. The "added `# issue: N` header line"
+    shape of the quotable guarantee is subsumed: the walker requires the
+    file name to match and refuses a second `# issue:`, so that line only
+    ever appears in a new case named for the issue, which the name rule
+    already credits; the gate no longer names it. The merged shape
+    required an added definition, so a fix that extended an existing
+    assertion, the testing guide's preferred form, could pass only through
+    `no-repro`. Owners the gate does not recognize, Python and shell
+    scripts among them, satisfy it only through `no-repro`, which a
+    maintainer applies; the docstring, `ci.md`, and `testing.md` say so.
   - Workflow layout (User and operational behavior: "a second job in the
-    same workflow", "honors the docs-only classification that `ci.yml`'s
-    `Classify Changes` job defines"; Rollout: "the workflow with both
-    jobs"). GitHub Actions cannot make a job depend on another workflow's
-    job, so `gq-logic-tests.yml` carries a verbatim copy of `ci.yml`'s
-    classification as a job of its own, `Classify Changes (GQ Logic
-    Tests)`, and the required `Classify Changes` context keeps one
-    reporter. The workflow carries three jobs. `ci.yml` is the source of
-    truth; `scripts/check-classify-copy.py`, a gate step, refuses drift.
+    same workflow", "running only on `pull_request` events", "`pull_request`
+    with its types declared explicitly (`opened`, `synchronize`,
+    `reopened`, `edited`, `labeled`, `unlabeled`)", "label and body-edit
+    events also re-run the test job", "honors the docs-only classification
+    that `ci.yml`'s `Classify Changes` job defines"; Rollout: "the workflow
+    with both jobs"). The gate is a policy check on the pull request, so it
+    runs code the pull request cannot edit: it lives in its own workflow,
+    `.github/workflows/fix-regression-gate.yml`, on `pull_request_target`,
+    which takes the workflow file and `scripts/check-fix-regression.py`
+    from the base branch and fetches the head only as data for the diff
+    range, never checking it out or executing it. Under `pull_request` a PR
+    could replace the check with `true` while keeping the required context
+    name, and branch protection requires no approving review. One residue
+    is accepted: a pull request can add a job of its own under the
+    required name in a `pull_request` workflow, and branch protection keys
+    on the name alone. That evasion is dominated by the `no-repro` label,
+    which any committer can apply in one click: the gate guards against
+    forgetting a regression, not against a committer who decides to skip
+    one, and the base-owned workflow closes the forgetting-shaped hole (a
+    PR that edits the workflow or the script cannot weaken the copy that
+    runs). Gating the label itself would be a ruleset that identifies the
+    gate by file rather than by name, and would gate both at once. The
+    base-branch workflow does not exist until this change merges, so the
+    gate first runs on the next pull request after it. The gate
+    workflow declares the `edited`, `labeled`, and `unlabeled` types and
+    builds nothing; `gq-logic-tests.yml` keeps only the code-bearing types
+    (`opened`, `synchronize`, `reopened`), so a body edit or label change
+    no longer re-runs the Rust build. GitHub Actions cannot make a job
+    depend on another workflow's job, so `gq-logic-tests.yml` carries a
+    verbatim copy of `ci.yml`'s classification as a job of its own,
+    `Classify Changes (GQ Logic Tests)`, and the required `Classify
+    Changes` context keeps one reporter. That workflow carries two jobs.
+    `ci.yml` is the source of truth; `scripts/check-classify-copy.py`, an
+    unconditional step at the top of the `GQ Logic Tests` job right after
+    checkout (so it runs on documentation-only pull requests too), refuses
+    drift.
+  - Header grammar (Format: "a `#` line not starting a key continues the
+    previous entry (a first header line starting no key is refused); any
+    other `# <word>:` key is refused; a key given twice is refused"). No
+    header line continues a previous entry: a multi-line note repeats
+    `# notes:`, which is the one key allowed more than once. A header line
+    is accepted exactly when it equals `# <key>: <value>` byte for byte,
+    for one of the four keys in that spelling and a value with no leading
+    or trailing whitespace; every other line is refused: a value with stray
+    whitespace is answered with the canonical line, a bad shape with the
+    grammar, an unknown key with the key list. The merged grammar sent a
+    misspelled key
+    (`# Traversal:`, `# traversal :`, `# traversal=csr`) into the
+    continuation branch, where it was read as prose and dropped, so a case
+    meant to pin one traversal path ran on the default path and passed.
+    With no continuation branch there is no prose to fall into; the
+    harness walks the typo space exhaustively (key spelling, separator,
+    leading and trailing whitespace, gap) and asserts that exactly one
+    line is accepted. The pin is also checked at execution time: a pinned
+    step runs with expand-path probes attached (`QueryIoProbes`'
+    `expand_indexed_runs` and `expand_csr_runs`, incremented where the
+    executor commits to a path), and any expand on the other path fails
+    the step with the message `pinned <mode>, ran <other> on N
+    expand(s)`. The pin and the probes are both task-local scopes, so a
+    boundary that dropped the pin would drop the probes with it and read
+    as a clean zero; for that reason a pinned query step whose match
+    clause carries an unbound traversal must also show at least one expand
+    on the pinned path once it succeeds, else it fails with `pinned
+    <mode>, but no expand ran on it`. A bound edge (`$a $k:knows $b`) scans
+    the edge dataset on a path no mode pins and is exempt. A header that
+    parses correctly proves the pin was requested; this proves the
+    executor honored it. The `.gqt` grammar gains nothing.
   - Runner mechanics and Execution semantics (Runner mechanics: "the cap
     is a walker implementation detail, not format contract", "an
     environment variable overrides the default"; Execution semantics:

@@ -1,6 +1,6 @@
 # issue: none
 # notes: pins that committed mutations survive a store reopen; exercises
-#   mutate, loop, restart, and read steps in one case.
+# notes: mutate, loop, restart, and read steps in one case.
 
 --- schema
 node Person {

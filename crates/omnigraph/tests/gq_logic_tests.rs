@@ -25,12 +25,12 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::instrumentation::with_traversal_mode;
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::query::ast::{Clause, Expr, Literal, Param, QueryDecl};
 use omnigraph_compiler::query::parser::parse_query;
@@ -86,6 +86,9 @@ struct QueryStep {
     ast_params: Vec<Param>,
     params_raw: Option<String>,
     expect: QueryExpect,
+    /// The match clause carries an unbound traversal, so a successful run
+    /// must show at least one Expand on the pinned path.
+    expects_expand: bool,
 }
 
 #[derive(Debug)]
@@ -136,41 +139,66 @@ enum IssueRef {
     Num(u64),
 }
 
+/// The four header keys, in the spelling the canonical form requires.
+const HEADER_KEYS: [&str; 4] = ["issue", "red_on", "notes", "traversal"];
+
+/// The one accepted spelling of a header line. A line is accepted exactly
+/// when it equals this for some key in `HEADER_KEYS` and a value with no
+/// leading or trailing whitespace: no continuation lines exist (a
+/// multi-line note repeats `# notes:`), so a misspelled key has no prose
+/// branch to fall into and is refused with the others.
+fn canonical_header_line(key: &str, value: &str) -> String {
+    format!("# {key}: {value}")
+}
+
+/// Splits a header line into its key and value, or names why it is not
+/// canonical. `# ` and `: ` are matched literally, so the key cannot carry
+/// whitespace; the value is refused when it does at either end. A line that
+/// passes prints back to itself through `canonical_header_line`.
+fn split_header_line(line: &str) -> Result<(&str, &str), String> {
+    let Some(rest) = line.strip_prefix("# ") else {
+        return Err("header line is not `# <key>: <value>`".into());
+    };
+    let Some((key, value)) = rest.split_once(": ") else {
+        return Err("header line is not `# <key>: <value>`".into());
+    };
+    if !HEADER_KEYS.contains(&key) {
+        return Err(format!(
+            "unknown header key `{key}`; keys are {}",
+            HEADER_KEYS.join(", ")
+        ));
+    }
+    if value.trim().is_empty() {
+        return Err(format!("`# {key}:` needs a value"));
+    }
+    if value.trim() != value {
+        return Err(format!(
+            "header value carries leading or trailing whitespace; write `{}`",
+            canonical_header_line(key, value.trim())
+        ));
+    }
+    debug_assert_eq!(canonical_header_line(key, value), line);
+    Ok((key, value))
+}
+
 fn parse_header(lines: &[&str]) -> Result<Header, String> {
     let mut issue: Option<IssueRef> = None;
     let mut red_on = false;
-    let mut notes_seen = false;
     let mut traversal: Option<&'static str> = None;
-    let mut have_key = false;
     for (idx, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let Some(rest) = line.strip_prefix('#') else {
+        if !line.starts_with('#') {
             return Err(format!(
                 "line {}: only `#` header lines may precede the first section",
                 idx + 1
             ));
-        };
-        let content = rest.trim_start();
-        let key = content
-            .split_once(':')
-            .map(|(k, _)| k)
-            .filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
-        let Some(key) = key else {
-            if !have_key {
-                return Err(format!(
-                    "line {}: the first header line must start a key (`# issue:`, `# red_on:`, `# notes:`, `# traversal:`)",
-                    idx + 1
-                ));
-            }
-            continue;
-        };
-        let value = content[key.len() + 1..].trim();
+        }
+        let (key, value) = split_header_line(line).map_err(|e| format!("line {}: {e}", idx + 1))?;
         let duplicate = match key {
             "issue" => issue.is_some(),
             "red_on" => red_on,
-            "notes" => notes_seen,
             "traversal" => traversal.is_some(),
             _ => false,
         };
@@ -194,13 +222,8 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
                     IssueRef::Num(n)
                 });
             }
-            "red_on" => {
-                if value.is_empty() {
-                    return Err(format!("line {}: `# red_on:` needs a value", idx + 1));
-                }
-                red_on = true;
-            }
-            "notes" => notes_seen = true,
+            "red_on" => red_on = true,
+            "notes" => {}
             "traversal" => {
                 traversal = Some(match value {
                     "indexed" => "indexed",
@@ -213,9 +236,8 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
                     }
                 });
             }
-            other => return Err(format!("line {}: unknown header key `# {other}:`", idx + 1)),
+            other => unreachable!("split_header_line admits only HEADER_KEYS, got `{other}`"),
         }
-        have_key = true;
     }
     let Some(issue) = issue else {
         return Err("missing required `# issue:` header".into());
@@ -658,6 +680,7 @@ struct PendingStep {
     name: String,
     ast_params: Vec<Param>,
     ordered_refusal: Option<String>,
+    expects_expand: bool,
     params_raw: Option<String>,
 }
 
@@ -775,6 +798,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     name: decl.name.clone(),
                     ast_params: decl.params.clone(),
                     ordered_refusal: ordered_refusal(decl),
+                    expects_expand: expects_expand(&decl.match_clause),
                     params_raw: None,
                 });
             }
@@ -847,6 +871,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                             name: step.name,
                             ast_params: step.ast_params,
                             params_raw: step.params_raw,
+                            expects_expand: step.expects_expand,
                             expect: QueryExpect::Rows {
                                 ordered,
                                 body_raw: body,
@@ -877,6 +902,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                 name: step.name,
                                 ast_params: step.ast_params,
                                 params_raw: step.params_raw,
+                                expects_expand: step.expects_expand,
                                 expect: QueryExpect::Error {
                                     needle: needle.clone(),
                                 },
@@ -1151,13 +1177,93 @@ fn build_params(
         .map_err(|e| format!("params rejected: {e}"))
 }
 
-/// Runs `fut` under the case's `# traversal:` pin, or unscoped on the
-/// production path when the case pins nothing.
-async fn under_traversal<F: Future>(mode: Option<&'static str>, fut: F) -> F::Output {
+/// Expand executions observed while a pinned step ran, by path.
+struct PathCounts {
+    indexed: Arc<AtomicU64>,
+    csr: Arc<AtomicU64>,
+}
+
+/// Runs `fut` under the case's `# traversal:` pin with expand-path probes
+/// attached, or unscoped on the production path when the case pins
+/// nothing. A pinned step gets its observed path counts back so the caller
+/// can check the pin took effect: the pin is a task-local override, and a
+/// step whose rows match its expect proves nothing about which path ran.
+async fn under_traversal<F: Future>(
+    mode: Option<&'static str>,
+    fut: F,
+) -> (F::Output, Option<PathCounts>) {
     match mode {
-        Some(mode) => with_traversal_mode(mode, fut).await,
-        None => fut.await,
+        Some(mode) => {
+            let counts = PathCounts {
+                indexed: Arc::new(AtomicU64::new(0)),
+                csr: Arc::new(AtomicU64::new(0)),
+            };
+            let probes = QueryIoProbes {
+                expand_indexed_runs: Arc::clone(&counts.indexed),
+                expand_csr_runs: Arc::clone(&counts.csr),
+                ..Default::default()
+            };
+            let out = with_traversal_mode(mode, with_query_io_probes(probes, fut)).await;
+            (out, Some(counts))
+        }
+        None => (fut.await, None),
     }
+}
+
+/// Why a pinned step's observed expand paths violate its pin, if they do.
+/// Any expand on the other path means the pinned mode was not honored. When
+/// the step is known to expand (`require_expand`: its match clause carries
+/// an unbound traversal and the query succeeded), zero expands on the pinned
+/// path is a violation too: the pin and the probes are both task-locals, so
+/// a boundary that drops the pin drops the probes with it and would
+/// otherwise read as a clean 0/0.
+fn pin_violation(mode: &str, indexed: u64, csr: u64, require_expand: bool) -> Option<String> {
+    let (other, ran, pinned) = match mode {
+        "indexed" => ("csr", csr, indexed),
+        "csr" => ("indexed", indexed, csr),
+        _ => return None,
+    };
+    if ran > 0 {
+        return Some(format!(
+            "pinned `{mode}`, ran `{other}` on {ran} expand(s); the pinned mode was not honored"
+        ));
+    }
+    if require_expand && pinned == 0 {
+        return Some(format!(
+            "pinned `{mode}`, but no expand ran on it; the pin was lost before the \
+             executor or the traversal did not execute"
+        ));
+    }
+    None
+}
+
+/// The pin check for one finished step: `None` when the step was unpinned
+/// or ran only, and at least once when required, on its pinned path.
+fn check_pin(
+    mode: Option<&'static str>,
+    counts: &Option<PathCounts>,
+    require_expand: bool,
+) -> Option<String> {
+    let (mode, counts) = mode.zip(counts.as_ref())?;
+    pin_violation(
+        mode,
+        counts.indexed.load(Ordering::Relaxed),
+        counts.csr.load(Ordering::Relaxed),
+        require_expand,
+    )
+}
+
+/// Whether a match clause list runs at least one Expand: a traversal
+/// without an edge binding, outside `not { }`. A bound edge scans the edge
+/// dataset on a path of its own that no mode pins, and a single-hop
+/// negation runs as a CSR existence check that never reaches the expand
+/// dispatch; a multi-hop negation does expand, and the other-path check
+/// still covers it.
+fn expects_expand(clauses: &[Clause]) -> bool {
+    clauses.iter().any(|c| match c {
+        Clause::Traversal(t) => t.edge_binding.is_none(),
+        Clause::Negation(_) | Clause::Binding(_) | Clause::Filter(_) => false,
+    })
 }
 
 async fn run_query_step(
@@ -1186,7 +1292,7 @@ async fn run_query_step(
             };
         }
     };
-    let outcome = under_traversal(
+    let (outcome, counts) = under_traversal(
         mode,
         db.query(
             ReadTarget::branch("main"),
@@ -1196,6 +1302,11 @@ async fn run_query_step(
         ),
     )
     .await;
+    let require_expand =
+        step.expects_expand && outcome.is_ok() && matches!(step.expect, QueryExpect::Rows { .. });
+    if let Some(violation) = check_pin(mode, &counts, require_expand) {
+        return Err(fail(violation));
+    }
     match &step.expect {
         QueryExpect::Rows {
             ordered,
@@ -1253,7 +1364,11 @@ async fn run_mutate_step(
             };
         }
     };
-    let outcome = under_traversal(mode, db.mutate("main", &step.source, &step.name, &params)).await;
+    let (outcome, counts) =
+        under_traversal(mode, db.mutate("main", &step.source, &step.name, &params)).await;
+    if let Some(violation) = check_pin(mode, &counts, false) {
+        return Err(fail(violation));
+    }
     match &step.expect {
         MutateExpect::Ok => outcome
             .map(|_| ())
@@ -1285,14 +1400,17 @@ async fn run_mutate_step(
     }
 }
 
-async fn execute_case(case: &Case, path: &Path, bless: bool) -> Result<(), String> {
+/// A fresh store for one case: init from the schema, seed, and build indices
+/// when the case needs them. The tempdir rides along so the store outlives
+/// the call.
+async fn open_case_store(case: &Case) -> Result<(Omnigraph, String, tempfile::TempDir), String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
     let uri = dir
         .path()
         .to_str()
         .ok_or_else(|| "temp path is not utf-8".to_string())?
         .to_string();
-    let mut db = Omnigraph::init(&uri, &case.schema)
+    let db = Omnigraph::init(&uri, &case.schema)
         .await
         .map_err(|e| format!("init failed: {e}"))?;
     if !case.seed.trim().is_empty() {
@@ -1305,6 +1423,11 @@ async fn execute_case(case: &Case, path: &Path, bless: bool) -> Result<(), Strin
             .await
             .map_err(|e| format!("ensure_indices failed: {e}"))?;
     }
+    Ok((db, uri, dir))
+}
+
+async fn execute_case(case: &Case, path: &Path, bless: bool) -> Result<(), String> {
+    let (mut db, uri, _dir) = open_case_store(case).await?;
 
     let mut first_fail: Option<StepFail> = None;
     'run: for item in &case.items {
@@ -1403,9 +1526,14 @@ fn corpus_root() -> PathBuf {
         .join("gq_logic_tests")
 }
 
-/// Splits the corpus dir into `.gqt` case files and foreign entries (anything
-/// else except dotfiles); a foreign entry is a mis-renamed or nested case that
-/// would otherwise silently never run.
+/// Splits the corpus dir into `.gqt` case files and foreign entries; a
+/// foreign entry is a mis-renamed, nested, or dot-prefixed case that would
+/// otherwise silently never run. A case is a top-level file whose name ends
+/// in `.gqt` and does not start with `.`; `scripts/check-fix-regression.py`
+/// (`corpus_case`) applies the same rule, and both self-tests walk one name
+/// battery. Dot-prefixed entries without a `.gqt` extension (`.DS_Store`,
+/// `.gitkeep`, and a file named exactly `.gqt`, which has no extension)
+/// are neither cases nor foreign: they are skipped.
 fn list_cases(root: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut files = Vec::new();
     let mut foreign = Vec::new();
@@ -1413,10 +1541,11 @@ fn list_cases(root: &Path) -> (Vec<PathBuf>, Vec<String>) {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            let is_gqt = path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("gqt");
+            if name.starts_with('.') && !is_gqt {
                 continue;
             }
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("gqt") {
+            if is_gqt && !name.starts_with('.') {
                 files.push(path);
             } else {
                 foreign.push(name);
@@ -1544,7 +1673,7 @@ async fn gq_logic_tests() {
     let (mut files, foreign) = list_cases(&root);
     assert!(
         foreign.is_empty(),
-        "non-.gqt entries under {}: {}; a mis-renamed or nested case must never silently skip",
+        "foreign entries under {}: {}; a mis-renamed, nested, or dot-prefixed case must never silently skip",
         root.display(),
         foreign.join(", ")
     );
@@ -1658,11 +1787,78 @@ fn parses_a_minimal_case() {
 }
 
 #[test]
-fn header_continuation_lines_extend_the_previous_key() {
+fn header_notes_repeat_and_continuation_lines_are_refused() {
+    let text = format!(
+        "# issue: 7\n# red_on: 2026-01-01, the run\n# notes: returned 8,\n# notes: not 20.\n{SCHEMA}{SEED}{QUERY}{EXPECT}"
+    );
+    parse_case("issue_7_notes", &text).unwrap();
     let text = format!(
         "# issue: 7\n# red_on: 2026-01-01, the run\n#   returned 8: not 20.\n{SCHEMA}{SEED}{QUERY}{EXPECT}"
     );
-    parse_case("issue_7_continued", &text).unwrap();
+    assert!(refusal("issue_7_x", &text).contains("unknown header key"));
+    // The three misspellings that the old prose branch swallowed silently.
+    for typo in [
+        "# Traversal: indexed",
+        "# traversal : indexed",
+        "# traversal=csr",
+    ] {
+        let text = format!("{HDR}{typo}\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+        let reason = refusal("x", &text);
+        assert!(
+            reason.contains("unknown header key") || reason.contains("not `# <key>: <value>`"),
+            "{typo}: {reason}"
+        );
+    }
+}
+
+/// Bounded exhaustive walk of the header-line typo space: key spelling,
+/// separator, leading and trailing whitespace, and the gap before the value.
+/// A line is accepted exactly when it equals the canonical
+/// `# traversal: indexed`, so a future key inherits the same proof.
+#[test]
+fn header_lines_are_accepted_only_in_canonical_form() {
+    let keys = [
+        "traversal",
+        "Traversal",
+        "TRAVERSAL",
+        "traversa1",
+        "traversal_",
+        " traversal",
+    ];
+    let seps = [":", " :", "=", "", "::"];
+    let leads = ["# ", "#", "#  ", " # "];
+    let gaps = [" ", "", "  ", "\t"];
+    let trails = ["", " ", "\t"];
+    let canonical = canonical_header_line("traversal", "indexed");
+    // Distinct lines: two lead/key pairs collide (`#` + ` traversal` = `# ` +
+    // `traversal`, and `# ` + ` traversal` = `#  ` + `traversal`), 120
+    // duplicates over the 1440 grid points, so the set is what gets walked.
+    let mut lines = std::collections::BTreeSet::new();
+    for lead in leads {
+        for key in keys {
+            for sep in seps {
+                for gap in gaps {
+                    for trail in trails {
+                        lines.insert(format!("{lead}{key}{sep}{gap}indexed{trail}"));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(lines.len(), 1320, "the typo space is 1320 distinct lines");
+    let mut accepted = 0;
+    for line in &lines {
+        let text = format!("{HDR}{line}\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+        match parse_case("x", &text) {
+            Ok(case) => {
+                assert_eq!(line, &canonical, "accepted a non-canonical line");
+                assert_eq!(case.traversal, Some("indexed"));
+                accepted += 1;
+            }
+            Err(e) => assert_ne!(line, &canonical, "refused the canonical line: {e}"),
+        }
+    }
+    assert_eq!(accepted, 1);
 }
 
 #[test]
@@ -1678,9 +1874,9 @@ fn refuses_numbered_issue_without_red_on() {
 }
 
 #[test]
-fn refuses_first_header_line_without_a_key() {
-    let text = format!("# stray continuation\n{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("first header line"));
+fn refuses_header_line_without_a_key() {
+    let text = format!("# stray prose\n{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    assert!(refusal("x", &text).contains("not `# <key>: <value>`"));
 }
 
 #[test]
@@ -2104,8 +2300,10 @@ fn refuses_duplicate_issue_header() {
 
 #[test]
 fn refuses_empty_red_on_value() {
-    let text = format!("# issue: 7\n# red_on:\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let text = format!("# issue: 7\n# red_on: \n{SCHEMA}{SEED}{QUERY}{EXPECT}");
     assert!(refusal("issue_7_x", &text).contains("needs a value"));
+    let text = format!("# issue: 7\n# red_on:\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    assert!(refusal("issue_7_x", &text).contains("not `# <key>: <value>`"));
 }
 
 #[test]
@@ -2193,6 +2391,105 @@ fn traversal_header_forces_index_builds() {
     let case = parse_case("x", &text).unwrap();
     assert!(case.needs_indices);
     assert_eq!(case.traversal, Some("indexed"));
+}
+
+#[test]
+fn pin_violation_names_the_path_that_ran() {
+    assert_eq!(pin_violation("indexed", 3, 0, true), None);
+    assert_eq!(pin_violation("csr", 0, 2, true), None);
+    assert_eq!(pin_violation("indexed", 0, 0, false), None);
+    let v = pin_violation("indexed", 1, 2, false).unwrap();
+    assert!(
+        v.contains("pinned `indexed`, ran `csr` on 2 expand(s)"),
+        "{v}"
+    );
+    let v = pin_violation("csr", 4, 0, false).unwrap();
+    assert!(
+        v.contains("pinned `csr`, ran `indexed` on 4 expand(s)"),
+        "{v}"
+    );
+    // A step that must expand and shows nothing on the pinned path: the
+    // pin and the probes were dropped together.
+    let v = pin_violation("indexed", 0, 0, true).unwrap();
+    assert!(v.contains("no expand ran on it"), "{v}");
+    let v = pin_violation("csr", 0, 0, true).unwrap();
+    assert!(v.contains("no expand ran on it"), "{v}");
+}
+
+#[test]
+fn expects_expand_ignores_bound_edges_and_plain_bindings() {
+    let unbound = parse_query(TRAVERSAL_QUERY.trim_start_matches("--- query\n")).unwrap();
+    assert!(expects_expand(&unbound.queries[0].match_clause));
+    let bound = "query f($n: String) {\n    match {\n        $a: Person\n        $a.name = $n\n        \
+                 $a $k:knows $b\n    }\n    return { $b.name }\n}\n";
+    let bound = parse_query(bound).unwrap();
+    assert!(!expects_expand(&bound.queries[0].match_clause));
+    let plain = parse_query(QUERY.trim_start_matches("--- query\n")).unwrap();
+    assert!(!expects_expand(&plain.queries[0].match_clause));
+    let negated = "query f() {\n    match {\n        $a: Person\n        not { $a knows $x }\n    }\n    \
+                   return { $a.name }\n}\n";
+    let negated = parse_query(negated).unwrap();
+    assert!(!expects_expand(&negated.queries[0].match_clause));
+}
+
+/// A two-node, one-edge graph with a one-hop traversal, for the pin tests.
+const TRAVERSAL_SCHEMA: &str = "--- schema\nnode Person {\n    name: String @key\n}\n\n\
+                                edge Knows: Person -> Person {\n    since: I64\n}\n";
+const TRAVERSAL_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n\
+                              {\"type\":\"Person\",\"data\":{\"name\":\"bob\"}}\n\
+                              {\"edge\":\"Knows\",\"from\":\"alice\",\"to\":\"bob\",\"data\":{\"id\":\"k-1\",\"since\":2020}}\n";
+const TRAVERSAL_QUERY: &str = "--- query\nquery friends($n: String) {\n    match {\n        $a: Person\n        \
+                               $a.name = $n\n        $a knows $b\n    }\n    return { $b.name }\n}\n";
+const TRAVERSAL_PARAMS: &str = "--- params\n{\"n\": \"alice\"}\n";
+const TRAVERSAL_EXPECT: &str = "--- expect unordered\n{\"b.name\": \"bob\"}\n";
+
+/// The pin reaches the executor on both paths: a pinned step runs its
+/// expands on the pinned path only, and the probes see them (a zero count
+/// on both paths would make the check vacuous).
+#[tokio::test]
+async fn pinned_step_runs_only_its_pinned_path() {
+    for (mode, expect_indexed) in [("indexed", true), ("csr", false)] {
+        let text = format!(
+            "{HDR}# traversal: {mode}\n{TRAVERSAL_SCHEMA}{TRAVERSAL_SEED}{TRAVERSAL_QUERY}{TRAVERSAL_PARAMS}{TRAVERSAL_EXPECT}"
+        );
+        let case = parse_case("pinned", &text).unwrap();
+        execute_case(&case, Path::new("unused.gqt"), false)
+            .await
+            .unwrap_or_else(|e| panic!("{mode}: {e}"));
+
+        let (db, _uri, _dir) = open_case_store(&case).await.unwrap();
+        let Some(Item::Step(Step::Query(step))) = case.items.first() else {
+            panic!("first item is the query step");
+        };
+        let params = build_params(step.params_raw.as_ref(), &step.ast_params, None).unwrap();
+        let (outcome, counts) = under_traversal(
+            Some(mode),
+            db.query(
+                ReadTarget::branch("main"),
+                &step.source,
+                &step.name,
+                &params,
+            ),
+        )
+        .await;
+        outcome.unwrap();
+        let counts = counts.unwrap();
+        let (indexed, csr) = (
+            counts.indexed.load(Ordering::Relaxed),
+            counts.csr.load(Ordering::Relaxed),
+        );
+        if expect_indexed {
+            assert!(
+                indexed >= 1 && csr == 0,
+                "{mode}: indexed={indexed} csr={csr}"
+            );
+        } else {
+            assert!(
+                csr >= 1 && indexed == 0,
+                "{mode}: indexed={indexed} csr={csr}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2369,16 +2666,29 @@ fn walker_refuses_a_process_traversal_override() {
     assert!(reason.contains("# traversal:"), "{reason}");
 }
 
+/// Same name battery as `scripts/check-fix-regression.py --self-test`
+/// (`corpus_case`): the walker and the gate must agree on what a case is.
 #[test]
 fn walker_flags_foreign_corpus_entries() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.gqt"), "x").unwrap();
     std::fs::write(dir.path().join("b.txt"), "x").unwrap();
-    std::fs::write(dir.path().join(".hidden"), "x").unwrap();
+    std::fs::write(dir.path().join(".hidden.gqt"), "x").unwrap();
+    std::fs::write(dir.path().join(".DS_Store"), "x").unwrap();
+    std::fs::write(dir.path().join("c.GQT"), "x").unwrap();
     std::fs::create_dir(dir.path().join("nested")).unwrap();
+    std::fs::write(dir.path().join("nested").join("d.gqt"), "x").unwrap();
     let (files, foreign) = list_cases(dir.path());
-    assert_eq!(files.len(), 1);
-    assert_eq!(foreign, vec!["b.txt".to_string(), "nested".to_string()]);
+    assert_eq!(files, vec![dir.path().join("a.gqt")]);
+    assert_eq!(
+        foreign,
+        vec![
+            ".hidden.gqt".to_string(),
+            "b.txt".to_string(),
+            "c.GQT".to_string(),
+            "nested".to_string()
+        ]
+    );
 }
 
 #[tokio::test]

@@ -1,8 +1,8 @@
 # issue: none
 # notes: a mutation inserting a node that omits its non-nullable @key property
-#   is refused at typecheck, pinned by its stable code. A mutation whose match
-#   merely misses is not an error: delete on an absent key succeeds with zero
-#   affected counts.
+# notes: is refused at typecheck, pinned by its stable code. A mutation whose match
+# notes: merely misses is not an error: delete on an absent key succeeds with zero
+# notes: affected counts.
 
 --- schema
 node Person {

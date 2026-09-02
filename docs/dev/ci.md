@@ -24,12 +24,19 @@ inside the full workspace suite. It takes the documentation-only skip the way
 the AWS job does and reports success without building; its workflow carries a
 verbatim copy of the `Classify Changes` job under the name
 `Classify Changes (GQ Logic Tests)`, and `scripts/check-classify-copy.py`
-holds that copy identical to `ci.yml`. `Fix Regression Gate` (same workflow,
-every PR event, no documentation-only skip) holds every issue the PR body
-closes by keyword to a matching `.gqt` case or `#[test]`-attributed `issue_N`
-function in the diff,
-waivable per PR with the `no-repro` label; `scripts/check-fix-regression.py`
-is the check.
+holds that copy identical to `ci.yml`. `Fix Regression Gate`
+(`fix-regression-gate.yml`) holds every issue the PR body closes by keyword to
+a regression in the diff: a `.gqt` case or a `#[test]`-attributed `issue_N`
+function, added or strengthened, in a top-level test target or `src/` module
+under `crates/*` or `tools/*` (an owner test not yet named for the issue is
+renamed to carry `issue_N` when extended). Owners the gate does not recognize
+(Python and shell scripts, helper and fixture modules) go through the
+`no-repro` label, which a maintainer applies to waive the check per PR;
+`scripts/check-fix-regression.py` is the check. It is a policy check, so it runs on `pull_request_target`: the
+workflow and the script come from `main`, and the pull request head is fetched
+only as data for the diff range, never checked out or executed. It runs on
+body edits and label changes as well as pushes, builds nothing, and takes no
+documentation-only skip.
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC

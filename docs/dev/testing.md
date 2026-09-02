@@ -5,7 +5,7 @@ This is the ownership map for OmniGraph's tests. Read it before changing code: f
 ## Rules
 
 1. Test at the boundary that owns the promise. Compiler behavior belongs in compiler tests; engine guarantees belong at the public engine API; HTTP and CLI behavior belongs at those transports.
-2. Prefer one new assertion, fixture row, or parameter over another `init_and_load` test.
+2. Prefer one new assertion, fixture row, or parameter over another `init_and_load` test. When the change fixes an issue, the `Fix Regression Gate` keys on `issue_N` in the test's name or the `.gqt` case's file name: extend an owner test by renaming it to carry `issue_N` in the same change, or add a row to the `issue_N_*.gqt` case (`docs/dev/ci.md`).
 3. Test logical results and durable state. Inspect Lance internals only for a compatibility fence, recovery fault, or physical-cost contract.
 4. Every failure path must prove what did *not* move: manifest head, table head, lineage, sidecar, or external I/O as appropriate.
 5. Time and RSS measurements are decision instruments, not ordinary correctness gates. Deterministic operation counts may be CI contracts.

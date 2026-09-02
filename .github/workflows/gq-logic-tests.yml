@@ -1,17 +1,14 @@
 name: GQ Logic Tests
 
 on:
+  # Code-bearing events only. The body and label events belong to
+  # `fix-regression-gate.yml`, which builds nothing; listing them here
+  # would re-run this Rust build on every label change.
   pull_request:
-    # `edited`, `labeled`, and `unlabeled` re-run the gate job when a body
-    # edit or the `no-repro` label changes its answer; the types list is
-    # workflow-level, so the test job re-runs on them too (accepted cost).
     types:
       - opened
       - synchronize
       - reopened
-      - edited
-      - labeled
-      - unlabeled
   push:
     branches:
       - main
@@ -25,7 +22,8 @@ concurrency:
 jobs:
   # A job cannot depend on another workflow's job, so this is a verbatim
   # copy of `ci.yml`'s `classify_changes`; `ci.yml` is the source of truth,
-  # and the gate job below asserts the two stay identical.
+  # and an unconditional step at the top of the test job, right after
+  # checkout, asserts the two stay identical.
   classify_changes:
     name: Classify Changes (GQ Logic Tests)
     runs-on: ubuntu-latest
@@ -108,15 +106,19 @@ jobs:
       # nested async engine frame, deeper than a default 2 MiB thread stack.
       RUST_MIN_STACK: 16777216
     steps:
+      # Unconditional: the copy assertion below must run on every PR, the
+      # documentation-only ones included, inside this required context.
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Assert the classification copy matches ci.yml
+        run: python3 scripts/check-classify-copy.py
+
       # Documentation-only change: report success without building, so the
       # required context is never left pending.
       - name: Skip for documentation-only changes
         if: needs.classify_changes.outputs.run_full_ci != 'true'
         run: echo "Documentation-only change detected; skipping the GQ logic tests."
-
-      - name: Checkout source
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Install system dependencies
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -143,36 +145,3 @@ jobs:
       - name: Run GQ logic tests
         if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: cargo test -p omnigraph-engine --test gq_logic_tests --locked -- --nocapture
-
-  fix_regression_gate:
-    name: Fix Regression Gate
-    # A push or dispatch run has no PR body to read; a skipped context does
-    # not block. Runs on every PR event, with no documentation-only skip.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Assert the classification copy matches ci.yml
-        run: python3 scripts/check-classify-copy.py
-
-      - name: Check closed issues carry regressions
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          python3 scripts/check-fix-regression.py --self-test
-          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
-          python3 scripts/check-fix-regression.py \
-            --body-file "$RUNNER_TEMP/pr-body.txt" \
-            --labels "$PR_LABELS" \
-            --range "$BASE_SHA...$HEAD_SHA"

@@ -1,12 +1,11 @@
 # issue: 563
-# red_on: 2026-08-28, retry disabled: the capped 8-row scan window held no
-#   edge-bearing chunk and the query returned 0 rows instead of 2.
+# red_on: 2026-08-28, retry disabled: the capped 8-row scan window held no edge-bearing chunk and the query returned 0 rows instead of 2.
 # notes: chunks 8..=11 carry the only edges; the limit 2 x 4 = 8-row cap
-#   window (either scan direction) excludes them, so filling the limit proves
-#   the uncapped retry ran. Passes on pre-cap code too (an unbounded scan
-#   finds everything): this case guards the retry GIVEN the cap, not the cap
-#   itself; the cap is the aggregate case's job. Rust twin:
-#   bm25_join_fills_limit_when_capped_scan_underfills_issue_563 (tests/search.rs).
+# notes: window (either scan direction) excludes them, so filling the limit proves
+# notes: the uncapped retry ran. Passes on pre-cap code too (an unbounded scan
+# notes: finds everything): this case guards the retry GIVEN the cap, not the cap
+# notes: itself; the cap is the aggregate case's job. Rust twin:
+# notes: bm25_join_fills_limit_when_capped_scan_underfills_issue_563 (tests/search.rs).
 
 --- schema
 node Chunk {
