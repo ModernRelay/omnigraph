@@ -53,6 +53,23 @@ pub(crate) async fn load_cluster_settings(
     }
     let env_require_all_graphs = env_flag("OMNIGRAPH_REQUIRE_ALL_GRAPHS");
     let require_all_graphs = cli_require_all_graphs || env_require_all_graphs;
+    // RFC 0048: what `/readyz` will report. Every graph the applied revision
+    // names, whether or not this process ends up serving it.
+    let mut applied_graphs: Vec<String> = snapshot
+        .graphs
+        .iter()
+        .map(|graph| graph.graph_id.clone())
+        .chain(snapshot.quarantined_graphs.iter().cloned())
+        .collect();
+    applied_graphs.sort();
+    applied_graphs.dedup();
+    let witness = BootWitness {
+        booted_serving_digest: snapshot.config_digest.clone(),
+        state_revision: snapshot.state_revision,
+        state_cas: snapshot.state_cas.clone(),
+        applied_graphs,
+    };
+    let shutdown_grace = shutdown_grace_from_env()?;
     if require_all_graphs && !snapshot.diagnostics.is_empty() {
         let details = snapshot
             .diagnostics
@@ -201,7 +218,23 @@ pub(crate) async fn load_cluster_settings(
         bind: cli_bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
         allow_unauthenticated: cli_allow_unauthenticated || env_unauth,
         require_all_graphs,
+        witness,
+        shutdown_grace,
     })
+}
+
+/// `OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`, or the default (RFC 0048). The CLI
+/// flag, when given, replaces this after loading.
+fn shutdown_grace_from_env() -> Result<std::time::Duration> {
+    match std::env::var("OMNIGRAPH_SHUTDOWN_GRACE_SECONDS") {
+        Ok(value) => {
+            let seconds: u64 = value.trim().parse().map_err(|err| {
+                eyre!("OMNIGRAPH_SHUTDOWN_GRACE_SECONDS must be a whole number of seconds, got `{value}`: {err}")
+            })?;
+            Ok(std::time::Duration::from_secs(seconds))
+        }
+        Err(_) => Ok(DEFAULT_SHUTDOWN_GRACE),
+    }
 }
 
 /// RFC-011 cluster-only boot: the server serves exclusively from a
@@ -667,6 +700,8 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
             require_all_graphs: false,
+            witness: crate::BootWitness::default(),
+            shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
         };
         let result = serve(config).await;
         let err = result
@@ -721,6 +756,8 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
             require_all_graphs: false,
+            witness: crate::BootWitness::default(),
+            shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
         };
         let result = serve(config).await;
         let err =

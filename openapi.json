@@ -3525,6 +3525,38 @@
           }
         }
       }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Readiness witness (RFC 0048).",
+        "description": "Unauthenticated. Reports whether this replica is serving or draining,\nthe applied `config_digest` it booted from, the ledger revision and CAS\nit read, and the graphs it serves and does not serve. Answers 503 once\nshutdown has begun; `/healthz` stays 200 while the process is alive.",
+        "operationId": "readiness",
+        "responses": {
+          "200": {
+            "description": "Serving",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Draining",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessOutput"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5171,6 +5203,68 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "ReadinessOutput": {
+        "type": "object",
+        "description": "The readiness witness of one replica (`GET /readyz`, RFC 0048): whether\nit is serving or draining, the applied revision it booted from, and the\ngraphs it does and does not serve.",
+        "required": [
+          "ready",
+          "status",
+          "state_revision",
+          "served_graphs",
+          "quarantined_graphs",
+          "shutdown_grace_seconds"
+        ],
+        "properties": {
+          "booted_serving_digest": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `config_digest` of the applied revision this process booted from.\nFixed for the life of the process: the server never reloads."
+          },
+          "quarantined_graphs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Graphs the applied revision names that this process does not serve,\nfor any reason, sorted."
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "False once shutdown has begun; the response is then 503."
+          },
+          "served_graphs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Graphs this process serves, sorted."
+          },
+          "shutdown_grace_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The bound on graceful shutdown, after which the process exits 2.",
+            "minimum": 0
+          },
+          "state_cas": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The ledger CAS (`sha256:<hex>`) the process booted from."
+          },
+          "state_revision": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The ledger revision the process booted from.",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string",
+            "description": "`serving` or `draining`."
           }
         }
       },

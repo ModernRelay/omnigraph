@@ -31,9 +31,9 @@ use api::{
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
     GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
     InvokeStoredQueryRequest, InvokeStoredQueryResponse, LegacyReadOutput, QueriesCatalogOutput,
-    QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
-    SnapshotQuery, graph_batch_load_receipt_output, ingest_receipt_output, schema_apply_output,
-    snapshot_payload,
+    QueryRequest, ReadOutput, ReadRequest, ReadinessOutput, SchemaApplyOutput, SchemaApplyRequest,
+    SchemaOutput, SnapshotQuery, graph_batch_load_receipt_output, ingest_receipt_output,
+    schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
@@ -94,6 +94,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
     ),
     paths(
         handlers::server_health,
+        handlers::server_ready,
         handlers::server_graphs_list,
         handlers::server_snapshot,
         handlers::server_blob_get,
@@ -188,6 +189,31 @@ pub struct ServerConfig {
     /// startup failures quarantine that graph and healthy graphs still serve.
     /// When true, any quarantined or failed graph aborts startup.
     pub require_all_graphs: bool,
+    /// What `GET /readyz` reports about the revision this process booted
+    /// from (RFC 0048).
+    pub witness: BootWitness,
+    /// The bound on graceful shutdown: readiness turns off at the signal,
+    /// in-flight requests drain, and at this deadline the process exits 2
+    /// (RFC 0048). `--shutdown-grace-seconds` or
+    /// `OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`; default 25.
+    pub shutdown_grace: std::time::Duration,
+}
+
+/// The default bound on graceful shutdown.
+pub const DEFAULT_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// The boot facts `GET /readyz` reports (RFC 0048), fixed for the life of
+/// the process.
+#[derive(Debug, Clone, Default)]
+pub struct BootWitness {
+    /// The applied revision's `config_digest`.
+    pub booted_serving_digest: Option<String>,
+    /// The ledger revision and CAS the snapshot was read from.
+    pub state_revision: u64,
+    pub state_cas: Option<String>,
+    /// Every graph the applied revision names, sorted. `/readyz` reports the
+    /// ones not in the registry as quarantined.
+    pub applied_graphs: Vec<String>,
 }
 
 /// What `load_server_settings` produces. RFC-011 cluster-only: the
@@ -285,6 +311,13 @@ pub struct AppState {
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.
     export_transport: export_transport::ExportTransport,
+    /// What `/readyz` reports about the boot (RFC 0048).
+    witness: Arc<BootWitness>,
+    /// Set at the shutdown signal; `/readyz` answers 503 from then on.
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Reported by `/readyz` so an orchestrator can check its own grace
+    /// exceeds the server's.
+    shutdown_grace: std::time::Duration,
 }
 
 struct OpenedGraph {
@@ -567,6 +600,9 @@ impl AppState {
             bearer_tokens,
             server_policy: None,
             export_transport: export_transport::ExportTransport::with_defaults(),
+            witness: Arc::new(BootWitness::default()),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         }
     }
 
@@ -594,7 +630,25 @@ impl AppState {
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
             export_transport: export_transport::ExportTransport::with_defaults(),
+            witness: Arc::new(BootWitness::default()),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         })
+    }
+
+    /// Attach the boot witness `/readyz` reports and the flag shutdown sets
+    /// (RFC 0048). `serve` calls this; a test may build its own.
+    #[must_use]
+    pub fn with_boot_witness(
+        mut self,
+        witness: BootWitness,
+        draining: Arc<std::sync::atomic::AtomicBool>,
+        shutdown_grace: std::time::Duration,
+    ) -> Self {
+        self.witness = Arc::new(witness);
+        self.draining = draining;
+        self.shutdown_grace = shutdown_grace;
+        self
     }
 
     /// Runtime routing accessor. Handlers don't typically inspect this —
@@ -1824,6 +1878,7 @@ pub fn build_app(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(server_health))
+        .route("/readyz", get(server_ready))
         .route("/openapi.json", get(server_openapi))
         .merge(protected)
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
@@ -1901,9 +1956,23 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         stdout.flush()?;
     }
 
+    // RFC 0048: the boot witness `/readyz` reports, the flag shutdown sets,
+    // and one deadline on the drain.
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_grace = config.shutdown_grace;
+    let state = state.with_boot_witness(
+        config.witness.clone(),
+        Arc::clone(&draining),
+        shutdown_grace,
+    );
     let registry = Arc::clone(&state.routing.registry);
+    let draining_at_signal = Arc::clone(&draining);
     let served = axum::serve(listener, build_app(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            draining_at_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+            arm_shutdown_watchdog(shutdown_grace);
+        })
         .await;
     // The drain finishes in-flight requests, but branch_delete's fork
     // reclaims run as detached tasks; join them on both exit paths so
@@ -2102,6 +2171,26 @@ async fn shutdown_signal() {
     info!("shutdown signal received");
 }
 
+/// One absolute deadline on graceful shutdown (RFC 0048): in-flight work
+/// may finish until `grace` after the signal; then the process exits 2
+/// without claiming success. A zero grace is an immediate cutoff. The exit
+/// is crash-equivalent for the work it interrupts, and the engine's
+/// durability and next-open recovery remain the authority for it.
+fn arm_shutdown_watchdog(grace: std::time::Duration) {
+    if grace.is_zero() {
+        error!("shutdown grace is zero; exiting immediately with unfinished work");
+        std::process::exit(2);
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        error!(
+            grace_seconds = grace.as_secs(),
+            "shutdown deadline reached with unfinished work; exiting 2"
+        );
+        std::process::exit(2);
+    });
+}
+
 #[cfg(all(test, unix))]
 mod shutdown_signal_tests {
     use std::process::Command;
@@ -2166,5 +2255,41 @@ mod shutdown_signal_tests {
 
         let status = child.wait().unwrap();
         assert!(status.success(), "SIGTERM helper failed with {status}");
+    }
+
+    const WATCHDOG_CHILD_ENV: &str = "OMNIGRAPH_SERVER_WATCHDOG_TEST_CHILD";
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "subprocess helper; exercised by the_shutdown_watchdog_exits_nonzero_at_the_deadline"]
+    async fn watchdog_child_outlives_its_deadline() {
+        if std::env::var_os(WATCHDOG_CHILD_ENV).is_none() {
+            return;
+        }
+        arm_shutdown_watchdog(Duration::from_millis(500));
+        // Work that never drains: the deadline, not this sleep, ends the process.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+
+    #[test]
+    fn the_shutdown_watchdog_exits_nonzero_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("shutdown_signal_tests::watchdog_child_outlives_its_deadline")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(WATCHDOG_CHILD_ENV, "1")
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(2),
+            "the watchdog must exit 2 at the deadline, got {status}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the watchdog did not bound the process: {:?}",
+            started.elapsed()
+        );
     }
 }

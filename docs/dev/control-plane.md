@@ -71,6 +71,13 @@ Servers do not hot-reload. Apply the new revision and restart every server that 
 
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
 
+A replica reports what it booted from on `GET /readyz` (RFC 0048): the
+applied `config_digest` as `booted_serving_digest`, the ledger revision and
+CAS, and its served and quarantined graphs; it answers 503 from the shutdown
+signal on. Graceful shutdown is bounded by one deadline
+(`--shutdown-grace-seconds`, default 25) after which the process exits 2
+without claiming success.
+
 ## Azure boundary
 
 `az://container/prefix` uses the same control-object and graph-root model as

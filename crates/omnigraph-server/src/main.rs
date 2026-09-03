@@ -32,6 +32,13 @@ struct Cli {
     /// serve. Equivalent to setting `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`.
     #[arg(long)]
     require_all_graphs: bool,
+    /// Bound on graceful shutdown, in seconds (RFC 0048): readiness turns off
+    /// at the signal, in-flight requests drain, and at the deadline the
+    /// process exits 2. Zero cuts off immediately. Equivalent to
+    /// `OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`; default 25. The orchestrator's own
+    /// termination grace must be longer.
+    #[arg(long)]
+    shutdown_grace_seconds: Option<u64>,
 }
 
 #[tokio::main]
@@ -40,12 +47,15 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let settings: ServerConfig = load_server_settings(
+    let mut settings: ServerConfig = load_server_settings(
         cli.cluster.as_ref(),
         cli.bind,
         cli.unauthenticated,
         cli.require_all_graphs,
     )
     .await?;
+    if let Some(seconds) = cli.shutdown_grace_seconds {
+        settings.shutdown_grace = std::time::Duration::from_secs(seconds);
+    }
     serve(settings).await
 }
