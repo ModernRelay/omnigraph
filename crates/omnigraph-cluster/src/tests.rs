@@ -4771,3 +4771,123 @@ async fn plan_annotates_apply_dispositions() {
         Some(ApplyDisposition::Applied)
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn validate_refuses_paths_that_escape_or_cross_a_symlink() {
+    let dir = fixture();
+    // A `..` segment leaves the bundle.
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
+version: 1
+metadata:
+  name: test
+graphs:
+  knowledge:
+    schema: ../people.pg
+"#,
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.code == "config_path_escape" && d.path == "graphs.knowledge.schema"),
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|d| d.code == "schema_file_missing"),
+        "a refused path is reported once: {:?}",
+        out.diagnostics
+    );
+
+    // A symbolic link reaches outside the bundle.
+    let elsewhere = tempdir().unwrap();
+    fs::write(elsewhere.path().join("people.gq"), QUERY).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("linked")).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
+version: 1
+metadata:
+  name: test
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries: ./linked/
+"#,
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.code == "config_path_symlink" && d.path == "graphs.knowledge.queries"),
+        "{:?}",
+        out.diagnostics
+    );
+
+    // A symbolic link *inside* a real directory is refused before it is read.
+    fs::create_dir_all(dir.path().join("queries")).unwrap();
+    std::os::unix::fs::symlink(
+        elsewhere.path().join("people.gq"),
+        dir.path().join("queries/linked.gq"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
+version: 1
+metadata:
+  name: test
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries: ./queries/
+"#,
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.code == "config_path_symlink"
+                && d.path == "graphs.knowledge.queries"
+                && d.message.contains("linked.gq")),
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(
+        !out.resources.iter().any(|r| r.address.contains("linked")),
+        "a refused entry is never a resource: {:?}",
+        out.resources
+    );
+
+    // An absolute path keeps its old behavior, `..` included.
+    let absolute = elsewhere.path().join("sub/../people.pg");
+    fs::create_dir_all(elsewhere.path().join("sub")).unwrap();
+    fs::write(elsewhere.path().join("people.pg"), SCHEMA).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        format!(
+            "version: 1\nmetadata:\n  name: test\ngraphs:\n  knowledge:\n    schema: {}\n",
+            absolute.display()
+        ),
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|d| d.code.starts_with("config_path_")),
+        "{:?}",
+        out.diagnostics
+    );
+}
