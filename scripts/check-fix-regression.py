@@ -38,7 +38,7 @@ recognize, Python and shell scripts among them, satisfy it only through
 the `no-repro` label, which a maintainer applies. What a match guarantees
 differs by shape: a corpus match ran green in the required `GQ Logic
 Tests` job; a Rust match is a test-attributed definition or an edit inside
-one, not a run. A pull request runs only the corpus walker and the
+one, not a run. A pull request runs only the corpus target and the
 `omnigraph-server` aws-feature suite among Rust test targets (`Test
 Workspace` runs post-merge), and workspace clippy refuses an unreferenced
 private function but not an `#[ignore]`d or cfg-gated one, so whether
@@ -72,9 +72,10 @@ CLOSING_KEYWORD = re.compile(
     r"(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)(?::\s*|\s+)#(\d+)",
     re.IGNORECASE,
 )
-CORPUS_PATH_SENTENCE = "crates/omnigraph/tests/gq_logic_tests/"
+CORPUS_PATH_SENTENCE = "crates/omnigraph-gqt/cases/"
 WAIVER_LABEL = "no-repro"
 PATHSPECS = (
+    ":(glob)crates/omnigraph-gqt/cases/**",
     ":(glob)crates/*/tests/**",
     ":(glob)crates/*/src/**",
     ":(glob)tools/*/tests/**",
@@ -90,7 +91,7 @@ def issue_token(n: str) -> re.Pattern[str]:
     return re.compile(rf"issue_{n}(?!\d)")
 
 
-CORPUS_DIR_PREFIX = "crates/omnigraph/tests/gq_logic_tests/"
+CORPUS_DIR_PREFIX = "crates/omnigraph-gqt/cases/"
 # One path segment after `tests/` (a top-level target) or any `.rs` under
 # `src/`, in a `crates/` or `tools/` workspace member.
 RUST_FN_PATH = re.compile(r"^(?:crates|tools)/[^/]+/(?:tests/[^/]+\.rs|src/.+\.rs)$")
@@ -235,7 +236,7 @@ def issue_satisfied(
             # A strengthened case: a body line added to a case named for the
             # issue, new or modified. Header (`#`) and GQ comment (`//`)
             # lines carry no assertion. (An added `# issue: N` header line
-            # is not a shape of its own: the walker requires the file name
+            # is not a shape of its own: the runner requires the file name
             # to match and refuses a second `# issue:`, so that line only
             # ever appears in a new case named for the issue.)
             stripped = text.strip()
@@ -356,10 +357,11 @@ def test_attributed(lines: list[tuple[str, str]], i: int) -> bool:
 
 def corpus_case(path: str) -> bool:
     """A case is a top-level corpus file whose name ends in `.gqt` and does
-    not start with `.`: the same rule the walker's `list_cases` applies
-    (`crates/omnigraph/tests/gq_logic_tests.rs`), so nothing the gate
-    credits can be a file the walker never runs. Both self-tests walk one
-    name battery."""
+    not start with `.`: the name half of the rule the corpus target's
+    `datatest_stable::harness!` pattern applies
+    (`crates/omnigraph-gqt/tests/gq_logic_tests.rs`, mirrored by `list_cases`
+    in `src/lib.rs`), so nothing the gate credits can be a file the target
+    never runs. Both self-tests walk one name battery."""
     rest = path[len(CORPUS_DIR_PREFIX) :] if path.startswith(CORPUS_DIR_PREFIX) else ""
     return bool(rest) and "/" not in rest and rest.endswith(".gqt") and not rest.startswith(".")
 
@@ -439,7 +441,7 @@ def self_test() -> int:
     for body, expected in cases:
         got = closed_issues(body)
         assert got == expected, f"closed_issues({body!r}) = {got}, expected {expected}"
-    corpus = "crates/omnigraph/tests/gq_logic_tests/issue_563_x.gqt"
+    corpus = "crates/omnigraph-gqt/cases/issue_563_x.gqt"
     rust = "crates/omnigraph/tests/search.rs"
     assert issue_satisfied("563", [corpus], [])
     assert not issue_satisfied("563", ["crates/omnigraph/tests/fixtures/issue_563_x.gqt"], [])
@@ -487,10 +489,10 @@ def self_test() -> int:
     assert not issue_satisfied("563", [], [(rust, "// see issue_563")])
     assert not issue_satisfied("563", [], [(rust, "let s = \"issue_563\";")])
     assert not issue_satisfied("563", [], [(rust, "fn t_issue_5630() {")])
-    # An added `# issue: N` line is not a shape: the walker requires the file
+    # An added `# issue: N` line is not a shape: the runner requires the file
     # name to match and refuses a second `# issue:`, so a case not named for
     # the issue never counts, whatever header line it gains.
-    other = "crates/omnigraph/tests/gq_logic_tests/ranked_join.gqt"
+    other = "crates/omnigraph-gqt/cases/ranked_join.gqt"
     assert not issue_satisfied("563", [], [(other, "# issue: 563")])
     assert not issue_satisfied("563", [], [(other, "# issue: 0563")])
     assert not issue_satisfied("563", [], [(other, "{\"c.slug\": \"chunk-12\"}")])
@@ -499,17 +501,17 @@ def self_test() -> int:
         "563", ["crates/omnigraph-cli/tests/gq_logic_tests/issue_563_x.gqt"], []
     )
     assert not issue_satisfied(
-        "563", ["crates/omnigraph/tests/gq_logic_tests/nested/issue_563_x.gqt"], []
+        "563", ["crates/omnigraph-gqt/cases/nested/issue_563_x.gqt"], []
     )
     assert not issue_satisfied(
-        "563", ["crates/omnigraph/tests/gq_logic_tests/regression_issue_563.gqt"], []
+        "563", ["crates/omnigraph-gqt/cases/regression_issue_563.gqt"], []
     )
-    # Name battery shared with the walker's `walker_flags_foreign_corpus_entries`:
+    # Name battery shared with the runner's `corpus_flags_foreign_entries`:
     # a dot-prefixed `.gqt` is never a case, by name or by header line.
-    hidden = "crates/omnigraph/tests/gq_logic_tests/.hidden.gqt"
+    hidden = "crates/omnigraph-gqt/cases/.hidden.gqt"
     assert not issue_satisfied("563", [hidden], [])
     assert not issue_satisfied("563", [], [(hidden, "# issue: 563")])
-    assert not issue_satisfied("563", ["crates/omnigraph/tests/gq_logic_tests/.issue_563_x.gqt"], [])
+    assert not issue_satisfied("563", ["crates/omnigraph-gqt/cases/.issue_563_x.gqt"], [])
     for name, expected in [
         ("a.gqt", True),
         ("b.txt", False),
@@ -565,7 +567,7 @@ def self_test() -> int:
             "+++ b/crates/omnigraph/tests/search.rs",
             "@@ -0,0 +1,3 @@",
             "+/*",
-            "+++ b/crates/omnigraph/tests/gq_logic_tests/fake.gqt",
+            "+++ b/crates/omnigraph-gqt/cases/fake.gqt",
             "+# issue: 999",
             "+*/",
         ]
@@ -611,8 +613,8 @@ def self_test() -> int:
     multi_diff = "\n".join(
         [
             "diff --git a/a.gqt b/a.gqt",
-            "--- a/crates/omnigraph/tests/gq_logic_tests/a.gqt",
-            "+++ b/crates/omnigraph/tests/gq_logic_tests/a.gqt",
+            "--- a/crates/omnigraph-gqt/cases/a.gqt",
+            "+++ b/crates/omnigraph-gqt/cases/a.gqt",
             "@@ -0,0 +1 @@",
             "+# issue: 7",
             "diff --git a/old.rs b/old.rs",
@@ -625,7 +627,7 @@ def self_test() -> int:
     )
     added, removed, _ = parse_diff(multi_diff)
     assert [a for a in added if a != HUNK_BREAK] == [
-        ("crates/omnigraph/tests/gq_logic_tests/a.gqt", "# issue: 7")
+        ("crates/omnigraph-gqt/cases/a.gqt", "# issue: 7")
     ], added
     assert removed_fn_names(removed) == {"t_issue_8_gone", "keep"}, removed
 
@@ -646,7 +648,7 @@ def self_test() -> int:
     assert not issue_satisfied("563", [], [(corpus, "# issue: 563")])
     assert not issue_satisfied("563", [], [(corpus, "    // a GQ comment")])
     assert not issue_satisfied(
-        "563", [], [("crates/omnigraph/tests/gq_logic_tests/other_case.gqt", "{\"x\": 1}")]
+        "563", [], [("crates/omnigraph-gqt/cases/other_case.gqt", "{\"x\": 1}")]
     )
 
     # A strengthened Rust test: an added body line inside an existing
@@ -768,7 +770,7 @@ def self_test() -> int:
             "+++ b/crates/omnigraph/tests/fixtures/q.sql",
             "@@ -1 +1,2 @@",
             "--- old sql comment",
-            "+++ b/crates/omnigraph/tests/gq_logic_tests/issue_563_x.gqt",
+            "+++ b/crates/omnigraph-gqt/cases/issue_563_x.gqt",
             "+{\"c.slug\": \"chunk-12\"}",
         ]
     )

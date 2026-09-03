@@ -1,15 +1,15 @@
-//! GQ logic tests: walks `tests/gq_logic_tests/*.gqt` and runs each case
-//! against a fresh temporary store (init, load, index, then the steps in
-//! order). The file format, refusal set, comparison semantics, and bless
-//! workflow are specified in `docs/rfcs/0045-gq-logic-tests.md`.
+//! GQ logic tests: the `.gqt` corpus under `cases/` and the runner that
+//! executes one case against a fresh temporary store (init, load, index,
+//! then the steps in order). The file format, refusal set, comparison
+//! semantics, and bless workflow are specified in
+//! `docs/rfcs/0045-gq-logic-tests.md`.
 //!
-//! To libtest the whole walker is one test; case concurrency comes from a
-//! `JoinSet` bounded by a semaphore (`OMNIGRAPH_GQ_JOBS=<n>` overrides the
-//! default of the machine's available parallelism), and every case runs under
-//! a per-case budget (`OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>`, default 10).
-//! `OMNIGRAPH_GQ_LOGIC_TESTS=<substr>[,<substr>]` restricts the run to
-//! matching case files; `OMNIGRAPH_GQ_BLESS=1` rewrites the failing step's
-//! `--- expect` rows in place.
+//! The test target `tests/gq_logic_tests.rs` registers every case file as
+//! its own test (`datatest-stable`); how cases are selected, listed, and
+//! run concurrently is documented there. Every case runs under a per-case
+//! wall-time budget (`OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>`, default 10) via
+//! [`run_case_bounded`]. `OMNIGRAPH_GQ_BLESS=1` rewrites the failing
+//! step's `--- expect` rows in place.
 //!
 //! Layout of the `run_query_step` future (an engine query under the traversal
 //! task-local, the timeout, and `catch_unwind`) exceeds the default
@@ -23,9 +23,8 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
@@ -38,12 +37,10 @@ use omnigraph_compiler::schema::ast::{Annotation, PropDecl, SchemaDecl};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{JsonParamMode, json_params_to_param_map};
 use serde_json::Value;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 
-const CASE_TIMEOUT_ENV: &str = "OMNIGRAPH_GQ_CASE_TIMEOUT_SECS";
-const DEFAULT_CASE_TIMEOUT_SECS: u64 = 10;
-const JOBS_ENV: &str = "OMNIGRAPH_GQ_JOBS";
+pub const CASE_TIMEOUT_ENV: &str = "OMNIGRAPH_GQ_CASE_TIMEOUT_SECS";
+pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 10;
+pub const BLESS_ENV: &str = "OMNIGRAPH_GQ_BLESS";
 
 #[derive(Debug)]
 struct Case {
@@ -1508,40 +1505,68 @@ fn bless_rewrite(path: &Path, span: BodySpan, rows: &[String]) -> Result<(), Str
         .map_err(|e| format!("bless: cannot write case: {e}"))
 }
 
-async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| "case file name is not utf-8".to_string())?
-        .to_string();
+/// Parses and executes one case file; `bless` rewrites a failing step's
+/// `--- expect` rows in place and still reports the step (`expect
+/// rewritten`), so the run stays red until the re-run confirms.
+pub async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
+    let stem = stem_of(&path);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read case file: {e}"))?;
     let case = parse_case(&stem, &text).map_err(|e| format!("refused: {e}"))?;
     execute_case(&case, &path, bless).await
 }
 
-fn corpus_root() -> PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest_dir)
-        .join("tests")
-        .join("gq_logic_tests")
+/// The corpus directory, `cases/` beside this crate's manifest: the same
+/// compile-time root the test target's `datatest_stable::harness!` resolves
+/// `root = "cases"` against.
+pub fn corpus_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cases")
+}
+
+/// `OMNIGRAPH_GQ_BLESS=1` turns bless on; unset, empty, or `0` leaves it off.
+///
+/// # Panics
+///
+/// On any other value: the knob is refused, not ignored.
+pub fn bless_from_env() -> bool {
+    match std::env::var(BLESS_ENV) {
+        Err(_) => false,
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(v) => panic!("{BLESS_ENV} takes 1 (or 0/unset), got `{v}`"),
+    }
+}
+
+/// The per-case wall-time budget: `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` or the
+/// default.
+pub fn case_budget_from_env() -> Duration {
+    Duration::from_secs(env_positive(CASE_TIMEOUT_ENV).unwrap_or(DEFAULT_CASE_TIMEOUT_SECS))
 }
 
 /// Splits the corpus dir into `.gqt` case files and foreign entries; a
-/// foreign entry is a mis-renamed, nested, or dot-prefixed case that would
-/// otherwise silently never run. A case is a top-level file whose name ends
-/// in `.gqt` and does not start with `.`; `scripts/check-fix-regression.py`
-/// (`corpus_case`) applies the same rule, and both self-tests walk one name
-/// battery. Dot-prefixed entries without a `.gqt` extension (`.DS_Store`,
-/// `.gitkeep`, and a file named exactly `.gqt`, which has no extension)
-/// are neither cases nor foreign: they are skipped.
-fn list_cases(root: &Path) -> (Vec<PathBuf>, Vec<String>) {
+/// foreign entry is a mis-renamed, nested, symlinked, dot-prefixed, or
+/// non-UTF-8-named case that would otherwise silently never run. The rule
+/// that RUNS a case is the test target's `datatest_stable::harness!` pattern
+/// (`tests/gq_logic_tests.rs`): a regular file (symlinks are not followed)
+/// with a UTF-8 name that ends in `.gqt` and does not start with `.`. This
+/// function mirrors that rule so `corpus_layout` refuses what the target
+/// would skip; `scripts/check-fix-regression.py` (`corpus_case`) mirrors
+/// the name half, and both self-tests walk one name battery. Dot-prefixed
+/// entries without a `.gqt` extension (`.DS_Store`, `.gitkeep`, and a file
+/// named exactly `.gqt`, which has no extension) are neither cases nor
+/// foreign: they are skipped, as the target skips every hidden file.
+pub fn list_cases(root: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut files = Vec::new();
     let mut foreign = Vec::new();
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            let is_gqt = path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("gqt");
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                foreign.push(entry.file_name().to_string_lossy().into_owned());
+                continue;
+            };
+            let is_regular_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+            let is_gqt =
+                is_regular_file && path.extension().and_then(|s| s.to_str()) == Some("gqt");
             if name.starts_with('.') && !is_gqt {
                 continue;
             }
@@ -1557,7 +1582,9 @@ fn list_cases(root: &Path) -> (Vec<PathBuf>, Vec<String>) {
     (files, foreign)
 }
 
-fn stem_of(path: &Path) -> String {
+/// The case name: the file stem, or `<non-utf8>` for a name the corpus
+/// rule refuses anyway.
+pub fn stem_of(path: &Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("<non-utf8>")
@@ -1565,7 +1592,12 @@ fn stem_of(path: &Path) -> String {
 }
 
 /// A positive-integer environment override; unset or empty means none.
-fn env_positive(name: &str) -> Option<u64> {
+///
+/// # Panics
+///
+/// On a value that is not a positive integer: the knob is refused, not
+/// ignored.
+pub fn env_positive(name: &str) -> Option<u64> {
     let value = std::env::var(name).ok()?;
     if value.trim().is_empty() {
         return None;
@@ -1578,7 +1610,7 @@ fn env_positive(name: &str) -> Option<u64> {
 
 /// The production traversal path consults `OMNIGRAPH_TRAVERSAL_MODE`, so a set
 /// variable would silently decide which path an unpinned case exercises.
-fn traversal_override_refusal(value: Option<&OsStr>) -> Option<String> {
+pub fn traversal_override_refusal(value: Option<&OsStr>) -> Option<String> {
     value.map(|v| {
         format!(
             "OMNIGRAPH_TRAVERSAL_MODE={} is set; logic tests run the production traversal \
@@ -1588,7 +1620,7 @@ fn traversal_override_refusal(value: Option<&OsStr>) -> Option<String> {
     })
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -1598,1171 +1630,52 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-type CaseFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
-type CaseRunner = Arc<dyn Fn(PathBuf) -> CaseFuture + Send + Sync>;
-
+/// What one case produced: its stem, wall time from the moment it started,
+/// and the verdict (the error text carries the failing step's diff, the
+/// refusal, the panic message, or the budget overrun).
 #[derive(Debug)]
-struct CaseOutcome {
-    stem: String,
-    elapsed: Duration,
-    result: Result<(), String>,
+pub struct CaseOutcome {
+    pub stem: String,
+    pub elapsed: Duration,
+    pub result: Result<(), String>,
 }
 
-/// Runs every case as its own task with at most `permits` in flight (each
-/// case holds a store and may build indexes) and `budget` of wall time per
-/// case, timed from the moment it holds a permit; a case over budget is
-/// dropped, store included, before its permit is released. A panic or a
-/// timeout is an ordinary failed case, so the whole corpus always runs.
-/// `report` sees each outcome as it completes; the returned list is sorted
-/// by case name.
-async fn run_bounded(
-    cases: Vec<(String, PathBuf)>,
-    permits: usize,
-    budget: Duration,
-    run: CaseRunner,
-    report: &(dyn Fn(&CaseOutcome) + Sync),
-) -> Vec<CaseOutcome> {
-    let semaphore = Arc::new(Semaphore::new(permits));
-    let mut set: JoinSet<CaseOutcome> = JoinSet::new();
-    for (stem, path) in cases {
-        let semaphore = Arc::clone(&semaphore);
-        let run = Arc::clone(&run);
-        set.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("the case semaphore is never closed");
-            let started = Instant::now();
-            let case = AssertUnwindSafe(run(path)).catch_unwind();
-            let result = match tokio::time::timeout(budget, case).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(payload)) => Err(format!(
-                    "case panicked: {}",
-                    panic_message(payload.as_ref())
-                )),
-                Err(_) => Err(format!(
-                    "case exceeded its budget of {:.2}s while up to {permits} cases ran \
-                     concurrently ({CASE_TIMEOUT_ENV} overrides the default of \
-                     {DEFAULT_CASE_TIMEOUT_SECS}s, {JOBS_ENV} the concurrency; a case over \
-                     budget belongs in a `heavy-repro:` `#[ignore]`d test, not the corpus)",
-                    budget.as_secs_f64()
-                )),
-            };
-            CaseOutcome {
-                stem,
-                elapsed: started.elapsed(),
-                result,
-            }
-        });
-    }
-    let mut outcomes = Vec::new();
-    while let Some(joined) = set.join_next().await {
-        // The case itself is caught by `catch_unwind`; the task around it
-        // holds nothing that can panic.
-        let outcome = joined.expect("a case task never panics");
-        report(&outcome);
-        outcomes.push(outcome);
-    }
-    outcomes.sort_by(|a, b| a.stem.cmp(&b.stem));
-    outcomes
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn gq_logic_tests() {
-    let root = corpus_root();
-    let (mut files, foreign) = list_cases(&root);
-    assert!(
-        foreign.is_empty(),
-        "foreign entries under {}: {}; a mis-renamed, nested, or dot-prefixed case must never silently skip",
-        root.display(),
-        foreign.join(", ")
-    );
-    assert!(
-        !files.is_empty(),
-        "no .gqt cases found under {}; a broken checkout must never read as green",
-        root.display()
-    );
-    if let Ok(filter) = std::env::var("OMNIGRAPH_GQ_LOGIC_TESTS") {
-        let needles: Vec<String> = filter
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
-        if !needles.is_empty() {
-            files.retain(|p| {
-                p.file_name()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|name| needles.iter().any(|n| name.contains(n.as_str())))
-            });
-            assert!(
-                !files.is_empty(),
-                "OMNIGRAPH_GQ_LOGIC_TESTS={filter} matched no cases"
-            );
-        }
-    }
-    let bless = match std::env::var("OMNIGRAPH_GQ_BLESS") {
-        Err(_) => false,
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" || v.is_empty() => false,
-        Ok(v) => panic!("OMNIGRAPH_GQ_BLESS takes 1 (or 0/unset), got `{v}`"),
+/// Runs `case` (the future for one case, named `stem`) under `budget` of
+/// wall time, timed from its first poll; a case over budget is dropped,
+/// store included. A panic or a timeout is an ordinary failed case, so a
+/// corpus run always reaches every case.
+pub async fn run_bounded<F>(stem: &str, budget: Duration, case: F) -> CaseOutcome
+where
+    F: Future<Output = Result<(), String>>,
+{
+    let started = Instant::now();
+    let case = AssertUnwindSafe(case).catch_unwind();
+    let result = match tokio::time::timeout(budget, case).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(payload)) => Err(format!(
+            "case panicked: {}",
+            panic_message(payload.as_ref())
+        )),
+        Err(_) => Err(format!(
+            "case exceeded its budget of {:.2}s ({CASE_TIMEOUT_ENV} overrides the default of \
+             {DEFAULT_CASE_TIMEOUT_SECS}s; libtest's --test-threads sets how many cases run \
+             concurrently; a case over budget belongs in a `heavy-repro:` `#[ignore]`d test, \
+             not the corpus)",
+            budget.as_secs_f64()
+        )),
     };
-
-    if let Some(reason) =
-        traversal_override_refusal(std::env::var_os("OMNIGRAPH_TRAVERSAL_MODE").as_deref())
-    {
-        panic!("{reason}");
-    }
-    let permits = env_positive(JOBS_ENV)
-        .map(|n| {
-            usize::try_from(n)
-                .unwrap_or(usize::MAX)
-                .min(Semaphore::MAX_PERMITS)
-        })
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(1)
-        });
-    let budget =
-        Duration::from_secs(env_positive(CASE_TIMEOUT_ENV).unwrap_or(DEFAULT_CASE_TIMEOUT_SECS));
-
-    let total = files.len();
-    let cases = files
-        .into_iter()
-        .map(|path| (stem_of(&path), path))
-        .collect();
-    let runner: CaseRunner = Arc::new(move |path| Box::pin(run_case(path, bless)));
-    let report = |outcome: &CaseOutcome| {
-        let secs = outcome.elapsed.as_secs_f64();
-        match &outcome.result {
-            Ok(()) => println!("ok {} {secs:.2}s", outcome.stem),
-            Err(_) => println!("FAIL {} {secs:.2}s", outcome.stem),
-        }
-    };
-    let outcomes = run_bounded(cases, permits, budget, runner, &report).await;
-
-    let mut failures: Vec<(String, String)> = outcomes
-        .into_iter()
-        .filter_map(|outcome| {
-            let CaseOutcome { stem, result, .. } = outcome;
-            result.err().map(|detail| (stem, detail))
-        })
-        .collect();
-
-    if !failures.is_empty() {
-        failures.sort();
-        let mut msg = format!(
-            "{} of {total} gq logic test cases failed:\n",
-            failures.len()
-        );
-        for (stem, detail) in &failures {
-            let _ = write!(msg, "\n{stem}:\n  {}\n", detail.replace('\n', "\n  "));
-        }
-        panic!("{msg}");
+    CaseOutcome {
+        stem: stem.to_string(),
+        elapsed: started.elapsed(),
+        result,
     }
 }
 
-const HDR: &str = "# issue: none\n";
-const SCHEMA: &str = "--- schema\nnode Person {\n    name: String @key\n}\n";
-const SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n";
-const QUERY: &str =
-    "--- query\nquery all() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
-const EXPECT: &str = "--- expect unordered\n{\"p.name\": \"alice\"}\n";
-const MUTATE: &str = "--- mutate\nquery ins($n: String) {\n    insert Person { name: $n }\n}\n";
-const PARAMS: &str = "--- params\n{\"n\": \"bob\"}\n";
-const EXPECT_OK: &str = "--- expect ok\n";
-
-fn refusal(stem: &str, text: &str) -> String {
-    parse_case(stem, text).expect_err("expected the case to be refused")
-}
-
-#[test]
-fn parses_a_minimal_case() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    let case = parse_case("minimal", &text).unwrap();
-    assert_eq!(case.items.len(), 1);
-    assert!(!case.needs_indices);
-    assert_eq!(case.traversal, None);
-}
-
-#[test]
-fn header_notes_repeat_and_continuation_lines_are_refused() {
-    let text = format!(
-        "# issue: 7\n# red_on: 2026-01-01, the run\n# notes: returned 8,\n# notes: not 20.\n{SCHEMA}{SEED}{QUERY}{EXPECT}"
-    );
-    parse_case("issue_7_notes", &text).unwrap();
-    let text = format!(
-        "# issue: 7\n# red_on: 2026-01-01, the run\n#   returned 8: not 20.\n{SCHEMA}{SEED}{QUERY}{EXPECT}"
-    );
-    assert!(refusal("issue_7_x", &text).contains("unknown header key"));
-    // The three misspellings that the old prose branch swallowed silently.
-    for typo in [
-        "# Traversal: indexed",
-        "# traversal : indexed",
-        "# traversal=csr",
-    ] {
-        let text = format!("{HDR}{typo}\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-        let reason = refusal("x", &text);
-        assert!(
-            reason.contains("unknown header key") || reason.contains("not `# <key>: <value>`"),
-            "{typo}: {reason}"
-        );
-    }
-}
-
-/// Bounded exhaustive walk of the header-line typo space: key spelling,
-/// separator, leading and trailing whitespace, and the gap before the value.
-/// A line is accepted exactly when it equals the canonical
-/// `# traversal: indexed`, so a future key inherits the same proof.
-#[test]
-fn header_lines_are_accepted_only_in_canonical_form() {
-    let keys = [
-        "traversal",
-        "Traversal",
-        "TRAVERSAL",
-        "traversa1",
-        "traversal_",
-        " traversal",
-    ];
-    let seps = [":", " :", "=", "", "::"];
-    let leads = ["# ", "#", "#  ", " # "];
-    let gaps = [" ", "", "  ", "\t"];
-    let trails = ["", " ", "\t"];
-    let canonical = canonical_header_line("traversal", "indexed");
-    // Distinct lines: two lead/key pairs collide (`#` + ` traversal` = `# ` +
-    // `traversal`, and `# ` + ` traversal` = `#  ` + `traversal`), 120
-    // duplicates over the 1440 grid points, so the set is what gets walked.
-    let mut lines = std::collections::BTreeSet::new();
-    for lead in leads {
-        for key in keys {
-            for sep in seps {
-                for gap in gaps {
-                    for trail in trails {
-                        lines.insert(format!("{lead}{key}{sep}{gap}indexed{trail}"));
-                    }
-                }
-            }
-        }
-    }
-    assert_eq!(lines.len(), 1320, "the typo space is 1320 distinct lines");
-    let mut accepted = 0;
-    for line in &lines {
-        let text = format!("{HDR}{line}\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-        match parse_case("x", &text) {
-            Ok(case) => {
-                assert_eq!(line, &canonical, "accepted a non-canonical line");
-                assert_eq!(case.traversal, Some("indexed"));
-                accepted += 1;
-            }
-            Err(e) => assert_ne!(line, &canonical, "refused the canonical line: {e}"),
-        }
-    }
-    assert_eq!(accepted, 1);
-}
-
-#[test]
-fn refuses_missing_issue_header() {
-    let text = format!("# notes: no anchor\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("# issue:"));
-}
-
-#[test]
-fn refuses_numbered_issue_without_red_on() {
-    let text = format!("# issue: 7\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("issue_7_x", &text).contains("red_on"));
-}
-
-#[test]
-fn refuses_header_line_without_a_key() {
-    let text = format!("# stray prose\n{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("not `# <key>: <value>`"));
-}
-
-#[test]
-fn refuses_unknown_header_key() {
-    let text = format!("{HDR}# owner: me\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("unknown header key"));
-}
-
-#[test]
-fn refuses_bad_traversal_mode() {
-    let text = format!("{HDR}# traversal: bogus\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("indexed"));
-}
-
-#[test]
-fn refuses_non_header_line_before_first_section() {
-    let text = format!("{HDR}stray\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("precede the first section"));
-}
-
-#[test]
-fn refuses_comment_line_in_seed() {
-    let text = format!("{HDR}{SCHEMA}--- seed\n# a comment\n{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("seed"));
-}
-
-#[test]
-fn refuses_comment_line_in_expect_body() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n# nope\n");
-    assert!(refusal("x", &text).contains("expect"));
-}
-
-#[test]
-fn refuses_seed_before_schema() {
-    let text = format!("{HDR}{SEED}{SCHEMA}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("first section"));
-}
-
-#[test]
-fn refuses_missing_seed_section() {
-    let text = format!("{HDR}{SCHEMA}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("second section"));
-}
-
-#[test]
-fn refuses_case_without_a_query_or_mutate_step() {
-    let text = format!("{HDR}{SCHEMA}{SEED}");
-    assert!(refusal("x", &text).contains("at least one query or mutate step"));
-}
-
-#[test]
-fn refuses_restart_only_step_list() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- restart\n");
-    assert!(refusal("x", &text).contains("at least one query or mutate step"));
-}
-
-#[test]
-fn refuses_second_declaration_in_one_section() {
-    let two = "--- query\nquery a() {\n    match { $p: Person }\n    return { $p.name }\n}\nquery b() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{two}{EXPECT}");
-    assert!(refusal("x", &text).contains("exactly one declaration"));
-}
-
-#[test]
-fn refuses_mutation_declaration_under_query() {
-    let text = format!(
-        "{HDR}{SCHEMA}{SEED}--- query\nquery ins($n: String) {{\n    insert Person {{ name: $n }}\n}}\n{EXPECT}"
-    );
-    assert!(refusal("x", &text).contains("use `--- mutate`"));
-}
-
-#[test]
-fn refuses_read_declaration_under_mutate() {
-    let text = format!(
-        "{HDR}{SCHEMA}{SEED}--- mutate\nquery all() {{\n    match {{ $p: Person }}\n    return {{ $p.name }}\n}}\n{EXPECT_OK}"
-    );
-    assert!(refusal("x", &text).contains("use `--- query`"));
-}
-
-#[test]
-fn refuses_bare_expect() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect\n");
-    assert!(refusal("x", &text).contains("mode word"));
-}
-
-#[test]
-fn refuses_error_expect_without_substring() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect error:\n");
-    assert!(refusal("x", &text).contains("substring"));
-}
-
-#[test]
-fn refuses_error_expect_with_body() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect error: boom\nbody\n");
-    assert!(refusal("x", &text).contains("carries no body"));
-}
-
-#[test]
-fn refuses_affected_expect_missing_a_count() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}--- expect affected: nodes=1\n");
-    assert!(refusal("x", &text).contains("nodes=<N> edges=<M>"));
-}
-
-#[test]
-fn refuses_unknown_expect_mode() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect sorted\n");
-    assert!(refusal("x", &text).contains("unknown expect mode"));
-}
-
-#[test]
-fn refuses_row_expect_on_a_mutate_step() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT}");
-    assert!(refusal("x", &text).contains("carry no rows"));
-}
-
-#[test]
-fn refuses_ok_expect_on_a_query_step() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT_OK}");
-    assert!(refusal("x", &text).contains("a query step takes"));
-}
-
-#[test]
-fn refuses_query_step_without_expect() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}");
-    assert!(refusal("x", &text).contains("missing its `--- expect`"));
-}
-
-#[test]
-fn refuses_expect_with_no_step_to_bind_to() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- restart\n{EXPECT}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("no query or mutate step to bind to"));
-}
-
-#[test]
-fn refuses_params_without_a_step() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{PARAMS}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("directly follow"));
-}
-
-#[test]
-fn refuses_second_params_for_one_step() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{PARAMS}{EXPECT_OK}");
-    assert!(refusal("x", &text).contains("second `--- params`"));
-}
-
-#[test]
-fn refuses_restart_with_a_body() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- restart\nstray\n");
-    assert!(refusal("x", &text).contains("carries no body"));
-}
-
-#[test]
-fn refuses_unknown_section() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- teardown\n");
-    assert!(refusal("x", &text).contains("unknown section"));
-}
-
-#[test]
-fn refuses_schema_out_of_position() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SCHEMA}");
-    assert!(refusal("x", &text).contains("out of position"));
-}
-
-#[test]
-fn refuses_negative_loop_bound() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- loop $i -1 2\n{QUERY}{EXPECT}--- endloop\n");
-    assert!(refusal("x", &text).contains("non-negative"));
-}
-
-#[test]
-fn refuses_empty_loop_range() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- loop $i 3 3\n{QUERY}{EXPECT}--- endloop\n");
-    assert!(refusal("x", &text).contains("empty loop range"));
-}
-
-#[test]
-fn refuses_foreach_without_values() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- foreach $x\n{QUERY}{EXPECT}--- endloop\n");
-    assert!(refusal("x", &text).contains("no values"));
-}
-
-#[test]
-fn refuses_foreach_value_outside_charset() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- foreach $x a\"b\n{QUERY}{EXPECT}--- endloop\n");
-    assert!(refusal("x", &text).contains("[A-Za-z0-9_.-]"));
-}
-
-#[test]
-fn refuses_bad_loop_variable_name() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- loop $I 0 2\n{QUERY}{EXPECT}--- endloop\n");
-    assert!(refusal("x", &text).contains("$[a-z][a-z0-9_]*"));
-}
-
-#[test]
-fn refuses_nested_loops() {
-    let text = format!(
-        "{HDR}{SCHEMA}{SEED}--- loop $i 0 2\n--- loop $j 0 2\n{QUERY}{EXPECT}--- endloop\n--- endloop\n"
-    );
-    assert!(refusal("x", &text).contains("may not nest"));
-}
-
-#[test]
-fn refuses_endloop_without_a_loop() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- endloop\n");
-    assert!(refusal("x", &text).contains("without an open loop"));
-}
-
-#[test]
-fn refuses_unclosed_loop() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- loop $i 0 2\n{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("not closed"));
-}
-
-#[test]
-fn refuses_loop_enclosing_no_steps() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- loop $i 0 2\n--- endloop\n{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("enclosing no steps"));
-}
-
-#[test]
-fn refuses_substitution_marker_in_query_body() {
-    let query = "--- query\nquery all() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
-    let text =
-        format!("{HDR}{SCHEMA}{SEED}{query}{EXPECT}").replace("$p.name }", "$p.name } // ${i}");
-    assert!(refusal("x", &text).contains("only inside a params or expect body"));
-}
-
-#[test]
-fn refuses_substitution_marker_in_seed() {
-    let text = format!(
-        "{HDR}{SCHEMA}--- seed\n{{\"type\":\"Person\",\"data\":{{\"name\":\"${{i}}\"}}}}\n{QUERY}{EXPECT}"
-    );
-    assert!(refusal("x", &text).contains("only inside a params or expect body"));
-}
-
-#[test]
-fn refuses_substitution_outside_a_loop() {
-    let text =
-        format!("{HDR}{SCHEMA}{SEED}{MUTATE}--- params\n{{\"n\": \"${{who}}\"}}\n{EXPECT_OK}");
-    assert!(refusal("x", &text).contains("outside a loop"));
-}
-
-#[test]
-fn refuses_substitution_naming_the_wrong_variable() {
-    let text = format!(
-        "{HDR}{SCHEMA}{SEED}--- foreach $who bob\n{MUTATE}--- params\n{{\"n\": \"${{other}}\"}}\n{EXPECT_OK}--- endloop\n"
-    );
-    assert!(refusal("x", &text).contains("enclosing loop's variable"));
-}
-
-#[test]
-fn refuses_unterminated_substitution() {
-    let text = format!(
-        "{HDR}{SCHEMA}{SEED}--- foreach $who bob\n{MUTATE}--- params\n{{\"n\": \"${{who\n{EXPECT_OK}--- endloop\n"
-    );
-    assert!(refusal("x", &text).contains("unterminated"));
-}
-
-#[test]
-fn refuses_file_name_disagreeing_with_issue_header() {
-    let text = format!("# issue: 7\n# red_on: 2026-01-01, red.\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("issue_8_wrong", &text).contains("disagrees"));
-}
-
-#[test]
-fn refuses_issue_prefix_without_number_or_short_name() {
-    let text = format!("# issue: 7\n# red_on: 2026-01-01, red.\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("issue_7", &text).contains("issue_<N>_<short_name>"));
-    assert!(refusal("issue_x", &text).contains("issue_<N>_<short_name>"));
-}
-
-#[test]
-fn refuses_feature_name_with_numbered_issue_header() {
-    let text = format!("# issue: 7\n# red_on: 2026-01-01, red.\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("feature_name", &text).contains("issue_7_<short_name>"));
+/// [`run_bounded`] over [`run_case`] for the file at `path`.
+pub async fn run_case_bounded(path: PathBuf, budget: Duration, bless: bool) -> CaseOutcome {
+    let stem = stem_of(&path);
+    run_bounded(&stem, budget, run_case(path, bless)).await
 }
 
-#[test]
-fn refuses_file_name_outside_charset() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("Bad-Name", &text).contains("[a-z0-9_]"));
-}
-
-#[test]
-fn refuses_ordered_expect_without_an_order_clause() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect ordered\n{{\"p.name\": \"alice\"}}\n");
-    assert!(refusal("x", &text).contains("order` clause"));
-}
-
-#[test]
-fn refuses_embed_schema() {
-    let schema = "--- schema\nnode Doc {\n    slug: String @key\n    text: String\n    vec: Vector(4) @embed(\"text\")\n}\n";
-    let seed = "--- seed\n";
-    let text = format!("{HDR}{schema}{seed}{QUERY}{EXPECT}")
-        .replace("$p: Person", "$p: Doc")
-        .replace("$p.name", "$p.slug");
-    assert!(refusal("x", &text).contains("@embed"));
-}
-
-#[test]
-fn refuses_nearest_over_a_string_literal() {
-    let query = "--- query\nquery q() {\n    match { $p: Person }\n    return { $p.name }\n    order { nearest($p.name, \"alpha\") }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
-    assert!(refusal("x", &text).contains("string argument"));
-}
-
-#[test]
-fn refuses_nearest_over_a_string_param() {
-    let query = "--- query\nquery q($q: String) {\n    match { $p: Person }\n    return { $p.name }\n    order { nearest($p.name, $q) }\n}\n";
-    let text = format!(
-        "{HDR}{SCHEMA}{SEED}{query}--- params\n{{\"q\": \"alpha\"}}\n--- expect unordered\n"
-    );
-    assert!(refusal("x", &text).contains("string argument"));
-}
-
-#[test]
-fn accepts_empty_expect_body_as_empty_result_assertion() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n");
-    parse_case("x", &text).unwrap();
-}
-
-#[test]
-fn search_construct_sets_the_index_decision() {
-    let schema = "--- schema\nnode Doc {\n    slug: String @key\n    text: String @index\n}\n";
-    let query = "--- query\nquery q($q: String) {\n    match {\n        $d: Doc\n        search($d.text, $q)\n    }\n    return { $d.slug }\n}\n";
-    let text = format!(
-        "{HDR}{schema}--- seed\n{query}--- params\n{{\"q\": \"needle\"}}\n--- expect unordered\n"
-    );
-    let case = parse_case("x", &text).unwrap();
-    assert!(case.needs_indices);
-}
-
-#[test]
-fn normalization_equates_integer_and_float_spellings() {
-    let a: Value = serde_json::from_str("{\"total\": 2}").unwrap();
-    let b: Value = serde_json::from_str("{\"total\": 2.0}").unwrap();
-    assert_eq!(canonical_json(&a), canonical_json(&b));
-}
-
-#[test]
-fn normalization_does_not_collapse_large_integers() {
-    let a: Value = serde_json::from_str("{\"n\": 9007199254740993}").unwrap();
-    let b: Value = serde_json::from_str("{\"n\": 9007199254740992}").unwrap();
-    assert_ne!(canonical_json(&a), canonical_json(&b));
-}
-
-#[test]
-fn normalization_ignores_noise_below_scale_12() {
-    let a: Value = serde_json::from_str("{\"x\": 0.1000000000000001}").unwrap();
-    let b: Value = serde_json::from_str("{\"x\": 0.1}").unwrap();
-    assert_eq!(canonical_json(&a), canonical_json(&b));
-}
-
-#[test]
-fn canonical_form_sorts_object_keys_and_recurses() {
-    let a: Value = serde_json::from_str("{\"b\": [{\"z\": 1, \"a\": 2}], \"a\": null}").unwrap();
-    assert_eq!(canonical_json(&a), "{\"a\":null,\"b\":[{\"a\":2,\"z\":1}]}");
-}
-
-#[test]
-fn unordered_comparison_is_multiset_equality() {
-    let rows = |s: &str| -> Vec<Value> {
-        s.lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
-    };
-    let expected = rows("{\"n\": 1}\n{\"n\": 1}\n{\"n\": 2}");
-    let actual = rows("{\"n\": 2}\n{\"n\": 1}\n{\"n\": 1}");
-    compare_rows(&expected, &actual, false).unwrap();
-    let missing_dup = rows("{\"n\": 1}\n{\"n\": 2}");
-    assert!(compare_rows(&expected, &missing_dup, false).is_err());
-}
-
-#[test]
-fn ordered_comparison_is_positional() {
-    let rows = |s: &str| -> Vec<Value> {
-        s.lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
-    };
-    let expected = rows("{\"n\": 1}\n{\"n\": 2}");
-    let swapped = rows("{\"n\": 2}\n{\"n\": 1}");
-    assert!(compare_rows(&expected, &swapped, true).is_err());
-    compare_rows(&expected, &expected.clone(), true).unwrap();
-}
-
-#[tokio::test]
-async fn execution_reports_a_row_mismatch() {
-    let text =
-        format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n");
-    let case = parse_case("mismatch", &text).unwrap();
-    let err = execute_case(&case, Path::new("unused.gqt"), false)
-        .await
-        .unwrap_err();
-    assert!(err.contains("row mismatch"), "got: {err}");
-    assert!(err.contains("step 1 (query)"), "got: {err}");
-}
-
-#[tokio::test]
-async fn bless_rewrites_the_failing_expect_and_converges() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bless_case.gqt");
-    let text =
-        format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n");
-    std::fs::write(&path, &text).unwrap();
-    let case = parse_case("bless_case", &text).unwrap();
-    let err = execute_case(&case, &path, true).await.unwrap_err();
-    assert!(err.contains("expect rewritten"), "got: {err}");
-
-    let blessed = std::fs::read_to_string(&path).unwrap();
-    assert!(blessed.contains("{\"p.name\":\"alice\"}"), "got: {blessed}");
-    let case = parse_case("bless_case", &blessed).unwrap();
-    execute_case(&case, &path, false).await.unwrap();
-}
-
-#[test]
-fn refuses_duplicate_issue_header() {
-    let text = format!("{HDR}# issue: none\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("x", &text).contains("duplicate"));
-}
-
-#[test]
-fn refuses_empty_red_on_value() {
-    let text = format!("# issue: 7\n# red_on: \n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("issue_7_x", &text).contains("needs a value"));
-    let text = format!("# issue: 7\n# red_on:\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("issue_7_x", &text).contains("not `# <key>: <value>`"));
-}
-
-#[test]
-fn refuses_noncanonical_issue_header_number() {
-    let text = format!("# issue: 0563\n# red_on: 2026-01-01, red.\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("issue_563_x", &text).contains("no sign or leading zeros"));
-    let text = format!("# issue: +563\n# red_on: 2026-01-01, red.\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("issue_563_x", &text).contains("no sign or leading zeros"));
-}
-
-#[test]
-fn refuses_leading_zero_issue_digits() {
-    let text = format!("# issue: 7\n# red_on: 2026-01-01, red.\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    assert!(refusal("issue_007_x", &text).contains("leading zeros"));
-}
-
-#[test]
-fn refuses_arguments_on_bare_sections() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- restart now\n");
-    assert!(refusal("x", &text).contains("takes no arguments"));
-    let junk_query =
-        "--- query fast\nquery all() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{junk_query}{EXPECT}");
-    assert!(refusal("x", &text).contains("takes no arguments"));
-}
-
-#[test]
-fn refuses_crlf_line_endings() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}").replace('\n', "\r\n");
-    assert!(refusal("x", &text).contains("line endings"));
-}
-
-#[test]
-fn refuses_loop_range_over_the_cap() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- loop $i 0 10001\n{QUERY}{EXPECT}--- endloop\n");
-    assert!(refusal("x", &text).contains("10000 cap"));
-}
-
-#[test]
-fn refuses_signed_or_padded_numeric_tokens() {
-    let text =
-        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}--- expect affected: nodes=+1 edges=0\n");
-    assert!(refusal("x", &text).contains("nodes=<N> edges=<M>"));
-    let text = format!("{HDR}{SCHEMA}{SEED}--- loop $i 00 2\n{QUERY}{EXPECT}--- endloop\n");
-    assert!(refusal("x", &text).contains("plain decimal"));
-}
-
-#[test]
-fn refuses_ok_expect_with_body() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}--- expect ok\nstray\n");
-    assert!(refusal("x", &text).contains("carries no body"));
-}
-
-#[test]
-fn refuses_affected_expect_with_body() {
-    let text =
-        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}--- expect affected: nodes=1 edges=0\nstray\n");
-    assert!(refusal("x", &text).contains("carries no body"));
-}
-
-#[test]
-fn refuses_schema_inside_a_loop() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- foreach $x a\n{SCHEMA}{QUERY}{EXPECT}--- endloop\n");
-    assert!(refusal("x", &text).contains("out of position"));
-}
-
-#[test]
-fn refuses_loop_headers_with_a_body() {
-    let text = format!("{HDR}{SCHEMA}{SEED}--- loop $i 0 2\nstray\n{QUERY}{EXPECT}--- endloop\n");
-    assert!(refusal("x", &text).contains("carries no body"));
-    let text = format!("{HDR}{SCHEMA}{SEED}--- loop $i 0 2\n{QUERY}{EXPECT}--- endloop\nstray\n");
-    assert!(refusal("x", &text).contains("carries no body"));
-}
-
-#[test]
-fn refuses_nearest_over_a_string_property() {
-    let query = "--- query\nquery q() {\n    match { $p: Person }\n    return { $p.name }\n    order { nearest($p.name, $p.name) }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
-    assert!(refusal("x", &text).contains("vector parameter"));
-}
-
-#[test]
-fn traversal_header_forces_index_builds() {
-    let text = format!("{HDR}# traversal: indexed\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    let case = parse_case("x", &text).unwrap();
-    assert!(case.needs_indices);
-    assert_eq!(case.traversal, Some("indexed"));
-}
-
-#[test]
-fn pin_violation_names_the_path_that_ran() {
-    assert_eq!(pin_violation("indexed", 3, 0, true), None);
-    assert_eq!(pin_violation("csr", 0, 2, true), None);
-    assert_eq!(pin_violation("indexed", 0, 0, false), None);
-    let v = pin_violation("indexed", 1, 2, false).unwrap();
-    assert!(
-        v.contains("pinned `indexed`, ran `csr` on 2 expand(s)"),
-        "{v}"
-    );
-    let v = pin_violation("csr", 4, 0, false).unwrap();
-    assert!(
-        v.contains("pinned `csr`, ran `indexed` on 4 expand(s)"),
-        "{v}"
-    );
-    // A step that must expand and shows nothing on the pinned path: the
-    // pin and the probes were dropped together.
-    let v = pin_violation("indexed", 0, 0, true).unwrap();
-    assert!(v.contains("no expand ran on it"), "{v}");
-    let v = pin_violation("csr", 0, 0, true).unwrap();
-    assert!(v.contains("no expand ran on it"), "{v}");
-}
-
-#[test]
-fn expects_expand_ignores_bound_edges_and_plain_bindings() {
-    let unbound = parse_query(TRAVERSAL_QUERY.trim_start_matches("--- query\n")).unwrap();
-    assert!(expects_expand(&unbound.queries[0].match_clause));
-    let bound = "query f($n: String) {\n    match {\n        $a: Person\n        $a.name = $n\n        \
-                 $a $k:knows $b\n    }\n    return { $b.name }\n}\n";
-    let bound = parse_query(bound).unwrap();
-    assert!(!expects_expand(&bound.queries[0].match_clause));
-    let plain = parse_query(QUERY.trim_start_matches("--- query\n")).unwrap();
-    assert!(!expects_expand(&plain.queries[0].match_clause));
-    let negated = "query f() {\n    match {\n        $a: Person\n        not { $a knows $x }\n    }\n    \
-                   return { $a.name }\n}\n";
-    let negated = parse_query(negated).unwrap();
-    assert!(!expects_expand(&negated.queries[0].match_clause));
-}
-
-/// A two-node, one-edge graph with a one-hop traversal, for the pin tests.
-const TRAVERSAL_SCHEMA: &str = "--- schema\nnode Person {\n    name: String @key\n}\n\n\
-                                edge Knows: Person -> Person {\n    since: I64\n}\n";
-const TRAVERSAL_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n\
-                              {\"type\":\"Person\",\"data\":{\"name\":\"bob\"}}\n\
-                              {\"edge\":\"Knows\",\"from\":\"alice\",\"to\":\"bob\",\"data\":{\"id\":\"k-1\",\"since\":2020}}\n";
-const TRAVERSAL_QUERY: &str = "--- query\nquery friends($n: String) {\n    match {\n        $a: Person\n        \
-                               $a.name = $n\n        $a knows $b\n    }\n    return { $b.name }\n}\n";
-const TRAVERSAL_PARAMS: &str = "--- params\n{\"n\": \"alice\"}\n";
-const TRAVERSAL_EXPECT: &str = "--- expect unordered\n{\"b.name\": \"bob\"}\n";
-
-/// The pin reaches the executor on both paths: a pinned step runs its
-/// expands on the pinned path only, and the probes see them (a zero count
-/// on both paths would make the check vacuous).
-#[tokio::test]
-async fn pinned_step_runs_only_its_pinned_path() {
-    for (mode, expect_indexed) in [("indexed", true), ("csr", false)] {
-        let text = format!(
-            "{HDR}# traversal: {mode}\n{TRAVERSAL_SCHEMA}{TRAVERSAL_SEED}{TRAVERSAL_QUERY}{TRAVERSAL_PARAMS}{TRAVERSAL_EXPECT}"
-        );
-        let case = parse_case("pinned", &text).unwrap();
-        execute_case(&case, Path::new("unused.gqt"), false)
-            .await
-            .unwrap_or_else(|e| panic!("{mode}: {e}"));
-
-        let (db, _uri, _dir) = open_case_store(&case).await.unwrap();
-        let Some(Item::Step(Step::Query(step))) = case.items.first() else {
-            panic!("first item is the query step");
-        };
-        let params = build_params(step.params_raw.as_ref(), &step.ast_params, None).unwrap();
-        let (outcome, counts) = under_traversal(
-            Some(mode),
-            db.query(
-                ReadTarget::branch("main"),
-                &step.source,
-                &step.name,
-                &params,
-            ),
-        )
-        .await;
-        outcome.unwrap();
-        let counts = counts.unwrap();
-        let (indexed, csr) = (
-            counts.indexed.load(Ordering::Relaxed),
-            counts.csr.load(Ordering::Relaxed),
-        );
-        if expect_indexed {
-            assert!(
-                indexed >= 1 && csr == 0,
-                "{mode}: indexed={indexed} csr={csr}"
-            );
-        } else {
-            assert!(
-                csr >= 1 && indexed == 0,
-                "{mode}: indexed={indexed} csr={csr}"
-            );
-        }
-    }
-}
-
-#[test]
-fn refuses_ordered_expect_on_an_rrf_led_order() {
-    let query = "--- query\nquery q($v: Vector(4), $t: String) {\n    match { $p: Person }\n    \
-                 return { $p.name }\n    order { rrf(nearest($p.vec, $v), bm25($p.name, $t)) }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
-    let message = refusal("x", &text);
-    assert!(message.contains("led by `rrf()`"), "{message}");
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
-    parse_case("x", &text).unwrap();
-}
-
-#[test]
-fn refuses_ordered_expect_with_an_aggregate_in_return() {
-    let query = "--- query\nquery q($t: String) {\n    match { $p: Person\n        search($p.name, $t) }\n    \
-                 return { count($p) as total }\n    order { bm25($p.name, $t) }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
-    assert!(refusal("x", &text).contains("aggregate in its `return` list"));
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
-    parse_case("x", &text).unwrap();
-}
-
-fn synthetic_cases(names: &[&str]) -> Vec<(String, PathBuf)> {
-    names
-        .iter()
-        .map(|n| ((*n).to_string(), PathBuf::from(format!("{n}.gqt"))))
-        .collect()
-}
-
-fn no_report(_: &CaseOutcome) {}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn walker_bounds_cases_in_flight() {
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    let max_seen = Arc::new(AtomicUsize::new(0));
-    let names: Vec<String> = (0..12).map(|i| format!("c{i:02}")).collect();
-    let cases = synthetic_cases(&names.iter().map(String::as_str).collect::<Vec<_>>());
-    // Every permit holder waits at a 3-party barrier, so the three are in
-    // flight together (max == 3) or the walker admitted fewer than three
-    // and the barrier never releases: the outer timeout turns that hang
-    // into a failure instead of a stall. Twelve cases = four generations.
-    let barrier = Arc::new(tokio::sync::Barrier::new(3));
-    let (counter, max) = (Arc::clone(&in_flight), Arc::clone(&max_seen));
-    let runner: CaseRunner = Arc::new(move |_| {
-        let (counter, max, barrier) =
-            (Arc::clone(&counter), Arc::clone(&max), Arc::clone(&barrier));
-        Box::pin(async move {
-            let now = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            max.fetch_max(now, Ordering::SeqCst);
-            barrier.wait().await;
-            counter.fetch_sub(1, Ordering::SeqCst);
-            Ok(())
-        })
-    });
-    let outcomes = tokio::time::timeout(
-        Duration::from_secs(30),
-        run_bounded(cases, 3, Duration::from_secs(10), runner, &no_report),
-    )
-    .await
-    .expect("fewer than three cases in flight: the barrier never released");
-    assert_eq!(outcomes.len(), 12);
-    assert!(outcomes.iter().all(|o| o.result.is_ok()), "{outcomes:?}");
-    assert_eq!(max_seen.load(Ordering::SeqCst), 3);
-    assert_eq!(in_flight.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn walker_reports_in_completion_order_and_returns_sorted() {
-    // Completion is forced into the order c2, c1, c0 by hand-offs, not by
-    // sleep lengths: c2 returns at once; c1 waits until c2 is reported;
-    // c0 waits until c1 is reported.
-    let gates: Arc<[tokio::sync::Notify; 2]> =
-        Arc::new([tokio::sync::Notify::new(), tokio::sync::Notify::new()]);
-    let runner_gates = Arc::clone(&gates);
-    let runner: CaseRunner = Arc::new(move |path| {
-        let gates = Arc::clone(&runner_gates);
-        let idx: usize = path.file_stem().unwrap().to_str().unwrap()[1..]
-            .parse()
-            .unwrap();
-        Box::pin(async move {
-            if idx < 2 {
-                gates[idx].notified().await;
-            }
-            Ok(())
-        })
-    });
-    let reported = std::sync::Mutex::new(Vec::new());
-    let report = |o: &CaseOutcome| {
-        reported.lock().unwrap().push(o.stem.clone());
-        match o.stem.as_str() {
-            "c2" => gates[1].notify_one(),
-            "c1" => gates[0].notify_one(),
-            _ => {}
-        }
-    };
-    let cases = synthetic_cases(&["c0", "c1", "c2"]);
-    let outcomes = tokio::time::timeout(
-        Duration::from_secs(30),
-        run_bounded(cases, 3, Duration::from_secs(10), runner, &report),
-    )
-    .await
-    .expect("a hand-off never arrived");
-    let returned: Vec<&str> = outcomes.iter().map(|o| o.stem.as_str()).collect();
-    assert_eq!(returned, ["c0", "c1", "c2"]);
-    assert_eq!(*reported.lock().unwrap(), ["c2", "c1", "c0"]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn walker_budget_starts_at_the_permit_not_at_spawn() {
-    let runner: CaseRunner = Arc::new(|_| {
-        Box::pin(async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            Ok(())
-        })
-    });
-    let cases = synthetic_cases(&["a", "b", "c"]);
-    // One permit: the third case waits ~600 ms in the queue, past the
-    // 500 ms budget that its own 300 ms of work stays under; the margins
-    // are wide because libtest runs this beside the corpus walker.
-    let outcomes = run_bounded(cases, 1, Duration::from_millis(500), runner, &no_report).await;
-    assert!(outcomes.iter().all(|o| o.result.is_ok()), "{outcomes:?}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn walker_fails_a_case_over_its_budget_and_runs_the_rest() {
-    let runner: CaseRunner = Arc::new(|path| {
-        Box::pin(async move {
-            if path.starts_with("slow.gqt") {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
-            Ok(())
-        })
-    });
-    let cases = synthetic_cases(&["slow", "quick"]);
-    let outcomes = run_bounded(cases, 1, Duration::from_millis(50), runner, &no_report).await;
-    let quick = &outcomes[0];
-    assert_eq!(quick.stem, "quick");
-    assert!(quick.result.is_ok(), "{quick:?}");
-    let slow = &outcomes[1];
-    assert_eq!(slow.stem, "slow");
-    assert!(
-        slow.elapsed < Duration::from_secs(5),
-        "timeout did not cut the case short"
-    );
-    let err = slow.result.as_ref().unwrap_err();
-    assert!(err.contains("budget of 0.05s"), "{err}");
-    assert!(err.contains("up to 1 cases"), "{err}");
-    assert!(err.contains(CASE_TIMEOUT_ENV), "{err}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn walker_records_a_panicking_case_and_runs_the_rest() {
-    let runner: CaseRunner = Arc::new(|path| {
-        Box::pin(async move {
-            if path.starts_with("p.gqt") {
-                panic!("boom");
-            }
-            Ok(())
-        })
-    });
-    let cases = synthetic_cases(&["p", "q"]);
-    let outcomes = run_bounded(cases, 1, Duration::from_secs(10), runner, &no_report).await;
-    let err = outcomes[0].result.as_ref().unwrap_err();
-    assert!(err.starts_with("case panicked: boom"), "{err}");
-    assert!(outcomes[1].result.is_ok(), "{:?}", outcomes[1]);
-}
-
-#[test]
-fn walker_refuses_a_process_traversal_override() {
-    assert!(traversal_override_refusal(None).is_none());
-    let reason = traversal_override_refusal(Some(OsStr::new("csr"))).unwrap();
-    assert!(reason.contains("OMNIGRAPH_TRAVERSAL_MODE=csr"), "{reason}");
-    assert!(reason.contains("# traversal:"), "{reason}");
-}
-
-/// Same name battery as `scripts/check-fix-regression.py --self-test`
-/// (`corpus_case`): the walker and the gate must agree on what a case is.
-#[test]
-fn walker_flags_foreign_corpus_entries() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a.gqt"), "x").unwrap();
-    std::fs::write(dir.path().join("b.txt"), "x").unwrap();
-    std::fs::write(dir.path().join(".hidden.gqt"), "x").unwrap();
-    std::fs::write(dir.path().join(".DS_Store"), "x").unwrap();
-    std::fs::write(dir.path().join("c.GQT"), "x").unwrap();
-    std::fs::create_dir(dir.path().join("nested")).unwrap();
-    std::fs::write(dir.path().join("nested").join("d.gqt"), "x").unwrap();
-    let (files, foreign) = list_cases(dir.path());
-    assert_eq!(files, vec![dir.path().join("a.gqt")]);
-    assert_eq!(
-        foreign,
-        vec![
-            ".hidden.gqt".to_string(),
-            "b.txt".to_string(),
-            "c.GQT".to_string(),
-            "nested".to_string()
-        ]
-    );
-}
-
-#[tokio::test]
-async fn bless_refuses_cases_containing_loops() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bless_loop_case.gqt");
-    let text = format!(
-        "{HDR}{SCHEMA}{SEED}--- foreach $x a b\n{QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n--- endloop\n"
-    );
-    std::fs::write(&path, &text).unwrap();
-    let case = parse_case("bless_loop_case", &text).unwrap();
-    let err = execute_case(&case, &path, true).await.unwrap_err();
-    assert!(err.contains("bless: refused"), "got: {err}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-}
-
-#[tokio::test]
-async fn bless_never_rewrites_on_a_kind_mismatch() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bless_kind_case.gqt");
-    let query = "--- query\nquery q() {\n    match { $p: Person }\n    return { $p.nope }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n{{\"p.nope\": \"x\"}}\n");
-    std::fs::write(&path, &text).unwrap();
-    let case = parse_case("bless_kind_case", &text).unwrap();
-    let err = execute_case(&case, &path, true).await.unwrap_err();
-    assert!(err.contains("query failed"), "got: {err}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-}
-
-#[tokio::test]
-async fn params_refusal_satisfies_an_error_expect() {
-    let query = "--- query\nquery q($q: String) {\n    match {\n        $p: Person\n        $p.name = $q\n    }\n    return { $p.name }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect error: q\n");
-    let case = parse_case("x", &text).unwrap();
-    execute_case(&case, Path::new("unused.gqt"), false)
-        .await
-        .unwrap();
-}
-
-#[test]
-fn bless_splice_preserves_the_trailing_blank_separator() {
-    let original = "--- expect unordered\nold\n\n--- restart\n";
-    let span = BodySpan {
-        start_line: 1,
-        len: 2,
-    };
-    let rows = vec!["{\"n\":1}".to_string()];
-    let out = splice_lines(original, span, &rows);
-    assert_eq!(out, "--- expect unordered\n{\"n\":1}\n\n--- restart\n");
-}
-
-#[test]
-fn bless_splice_replaces_only_the_expect_body() {
-    let original = "--- query\nq\n--- expect unordered\nold row\nold row 2\n--- restart\n";
-    let span = BodySpan {
-        start_line: 3,
-        len: 2,
-    };
-    let rows = vec!["{\"n\":1}".to_string()];
-    let out = splice_lines(original, span, &rows);
-    assert_eq!(
-        out,
-        "--- query\nq\n--- expect unordered\n{\"n\":1}\n--- restart\n"
-    );
-}
-
-#[test]
-fn bless_splice_inserts_into_an_empty_expect_body() {
-    let original = "--- expect unordered\n--- restart\n";
-    let span = BodySpan {
-        start_line: 1,
-        len: 0,
-    };
-    let rows = vec!["{\"n\":1}".to_string()];
-    let out = splice_lines(original, span, &rows);
-    assert_eq!(out, "--- expect unordered\n{\"n\":1}\n--- restart\n");
-}
+#[cfg(test)]
+mod tests;

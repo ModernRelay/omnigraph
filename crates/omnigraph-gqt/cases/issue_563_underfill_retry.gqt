@@ -5,7 +5,7 @@
 # notes: the uncapped retry ran. Passes on pre-cap code too (an unbounded scan
 # notes: finds everything): this case guards the retry GIVEN the cap, not the cap
 # notes: itself; the cap is the aggregate case's job. Rust twin:
-# notes: bm25_join_fills_limit_when_capped_scan_underfills_issue_563 (tests/search.rs).
+# notes: bm25_join_fills_limit_when_capped_scan_underfills_issue_563 (crates/omnigraph/tests/search.rs).
 
 --- schema
 node Chunk {

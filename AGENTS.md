@@ -34,7 +34,8 @@ Tools that support `@` imports include these automatically:
 - Storage substrate: Lance 11.0.0
 - Workspace: compiler, storage, engine (`omnigraph-engine` package), policy,
   API types, cluster, CLI, server, Azure admission wrapper, benchmark harness,
-  and `omnigraph-dst` (deterministic simulation testing; needs
+  `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
+  test per case), and `omnigraph-dst` (deterministic simulation testing; needs
   `--cfg tokio_unstable`, set by its crate-local `.cargo/config.toml` when
   cargo runs from the crate dir — compiles empty without it)
 - License: MIT
@@ -152,7 +153,7 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 - For a bug, reproduce the predicted failure at the tier the regression rule
   below names, then fix the root cause and prove the regression turns green.
 - Query-behavior tests default to `.gqt` logic tests under
-  `crates/omnigraph/tests/gq_logic_tests/`; a Rust test needs a reason the
+  `crates/omnigraph-gqt/cases/`; a Rust test needs a reason the
   logic test format cannot express (mechanism assertions, scale symptoms,
   process environment, concurrency).
 - Every issue fix lands a regression test at the cheapest tier that catches

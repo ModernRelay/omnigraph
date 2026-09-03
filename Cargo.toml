@@ -12,6 +12,7 @@ members = [
     "crates/omnigraph-policy",
     "crates/omnigraph-server",
     "crates/omnigraph-dst",
+    "crates/omnigraph-gqt",
     "tools/omnigraph-vocabulary-guard",
 ]
 default-members = [

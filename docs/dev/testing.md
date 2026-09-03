@@ -25,6 +25,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `lane_b.rs`, `torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the crate-local `.cargo/config.toml` sets it when cargo runs from the crate dir; every test file is `#![cfg(tokio_unstable)]`-gated and the crate compiles empty without it, so the default workspace gate is unaffected). `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
+| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus in-source format self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; format in RFC 0045 |
 
 Do not copy server or CLI process setup into a new suite. Their support modules own hermetic configuration, binary startup, temporary roots, and common assertions.
 
@@ -35,7 +36,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Concern | Existing owners |
 |---|---|
 | Initialization and representative journeys | `lifecycle.rs`, `end_to_end.rs`, `composite_flow.rs`, `consistency.rs` |
-| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs`, `gq_logic_tests.rs` (walks the `.gqt` cases under `tests/gq_logic_tests/`) |
+| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs`; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
 | Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs`, `rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
 | Branches, snapshots, diffs, and merges | `branching.rs`, `point_in_time.rs`, `changes.rs`, `merge_truth_table.rs`, `merge_fast_forward.rs` |
@@ -96,22 +97,29 @@ Focused iteration:
 ```bash
 cargo test -p omnigraph-engine --test traversal
 cargo test -p omnigraph-engine --test writes concurrent
-cargo test -p omnigraph-engine --test gq_logic_tests
+cargo test -p omnigraph-gqt                                      # every .gqt case + the format self-tests
+cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # the cases whose file name contains issue_563
+cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
 cargo test -p omnigraph-server --test data_routes
 cargo test -p omnigraph-cli --test cli_data
 cargo test -p omnigraph-cluster --test failpoints --features failpoints
 cargo test -p omnigraph-bench --locked
 ```
 
-`OMNIGRAPH_GQ_LOGIC_TESTS=<substr>[,<substr>]` restricts the gq logic-test run
-to case files whose name contains a value; `OMNIGRAPH_GQ_BLESS=1` rewrites the
-failing step's expect rows in place (local workflow only, never CI). The walker
-keeps at most `OMNIGRAPH_GQ_JOBS=<n>` cases in flight (default: the machine's
-available parallelism) and fails a case that exceeds
-`OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>` seconds (default 10); every `ok`/`FAIL`
-line carries the case's elapsed time, and a case over budget belongs in a
-`heavy-repro:` `#[ignore]`d test under `tests/repro_issue_*.rs`, not the
-corpus.
+Every `.gqt` case is its own libtest test named `case::<file>.gqt`, registered
+at run time (`datatest-stable`), so the ordinary name filter selects cases, a
+case-only pull request needs no Rust change, and `cargo-nextest` sees each
+case (an IDE's test-results view lists cases from the
+libtest-shaped output; no per-case gutter runnable exists, since no source
+item does). `--test-threads=<n>` bounds how many cases run
+concurrently (default: the machine's available parallelism); each case fails
+if it exceeds `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>` seconds (default 10);
+`OMNIGRAPH_GQ_BLESS=1` rewrites the failing step's expect rows in place (local
+workflow only, never CI). Every `ok`/`FAIL` line carries the case's elapsed
+time, and a case over budget belongs in a `heavy-repro:` `#[ignore]`d test
+under `crates/omnigraph/tests/repro_issue_*.rs`, not the corpus. A name filter
+that matches no case is libtest's ordinary green zero-test run; read the
+`filtered out` count.
 
 Canonical workspace graph:
 

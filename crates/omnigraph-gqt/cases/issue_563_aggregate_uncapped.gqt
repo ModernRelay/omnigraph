@@ -2,7 +2,7 @@
 # red_on: 2026-08-29, pre-fix build: the bm25 scan cap (limit 2 x 4 = 8 rows) fed count() only the capped window, so total was 8, not 20.
 # notes: an aggregate's value is computed over the matching rows, so the BM25
 # notes: scan cap must never apply to aggregate returns. Rust twin:
-# notes: bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan (tests/search.rs).
+# notes: bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan (crates/omnigraph/tests/search.rs).
 # notes: Seed geometry: 20 chunks all matching "needle", strict tf gradient
 # notes: (tf = 20 - c) so BM25 has a real order with no ties.
 
