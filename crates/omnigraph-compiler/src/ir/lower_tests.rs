@@ -39,6 +39,170 @@ return { $f.name, $f.age }
     assert_eq!(ir.return_exprs.len(), 2);
 }
 
+fn lower(catalog: &Catalog, text: &str) -> QueryIR {
+    let qf = parse_query(text).unwrap();
+    let tc = typecheck_query(catalog, &qf.queries[0]).unwrap();
+    lower_query(catalog, &qf.queries[0], &tc).unwrap()
+}
+
+fn expand_dsts(ir: &QueryIR) -> Vec<&str> {
+    ir.pipeline
+        .iter()
+        .filter_map(|op| match op {
+            IROp::Expand { dst_var, .. } => Some(dst_var.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn test_lower_anonymous_destinations_get_distinct_names() {
+    let ir = lower(
+        &setup(),
+        "query q() { match { $p: Person  $p knows $_  $p knows $_ } return { $p.name } }",
+    );
+    let dsts = expand_dsts(&ir);
+    assert_eq!(dsts.len(), 2);
+    assert!(dsts.iter().all(|d| d.starts_with("__anon_")), "{dsts:?}");
+    assert_ne!(dsts[0], dsts[1]);
+}
+
+#[test]
+fn test_lower_anonymous_sources_get_distinct_names() {
+    // Reverse expand: the bound end is the destination, `_` the source.
+    let ir = lower(
+        &setup(),
+        "query q() { match { $p: Person  $_ knows $p  $_ knows $p } return { $p.name } }",
+    );
+    let dsts = expand_dsts(&ir);
+    assert_eq!(dsts.len(), 2);
+    assert!(dsts.iter().all(|d| d.starts_with("__anon_")), "{dsts:?}");
+    assert_ne!(dsts[0], dsts[1]);
+}
+
+#[test]
+fn test_lower_rebinding_a_scanned_variable_filters_instead_of_rescanning() {
+    let ir = lower(
+        &setup(),
+        "query q() { match { $p: Person  $p: Person { name: \"x\" } } return { $p.name } }",
+    );
+    let scans = ir
+        .pipeline
+        .iter()
+        .filter(|op| matches!(op, IROp::NodeScan { .. }))
+        .count();
+    let filters_on_p_name = ir
+        .pipeline
+        .iter()
+        .filter(|op| {
+            matches!(
+                op,
+                IROp::Filter(IRFilter {
+                    left: IRExpr::PropAccess { variable, property },
+                    ..
+                }) if variable == "p" && property == "name"
+            )
+        })
+        .count();
+    assert_eq!((scans, filters_on_p_name), (1, 1), "{:?}", ir.pipeline);
+}
+
+#[test]
+fn test_lower_repeated_deferred_binding_keeps_both_filter_sets() {
+    let ir = lower(
+        &setup(),
+        "query q() { match { $p: Person  $p knows $f  $f: Person { age: 40 }  $f: Person { name: \"x\" } } return { $f.name } }",
+    );
+    let dst_filter_props: Vec<Vec<&str>> = ir
+        .pipeline
+        .iter()
+        .filter_map(|op| match op {
+            IROp::Expand { dst_filters, .. } => Some(
+                dst_filters
+                    .iter()
+                    .map(|f| match &f.left {
+                        IRExpr::PropAccess { variable, property } if variable == "f" => {
+                            property.as_str()
+                        }
+                        other => panic!("unexpected filter operand {other:?}"),
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dst_filter_props,
+        vec![vec!["age", "name"]],
+        "{:?}",
+        ir.pipeline
+    );
+}
+
+#[test]
+fn test_lower_cycle_closing_temps_are_distinct() {
+    let ir = lower(
+        &setup(),
+        "query q() { match { $p: Person  $p knows $p  $p knows $p } return { $p.name } }",
+    );
+    let dsts = expand_dsts(&ir);
+    assert_eq!(dsts.len(), 2);
+    assert!(dsts.iter().all(|d| d.starts_with("__temp_p_")), "{dsts:?}");
+    assert_ne!(dsts[0], dsts[1]);
+}
+
+#[test]
+fn test_lower_rebinding_an_outer_variable_inside_negation_keeps_its_filter() {
+    // `$q` is outer-bound and, inside the negation, not the root of its
+    // component; its inline filter must survive as a Filter in the inner
+    // pipeline, never be deferred onto an Expand that will not introduce it.
+    let ir = lower(
+        &setup(),
+        "query q() { match { $p: Person  $p knows $q  not { $r: Person  $r knows $q  $q: Person { name: \"zzz\" } } } return { $p.name } }",
+    );
+    let inner = ir
+        .pipeline
+        .iter()
+        .find_map(|op| match op {
+            IROp::AntiJoin { inner, .. } => Some(inner),
+            _ => None,
+        })
+        .expect("an AntiJoin");
+    let filters_on_q_name = inner
+        .iter()
+        .filter(|op| {
+            matches!(
+                op,
+                IROp::Filter(IRFilter {
+                    left: IRExpr::PropAccess { variable, property },
+                    ..
+                }) if variable == "q" && property == "name"
+            )
+        })
+        .count();
+    assert_eq!(filters_on_q_name, 1, "{inner:?}");
+}
+
+#[test]
+fn test_typecheck_refuses_reserved_variable_prefix() {
+    // A user variable spelled like a minted name would collide with it in
+    // the plan check; the typechecker refuses the spelling with the reason.
+    let catalog = setup();
+    for text in [
+        "query q() { match { $__anon_1: Person } return { $__anon_1.name } }",
+        "query q() { match { $p: Person  $p knows $__temp_p_1 } return { $p.name } }",
+        "query q() { match { $p: Person  not { $p knows $__x } } return { $p.name } }",
+        "query q() { match { $p: Person  $__x knows $p } return { $p.name } }",
+        "query q() { match { $p: Person  $p $__w:knows $q } return { $q.name } }",
+    ] {
+        let qf = parse_query(text).unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0])
+            .expect_err("reserved prefix must be refused")
+            .to_string();
+        assert!(err.contains("reserved for the compiler"), "{err}");
+    }
+}
+
 #[test]
 fn test_lower_resolves_contains_overload_by_left_operand_type() {
     // `contains` on a scalar String left operand lowers to StringContains
@@ -591,7 +755,7 @@ return { $p.name, $c.name }
     assert!(matches!(
         &ir.pipeline[2],
         IROp::Expand { src_var, dst_var, .. }
-        if src_var == "p" && dst_var == "_"
+        if src_var == "p" && dst_var.starts_with("__anon_")
     ));
 }
 
@@ -702,13 +866,13 @@ return { $a.name }
         IROp::Expand { src_var, dst_var, dst_filters, .. }
         if src_var == "a" && dst_var == "b" && dst_filters.len() == 1
     ));
-    // Cycle-closing expand to __temp_a
+    // Cycle-closing expand to __temp_a_1
     assert!(matches!(
         &ir.pipeline[2],
         IROp::Expand { src_var, dst_var, dst_filters, .. }
         if src_var == "b" && dst_var.starts_with("__temp_") && dst_filters.is_empty()
     ));
-    // Cycle-closing filter: __temp_a.id == a.id
+    // Cycle-closing filter: __temp_a_1.id == a.id
     assert!(matches!(&ir.pipeline[3], IROp::Filter(_)));
 }
 
