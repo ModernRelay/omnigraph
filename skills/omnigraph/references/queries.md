@@ -158,7 +158,10 @@ traversals keep set-of-pairs semantics). Rejected with `T23`: binding a
 
 Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in
 either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
-typecheck (T22) — use the directional form there.
+typecheck (T22) — use the directional form there. Hop counts are shortest-path
+distances from the start node; a node is never re-reached through its own
+self-loop or a cycle, and the start node is returned only through its own
+self-loop, which counts as one hop.
 
 ### Negation
 
