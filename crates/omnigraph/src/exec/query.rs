@@ -3315,13 +3315,11 @@ async fn execute_expand_bfs(
             }
         }
 
-        // Advance each source row's frontier independently (dense ids). The
-        // emission contract is identical across sources: a self-edge is a
-        // valid destination that reaches nothing new — emit it without
-        // entering the frontier, so the seeded-source `visited` pre-mark
-        // prunes only multi-hop cycle returns (same-type only: cross-type
-        // dense ids live in different namespaces, where node == neighbor is
-        // meaningless for Csr and collision-prone for Indexed).
+        // Advance each source row's frontier independently (dense ids). A
+        // self-edge is admitted only at hop 1, where the frontier is exactly
+        // the seed (seeded above): the seed's own loop, which the `visited`
+        // pre-mark would otherwise drop. Later it is a cycle return to a
+        // shorter distance. Same-type only: cross-type dense ids differ.
         for i in 0..n {
             let cur = std::mem::take(&mut frontiers[i]);
             let mut next: Vec<u32> = Vec::new();
@@ -3340,7 +3338,7 @@ async fn execute_expand_bfs(
                     ),
                 };
                 for &neighbor in fwd.iter().chain(rev) {
-                    let is_self = same_type && neighbor == node;
+                    let is_self = same_type && hop == 1 && neighbor == node;
                     if !is_self && same_type && !visited[i].insert(neighbor) {
                         continue;
                     }

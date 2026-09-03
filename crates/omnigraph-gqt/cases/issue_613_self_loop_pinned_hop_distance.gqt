@@ -1,0 +1,39 @@
+# issue: 613
+# red_on: 2026-09-03, pre-fix build: knows{2,2} from alice returned bob, one hop away, instead of no rows.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"bob"}}
+{"edge":"Knows","from":"alice","to":"bob"}
+{"edge":"Knows","from":"bob","to":"bob"}
+
+--- query
+query exactly_two_hops() {
+    match {
+        $p: Person
+        $p knows{2,2} $f
+    }
+    return { $p.name, $f.name }
+}
+
+--- expect unordered
+
+--- query
+query one_to_two_hops() {
+    match {
+        $p: Person
+        $p knows{1,2} $f
+    }
+    return { $p.name, $f.name }
+}
+
+--- expect unordered
+{"p.name": "alice", "f.name": "bob"}
+{"p.name": "bob", "f.name": "bob"}

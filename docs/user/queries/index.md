@@ -49,6 +49,11 @@ Inside `match { ... }`:
 | `$p.age >= 18` | Apply a filter expression. |
 | `not { $p Blocked $other }` | Keep rows for which the inner pattern has no match. |
 
+Hop counts are shortest-path distances from the start node: `{2,2}` returns the
+nodes exactly two hops away. A node is never re-reached through its own
+self-loop or through a cycle back to it. The start node is returned only
+through its own self-loop, which counts as one hop, never through a cycle.
+
 An unbound traversal has set semantics for endpoint pairs. Binding the edge
 returns one result per matching edge, so parallel edges remain distinct. Edge
 bindings are available only for a single hop.
