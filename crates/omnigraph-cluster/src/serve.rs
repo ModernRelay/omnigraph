@@ -41,6 +41,18 @@ pub struct ServingSnapshot {
     pub queries: Vec<ServingQuery>,
     pub policies: Vec<ServingPolicy>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The applied revision's `config_digest`: what a server booted from
+    /// reports as its `booted_serving_digest` (RFC 0049).
+    pub config_digest: Option<String>,
+    /// The ledger revision and CAS this snapshot was read from.
+    pub state_revision: u64,
+    pub state_cas: Option<String>,
+    /// Every graph the applied revision names, sorted.
+    pub applied_graphs: Vec<String>,
+    /// Applied graphs this snapshot does not serve because pending recovery
+    /// quarantined them, sorted. A sidecar for a graph the revision does not
+    /// name is not in this list.
+    pub quarantined_graphs: Vec<String>,
 }
 
 /// Read the applied revision as a serving snapshot — the read-only loader for
@@ -271,6 +283,10 @@ async fn read_snapshot_with_store(
         diagnostics.extend(startup_diagnostics);
         return Err(diagnostics);
     };
+    let boot_config_digest = state.applied_revision.config_digest.clone();
+    let boot_state_revision = state.state_revision;
+    let boot_state_cas = observations.state_cas.clone();
+    let boot_applied_graphs = applied_graph_ids(&state);
 
     let required_embedding_providers: BTreeSet<String> = state
         .applied_revision
@@ -457,6 +473,14 @@ async fn read_snapshot_with_store(
         queries,
         policies,
         diagnostics: startup_diagnostics,
+        config_digest: boot_config_digest,
+        state_revision: boot_state_revision,
+        state_cas: boot_state_cas,
+        quarantined_graphs: quarantined_graphs
+            .into_iter()
+            .filter(|graph_id| boot_applied_graphs.contains(graph_id))
+            .collect(),
+        applied_graphs: boot_applied_graphs,
     })
 }
 

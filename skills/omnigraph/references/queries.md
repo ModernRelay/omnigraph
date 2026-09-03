@@ -156,6 +156,13 @@ traversals keep set-of-pairs semantics). Rejected with `T23`: binding a
 `{min,max}` multi-hop, rebinding a taken variable name, or projecting bare
 `$w` (project a property instead).
 
+Node variables: each `$_` is a distinct anonymous node, so two anonymous
+traversals from one variable are independent (a source with two neighbours
+matches two by two rows). Binding a node variable a second time (`$p:
+Person` after `$p` is bound, at the top level or inside `not { }`) adds the
+second binding's property matches as constraints on the same rows; it never
+introduces a second `$p`. Variable names beginning with `__` are reserved.
+
 Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in
 either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
 typecheck (T22) — use the directional form there. Hop counts are shortest-path

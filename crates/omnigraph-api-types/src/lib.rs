@@ -1065,6 +1065,34 @@ pub struct HealthOutput {
     pub source_version: Option<String>,
 }
 
+/// The readiness witness of one replica (`GET /readyz`, RFC 0049): whether
+/// it is serving or draining, the applied revision it booted from, and how
+/// many graphs it does and does not serve. Unauthenticated, so it carries
+/// no graph id: those stay behind `GET /graphs`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReadinessOutput {
+    /// False once shutdown has begun; the response is then 503.
+    pub ready: bool,
+    /// `serving` or `draining`.
+    pub status: String,
+    /// The `config_digest` of the applied revision this process booted from.
+    /// Fixed for the life of the process: the server never reloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub booted_serving_digest: Option<String>,
+    /// The ledger revision the process booted from.
+    pub state_revision: u64,
+    /// The ledger CAS (`sha256:<hex>`) the process booted from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_cas: Option<String>,
+    /// How many graphs this process serves.
+    pub served_graph_count: usize,
+    /// How many graphs the applied revision names that this process does
+    /// not serve, for any reason. `GET /graphs` names them.
+    pub quarantined_graph_count: usize,
+    /// The bound on graceful shutdown, after which the process exits 2.
+    pub shutdown_grace_seconds: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -1611,6 +1639,11 @@ pub struct GraphInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphListResponse {
     pub graphs: Vec<GraphInfo>,
+    /// Graphs the applied revision names that this process does not serve,
+    /// for any reason, sorted (RFC 0049). Empty when every applied graph is
+    /// served.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantined: Vec<String>,
 }
 
 #[cfg(test)]

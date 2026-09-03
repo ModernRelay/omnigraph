@@ -206,6 +206,15 @@ pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
             output.changes.len(),
             output.approvals_required.len()
         );
+        match output.authority {
+            omnigraph_cluster::LedgerAuthority::Observed => {
+                println!("  authority: observed (no lock taken, nothing written)");
+            }
+            omnigraph_cluster::LedgerAuthority::Unlocked => {
+                println!("  authority: unlocked (state.lock is false)");
+            }
+            omnigraph_cluster::LedgerAuthority::Locked => {}
+        }
         for change in &output.changes {
             let bindings = if change.binding_change {
                 " [bindings]"
@@ -312,6 +321,7 @@ pub(crate) fn print_cluster_state_sync_human(output: &StateSyncOutput) {
     let operation = match output.operation {
         omnigraph_cluster::StateSyncOperation::Refresh => "refresh",
         omnigraph_cluster::StateSyncOperation::Import => "import",
+        omnigraph_cluster::StateSyncOperation::Observe => "observe",
     };
     if output.ok {
         let state = &output.state_observations;
@@ -319,11 +329,25 @@ pub(crate) fn print_cluster_state_sync_human(output: &StateSyncOutput) {
             "cluster {operation}: revision {}, {} resource(s)",
             state.state_revision, state.resource_count
         );
+        match output.authority {
+            omnigraph_cluster::LedgerAuthority::Observed => {
+                println!("  authority: observed (no lock taken, nothing written)");
+            }
+            omnigraph_cluster::LedgerAuthority::Unlocked => {
+                println!("  authority: unlocked (state.lock is false)");
+            }
+            omnigraph_cluster::LedgerAuthority::Locked => {}
+        }
         if let Some(cas) = state.state_cas.as_deref() {
             println!("  state_cas: {cas}");
         }
-        if state.locked {
+        if state.lock_acquired {
             println!("  lock: acquired{}", cluster_lock_summary(state));
+        } else if state.locked {
+            println!(
+                "  lock: held by another process{}",
+                cluster_lock_summary(state)
+            );
         } else {
             println!("  lock: not acquired");
         }

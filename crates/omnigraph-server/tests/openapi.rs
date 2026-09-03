@@ -180,10 +180,11 @@ fn openapi_info_contains_version() {
 // Path coverage tests
 // ---------------------------------------------------------------------------
 
-// The canonical served spec keeps `/healthz` and `/graphs` flat; every
+// The canonical served spec keeps `/healthz`, `/readyz`, and `/graphs` flat; every
 // protected route nests under `/graphs/{graph_id}/…`.
 const EXPECTED_PATHS: &[&str] = &[
     "/healthz",
+    "/readyz",
     "/graphs",
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/blob",
@@ -2189,12 +2190,12 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
         .unwrap();
     let (_, json) = json_response(&app, request).await;
     // Every cluster path operation must have a `cluster_` operation_id.
-    // Flat-mounted paths (healthz, management /graphs) keep their
+    // Flat-mounted paths (healthz, readyz, management /graphs) keep their
     // original operation_ids — they're not per-graph.
     let paths = json["paths"].as_object().unwrap();
     let mut checked = 0;
     for (path, item) in paths {
-        if path == "/healthz" || path == "/graphs" {
+        if path == "/healthz" || path == "/readyz" || path == "/graphs" {
             continue;
         }
         for method in ["get", "head", "post", "put", "delete", "patch"] {

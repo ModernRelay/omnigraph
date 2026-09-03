@@ -58,6 +58,13 @@ An unbound traversal has set semantics for endpoint pairs. Binding the edge
 returns one result per matching edge, so parallel edges remain distinct. Edge
 bindings are available only for a single hop.
 
+Each `$_` is a distinct anonymous node: two anonymous traversals from one
+variable are independent, so a source with two neighbours matches two by two
+rows. Binding a variable a second time (`$p: Person` after `$p` is already
+bound, at the top level or inside `not { }`) adds the second binding's
+property matches as constraints on the same rows; it never introduces a
+second `$p`. Variable names beginning with `__` are reserved.
+
 Traversal spelling begins with a lowercase letter (`worksAt` for the declared
 edge `WorksAt`); edge lookup itself is case-insensitive.
 

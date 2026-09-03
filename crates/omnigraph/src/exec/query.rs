@@ -4375,10 +4375,34 @@ fn prefix_batch(batch: &RecordBatch, variable: &str) -> Result<RecordBatch> {
     RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(OmniError::arrow_internal)
 }
 
+/// A column name present on both sides would let `column_by_name` silently
+/// pick the left one (Arrow admits duplicate field names). The compiler's
+/// plan check keeps this unreachable for lowered plans; this is the last
+/// line, in every build (#605).
+fn refuse_duplicate_columns(left: &RecordBatch, right: &RecordBatch) -> Result<()> {
+    let left_schema = left.schema();
+    let left_names: HashSet<&str> = left_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let right_schema = right.schema();
+    for f in right_schema.fields() {
+        if left_names.contains(f.name().as_str()) {
+            return Err(OmniError::manifest_internal(format!(
+                "duplicate column '{}' when joining batches",
+                f.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn cross_join_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatch> {
     let n = left.num_rows();
     let m = right.num_rows();
     if n == 0 || m == 0 {
+        refuse_duplicate_columns(left, right)?;
         let mut fields: Vec<Field> = left
             .schema()
             .fields()
@@ -4404,22 +4428,10 @@ fn hconcat_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatc
         .iter()
         .map(|f| f.as_ref().clone())
         .collect();
-    if cfg!(debug_assertions) {
-        let left_schema = left.schema();
-        let left_names: HashSet<&str> = left_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        let right_schema = right.schema();
-        for f in right_schema.fields() {
-            debug_assert!(
-                !left_names.contains(f.name().as_str()),
-                "hconcat_batches: duplicate column '{}'",
-                f.name()
-            );
-        }
-    }
+    // Arrow allows duplicate field names and `column_by_name` returns the
+    // first match, so a duplicate here would silently shadow a column; the
+    // refusal holds in every build (#605).
+    refuse_duplicate_columns(left, right)?;
     fields.extend(right.schema().fields().iter().map(|f| f.as_ref().clone()));
     let mut columns: Vec<ArrayRef> = left.columns().to_vec();
     columns.extend(right.columns().to_vec());
