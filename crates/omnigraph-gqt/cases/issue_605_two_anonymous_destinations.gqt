@@ -1,0 +1,87 @@
+# issue: 605
+# red_on: 2026-09-03, pre-fix build: panicked at hconcat_batches `duplicate column`, '_.id' (step 1), 'p.id' (steps 2, 3), '__temp_p.id' (step 4); step 5 returned no rows.
+# notes: four shapes that hand the executor one column twice, plus a rebound
+# notes: outer variable inside not {} whose filter was dropped; one outgoing
+# notes: edge per source keeps each step at one row per source.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"bob"}}
+{"edge":"Knows","from":"alice","to":"bob"}
+{"edge":"Knows","from":"bob","to":"bob"}
+
+--- query
+query knows_anyone_twice() {
+    match {
+        $p: Person
+        $p knows $_
+        $p knows $_
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- query
+query bound_twice() {
+    match {
+        $p: Person
+        $p: Person { name: "bob" }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "bob"}
+
+--- query
+query bound_twice_in_negation() {
+    match {
+        $p: Person
+        not { $p: Person { name: "bob" } }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- query
+query self_loop_twice() {
+    match {
+        $p: Person
+        $p knows $p
+        $p knows $p
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "bob"}
+
+--- query
+query rebind_inside_negation_non_root() {
+    match {
+        $p: Person
+        $p knows $q
+        not {
+            $r: Person
+            $r knows $q
+            $q: Person { name: "zzz" }
+        }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
