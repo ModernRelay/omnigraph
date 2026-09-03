@@ -59,6 +59,14 @@ pub(crate) fn resolve_query_decls(
 
     let mut files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (declared-relative, resolved)
     for declared in &paths {
+        if !check_config_path(
+            config_dir,
+            declared,
+            &format!("graphs.{graph_id}.queries"),
+            diagnostics,
+        ) {
+            continue;
+        }
         let resolved = resolve_config_path(config_dir, declared);
         if resolved.is_dir() {
             let mut entries: Vec<PathBuf> = match fs::read_dir(&resolved) {
@@ -660,7 +668,17 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         }
 
         let schema_path = resolve_config_path(&config_dir, &graph.schema);
-        let schema_source = match fs::read_to_string(&schema_path) {
+        let schema_readable = check_config_path(
+            &config_dir,
+            &graph.schema,
+            &format!("graphs.{graph_id}.schema"),
+            &mut diagnostics,
+        );
+        let schema_source = match if schema_readable {
+            fs::read_to_string(&schema_path)
+        } else {
+            Err(std::io::Error::other("path refused"))
+        } {
             Ok(source) => {
                 let digest = sha256_hex(source.as_bytes());
                 graph_schema_digests.insert(graph_id.clone(), digest.clone());
@@ -676,14 +694,16 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 Some(source)
             }
             Err(err) => {
-                diagnostics.push(Diagnostic::error(
-                    "schema_file_missing",
-                    format!("graphs.{graph_id}.schema"),
-                    format!(
-                        "could not read schema file '{}': {err}",
-                        schema_path.display()
-                    ),
-                ));
+                if schema_readable {
+                    diagnostics.push(Diagnostic::error(
+                        "schema_file_missing",
+                        format!("graphs.{graph_id}.schema"),
+                        format!(
+                            "could not read schema file '{}': {err}",
+                            schema_path.display()
+                        ),
+                    ));
+                }
                 None
             }
         };
@@ -729,6 +749,14 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 to: schema_address.clone(),
             });
 
+            if !check_config_path(
+                &config_dir,
+                &query.file,
+                &format!("graphs.{graph_id}.queries.{query_name}.file"),
+                &mut diagnostics,
+            ) {
+                continue;
+            }
             let query_path = resolve_config_path(&config_dir, &query.file);
             let source = match query_contents.get(&query.file) {
                 Some(cached) => Ok(cached.clone()),
@@ -877,6 +905,14 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
             }
         }
 
+        if !check_config_path(
+            &config_dir,
+            &policy.file,
+            &format!("policies.{policy_name}.file"),
+            &mut diagnostics,
+        ) {
+            continue;
+        }
         let policy_path = resolve_config_path(&config_dir, &policy.file);
         match fs::read_to_string(&policy_path) {
             Ok(source) => {
@@ -1186,4 +1222,52 @@ pub(crate) fn resolve_config_path(config_dir: &Path, path: &Path) -> PathBuf {
     } else {
         config_dir.join(path)
     }
+}
+
+/// Refuse a declared path that leaves the configuration directory through a
+/// `..` segment or reaches its target through a symbolic link. A bundle is
+/// one directory of files read exactly as declared; either shape makes what
+/// gets applied depend on something outside it. The diagnostic names the
+/// setting that declared the path. Absolute paths stay accepted as before.
+/// Returns whether the path may be read.
+pub(crate) fn check_config_path(
+    config_dir: &Path,
+    declared: &Path,
+    setting: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    if declared
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        diagnostics.push(Diagnostic::error(
+            "config_path_escape",
+            setting.to_string(),
+            format!(
+                "path '{}' contains a `..` segment; declare paths inside the configuration directory",
+                declared.display()
+            ),
+        ));
+        return false;
+    }
+    if declared.is_absolute() {
+        return true;
+    }
+    let mut current = config_dir.to_path_buf();
+    for component in declared.components() {
+        current.push(component);
+        if fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            diagnostics.push(Diagnostic::error(
+                "config_path_symlink",
+                setting.to_string(),
+                format!(
+                    "path '{}' crosses a symbolic link at '{}'; declare the target directly",
+                    declared.display(),
+                    current.display()
+                ),
+            ));
+            return false;
+        }
+    }
+    true
 }
