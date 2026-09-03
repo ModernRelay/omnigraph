@@ -74,6 +74,25 @@ pub(crate) fn resolve_query_decls(
                     .flatten()
                     .map(|entry| entry.path())
                     .filter(|path| path.extension().is_some_and(|ext| ext == "gq"))
+                    // A discovered entry is checked with no-follow metadata
+                    // before anything reads it: a symbolic link inside a
+                    // checked directory is refused the same way as one on the
+                    // way to it.
+                    .filter(|path| {
+                        let is_symlink = fs::symlink_metadata(path)
+                            .is_ok_and(|meta| meta.file_type().is_symlink());
+                        if is_symlink {
+                            diagnostics.push(Diagnostic::error(
+                                "config_path_symlink",
+                                format!("graphs.{graph_id}.queries"),
+                                format!(
+                                    "query file '{}' is a symbolic link; declare the target directly",
+                                    path.display()
+                                ),
+                            ));
+                        }
+                        !is_symlink
+                    })
                     .collect(),
                 Err(err) => {
                     diagnostics.push(Diagnostic::error(
@@ -1224,18 +1243,22 @@ pub(crate) fn resolve_config_path(config_dir: &Path, path: &Path) -> PathBuf {
     }
 }
 
-/// Refuse a declared path that leaves the configuration directory through a
-/// `..` segment or reaches its target through a symbolic link. A bundle is
-/// one directory of files read exactly as declared; either shape makes what
-/// gets applied depend on something outside it. The diagnostic names the
-/// setting that declared the path. Absolute paths stay accepted as before.
-/// Returns whether the path may be read.
+/// Refuse a relative declared path that leaves the configuration directory
+/// through a `..` segment or reaches its target through a symbolic link. A
+/// bundle is one directory of files read exactly as declared; either shape
+/// makes what gets applied depend on something outside it. The diagnostic
+/// names the setting that declared the path. Absolute paths stay accepted
+/// as before, `..` segments and symbolic links included: they were never
+/// confined to the bundle. Returns whether the path may be read.
 pub(crate) fn check_config_path(
     config_dir: &Path,
     declared: &Path,
     setting: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> bool {
+    if declared.is_absolute() {
+        return true;
+    }
     if declared
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -1249,9 +1272,6 @@ pub(crate) fn check_config_path(
             ),
         ));
         return false;
-    }
-    if declared.is_absolute() {
-        return true;
     }
     let mut current = config_dir.to_path_buf();
     for component in declared.components() {
