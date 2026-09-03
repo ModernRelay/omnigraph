@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -18,28 +18,38 @@ blocked_on: []
 
 ## Summary
 
-The engine package (`omnigraph-engine`, library crate `omnigraph`) becomes six
-crates in a strict dependency order. `omnigraph-lance` is the only production
-crate that links Lance and DataFusion execution, and its public API names no
-Lance type: callers receive pinned table references, read handles, typed scan
-requests, staged-write handles, and a manifest row gateway. `omnigraph-graph`
-owns accepted graph state: schema authority, manifest state, snapshots,
-captured write authority, validation, lineage, and the change feed.
+The engine package (`omnigraph-engine`, library crate `omnigraph`) becomes a
+seven-crate family in a strict dependency order. `omnigraph-lance` is the only
+production crate that links Lance and DataFusion execution. Its operational
+API names no Lance type: callers receive pinned table references, read
+handles, typed scan requests, staged-write handles, and a physical manifest
+row gateway. A closed compatibility module retains the four existing
+`SnapshotDataset` and
+`SnapshotScanner` signatures that already name Lance types; the facade
+re-exports them unchanged, and no new code uses that module internally.
+`omnigraph-graph` owns accepted graph state: schema authority, manifest state,
+snapshots, captured write authority, validation, lineage, and the change feed.
 `omnigraph-exec` executes typed IR over read handles and owns the derived
-topology index. `omnigraph-write` holds every operation that can move a
-dataset HEAD or publish a manifest, behind one `publish_once`. `omnigraph`
-keeps the `Omnigraph` handle, the policy gates, and today's public API by
-re-export. Two leaves, `omnigraph-embedding` and `omnigraph-failpoints`, hold
-the provider client and the failpoint registry that other crates already reach
-through the engine.
+topology index. `omnigraph-write` orchestrates every supported graph write and
+graph-visible publication behind one graph-aware `publish_once`; the substrate
+owns the physical HEAD-moving primitives. Its policy-configured `WriteEngine`
+owns the graph-mutation gates and the closed disposition of existing
+maintenance entry points. `omnigraph` keeps the `Omnigraph` handle, actor
+forwarding and policy configuration, and today's public API by re-export. Two
+leaves, `omnigraph-embedding` and `omnigraph-failpoints`, hold the provider
+client and the failpoint registry that other crates already reach through the
+engine.
 
 The boundary that does not change: no storage layout, manifest schema,
 recovery sidecar, wire format, CLI, HTTP, or query-language behavior changes.
 The public Rust surface of `omnigraph` is preserved by re-export. The closed
 inventory of public async `Omnigraph` methods that the write-surface guard
 keys on stays on one handle. The sealed `TableStorage` trait stays the
-deterministic-simulation injection point. Arrow remains the interchange type
-across every boundary; only Lance and DataFusion execution are sealed.
+deterministic-simulation injection point. Tabular payloads cross new boundaries
+as Arrow; control data crosses as the owned boundary types defined below. The
+closed legacy compatibility module is the only place a new crate boundary
+retains Lance-owned argument or result types; Lance handles and DataFusion
+execution remain sealed.
 
 ## Motivation
 
@@ -104,8 +114,11 @@ why this is an RFC.
   schema are unchanged.
 - Embedded Rust users keep `omnigraph` (package `omnigraph-engine`) as their
   dependency. Every public type and method they use today stays reachable at
-  its current path through re-exports. A `cargo-public-api` diff of the facade
-  before and after each phase shows only additive re-exports.
+  its current path through re-exports. In particular, the four existing
+  Lance-typed `SnapshotDataset` and `SnapshotScanner` signatures stay exact,
+  while no fifth Lance-typed signature may enter the facade. A
+  `cargo-public-api` diff of the facade before and after each phase shows only
+  additive re-exports.
 - The new crates are published in lockstep with the workspace version. The
   publish workflow's crate order gains the new crates below the facade.
 - Environment knobs keep their names and defaults. They are captured once per
@@ -123,49 +136,55 @@ why this is an RFC.
 
 ### Topology
 
-```text
-   omnigraph-server     omnigraph-cli     omnigraph-cluster     omnigraph-gqt
-          \                  |                  /                    /
-           v                 v                 v                    v
-                    omnigraph   (facade: the Omnigraph handle, _as policy gates,
-                                 read-view capture, re-exports, dst seams)
-                     /                          \
-                    v                            v
-           omnigraph-exec  <---------------  omnigraph-write
-           (IR execution over read handles;  (mutation, load, merge, schema apply,
-            derived topology index)           indexes, optimize, repair, branch refs,
-                    \                         recovery protocol; publish_once)
-                     v                          /
-                              omnigraph-graph  <-----  omnigraph-api-types
-                              (accepted schema, manifest state, Snapshot,
-                               WriteTxn, validation, lineage, change feed,
-                               logical Blob facade, error types)
-                                      |
-                                      v
-                              omnigraph-lance
-                              (sealed substrate: staged primitives, exact commit,
-                               read handles, manifest row gateway, recovery
-                               primitives, sessions, physical maintenance)
-                                      |
-     omnigraph-compiler   omnigraph-storage   omnigraph-policy
-     omnigraph-embedding  omnigraph-failpoints              (leaves, no Lance)
+```mermaid
+flowchart TB
+    CONSUMERS[server / CLI / gqt] --> F[omnigraph facade]
+    CLUSTER[omnigraph-cluster] --> F
+    CLUSTER --> FP[omnigraph-failpoints]
+    F --> E[omnigraph-exec]
+    F --> W[omnigraph-write]
+    F --> G[omnigraph-graph]
+    F -. legacy compatibility re-export .-> L[omnigraph-lance]
+    F --> P[omnigraph-policy]
+    F --> EMB[omnigraph-embedding]
+    F --> FP
+    W --> E
+    W --> G
+    W --> L
+    W --> P
+    W --> FP
+    E --> G
+    E --> L
+    G --> L
+    G --> C[omnigraph-compiler]
+    G --> S[omnigraph-storage]
+    G --> FP
+    L --> S
+    L --> FP
+    API[omnigraph-api-types] --> G
+    API --> C
 ```
 
-Arrows point from dependent to dependency. `omnigraph-write` depends on
-`omnigraph-exec` for predicate lowering and read-your-writes evaluation; the
-executor never depends on the write crate. The benchmark and simulation
-harnesses keep their direct Lance dependencies for instrumentation and fault
-injection; they are test tooling, not production crates.
+Arrows point from dependent to dependency. `omnigraph-write` depends directly
+on `omnigraph-exec`, `omnigraph-graph`, `omnigraph-lance`, and
+`omnigraph-policy`, plus the failpoint leaf when that feature is enabled; the
+executor never depends on the write crate. Its direct
+substrate edge is required for the single-attempt manifest CAS and staged
+effects, while graph semantics stay in the graph and write crates. The facade's
+direct substrate edge exists only for the closed compatibility re-export. The
+benchmark and simulation harnesses keep their direct Lance dependencies for
+instrumentation and fault injection; they are test tooling, not production
+crates.
 
 ### Crates
 
 | Crate | Owns | Must not contain | Today's modules |
 |---|---|---|---|
-| `omnigraph-lance` | Staged write primitives and exact commit, read handles and typed scan requests, index coverage probes, the manifest row gateway with CAS, recovery primitives, cleanup and compaction, index build, sessions and the process-wide store registry, the held-handle cache, physical Blob access, I/O probes, the Lance surface guards | Any graph semantics; it does not know what a node, edge, branch, or schema is | `table_store.rs` and its submodules, `storage_layer.rs`, `lance_access.rs`, `db/manifest/{namespace,publisher,graph,layout,metadata}.rs`, `db/recovery_audit.rs`, the Lance-facing half of `db/manifest/recovery.rs`, the opener and probes in `instrumentation.rs`, the handle cache in `runtime_cache.rs`, the physical half of `blob.rs` and `db/omnigraph/optimize.rs` |
-| `omnigraph-graph` | Accepted SchemaIR state and its catalog projection, manifest state model and migrations, `Snapshot`, `ReadTarget` resolution, commit graph and lineage, `WriteTxn` capture, branch naming, catalog-derived validation, change feed, export cut, logical Blob facade, public receipt and outcome types, `OmniError` | Any Lance or DataFusion execution type in its public API | `db/manifest.rs`, `db/manifest/{state,migrations}.rs`, `db/{graph_coordinator,commit_graph,schema_state}.rs`, `branch_names.rs`, `validate.rs`, `changes/`, `db/omnigraph/export.rs`, the logical half of `blob.rs`, `error.rs`, `storage.rs` |
+| `omnigraph-lance` | Staged write primitives and exact commit, read handles and typed scan requests, index coverage probes, exact manifest attempts and single-attempt row CAS, recovery primitives, cleanup and compaction, index build, sessions and the process-wide store registry, the held-handle cache, physical Blob access, I/O probes, the closed legacy read-compatibility adapters, and the Lance surface guards | Graph semantics, or a Lance type in an operational signature outside the closed compatibility allow-list; it does not know what a node, edge, logical branch, or schema is | `table_store.rs` and its submodules, `storage_layer.rs`, `lance_access.rs`, the Lance-facing halves of `db/manifest/{namespace,publisher,graph,layout,metadata}.rs`, `db/recovery_audit.rs`, the Lance-facing half of `db/manifest/recovery.rs`, the opener and probes in `instrumentation.rs`, the handle cache in `runtime_cache.rs`, the physical half of `blob.rs` and `db/omnigraph/optimize.rs` |
+| `omnigraph-graph` | Accepted SchemaIR state and its catalog projection, manifest state model and migrations, manifest observation decoding and logical publication preconditions, `Snapshot`, `ReadTarget` resolution, commit graph and lineage, `WriteTxn` capture, branch naming, catalog-derived validation, change feed, export cut, logical Blob facade, public receipt and outcome types, `OmniError` | Any Lance or DataFusion execution type in its public API | `db/manifest.rs`, `db/manifest/{state,migrations}.rs`, the graph-semantic halves of `db/manifest/{publisher,graph,layout,metadata}.rs`, `db/{graph_coordinator,commit_graph,schema_state}.rs`, `branch_names.rs`, `validate.rs`, `changes/`, `db/omnigraph/export.rs`, the logical half of `blob.rs`, `error.rs`, `storage.rs` |
 | `omnigraph-exec` | IR execution: search mode from the lowered retrieval, expand with its cost model and adaptive switch, node scan, anti-join, projection, aggregation, ordering, IR-to-predicate lowering, batch utilities, the CSR/CSC topology index with its persisted-artifact codec and version-keyed cache | Network calls, environment reads, task-locals, `_as` entry points, anything that can move a HEAD | `exec/query.rs`, `exec/projection.rs`, `graph_index/`, the index cache in `runtime_cache.rs` |
-| `omnigraph-write` | Mutation, staging, load publication, three-way merge, schema apply, `ensure_indices`, `optimize`, `repair`, cleanup floors, branch ref control, the recovery protocol over substrate primitives, the write queue gates, and `publish_once` | A manifest publication from any function except `publish_once` | `exec/{mutation,staging,merge}.rs`, the publication half of `loader/mod.rs`, `db/omnigraph/{table_ops,schema_apply,repair}.rs`, the protocol half of `db/omnigraph/optimize.rs`, `branch_control.rs`, `db/write_queue.rs`, the protocol half of `db/manifest/recovery.rs`, the write orchestration in `db/omnigraph.rs` |
-| `omnigraph` | The `Omnigraph` handle: open, init, refresh, read-view capture, every `query*` and `_as` entry, policy gate application, query-vector resolution, handle-level caches, re-exports, and the `dst_*` seams | Logic beyond capture, gate, delegate, and map | The remainder of `db/omnigraph.rs`, the orchestration in `exec/query.rs`, `dst_{clock,gate,ids}.rs`, `lib.rs` |
+| `omnigraph-write` | The policy-configured `WriteEngine`, policy-bearing graph-mutation gates and their private authorization proofs, the closed dispositions for existing actor-less maintenance, mutation, staging, load publication, three-way merge, schema apply, `ensure_indices`, `optimize`, `repair`, cleanup floors, branch ref control, the recovery protocol over substrate primitives, the write queue gates, the bounded graph-aware publication retry, and private `publish_once` | A caller-supplied policy mode or authorization proof; a manifest publication from any function except `publish_once` | `exec/{mutation,staging,merge}.rs`, the publication half of `loader/mod.rs`, `db/omnigraph/{table_ops,schema_apply,repair}.rs`, the protocol half of `db/omnigraph/optimize.rs`, `branch_control.rs`, `db/write_queue.rs`, the protocol half of `db/manifest/recovery.rs`, the publication coordinator from `db/manifest/publisher.rs`, the write orchestration in `db/omnigraph.rs` |
+| `omnigraph` | The `Omnigraph` handle: open, init, refresh, read-view capture, every `query*` and `_as` entry, actor forwarding, `with_policy` configuration of the owned `WriteEngine`, query-vector resolution, handle-level caches, re-exports, and the `dst_*` seams | Logic beyond capture, configure, delegate, and map | The remainder of `db/omnigraph.rs`, the orchestration in `exec/query.rs`, `dst_{clock,gate,ids}.rs`, `lib.rs` |
 | `omnigraph-embedding` | The provider-independent embedding client and its configuration | Engine types | `embedding.rs` |
 | `omnigraph-failpoints` | The registry-as-value failpoint machinery and the name namespace | Engine types | `failpoints.rs` |
 
@@ -174,7 +193,9 @@ gains the loader's pure NDJSON and JSONL parsing and the date-literal parser,
 because both are catalog-driven input validation with no storage dependency.
 `omnigraph-api-types` depends on `omnigraph-graph` and `omnigraph-compiler`
 only; the receipt and outcome types it converts are defined in the graph crate
-and produced by the write crate.
+and produced by the write crate. `omnigraph-policy` keeps the shared
+`PolicyChecker`, actions, scopes, and decision types; `omnigraph-write` calls it
+inside its encapsulated mutation gates.
 
 Approximate sizes from the current tree, so reviewers can weigh each cut:
 
@@ -198,17 +219,29 @@ is reviewed today becomes a compile error tomorrow.
 dataset version. It never holds a Lance handle. Opening a `TableRef` through
 the substrate crate yields a `ReadHandle` that exposes scan, count, Arrow
 schema, published version, index coverage and index metadata probes, and Blob
-reads. `SnapshotDataset` is the seed of this type. A `ReadHandle` has no
-method that can move a HEAD, and the underlying `Dataset` is private to the
-substrate crate, so the deny-list item on public writable dataset handles is
-enforced by the compiler rather than by the scanner.
+reads. `ReadHandle` is extracted from the implementation behind
+`SnapshotDataset`. It has no method that can move a HEAD, and the underlying
+`Dataset` is private to the substrate crate, so the deny-list item on public
+writable dataset handles is enforced by the compiler rather than by the
+scanner.
+
+The existing public `SnapshotDataset` and `SnapshotScanner` remain as adapters
+in `omnigraph-lance::compat` and are re-exported at their current `omnigraph`
+paths. Their closed exception consists of
+`SnapshotScanner::blob_handling(BlobHandling)`,
+`SnapshotScanner::try_into_stream() -> DatasetRecordBatchStream`,
+`SnapshotDataset::schema() -> &lance::datatypes::Schema`, and
+`SnapshotDataset::load_indices() -> Arc<Vec<lance_table::format::IndexMetadata>>`.
+New engine code uses `ReadHandle`; the compatibility module returns no raw
+writable `Dataset`, and its allow-list cannot grow without a reviewed API
+change.
 
 **Typed scan requests.** `ReadHandle::scan` takes a `ScanRequest` carrying
 projection, predicate, prefilter, a full-text request, a nearest request,
 limit and offset, batch sizing, row-address and row-id selection, Blob
 handling, ordering, and the single-partition fence for late payload
 hydration. The substrate crate owns `FtsQuery` and `NearestQuery` so that no
-`lance-index` type crosses the seal. The predicate is the DataFusion
+`lance-index` type crosses the operational seal. The predicate is the DataFusion
 expression AST from `datafusion-expr`, which is a pure expression crate with
 no execution engine; the executor and the graph crate may depend on it, and
 only `omnigraph-lance` may depend on `datafusion`, `lance-datafusion`, or any
@@ -223,25 +256,63 @@ shape comes from the lowered plan as RFC 0047 proposes; the executor's search
 module translates that plan into the substrate's typed requests and never
 re-infers a mode from ordering.
 
-**Captured write authority.** `omnigraph-graph` captures a `WriteTxn` from one
-attempt: accepted schema hash, branch, native ref identity, graph head, and
-per-table baselines as `TableRef` values. `omnigraph-write` revalidates the
-complete token under the shared gates and never re-reads authority mid-attempt.
-The capture-then-use split across two crates is invariant 3 as a data-flow
+**Captured write authority.** For an exact-authority operation,
+`omnigraph-graph` captures a `WriteTxn` from one attempt: accepted schema hash,
+branch, native ref identity, graph head, and per-table baselines as `TableRef`
+values. `omnigraph-write` revalidates the complete token under the shared gates
+and never replaces its facts with a later view. Each manifest CAS retry obtains
+a fresh physical observation only to test it against this fixed token; changed
+graph, ref, or table authority is a terminal typed conflict, not permission to
+refresh or re-plan the write. Existing publication adapters whose contract
+permits rebasing instead carry that typed publication precondition; they may
+re-resolve only the parent and delta that precondition allows. The operation
+selects its precondition before effects, and a retry never widens or switches
+it. The capture-then-use split across crates remains invariant 3 as a data-flow
 constraint.
 
-**Authorized action tokens.** Every public function of `omnigraph-write` takes
-an `Authorized<Action>` value alongside the `WriteTxn`. Only the policy gate in
-the facade can construct one, from the installed `PolicyChecker` and the
-resolved actor, or from the explicit no-policy embedded configuration. An
-embedded caller that reaches the write crate without the gate has no way to
-name the token type's constructor. Invariant 10 stops being a checklist item
-for every new entry point.
+**Policy-configured write engine.** Every externally initiated effectful entry
+point of `omnigraph-write` is a method on one `WriteEngine` and has one closed
+registry disposition. The engine owns the policy mode fixed for that instance;
+the facade's existing consuming `with_policy` method returns the same engine
+state with its checker installed, not a second facade-owned policy slot. No
+method accepts a caller-supplied checker, policy mode, action, scope, or
+authorization token.
 
-**One publication call.** `publish_once` in `omnigraph-write` takes every
-staged participant plus the lineage update and performs the single manifest
-CAS through the substrate's row gateway. It is the only caller of that
-gateway's publish method, and the structural guard pins that fact.
+The graph-mutation methods that enforce policy today have a `PolicyGated`
+disposition. Each derives its fixed action and scope from the operation and
+asks the owned `PolicyChecker` to authorize the forwarded actor before write
+preparation or effects. Only after a positive decision does it privately
+construct an `Authorized<Action>` proof bound to that engine instance and the
+operation's captured authority; protocol helpers require that private proof.
+The existing actor-less `ensure_indices`, `optimize`, `repair`, and `cleanup`
+surfaces retain their current non-policy maintenance dispositions and behavior;
+bootstrap and recovery retain their own internal authorities. No new public
+effectful method can land without an explicit disposition. A direct caller of
+a configured `WriteEngine` therefore receives the same gates and maintenance
+classifications as the facade, while a separately constructed no-policy engine
+is the existing embedded mode rather than a per-call bypass.
+
+**One graph-publication orchestrator.** `publish_once` in `omnigraph-write` takes every
+staged participant plus the lineage update and owns the bounded graph-aware
+retry. Each iteration obtains one exact `ManifestAttempt` from the substrate,
+uses `omnigraph-graph` to decode it, evaluates the operation's fixed
+publication precondition, resolves the lineage parent under that precondition,
+and builds and post-fold validates the complete row delta from the same
+observation. Exact-authority publication revalidates its `WriteTxn` and never
+reparents; an existing rebasable adapter may recompute only what its explicit
+precondition permits. `ManifestAttempt` keeps the Arrow observation inseparable
+from a private dataset, physical branch, and version witness. The substrate's
+single-attempt `try_commit_manifest_rows` consumes the attempt and delta,
+cannot reopen or retarget them, and runs with Lance's transparent conflict
+retry disabled.
+
+Only a typed contention result that proves the CAS did not commit starts the
+next bounded iteration; acknowledgement-unknown or otherwise ambiguous storage
+outcomes remain terminal and recovery-owned. Validation is never reused across
+iterations. The substrate sees Arrow rows and physical witnesses, not logical
+graph heads, logical branch names, lineage, or table semantics. Within the
+workspace, `publish_once` is the only production caller of
+`try_commit_manifest_rows`, and the structural guard pins that fact.
 
 **Execution configuration captured once.** The facade reads the traversal
 override, the expand caps, the RRF gate settings, and the ANN probe bound into
@@ -283,33 +354,44 @@ with the substrate crate.
 - **Public API snapshot.** The public surfaces of `omnigraph-lance` and
   `omnigraph-write` are captured with `cargo-public-api`, the tool the
   vocabulary guard already drives, and compared in CI. A `Dataset`, `Scanner`,
-  or `Transaction` in a signature is a failing diff; a new export is a
-  reviewed diff.
+  `Transaction`, or other Lance type in an operational signature is a failing
+  diff. The four legacy signatures in `omnigraph-lance::compat` are an exact
+  allow-list: removal would break the facade and any addition is a failing
+  diff. Every other new export is a reviewed diff.
 - **Structural registry.** The existing write-surface registry keeps pinning
-  every public async inherent `Omnigraph` method to a protocol disposition,
-  and additionally pins `publish_once` as the sole caller of the manifest
-  gateway's publish method.
+  every public async inherent `Omnigraph` method to a protocol disposition. A
+  write-crate registry enumerates every public effectful `WriteEngine` method,
+  requires each `PolicyGated` entry to authorize before protocol delegation,
+  preserves the named maintenance, bootstrap, and recovery dispositions, and
+  pins private `publish_once` as the sole production caller of
+  `try_commit_manifest_rows` within the workspace.
 - **Facade snapshot.** A `cargo-public-api` capture of `omnigraph` before
   phase 1 is the compatibility baseline every later phase is diffed against.
 
 ### Features
 
 `failpoints` is owned by `omnigraph-failpoints` and enabled by the substrate,
-write, and cluster crates; `dst` is owned by the substrate crate for the
-injected store registry and by the facade for the seeded clock, id, and gate
-seams. The facade forwards both so existing feature flags keep working.
+graph, write, facade, and cluster crates; `dst` is owned by the substrate crate
+for the injected store registry and by the facade for the seeded clock, id, and
+gate seams. The facade forwards both so existing feature flags keep working.
 
 ## Invariants
 
 1. **Respect the substrate.** Strengthened. One crate reads
    [the Lance guide](../dev/lance.md) and owns every fence; a Lance bump is a
-   change to one crate plus its public API snapshot.
-2. **One publication door.** Strengthened. `publish_once` is the only manifest
-   publication, and the guard pins it structurally rather than by inventory of
-   call sites.
+   change to one implementation crate. Its operational API snapshot and the
+   facade compatibility snapshot must both preserve the closed legacy
+   signatures.
+2. **One publication door.** Strengthened. `publish_once` owns graph-aware
+   validation and retry and is the only production caller of the substrate's
+   single-attempt manifest CAS within the workspace. The guard pins that call
+   structurally rather than by inventory of call sites.
 3. **One coherent accepted view.** Strengthened. `Snapshot` and `WriteTxn` are
-   captured in the graph crate and consumed above it; `ExecConfig` is captured
-   once per query. A mid-operation re-read has no API to call.
+   captured in the graph crate and consumed above it. Exact-authority
+   operations use a fresh `ManifestAttempt` only to validate, never replace, a
+   fixed `WriteTxn`; explicitly rebasable operations retain their existing
+   typed precondition instead of silently mixing modes. `ExecConfig` is
+   captured once per query.
 4. **A mutation publishes once.** Unchanged. Staging still accumulates every
    participant, and the D2 constructive-versus-destructive split stays in the
    write crate.
@@ -329,7 +411,11 @@ seams. The facade forwards both so existing feature flags keep working.
    `FtsQuery`, `NearestQuery`, and the predicate AST replace the last
    string-built predicate seam.
 10. **Trust at the boundary, enforced at the engine.** Strengthened.
-    `Authorized<Action>` makes the engine-side gate unskippable by type.
+    One policy-configured `WriteEngine` derives and checks the action and scope
+    of every policy-bearing graph mutation, then mints a private proof required
+    by its protocol helpers. Policy state cannot be replaced or bypassed per
+    call; existing non-policy maintenance stays explicitly classified rather
+    than acquiring an accidental new actor contract.
 11. **Bounded, observable failures and resources.** Unchanged. Retry bounds,
     budgets, and probes move with their owners; the I/O probes live where I/O
     happens.
@@ -343,7 +429,12 @@ Deny-list review: raw Lance writers and public writable `Dataset` handles
 become unrepresentable above the seal; ad-hoc SQL predicate generation is
 retired; no job queue, WAL, buffer pool, shadow truth, or cloud-only path is
 added; the process-local write queue stays process-local and documented as
-such. No known gap changes.
+such. `try_commit_manifest_rows` is necessarily public between the published
+substrate and write crates; it is an unsupported physical primitive below the
+graph-policy boundary, not a second supported graph mutation API. The
+sole-caller guard constrains production code in this workspace, not third-party
+crates or an actor that already has direct storage authority. No known gap
+changes.
 
 ## Compatibility and reversibility
 
@@ -355,19 +446,25 @@ such. No known gap changes.
   through `omnigraph`. Downstream workspace crates may keep depending on the
   facade or switch to the crate that owns the types they use; `omnigraph-cluster`
   is expected to switch its failpoint and embedding-config imports to the leaf
-  crates.
+  crates. The four existing Lance-typed `SnapshotDataset` and
+  `SnapshotScanner` signatures remain source-compatible through the closed
+  `omnigraph-lance::compat` re-export; they are not precedents for new
+  Lance-typed engine seams.
 - **Publishing.** New crates ship on crates.io with the workspace version.
   Their public API is a contract from the first publish; the API snapshot
-  guard exists for that reason.
+  guard exists for that reason. The four Lance-typed compatibility signatures
+  are permanent semver baggage unless a later RFC changes the facade API.
+  After extraction, the supported graph mutation surfaces are `Omnigraph` and
+  `WriteEngine`; lower physical primitives do not promise graph policy or
+  publication semantics to direct consumers.
 - **Support boundaries.** The one-mutation-process boundaries listed in
   [the invariants](../dev/invariants.md) are unchanged; the write queue and
   the merge mutex remain in-process gates.
-- **Reverting.** Each phase is a module move plus a type narrowing, and each
-  can be reverted alone by moving code back into the facade crate. The cost
-  of reverting the whole topology is the reverse of the moves; no persisted
-  state is touched. Reverting after publishing removes crates from crates.io
-  consumers, which is the one irreversible cost, so the publish of each new
-  crate happens at the end of its phase, not the start.
+- **Reverting.** Before publication, completed phases can be reverted in
+  reverse dependency order by moving code back into the facade crate; no
+  persisted state is touched. Published crate versions cannot be removed from
+  consumers, only superseded or yanked, so each new crate is published at the
+  end of its phase rather than the start.
 
 ## Alternatives
 
@@ -418,10 +515,26 @@ such. No known gap changes.
   `policy_engine_chassis.rs` stay on the facade. The map in
   [the testing guide](../dev/testing.md) is updated in the same phase as
   each move.
-- **New guards.** The dependency guard, the two public API snapshots, the
-  facade snapshot, and the `publish_once` pin from the Design section. The
-  structural registry in `forbidden_apis.rs` is retargeted to the write crate;
-  its lexical deny-list is deleted when the dependency guard lands.
+- **New guards.** The dependency guard, the two lower-crate public API
+  snapshots, the facade snapshot, and the `publish_once` pin from the Design
+  section. The facade method registry remains; a write-crate registry adds the
+  closed effectful-method inventory, policy-gate requirement, and retained
+  maintenance dispositions. The lexical Lance
+  deny-list is deleted when the dependency guard lands.
+- **Boundary proof.** Direct calls to every public `WriteEngine` method with
+  a `PolicyGated` disposition and an installed denying checker, or with a
+  missing required actor, fail before any table HEAD, native ref, sidecar, or
+  manifest movement. The action/scope mapping, allowed path, explicit
+  no-policy path, and maintenance dispositions are pinned separately.
+  Manifest publisher tests prove that the physical gateway performs one
+  attempt without transparent rebase and that a proven CAS loss causes a fresh
+  observation and complete logical revalidation. For an exact-authority
+  publication, changed graph head, native ref identity, or table baselines
+  refuse the fixed write; for an existing rebasable publication, only the
+  explicitly allowed parent and delta may change. Unchanged authority can
+  converge to exactly one manifest version and one lineage update. Ambiguous
+  outcomes never retry. Pre-CAS post-fold validation and the workspace
+  sole-caller inventory remain explicit assertions.
 - **Behavior proof.** The `.gqt` corpus of [RFC 0045](0045-gq-logic-tests.md),
   the server and CLI suites, the parity matrix, and the simulation scenarios
   run unchanged at every phase. A phase that needs a test body to change has
@@ -429,13 +542,15 @@ such. No known gap changes.
 - **Cost proof.** Cross-crate boundaries can change inlining in the hot Arrow
   paths. `warm_read_cost.rs`, `write_cost.rs`, and `merge_cost.rs` prove the
   deterministic operation counts are unchanged, and the local benchmark suite
-  is run before and after phases 2 and 4 under the release profile, which
+  is run before and after phases 2, 4, and 5 under the release profile, which
   already uses thin LTO. A wall-time regression above the suite's noise band
   blocks the phase until the boundary is adjusted.
-- **Upstream surfaces.** No Lance surface is added or removed; the phases
-  reuse the current `lance` 11.0.0 and `datafusion` 54 pins and touch no
-  upstream page that [the Lance guide](../dev/lance.md) does not already
-  list.
+- **Upstream surfaces.** No Lance capability or dependency surface is added to
+  the supported graph API; the phases reuse the current `lance` 11.0.0 and
+  `datafusion` 54 pins. The new substrate package republishes only the four
+  Lance-typed signatures already present on the facade; it adds no writable
+  Lance handle or execution capability. The phases touch no upstream page that
+  [the Lance guide](../dev/lance.md) does not already list.
 
 ## Rollout
 
@@ -444,42 +559,50 @@ Nothing user-facing is unavailable at any stop.
 
 0. **In-crate preparation.** Replace the `exec` glob-import hub with explicit
    imports and move mutation, staging, and merge out of `exec` so the module
-   means read execution. Point the read helpers at `SnapshotDataset` and ban
-   the crate-private opener outside the storage, manifest, and graph-index
-   modules. Hoist query-vector resolution and knob capture into the facade
-   behind `ExecConfig`. Move the date and NDJSON parsers to the compiler.
-   Extend `forbidden_apis.rs` with an import allow-list for the read
-   executor. `implementation` advances to `in-progress`.
+   means read execution. Introduce the in-crate `ReadHandle` shape, point
+   internal read helpers at it, reserve `SnapshotDataset` for external
+   compatibility, and ban the crate-private opener outside the storage,
+   manifest, and graph-index modules. Hoist query-vector resolution and knob
+   capture into the facade behind `ExecConfig`. Move the date and NDJSON
+   parsers to the compiler. Extend `forbidden_apis.rs` with an import
+   allow-list for the read executor. `implementation` advances to
+   `in-progress`.
 1. **Leaves.** Extract `omnigraph-failpoints` and `omnigraph-embedding`; the
    facade re-exports both; `omnigraph-cluster` switches its imports.
 2. **The substrate crate.** Extract `omnigraph-lance` with `TableRef`,
    `ReadHandle`, `ScanRequest`, `FtsQuery`, `NearestQuery`, the staged-write
-   handles, the manifest row gateway, and the recovery primitives. Land the
-   dependency guard and the substrate API snapshot, move the surface guards,
-   and delete the lexical deny-list. At this stop the seal is a compiler
-   fact and everything else is still one crate. `implementation` advances to
-   `partial`.
+   handles, exact manifest attempts, the single-attempt manifest row CAS,
+   the closed legacy compatibility adapters, and the recovery primitives. Land
+   the dependency guard and substrate API snapshot with its four-signature
+   compatibility allow-list, move the surface guards, and delete the lexical
+   source-import deny-list. The facade snapshot remains exact at this stop. The
+   operational seal is a compiler fact and everything else is still one crate.
+   `implementation` advances to `partial`.
 3. **The graph crate.** Extract `omnigraph-graph` with `Snapshot`, the
-   manifest state model, `WriteTxn`, validation, the change feed, the logical
-   Blob facade, the receipt types, and `OmniError`. `omnigraph-api-types`
-   switches to it.
+   manifest state model and pure observation decode, fold, lineage, and
+   precondition helpers, `WriteTxn`, validation, the change feed, the logical
+   Blob facade, the receipt types, and `OmniError`.
+   `omnigraph-api-types` switches to it.
 4. **The executor crate.** Extract `omnigraph-exec`, splitting `query.rs` by
    concern: search, expand, scan, anti-join, lowering, projection, batch
    utilities, and the topology index. Executor suites move and gain
    primitive-built fixtures.
-5. **The write crate.** Extract `omnigraph-write` with `Authorized<Action>`,
-   `publish_once`, and the recovery protocol. Retarget the structural
-   registry and land the write API snapshot.
-6. **Facade and documentation.** Thin `db/omnigraph.rs` to capture, gate,
-   delegate, and map. Update the layers table in
+5. **The write crate.** Extract `omnigraph-write` with the policy-configured
+   `WriteEngine`, its private `Authorized<Action>` proof, the bounded
+   graph-aware `publish_once` retry, and the recovery protocol. Add the
+   write-crate structural registry, the direct-denial/no-movement and
+   manifest-attempt retry proofs, and the write API snapshot.
+6. **Facade and documentation.** Thin `db/omnigraph.rs` to capture, configure,
+   forward, delegate, and map. Update the layers table in
    [the architecture guide](../dev/architecture.md), the ownership map in
    [the testing guide](../dev/testing.md), and the fence owners in
    [the Lance guide](../dev/lance.md). `implementation` advances to
    `complete`.
 
-Phases 3, 4, and 5 may land in either order after phase 2, with the
-constraint that the write crate cannot be cut before the graph crate holds
-`WriteTxn`.
+Phases 3, 4, and 5 land in dependency order: the graph crate first, then the
+executor, then the write crate that consumes both. Module moves within a phase
+may be staged, but each phase ends with the declared production DAG and a green
+canonical test graph.
 
 ## Unresolved questions
 
@@ -497,3 +620,7 @@ constraint that the write crate cannot be cut before the graph crate holds
 ## Decision log
 
 - 2026-09-03: Draft opened.
+- 2026-09-04: Closed the legacy Lance-typed compatibility exception, moved
+  policy enforcement and private authorization-proof minting into the
+  context-owning write engine, and split graph-aware publication retry from the
+  substrate's single-attempt row CAS.
