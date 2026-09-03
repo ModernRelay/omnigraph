@@ -278,9 +278,9 @@ prototype):
 
 ## Decision log
 
-- 2026-08-20 — v0.1 drafted on the ModernRelay dev graph
-  (`spc-rfc-0039-search-contracts`) from a source audit of OmniGraph 0.10.0.
-- 2026-08-31 — v0.2: reconciled with the Lance 11 impact analysis, a
+- 2026-08-20 — initial design draft produced from a source audit of
+  OmniGraph 0.10.0.
+- 2026-08-31 — draft reconciled with a Lance 11 impact analysis, a
   line-level source validation of every audit claim, and a fourteen-system
   constraint-placement survey; this RFC is the repository-facing slice of
   that larger draft (schema-owned analyzed search and format-boundary work
@@ -301,11 +301,12 @@ contract; the sections above are authoritative.
 
 **Prototype map.** Branch `search-contracts-p0-p1` @ `3e459aad` (closed
 PR #595). Commit order = Rollout stages; the review-fix commit is
-`3e459aad`, the #587 port is `858ce066`. The dev-graph draft
-(`spc-rfc-0039-search-contracts` v0.2.2, server `modernrelay`, graph `dev`)
-holds the full program this RFC slices from, including the Lance 11 impact
-analysis, the comparative survey, and the P2+ roadmap (`@analyzed`,
-schema-bound distance, SchemaIR vNext).
+`3e459aad`, the #587 port is `858ce066`. This RFC is one slice of a larger
+search-contracts design program whose remaining scope — schema-owned
+analyzed search (`@analyzed`), schema-bound vector distance, and the
+SchemaIR boundary they require — will arrive as its own RFC with its own
+evidence (a Lance 11 change-by-change impact analysis and a fourteen-system
+comparative survey back both slices).
 
 **Substrate dependencies (pinned Lance 11.0.0, crates.io — validate against
 the pin, not the GitHub tag; the two diverge).**
@@ -360,7 +361,7 @@ the pin, not the GitHub tag; the two diverge).**
 - RFC 0040 (system columns): the `__` reserved namespace is where
   engine-owned metric columns migrate; arm-level rrf projection (Unresolved
   question 1) likely lands with it.
-- The full search-contracts program (dev graph) depends on decisions not
+- The remainder of the search-contracts program depends on decisions not
   made here: analyzer/scorer schema surface, SchemaIR version-facet
   coordination with RFCs 0040/0044, and the analyzed-search index posture.
 
