@@ -189,21 +189,54 @@ pub struct ServerConfig {
     /// startup failures quarantine that graph and healthy graphs still serve.
     /// When true, any quarantined or failed graph aborts startup.
     pub require_all_graphs: bool,
-    /// What `GET /readyz` reports about the revision this process booted
-    /// from (RFC 0048).
+    /// What `GET /readyz` and `GET /graphs` report about the revision this
+    /// process booted from (RFC 0049).
     pub witness: BootWitness,
     /// The bound on graceful shutdown: readiness turns off at the signal,
     /// in-flight requests drain, and at this deadline the process exits 2
-    /// (RFC 0048). `--shutdown-grace-seconds` or
-    /// `OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`; default 25.
+    /// (RFC 0049). Resolved by [`resolve_shutdown_grace`]; default 25 s.
     pub shutdown_grace: std::time::Duration,
 }
 
 /// The default bound on graceful shutdown.
 pub const DEFAULT_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
 
-/// The boot facts `GET /readyz` reports (RFC 0048), fixed for the life of
-/// the process.
+/// The environment variable [`resolve_shutdown_grace`] reads when the flag
+/// is absent.
+pub const SHUTDOWN_GRACE_ENV: &str = "OMNIGRAPH_SHUTDOWN_GRACE_SECONDS";
+
+/// The shutdown grace: the `--shutdown-grace-seconds` flag when given, else
+/// `OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`, else 25 seconds (RFC 0049). A
+/// malformed environment value is an error only when the flag is absent.
+pub fn resolve_shutdown_grace(flag_seconds: Option<u64>) -> Result<std::time::Duration> {
+    resolve_shutdown_grace_from(
+        flag_seconds,
+        std::env::var(SHUTDOWN_GRACE_ENV).ok().as_deref(),
+    )
+}
+
+fn resolve_shutdown_grace_from(
+    flag_seconds: Option<u64>,
+    env_value: Option<&str>,
+) -> Result<std::time::Duration> {
+    if let Some(seconds) = flag_seconds {
+        return Ok(std::time::Duration::from_secs(seconds));
+    }
+    match env_value {
+        Some(value) => {
+            let seconds: u64 = value.trim().parse().map_err(|err| {
+                eyre!(
+                    "{SHUTDOWN_GRACE_ENV} must be a whole number of seconds, got `{value}`: {err}"
+                )
+            })?;
+            Ok(std::time::Duration::from_secs(seconds))
+        }
+        None => Ok(DEFAULT_SHUTDOWN_GRACE),
+    }
+}
+
+/// The boot facts `GET /readyz` and `GET /graphs` report (RFC 0049), fixed
+/// for the life of the process.
 #[derive(Debug, Clone, Default)]
 pub struct BootWitness {
     /// The applied revision's `config_digest`.
@@ -211,8 +244,8 @@ pub struct BootWitness {
     /// The ledger revision and CAS the snapshot was read from.
     pub state_revision: u64,
     pub state_cas: Option<String>,
-    /// Every graph the applied revision names, sorted. `/readyz` reports the
-    /// ones not in the registry as quarantined.
+    /// Every graph the applied revision names, sorted. The ones not in the
+    /// registry are quarantined.
     pub applied_graphs: Vec<String>,
 }
 
@@ -311,7 +344,7 @@ pub struct AppState {
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.
     export_transport: export_transport::ExportTransport,
-    /// What `/readyz` reports about the boot (RFC 0048).
+    /// What `/readyz` and `/graphs` report about the boot (RFC 0049).
     witness: Arc<BootWitness>,
     /// Set at the shutdown signal; `/readyz` answers 503 from then on.
     draining: Arc<std::sync::atomic::AtomicBool>,
@@ -637,7 +670,7 @@ impl AppState {
     }
 
     /// Attach the boot witness `/readyz` reports and the flag shutdown sets
-    /// (RFC 0048). `serve` calls this; a test may build its own.
+    /// (RFC 0049). `serve` calls this; a test may build its own.
     #[must_use]
     pub fn with_boot_witness(
         mut self,
@@ -649,6 +682,28 @@ impl AppState {
         self.draining = draining;
         self.shutdown_grace = shutdown_grace;
         self
+    }
+
+    /// The applied graphs this process does not serve, sorted: the boot
+    /// witness's applied set minus the registry.
+    pub(crate) fn quarantined_graphs(&self) -> Vec<String> {
+        let served: std::collections::BTreeSet<String> = self
+            .routing
+            .registry
+            .list()
+            .iter()
+            .map(|handle| handle.key.graph_id.as_str().to_string())
+            .collect();
+        let mut quarantined: Vec<String> = self
+            .witness
+            .applied_graphs
+            .iter()
+            .filter(|graph_id| !served.contains(*graph_id))
+            .cloned()
+            .collect();
+        quarantined.sort();
+        quarantined.dedup();
+        quarantined
     }
 
     /// Runtime routing accessor. Handlers don't typically inspect this —
@@ -1887,6 +1942,22 @@ pub fn build_app(state: AppState) -> Router {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
+    // RFC 0049: the signal listener is installed before anything else, so
+    // the shutdown bound covers startup. On the signal it sets `draining`,
+    // arms the watchdog thread, and releases the graceful shutdown.
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_grace = config.shutdown_grace;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    {
+        let draining = Arc::clone(&draining);
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            draining.store(true, std::sync::atomic::Ordering::SeqCst);
+            arm_shutdown_watchdog(shutdown_grace);
+            let _ = shutdown_tx.send(true);
+        });
+    }
+
     let token_source = resolve_token_source().await?;
     info!(source = token_source.name(), "loaded bearer token source");
     let tokens = token_source.load().await?;
@@ -1956,22 +2027,20 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         stdout.flush()?;
     }
 
-    // RFC 0048: the boot witness `/readyz` reports, the flag shutdown sets,
-    // and one deadline on the drain.
-    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let shutdown_grace = config.shutdown_grace;
     let state = state.with_boot_witness(
         config.witness.clone(),
         Arc::clone(&draining),
         shutdown_grace,
     );
     let registry = Arc::clone(&state.routing.registry);
-    let draining_at_signal = Arc::clone(&draining);
+    let mut shutdown_rx = shutdown_rx;
     let served = axum::serve(listener, build_app(state))
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            draining_at_signal.store(true, std::sync::atomic::Ordering::SeqCst);
-            arm_shutdown_watchdog(shutdown_grace);
+            while !*shutdown_rx.borrow() {
+                if shutdown_rx.changed().await.is_err() {
+                    break;
+                }
+            }
         })
         .await;
     // The drain finishes in-flight requests, but branch_delete's fork
@@ -2171,24 +2240,29 @@ async fn shutdown_signal() {
     info!("shutdown signal received");
 }
 
-/// One absolute deadline on graceful shutdown (RFC 0048): in-flight work
+/// One absolute deadline on graceful shutdown (RFC 0049): in-flight work
 /// may finish until `grace` after the signal; then the process exits 2
-/// without claiming success. A zero grace is an immediate cutoff. The exit
-/// is crash-equivalent for the work it interrupts, and the engine's
-/// durability and next-open recovery remain the authority for it.
+/// without claiming success. A zero grace is an immediate cutoff. The
+/// watchdog is an operating-system thread, not a task: a blocked executor,
+/// a stalled teardown, or a runtime that never polls again cannot postpone
+/// it. The exit is crash-equivalent for the work it interrupts, and the
+/// engine's durability and next-open recovery remain the authority for it.
 fn arm_shutdown_watchdog(grace: std::time::Duration) {
     if grace.is_zero() {
         error!("shutdown grace is zero; exiting immediately with unfinished work");
         std::process::exit(2);
     }
-    tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
-        error!(
-            grace_seconds = grace.as_secs(),
-            "shutdown deadline reached with unfinished work; exiting 2"
-        );
-        std::process::exit(2);
-    });
+    std::thread::Builder::new()
+        .name("shutdown-watchdog".to_string())
+        .spawn(move || {
+            std::thread::sleep(grace);
+            error!(
+                grace_seconds = grace.as_secs(),
+                "shutdown deadline reached with unfinished work; exiting 2"
+            );
+            std::process::exit(2);
+        })
+        .expect("the shutdown watchdog thread spawns");
 }
 
 #[cfg(all(test, unix))]
@@ -2266,8 +2340,26 @@ mod shutdown_signal_tests {
             return;
         }
         arm_shutdown_watchdog(Duration::from_millis(500));
-        // Work that never drains: the deadline, not this sleep, ends the process.
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Non-cooperative work: block the only runtime thread so no task,
+        // timer, or teardown can run. Only a thread watchdog ends this.
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_flag_wins_and_the_environment_is_read_only_without_it() {
+        assert_eq!(
+            resolve_shutdown_grace_from(Some(10), Some("bogus")).unwrap(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            resolve_shutdown_grace_from(None, Some(" 7 ")).unwrap(),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            resolve_shutdown_grace_from(None, None).unwrap(),
+            DEFAULT_SHUTDOWN_GRACE
+        );
+        assert!(resolve_shutdown_grace_from(None, Some("bogus")).is_err());
     }
 
     #[test]

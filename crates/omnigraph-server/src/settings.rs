@@ -53,23 +53,14 @@ pub(crate) async fn load_cluster_settings(
     }
     let env_require_all_graphs = env_flag("OMNIGRAPH_REQUIRE_ALL_GRAPHS");
     let require_all_graphs = cli_require_all_graphs || env_require_all_graphs;
-    // RFC 0048: what `/readyz` will report. Every graph the applied revision
-    // names, whether or not this process ends up serving it.
-    let mut applied_graphs: Vec<String> = snapshot
-        .graphs
-        .iter()
-        .map(|graph| graph.graph_id.clone())
-        .chain(snapshot.quarantined_graphs.iter().cloned())
-        .collect();
-    applied_graphs.sort();
-    applied_graphs.dedup();
+    // RFC 0049: what `/readyz` and `GET /graphs` report. Every graph the
+    // applied revision names, whether or not this process ends up serving it.
     let witness = BootWitness {
         booted_serving_digest: snapshot.config_digest.clone(),
         state_revision: snapshot.state_revision,
         state_cas: snapshot.state_cas.clone(),
-        applied_graphs,
+        applied_graphs: snapshot.applied_graphs.clone(),
     };
-    let shutdown_grace = shutdown_grace_from_env()?;
     if require_all_graphs && !snapshot.diagnostics.is_empty() {
         let details = snapshot
             .diagnostics
@@ -219,22 +210,10 @@ pub(crate) async fn load_cluster_settings(
         allow_unauthenticated: cli_allow_unauthenticated || env_unauth,
         require_all_graphs,
         witness,
-        shutdown_grace,
+        // The binary resolves the flag, then the environment, then the default
+        // (`resolve_shutdown_grace`); settings carry the default.
+        shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
     })
-}
-
-/// `OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`, or the default (RFC 0048). The CLI
-/// flag, when given, replaces this after loading.
-fn shutdown_grace_from_env() -> Result<std::time::Duration> {
-    match std::env::var("OMNIGRAPH_SHUTDOWN_GRACE_SECONDS") {
-        Ok(value) => {
-            let seconds: u64 = value.trim().parse().map_err(|err| {
-                eyre!("OMNIGRAPH_SHUTDOWN_GRACE_SECONDS must be a whole number of seconds, got `{value}`: {err}")
-            })?;
-            Ok(std::time::Duration::from_secs(seconds))
-        }
-        Err(_) => Ok(DEFAULT_SHUTDOWN_GRACE),
-    }
 }
 
 /// RFC-011 cluster-only boot: the server serves exclusively from a

@@ -564,10 +564,12 @@ mod readiness_witness {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// `/readyz` reports the boot witness, the served and quarantined graphs,
-    /// and turns off while draining; `/healthz` stays 200 (RFC 0048).
+    /// `/readyz` reports the boot witness and counts only, turns off while
+    /// draining, and leaves `/healthz` alone; the quarantined ids are on the
+    /// gated `GET /graphs`, derived from the applied set minus the registry
+    /// (RFC 0049).
     #[tokio::test(flavor = "multi_thread")]
-    async fn readyz_reports_the_boot_witness_and_turns_off_while_draining() {
+    async fn readyz_reports_counts_and_graphs_names_the_quarantined() {
         let dir = tempfile::tempdir().unwrap();
         let graph_uri = dir.path().join("alpha").to_str().unwrap().to_string();
         let schema = fs::read_to_string(fixture("test.pg")).unwrap();
@@ -579,9 +581,28 @@ mod readiness_witness {
             policy: None,
             queries: None,
         });
+        // The inventory is gated: a bearer token and a server policy that
+        // permits `graph_list` for it. Readiness needs neither.
+        let policy_path = dir.path().join("server-policy.yaml");
+        fs::write(
+            &policy_path,
+            r#"
+version: 1
+groups:
+  operators: [act-test]
+rules:
+  - id: operators-list-graphs
+    allow:
+      actors: { group: operators }
+      actions: [graph_list]
+"#,
+        )
+        .unwrap();
+        let server_policy = omnigraph_policy::PolicyEngine::load_server(&policy_path).unwrap();
+        let tokens = vec![("act-test".to_string(), "secret".to_string())];
         let workload = omnigraph_server::workload::WorkloadController::from_env();
         let draining = Arc::new(AtomicBool::new(false));
-        let state = AppState::new_multi(vec![handle], Vec::new(), None, workload, None)
+        let state = AppState::new_multi(vec![handle], tokens, Some(server_policy), workload, None)
             .unwrap()
             .with_boot_witness(
                 BootWitness {
@@ -602,9 +623,22 @@ mod readiness_witness {
         assert_eq!(body["booted_serving_digest"], "digest-1");
         assert_eq!(body["state_revision"], 42);
         assert_eq!(body["state_cas"], "sha256:abc");
-        assert_eq!(body["served_graphs"], serde_json::json!(["alpha"]));
-        assert_eq!(body["quarantined_graphs"], serde_json::json!(["beta"]));
+        assert_eq!(body["served_graph_count"], 1);
+        assert_eq!(body["quarantined_graph_count"], 1);
         assert_eq!(body["shutdown_grace_seconds"], 7);
+        assert!(
+            body.get("served_graphs").is_none() && body.get("quarantined_graphs").is_none(),
+            "public readiness carries no graph id: {body}"
+        );
+
+        // The ids live on the gated inventory: refused without the token,
+        // listed with it.
+        let (status, _) = json_response(&app, get_request("/graphs", "wrong")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = json_response(&app, get_request("/graphs", "secret")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["graphs"][0]["graph_id"], "alpha");
+        assert_eq!(body["quarantined"], serde_json::json!(["beta"]));
 
         draining.store(true, Ordering::SeqCst);
         let (status, body) = json_response(&app, get_request("/readyz", "")).await;

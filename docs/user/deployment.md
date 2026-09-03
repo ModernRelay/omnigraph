@@ -30,14 +30,18 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-service":"secret"}' \
 Use `GET /healthz` for process health and `GET /readyz` for readiness:
 `/readyz` reports whether the replica is serving or draining, the applied
 `config_digest` it booted from (`booted_serving_digest`), the ledger revision
-it read, and its served and quarantined graphs, and answers 503 once shutdown
-has begun. Add `--require-all-graphs` when a quarantined graph should make the
-whole process fail startup.
+it read, and how many graphs it serves and does not serve, and answers 503
+once shutdown has begun. It is unauthenticated and therefore names no graph:
+the authenticated `GET /graphs` lists the served graphs and, as `quarantined`,
+the applied graphs this process does not serve. Add `--require-all-graphs`
+when a quarantined graph should make the whole process fail startup.
 
 Shutdown is bounded: at SIGTERM the server stops accepting connections and
-drains in-flight requests for at most `--shutdown-grace-seconds` (or
-`OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`; default 25), then exits 2 with the
-unfinished work logged. A clean drain exits 0. Set the orchestrator's own
+drains in-flight requests for at most `--shutdown-grace-seconds` (else
+`OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`, else 25), then exits 2 with the unfinished
+work logged. The deadline is kept by a thread, so a stalled request or a
+blocked runtime cannot extend it, and the signal is handled from process start,
+so it covers startup too. A clean drain exits 0. Set the orchestrator's own
 termination grace longer than this value; a cutoff is crash-equivalent for the
 work it interrupts, and the next open recovers it as after any crash.
 

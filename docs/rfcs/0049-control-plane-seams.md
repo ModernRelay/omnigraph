@@ -3,7 +3,7 @@ rfc: "0049"
 title: "Control-plane seams: observe, readiness witness, bounded shutdown"
 track: maintainer
 status: accepted
-implementation: partial
+implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-09-03

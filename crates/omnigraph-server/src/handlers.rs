@@ -28,12 +28,14 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     })
 }
 
-/// Readiness witness (RFC 0048).
+/// Readiness witness (RFC 0049).
 ///
-/// Unauthenticated. Reports whether this replica is serving or draining,
-/// the applied `config_digest` it booted from, the ledger revision and CAS
-/// it read, and the graphs it serves and does not serve. Answers 503 once
-/// shutdown has begun; `/healthz` stays 200 while the process is alive.
+/// Unauthenticated, and therefore minimal: it reports whether this replica
+/// is serving or draining, the applied `config_digest` it booted from, the
+/// ledger revision and CAS it read, and how many graphs it serves and does
+/// not serve. Graph ids are topology and stay behind `GET /graphs`. Answers
+/// 503 once shutdown has begun; `/healthz` stays 200 while the process is
+/// alive.
 #[utoipa::path(
     get,
     path = "/readyz",
@@ -48,31 +50,16 @@ pub(crate) async fn server_ready(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<ReadinessOutput>) {
     let draining = state.draining.load(std::sync::atomic::Ordering::SeqCst);
-    let mut served: Vec<String> = state
-        .routing()
-        .registry
-        .list()
-        .iter()
-        .map(|handle| handle.key.graph_id.as_str().to_string())
-        .collect();
-    served.sort();
-    let mut quarantined: Vec<String> = state
-        .witness
-        .applied_graphs
-        .iter()
-        .filter(|graph_id| !served.contains(graph_id))
-        .cloned()
-        .collect();
-    quarantined.sort();
-    quarantined.dedup();
+    let served_graph_count = state.routing().registry.list().len();
+    let quarantined_graph_count = state.quarantined_graphs().len();
     let output = ReadinessOutput {
         ready: !draining,
         status: if draining { "draining" } else { "serving" }.to_string(),
         booted_serving_digest: state.witness.booted_serving_digest.clone(),
         state_revision: state.witness.state_revision,
         state_cas: state.witness.state_cas.clone(),
-        served_graphs: served,
-        quarantined_graphs: quarantined,
+        served_graph_count,
+        quarantined_graph_count,
         shutdown_grace_seconds: state.shutdown_grace.as_secs(),
     };
     let status = if draining {
@@ -136,7 +123,10 @@ pub(crate) async fn server_graphs_list(
         })
         .collect();
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
-    Ok(Json(GraphListResponse { graphs }))
+    Ok(Json(GraphListResponse {
+        graphs,
+        quarantined: state.quarantined_graphs(),
+    }))
 }
 
 pub(crate) async fn server_openapi(

@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use color_eyre::eyre::Result;
-use omnigraph_server::{ServerConfig, init_tracing, load_server_settings, serve};
+use omnigraph_server::{
+    ServerConfig, init_tracing, load_server_settings, resolve_shutdown_grace, serve,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph-server")]
@@ -32,7 +34,7 @@ struct Cli {
     /// serve. Equivalent to setting `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`.
     #[arg(long)]
     require_all_graphs: bool,
-    /// Bound on graceful shutdown, in seconds (RFC 0048): readiness turns off
+    /// Bound on graceful shutdown, in seconds (RFC 0049): readiness turns off
     /// at the signal, in-flight requests drain, and at the deadline the
     /// process exits 2. Zero cuts off immediately. Equivalent to
     /// `OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`; default 25. The orchestrator's own
@@ -54,8 +56,6 @@ async fn main() -> Result<()> {
         cli.require_all_graphs,
     )
     .await?;
-    if let Some(seconds) = cli.shutdown_grace_seconds {
-        settings.shutdown_grace = std::time::Duration::from_secs(seconds);
-    }
+    settings.shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
     serve(settings).await
 }
