@@ -556,3 +556,100 @@ rules:
         );
     }
 }
+
+mod readiness_witness {
+    use super::*;
+    use omnigraph::storage::normalize_root_uri;
+    use omnigraph_server::{BootWitness, GraphHandle, GraphId, GraphKey};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `/readyz` reports the boot witness and counts only, turns off while
+    /// draining, and leaves `/healthz` alone; the quarantined ids are on the
+    /// gated `GET /graphs`, derived from the applied set minus the registry
+    /// (RFC 0049).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn readyz_reports_counts_and_graphs_names_the_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join("alpha").to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+        let handle = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("alpha").unwrap()),
+            uri: normalize_root_uri(&graph_uri).unwrap(),
+            engine: Arc::new(engine),
+            policy: None,
+            queries: None,
+        });
+        // The inventory is gated: a bearer token and a server policy that
+        // permits `graph_list` for it. Readiness needs neither.
+        let policy_path = dir.path().join("server-policy.yaml");
+        fs::write(
+            &policy_path,
+            r#"
+version: 1
+groups:
+  operators: [act-test]
+rules:
+  - id: operators-list-graphs
+    allow:
+      actors: { group: operators }
+      actions: [graph_list]
+"#,
+        )
+        .unwrap();
+        let server_policy = omnigraph_policy::PolicyEngine::load_server(&policy_path).unwrap();
+        let tokens = vec![("act-test".to_string(), "secret".to_string())];
+        let workload = omnigraph_server::workload::WorkloadController::from_env();
+        let draining = Arc::new(AtomicBool::new(false));
+        let state = AppState::new_multi(vec![handle], tokens, Some(server_policy), workload, None)
+            .unwrap()
+            .with_boot_witness(
+                BootWitness {
+                    booted_serving_digest: Some("digest-1".to_string()),
+                    state_revision: 42,
+                    state_cas: Some("sha256:abc".to_string()),
+                    applied_graphs: vec!["alpha".to_string(), "beta".to_string()],
+                },
+                Arc::clone(&draining),
+                std::time::Duration::from_secs(7),
+            );
+        let app = build_app(state);
+
+        let (status, body) = json_response(&app, get_request("/readyz", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["status"], "serving");
+        assert_eq!(body["booted_serving_digest"], "digest-1");
+        assert_eq!(body["state_revision"], 42);
+        assert_eq!(body["state_cas"], "sha256:abc");
+        assert_eq!(body["served_graph_count"], 1);
+        assert_eq!(body["quarantined_graph_count"], 1);
+        assert_eq!(body["shutdown_grace_seconds"], 7);
+        assert!(
+            body.get("served_graphs").is_none() && body.get("quarantined_graphs").is_none(),
+            "public readiness carries no graph id: {body}"
+        );
+
+        // The ids live on the gated inventory: refused without the token,
+        // listed with it.
+        let (status, _) = json_response(&app, get_request("/graphs", "wrong")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = json_response(&app, get_request("/graphs", "secret")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["graphs"][0]["graph_id"], "alpha");
+        assert_eq!(body["quarantined"], serde_json::json!(["beta"]));
+
+        draining.store(true, Ordering::SeqCst);
+        let (status, body) = json_response(&app, get_request("/readyz", "")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["status"], "draining");
+        let (status, _) = json_response(&app, get_request("/healthz", "")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "liveness is unchanged while draining"
+        );
+    }
+}

@@ -3525,6 +3525,38 @@
           }
         }
       }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Readiness witness (RFC 0049).",
+        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and how many graphs it serves and does\nnot serve. Graph ids are topology and stay behind `GET /graphs`. Answers\n503 once shutdown has begun; `/healthz` stays 200 while the process is\nalive.",
+        "operationId": "readiness",
+        "responses": {
+          "200": {
+            "description": "Serving",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Draining",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessOutput"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -4585,6 +4617,13 @@
             "items": {
               "$ref": "#/components/schemas/GraphInfo"
             }
+          },
+          "quarantined": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Graphs the applied revision names that this process does not serve,\nfor any reason, sorted (RFC 0049). Empty when every applied graph is\nserved."
           }
         }
       },
@@ -5171,6 +5210,64 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "ReadinessOutput": {
+        "type": "object",
+        "description": "The readiness witness of one replica (`GET /readyz`, RFC 0049): whether\nit is serving or draining, the applied revision it booted from, and how\nmany graphs it does and does not serve. Unauthenticated, so it carries\nno graph id: those stay behind `GET /graphs`.",
+        "required": [
+          "ready",
+          "status",
+          "state_revision",
+          "served_graph_count",
+          "quarantined_graph_count",
+          "shutdown_grace_seconds"
+        ],
+        "properties": {
+          "booted_serving_digest": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `config_digest` of the applied revision this process booted from.\nFixed for the life of the process: the server never reloads."
+          },
+          "quarantined_graph_count": {
+            "type": "integer",
+            "description": "How many graphs the applied revision names that this process does\nnot serve, for any reason. `GET /graphs` names them.",
+            "minimum": 0
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "False once shutdown has begun; the response is then 503."
+          },
+          "served_graph_count": {
+            "type": "integer",
+            "description": "How many graphs this process serves.",
+            "minimum": 0
+          },
+          "shutdown_grace_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The bound on graceful shutdown, after which the process exits 2.",
+            "minimum": 0
+          },
+          "state_cas": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The ledger CAS (`sha256:<hex>`) the process booted from."
+          },
+          "state_revision": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The ledger revision the process booted from.",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string",
+            "description": "`serving` or `draining`."
           }
         }
       },

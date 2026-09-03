@@ -53,6 +53,14 @@ pub(crate) async fn load_cluster_settings(
     }
     let env_require_all_graphs = env_flag("OMNIGRAPH_REQUIRE_ALL_GRAPHS");
     let require_all_graphs = cli_require_all_graphs || env_require_all_graphs;
+    // RFC 0049: what `/readyz` and `GET /graphs` report. Every graph the
+    // applied revision names, whether or not this process ends up serving it.
+    let witness = BootWitness {
+        booted_serving_digest: snapshot.config_digest.clone(),
+        state_revision: snapshot.state_revision,
+        state_cas: snapshot.state_cas.clone(),
+        applied_graphs: snapshot.applied_graphs.clone(),
+    };
     if require_all_graphs && !snapshot.diagnostics.is_empty() {
         let details = snapshot
             .diagnostics
@@ -201,6 +209,10 @@ pub(crate) async fn load_cluster_settings(
         bind: cli_bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
         allow_unauthenticated: cli_allow_unauthenticated || env_unauth,
         require_all_graphs,
+        witness,
+        // The binary resolves the flag, then the environment, then the default
+        // (`resolve_shutdown_grace`); settings carry the default.
+        shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
     })
 }
 
@@ -667,6 +679,8 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
             require_all_graphs: false,
+            witness: crate::BootWitness::default(),
+            shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
         };
         let result = serve(config).await;
         let err = result
@@ -721,6 +735,8 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
             require_all_graphs: false,
+            witness: crate::BootWitness::default(),
+            shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
         };
         let result = serve(config).await;
         let err =
