@@ -2,7 +2,7 @@
 rfc: "0049"
 title: "Control-plane seams: observe, readiness witness, bounded shutdown"
 track: maintainer
-status: draft
+status: accepted
 implementation: not-started
 authors:
   - OmniGraph maintainers
@@ -272,3 +272,6 @@ None that block acceptance. The default grace of 25 seconds matches RFC
   counts with the ids on `GET /graphs`; the watchdog became a thread and the
   listener moved before graph open; the compatibility section now states the
   Rust-level breaks; `unlocked` added to the authority enum.
+- 2026-09-03: accepted by the maintainer. Implementation follows in two
+  PRs, the cluster crate and CLI (observe) and the server (witness and
+  bounded shutdown); `implementation` advances with each.
