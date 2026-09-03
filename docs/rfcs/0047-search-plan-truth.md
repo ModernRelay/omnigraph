@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-09-01
+updated: 2026-09-03
 discussion: "https://github.com/ModernRelay/omnigraph/pull/595"
 supersedes: []
 superseded_by: []
@@ -301,12 +301,13 @@ contract; the sections above are authoritative.
 
 **Prototype map.** Branch `search-contracts-p0-p1` @ `3e459aad` (closed
 PR #595). Commit order = Rollout stages; the review-fix commit is
-`3e459aad`, the #587 port is `858ce066`. This RFC is one slice of a larger
-search-contracts design program whose remaining scope — schema-owned
+`3e459aad`, the #587 port is `858ce066`. This RFC is the first slice of a
+larger search-contracts design program whose remaining scope — schema-owned
 analyzed search (`@analyzed`), schema-bound vector distance, and the
-SchemaIR boundary they require — will arrive as its own RFC with its own
-evidence (a Lance 11 change-by-change impact analysis and a fourteen-system
-comparative survey back both slices).
+SchemaIR boundary they require — is
+[RFC 0048](0048-search-contracts.md), blocked on this RFC (a Lance 11
+change-by-change impact analysis and a fourteen-system comparative survey
+back both slices).
 
 **Substrate dependencies (pinned Lance 11.0.0, crates.io — validate against
 the pin, not the GitHub tag; the two diverge).**
@@ -361,9 +362,10 @@ the pin, not the GitHub tag; the two diverge).**
 - RFC 0040 (system columns): the `__` reserved namespace is where
   engine-owned metric columns migrate; arm-level rrf projection (Unresolved
   question 1) likely lands with it.
-- The remainder of the search-contracts program depends on decisions not
-  made here: analyzer/scorer schema surface, SchemaIR version-facet
-  coordination with RFCs 0040/0044, and the analyzed-search index posture.
+- The remainder of the search-contracts program
+  ([RFC 0048](0048-search-contracts.md)) depends on decisions not made
+  here: analyzer/scorer schema surface, SchemaIR version-facet coordination
+  with RFCs 0040/0044, and the analyzed-search index posture.
 
 **Build/CI traps observed while producing the evidence.**
 
