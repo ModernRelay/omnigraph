@@ -38,7 +38,7 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0050**; lower gaps are historical and must
+The next available number is **0051**; lower gaps are historical and must
 not be reused (0047 and 0048 are allocated by PR #606).
 
 ## Required frontmatter
@@ -175,3 +175,4 @@ This table is the human index for the canonical RFC corpus.
 | [0045](0045-gq-logic-tests.md) | GQ logic tests | maintainer | draft | partial |
 | [0046](0046-index-status.md) | Read-only index status | maintainer | draft | not-started |
 | [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | complete |
+| [0050](0050-engine-crate-topology.md) | Engine crate topology and the sealed substrate boundary | maintainer | draft | not-started |
