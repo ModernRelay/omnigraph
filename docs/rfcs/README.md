@@ -38,8 +38,8 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0047**; lower gaps are historical and must
-not be reused.
+The next available number is **0049**; lower gaps are historical and must
+not be reused (0047 is held by an out-of-tree draft).
 
 ## Required frontmatter
 
@@ -174,3 +174,4 @@ This table is the human index for the canonical RFC corpus.
 | [0044](0044-edge-keys.md) | Edge keys: derived edge identity | maintainer | draft | in-progress |
 | [0045](0045-gq-logic-tests.md) | GQ logic tests | maintainer | draft | partial |
 | [0046](0046-index-status.md) | Read-only index status | maintainer | draft | not-started |
+| [0048](0048-control-plane-seams.md) | Control-plane seams: observe, ledger restore, readiness witness, bounded shutdown | maintainer | draft | not-started |
