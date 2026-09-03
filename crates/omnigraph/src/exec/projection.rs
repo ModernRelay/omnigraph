@@ -168,8 +168,13 @@ fn evaluate_string_match_filter(
 
     // A NULL operand yields a NULL result; normalize to `false` so the mask
     // explicitly excludes those rows (NULL is not a match) rather than relying
-    // on the downstream filter's null handling.
-    Ok(arrow_select::filter::prep_null_mask_filter(&matches))
+    // on the downstream filter's null handling. `prep_null_mask_filter` unwraps
+    // the null buffer, so skip it when there is none (#603).
+    if matches.nulls().is_some() {
+        Ok(arrow_select::filter::prep_null_mask_filter(&matches))
+    } else {
+        Ok(matches)
+    }
 }
 
 fn array_value_eq(
