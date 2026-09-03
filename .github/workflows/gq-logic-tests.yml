@@ -144,4 +144,5 @@ jobs:
 
       - name: Run GQ logic tests
         if: needs.classify_changes.outputs.run_full_ci == 'true'
-        run: cargo test -p omnigraph-engine --test gq_logic_tests --locked -- --nocapture
+        # The corpus crate: format self-tests, corpus layout check, one test per case.
+        run: cargo test -p omnigraph-gqt --locked -- --nocapture

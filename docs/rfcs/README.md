@@ -38,9 +38,8 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0047**. RFC 0045 is reserved by
-[PR #584](https://github.com/ModernRelay/omnigraph/pull/584); lower gaps are
-historical and must not be reused.
+The next available number is **0047**; lower gaps are historical and must
+not be reused.
 
 ## Required frontmatter
 
@@ -116,7 +115,9 @@ dependencies do.
 3. Review the problem, user/operational behavior, invariants, substrate
    alignment, compatibility, evidence, alternatives, and rollout.
 4. Record material review outcomes in the RFC's decision log. Do not maintain a
-   separate review ledger.
+   separate review ledger. A post-merge amendment rewrites the body sentences
+   it changes and its Decision-log entry names each sentence it supersedes, so
+   the body alone stays current.
 5. A maintainer decision changes the lifecycle to `accepted` or `rejected`.
 6. Implementation PRs link the accepted RFC and update `implementation` plus
    any durable evidence or support boundary in the canonical file.
