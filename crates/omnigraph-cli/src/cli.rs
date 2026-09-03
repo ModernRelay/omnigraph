@@ -514,6 +514,10 @@ pub(crate) enum ClusterCommand {
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
+        /// Plan without taking the cluster lock: read the ledger once, report
+        /// any lock instead of refusing, and label the output `observed`.
+        #[arg(long)]
+        observe: bool,
     },
     /// Converge the cluster to its config: create graphs, apply schema updates
     /// (soft drops), write stored-query/policy catalog resources, and execute
@@ -541,6 +545,17 @@ pub(crate) enum ClusterCommand {
     },
     /// Read the local JSON state ledger without scanning live graph resources.
     Status {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Observe declared graphs and catalog payloads without the lock, the
+    /// recovery sweep, or a write: what `refresh` would record, labeled
+    /// `observed`, with the exact ledger CAS it read.
+    Observe {
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,

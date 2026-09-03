@@ -34,11 +34,12 @@ The cluster sidecars are separate from each graph's ordinary recovery-v9 sidecar
 | Operation | Mutation | Responsibility |
 |---|---|---|
 | `validate` | None | Parse the whole bundle, normalize references, type-check schemas and queries, validate policies and bindings, and report all diagnostics. |
-| `plan` | None | Compare desired resource digests with recorded/applied and observed state; compute dependencies and approval requirements. |
+| `plan` | None | Compare desired resource digests with recorded/applied and observed state; compute dependencies and approval requirements. `--observe` takes no lock and labels the output `authority: observed`. |
 | `approve` | Approval artifact | Bind one irreversible planned operation to exact before/after/config digests and an actor. |
 | `apply` | Resources and ledger | Re-plan under the lock, execute eligible changes in dependency order, recover interrupted changes, then CAS the applied ledger. |
 | `status` | None | Read the ledger, lock, recoveries, approvals, and current observations. |
 | `refresh` | Ledger observations | Reconcile recorded observations with live resources without changing the desired bundle. |
+| `observe` | None | `refresh` without the lock, the recovery sweep, or the write: report the statuses and observations `refresh` would record, labeled `authority: observed` with the exact `state_cas` read (RFC 0049). |
 | `import` | Initial ledger | Adopt declared existing resources after validation and observation. |
 | `force-unlock` | Lock only | Remove one exact stale lock ID after an operator proves no owner is alive. |
 
@@ -48,7 +49,7 @@ Destructive graph deletion requires a matching unconsumed approval. Any relevant
 
 ## Concurrency
 
-State-changing operations acquire `__cluster/lock.json` with storage-native create-if-absent semantics. Final ledger publication is also conditional on the state version observed under the operation. The lock coordinates operator processes; graph-level manifest gates and recovery still own data correctness.
+State-changing operations acquire `__cluster/lock.json` with storage-native create-if-absent semantics. Observe-only reads (`plan --observe`, `observe`) take no lock and write nothing; their output says so (`authority: observed`) and names the `state_cas` they read, and an existing lock is reported rather than refused. A bundle that sets `state.lock: false` gets `authority: unlocked` on every command that would otherwise have held the lock. Final ledger publication is also conditional on the state version observed under the operation. The lock coordinates operator processes; graph-level manifest gates and recovery still own data correctness.
 
 Do not bypass the cluster API with direct filesystem writes, edit `state.json`, or derive a second mutable inventory. Content digests and live observations are recomputed from the declared and durable authorities.
 

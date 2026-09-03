@@ -174,4 +174,4 @@ This table is the human index for the canonical RFC corpus.
 | [0044](0044-edge-keys.md) | Edge keys: derived edge identity | maintainer | draft | in-progress |
 | [0045](0045-gq-logic-tests.md) | GQ logic tests | maintainer | draft | partial |
 | [0046](0046-index-status.md) | Read-only index status | maintainer | draft | not-started |
-| [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | not-started |
+| [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | partial |
