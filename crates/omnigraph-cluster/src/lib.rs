@@ -124,6 +124,22 @@ pub fn validate_config_dir(config_dir: impl AsRef<Path>) -> ValidateOutput {
 }
 
 pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
+    plan_config_dir_with_options(config_dir, PlanOptions::default()).await
+}
+
+/// `plan`, optionally without the cluster lock (RFC 0048). An observed plan
+/// reads the ledger once, reports any lock it finds instead of refusing, and
+/// labels its output `authority: observed`; it is never authority for an
+/// effect.
+pub async fn plan_config_dir_with_options(
+    config_dir: impl AsRef<Path>,
+    options: PlanOptions,
+) -> PlanOutput {
+    let mut authority = if options.observe {
+        LedgerAuthority::Observed
+    } else {
+        LedgerAuthority::Locked
+    };
     let outcome = load_desired(config_dir.as_ref());
     let mut diagnostics = outcome.diagnostics;
     let storage_root = outcome
@@ -142,6 +158,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     let Some(desired) = outcome.desired else {
         return PlanOutput {
             ok: false,
+            authority,
             config_dir: display_path(&outcome.config_dir),
             desired_revision: DesiredRevision {
                 config_digest: None,
@@ -159,6 +176,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     if has_errors(&diagnostics) {
         return PlanOutput {
             ok: false,
+            authority,
             config_dir: display_path(&desired.config_dir),
             desired_revision: DesiredRevision {
                 config_digest: Some(desired.config_digest),
@@ -173,7 +191,15 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
         };
     }
 
-    let _lock_guard = if desired.state_lock {
+    if !options.observe && !desired.state_lock {
+        authority = LedgerAuthority::Unlocked;
+    }
+    let _lock_guard = if options.observe {
+        backend
+            .observe_lock(&mut observations, &mut diagnostics)
+            .await;
+        None
+    } else if desired.state_lock {
         match backend.acquire_lock("plan", &mut observations).await {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
@@ -267,6 +293,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
 
     PlanOutput {
         ok,
+        authority,
         config_dir: display_path(&desired.config_dir),
         desired_revision: DesiredRevision {
             config_digest: Some(desired.config_digest),
@@ -1477,7 +1504,21 @@ pub async fn import_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput 
     sync_config_dir(config_dir.as_ref(), StateSyncOperation::Import).await
 }
 
+/// `refresh` without the lock, the recovery sweep, or the write (RFC 0049):
+/// verify catalog payloads and observe every declared graph through the
+/// read-only open, and report the statuses and observations `refresh` would
+/// have recorded. The ledger's bytes and revision are untouched; the output
+/// is labeled `authority: observed` and names the `state_cas` it read.
+pub async fn observe_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput {
+    sync_config_dir(config_dir.as_ref(), StateSyncOperation::Observe).await
+}
+
 async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> StateSyncOutput {
+    let mut authority = if operation == StateSyncOperation::Observe {
+        LedgerAuthority::Observed
+    } else {
+        LedgerAuthority::Locked
+    };
     let outcome = load_desired(config_dir);
     let mut diagnostics = outcome.diagnostics;
     let storage_root = outcome
@@ -1497,6 +1538,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         return StateSyncOutput {
             ok: false,
             operation,
+            authority,
             config_dir: display_path(&outcome.config_dir),
             state_observations: observations,
             resource_digests: BTreeMap::new(),
@@ -1510,6 +1552,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         return StateSyncOutput {
             ok: false,
             operation,
+            authority,
             config_dir: display_path(&desired.config_dir),
             state_observations: observations,
             resource_digests: desired.resource_digests,
@@ -1520,7 +1563,15 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
     }
 
     let operation_label = state_sync_operation_label(operation);
-    let _lock_guard = if desired.state_lock {
+    if operation != StateSyncOperation::Observe && !desired.state_lock {
+        authority = LedgerAuthority::Unlocked;
+    }
+    let _lock_guard = if operation == StateSyncOperation::Observe {
+        backend
+            .observe_lock(&mut observations, &mut diagnostics)
+            .await;
+        None
+    } else if desired.state_lock {
         match backend
             .acquire_lock(operation_label, &mut observations)
             .await
@@ -1546,6 +1597,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         return StateSyncOutput {
             ok: false,
             operation,
+            authority,
             config_dir: display_path(&desired.config_dir),
             state_observations: observations,
             resource_digests: desired.resource_digests,
@@ -1562,6 +1614,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
             return StateSyncOutput {
                 ok: false,
                 operation,
+                authority,
                 config_dir: display_path(&desired.config_dir),
                 state_observations: observations,
                 resource_digests: desired.resource_digests,
@@ -1584,6 +1637,26 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
             return StateSyncOutput {
                 ok: false,
                 operation,
+                authority,
+                config_dir: display_path(&desired.config_dir),
+                state_observations: observations,
+                resource_digests: BTreeMap::new(),
+                resource_statuses: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                diagnostics,
+            };
+        }
+        (StateSyncOperation::Observe, Some(state)) => state,
+        (StateSyncOperation::Observe, None) => {
+            diagnostics.push(Diagnostic::error(
+                "state_missing",
+                CLUSTER_STATE_FILE,
+                "observe requires an existing state.json; run `cluster import` to bootstrap state",
+            ));
+            return StateSyncOutput {
+                ok: false,
+                operation,
+                authority,
                 config_dir: display_path(&desired.config_dir),
                 state_observations: observations,
                 resource_digests: BTreeMap::new(),
@@ -1601,6 +1674,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
             return StateSyncOutput {
                 ok: false,
                 operation,
+                authority,
                 config_dir: display_path(&desired.config_dir),
                 state_observations: observations,
                 resource_digests: state_resource_digests(&state),
@@ -1619,6 +1693,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         return StateSyncOutput {
             ok: false,
             operation,
+            authority,
             config_dir: display_path(&desired.config_dir),
             state_observations: observations,
             resource_digests: state_resource_digests(&state),
@@ -1631,62 +1706,74 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
     // Recovery sweep first (RFC-004 §D3): classify any interrupted graph
     // operation before observation/verification so a rolled-forward outcome
     // is what those passes see.
-    let sweep = sweep_recovery_sidecars(&backend, &mut state, &mut diagnostics).await;
+    let sweep = match operation {
+        StateSyncOperation::Refresh | StateSyncOperation::Import => {
+            Some(sweep_recovery_sidecars(&backend, &mut state, &mut diagnostics).await)
+        }
+        // Observe never sweeps: pending sidecars are reported, not acted on.
+        StateSyncOperation::Observe => {
+            warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
+            None
+        }
+    };
 
-    // Catalog payload verification must run BEFORE graph observation: removing
-    // a drifted query digest first means the live-graph composite recompute
-    // below already excludes it, so the persisted graph.<id> composite stays
-    // consistent and the next plan shows exactly the create + derived update.
-    for (address, finding) in verify_catalog_payloads(&backend, &state).await {
-        diagnostics.push(payload_finding_diagnostic(&address, &finding));
-        match finding {
-            PayloadFinding::Missing => {
-                state.applied_revision.resources.remove(&address);
-                set_resource_status(
-                    &mut state,
-                    &address,
-                    ResourceLifecycleStatus::Drifted,
-                    "payload_missing",
-                    "catalog payload blob is missing; re-run `cluster apply` to republish",
-                );
-            }
-            PayloadFinding::Mismatch { .. } => {
-                state.applied_revision.resources.remove(&address);
-                set_resource_status(
-                    &mut state,
-                    &address,
-                    ResourceLifecycleStatus::Drifted,
-                    "payload_mismatch",
-                    "catalog payload blob does not match the recorded digest; re-run `cluster apply` to republish",
-                );
-            }
-            // Transient IO must not trigger a spurious republish: keep the
-            // digest, surface the error, let a later clean refresh converge.
-            PayloadFinding::ReadError(error) => {
-                set_resource_status(
-                    &mut state,
-                    &address,
-                    ResourceLifecycleStatus::Error,
-                    "payload_read_error",
-                    &error,
-                );
+    {
+        // Catalog payload verification must run BEFORE graph observation: removing
+        // a drifted query digest first means the live-graph composite recompute
+        // below already excludes it, so the persisted graph.<id> composite stays
+        // consistent and the next plan shows exactly the create + derived update.
+        for (address, finding) in verify_catalog_payloads(&backend, &state).await {
+            diagnostics.push(payload_finding_diagnostic(&address, &finding));
+            match finding {
+                PayloadFinding::Missing => {
+                    state.applied_revision.resources.remove(&address);
+                    set_resource_status(
+                        &mut state,
+                        &address,
+                        ResourceLifecycleStatus::Drifted,
+                        "payload_missing",
+                        "catalog payload blob is missing; re-run `cluster apply` to republish",
+                    );
+                }
+                PayloadFinding::Mismatch { .. } => {
+                    state.applied_revision.resources.remove(&address);
+                    set_resource_status(
+                        &mut state,
+                        &address,
+                        ResourceLifecycleStatus::Drifted,
+                        "payload_mismatch",
+                        "catalog payload blob does not match the recorded digest; re-run `cluster apply` to republish",
+                    );
+                }
+                // Transient IO must not trigger a spurious republish: keep the
+                // digest, surface the error, let a later clean refresh converge.
+                PayloadFinding::ReadError(error) => {
+                    set_resource_status(
+                        &mut state,
+                        &address,
+                        ResourceLifecycleStatus::Error,
+                        "payload_read_error",
+                        &error,
+                    );
+                }
             }
         }
-    }
 
-    let graph_error_count = observe_declared_graphs(&desired, &backend, &mut state).await;
-    if graph_error_count > 0 {
-        diagnostics.push(Diagnostic::error(
-            "graph_observation_error",
-            CLUSTER_GRAPHS_DIR,
-            format!("{graph_error_count} graph observation(s) failed"),
-        ));
+        let graph_error_count = observe_declared_graphs(&desired, &backend, &mut state).await;
+        if graph_error_count > 0 {
+            diagnostics.push(Diagnostic::error(
+                "graph_observation_error",
+                CLUSTER_GRAPHS_DIR,
+                format!("{graph_error_count} graph observation(s) failed"),
+            ));
+        }
     }
 
     if operation == StateSyncOperation::Import && has_errors(&diagnostics) {
         return StateSyncOutput {
             ok: false,
             operation,
+            authority,
             config_dir: display_path(&desired.config_dir),
             state_observations: observations,
             resource_digests: state_resource_digests(&state),
@@ -1696,25 +1783,51 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         };
     }
 
-    if operation == StateSyncOperation::Import {
-        state.state_revision = 1;
-    } else {
-        state.state_revision = state.state_revision.saturating_add(1);
+    match operation {
+        StateSyncOperation::Import => state.state_revision = 1,
+        StateSyncOperation::Refresh => match state.state_revision.checked_add(1) {
+            Some(next) => state.state_revision = next,
+            None => {
+                diagnostics.push(Diagnostic::error(
+                    "state_revision_overflow",
+                    CLUSTER_STATE_FILE,
+                    "state_revision is at u64::MAX and cannot advance; the ledger was left unchanged",
+                ));
+                return StateSyncOutput {
+                    ok: false,
+                    operation,
+                    authority,
+                    config_dir: display_path(&desired.config_dir),
+                    state_observations: observations,
+                    resource_digests: state_resource_digests(&state),
+                    resource_statuses: state.resource_statuses,
+                    observations: state.observations,
+                    diagnostics,
+                };
+            }
+        },
+        // Observe never moves the revision.
+        StateSyncOperation::Observe => {}
     }
 
-    match backend
-        .write_state(&state, expected_cas.as_deref(), &mut observations)
-        .await
-    {
-        Ok(()) => {
-            // Completed sweep sidecars are deleted only after their outcome
-            // is durably recorded; on failure they stay and re-sweep.
-            for sidecar_uri in &sweep.completed_sidecars {
-                backend.delete_object(sidecar_uri).await;
+    if operation != StateSyncOperation::Observe {
+        match backend
+            .write_state(&state, expected_cas.as_deref(), &mut observations)
+            .await
+        {
+            Ok(()) => {
+                if let Some(sweep) = &sweep {
+                    // Completed sweep sidecars are deleted only after their
+                    // outcome is durably recorded; on failure they stay and
+                    // re-sweep.
+                    for sidecar_uri in &sweep.completed_sidecars {
+                        backend.delete_object(sidecar_uri).await;
+                    }
+                    mark_approvals_consumed(&backend, &sweep.consumed_approvals).await;
+                }
             }
-            mark_approvals_consumed(&backend, &sweep.consumed_approvals).await;
+            Err(diagnostic) => diagnostics.push(diagnostic),
         }
-        Err(diagnostic) => diagnostics.push(diagnostic),
     }
 
     let resource_digests = state_resource_digests(&state);
@@ -1723,6 +1836,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
     StateSyncOutput {
         ok,
         operation,
+        authority,
         config_dir: display_path(&desired.config_dir),
         state_observations: observations,
         resource_digests,
@@ -2291,6 +2405,7 @@ fn state_sync_operation_label(operation: StateSyncOperation) -> &'static str {
     match operation {
         StateSyncOperation::Refresh => "refresh",
         StateSyncOperation::Import => "import",
+        StateSyncOperation::Observe => "observe",
     }
 }
 

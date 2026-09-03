@@ -10,10 +10,10 @@ use omnigraph_api_types::{
     SnapshotDatasetOutput,
 };
 use omnigraph_cluster::{
-    ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
-    StateSyncOutput, StatusOutput, ValidateOutput, apply_config_dir_with_options,
-    approve_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
-    refresh_config_dir, status_config_dir, validate_config_dir,
+    ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOptions,
+    PlanOutput, StateSyncOutput, StatusOutput, ValidateOutput, apply_config_dir_with_options,
+    approve_config_dir, force_unlock_config_dir, import_config_dir, observe_config_dir,
+    plan_config_dir_with_options, refresh_config_dir, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -1591,9 +1591,17 @@ async fn main() -> Result<()> {
                 let output = validate_config_dir(config);
                 finish_cluster_validate(&output, json)?;
             }
-            ClusterCommand::Plan { config, json } => {
-                let output = plan_config_dir(config).await;
+            ClusterCommand::Plan {
+                config,
+                json,
+                observe,
+            } => {
+                let output = plan_config_dir_with_options(config, PlanOptions { observe }).await;
                 finish_cluster_plan(&output, json)?;
+            }
+            ClusterCommand::Observe { config, json } => {
+                let output = observe_config_dir(config).await;
+                finish_cluster_state_sync(&output, json)?;
             }
             ClusterCommand::Apply { config, json } => {
                 // The actor attributes graph-moving operations (sidecars,

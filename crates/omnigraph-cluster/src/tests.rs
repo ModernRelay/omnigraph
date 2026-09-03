@@ -4891,3 +4891,186 @@ graphs:
         out.diagnostics
     );
 }
+
+#[tokio::test]
+async fn plan_observe_takes_no_lock_and_reports_observed_authority() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    let state = r#"{
+  "version": 1,
+  "state_revision": 7,
+  "applied_revision": {
+    "config_digest": "old",
+    "resources": {
+      "graph.knowledge": { "digest": "old-graph" }
+    }
+  }
+}"#;
+    fs::write(state_dir.join("state.json"), state).unwrap();
+    // Another process holds the lock; an observer reports it and proceeds.
+    fs::write(
+        dir.path().join(CLUSTER_LOCK_FILE),
+        r#"{"version":1,"lock_id":"01OTHER","operation":"apply","created_at":"2026-09-03T00:00:00Z","pid":1}"#,
+    )
+    .unwrap();
+
+    let out = plan_config_dir_with_options(dir.path(), PlanOptions { observe: true }).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(out.authority, LedgerAuthority::Observed);
+    assert_eq!(out.state_observations.state_revision, 7);
+    assert_eq!(
+        out.state_observations.state_cas.as_deref(),
+        Some(format!("sha256:{}", sha256_hex(state.as_bytes())).as_str())
+    );
+    assert!(out.state_observations.locked);
+    assert_eq!(out.state_observations.lock_id.as_deref(), Some("01OTHER"));
+    assert!(!out.state_observations.lock_acquired);
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|d| d.code == "state_lock_disabled" || d.code == "state_lock_held"),
+        "{:?}",
+        out.diagnostics
+    );
+    // The foreign lock is exactly as it was: nothing created, nothing removed.
+    assert!(
+        fs::read_to_string(dir.path().join(CLUSTER_LOCK_FILE))
+            .unwrap()
+            .contains("01OTHER")
+    );
+    // The locked path still labels itself.
+    fs::remove_file(dir.path().join(CLUSTER_LOCK_FILE)).unwrap();
+    let locked = plan_config_dir(dir.path()).await;
+    assert_eq!(locked.authority, LedgerAuthority::Locked);
+    assert!(locked.state_observations.lock_acquired);
+}
+
+#[tokio::test]
+async fn observe_reports_drift_without_writing_the_ledger() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    let graph_digest = historical_graph_digest("knowledge", None, &[]);
+    let ledger = serde_json::to_string(&json!({
+        "version": 1,
+        "state_revision": 3,
+        "applied_revision": {
+            "config_digest": "old",
+            "resources": { "graph.knowledge": { "digest": graph_digest } }
+        }
+    }))
+    .unwrap();
+    fs::write(state_dir.join("state.json"), &ledger).unwrap();
+
+    let out = observe_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(out.operation, StateSyncOperation::Observe);
+    assert_eq!(out.authority, LedgerAuthority::Observed);
+    assert_eq!(out.state_observations.state_revision, 3);
+    assert!(!out.state_observations.lock_acquired);
+    assert_eq!(
+        out.resource_statuses["graph.knowledge"].status,
+        ResourceLifecycleStatus::Applied
+    );
+    // Nothing was written: the bytes, the revision, and the absence of a lock.
+    assert_eq!(
+        fs::read_to_string(state_dir.join("state.json")).unwrap(),
+        ledger
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+
+    // A graph that disappeared is reported as drifted, still without a write.
+    fs::remove_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR)).unwrap();
+    let out = observe_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(
+        out.resource_statuses["graph.knowledge"].status,
+        ResourceLifecycleStatus::Drifted
+    );
+    assert_eq!(
+        fs::read_to_string(state_dir.join("state.json")).unwrap(),
+        ledger
+    );
+}
+
+#[tokio::test]
+async fn a_bundle_without_the_lock_is_labeled_unlocked() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE))
+            .unwrap()
+            .replace("lock: true", "lock: false"),
+    )
+    .unwrap();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    let graph_digest = historical_graph_digest("knowledge", None, &[]);
+    fs::write(
+        state_dir.join("state.json"),
+        serde_json::to_string(&json!({
+            "version": 1,
+            "state_revision": 3,
+            "applied_revision": {
+                "config_digest": "old",
+                "resources": { "graph.knowledge": { "digest": graph_digest } }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let plan = plan_config_dir(dir.path()).await;
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert_eq!(plan.authority, LedgerAuthority::Unlocked);
+    assert!(!plan.state_observations.lock_acquired);
+    let refresh = refresh_config_dir(dir.path()).await;
+    assert!(refresh.ok, "{:?}", refresh.diagnostics);
+    assert_eq!(refresh.authority, LedgerAuthority::Unlocked);
+    assert!(
+        refresh
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "state_lock_disabled")
+    );
+    // An observer stays an observer whatever the bundle says.
+    let observe = observe_config_dir(dir.path()).await;
+    assert_eq!(observe.authority, LedgerAuthority::Observed);
+}
+
+#[tokio::test]
+async fn refresh_refuses_to_advance_past_the_last_revision() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    let graph_digest = historical_graph_digest("knowledge", None, &[]);
+    let ledger = serde_json::to_string(&json!({
+        "version": 1,
+        "state_revision": u64::MAX,
+        "applied_revision": {
+            "config_digest": "old",
+            "resources": { "graph.knowledge": { "digest": graph_digest } }
+        }
+    }))
+    .unwrap();
+    fs::write(state_dir.join("state.json"), &ledger).unwrap();
+
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.code == "state_revision_overflow"),
+        "{:?}",
+        out.diagnostics
+    );
+    assert_eq!(
+        fs::read_to_string(state_dir.join("state.json")).unwrap(),
+        ledger
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+}
