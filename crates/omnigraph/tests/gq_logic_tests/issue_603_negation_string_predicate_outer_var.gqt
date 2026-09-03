@@ -1,0 +1,26 @@
+# issue: 603
+# red_on: 2026-09-02, pre-fix build: panicked in arrow's prep_null_mask_filter (Option::unwrap on None) instead of returning bob.
+# notes: a starts_with / contains predicate on the outer variable inside `not { }`
+# notes: runs in the anti-join's inner pipeline, whose string column carries no
+# notes: null buffer; the in-memory arm folded nulls unconditionally.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"bob"}}
+
+--- query
+query not_prefixed() {
+    match {
+        $p: Person
+        not { $p.name starts_with "a" }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "bob"}
