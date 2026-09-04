@@ -26,14 +26,25 @@ the AWS job does and reports success without building; its workflow carries a
 verbatim copy of the `Classify Changes` job under the name
 `Classify Changes (GQ Logic Tests)`, and `scripts/check-classify-copy.py`
 holds that copy identical to `ci.yml`. `Fix Regression Gate`
-(`fix-regression-gate.yml`) holds every issue the PR body closes by keyword to
-a regression in the diff: a `.gqt` case or a `#[test]`-attributed `issue_N`
-function, added or strengthened, in a top-level test target or `src/` module
-under `crates/*` or `tools/*` (an owner test not yet named for the issue is
-renamed to carry `issue_N` when extended). Owners the gate does not recognize
-(Python and shell scripts, helper and fixture modules) go through the
-`no-repro` label, which a maintainer applies to waive the check per PR;
-`scripts/check-fix-regression.py` is the check. It is a policy check, so it runs on `pull_request_target`: the
+(`fix-regression-gate.yml`) holds every issue the PR body closes by keyword
+(`Closes #N`, `Closes ModernRelay/omnigraph#N`, or the issue URL) to a
+regression in the diff: a top-level `.gqt` case or a `#[test]`-attributed
+`issue_N` function, added or strengthened, in a top-level test target
+(`tests/<name>.rs`) or `src/` module under `crates/*` or `tools/*` (an owner
+test not yet named for the issue is renamed to carry `issue_N` when
+extended). A PR whose diff changes no path under `crates/` or `tools/`
+(Markdown files there aside) and neither root `Cargo.toml` nor `Cargo.lock`
+passes unexamined, with a notice annotation saying so: a fix in a workflow, a
+script, a document, or a deployment file has no logic or Rust test that could
+witness it. Owners the gate does not recognize inside those paths (helper and
+fixture modules, a script under a crate, a rustdoc-only change) go through
+the `no-repro` label, which a maintainer applies to waive the check per PR;
+`scripts/check-fix-regression.py` is the check. A failure names the code
+paths that made the gate look, the ways through, any near miss in the diff (a
+case whose header says `# issue: N` under another name or a subdirectory, a
+test named with the bare number, moved, under a leading `_`, or in a helper
+module, an issue-named function with no test attribute), and a case skeleton,
+as a log line and as a GitHub error annotation. It is a policy check, so it runs on `pull_request_target`: the
 workflow and the script come from `main`, and the pull request head is fetched
 only as data for the diff range, never checked out or executed. It runs on
 body edits and label changes as well as pushes, builds nothing, and takes no
