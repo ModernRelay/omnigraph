@@ -55,4 +55,5 @@ jobs:
           python3 scripts/check-fix-regression.py \
             --body-file "$RUNNER_TEMP/pr-body.txt" \
             --labels "$PR_LABELS" \
+            --repo "$GITHUB_REPOSITORY" \
             --range "$BASE_SHA...$HEAD_SHA"

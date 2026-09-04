@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-03
+updated: 2026-09-04
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -175,9 +175,22 @@ read) reads the PR body for GitHub's closing keywords (close, closes, closed,
 fix, fixes, fixed, resolve, resolves, resolved), matched the way GitHub's
 own parser matches them: case-insensitive, a word boundary before the
 keyword (so "hotfix #563" never fires on `fix`), an optional colon, then
-whitespace (optional when the colon is present) and `#N`, with leading
-zeros in `N` normalized away. Every issue so closed needs a matching
-regression in the diff, added or strengthened (the two owner locations
+whitespace (optional when the colon is present) and the target, one of
+`#N`, `OWNER/NAME#N`, and `https://github.com/OWNER/NAME/issues/N` for the
+repository the gate runs in (`--repo`; the workflow passes
+`GITHUB_REPOSITORY`; a reference to another repository closes nothing here
+and is not read), with leading zeros in `N` normalized away. Before any
+issue is examined the gate lists the paths the diff changes (`git diff
+--name-only --no-renames`, so a file moved out of a crate still shows its
+source-side deletion); when none is under `crates/` or `tools/` (a Markdown
+file there does not count) and none is the root `Cargo.toml` or
+`Cargo.lock`, the code paths, where every workspace member lives (the
+gate's self-test pins every `[workspace] member` to them), the PR passes
+with its closed issues unexamined, as a log line and a notice annotation: a
+fix made in a workflow, a script, a document, or a deployment file has no
+logic or Rust test that could witness it, and a demand for one is a demand
+for nothing. Every issue so closed by a PR that changes a code path needs a
+matching regression in the diff, added or strengthened (the two owner locations
 `docs/dev/testing.md` lists per package: `tests/` targets and in-source
 test modules), checked independently per issue: a `.gqt` case in the
 logic test corpus named `issue_N_*`, new or modified with
@@ -199,8 +212,8 @@ the line is a declaration ending in `;`, or when the same name is
 removed elsewhere in the diff (a rename alone never counts, a rename
 plus an added assertion does). A comment, string, or fixture line
 mentioning the issue never satisfies the gate, and owners the gate does
-not recognize (Python and shell scripts among them) satisfy it only
-through `no-repro`. Adjacency and body-location rules, with their named
+not recognize inside the code paths (a helper or fixture module, a script
+under a crate, a rustdoc-only change) satisfy it only through `no-repro`. Adjacency and body-location rules, with their named
 residues, are in the Decision log (2026-09-02). The gate is a diff check, and what it guarantees about
 execution differs by shape: a corpus shape executes, since the target
 registers and runs every `.gqt` in the corpus, refuses a malformed one, and the
@@ -218,21 +231,32 @@ function can besides be `#[ignore]`d or cfg-gated (workspace clippy on
 the pull request refuses an unreferenced private function, not those),
 so whether that test runs in the suite and asserts the right thing stays
 with review, which the first AGENTS.md sentence primes: a Rust test needs
-a reason the format cannot express. The gate reads only that form in the
-PR body: closings
-by full URL, `owner/repo#N` reference, a bare no-space `fixes#N`,
-commit-message keyword, or manual close after merge pass unexamined; that
-residue is accepted and belongs to review under the AGENTS.md regression
-sentence.
+a reason the format cannot express. The gate reads only those three forms
+in the PR body: closings by `GH-N`, a bare no-space `fixes#N`, an
+autolink in angle brackets or a Markdown link whose text is `#N`, an
+`http://` or `www.` URL,
+commit-message keyword, or manual close after merge pass unexamined, a
+keyword inside a code span, a fence, or an HTML comment is read, and a PR
+against a non-default base is examined although GitHub closes nothing
+there; that residue is accepted and belongs to review under the AGENTS.md
+regression sentence. A failure names the code paths that made the gate
+examine the PR, the ways through, any near miss the diff holds (a case
+whose header says `# issue: N` under another name or a subdirectory; a
+test named with the bare number, moved rather than added, under a leading
+`_`, or in a helper module; a function named for the issue with no test
+attribute directly above it), and a case skeleton; the same text goes out
+as a GitHub error annotation, so it shows on the checks summary without
+opening the log.
 The escape hatch is the `no-repro` label, applied to the PR by a
 maintainer (label rights sit with triage and the label is visible on the
 PR, so waiving is a reviewed maintainer act, not a silent skip). The
-label waives the whole PR, an accepted coarseness; docs-only fixes,
-perf-only issues, and non-deterministic races cannot carry an
-input-to-output logic test, and a gate without an escape hatch gets
-deleted. The gate's guarantee, quotable: exit 0 exactly when every issue
-the body closes by keyword has its matching addition or the PR carries
-`no-repro`, and the AGENTS.md contract sentence is present (the grep in
+label waives the whole PR, an accepted coarseness; perf-only issues,
+non-deterministic races, a removal, and a rustdoc-only change cannot carry
+an input-to-output logic test (a fix outside the code paths never reaches
+the label), and a gate without an escape hatch gets deleted. The gate's guarantee, quotable: exit 0 exactly
+when the diff changes no code path, or every issue the body closes by
+keyword has its matching addition, or the PR carries `no-repro`, and in
+every case the AGENTS.md contract sentence is present (the grep in
 the Enforcement ladder); a corpus match means the case ran green in the
 required job, and a Rust match means a test-attributed function of that
 name was added or extended. The guarantee holds over the base branch's
@@ -1120,3 +1144,58 @@ listed in Compatibility and reversibility.
     `gq_logic_tests` runs on a pull request" premise; the 2026-09-03
     amendment's "A pull request runs only the corpus walker and `Test
     omnigraph-server --features aws`" as a description of what runs.
+- 2026-09-04, amendment from the PR that scoped the Fix Regression Gate to
+  the code paths, after the CI pull-request-tier PR. Where the body or any
+  earlier entry differs from this entry, this entry holds. Trigger: a
+  workflow-only fix that closed its issue by keyword (#594, two files under
+  `.github/workflows/`) was red on the gate with no way through but the
+  `no-repro` label, which only a maintainer can apply; the gate was
+  demanding a test that no location could hold.
+  - Code paths (User and operational behavior, Fix-PR gate): before any
+    closed issue is examined, the gate lists the paths the diff changes
+    (`git diff --name-only --no-renames`) and passes the PR unexamined,
+    with a `::notice` annotation naming the closed issues, when none is
+    under `crates/` or `tools/` (Markdown files there excluded) and none is
+    the root `Cargo.toml` or `Cargo.lock`. Those are where every workspace
+    member lives (`Cargo.toml` `[workspace] members`; the self-test asserts
+    each member sits under a code path, so a member added elsewhere turns
+    the gate red on its next run), so they are the only paths a `.gqt`
+    case or a Rust test can witness a change in. A PR that changes a
+    workflow and a crate is examined as before, as is one whose only
+    code-path change is `Cargo.lock`. `scripts/`, `deploy/`, `docker/`,
+    `benchmarks/` (fixtures and suites, no member), `.github/`, `docs/`,
+    and root files other than the two manifests are outside; a rustdoc-only
+    change inside a `.rs` file is not told apart from code and goes through
+    the label.
+  - Closing forms: `#N`, `OWNER/NAME#N`, and
+    `https://github.com/OWNER/NAME/issues/N`, the three GitHub's parser
+    closes on, for the repository the gate runs in (`--repo`, refused
+    unless `OWNER/NAME`; the workflow passes `GITHUB_REPOSITORY`; with
+    neither, `#N` only and a `warn:` line). A reference to another
+    repository closes nothing here and is not read. Residue, named in the
+    body: `GH-N`, bare `fixes#N`, autolink and Markdown-link forms,
+    `http://` and `www.` URLs, commit-message keywords, manual closes; a
+    keyword inside a code span, fence, or HTML comment is read; a
+    non-default base branch is examined.
+  - Failure text: names the code paths that made the gate look, the ways
+    through as a numbered list, near misses the diff holds (a case whose
+    header says `# issue: N` under another name or a subdirectory; a test
+    named with the bare number, moved rather than added, under a leading
+    `_`, or in a helper module; an issue-named function with no added test
+    attribute directly above it), and a case skeleton; emitted once as the
+    log line and once as a `::error` annotation. Near misses are named,
+    never credited: the match rules are unchanged.
+  - PR template: the "Fixes an accepted issue" line says what a fix under
+    the code paths must carry.
+  - Guarantee: exit 0 exactly when the diff changes no code path, or every
+    issue the body closes by keyword has its matching addition, or the PR
+    carries `no-repro`; and in every case the AGENTS.md contract sentence
+    is present.
+  - Superseded: "and `#N`" as the whole target; "The gate reads only that
+    form in the PR body: closings by full URL, `owner/repo#N` reference,
+    ... pass unexamined"; "owners the gate does not recognize (Python and
+    shell scripts among them) satisfy it only through `no-repro`" (a
+    script outside a crate is now outside the code paths; one under a
+    crate still goes through the label); "docs-only fixes" as a reason the
+    label exists, narrowed to a rustdoc-only change inside a crate; the
+    quotable guarantee's two-way form.
