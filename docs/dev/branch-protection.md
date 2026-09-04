@@ -27,10 +27,13 @@ documentation structure check.
 Documentation-only PRs still receive every required context; work-heavy steps
 may report as skipped.
 
-`Test Workspace` is deliberately not required because it runs after merge, on
-tags, or by manual dispatch rather than on PRs. Making it required would leave
-PRs waiting for a context they cannot receive. A post-merge failure makes
-`main` stop-the-line until fixed or reverted. See [ci.md](ci.md).
+`Test Workspace` runs on pull requests as a reporting context and is
+deliberately not required: with strict checks every merge invalidates every
+other open pull request's required contexts, so a required 60-minute context
+would space merges an hour apart. The merger waits for `Test Workspace` to
+report and reads a red result before merging. The same suite runs again on
+every push to `main`, on tags, and by dispatch, where a red run makes `main`
+stop-the-line until fixed or reverted. See [ci.md](ci.md).
 
 The remaining policy is:
 
