@@ -206,9 +206,21 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     typecheck_clauses(catalog, &query.match_clause, &mut ctx, &params, false)?;
 
     // Typecheck return projections
+    let mut result_columns: HashSet<String> = HashSet::new();
     for proj in &query.return_clause {
         let resolved = resolve_expr_type(catalog, &proj.expr, &ctx, &params)?;
         reject_blob_read_value(&resolved, &proj.expr)?;
+        // T25: one result column per name. The executor emits a batch with
+        // every projection's column under its executed name; two columns of
+        // one name survive the batch (Arrow allows it) and every reader that
+        // keys a row by column name keeps the last one, so the first value
+        // is lost without an error.
+        let column = executed_column_name(&proj.expr, proj.alias.as_deref());
+        if !result_columns.insert(column.clone()) {
+            return Err(CompilerError::Type(format!(
+                "T25: result column `{column}` is produced by more than one projection; give each projection its own alias"
+            )));
+        }
         if let Some(alias) = &proj.alias {
             ctx.aliases.insert(alias.clone(), resolved);
             alias_exprs.insert(alias.clone(), &proj.expr);
@@ -1667,6 +1679,30 @@ fn infer_projection_field(
             let (data_type, nullable) = resolved_type_to_field_shape(catalog, &resolved)?;
             Ok(Field::new(name, data_type, nullable))
         }
+    }
+}
+
+/// The column name a projection carries in the executed result batch
+/// (`exec/projection.rs`, `evaluate_projection` and the aggregate path): the
+/// alias when given, else `var.prop` for a property, the variable or
+/// parameter name for a bare variable, `literal` for a literal, and the
+/// argument's executed name for an aggregate; every other expression keeps
+/// `projection_name`'s spelling. `projection_name` is the inferred-schema
+/// spelling and names an unaliased property by the property alone; the two
+/// spellings drift for unaliased projections today, and this function
+/// follows the executor because T25 guards the batch the executor builds.
+fn executed_column_name(expr: &Expr, alias: Option<&str>) -> String {
+    if let Some(alias) = alias {
+        return alias.to_string();
+    }
+    match expr {
+        Expr::PropAccess { variable, property } => format!("{variable}.{property}"),
+        Expr::Variable(variable) => variable.clone(),
+        Expr::Literal(_) => "literal".to_string(),
+        Expr::Aggregate { arg, .. } => executed_column_name(arg, None),
+        // `now()` lowers to the hidden parameter and is named after it.
+        Expr::Now => crate::query::ast::NOW_PARAM_NAME.to_string(),
+        other => projection_name(other, None),
     }
 }
 

@@ -94,6 +94,10 @@ limit 20
 
 Return expressions include variables, properties, literals, `now()`, earlier
 projection aliases, and the aggregates `count`, `sum`, `avg`, `min`, and `max`.
+'''''' Each projection produces one result column, named by its alias or, without
+one, by its expression (`$p.name` gives `p.name`). Two projections that would
+produce the same column name are refused at compile time (`T25`); give each
+its own alias.
 Search expressions are documented in [Search](../search/index.md).
 
 An explicit order is total and deterministic: OmniGraph adds entity ids as a
