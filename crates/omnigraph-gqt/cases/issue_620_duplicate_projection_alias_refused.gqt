@@ -1,0 +1,138 @@
+# issue: 620
+# red_on: 2026-09-03, main @ 0ff0ae3b: the query succeeded, one column `value` holding 7, the name silently dropped (step 1); steps 2-9 succeed the same way on 44211fce, which has no refusal to name.
+
+--- schema
+node Pair {
+    name: String @key
+    num: I64
+}
+
+--- seed
+{"type":"Pair","data":{"name":"p","num":7}}
+
+--- query
+query same_alias_twice() {
+    match {
+        $a: Pair
+    }
+    return { $a.name as value, $a.num as value }
+}
+
+--- expect error: result column `value` is produced by more than one projection
+
+--- query
+query same_property_twice() {
+    match {
+        $a: Pair
+    }
+    return { $a.num, $a.num }
+}
+
+--- expect error: result column `a.num` is produced by more than one projection
+
+--- query
+query two_literals() {
+    match {
+        $a: Pair
+    }
+    return { 1, 2 }
+}
+
+--- expect error: result column `literal` is produced by more than one projection
+
+--- query
+query alias_named_like_a_literal() {
+    match {
+        $a: Pair
+    }
+    return { $a.num as literal, 2 }
+}
+
+--- expect error: result column `literal` is produced by more than one projection
+
+--- query
+query property_and_aggregate_over_it() {
+    match {
+        $a: Pair
+    }
+    return { $a.name, count($a.name) }
+}
+
+--- expect error: result column `a.name` is produced by more than one projection
+
+--- query
+query variable_and_alias_named_like_it() {
+    match {
+        $a: Pair
+        $b: Pair
+    }
+    return { $a, $b.name as a }
+}
+
+--- expect error: result column `a` is produced by more than one projection
+
+--- query
+query parameter_and_alias_named_like_it($x: I64) {
+    match {
+        $a: Pair
+    }
+    return { $x, $a.name as x }
+}
+
+--- params
+{"x": 1}
+
+--- expect error: result column `x` is produced by more than one projection
+
+--- query
+query two_aggregates_one_alias() {
+    match {
+        $a: Pair
+    }
+    return { count($a) as n, sum($a.num) as n }
+}
+
+--- expect error: result column `n` is produced by more than one projection
+
+--- query
+query third_occurrence() {
+    match {
+        $a: Pair
+    }
+    return { $a.name as v, $a.num as w, $a.name as v }
+}
+
+--- expect error: result column `v` is produced by more than one projection
+
+--- query
+query distinct_aliases() {
+    match {
+        $a: Pair
+    }
+    return { $a.name as who, $a.num as how_many }
+}
+
+--- expect unordered
+{"who": "p", "how_many": 7}
+
+--- query
+query property_and_aliased_aggregate() {
+    match {
+        $a: Pair
+    }
+    return { $a.name, count($a.num) as n }
+}
+
+--- expect unordered
+{"a.name": "p", "n": 1}
+
+--- query
+query two_aliased_literals() {
+    match {
+        $a: Pair
+    }
+    return { 1 as one, 2 as two }
+}
+
+--- expect unordered
+{"one": 1, "two": 2}
