@@ -11,9 +11,14 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Keep post-merge main runs alive so a red full-suite result is actionable.
+  # Keep main runs alive: their suite result is the post-merge detection
+  # channel, and a cancelled job never reaches rust-cache's post-step save.
   # Superseded PR runs are safe to cancel.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The one failpoint feature list `lint` and `test` both compile.
+  FAILPOINT_FEATURES: omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 
 jobs:
   classify_changes:
@@ -262,6 +267,7 @@ jobs:
           workspaces: |
             . -> target/vocabulary-public-api
           key: vocabulary-public-api-nightly-2026-08-01-v1
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test vocabulary guard
         run: cargo test -p omnigraph-vocabulary-guard --locked
@@ -448,42 +454,37 @@ jobs:
           workspaces: |
             . -> target
           key: lint
-          # Only main runs save: PR-branch saves are invisible to other PRs
-          # and only evict shared entries.
-          save-if: ${{ github.event_name == 'push' }}
+          # Save only from main: a save from any other ref (a PR branch, a
+          # tag) is restorable by no PR and only evicts shared entries. Save
+          # even when the job is red: dependency artifacts are valid whatever
+          # the verdict, and a red seed run would otherwise leave every PR
+          # cold until main is green again.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       - name: Clippy (default features)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_macro
 
-      # Feature-gated code is invisible to the default build. Keep this
-      # feature list in sync with the post-merge test job's.
+      # Feature-gated code is invisible to the default build.
       - name: Clippy (failpoints superset)
         run: |
           cargo clippy --workspace --all-targets --locked \
-            --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
+            --features "$FAILPOINT_FEATURES" \
             -- -D warnings -W clippy::dbg_macro
 
   test:
     name: Test Workspace
     needs: classify_changes
-    # PR latency: the workspace gate runs only for pushes to `main` that are
-    # not proven documentation-only
-    # (post-merge), tags, and manual `workflow_dispatch` — NOT on pull_request.
-    # Trade-off accepted deliberately: a regression is caught on the `main`
-    # run after merge rather than before it, so `main` can briefly go red.
-    # Mitigations:
-    # (1) `Test Workspace` is removed from required PR checks in
-    #     `.github/branch-protection.json` (a required check that never
-    #     reports would leave every PR permanently pending);
-    # (2) run the full suite locally before merging risky changes
-    #     (`cargo test --workspace --locked --features
-    #     omnigraph-engine/failpoints,omnigraph-cluster/failpoints`), or trigger
-    #     this workflow via the Actions "Run workflow" button on your branch;
-    # (3) openapi.json is not auto-regenerated — regenerate it locally for
-    #     server/API changes
-    #     (`OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi`)
-    #     or the strict drift check fails the post-merge `main` run.
-    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    # Runs on every non-documentation pull request (fail-fast; a reporting
+    # context, not in `.github/branch-protection.json`: under strict checks a
+    # required 60-minute context would space merges an hour apart; wait for
+    # it before merging) and on main pushes, tags, and workflow_dispatch
+    # (`--no-fail-fast`: the post-merge detection channel; the main run also
+    # seeds the dependency cache PRs restore). openapi.json is not
+    # auto-regenerated: after server/API changes run
+    # `OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi`
+    # or the drift check fails this job.
+    if: needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # The 2026-07-28 cold diagnostic spent 25m29s on the featureless workspace
     # graph, then another 23m21s compiling the failpoints graph. Build the
@@ -514,16 +515,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: stable
+      - name: Install pinned toolchain
+        run: rustup toolchain install
 
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
             . -> target
+          # Save only from main, red or green (same rule as `lint`).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      # Own step so compile and run wall clock read apart in the log; the
+      # run step reuses these binaries (same flags, features, and env).
+      - name: Compile the workspace and failpoint test graph
+        run: |
+          cargo test --workspace --locked --no-run \
+            --features "$FAILPOINT_FEATURES"
 
       - name: Install genuine v0.9 release for upgrade regression
         run: |
@@ -542,12 +551,15 @@ jobs:
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/workspace-tests.log"
-          # --no-fail-fast: this post-merge run is a detection channel, not a
-          # gate. Stopping at the first red suite hides every independent
-          # failure behind it, which makes later regressions unattributable
-          # (suite order decided what CI could see, not what was broken).
-          cargo test --workspace --locked --no-fail-fast \
-            --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
+          # A pull request is a gate: stop at the first red suite. Main,
+          # tag, and dispatch runs are detection channels: --no-fail-fast,
+          # so every independent failure is reported.
+          no_fail_fast=()
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+            no_fail_fast+=(--no-fail-fast)
+          fi
+          cargo test --workspace --locked ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
+            --features "$FAILPOINT_FEATURES" \
             -- --nocapture 2>&1 | tee "$test_log"
           if grep -Fq "skipping v0.9 upgrade e2e:" "$test_log"; then
             echo "::error::v0.9 upgrade regression skipped despite a configured release binary"
@@ -583,10 +595,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: stable
+      - name: Install pinned toolchain
+        run: rustup toolchain install
 
       - name: Cache cross-version build data
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -594,6 +604,7 @@ jobs:
           workspaces: |
             . -> target
           key: crossversion-v5-v6
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # CI pins only the immediate predecessor. Older seams remain env-gated
       # and on-demand, per docs/dev/testing.md.
@@ -647,7 +658,10 @@ jobs:
     name: Test omnigraph-server --features aws
     needs: classify_changes
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Required context whose cache saves only from main: a cold main run
+    # that outruns the ceiling is cancelled before the save and every PR
+    # stays cold (the dst.yml lesson). Sized for a cold dependency graph.
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
@@ -667,11 +681,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
-      - name: Install Rust stable
+      - name: Install pinned toolchain
         if: needs.classify_changes.outputs.run_full_ci == 'true'
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: stable
+        run: rustup toolchain install
 
       - name: Cache Rust build data
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -680,6 +692,9 @@ jobs:
           workspaces: |
             . -> target
           key: aws-feature
+          # Save only from main, red or green (same rule as `lint`).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       - name: Build omnigraph-server with aws feature
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -737,10 +752,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-pip
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: stable
+      - name: Install pinned toolchain
+        run: rustup toolchain install
 
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -750,6 +763,7 @@ jobs:
           key: ${{ matrix.shard }}
           workspaces: |
             . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Start RustFS
         # Pinned to 1.0.0-beta.12 (2026-07-30). beta.8 carried hyper's short
@@ -933,6 +947,7 @@ jobs:
           workspaces: |
             . -> target
           key: azurite-azure
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Start pinned Azurite Blob service
         # Azurite 3.35.0, pinned to the immutable multi-arch index digest.
