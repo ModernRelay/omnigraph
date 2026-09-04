@@ -1,0 +1,44 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue.test, -CASE KindOfFruit, -DATASET CSV empty;
+# notes: the case builds its own schema and rows. Rel tables LIKES / KIND_OF become edge
+# notes: types Likes / KindOf. Only the middle statement is expressible: the other two
+# notes: use a recursive traversal, OR, and UNION. No T likes both Apple and Banana, so
+# notes: the result is empty.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node T {
+    name: String @key
+}
+node Fruit {
+    name: String @key
+}
+edge Likes: T -> Fruit
+edge KindOf: T -> T
+
+--- seed
+{"type":"T","data":{"name":"T1"}}
+{"type":"T","data":{"name":"T2"}}
+{"type":"T","data":{"name":"T3"}}
+{"type":"Fruit","data":{"name":"Banana"}}
+{"type":"Fruit","data":{"name":"Orange"}}
+{"type":"Fruit","data":{"name":"Apple"}}
+{"edge":"Likes","from":"T1","to":"Banana","data":{}}
+{"edge":"Likes","from":"T2","to":"Orange","data":{}}
+{"edge":"Likes","from":"T3","to":"Apple","data":{}}
+{"edge":"KindOf","from":"T1","to":"T2","data":{}}
+{"edge":"KindOf","from":"T2","to":"T3","data":{}}
+
+--- query
+query stmt_7() {
+    match {
+        $t: T
+        $f1: Fruit { name: "Apple" }
+        $f2: Fruit { name: "Banana" }
+        $t likes $f1
+        $t likes $f2
+    }
+    return { $t.name }
+}
+
+--- expect unordered

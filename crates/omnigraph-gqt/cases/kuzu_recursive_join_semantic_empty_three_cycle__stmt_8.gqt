@@ -1,0 +1,37 @@
+# issue: none
+# notes: kuzu recursive_join/semantic_empty.test, -CASE ThreeCycle, statement 8. Split
+# notes: out of kuzu_recursive_join_semantic_empty_three_cycle.gqt because GQ's answer
+# notes: diverges from Kuzu's walk semantics: Kuzu counts 2 walks of length 2..3 out of
+# notes: node 0, the longer one closing the cycle; GQ's r{2,3} is shortest-path distance
+# notes: per endpoint pair and does not return the source. Expectation rewritten to GQ's
+# notes: shortest-path-distance semantics by project decision (2026-09-04); Kuzu's walk
+# notes: semantics expect 2 here.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node N {
+    pk: I64 @key
+}
+edge R: N -> N
+
+--- seed
+{"type":"N","data":{"pk":0}}
+{"type":"N","data":{"pk":1}}
+{"type":"N","data":{"pk":2}}
+{"edge":"R","from":"0","to":"1"}
+{"edge":"R","from":"1","to":"2"}
+{"edge":"R","from":"2","to":"0"}
+
+--- query
+query stmt_8() {
+    match {
+        $a: N
+        $b: N
+        $a r{2,3} $b
+        $a.pk = 0
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 1}

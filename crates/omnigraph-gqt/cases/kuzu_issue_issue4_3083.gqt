@@ -1,0 +1,37 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue4.test, -CASE 3083 (kuzudb/kuzu issue 3083),
+# notes: -DATASET CSV empty; the case builds its own schema and rows. MERGE has no GQ
+# notes: spelling: each MERGE is not translated and its values are carried into the
+# notes: seed, so the closing read sees the same rows Kuzu does. Table `test` becomes
+# notes: type `Test` (GQ type names start uppercase). One key is merged twice and seeded
+# notes: once.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Test {
+    prop0: String?
+    prop1: [String]?
+    prop2: String?
+    prop3: I64?
+    prop4: String @key
+}
+
+--- seed
+{"type":"Test","data":{"prop4":"efwb2143d10ccfw","prop0":"efwoj23","prop1":["eee","wefwhiihifwe23343","dmkwlenfwef232323"],"prop2":"NOT eee IS NULL AND dmkwlenfwef232323 <'2023-01-10T00:00:00-05:00' AND dmkwlenfwef232323 >='2022-01-01T00:00:00-05:00'","prop3":5}}
+{"type":"Test","data":{"prop4":"sdnweh2382933228","prop0":"efwoj23","prop1":["customer_name","wefwhiihifwe23343","dmkwlenfwef232323"],"prop2":"NOT customer_name IS NULL AND NOT dmkwlenfwef232323 IS NULL"}}
+{"type":"Test","data":{"prop4":"sdnjb232*23ksfew","prop0":"fw","prop1":["wefwhiihifwe23343","dmkwlenfwef232323"],"prop2":"wefwhiihifwe23343 > 5"}}
+{"type":"Test","data":{"prop4":"dsnfjwne*&232","prop0":"tweee"}}
+{"type":"Test","data":{"prop4":"nsdwew*232njfds^","prop0":"fw"}}
+{"type":"Test","data":{"prop4":"fwsdmwfnw&","prop0":"sds"}}
+
+--- query
+query stmt_9() {
+    match {
+        $n: Test
+        $n.prop4 = "efwb2143d10ccfw"
+    }
+    return { $n.prop1 }
+}
+
+--- expect unordered
+{"n.prop1": ["eee", "wefwhiihifwe23343", "dmkwlenfwef232323"]}

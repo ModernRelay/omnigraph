@@ -1,0 +1,24 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return/return2.test, -CASE Scenario2. tck dataset,
+# notes: inline schema/seed. One node table, so the unlabeled (a) binds A.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    num: I64?
+}
+
+--- seed
+{"type":"A","data":{"pk":0,"num":1}}
+
+--- query
+query stmt_3() {
+    match {
+        $a: A
+    }
+    return { $a.num }
+}
+
+--- expect unordered
+{"a.num": 1}

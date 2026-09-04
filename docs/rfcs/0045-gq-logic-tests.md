@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-03
+updated: 2026-09-04
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -1097,3 +1097,39 @@ listed in Compatibility and reversibility.
     per-case budget, panic capture, and corpus layout (no foreign entry,
     never empty) each keep one test; the traversal-override and
     foreign-entry tests stay.
+- 2026-09-04, amendment from the PR that added the Kuzu-derived cases
+  (new, supersedes nothing). This entry extends the feature-case sentence
+  of User and operational behavior ("a case written for new or existing
+  behavior with no failure to witness") and File format's "A feature case
+  writes `# issue: none` and drops the prefix" with a third origin, derived
+  cases, translated from another engine's test corpus; it adds nothing to
+  the harness. The body says nothing about where a feature case's
+  expectation comes from, so no body sentence differs from this entry.
+  Derived cases live in the same directory under a source prefix
+  (`kuzu_*.gqt` for kuzudb/kuzu `test/test_files/`, MIT), as
+  `# issue: none` feature cases, with the source file and case named in the
+  header and the License attribution in `crates/omnigraph-gqt/README.md`.
+  Unchanged: File format's naming rule (`<short_name>.gqt` over
+  `[a-z0-9_]`) and its "there are deliberately no external-file references,
+  or single files decay back into directories", and the `corpus_layout`
+  unit test in Runner mechanics; the prefix is a convention, not a harness
+  distinction. The expectation of a derived case follows one of these
+  rules, and the header's `# notes:` lines say which:
+  - Where the engines agree, the expectation is the source engine's,
+    translated to GQ; the attribution line says so. Numbers render at
+    scale 12 (Compatibility), so a six-decimal Kuzu AVG is written at
+    twelve.
+  - Where the engines disagree on semantics, the statement is split into
+    its own file, the header names the source engine's value and the
+    reading taken, and the expectation follows that reading (a bounded
+    traversal as shortest-path distance per endpoint pair; an undirected
+    self-loop as one row per matched node).
+  - Where the source engine asserts only `ok`, the rows are derived from
+    the seed.
+  - A translation may add an order key so a `limit` cut is deterministic,
+    or split one statement into typed reads when an untyped edge has no GQ
+    spelling; the header records each such change.
+  - A case pinning a refusal or fix the engine does not have yet may be
+    red on its pull-request branch; its header names what it waits on, and
+    the PR merges only after that lands, so the corpus on `main` is never
+    red.

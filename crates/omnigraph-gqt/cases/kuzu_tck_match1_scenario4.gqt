@@ -1,0 +1,29 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match1.test, -CASE Scenario4, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). SERIAL ID -> pk with 0,1,2 in creation
+# notes: order. Unlabeled (n) binds A, the schema's only node table. RETURN n is spelled
+# notes: as the node's declared scalar properties (whole_entity_spelled_as_props).
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    name: String?
+    firstName: String?
+}
+
+--- seed
+{"type":"A","data":{"pk":0,"name":"bar"}}
+{"type":"A","data":{"pk":1,"name":"monkey"}}
+{"type":"A","data":{"pk":2,"firstName":"bar"}}
+
+--- query
+query stmt_3() {
+    match {
+        $n: A { name: "bar" }
+    }
+    return { $n.pk, $n.name, $n.firstName }
+}
+
+--- expect unordered
+{"n.pk": 0, "n.name": "bar", "n.firstName": null}

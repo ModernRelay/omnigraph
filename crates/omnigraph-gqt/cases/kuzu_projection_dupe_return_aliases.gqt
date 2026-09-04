@@ -1,0 +1,30 @@
+# issue: none
+# notes: kuzu test/test_files/projection/dupe_return.test, -CASE ReturnDupeAliases.
+# notes: -DATASET CSV empty, so the case carries its own schema+seed; SERIAL ID -> pk 0
+# notes: for the single CREATE. Kuzu returns two columns named `number` (`1|2`); a
+# notes: name-keyed row cannot carry `number` twice, so the expectation is the
+# notes: engine's refusal, not Kuzu's rows.
+# notes: Expectation rewritten to the engine's refusal by project decision
+# notes: (2026-09-04); Kuzu returns the rows 1|2 here.
+# notes: Red on purpose: waits on the duplicate-column refusal landing in the engine.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    num1: I64?
+    num2: I64?
+}
+
+--- seed
+{"type":"A","data":{"pk":0,"num1":1,"num2":2}}
+
+--- query
+query return_dupe_aliases() {
+    match {
+        $a: A
+    }
+    return { $a.num1 as number, $a.num2 as number }
+}
+
+--- expect error: T25: result column `number` is produced by more than one projection

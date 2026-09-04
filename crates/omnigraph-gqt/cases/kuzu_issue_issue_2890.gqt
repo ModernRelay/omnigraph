@@ -1,0 +1,36 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue.test, -CASE 2890 (kuzudb/kuzu issue 2890),
+# notes: -DATASET CSV empty; the case builds its own schema and rows. BEGIN TRANSACTION
+# notes: / COMMIT have no GQ spelling and are not translated; the two CREATEs inside the
+# notes: transaction are the seed, and the MATCH+CREATE that links them is the one
+# notes: mutate step.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node SpotTableNode {
+    model_key: String @key
+    technical_name: String?
+    name: String?
+    row_count: I64?
+}
+node SpotColumnNode {
+    model_key: String @key
+    technical_name: String?
+    name: String?
+    p_unique: F64?
+    p_distinct: F64?
+    p_missing: F64?
+    common_values: [String]?
+}
+edge SpotTableToCol: SpotTableNode -> SpotColumnNode
+
+--- seed
+{"type":"SpotTableNode","data":{"model_key":"tableSchema::tpcds_1.tpcds.store_returns","technical_name":"tpcds.store_returns","name":"Store Returns","row_count":288279}}
+{"type":"SpotColumnNode","data":{"model_key":"columnSchema::tpcds_1.tpcds.store_returns.sr_return_time_sk","technical_name":"sr_return_time_sk","name":"Return Time","p_unique":0.055061,"p_distinct":0.318826,"p_missing":0.0,"common_values":["33413","31810","54900","54638","45302"]}}
+
+--- mutate
+query stmt_7() {
+    insert SpotTableToCol { from: "tableSchema::tpcds_1.tpcds.store_returns", to: "columnSchema::tpcds_1.tpcds.store_returns.sr_return_time_sk" }
+}
+
+--- expect affected: nodes=0 edges=1

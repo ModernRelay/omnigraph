@@ -1,0 +1,83 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue.test, -CASE 5954 (github.com/kuzudb/kuzu issue
+# notes: 5954), -DATASET CSV empty; the case builds its own schema and rows. Node
+# notes: property `id` is spelled `pk` (engine system field). Rel tables REQUESTED_BY /
+# notes: TARGET become edge types RequestedBy / Target. The first CREATE is the seed;
+# notes: the MATCH+CREATE chain is one mutate step with four inserts. DETACH DELETE is
+# notes: spelled as a plain node delete; the engine cascades the incident edges and
+# notes: reports them in affected_edges, so `expect affected` is what pins the detach
+# notes: (`ok` would assert success only). Kuzu's two closing reads walk an untyped edge
+# notes: across both rel tables, which has no GQ spelling; they are split into two typed
+# notes: reads that assert the same facts: RequestedBy is empty and Target holds only R2
+# notes: -> D2, together equal to Kuzu's `COUNT(*) = 1` and `R2|D2`.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Device {
+    pk: String @key
+}
+node Execution {
+    pk: String @key
+}
+node Request {
+    pk: String @key
+}
+edge RequestedBy: Execution -> Request
+edge Target: Request -> Device
+
+--- seed
+{"type":"Execution","data":{"pk":"E1"}}
+{"type":"Request","data":{"pk":"R1"}}
+{"type":"Device","data":{"pk":"D1"}}
+{"edge":"RequestedBy","from":"E1","to":"R1","data":{}}
+{"edge":"Target","from":"R1","to":"D1","data":{}}
+
+--- mutate
+query stmt_7() {
+    insert Request { pk: "R2" }
+    insert Device { pk: "D2" }
+    insert RequestedBy { from: "E1", to: "R2" }
+    insert Target { from: "R2", to: "D2" }
+}
+
+--- expect affected: nodes=2 edges=2
+
+--- mutate
+query stmt_8() {
+    delete Request where pk = "R1"
+}
+
+--- expect affected: nodes=1 edges=2
+
+--- mutate
+query stmt_9() {
+    delete Execution where pk = "E1"
+}
+
+--- expect affected: nodes=1 edges=1
+
+--- query
+query stmt_10() {
+    match {
+        $e: Execution
+        $r: Request
+        $e requestedBy $r
+    }
+    return { count($r) as n }
+}
+
+--- expect unordered
+{"n": 0}
+
+--- query
+query stmt_11() {
+    match {
+        $r: Request
+        $d: Device
+        $r target $d
+    }
+    return { $r.pk, $d.pk }
+}
+
+--- expect unordered
+{"r.pk": "R2", "d.pk": "D2"}

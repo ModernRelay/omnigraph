@@ -1,0 +1,59 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match3.test, -CASE Scenario21, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). Seed nodes a..k are unlabeled in the
+# notes: CREATE and bind A, the schema's only node table, with pk 0..10 in creation
+# notes: order. RETURN x is spelled as x.pk, x.name (whole_entity_spelled_as_props).
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    name: String?
+}
+edge KNOWS: A -> A
+
+--- seed
+{"type":"A","data":{"pk":0,"name":"a"}}
+{"type":"A","data":{"pk":1,"name":"b"}}
+{"type":"A","data":{"pk":2,"name":"c"}}
+{"type":"A","data":{"pk":3,"name":"d"}}
+{"type":"A","data":{"pk":4,"name":"e"}}
+{"type":"A","data":{"pk":5,"name":"f"}}
+{"type":"A","data":{"pk":6,"name":"g"}}
+{"type":"A","data":{"pk":7,"name":"h"}}
+{"type":"A","data":{"pk":8,"name":"i"}}
+{"type":"A","data":{"pk":9,"name":"j"}}
+{"type":"A","data":{"pk":10,"name":"k"}}
+{"edge":"KNOWS","from":"0","to":"3","data":{}}
+{"edge":"KNOWS","from":"0","to":"4","data":{}}
+{"edge":"KNOWS","from":"0","to":"5","data":{}}
+{"edge":"KNOWS","from":"0","to":"6","data":{}}
+{"edge":"KNOWS","from":"0","to":"8","data":{}}
+{"edge":"KNOWS","from":"1","to":"3","data":{}}
+{"edge":"KNOWS","from":"1","to":"4","data":{}}
+{"edge":"KNOWS","from":"1","to":"5","data":{}}
+{"edge":"KNOWS","from":"1","to":"7","data":{}}
+{"edge":"KNOWS","from":"1","to":"10","data":{}}
+{"edge":"KNOWS","from":"2","to":"3","data":{}}
+{"edge":"KNOWS","from":"2","to":"4","data":{}}
+{"edge":"KNOWS","from":"2","to":"7","data":{}}
+{"edge":"KNOWS","from":"2","to":"6","data":{}}
+{"edge":"KNOWS","from":"2","to":"9","data":{}}
+
+--- query
+query stmt_4() {
+    match {
+        $a: A { name: "a" }
+        $b: A { name: "b" }
+        $c: A { name: "c" }
+        $x: A
+        $a knows $x
+        $b knows $x
+        $c knows $x
+    }
+    return { $x.pk, $x.name }
+}
+
+--- expect unordered
+{"x.pk": 3, "x.name": "d"}
+{"x.pk": 4, "x.name": "e"}

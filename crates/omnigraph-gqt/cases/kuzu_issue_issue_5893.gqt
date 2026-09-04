@@ -1,0 +1,33 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue.test, -CASE 5893 (kuzudb/kuzu issue 5893),
+# notes: -DATASET CSV empty; the case builds its own schema and rows. SERIAL primary key
+# notes: `id` becomes `pk` assigned 0,1,2,3 in creation order. Two Account rows carry a
+# notes: null name; the cross-variable equality must not pair them, so only alice
+# notes: survives.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Account {
+    pk: I64 @key
+    service: String?
+    name: String?
+}
+
+--- seed
+{"type":"Account","data":{"pk":0,"service":"A","name":"alice"}}
+{"type":"Account","data":{"pk":1,"service":"A","name":null}}
+{"type":"Account","data":{"pk":2,"service":"B","name":null}}
+{"type":"Account","data":{"pk":3,"service":"B","name":"alice"}}
+
+--- query
+query stmt_6() {
+    match {
+        $a: Account { service: "A" }
+        $b: Account { service: "B" }
+        $a.name = $b.name
+    }
+    return { $a.name }
+}
+
+--- expect unordered
+{"a.name": "alice"}

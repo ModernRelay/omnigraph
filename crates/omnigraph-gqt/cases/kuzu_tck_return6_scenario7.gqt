@@ -1,0 +1,29 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return/return6.test, -CASE Scenario7. tck dataset,
+# notes: inline schema/seed. One node table, so the unlabeled (n) binds A. count(*) is
+# notes: spelled count($n) and aliased; grouping is implicit on the non-aggregate column
+# notes: n.num.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    num: I64?
+}
+
+--- seed
+{"type":"A","data":{"pk":0,"num":33}}
+{"type":"A","data":{"pk":1,"num":33}}
+{"type":"A","data":{"pk":2,"num":42}}
+
+--- query
+query stmt_3() {
+    match {
+        $n: A
+    }
+    return { $n.num, count($n) as cnt }
+}
+
+--- expect unordered
+{"n.num": 42, "cnt": 1}
+{"n.num": 33, "cnt": 2}

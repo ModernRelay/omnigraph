@@ -1,0 +1,99 @@
+# issue: none
+# notes: kuzu test/test_files/recursive_join/n_n.test, -CASE VarLengthExtendNNTests,
+# notes: -LOG KnowsLongPathTest, tinysnb seed. Split out of kuzu_recursive_join_n_n.gqt
+# notes: because GQ's answer diverges from Kuzu's walk semantics: Kuzu counts 1049760
+# notes: walks of length 8..11, GQ's knows{8,11} is shortest-path distance per endpoint
+# notes: pair and no pair is 8 hops apart. Expectation rewritten to GQ's
+# notes: shortest-path-distance semantics by project decision (2026-09-04); Kuzu's walk
+# notes: semantics expect 1049760 here.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Person {
+    pk: I64 @key
+    fName: String?
+    gender: I64?
+    isStudent: Bool?
+    isWorker: Bool?
+    age: I64?
+    eyeSight: F64?
+    birthdate: Date?
+    workedHours: [I64]?
+    usedNames: [String]?
+    height: F32?
+}
+node Organisation {
+    pk: I64 @key
+    name: String?
+    orgCode: I64?
+    mark: F64?
+    score: I64?
+    history: String?
+    rating: F64?
+}
+edge Knows: Person -> Person {
+    date: Date?
+    meetTime: DateTime?
+    comments: [String]?
+}
+edge StudyAt: Person -> Organisation {
+    year: I64?
+    places: [String]?
+    length: I64?
+    level: I64?
+    code: U64?
+    temperature: U32?
+    ulength: U32?
+    ulevel: U32?
+}
+edge WorkAt: Person -> Organisation {
+    year: I64?
+    grading: [F64]?
+    rating: F32?
+}
+
+--- seed
+{"type":"Person","data":{"pk":0,"fName":"Alice","gender":1,"isStudent":true,"isWorker":false,"age":35,"eyeSight":5.0,"birthdate":"1900-01-01","workedHours":[10,5],"usedNames":["Aida"],"height":1.731}}
+{"type":"Person","data":{"pk":2,"fName":"Bob","gender":2,"isStudent":true,"isWorker":false,"age":30,"eyeSight":5.1,"birthdate":"1900-01-01","workedHours":[12,8],"usedNames":["Bobby"],"height":0.99}}
+{"type":"Person","data":{"pk":3,"fName":"Carol","gender":1,"isStudent":false,"isWorker":true,"age":45,"eyeSight":5.0,"birthdate":"1940-06-22","workedHours":[4,5],"usedNames":["Carmen","Fred"],"height":1.0}}
+{"type":"Person","data":{"pk":5,"fName":"Dan","gender":2,"isStudent":false,"isWorker":true,"age":20,"eyeSight":4.8,"birthdate":"1950-07-23","workedHours":[1,9],"usedNames":["Wolfeschlegelstein","Daniel"],"height":1.3}}
+{"type":"Person","data":{"pk":7,"fName":"Elizabeth","gender":1,"isStudent":false,"isWorker":true,"age":20,"eyeSight":4.7,"birthdate":"1980-10-26","workedHours":[2],"usedNames":["Ein"],"height":1.463}}
+{"type":"Person","data":{"pk":8,"fName":"Farooq","gender":2,"isStudent":true,"isWorker":false,"age":25,"eyeSight":4.5,"birthdate":"1980-10-26","workedHours":[3,4,5,6,7],"usedNames":["Fesdwe"],"height":1.51}}
+{"type":"Person","data":{"pk":9,"fName":"Greg","gender":2,"isStudent":false,"isWorker":false,"age":40,"eyeSight":4.9,"birthdate":"1980-10-26","workedHours":[1],"usedNames":["Grad"],"height":1.6}}
+{"type":"Person","data":{"pk":10,"fName":"Hubert Blaine Wolfeschlegelsteinhausenbergerdorff","gender":2,"isStudent":false,"isWorker":true,"age":83,"eyeSight":4.9,"birthdate":"1990-11-27","workedHours":[10,11,12,3,4,5,6,7],"usedNames":["Ad","De","Hi","Kye","Orlan"],"height":1.323}}
+{"type":"Organisation","data":{"pk":1,"name":"ABFsUni","orgCode":325,"mark":3.7,"score":-2,"history":"10 years 5 months 13 hours 24 us","rating":1.0}}
+{"type":"Organisation","data":{"pk":4,"name":"CsWork","orgCode":934,"mark":4.1,"score":-100,"history":"2 years 4 days 10 hours","rating":0.78}}
+{"type":"Organisation","data":{"pk":6,"name":"DEsWork","orgCode":824,"mark":4.1,"score":7,"history":"2 years 4 hours 22 us 34 minutes","rating":0.52}}
+{"edge":"Knows","from":"0","to":"2","data":{"date":"2021-06-30","meetTime":"1986-10-21T21:08:31.521Z","comments":["rnme","m8sihsdnf2990nfiwf"]}}
+{"edge":"Knows","from":"0","to":"3","data":{"date":"2021-06-30","meetTime":"1946-08-25T19:07:22Z","comments":["njnojppo9u0jkmf","fjiojioh9h9h89hph"]}}
+{"edge":"Knows","from":"0","to":"5","data":{"date":"2021-06-30","meetTime":"2012-12-11T20:07:22Z","comments":["ioji232","jifhe8w99u43434"]}}
+{"edge":"Knows","from":"2","to":"0","data":{"date":"2021-06-30","meetTime":"1946-08-25T19:07:22Z","comments":["2huh9y89fsfw23","23nsihufhw723"]}}
+{"edge":"Knows","from":"2","to":"3","data":{"date":"1950-05-14","meetTime":"1946-08-25T19:07:22Z","comments":["fwehu9h9832wewew","23u9h989sdfsss"]}}
+{"edge":"Knows","from":"2","to":"5","data":{"date":"1950-05-14","meetTime":"2012-12-11T20:07:22Z","comments":["fwh9y81232uisuiehuf","ewnuihxy8dyf232"]}}
+{"edge":"Knows","from":"3","to":"0","data":{"date":"2021-06-30","meetTime":"2002-07-31T11:42:53.12342Z","comments":["fnioh8323aeweae34d","osd89e2ejshuih12"]}}
+{"edge":"Knows","from":"3","to":"2","data":{"date":"1950-05-14","meetTime":"2007-02-12T12:11:42.123Z","comments":["fwh983-sdjisdfji","ioh89y32r2huir"]}}
+{"edge":"Knows","from":"3","to":"5","data":{"date":"2000-01-01","meetTime":"1998-10-02T13:09:22.423Z","comments":["psh989823oaaioe","nuiuah1nosndfisf"]}}
+{"edge":"Knows","from":"5","to":"0","data":{"date":"2021-06-30","meetTime":"1936-11-02T11:02:01Z","comments":["fwewe"]}}
+{"edge":"Knows","from":"5","to":"2","data":{"date":"1950-05-14","meetTime":"1982-11-11T13:12:05.123Z","comments":["fewh9182912e3","h9y8y89soidfsf","nuhudf78w78efw","hioshe0f9023sdsd"]}}
+{"edge":"Knows","from":"5","to":"3","data":{"date":"2000-01-01","meetTime":"1999-04-21T15:12:11.42Z","comments":["23h9sdslnfowhu2932","shuhf98922323sf"]}}
+{"edge":"Knows","from":"7","to":"8","data":{"date":"1905-12-12","meetTime":"2025-01-01T11:22:33.52Z","comments":["ahu2333333333333","12weeeeeeeeeeeeeeeeee"]}}
+{"edge":"Knows","from":"7","to":"9","data":{"date":"1905-12-12","meetTime":"2020-03-01T12:11:41.6552Z","comments":["peweeeeeeeeeeeeeeeee","kowje9w0eweeeeeeeee"]}}
+{"edge":"StudyAt","from":"0","to":"1","data":{"year":2021,"places":["wwAewsdndweusd","wek"],"length":5,"level":5,"code":9223372036854775808,"temperature":32800,"ulength":33768,"ulevel":250}}
+{"edge":"StudyAt","from":"2","to":"1","data":{"year":2020,"places":["anew","jsdnwusklklklwewsd"],"length":55,"level":120,"code":6689,"temperature":1,"ulength":90,"ulevel":220}}
+{"edge":"StudyAt","from":"8","to":"1","data":{"year":2020,"places":["awndsnjwejwen","isuhuwennjnuhuhuwewe"],"length":22,"level":2,"code":23,"temperature":20,"ulength":180,"ulevel":12}}
+{"edge":"WorkAt","from":"3","to":"4","data":{"year":2015,"grading":[3.8,2.5],"rating":8.2}}
+{"edge":"WorkAt","from":"5","to":"6","data":{"year":2010,"grading":[2.1,4.4],"rating":7.6}}
+{"edge":"WorkAt","from":"7","to":"6","data":{"year":2015,"grading":[9.2,3.1],"rating":9.2}}
+
+--- query
+query knows_long_path_test() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows{8,11} $b
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 0}

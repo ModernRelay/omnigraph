@@ -1,0 +1,34 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match3.test, -CASE Scenario1, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). n1/n2 are unlabeled in Cypher but the
+# notes: typed edge KNOWS(FROM A TO B) pins them to A and B, so each gets its binding
+# notes: line. RETURN n1, n2 is spelled as their declared scalar properties
+# notes: (whole_entity_spelled_as_props).
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    num: I64 @key
+}
+node B {
+    num: I64 @key
+}
+edge KNOWS: A -> B
+
+--- seed
+{"type":"A","data":{"num":1}}
+{"type":"B","data":{"num":2}}
+{"edge":"KNOWS","from":"1","to":"2","data":{}}
+
+--- query
+query stmt_5() {
+    match {
+        $n1: A
+        $n2: B
+        $n1 knows $n2
+    }
+    return { $n1.num, $n2.num }
+}
+
+--- expect unordered
+{"n1.num": 1, "n2.num": 2}

@@ -1,0 +1,24 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match_where/match_where1.test, -CASE Scenario15. Kuzu
+# notes: refuses an aggregate in WHERE; GQ has both aggregates and filters, so the
+# notes: refusal is the same reason and stays an error step. The pinned substring is
+# notes: GQ's own message, not Kuzu's.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+}
+
+--- seed
+
+--- query
+query stmt_2() {
+    match {
+        $a: A
+        count($a) > 10
+    }
+    return { $a.pk }
+}
+
+--- expect error: T7: filter comparisons require scalar operands, got aggregate

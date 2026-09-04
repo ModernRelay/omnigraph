@@ -1,0 +1,269 @@
+# issue: none
+# notes: kuzu test/test_files/agg/hash.test, -CASE AggHash, tinysnb seed. One query step
+# notes: per convertible Kuzu -STATEMENT, in file order. `CALL threads=N` knobs dropped.
+# notes: OPTIONAL MATCH, DISTINCT, collect, whole-entity returns, arithmetic around an
+# notes: aggregate, `or`, and the dropped columns (movies, hugedata) are absent here and
+# notes: not translated. Kuzu `a.ID` is `pk`; grouping is implicit on the non-aggregate
+# notes: return columns.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Person {
+    pk: I64 @key
+    fName: String?
+    gender: I64?
+    isStudent: Bool?
+    isWorker: Bool?
+    age: I64?
+    eyeSight: F64?
+    birthdate: Date?
+    workedHours: [I64]?
+    usedNames: [String]?
+    height: F32?
+}
+node Organisation {
+    pk: I64 @key
+    name: String?
+    orgCode: I64?
+    mark: F64?
+    score: I64?
+    history: String?
+    rating: F64?
+}
+edge Knows: Person -> Person {
+    date: Date?
+    meetTime: DateTime?
+    comments: [String]?
+}
+edge StudyAt: Person -> Organisation {
+    year: I64?
+    places: [String]?
+    length: I64?
+    level: I64?
+    code: U64?
+    temperature: U32?
+    ulength: U32?
+    ulevel: U32?
+}
+edge WorkAt: Person -> Organisation {
+    year: I64?
+    grading: [F64]?
+    rating: F32?
+}
+
+--- seed
+{"type":"Person","data":{"pk":0,"fName":"Alice","gender":1,"isStudent":true,"isWorker":false,"age":35,"eyeSight":5.0,"birthdate":"1900-01-01","workedHours":[10,5],"usedNames":["Aida"],"height":1.731}}
+{"type":"Person","data":{"pk":2,"fName":"Bob","gender":2,"isStudent":true,"isWorker":false,"age":30,"eyeSight":5.1,"birthdate":"1900-01-01","workedHours":[12,8],"usedNames":["Bobby"],"height":0.99}}
+{"type":"Person","data":{"pk":3,"fName":"Carol","gender":1,"isStudent":false,"isWorker":true,"age":45,"eyeSight":5.0,"birthdate":"1940-06-22","workedHours":[4,5],"usedNames":["Carmen","Fred"],"height":1.0}}
+{"type":"Person","data":{"pk":5,"fName":"Dan","gender":2,"isStudent":false,"isWorker":true,"age":20,"eyeSight":4.8,"birthdate":"1950-07-23","workedHours":[1,9],"usedNames":["Wolfeschlegelstein","Daniel"],"height":1.3}}
+{"type":"Person","data":{"pk":7,"fName":"Elizabeth","gender":1,"isStudent":false,"isWorker":true,"age":20,"eyeSight":4.7,"birthdate":"1980-10-26","workedHours":[2],"usedNames":["Ein"],"height":1.463}}
+{"type":"Person","data":{"pk":8,"fName":"Farooq","gender":2,"isStudent":true,"isWorker":false,"age":25,"eyeSight":4.5,"birthdate":"1980-10-26","workedHours":[3,4,5,6,7],"usedNames":["Fesdwe"],"height":1.51}}
+{"type":"Person","data":{"pk":9,"fName":"Greg","gender":2,"isStudent":false,"isWorker":false,"age":40,"eyeSight":4.9,"birthdate":"1980-10-26","workedHours":[1],"usedNames":["Grad"],"height":1.6}}
+{"type":"Person","data":{"pk":10,"fName":"Hubert Blaine Wolfeschlegelsteinhausenbergerdorff","gender":2,"isStudent":false,"isWorker":true,"age":83,"eyeSight":4.9,"birthdate":"1990-11-27","workedHours":[10,11,12,3,4,5,6,7],"usedNames":["Ad","De","Hi","Kye","Orlan"],"height":1.323}}
+{"type":"Organisation","data":{"pk":1,"name":"ABFsUni","orgCode":325,"mark":3.7,"score":-2,"history":"10 years 5 months 13 hours 24 us","rating":1.0}}
+{"type":"Organisation","data":{"pk":4,"name":"CsWork","orgCode":934,"mark":4.1,"score":-100,"history":"2 years 4 days 10 hours","rating":0.78}}
+{"type":"Organisation","data":{"pk":6,"name":"DEsWork","orgCode":824,"mark":4.1,"score":7,"history":"2 years 4 hours 22 us 34 minutes","rating":0.52}}
+{"edge":"Knows","from":"0","to":"2","data":{"date":"2021-06-30","meetTime":"1986-10-21T21:08:31.521Z","comments":["rnme","m8sihsdnf2990nfiwf"]}}
+{"edge":"Knows","from":"0","to":"3","data":{"date":"2021-06-30","meetTime":"1946-08-25T19:07:22Z","comments":["njnojppo9u0jkmf","fjiojioh9h9h89hph"]}}
+{"edge":"Knows","from":"0","to":"5","data":{"date":"2021-06-30","meetTime":"2012-12-11T20:07:22Z","comments":["ioji232","jifhe8w99u43434"]}}
+{"edge":"Knows","from":"2","to":"0","data":{"date":"2021-06-30","meetTime":"1946-08-25T19:07:22Z","comments":["2huh9y89fsfw23","23nsihufhw723"]}}
+{"edge":"Knows","from":"2","to":"3","data":{"date":"1950-05-14","meetTime":"1946-08-25T19:07:22Z","comments":["fwehu9h9832wewew","23u9h989sdfsss"]}}
+{"edge":"Knows","from":"2","to":"5","data":{"date":"1950-05-14","meetTime":"2012-12-11T20:07:22Z","comments":["fwh9y81232uisuiehuf","ewnuihxy8dyf232"]}}
+{"edge":"Knows","from":"3","to":"0","data":{"date":"2021-06-30","meetTime":"2002-07-31T11:42:53.12342Z","comments":["fnioh8323aeweae34d","osd89e2ejshuih12"]}}
+{"edge":"Knows","from":"3","to":"2","data":{"date":"1950-05-14","meetTime":"2007-02-12T12:11:42.123Z","comments":["fwh983-sdjisdfji","ioh89y32r2huir"]}}
+{"edge":"Knows","from":"3","to":"5","data":{"date":"2000-01-01","meetTime":"1998-10-02T13:09:22.423Z","comments":["psh989823oaaioe","nuiuah1nosndfisf"]}}
+{"edge":"Knows","from":"5","to":"0","data":{"date":"2021-06-30","meetTime":"1936-11-02T11:02:01Z","comments":["fwewe"]}}
+{"edge":"Knows","from":"5","to":"2","data":{"date":"1950-05-14","meetTime":"1982-11-11T13:12:05.123Z","comments":["fewh9182912e3","h9y8y89soidfsf","nuhudf78w78efw","hioshe0f9023sdsd"]}}
+{"edge":"Knows","from":"5","to":"3","data":{"date":"2000-01-01","meetTime":"1999-04-21T15:12:11.42Z","comments":["23h9sdslnfowhu2932","shuhf98922323sf"]}}
+{"edge":"Knows","from":"7","to":"8","data":{"date":"1905-12-12","meetTime":"2025-01-01T11:22:33.52Z","comments":["ahu2333333333333","12weeeeeeeeeeeeeeeeee"]}}
+{"edge":"Knows","from":"7","to":"9","data":{"date":"1905-12-12","meetTime":"2020-03-01T12:11:41.6552Z","comments":["peweeeeeeeeeeeeeeeee","kowje9w0eweeeeeeeee"]}}
+{"edge":"StudyAt","from":"0","to":"1","data":{"year":2021,"places":["wwAewsdndweusd","wek"],"length":5,"level":5,"code":9223372036854775808,"temperature":32800,"ulength":33768,"ulevel":250}}
+{"edge":"StudyAt","from":"2","to":"1","data":{"year":2020,"places":["anew","jsdnwusklklklwewsd"],"length":55,"level":120,"code":6689,"temperature":1,"ulength":90,"ulevel":220}}
+{"edge":"StudyAt","from":"8","to":"1","data":{"year":2020,"places":["awndsnjwejwen","isuhuwennjnuhuhuwewe"],"length":22,"level":2,"code":23,"temperature":20,"ulength":180,"ulevel":12}}
+{"edge":"WorkAt","from":"3","to":"4","data":{"year":2015,"grading":[3.8,2.5],"rating":8.2}}
+{"edge":"WorkAt","from":"5","to":"6","data":{"year":2010,"grading":[2.1,4.4],"rating":7.6}}
+{"edge":"WorkAt","from":"7","to":"6","data":{"year":2015,"grading":[9.2,3.1],"rating":9.2}}
+
+--- query
+query single_node_agg_test() {
+    match {
+        $a: Person
+    }
+    return { $a.age, min($a.pk) as min_pk, avg($a.eyeSight) as avg_eye_sight, count($a) as n }
+}
+
+--- expect unordered
+{"a.age": 20, "min_pk": 5, "avg_eye_sight": 4.75, "n": 2}
+{"a.age": 25, "min_pk": 8, "avg_eye_sight": 4.5, "n": 1}
+{"a.age": 30, "min_pk": 2, "avg_eye_sight": 5.1, "n": 1}
+{"a.age": 35, "min_pk": 0, "avg_eye_sight": 5.0, "n": 1}
+{"a.age": 40, "min_pk": 9, "avg_eye_sight": 4.9, "n": 1}
+{"a.age": 45, "min_pk": 3, "avg_eye_sight": 5.0, "n": 1}
+{"a.age": 83, "min_pk": 10, "avg_eye_sight": 4.9, "n": 1}
+
+--- query
+query in_mem_overflow_buffer_test() {
+    match {
+        $a: Person
+    }
+    return { $a.fName as name, count($a) as n }
+    order { name desc }
+}
+
+--- expect unordered
+{"name": "Hubert Blaine Wolfeschlegelsteinhausenbergerdorff", "n": 1}
+{"name": "Greg", "n": 1}
+{"name": "Farooq", "n": 1}
+{"name": "Elizabeth", "n": 1}
+{"name": "Dan", "n": 1}
+{"name": "Carol", "n": 1}
+{"name": "Bob", "n": 1}
+{"name": "Alice", "n": 1}
+
+--- query
+query one_hop_agg_test() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.age, $a.gender, count($a) as n }
+}
+
+--- expect unordered
+{"a.age": 20, "a.gender": 1, "n": 2}
+{"a.age": 20, "a.gender": 2, "n": 3}
+{"a.age": 30, "a.gender": 2, "n": 3}
+{"a.age": 35, "a.gender": 1, "n": 3}
+{"a.age": 45, "a.gender": 1, "n": 3}
+
+--- query
+query one_hop_agg_flat_unflat_vec_test() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.pk, $b.gender, sum($b.age) as s }
+}
+
+--- expect unordered
+{"a.pk": 0, "b.gender": 1, "s": 45}
+{"a.pk": 0, "b.gender": 2, "s": 50}
+{"a.pk": 2, "b.gender": 1, "s": 80}
+{"a.pk": 2, "b.gender": 2, "s": 20}
+{"a.pk": 3, "b.gender": 1, "s": 35}
+{"a.pk": 3, "b.gender": 2, "s": 50}
+{"a.pk": 5, "b.gender": 1, "s": 80}
+{"a.pk": 5, "b.gender": 2, "s": 30}
+{"a.pk": 7, "b.gender": 2, "s": 65}
+
+--- query
+query one_hop_agg_flat_unflat_vec_with_non_hash_key_test() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.pk, $a.gender, $b.gender, sum($b.age) as s }
+}
+
+--- expect unordered
+{"a.pk": 0, "a.gender": 1, "b.gender": 1, "s": 45}
+{"a.pk": 0, "a.gender": 1, "b.gender": 2, "s": 50}
+{"a.pk": 2, "a.gender": 2, "b.gender": 1, "s": 80}
+{"a.pk": 2, "a.gender": 2, "b.gender": 2, "s": 20}
+{"a.pk": 3, "a.gender": 1, "b.gender": 1, "s": 35}
+{"a.pk": 3, "a.gender": 1, "b.gender": 2, "s": 50}
+{"a.pk": 5, "a.gender": 2, "b.gender": 1, "s": 80}
+{"a.pk": 5, "a.gender": 2, "b.gender": 2, "s": 30}
+{"a.pk": 7, "a.gender": 1, "b.gender": 2, "s": 65}
+
+--- query
+query hash_agg_count_int8() {
+    match {
+        $p: Person
+        $o: Organisation
+        $p $s:studyAt $o
+    }
+    return { $s.year, count($s.level) as n }
+}
+
+--- expect unordered
+{"s.year": 2020, "n": 2}
+{"s.year": 2021, "n": 1}
+
+--- query
+query hash_agg_int8_key() {
+    match {
+        $p: Person
+        $o: Organisation
+        $p $s:studyAt $o
+    }
+    return { $s.level, count($s.year) as n }
+}
+
+--- expect unordered
+{"s.level": 2, "n": 1}
+{"s.level": 5, "n": 1}
+{"s.level": 120, "n": 1}
+
+--- query
+query hash_agg_uint8_key() {
+    match {
+        $p: Person
+        $o: Organisation
+        $p $s:studyAt $o
+    }
+    return { $s.ulevel, count($s.year) as n }
+}
+
+--- expect unordered
+{"s.ulevel": 12, "n": 1}
+{"s.ulevel": 220, "n": 1}
+{"s.ulevel": 250, "n": 1}
+
+--- query
+query hash_agg_uint16_key() {
+    match {
+        $p: Person
+        $o: Organisation
+        $p $s:studyAt $o
+    }
+    return { $s.ulength, count($s.year) as n }
+}
+
+--- expect unordered
+{"s.ulength": 33768, "n": 1}
+{"s.ulength": 90, "n": 1}
+{"s.ulength": 180, "n": 1}
+
+--- query
+query hash_agg_uint32_key() {
+    match {
+        $p: Person
+        $o: Organisation
+        $p $s:studyAt $o
+    }
+    return { $s.temperature, count($s.year) as n }
+}
+
+--- expect unordered
+{"s.temperature": 32800, "n": 1}
+{"s.temperature": 1, "n": 1}
+{"s.temperature": 20, "n": 1}
+
+--- query
+query hash_agg_uint64_key() {
+    match {
+        $p: Person
+        $o: Organisation
+        $p $s:studyAt $o
+    }
+    return { $s.code, count($s.year) as n }
+}
+
+--- expect unordered
+{"s.code": 23, "n": 1}
+{"s.code": 9223372036854775808, "n": 1}
+{"s.code": 6689, "n": 1}

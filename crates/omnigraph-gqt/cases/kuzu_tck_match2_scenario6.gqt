@@ -1,0 +1,40 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match2.test, -CASE Scenario6, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). Only the first query statement is
+# notes: expressible: MATCH (n) binds A, the schema's only node table. The other two
+# notes: statements use an untyped edge and an edge-type disjunction and are not
+# notes: translated.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    name: String @key
+}
+edge KNOWS: A -> A {
+    name: String?
+}
+edge HATES: A -> A {
+    name: String?
+}
+edge WONDERS: A -> A {
+    name: String?
+}
+
+--- seed
+{"type":"A","data":{"name":"A"}}
+{"type":"A","data":{"name":"B"}}
+{"type":"A","data":{"name":"C"}}
+{"edge":"KNOWS","from":"A","to":"B","data":{}}
+{"edge":"HATES","from":"A","to":"C","data":{}}
+{"edge":"WONDERS","from":"A","to":"C","data":{}}
+
+--- query
+query stmt_6() {
+    match {
+        $n: A
+    }
+    return { count($n) as n }
+}
+
+--- expect unordered
+{"n": 3}

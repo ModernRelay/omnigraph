@@ -1,0 +1,30 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match2.test, -CASE Scenario3&4, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). A(name STRING PRIMARY KEY) keeps name
+# notes: as the @key. RETURN a is spelled as a.name (whole_entity_spelled_as_props).
+# notes: Statement 4 (the undirected self-loop) lives in
+# notes: kuzu_tck_match2_scenario3_4__stmt_4.gqt, split into its own file because its
+# notes: expectation follows the openCypher TCK reading rather than Kuzu's.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    name: String @key
+}
+edge T: A -> A
+
+--- seed
+{"type":"A","data":{"name":"xx"}}
+{"edge":"T","from":"xx","to":"xx","data":{}}
+
+--- query
+query stmt_5() {
+    match {
+        $a: A
+        $a t $a
+    }
+    return { $a.name }
+}
+
+--- expect unordered
+{"a.name": "xx"}

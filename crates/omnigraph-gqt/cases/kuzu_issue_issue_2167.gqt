@@ -1,0 +1,27 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue.test, -CASE 2167 (kuzudb/kuzu issue 2167),
+# notes: -DATASET CSV empty; the case builds its own schema and rows. SERIAL primary key
+# notes: `id` becomes `pk` assigned 0 in creation order. Kuzu returns the whole node;
+# notes: the step projects its kept scalar properties instead
+# notes: (whole_entity_spelled_as_props).
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Test {
+    pk: I64 @key
+    content: String?
+}
+
+--- seed
+{"type":"Test","data":{"pk":0,"content":"mycontent"}}
+
+--- query
+query stmt_3() {
+    match {
+        $t: Test
+    }
+    return { $t.pk, $t.content }
+}
+
+--- expect unordered
+{"t.pk": 0, "t.content": "mycontent"}
