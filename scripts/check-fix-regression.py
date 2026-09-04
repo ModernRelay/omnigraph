@@ -4,11 +4,26 @@ matching regression addition in the diff, or the PR carries the `no-repro`
 label. Specified in docs/rfcs/0045-gq-logic-tests.md (User and operational
 behavior, "Fix-PR gate").
 
-The gate reads only GitHub's own closing-keyword form (`fixes #123`,
-`fixes: #123`, `fixes:#123`): case-insensitive, a word boundary before the
-keyword, an optional colon, whitespace unless the colon is present, then
-`#N`. Closings by URL, `owner/repo#N`, `GH-N`, a bare `fixes#123`, commit
-message, or manual close pass unexamined and belong to review.
+The gate reads the three closing forms GitHub's own parser closes on,
+`fixes #123`, `fixes ModernRelay/omnigraph#123`, and
+`fixes https://github.com/ModernRelay/omnigraph/issues/123` (the repository
+from `--repo`, the workflow passes `GITHUB_REPOSITORY`; with neither, only
+`#N`): case-insensitive, a word boundary before the keyword, an optional
+colon, whitespace unless the colon is present, then the target. A reference
+to another repository closes nothing here and is not read. Closings by
+`GH-N`, a bare `fixes#123`, an autolink `<url>` or Markdown link `[#N](url)`,
+`http://` or `www.` URLs, commit message, or manual close pass unexamined and
+belong to review; a keyword inside a code span, a fence, or an HTML comment
+is read, and a PR against a non-default base is examined although GitHub
+closes nothing there.
+
+A fix outside the code paths, `crates/` and `tools/` (Markdown files under
+them aside) and the root `Cargo.toml` and `Cargo.lock`, where every
+workspace member lives, has no logic or Rust test that could witness it (a
+workflow, a script, a document, a deployment file), so a PR whose diff
+changes no code path passes with its closed issues unexamined, as a log
+line and a `::notice` annotation; the diff is listed with renames disabled
+so a file moved out of a crate still shows its source-side deletion.
 
 Label names are read as a comma-joined list, so a label whose own name
 contains a comma could smuggle the waiver token; creating labels needs the
@@ -34,15 +49,16 @@ issue is extended by renaming it to carry `issue_N` in the same change
 (the rename alone never counts; the rename plus the assertion does).
 Helper and fixture modules under `tests/<dir>/` never match, and a plain
 function, however named, never matches. Owners the gate does not
-recognize, Python and shell scripts among them, satisfy it only through
-the `no-repro` label, which a maintainer applies. What a match guarantees
+recognize inside the code paths (a helper or fixture module, a script
+under a crate, a rustdoc-only change) satisfy it only through the
+`no-repro` label, which a maintainer applies. What a match guarantees
 differs by shape: a corpus match ran green in the required `GQ Logic
 Tests` job; a Rust match is a test-attributed definition or an edit inside
-one, not a run. A pull request runs only the corpus target and the
-`omnigraph-server` aws-feature suite among Rust test targets (`Test
-Workspace` runs post-merge), and workspace clippy refuses an unreferenced
-private function but not an `#[ignore]`d or cfg-gated one, so whether
-that test runs in the suite and asserts the right thing stays with review.
+one, not a run. A pull request runs every workspace test target in `Test
+Workspace`, a reporting context the gate does not consult, and workspace
+clippy refuses an unreferenced private function but not an `#[ignore]`d or
+cfg-gated one, so whether that test runs in the suite and asserts the right
+thing stays with review.
 Comments, strings, and fixture lines mentioning the issue do not count.
 N is always followed by a non-digit or the end. Named residue: a
 definition inside an added block comment or raw string still matches
@@ -52,26 +68,59 @@ literals, and `//` comments blanked, so a brace inside a raw string or a
 multi-line block comment can mislead it; those evasions, like a test that
 asserts nothing, are deliberate and stay with review.
 
-Exit 0 exactly when every keyword-closed issue has its match or the PR
-carries `no-repro`, and AGENTS.md still names the logic-test corpus path.
+A failure names the code paths that made the gate look, the ways through,
+any near miss the diff holds (a case whose header says `# issue: N` under
+another name or a subdirectory; a test named with the bare number, moved
+rather than added, under a leading `_`, or in a helper module; a function
+named for the issue with no added test attribute directly above it), and a
+case skeleton, as a log line and as a GitHub `::error` annotation. The
+skeleton spells the corpus format by hand (`crates/omnigraph-gqt/README.md`);
+a change to the header keys or section names updates it here too.
+
+Exit 0 exactly when the diff changes no code path, or every keyword-closed
+issue has its match, or the PR carries `no-repro`; and in every case
+AGENTS.md still names the logic-test corpus path.
 
 Usage:
-  check-fix-regression.py --body-file F --labels "a,b" --range BASE...HEAD
+  check-fix-regression.py --body-file F --labels "a,b" --range BASE...HEAD [--repo OWNER/NAME]
   check-fix-regression.py --self-test
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-CLOSING_KEYWORD = re.compile(
-    r"(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)(?::\s*|\s+)#(\d+)",
-    re.IGNORECASE,
-)
+CLOSING_PREFIX = r"(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)(?::\s*|\s+)"
+
+
+def closing_keyword(repo: str | None) -> re.Pattern[str]:
+    """`#N` always; `OWNER/NAME#N` and the issue URL only for `repo`, the
+    repository the gate runs in, since a reference to any other repository
+    closes nothing here."""
+    targets = [r"#(\d+)"]
+    if repo:
+        slug = "/".join(re.escape(part) for part in repo.split("/", 1))
+        targets.append(rf"{slug}#(\d+)")
+        targets.append(rf"https://github\.com/{slug}/issues/(\d+)")
+    return re.compile(CLOSING_PREFIX + "(?:" + "|".join(targets) + ")", re.IGNORECASE)
+
+
+# The workspace members' homes plus the root manifests, Markdown excluded;
+# the self-test pins it to `[workspace] members`.
+CODE_PATH = re.compile(r"^(?:(?:crates|tools)/(?!.*\.md$)|Cargo\.toml$|Cargo\.lock$)")
+WORKSPACE_MEMBERS = re.compile(r"^members\s*=\s*\[(.*?)\]", re.MULTILINE | re.DOTALL)
+# A corpus case's `# issue: N` header line, spelled exactly as the harness
+# accepts it (`crates/omnigraph-gqt/src/lib.rs`, `parse_header`).
+CASE_ISSUE_HEADER = re.compile(r"^# issue: ([1-9]\d*)$")
+CASE_ISSUE_STEM = re.compile(r"^issue[_-]?0*(\d+)[_-]?", re.IGNORECASE)
+# A Rust file under a crate's `tests/<dir>/`: a helper or fixture module,
+# never a top-level target.
+RUST_NESTED_TEST_PATH = re.compile(r"^(?:crates|tools)/[^/]+/tests/[^/]+/.+\.rs$")
 CORPUS_PATH_SENTENCE = "crates/omnigraph-gqt/cases/"
 WAIVER_LABEL = "no-repro"
 PATHSPECS = (
@@ -83,8 +132,9 @@ PATHSPECS = (
 )
 
 
-def closed_issues(body: str) -> list[str]:
-    return sorted({str(int(n)) for n in CLOSING_KEYWORD.findall(body)}, key=int)
+def closed_issues(body: str, repo: str | None = None) -> list[str]:
+    found = {m.group(m.lastindex) for m in closing_keyword(repo).finditer(body)}
+    return sorted({str(int(n)) for n in found}, key=int)
 
 
 def issue_token(n: str) -> re.Pattern[str]:
@@ -109,24 +159,38 @@ ATTR_OR_COMMENT = re.compile(r"^\s*(?:#\[|//)")
 HUNK_BREAK = ("", "")
 
 
-def added_files(range_: str) -> list[str]:
+def git_diff(*args: str) -> str:
     out = subprocess.run(
-        [
-            "git",
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--name-only",
-            "--diff-filter=A",
-            range_,
-            "--",
-            *PATHSPECS,
-        ],
+        ["git", "-c", "core.quotePath=false", "diff", *args],
         check=True,
         capture_output=True,
         text=True,
     )
-    return [line for line in out.stdout.splitlines() if line]
+    return out.stdout
+
+
+def added_files(range_: str) -> list[str]:
+    out = git_diff("--name-only", "--diff-filter=A", range_, "--", *PATHSPECS)
+    return [line for line in out.splitlines() if line]
+
+
+def changed_paths(range_: str) -> list[str]:
+    """Every path the range changes, renames disabled: a file moved out of
+    a crate still shows its source-side deletion."""
+    out = git_diff("--name-only", "--no-renames", range_, "--")
+    return [line for line in out.splitlines() if line]
+
+
+def parse_repo(value: str | None) -> str | None:
+    """`OWNER/NAME` or nothing; any other shape is refused rather than
+    matched against nothing."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    owner, sep, name = value.partition("/")
+    if not sep or not owner or not name or "/" in name:
+        raise ValueError(f"--repo must be OWNER/NAME, got {value!r}")
+    return value
 
 
 HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -178,13 +242,7 @@ def parse_diff(
 def diff_changes(
     range_: str,
 ) -> tuple[list[tuple[str, str]], list[str], list[tuple[str, int, str]]]:
-    out = subprocess.run(
-        ["git", "-c", "core.quotePath=false", "diff", "-U0", range_, "--", *PATHSPECS],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return parse_diff(out.stdout)
+    return parse_diff(git_diff("-U0", range_, "--", *PATHSPECS))
 
 
 def head_file_reader(range_: str):
@@ -262,6 +320,123 @@ def issue_satisfied(
             if RUST_FN_PATH.match(path) and strengthens_test(token, path, lineno, text, read_file):
                 return True
     return False
+
+
+def near_misses(
+    n: str, lines: list[tuple[str, str]], removed_fns: frozenset[str] | set[str] = frozenset()
+) -> list[str]:
+    """What the diff holds that almost satisfies issue `n`, named in the
+    failure and never credited: a corpus case whose header says
+    `# issue: n` under another name or under a subdirectory; a test named
+    with the bare number, moved rather than added, under a leading `_`, or
+    in a helper module; a function named for the issue with no added test
+    attribute directly above it."""
+    token = issue_token(n)
+    bare = re.compile(rf"(?<!\d){n}(?!\d)")
+    other_issue = re.compile(r"issue_\d+")
+    hints: list[str] = []
+    for i, (path, text) in enumerate(lines):
+        name = Path(path).name
+        if path.startswith(CORPUS_DIR_PREFIX) and name.endswith(".gqt"):
+            m = CASE_ISSUE_HEADER.match(text)
+            if not m or m.group(1) != n:
+                continue
+            stem = CASE_ISSUE_STEM.sub("", name[: -len(".gqt")]).lower()
+            short = re.sub(r"[^a-z0-9_]", "_", stem)
+            target = f"{CORPUS_DIR_PREFIX}issue_{n}_{short or '<short_name>'}.gqt"
+            if not corpus_case(path):
+                hints.append(
+                    f"`{path}` carries `# issue: {n}` but the corpus runs top-level "
+                    f"`.gqt` files only; move it to `{target}`"
+                )
+            elif not name.startswith(f"issue_{n}_") or name == f"issue_{n}_.gqt":
+                hints.append(
+                    f"`{path}` carries `# issue: {n}` in its header; rename it to "
+                    f"`{target}` (`issue_{n}_` then a short name over `[a-z0-9_]`)"
+                )
+        elif RUST_FN_PATH.match(path) or RUST_NESTED_TEST_PATH.match(path):
+            m = RUST_FN_DEF.match(text)
+            if not m or text.rstrip().endswith(";"):
+                continue
+            fn = m.group(1)
+            attributed = test_attributed(lines, i)
+            if RUST_NESTED_TEST_PATH.match(path):
+                if token.search(fn) and attributed:
+                    hints.append(
+                        f"`fn {fn}` in `{path}` sits in a helper or fixture module; only a "
+                        f"top-level target `tests/<name>.rs` or a `src/` module counts"
+                    )
+            elif token.search(fn) and fn.startswith("_") and attributed:
+                hints.append(f"`fn {fn}` in `{path}` starts with `_`; drop the underscore")
+            elif token.search(fn) and fn in removed_fns and attributed:
+                hints.append(
+                    f"`fn {fn}` in `{path}` is moved, not added (the same name is removed "
+                    f"elsewhere in the diff); add an assertion inside its body"
+                )
+            elif token.search(fn) and not attributed:
+                hints.append(
+                    f"`fn {fn}` in `{path}` is named for the issue but the diff adds no "
+                    f"`#[test]` line directly above it (other attributes and `//` comments "
+                    f"may sit between, a blank line or a block comment may not); only a "
+                    f"test-attributed function counts, a helper by that name is not credited, "
+                    f"and a renamed existing test needs an added assertion in its body"
+                )
+            elif bare.search(fn) and not other_issue.search(fn) and attributed:
+                hints.append(
+                    f"`fn {fn}` in `{path}` is a test named with the bare number; "
+                    f"rename it to carry `issue_{n}`"
+                )
+    return list(dict.fromkeys(hints))
+
+
+def failure_message(n: str, code_paths: list[str], hints: list[str]) -> str:
+    shown = ", ".join(code_paths[:5])
+    if len(code_paths) > 5:
+        shown += f", +{len(code_paths) - 5} more"
+    parts = [
+        f"FAIL: the body closes #{n} and the diff changes code under test ({shown}), "
+        f"but adds or extends no `.gqt` case named `issue_{n}_*` under {CORPUS_DIR_PREFIX} "
+        f"and no `#[test]`-attributed function named for `issue_{n}`.",
+        *(f"  near miss: {hint}" for hint in hints),
+        "  Ways through, any one:",
+        f"    1. add {CORPUS_DIR_PREFIX}issue_{n}_<short_name>.gqt: the query that went wrong "
+        "before the fix, with the rows it returns after (the corpus runs it on every PR)",
+        f"    2. add a #[test] function named for issue_{n} in crates/*/tests/<name>.rs, "
+        "tools/*/tests/<name>.rs, or their src/",
+        f"    3. extend an existing test: rename it to carry issue_{n} and add the assertion",
+        f"    4. no test can exist (perf-only, a race, a removal, a docs-only change inside "
+        f"a crate such as rustdoc): ask a maintainer for the `{WAIVER_LABEL}` label",
+        "  Rule: docs/dev/ci.md, Fix Regression Gate. Skeleton for 1:",
+        f"    # issue: {n}",
+        "    # red_on: <date>, pre-fix build: <what the old build returned>",
+        "    # notes: <one line on what the case pins>",
+        "",
+        "    --- schema",
+        "    node Person {",
+        "        name: String @key",
+        "    }",
+        "",
+        "    --- seed",
+        '    {"type":"Person","data":{"name":"alice"}}',
+        "",
+        "    --- query",
+        "    query q() {",
+        "        match { $p: Person }",
+        "        return { $p.name }",
+        "    }",
+        "",
+        "    --- expect unordered",
+        '    {"p.name": "alice"}',
+    ]
+    return "\n".join(parts)
+
+
+def annotate(level: str, message: str) -> None:
+    """The same text as a GitHub annotation (`error` or `notice`), shown on
+    the checks summary without opening the log; `%`, CR, and LF escaped
+    per the workflow-command encoding."""
+    encoded = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{level} title=Fix Regression Gate::{encoded}")
 
 
 # Brace-opening items that are not functions: an added line inside one of
@@ -371,7 +546,7 @@ def check_agents_md() -> bool:
     return agents.is_file() and CORPUS_PATH_SENTENCE in agents.read_text(encoding="utf-8")
 
 
-def run_gate(body: str, labels: list[str], range_: str) -> int:
+def run_gate(body: str, labels: list[str], range_: str, repo: str | None) -> int:
     ok = True
     if not check_agents_md():
         print(
@@ -379,7 +554,9 @@ def run_gate(body: str, labels: list[str], range_: str) -> int:
             "the contract sentence and this gate leave together"
         )
         ok = False
-    issues = closed_issues(body)
+    if repo is None:
+        print("warn: no --repo and no GITHUB_REPOSITORY; only the `#N` closing form is read")
+    issues = closed_issues(body, repo)
     if not issues:
         print("ok: the PR body closes no issue by keyword")
         return 0 if ok else 1
@@ -387,6 +564,17 @@ def run_gate(body: str, labels: list[str], range_: str) -> int:
         print(f"ok: `{WAIVER_LABEL}` label waives the regression requirement for this PR")
         return 0 if ok else 1
     try:
+        code_paths = [path for path in changed_paths(range_) if CODE_PATH.match(path)]
+        if not code_paths:
+            closed = ", ".join(f"#{n}" for n in issues)
+            message = (
+                f"ok: the body closes {closed} but the diff changes no path under crates/ "
+                "or tools/ (Markdown aside) and neither Cargo.toml nor Cargo.lock, so no "
+                "logic or Rust test can witness the fix; the closed issues pass UNEXAMINED"
+            )
+            print(message)
+            annotate("notice", message)
+            return 0 if ok else 1
         files = added_files(range_)
         lines, removed, positioned = diff_changes(range_)
     except subprocess.CalledProcessError as e:
@@ -405,15 +593,9 @@ def run_gate(body: str, labels: list[str], range_: str) -> int:
         if issue_satisfied(n, files, lines, removed_fns, positioned, read_file):
             print(f"ok: issue #{n} has a matching regression addition")
         else:
-            print(
-                f"FAIL: the body closes #{n} but the diff neither adds nor extends a "
-                f"`.gqt` case named `issue_{n}_*` under {CORPUS_DIR_PREFIX}, and "
-                f"neither adds nor extends a `#[test]`-attributed function named for "
-                f"`issue_{n}` in crates/*/tests/<name>.rs, tools/*/tests/<name>.rs, or "
-                f"their src/. Add one; to extend an existing owner test, rename it to "
-                f"carry `issue_{n}` and add the assertion; or ask a maintainer for the "
-                f"`{WAIVER_LABEL}` label"
-            )
+            message = failure_message(n, code_paths, near_misses(n, lines, removed_fns))
+            print(message)
+            annotate("error", message)
             ok = False
     return 0 if ok else 1
 
@@ -437,10 +619,48 @@ def self_test() -> int:
         ("fixes o/r#4", []),
         ("fixes GH-4", []),
         ("FIX #8", ["8"]),
+        ("fixes ModernRelay/omnigraph#4", ["4"]),
+        ("fixes: modernrelay/OMNIGRAPH#4", ["4"]),
+        ("fixes ModernRelay/omnigraph-foo#4", []),
+        ("fixes ModernRelay/omnigraph#4 closes #4", ["4"]),
+        ("Closes https://github.com/ModernRelay/omnigraph/issues/4", ["4"]),
+        ("Closes https://github.com/ModernRelay/omnigraph/issues/4.", ["4"]),
+        ("Closes https://github.com/ModernRelay/omnigraph/pull/4", []),
+        ("Closes https://github.com/o/r/issues/4", []),
+        ("see https://github.com/ModernRelay/omnigraph/issues/4", []),
     ]
+    repo = "ModernRelay/omnigraph"
     for body, expected in cases:
-        got = closed_issues(body)
+        got = closed_issues(body, repo)
         assert got == expected, f"closed_issues({body!r}) = {got}, expected {expected}"
+    # Without a repository only `#N` is read: another form cannot be told
+    # from a reference to some other repository.
+    assert closed_issues("fixes ModernRelay/omnigraph#4", None) == []
+    assert closed_issues("Closes https://github.com/ModernRelay/omnigraph/issues/4") == []
+    assert closed_issues("fixes #4", None) == ["4"]
+    for path in ("crates/omnigraph/src/lib.rs", "tools/x/tests/a.rs", "Cargo.toml", "Cargo.lock", "crates/omnigraph-bench/Cargo.toml", "crates/x/tests/fixtures/a.md.json"):
+        assert CODE_PATH.match(path), path
+    for path in (".github/workflows/ci.yml", "docs/dev/ci.md", "scripts/check-docs.py", "deploy/x.yaml", "benchmarks/Cargo.toml", "rust-toolchain.toml", "crates2/x.rs", "Cargo.toml.bak", "crates/omnigraph-dst/README.md", "crates/omnigraph/tests/fixtures/lance10-fts.md", "tools/x/README.md"):
+        assert not CODE_PATH.match(path), path
+    # The code paths are pinned to the workspace: every member must sit
+    # under one, or a fix there would pass unexamined.
+    cargo_toml = Path(__file__).resolve().parents[1] / "Cargo.toml"
+    assert cargo_toml.is_file(), f"{cargo_toml} is missing; the members pin needs the workspace manifest"
+    m = WORKSPACE_MEMBERS.search(cargo_toml.read_text(encoding="utf-8"))
+    members = re.findall(r'"([^"]+)"', m.group(1)) if m else []
+    assert members, "no [workspace] members found in Cargo.toml"
+    for member in members:
+        assert CODE_PATH.match(member + "/"), f"workspace member {member} is outside the code paths"
+    assert parse_repo("ModernRelay/omnigraph") == "ModernRelay/omnigraph"
+    assert parse_repo("  ModernRelay/omnigraph\n") == "ModernRelay/omnigraph"
+    assert parse_repo("") is None and parse_repo(None) is None and parse_repo("  ") is None
+    for bad in ("ModernRelay", "/omnigraph", "ModernRelay/", "a/b/c"):
+        try:
+            parse_repo(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"parse_repo({bad!r}) accepted")
     corpus = "crates/omnigraph-gqt/cases/issue_563_x.gqt"
     rust = "crates/omnigraph/tests/search.rs"
     assert issue_satisfied("563", [corpus], [])
@@ -809,6 +1029,47 @@ def self_test() -> int:
     assert not issue_satisfied("563", [], [], positioned=[(rust, 14, "    #![proptest_config(Config::default())]")], read_file=macro_reader)
     assert not issue_satisfied("563", [], [], positioned=[(rust, 20, "    b,")], read_file=macro_reader)
 
+    # Near misses: named in the failure, never credited.
+    misnamed = "crates/omnigraph-gqt/cases/bm25_underfill.gqt"
+    hints = near_misses("563", [(misnamed, "# issue: 563"), (misnamed, "--- schema")])
+    assert len(hints) == 1 and "`crates/omnigraph-gqt/cases/issue_563_bm25_underfill.gqt`" in hints[0], hints
+    for header in ("# issue: none", "# issue: 5630", "# issue: 0563", "#issue:563", "# issue: #563", "# issue: 563 ", "  # issue: 563"):
+        assert near_misses("563", [(misnamed, header)]) == [], header
+    assert near_misses("563", [(corpus, "# issue: 563")]) == []
+    assert near_misses("563", [("crates/omnigraph/tests/fixtures/x.gqt", "# issue: 563")]) == []
+    # A stem already carrying the token is not prefixed a second time.
+    for stem in ("issue_563", "issue-563", "issue_0563_x", "issue_563_"):
+        hints = near_misses("563", [(f"crates/omnigraph-gqt/cases/{stem}.gqt", "# issue: 563")])
+        assert len(hints) == 1 and "issue_563_issue" not in hints[0], (stem, hints)
+    assert "issue_563_x.gqt" in near_misses("563", [("crates/omnigraph-gqt/cases/issue_0563_x.gqt", "# issue: 563")])[0]
+    assert "`crates/omnigraph-gqt/cases/issue_563_x_y.gqt`" in near_misses("563", [("crates/omnigraph-gqt/cases/ISSUE-563-X-y.gqt", "# issue: 563")])[0]
+    assert "`crates/omnigraph-gqt/cases/issue_563_bm25_v2.gqt`" in near_misses("563", [("crates/omnigraph-gqt/cases/bm25.v2.gqt", "# issue: 563")])[0]
+    assert near_misses("563", [("crates/omnigraph-gqt/cases/README.md", "# issue: 563")]) == []
+    assert "issue_563_<short_name>.gqt" in near_misses("563", [("crates/omnigraph-gqt/cases/issue_563.gqt", "# issue: 563")])[0]
+    hints = near_misses("563", [("crates/omnigraph-gqt/cases/traversal/issue_563_x.gqt", "# issue: 563")])
+    assert len(hints) == 1 and "top-level" in hints[0] and "cases/issue_563_x.gqt" in hints[0], hints
+    hints = near_misses("563", [(rust, "#[test]"), (rust, "fn bm25_underfill_563() {")])
+    assert len(hints) == 1 and "bare number" in hints[0], hints
+    assert near_misses("563", [(rust, "fn bm25_underfill_563() {")]) == []
+    assert near_misses("563", [(rust, "#[test]"), (rust, "fn underfill_5630() {")]) == []
+    assert near_misses("563", [(rust, "#[test]"), (rust, "fn issue_564_probe_563() {")]) == []
+    hints = near_misses("563", [(rust, "fn issue_563_underfill() {")])
+    assert len(hints) == 1 and "adds no `#[test]`" in hints[0] and "helper" in hints[0], hints
+    assert near_misses("563", [(rust, "#[test]"), (rust, "fn issue_563_underfill() {")]) == []
+    assert near_misses("563", [(rust, "fn issue_563_underfill();")]) == []
+    hints = near_misses("563", [(rust, "#[test]"), (rust, "fn _issue_563_underfill() {")])
+    assert len(hints) == 1 and "underscore" in hints[0], hints
+    hints = near_misses("563", [(rust, "#[test]"), (rust, "fn issue_563_underfill() {")], {"issue_563_underfill"})
+    assert len(hints) == 1 and "moved, not added" in hints[0], hints
+    nested = "crates/omnigraph/tests/fixtures/mod.rs"
+    hints = near_misses("563", [(nested, "#[test]"), (nested, "fn issue_563_underfill() {")])
+    assert len(hints) == 1 and "helper or fixture module" in hints[0], hints
+    assert near_misses("563", [(nested, "fn issue_563_underfill() {")]) == []
+    assert near_misses("563", [(nested, "#[test]"), (nested, "fn underfill_563() {")]) == []
+    message = failure_message("563", ["crates/omnigraph/src/lib.rs"], ["hint one"])
+    assert message.startswith("FAIL: the body closes #563") and "near miss: hint one" in message
+    assert "issue_563_<short_name>.gqt" in message and "# issue: 563" in message
+
     print("self-test ok")
     return 0
 
@@ -818,15 +1079,24 @@ def main() -> int:
     parser.add_argument("--body-file")
     parser.add_argument("--labels", default="")
     parser.add_argument("--range")
+    parser.add_argument(
+        "--repo",
+        default=os.environ.get("GITHUB_REPOSITORY"),
+        help="OWNER/NAME whose `OWNER/NAME#N` and issue-URL closings count; default $GITHUB_REPOSITORY",
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
     if not args.body_file or not args.range:
         parser.error("--body-file and --range are required unless --self-test")
+    try:
+        repo = parse_repo(args.repo)
+    except ValueError as e:
+        parser.error(str(e))
     body = Path(args.body_file).read_text(encoding="utf-8")
     labels = [label.strip() for label in args.labels.split(",") if label.strip()]
-    return run_gate(body, labels, args.range)
+    return run_gate(body, labels, args.range, repo)
 
 
 if __name__ == "__main__":
