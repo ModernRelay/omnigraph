@@ -169,9 +169,32 @@ impl omnigraph::storage::StorageAdapter for CostStorage {
         );
         out
     }
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> omnigraph::error::Result<Option<Vec<u8>>> {
+        let out = self
+            .inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await;
+        tally(
+            "a.get",
+            out.as_ref()
+                .ok()
+                .and_then(|o| o.as_ref())
+                .map(|b| b.len() as u64)
+                .unwrap_or(0),
+        );
+        out
+    }
     async fn write_text(&self, uri: &str, contents: &str) -> omnigraph::error::Result<()> {
         tally("a.put", contents.len() as u64);
         self.inner.write_text(uri, contents).await
+    }
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> omnigraph::error::Result<()> {
+        tally("a.put", contents.len() as u64);
+        self.inner.write_bytes(uri, contents).await
     }
     async fn write_text_if_absent(
         &self,

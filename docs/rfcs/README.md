@@ -38,9 +38,8 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0044**. RFC 0040 is reserved by
-[PR #546](https://github.com/ModernRelay/omnigraph/pull/546); lower gaps are
-historical and must not be reused.
+The next available number is **0050**; lower gaps are historical and must
+not be reused (0047 and 0048 are allocated by PR #606).
 
 ## Required frontmatter
 
@@ -116,7 +115,9 @@ dependencies do.
 3. Review the problem, user/operational behavior, invariants, substrate
    alignment, compatibility, evidence, alternatives, and rollout.
 4. Record material review outcomes in the RFC's decision log. Do not maintain a
-   separate review ledger.
+   separate review ledger. A post-merge amendment rewrites the body sentences
+   it changes and its Decision-log entry names each sentence it supersedes, so
+   the body alone stays current.
 5. A maintainer decision changes the lifecycle to `accepted` or `rejected`.
 6. Implementation PRs link the accepted RFC and update `implementation` plus
    any durable evidence or support boundary in the canonical file.
@@ -166,6 +167,11 @@ This table is the human index for the canonical RFC corpus.
 | [0037](0037-deterministic-simulation-harness.md) | Deterministic simulation harness | public | accepted | in-progress |
 | [0038](0038-typed-storage-failures.md) | Typed storage failures | public | accepted | complete |
 | [0039](0039-end-to-end-benchmark.md) | The end-to-end benchmark | public | accepted | in-progress |
+| [0040](0040-system-column-namespace.md) | System column namespace | public | draft | in-progress |
 | [0041](0041-inline-stored-queries.md) | Inline and stored queries | maintainer | accepted | partial |
 | [0042](0042-incarnation-suffixed-branch-refs.md) | Incarnation-suffixed native branch refs | maintainer | accepted | complete |
 | [0043](0043-full-text-index-compatibility.md) | Full-text index compatibility and explicit rebuild | maintainer | accepted | complete |
+| [0044](0044-edge-keys.md) | Edge keys: derived edge identity | maintainer | draft | in-progress |
+| [0045](0045-gq-logic-tests.md) | GQ logic tests | maintainer | draft | partial |
+| [0046](0046-index-status.md) | Read-only index status | maintainer | draft | not-started |
+| [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | complete |

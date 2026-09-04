@@ -58,10 +58,23 @@ unsupported. RFC 0023 owns the detailed proof and performance evidence.
 
 ## General route
 
-The fallback is an ordered three-way cursor merge:
+The fallback is an ordered three-way cursor merge. Each cursor streams one
+snapshot's rows in `id` order in two phases so no payload column ever reaches
+a SortExec input:
 
-- each production cursor requests 8,192 rows and 32 MiB per decoded batch;
-- Blob-bearing rows are materialized under the same operation budget;
+- a narrow ordered scan sorts only `id` + `_rowid` + `_rowaddr` (8,192 rows
+  and 32 MiB per decoded batch as targets — a few dozen bytes per sorted row);
+- sorted keys are hydrated back into complete rows in bounded chunks through
+  an unordered, fragment-scoped scan filtered to the chunk's exact `_rowaddr`
+  set against the same pinned dataset. Every retained batch is compacted and
+  hard-charged as it streams; a chunk that crosses the 64 MiB retained
+  ceiling is dropped mid-stream and retried with half the rows, so peak
+  hydration memory is the ceiling plus one in-flight scanner batch for any
+  row-width shape — the width estimate that plans chunk sizes only reduces
+  retries, it is never load-bearing for the bound. A single indivisible row
+  wider than the ceiling still hydrates alone;
+- Blob columns hydrate as descriptors; Blob-bearing rows are materialized
+  under the same operation budget;
 - all selected constructive rows stage as upserts and removals as deletes;
 - the transaction plan is pre-minted and bounded before recovery arm;
 - selected validation deltas share one operation-wide memory budget.
@@ -92,15 +105,21 @@ inserts.
 Every ordered cursor asks Lance to sort the full table by logical `id`. The
 sort is `O(N log N)` and consumes all input before producing its first row. An
 `id` BTREE accelerates filters but does not provide ordered enumeration, so it
-does not remove this sort. The cursor projects full logical rows, including
-vectors and Blob descriptors, so wide rows increase read and spill cost.
+does not remove this sort. Only the narrow key projection enters the sort;
+payload columns (vectors, wide strings, Blob descriptors) are read once through
+the bounded hydration takes, so row width raises hydration read cost but not
+sort or spill cost, and a pre-existing wide row cannot fail an unrelated
+merge at the sort's single-row cap.
 
 Ordered scans run in a bounded spill context: each execution has a 150 MiB
 memory pool, a 100 GiB scratch quota, and a 37.5 MiB cap on the batches fed
 into a sort. If spilling is disabled, the scratch quota is exhausted, or an
 indivisible row exceeds the hard cap, merge fails loudly; it never returns a
-partial result. The 8,192-row and 32 MiB scanner settings are batch targets,
-not hard decoded-batch limits.
+partial result. A hard-cap failure reports the byte count Lance measured (the
+`limit + 1` sentinel survives only for an unparseable upstream message), and
+cursor-context failures name the table and base/source/target snapshot role.
+The 8,192-row and 32 MiB scanner settings are batch targets, not hard
+decoded-batch limits.
 
 Validation is delta-scoped and retains at most 32 MiB of projected scalar
 state. Usable physical indexes reduce uniqueness and relationship probe cost;

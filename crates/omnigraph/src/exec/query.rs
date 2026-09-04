@@ -155,6 +155,10 @@ impl Omnigraph {
 struct SearchMode {
     /// Vector ANN search: (variable, property, query_vector, k).
     nearest: Option<(String, String, Vec<f32>, usize)>,
+    /// Maximum number of IVF payload partitions a nearest scan may search.
+    /// Lance retains its adaptive minimum (one by default); `maximum = None`
+    /// is used by the completeness retry.
+    ann_probe_budget: Option<AnnProbeBudget>,
     /// BM25 full-text search: (variable, property, query_text).
     bm25: Option<(String, String, String)>,
     /// Row cap for the BM25 scan, the counterpart of `nearest`'s `k`; see
@@ -162,17 +166,63 @@ struct SearchMode {
     bm25_scan_limit: Option<usize>,
     /// RRF fusion: (primary, secondary, k_constant, limit).
     rrf: Option<RrfMode>,
+    /// The rrf prefilter gate's eligible-id set for this arm's BM25 scan
+    /// (`execute_rrf_fusion` sets it on an arm iff that arm carries an
+    /// uncapped `bm25` target on the ranked variable — never on a `nearest`
+    /// arm, whose constitutive `k` truncation would make a prefiltered run
+    /// answer-DIFFERENT, not just cheaper). The set over-approximates the
+    /// traversal's survivors (single owner of that invariant:
+    /// `rrf_prefilter_gate`'s doc), so ANDing it into the scan is a cost
+    /// change only. Not a cap: `to_uncapped` must NOT clear it.
+    bm25_eligible_ids: Option<EligibleIds>,
+}
+
+/// Shared eligible-id set, `Debug`-opaque so a logged `SearchMode` prints the
+/// cardinality instead of up to `DEFAULT_RRF_GATE_MAX_IDS` id strings.
+#[derive(Clone)]
+struct EligibleIds(Arc<Vec<String>>);
+
+impl std::fmt::Debug for EligibleIds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EligibleIds(len={})", self.0.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnnProbeBudget {
+    maximum: Option<usize>,
+}
+
+impl AnnProbeBudget {
+    fn bounded(maximum: usize) -> Self {
+        Self {
+            maximum: Some(maximum),
+        }
+    }
 }
 
 impl SearchMode {
     /// This mode with the BM25 scan cap cleared (only a standalone `bm25()`
     /// ordering ever carries one — `rrf()` arms are never capped, see
     /// `extract_sub_search_mode`). Any future scan cap must be cleared here
-    /// too.
+    /// too. (`bm25_eligible_ids` is not a cap — a superset prefilter is
+    /// answer-preserving — so it survives.)
     fn to_uncapped(&self) -> Self {
         Self {
             bm25_scan_limit: None,
+            ann_probe_budget: self
+                .ann_probe_budget
+                .map(|_| AnnProbeBudget { maximum: None }),
             ..self.clone()
+        }
+    }
+
+    /// The eligible-id set to AND into `variable`'s scan, if this mode is a
+    /// bm25 arm targeting `variable` and the gate chose the prefilter plan.
+    fn bm25_eligible_ids_for(&self, variable: &str) -> Option<&[String]> {
+        match (&self.bm25, &self.bm25_eligible_ids) {
+            (Some((var, ..)), Some(ids)) if var == variable => Some(ids.0.as_slice()),
+            _ => None,
         }
     }
 }
@@ -196,6 +246,13 @@ const BM25_SCAN_OVERFETCH_FACTOR: usize = 4;
 /// arms never call this (see `extract_sub_search_mode`).
 fn bm25_scan_limit(ir: &QueryIR) -> Option<usize> {
     if projections_have_aggregates(&ir.return_exprs) {
+        return None;
+    }
+    // Secondary order keys disqualify the cap: they rank WITHIN score ties,
+    // and a bounded scan chooses which tied rows exist at all — the secondary
+    // sort over a cap-arbitrary subset would be a silently wrong answer the
+    // under-fill retry cannot see (exactly `limit` rows still come back).
+    if ir.order_by.len() > 1 {
         return None;
     }
     ir.limit.map(|rows| {
@@ -232,6 +289,7 @@ async fn extract_search_mode(
             .unwrap_or(usize::MAX);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
+                ann_probe_budget: Some(AnnProbeBudget::bounded(ann_nprobes())),
                 ..Default::default()
             })
         }
@@ -314,6 +372,7 @@ async fn extract_sub_search_mode(
                 .unwrap_or(100);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
+                ann_probe_budget: Some(AnnProbeBudget::bounded(ann_nprobes())),
                 ..Default::default()
             })
         }
@@ -549,6 +608,30 @@ pub async fn execute_query(
         return Ok(QueryResult::new(retried.schema(), vec![retried]));
     }
 
+    // A maximum probe guard can return fewer than k rows when the selected
+    // IVF partitions do not contain enough candidates (large k or a selective
+    // prefilter). Retry once without the maximum so the guard cannot silently
+    // lower the query's row limit. Short corpora pay the second scan because
+    // row count alone cannot distinguish them from cap starvation.
+    if search_mode
+        .ann_probe_budget
+        .is_some_and(|budget| budget.maximum.is_some())
+        && ir
+            .limit
+            .is_some_and(|limit| (result_batch.num_rows() as u64) < limit)
+    {
+        tracing::debug!(
+            limit = ir.limit,
+            capped_rows = result_batch.num_rows(),
+            "ANN scan cap under-filled; retrying without a maximum probe cap"
+        );
+        crate::instrumentation::record_ann_uncapped_retry();
+        let uncapped = search_mode.to_uncapped();
+        let retried =
+            execute_query_once(ir, params, snapshot, graph_index, catalog, &uncapped).await?;
+        return Ok(QueryResult::new(retried.schema(), vec![retried]));
+    }
+
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
 }
 
@@ -563,6 +646,22 @@ async fn execute_query_once(
     catalog: &Catalog,
     search_mode: &SearchMode,
 ) -> Result<RecordBatch> {
+    let has_aggregates = projections_have_aggregates(&ir.return_exprs);
+
+    // Limit pushdown into a final Expand (query-level half of the legality
+    // check; the op-level half lives in `execute_pipeline`). An unordered
+    // `limit` demands ANY n valid rows, so a traversal may stop once n pairs
+    // are emitted. Ordering (explicit or search-imposed) needs the full row
+    // set to rank, and an aggregate consumes every row — both disqualify.
+    let final_expand_cap = match ir.limit {
+        Some(limit)
+            if ir.order_by.is_empty() && !has_aggregates && !is_search_ordered(search_mode) =>
+        {
+            usize::try_from(limit).ok()
+        }
+        _ => None,
+    };
+
     let needed_columns = collect_needed_columns(ir);
     let mut wide: Option<RecordBatch> = None;
     execute_pipeline(
@@ -573,22 +672,69 @@ async fn execute_query_once(
         catalog,
         &mut wide,
         search_mode,
+        final_expand_cap,
         &needed_columns,
     )
     .await?;
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
-
-    // Project return expressions
-    let has_aggregates = projections_have_aggregates(&ir.return_exprs);
     let mut result_batch = project_return(&wide_batch, &ir.return_exprs, params)?;
 
-    // Apply ordering (skip if search mode already ordered the results)
+    // Apply ordering. Search-ordered plans sort on the appended score column
+    // (mechanism and contract: `search_score_orderings`). Aggregated
+    // search-ordered queries keep the historical no-sort behavior: the score
+    // column does not survive aggregation. `fetch` is safe to pass on every
+    // path here because the only step after ordering is the limit slice.
+    let fetch = ir.limit.and_then(|limit| usize::try_from(limit).ok());
     if !ir.order_by.is_empty() && !is_search_ordered(search_mode) {
         result_batch = if has_aggregates {
-            apply_ordering(result_batch.clone(), &ir.order_by, &result_batch, params)?
+            apply_ordering(
+                result_batch.clone(),
+                &ir.order_by,
+                &result_batch,
+                params,
+                fetch,
+            )?
         } else {
-            apply_ordering(result_batch, &ir.order_by, &wide_batch, params)?
+            apply_ordering(result_batch, &ir.order_by, &wide_batch, params, fetch)?
         };
+    } else if !has_aggregates {
+        if let Some(mut orderings) = search_score_orderings(search_mode) {
+            // Guard on the invariant itself (score column present), not row
+            // count: an empty scan's fallback schema legitimately lacks the
+            // column (zero rows, nothing to order); rows WITHOUT the column
+            // would mean the ranking is unrecoverable, and returning them
+            // unranked would be a silent wrong answer — refuse instead.
+            let score_col = match &orderings[0].expr {
+                IRExpr::PropAccess { variable, property } => format!("{variable}.{property}"),
+                _ => String::new(),
+            };
+            if wide_batch.column_by_name(&score_col).is_some() {
+                // User-stated secondary keys (`order { nearest(...), $p.name
+                // desc }`) apply after the score, before the id tie-break. A
+                // search function in a non-leading position is refused with
+                // its constraint named, not fed to `apply_ordering`'s opaque
+                // unsupported-expression arm.
+                for extra in ir.order_by.iter().skip(1) {
+                    if matches!(
+                        extra.expr,
+                        IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Rrf { .. }
+                    ) {
+                        return Err(OmniError::manifest(
+                            "search functions must lead the order clause; keys after the \
+                             search function must be plain expressions"
+                                .to_string(),
+                        ));
+                    }
+                }
+                orderings.extend(ir.order_by.iter().skip(1).cloned());
+                result_batch =
+                    apply_ordering(result_batch, &orderings, &wide_batch, params, fetch)?;
+            } else if result_batch.num_rows() > 0 {
+                return Err(OmniError::manifest(format!(
+                    "search-ordered query produced rows without its '{score_col}' ranking column"
+                )));
+            }
+        }
     }
 
     // Apply limit
@@ -600,15 +746,542 @@ async fn execute_query_once(
     Ok(result_batch)
 }
 
-/// Check if the search mode already returns results in the correct order.
+/// Check if the query's ordering is search-imposed (`nearest()`/`bm25`).
 fn is_search_ordered(search_mode: &SearchMode) -> bool {
     search_mode.nearest.is_some() || search_mode.bm25.is_some()
+}
+
+/// Synthetic orderings for a search-ordered plan: sort on the score column
+/// Lance appended to the scan (`nearest` ranks by ascending `_distance`,
+/// `bm25` by descending `_score`). The column rides the wide batch under the
+/// search binding's prefix like any other property — hydration replicates it
+/// onto every traversal row, so ranking is data on the rows and Expand
+/// emission order is not load-bearing — and `apply_ordering`'s `.id`
+/// tie-break makes the order total and deterministic. The bare names are
+/// reserved property names at schema validation, so a user column can never
+/// shadow them. Latent nulls note: `apply_ordering` places nulls first under
+/// asc; no in-tree path produces a null score (T23 blocks edge-binding
+/// nearest, hydration replicates non-null seed columns) — if one ever
+/// appears, rank nulls last explicitly here.
+fn search_score_orderings(search_mode: &SearchMode) -> Option<Vec<IROrdering>> {
+    let (variable, property, descending) = if let Some((var, ..)) = &search_mode.nearest {
+        (var.clone(), "_distance", false)
+    } else if let Some((var, ..)) = &search_mode.bm25 {
+        (var.clone(), "_score", true)
+    } else {
+        return None;
+    };
+    Some(vec![IROrdering {
+        expr: IRExpr::PropAccess {
+            variable,
+            property: property.to_string(),
+        },
+        descending,
+    }])
+}
+
+// ─── RRF prefilter gate ──────────────────────────────────────────────────────
+
+/// Prefilter admission ratio: the gate's selective plan runs when
+/// |eligible| / corpus is at or below this. Set by the gate benchmark
+/// (`benches/scenarios.rs` `rrf-gate`, 2026-08-31): on a 100k-row corpus the
+/// prefiltered plan's warm wall clock still beat the postfilter plan's at
+/// 10% eligibility (31.5 ms vs 53.5 ms) and lost at 25% (85 ms vs 68.5 ms);
+/// a 200 KiB-payload corpus crossed even higher. 0.10 is the conservative
+/// (smaller) crossover across both corpora.
+const DEFAULT_RRF_GATE_RATIO: f64 = 0.10;
+/// Absolute ceiling on the eligible-id in-list: the per-id predicate cost
+/// the ratio cannot see on huge corpora. Set by the same benchmark's 10^5 /
+/// 10^6 microbench (1e6-row corpus): at 1e5 ids the prefiltered plan still
+/// won (324.5 ms vs 360.5 ms warm) and at 1e6 it lost 1.7x (2.76 s vs
+/// 1.63 s) — `Expr` construction itself stays negligible (31 ms at 1e6);
+/// the loss is the in-list probe/filter evaluation.
+const DEFAULT_RRF_GATE_MAX_IDS: usize = 100_000;
+
+fn rrf_gate_ratio() -> f64 {
+    std::env::var("OMNIGRAPH_RRF_GATE_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|r| r.is_finite() && *r >= 0.0)
+        .unwrap_or(DEFAULT_RRF_GATE_RATIO)
+}
+
+fn rrf_gate_max_ids() -> usize {
+    std::env::var("OMNIGRAPH_RRF_GATE_MAX_IDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_RRF_GATE_MAX_IDS)
+}
+
+/// The rrf gate's force hook. `OMNIGRAPH_RRF_PLAN` ∈ {auto (default),
+/// force_prefilter, force_postfilter}; the scoped test seam
+/// (`instrumentation::with_rrf_plan`) takes precedence over the
+/// process-global env var, mirroring `traversal_indexed_override`. A force
+/// overrides only the gate's THRESHOLD decision, never a correctness fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RrfPlanForce {
+    Auto,
+    Prefilter,
+    Postfilter,
+}
+
+fn rrf_plan_force() -> RrfPlanForce {
+    let mode = crate::instrumentation::rrf_plan_override()
+        .map(str::to_string)
+        .or_else(|| std::env::var("OMNIGRAPH_RRF_PLAN").ok());
+    match mode.as_deref() {
+        Some("force_prefilter") => RrfPlanForce::Prefilter,
+        Some("force_postfilter") => RrfPlanForce::Postfilter,
+        // A diagnosis knob must not fail silent while someone is diagnosing:
+        // an unrecognized value runs auto, loudly.
+        Some(other) if !other.is_empty() && other != "auto" => {
+            tracing::warn!(
+                value = other,
+                "unrecognized OMNIGRAPH_RRF_PLAN value; running auto"
+            );
+            RrfPlanForce::Auto
+        }
+        _ => RrfPlanForce::Auto,
+    }
+}
+
+/// Top-level Expand ops whose `src_var` is the ranked variable — the
+/// admission table's eligibility sources, as (edge_type, direction) pairs.
+/// `None` is the shape fall-back: the ranked variable is some Expand's dst
+/// (its NodeScan never installs the search — pre-existing silent-ignore), it
+/// is not introduced by a top-level NodeScan, or no top-level Expand
+/// constrains it. Expands inside an AntiJoin inner are NEVER sources: the
+/// anti-join inverts their meaning, and deriving eligibility from one is a
+/// subset error — the one direction that changes answers (the superset
+/// rule on `rrf_prefilter_gate`). A `min_hops == 0` Expand would make every node
+/// eligible; typecheck T15 rejects it, and it is skipped defensively here
+/// (skipping a source only widens the set).
+fn rrf_gate_expand_sources<'a>(
+    pipeline: &'a [IROp],
+    ranked_var: &str,
+) -> Option<Vec<(&'a str, Direction)>> {
+    let mut introduced_by_scan = false;
+    let mut sources: Vec<(&str, Direction)> = Vec::new();
+    for op in pipeline {
+        match op {
+            IROp::NodeScan { variable, .. } if variable == ranked_var => {
+                introduced_by_scan = true;
+            }
+            // Field-exhaustive on purpose (no `..`): a future Expand field
+            // must be classified here — superset-safe or not — before this
+            // walk compiles, the field-level twin of the exhaustive op match.
+            // The elided-by-name fields are each shrink-only or
+            // multiplicity-only: `dst_type` (typing, checked at the catalog
+            // in the gate), `max_hops` (an upper bound never widens the
+            // first-hop necessity), `dst_filters` (shrink survivors only),
+            // `edge_binding` (row multiplicity, not membership).
+            IROp::Expand {
+                src_var,
+                dst_var,
+                edge_type,
+                direction,
+                min_hops,
+                dst_type: _,
+                max_hops: _,
+                dst_filters: _,
+                edge_binding: _,
+            } => {
+                if dst_var == ranked_var {
+                    return None;
+                }
+                if src_var == ranked_var && *min_hops > 0 {
+                    sources.push((edge_type.as_str(), *direction));
+                }
+            }
+            IROp::NodeScan { .. } | IROp::Filter(_) | IROp::AntiJoin { .. } => {}
+        }
+    }
+    if introduced_by_scan && !sources.is_empty() {
+        Some(sources)
+    } else {
+        None
+    }
+}
+
+/// The rrf prefilter gate: decide, before the arms run, between two ANSWER-IDENTICAL
+/// plans — prefilter (the uncapped bm25 arms rank only the traversal's
+/// eligible ids) and postfilter (the uncapped corpus-wide arms, v0.9 rrf
+/// semantics).
+///
+/// INVARIANT (single owner): with bm25 arms prefiltered and nearest arms
+/// untouched, over FTS-index-covered data,
+/// up to BM25 score ties, the candidate plans are answer-identical;
+/// cardinality decides cost only. A mis-estimate wastes time, never flips a
+/// winner — re-coupling answer content to the estimate would recreate the
+/// PR #574 cap starvation one level up. Every fence below guards that
+/// identity:
+/// - the eligible set MUST over-approximate the traversal's survivors (a
+///   superset only costs speedup; a subset changes answers) — every
+///   admitted shape in `rrf_gate_expand_sources` is an instance;
+/// - full FTS fragment coverage (uncovered fragments are scored
+///   filter-dependently, so a mask would change their scores);
+/// - `nearest` arms are never prefiltered (their constitutive `k` makes a
+///   prefiltered run answer-different) — the caller's threading rule;
+/// - an empty eligible set runs postfilter (same empty join, and `IN ()`
+///   edge semantics never arise).
+///
+/// Fallible steps fall back to postfilter — a query must never fail because
+/// an optimization could not start. The gate reads the eligible COUNT only;
+/// id strings materialize only after the prefilter plan is chosen, so the
+/// broad regime never builds them. Every decision records a
+/// `rrf_gate_verdicts` probe entry.
+async fn rrf_prefilter_gate(
+    ir: &QueryIR,
+    snapshot: &Snapshot,
+    graph_index: &GraphIndexHandle<'_>,
+    catalog: &Catalog,
+    rrf: &RrfMode,
+) -> Option<EligibleIds> {
+    use crate::instrumentation::{
+        RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_rrf_gate_verdict,
+    };
+
+    let fall_back =
+        |fallback: RrfGateFallback, forced: bool, eligible: Option<u64>, corpus: Option<u64>| {
+            // Production-visible trace beside the test-only probe: a
+            // persistently failing fence (e.g. a CSR build error) silently
+            // disables the optimization otherwise — the bm25 retry's
+            // logging precedent.
+            tracing::debug!(
+                ?fallback,
+                forced,
+                "rrf prefilter gate fell back to the postfilter plan"
+            );
+            record_rrf_gate_verdict(RrfGateVerdict {
+                plan: RrfGatePlan::Postfilter,
+                fallback: Some(fallback),
+                forced,
+                eligible,
+                corpus,
+            });
+        };
+
+    let force = rrf_plan_force();
+    if force == RrfPlanForce::Postfilter {
+        fall_back(RrfGateFallback::Forced, true, None, None);
+        return None;
+    }
+    let forced = force == RrfPlanForce::Prefilter;
+
+    // Both arms must target one ranked variable, and at least one arm must
+    // be bm25 — a nearest-only fusion has nothing the gate may prefilter.
+    let arm_target = |mode: &SearchMode| {
+        mode.bm25
+            .as_ref()
+            .map(|(v, ..)| v.clone())
+            .or_else(|| mode.nearest.as_ref().map(|(v, ..)| v.clone()))
+    };
+    let (Some(primary_var), Some(secondary_var)) =
+        (arm_target(&rrf.primary), arm_target(&rrf.secondary))
+    else {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    };
+    if primary_var != secondary_var {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    }
+    let ranked_var = primary_var.as_str();
+    let bm25_props: Vec<&str> = [&rrf.primary, &rrf.secondary]
+        .into_iter()
+        .filter_map(|arm| arm.bm25.as_ref().map(|(_, prop, _)| prop.as_str()))
+        .collect();
+    if bm25_props.is_empty() {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    }
+
+    let Some(sources) = rrf_gate_expand_sources(&ir.pipeline, ranked_var) else {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    };
+    let Some(ranked_type) = resolve_binding_type_name(&ir.pipeline, ranked_var) else {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    };
+
+    // Gate input: the ranked type's manifest-resident entity count — the
+    // expand cost model's own corpus spelling, no async count_rows.
+    let node_key = format!("node:{}", ranked_type);
+    let Some(node_entry) = snapshot.dataset(&node_key) else {
+        fall_back(RrfGateFallback::Shape, forced, None, None);
+        return None;
+    };
+    let corpus = node_entry.entity_count;
+
+    // Correctness fence: the prefilter plan is admitted only when the ranked
+    // table's FTS index covers ALL fragments (see
+    // `TableStore::fts_covers_all_fragments`); a coverage probe failure is
+    // conservatively treated as uncovered. Never overridden by force.
+    match snapshot.open_lance_dataset(&node_key).await {
+        Ok(ds) => {
+            for prop in &bm25_props {
+                match crate::table_store::TableStore::fts_covers_all_fragments(&ds, prop).await {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
+                        return None;
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
+            return None;
+        }
+    }
+
+    // On build Err the gate falls back — the postfilter plan needs no CSR up
+    // front. (`GraphIndexHandle::get` is lazy and fallible; the traversal
+    // will surface a real failure on its own terms later.)
+    let graph = match graph_index.get().await {
+        Ok(Some(graph)) => graph,
+        Ok(None) | Err(_) => {
+            fall_back(RrfGateFallback::BuildErr, forced, None, Some(corpus));
+            return None;
+        }
+    };
+
+    // The dense space is built from edge-table endpoints only: a ranked type
+    // absent from it has no node with any edge — the eligible set is empty.
+    let Some(idx) = graph.type_index(ranked_type) else {
+        fall_back(
+            RrfGateFallback::EmptyEligible,
+            forced,
+            Some(0),
+            Some(corpus),
+        );
+        return None;
+    };
+
+    // Resolve each source Expand to the adjacency (CSR for Out, CSC for In,
+    // union for Both) whose `has_neighbors` answers "does this node satisfy
+    // the source's first edge". Several sources intersect — still a superset
+    // of the traversal's survivors. An edge type with no built adjacency has
+    // zero edges, so the intersection is empty. The endpoint-type check and
+    // the width check are LOAD-BEARING: `has_neighbors` indexes
+    // `offsets[n + 1]` unchecked, so a misaligned dense space would panic.
+    let mut adjacencies: Vec<(
+        Option<&crate::graph_index::CsrIndex>,
+        Option<&crate::graph_index::CsrIndex>,
+    )> = Vec::with_capacity(sources.len());
+    for (edge_type, direction) in &sources {
+        let Some(edge_def) = catalog.edge_types.get(*edge_type) else {
+            fall_back(RrfGateFallback::Shape, forced, None, Some(corpus));
+            return None;
+        };
+        let side_matches = match direction {
+            Direction::Out => edge_def.from_type == ranked_type,
+            Direction::In => edge_def.to_type == ranked_type,
+            // Undirected is same-type only (typecheck T22).
+            Direction::Both => edge_def.from_type == ranked_type && edge_def.to_type == ranked_type,
+        };
+        if !side_matches {
+            fall_back(RrfGateFallback::Shape, forced, None, Some(corpus));
+            return None;
+        }
+        let (out, incoming) = match direction {
+            Direction::Out => (graph.csr(edge_type), None),
+            Direction::In => (None, graph.csc(edge_type)),
+            Direction::Both => (graph.csr(edge_type), graph.csc(edge_type)),
+        };
+        if out.is_none() && incoming.is_none() {
+            fall_back(
+                RrfGateFallback::EmptyEligible,
+                forced,
+                Some(0),
+                Some(corpus),
+            );
+            return None;
+        }
+        for adjacency in [out, incoming].into_iter().flatten() {
+            if adjacency.num_nodes() != idx.len() {
+                fall_back(RrfGateFallback::BuildErr, forced, None, Some(corpus));
+                return None;
+            }
+        }
+        adjacencies.push((out, incoming));
+    }
+
+    let passes = |dense: u32| {
+        adjacencies.iter().all(|(out, incoming)| {
+            out.is_some_and(|adj| adj.has_neighbors(dense))
+                || incoming.is_some_and(|adj| adj.has_neighbors(dense))
+        })
+    };
+
+    // COUNT pass only — no allocation until the prefilter plan is chosen.
+    let eligible_count = (0..idx.len() as u32).filter(|&dense| passes(dense)).count() as u64;
+    if eligible_count == 0 {
+        fall_back(
+            RrfGateFallback::EmptyEligible,
+            forced,
+            Some(0),
+            Some(corpus),
+        );
+        return None;
+    }
+
+    // Threshold: ratio AND absolute cap, both after the zero override; pure
+    // cost tuning (the one decision a force may override).
+    if !forced {
+        let ratio_ok = corpus > 0 && (eligible_count as f64) <= rrf_gate_ratio() * (corpus as f64);
+        let cap_ok = eligible_count <= rrf_gate_max_ids() as u64;
+        if !(ratio_ok && cap_ok) {
+            fall_back(
+                RrfGateFallback::Threshold,
+                false,
+                Some(eligible_count),
+                Some(corpus),
+            );
+            return None;
+        }
+    }
+
+    let mut ids: Vec<String> = Vec::with_capacity(eligible_count as usize);
+    for dense in 0..idx.len() as u32 {
+        if passes(dense) {
+            if let Some(id) = idx.to_id(dense) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    // The count pass and this materialization share `passes`, and `to_id` is
+    // total over the dense range, so a mismatch is unreachable — but if one
+    // ever appears, a silently SHRUNK set would be a subset error (the one
+    // answer-changing direction). Fall back instead: cost-only, like every
+    // other impossible-state fence in this gate.
+    if ids.len() as u64 != eligible_count {
+        fall_back(
+            RrfGateFallback::BuildErr,
+            forced,
+            Some(eligible_count),
+            Some(corpus),
+        );
+        return None;
+    }
+    // Test-only red control (`instrumentation::with_rrf_gate_subset_drop`):
+    // deliberately violates the superset rule so the differential oracle can
+    // prove it detects a subset. Compiled out of release binaries with its
+    // seam — an answer-corrupting hook must not exist in production.
+    #[cfg(debug_assertions)]
+    if let Some(dropped) = crate::instrumentation::rrf_gate_subset_drop() {
+        ids.retain(|id| *id != dropped);
+    }
+    record_rrf_gate_verdict(RrfGateVerdict {
+        plan: RrfGatePlan::Prefilter,
+        fallback: None,
+        forced,
+        eligible: Some(eligible_count),
+        corpus: Some(corpus),
+    });
+    Some(EligibleIds(Arc::new(ids)))
+}
+
+/// This arm's mode with the eligible-id prefilter attached iff the arm
+/// carries a bm25 target (both arms when both are bm25). A
+/// `nearest` arm passes through untouched and runs identical code in both
+/// plans — prefiltering its `k`-truncated scan would change answers.
+fn arm_with_bm25_prefilter(arm: &SearchMode, ids: &EligibleIds) -> SearchMode {
+    if arm.bm25.is_some() {
+        SearchMode {
+            bm25_eligible_ids: Some(ids.clone()),
+            ..arm.clone()
+        }
+    } else {
+        arm.clone()
+    }
+}
+
+/// Execute one RRF arm with its selected search mode.
+async fn execute_rrf_arm_once(
+    ir: &QueryIR,
+    params: &ParamMap,
+    snapshot: &Snapshot,
+    graph_index: &GraphIndexHandle<'_>,
+    catalog: &Catalog,
+    mode: &SearchMode,
+    needed_columns: &HashMap<String, NeededColumns>,
+) -> Result<Option<RecordBatch>> {
+    let mut wide = None;
+    execute_pipeline(
+        &ir.pipeline,
+        params,
+        snapshot,
+        graph_index,
+        catalog,
+        &mut wide,
+        mode,
+        None,
+        needed_columns,
+    )
+    .await?;
+    Ok(wide)
+}
+
+/// Execute one RRF arm and retry a detectably short bounded nearest scan.
+async fn execute_rrf_arm(
+    ir: &QueryIR,
+    params: &ParamMap,
+    snapshot: &Snapshot,
+    graph_index: &GraphIndexHandle<'_>,
+    catalog: &Catalog,
+    mode: &SearchMode,
+    needed_columns: &HashMap<String, NeededColumns>,
+    limit: usize,
+) -> Result<Option<RecordBatch>> {
+    let mut wide = execute_rrf_arm_once(
+        ir,
+        params,
+        snapshot,
+        graph_index,
+        catalog,
+        mode,
+        needed_columns,
+    )
+    .await?;
+    let bounded_nearest = mode
+        .ann_probe_budget
+        .is_some_and(|budget| budget.maximum.is_some());
+    let unique_candidates = match (&mode.nearest, &wide) {
+        (Some((variable, ..)), Some(batch)) => {
+            let ids = extract_id_column_by_name(batch, &format!("{variable}.id"))?;
+            ids.into_iter().collect::<HashSet<_>>().len()
+        }
+        (Some(_), None) => 0,
+        (None, _) => limit,
+    };
+    if bounded_nearest && unique_candidates < limit {
+        tracing::debug!(
+            limit,
+            capped_candidates = unique_candidates,
+            "RRF ANN arm under-filled; retrying without a maximum probe cap"
+        );
+        crate::instrumentation::record_ann_uncapped_retry();
+        wide = execute_rrf_arm_once(
+            ir,
+            params,
+            snapshot,
+            graph_index,
+            catalog,
+            &mode.to_uncapped(),
+            needed_columns,
+        )
+        .await?;
+    }
+    Ok(wide)
 }
 
 /// One RRF pass: run both arms, fuse their ranks, reconstruct and limit.
 ///
 /// INPUT CONTRACT: bm25 arms are complete rankings, never capped — see
-/// `extract_sub_search_mode`. (The `nearest` arm was always truncated at `k`.)
+/// `extract_sub_search_mode`. Nearest arms are truncated at `k`; a bounded arm
+/// that returns fewer than `k` distinct candidates retries uncapped.
 async fn execute_rrf_fusion(
     ir: &QueryIR,
     params: &ParamMap,
@@ -624,31 +1297,46 @@ async fn execute_rrf_fusion(
     let mut needed_columns = collect_needed_columns(ir);
     fail_open_rrf_leg_targets(&mut needed_columns, rrf);
 
-    // Execute primary search
-    let mut primary_wide: Option<RecordBatch> = None;
-    execute_pipeline(
-        &ir.pipeline,
+    // The prefilter gate: the eligible-id set is computed ONCE here, above
+    // the arms, then threaded ASYMMETRICALLY — into an arm iff it carries an
+    // uncapped bm25 target on the ranked variable (both arms when both are
+    // bm25), never into a `nearest` arm, which runs identical code in both
+    // plans. The asymmetry must live at this threading site:
+    // `execute_node_scan` applies its filters unconditionally and has no arm
+    // identity of its own. (The both-legs symmetry `fail_open_rrf_leg_targets`
+    // enforces for COLUMNS deliberately does not extend to rows.)
+    let eligible = rrf_prefilter_gate(ir, snapshot, graph_index, catalog, rrf).await;
+    let gated = eligible.as_ref().map(|ids| {
+        (
+            arm_with_bm25_prefilter(&rrf.primary, ids),
+            arm_with_bm25_prefilter(&rrf.secondary, ids),
+        )
+    });
+    let (primary_mode, secondary_mode) = match &gated {
+        Some((primary, secondary)) => (primary, secondary),
+        None => (rrf.primary.as_ref(), rrf.secondary.as_ref()),
+    };
+
+    let primary_wide = execute_rrf_arm(
+        ir,
         params,
         snapshot,
         graph_index,
         catalog,
-        &mut primary_wide,
-        &rrf.primary,
+        primary_mode,
         &needed_columns,
+        rrf.limit,
     )
     .await?;
-
-    // Execute secondary search
-    let mut secondary_wide: Option<RecordBatch> = None;
-    execute_pipeline(
-        &ir.pipeline,
+    let secondary_wide = execute_rrf_arm(
+        ir,
         params,
         snapshot,
         graph_index,
         catalog,
-        &mut secondary_wide,
-        &rrf.secondary,
+        secondary_mode,
         &needed_columns,
+        rrf.limit,
     )
     .await?;
 
@@ -669,9 +1357,18 @@ async fn execute_rrf_fusion(
         ))
     })?;
     let secondary_batch = secondary_wide.as_ref().ok_or_else(|| {
+        // Name the secondary arm's own target — this message interpolated
+        // the primary variable, misdirecting a secondary-leg failure.
+        let secondary_var = rrf
+            .secondary
+            .nearest
+            .as_ref()
+            .map(|(v, ..)| v.as_str())
+            .or_else(|| rrf.secondary.bm25.as_ref().map(|(v, ..)| v.as_str()))
+            .unwrap_or(primary_var);
         OmniError::manifest(format!(
             "rrf secondary variable '{}' not in bindings",
-            primary_var
+            secondary_var
         ))
     })?;
 
@@ -707,7 +1404,14 @@ async fn execute_rrf_fusion(
         }
     }
 
-    // Compute RRF scores
+    // Compute RRF scores. NOTE: each arm's rank is derived from the arm
+    // batch's first-seen row order, which equals search rank today only
+    // because the BFS emits each hop's rows in seed input order and every
+    // seed's first in-bounds row lands at its first emitting hop. Under
+    // `min_hops >= 2` with heterogeneous per-seed reach that coincidence
+    // breaks and fused ranks drift; the durable fix is deriving arm ranks
+    // from the arms' `_distance`/`_score` columns like the single-search
+    // path.
     let k = rrf.k as f64;
     let mut scored: Vec<(String, f64)> = all_ids
         .iter()
@@ -1069,6 +1773,13 @@ fn execute_pipeline<'a>(
     catalog: &'a Catalog,
     wide: &'a mut Option<RecordBatch>,
     search_mode: &'a SearchMode,
+    // The query's `limit`, pushable into a final Expand as an emission bound.
+    // `Some` only from `execute_query` when the query-level conditions hold
+    // (unordered, aggregate-free, plain search mode); the op-level conditions
+    // (effectively-last Expand, no destination filters, no edge binding) are
+    // checked at the op site below. Anti-join inner pipelines and RRF arms
+    // always pass `None`.
+    final_expand_cap: Option<usize>,
     needed_columns: &'a HashMap<String, NeededColumns>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
@@ -1138,6 +1849,14 @@ fn execute_pipeline<'a>(
             hoisted_indices.insert(i);
         }
 
+        // The last op that will actually execute (hoisted filters are skipped
+        // in place). Only an Expand in this position may take the emission
+        // cap: any later executing op could drop or multiply rows, making
+        // emitted pairs and result rows diverge.
+        let last_effective_idx = (0..pipeline.len())
+            .rev()
+            .find(|i| !hoisted_indices.contains(i));
+
         for (i, op) in pipeline.iter().enumerate() {
             // Skip hoisted search filters
             if hoisted_indices.contains(&i) {
@@ -1195,6 +1914,21 @@ fn execute_pipeline<'a>(
                     if let Some(extra) = hoisted_dst_filters.get(dst_var) {
                         all_dst_filters.extend(extra.iter().cloned());
                     }
+                    // Emission cap (limit pushdown): only for the effectively
+                    // last op, and only when nothing can drop emitted pairs
+                    // after the traversal — destination filters (lowered OR
+                    // hoisted) drop rows at hydration, and a bound edge emits
+                    // one row per edge ROW rather than per pair.
+                    let emit_cap = match final_expand_cap {
+                        Some(cap)
+                            if Some(i) == last_effective_idx
+                                && all_dst_filters.is_empty()
+                                && edge_binding.is_none() =>
+                        {
+                            Some(cap)
+                        }
+                        _ => None,
+                    };
                     if let Some(batch) = wide.as_mut() {
                         execute_expand(
                             batch,
@@ -1211,6 +1945,7 @@ fn execute_pipeline<'a>(
                             &all_dst_filters,
                             edge_binding.as_deref(),
                             params,
+                            emit_cap,
                         )
                         .await?;
                     }
@@ -1339,7 +2074,7 @@ impl<'a> GraphIndexHandle<'a> {
                         db.graph_index_for_resolved(resolved, edge_types).await?,
                     )),
                     GraphIndexBuilder::Direct(snapshot, edge_types) => Ok(Some(Arc::new(
-                        GraphIndex::build(snapshot, edge_types).await?,
+                        GraphIndex::load_or_build(snapshot, edge_types, None).await?,
                     ))),
                 }
             })
@@ -1369,6 +2104,23 @@ fn traversal_indexed_override() -> Option<bool> {
         Some("csr") => Some(false),
         _ => None,
     }
+}
+
+/// Guard Lance's IVF search against loading every payload partition when its
+/// centroid-distance heuristic expands the adaptive minimum. This is a
+/// maximum only: easy queries retain Lance's one-partition default.
+const DEFAULT_ANN_NPROBES: usize = 20;
+
+fn ann_nprobes_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_ANN_NPROBES)
+}
+
+fn ann_nprobes() -> usize {
+    let value = std::env::var("OMNIGRAPH_ANN_NPROBES").ok();
+    ann_nprobes_from(value.as_deref())
 }
 
 /// Max source-row frontier for which Expand uses the BTREE-indexed path.
@@ -1440,6 +2192,12 @@ struct ExpandCostInputs {
     /// built (making the CSR path ≈ free). Conservatively `false` until the
     /// cache-peek is wired (the plan's optional refinement).
     csr_cached: bool,
+    /// Endpoint probes the indexed path issues per hop: 1 for a directed
+    /// traversal, 2 for undirected (`Direction::Both` scans BOTH the src-keyed
+    /// and dst-keyed orientations — see `endpoint_probes`). Without this the
+    /// cost model priced an undirected traversal at half its probe count and
+    /// half its effective degree.
+    probe_factor: f64,
 }
 
 /// Pure cost-based traversal-mode chooser. Compares an estimate of the indexed
@@ -1468,9 +2226,10 @@ fn choose_expand_mode(i: &ExpandCostInputs) -> ExpandMode {
 
     // Indexed work scales with the frontier when the BTREE serves the IN-list;
     // a degraded scan is a full edge scan per hop instead (the C6 perf cliff).
+    // Either way an undirected traversal pays every hop twice (both probes).
     let indexed_cost = match i.coverage {
-        crate::table_store::IndexCoverage::Indexed => hops * frontier * fanout,
-        crate::table_store::IndexCoverage::Degraded { .. } => hops * edges,
+        crate::table_store::IndexCoverage::Indexed => hops * frontier * fanout * i.probe_factor,
+        crate::table_store::IndexCoverage::Degraded { .. } => hops * edges * i.probe_factor,
     };
     // A warm CSR is ~free to reuse; a cold one costs a build over all edges.
     let csr_cost = if i.csr_cached {
@@ -1484,6 +2243,58 @@ fn choose_expand_mode(i: &ExpandCostInputs) -> ExpandMode {
     } else {
         ExpandMode::Csr
     }
+}
+
+/// Mid-traversal re-decision (issue #533): asked at the top of every indexed
+/// hop after the first with the OBSERVED union frontier, where the dispatch
+/// decision only ever saw the initial one. Pure so the crossover is
+/// unit-tested like `choose_expand_mode`.
+///
+/// Two triggers, either sufficient:
+///
+/// 1. **The hard frontier ceiling.** Dispatch enforces it only against the
+///    initial frontier; here it becomes an execution bound.
+/// 2. **Remaining-work estimate.** Projects the frontier forward over the
+///    remaining hops using the OBSERVED per-hop growth ratio when it exceeds
+///    the manifest's average fanout — heavy-tailed graphs (the #533 shape)
+///    blow through the average, and the observed ratio is the only estimator
+///    that sees hubs. Each projected frontier saturates at |V_src| (BFS
+///    `visited` pruning caps reach). Switch when that estimate exceeds what
+///    the CSR path still costs (a build when cold, ~nothing when warm) —
+///    correct precisely because the switch CONTINUES from carried state, so
+///    switching pays `csr_cost` once while staying pays the whole estimate.
+fn should_switch_to_csr(
+    observed_frontier: usize,
+    prev_frontier: usize,
+    remaining_hops: u32,
+    csr_ready: bool,
+    i: &ExpandCostInputs,
+) -> bool {
+    if observed_frontier > i.max_frontier_cap {
+        return true;
+    }
+    let edges = i.edge_count as f64;
+    let src = i.src_node_count.max(1) as f64;
+    let fanout = edges / src;
+    let observed_growth = if prev_frontier > 0 {
+        observed_frontier as f64 / prev_frontier as f64
+    } else {
+        fanout
+    };
+    let growth = observed_growth.max(fanout).max(1.0);
+
+    let mut remaining_cost = 0.0;
+    let mut frontier = observed_frontier as f64;
+    for _ in 0..remaining_hops {
+        remaining_cost += frontier * fanout * i.probe_factor;
+        frontier = (frontier * growth).min(src);
+    }
+    let csr_cost = if csr_ready {
+        0.0
+    } else {
+        CSR_BUILD_FACTOR * edges
+    };
+    remaining_cost > csr_cost
 }
 
 /// Hops the indexed path will actually run, for cost-model purposes. A cross-type
@@ -1536,7 +2347,17 @@ fn gather_cost_inputs(
         max_frontier_cap: expand_indexed_max_frontier(),
         coverage,
         csr_cached,
+        probe_factor: direction_probe_factor(direction),
     })
+}
+
+/// Per-hop probe multiplier for the indexed path: `endpoint_probes` issues one
+/// scan for a directed traversal and two for an undirected one.
+fn direction_probe_factor(direction: Direction) -> f64 {
+    match direction {
+        Direction::Out | Direction::In => 1.0,
+        Direction::Both => 2.0,
+    }
 }
 
 /// Coverage value to feed the cost decision. A failed coverage probe is treated
@@ -1616,10 +2437,20 @@ fn endpoint_probes(direction: Direction) -> &'static [(&'static str, &'static st
     }
 }
 
-/// Execute a graph traversal (Expand). Dispatches to the BTREE-indexed path
-/// (selective traversals — neighbor lookups via the persisted src/dst index) or
-/// the in-memory CSR path (dense / whole-graph traversals). The CSR index is
-/// built lazily and only the CSR path requests it.
+/// Execute a graph traversal (Expand). Dispatches to the BTREE-indexed
+/// strategy (selective traversals — neighbor lookups via the persisted
+/// src/dst index) or the in-memory CSR strategy (dense / whole-graph
+/// traversals); both run in the shared `execute_expand_bfs` core, which can
+/// also swap indexed → CSR mid-traversal when the frontier outgrows the
+/// dispatch decision (issue #533). The CSR index is built lazily and only
+/// requested when a CSR start or a mid-traversal switch needs it.
+///
+/// `emit_cap`, when set by the pipeline (an unordered trailing `limit` on a
+/// final filterless Expand), bounds the traversal's emitted pairs. Hydration
+/// can drop an emitted id that no longer resolves (a dangling edge), which
+/// would under-fill a capped result; the guard re-runs uncapped in that rare
+/// case, so the cap is a pure optimization, never a correctness change.
+#[allow(clippy::too_many_arguments)]
 async fn execute_expand(
     wide: &mut RecordBatch,
     graph_index: &GraphIndexHandle<'_>,
@@ -1635,7 +2466,108 @@ async fn execute_expand(
     dst_filters: &[IRFilter],
     edge_binding: Option<&str>,
     params: &ParamMap,
+    emit_cap: Option<usize>,
 ) -> Result<()> {
+    if let Some(cap) = emit_cap {
+        // RecordBatch clones are Arc'd column handles — cheap insurance for
+        // the rerun path.
+        let original = wide.clone();
+        let stopped_early = execute_expand_dispatch(
+            wide,
+            graph_index,
+            snapshot,
+            catalog,
+            src_var,
+            dst_var,
+            edge_type,
+            direction,
+            dst_type,
+            min_hops,
+            max_hops,
+            dst_filters,
+            edge_binding,
+            params,
+            Some(cap),
+        )
+        .await?;
+        // The cap is only legal when there are no `dst_filters`, so an
+        // under-fill here can only mean a hydrated dst id had no row — which
+        // loader and mutation referential integrity make unreachable. The
+        // rerun is deliberate defense-in-depth for out-of-band writes or
+        // historical stores, and is intentionally untested: no fixture can
+        // produce a dangling edge through the supported write paths.
+        if stopped_early && wide.num_rows() < cap {
+            tracing::debug!(
+                target: "omnigraph::traverse",
+                edge = %edge_type,
+                rows = wide.num_rows(),
+                cap,
+                "capped expand under-filled after hydration; re-running uncapped",
+            );
+            *wide = original;
+            execute_expand_dispatch(
+                wide,
+                graph_index,
+                snapshot,
+                catalog,
+                src_var,
+                dst_var,
+                edge_type,
+                direction,
+                dst_type,
+                min_hops,
+                max_hops,
+                dst_filters,
+                edge_binding,
+                params,
+                None,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    execute_expand_dispatch(
+        wide,
+        graph_index,
+        snapshot,
+        catalog,
+        src_var,
+        dst_var,
+        edge_type,
+        direction,
+        dst_type,
+        min_hops,
+        max_hops,
+        dst_filters,
+        edge_binding,
+        params,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The mode-dispatch half of Expand execution: pick the starting strategy,
+/// then hand off to the shared BFS core. Returns whether the core stopped
+/// early on `emit_cap`.
+#[allow(clippy::too_many_arguments)]
+async fn execute_expand_dispatch(
+    wide: &mut RecordBatch,
+    graph_index: &GraphIndexHandle<'_>,
+    snapshot: &Snapshot,
+    catalog: &Catalog,
+    src_var: &str,
+    dst_var: &str,
+    edge_type: &str,
+    direction: Direction,
+    dst_type: &str,
+    min_hops: u32,
+    max_hops: Option<u32>,
+    dst_filters: &[IRFilter],
+    edge_binding: Option<&str>,
+    params: &ParamMap,
+    emit_cap: Option<usize>,
+) -> Result<bool> {
     let frontier_rows = wide.num_rows();
     let effective_max_hops = max_hops.unwrap_or(min_hops.max(1));
     let (key_col, _) = endpoint_columns(direction);
@@ -1647,7 +2579,7 @@ async fn execute_expand(
     // does not apply.
     if let Some(binding) = edge_binding {
         let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
-        return execute_expand_bound(
+        execute_expand_bound(
             wide,
             snapshot,
             catalog,
@@ -1661,7 +2593,8 @@ async fn execute_expand(
             params,
             edge_ds,
         )
-        .await;
+        .await?;
+        return Ok(false);
     }
 
     // Cardinality-first preliminary decision (no IO). The override wins; else the
@@ -1701,12 +2634,10 @@ async fn execute_expand(
             mode = "csr",
             "expand mode chosen",
         );
-        let gi = graph_index.get().await?.ok_or_else(|| {
-            OmniError::manifest("graph index required for CSR traversal".to_string())
-        })?;
-        return execute_expand_csr(
+        crate::instrumentation::record_expand_path(false);
+        return execute_expand_bfs(
             wide,
-            gi,
+            graph_index,
             snapshot,
             catalog,
             src_var,
@@ -1718,6 +2649,9 @@ async fn execute_expand(
             max_hops,
             dst_filters,
             params,
+            None,
+            HopPolicy::Off,
+            emit_cap,
         )
         .await;
     }
@@ -1761,12 +2695,10 @@ async fn execute_expand(
                     reason = "index coverage degraded",
                     "expand mode chosen",
                 );
-                let gi = graph_index.get().await?.ok_or_else(|| {
-                    OmniError::manifest("graph index required for CSR traversal".to_string())
-                })?;
-                return execute_expand_csr(
+                crate::instrumentation::record_expand_path(false);
+                return execute_expand_bfs(
                     wide,
-                    gi,
+                    graph_index,
                     snapshot,
                     catalog,
                     src_var,
@@ -1778,6 +2710,9 @@ async fn execute_expand(
                     max_hops,
                     dst_filters,
                     params,
+                    None,
+                    HopPolicy::Off,
+                    emit_cap,
                 )
                 .await;
             }
@@ -1792,10 +2727,33 @@ async fn execute_expand(
         mode = "indexed",
         "expand mode chosen",
     );
+    crate::instrumentation::record_expand_path(true);
     // Surface the C6 silent scalar-index fallback once, now that coverage is known.
     warn_on_degraded_coverage(&coverage, key_col, edge_type);
-    execute_expand_indexed(
+    // Per-hop re-decision policy (issue #533): a forced mode is a contract and
+    // never switches; the cost model re-decides per hop with observed frontier
+    // cardinality; absent manifest counts, the hard frontier ceiling still
+    // becomes an execution bound instead of a dispatch-only gate.
+    let hop_policy = if forced.is_some() {
+        HopPolicy::Off
+    } else {
+        match gather_cost_inputs(
+            snapshot,
+            catalog,
+            edge_type,
+            direction,
+            frontier_rows,
+            effective_max_hops,
+            coverage_for_decision(&coverage),
+            graph_index.is_built(),
+        ) {
+            Some(inputs) => HopPolicy::Full(inputs),
+            None => HopPolicy::CapOnly,
+        }
+    };
+    execute_expand_bfs(
         wide,
+        graph_index,
         snapshot,
         catalog,
         src_var,
@@ -1807,7 +2765,9 @@ async fn execute_expand(
         max_hops,
         dst_filters,
         params,
-        edge_ds,
+        Some(edge_ds),
+        hop_policy,
+        emit_cap,
     )
     .await
 }
@@ -2016,14 +2976,118 @@ async fn execute_expand_bound(
     .await
 }
 
-/// BTREE-indexed graph traversal: per hop, batch the current frontier into one
-/// `scan_edges_by_endpoint` call against the persisted src/dst index, then fan
-/// out per source row. Cost scales with the frontier, not |E|. Produces the
-/// same `(src_row, dst_id)` pairs as the CSR path and shares its hydrate+align
-/// tail. Multi-hop only advances for same-type edges; cross-type frontiers go
-/// empty after one hop (no edges key off the destination type), matching CSR.
-async fn execute_expand_indexed(
+/// Where the shared BFS core reads each hop's neighbors from. The two sources
+/// are the same two execution strategies the dispatcher chooses between; the
+/// core can swap Indexed → Csr BETWEEN hops (issue #533), carrying its BFS
+/// state across the swap instead of restarting.
+///
+/// Id spaces differ per source: Indexed owns a per-traversal interner (both
+/// endpoint types in ONE dense space — see the cross-type single-hop guard in
+/// `execute_expand_bfs`), Csr borrows the graph index's per-type dictionaries.
+/// A swap therefore translates all live state through the id strings once.
+enum ActiveExpandSource<'g> {
+    // Boxed: the indexed state (dataset handle + interner + per-hop map) is
+    // hundreds of bytes against Csr's four refs, and exactly one instance
+    // lives per expand.
+    Indexed(Box<IndexedExpandSource>),
+    Csr {
+        adj: &'g crate::graph_index::CsrIndex,
+        adj_rev: Option<&'g crate::graph_index::CsrIndex>,
+        src_idx: &'g crate::graph_index::TypeIndex,
+        dst_idx: &'g crate::graph_index::TypeIndex,
+    },
+}
+
+struct IndexedExpandSource {
+    edge_ds: Dataset,
+    interner: crate::graph_index::TypeIndex,
+    /// This hop's dense key -> dense neighbors (scan order; duplicates
+    /// preserved, like CSR multi-edges). Rebuilt per hop.
+    neighbor_map: HashMap<u32, Vec<u32>>,
+}
+
+/// Per-hop re-decision policy for a traversal that started on the indexed
+/// path. `Off` for forced modes and CSR starts; `CapOnly` when manifest counts
+/// were unavailable at dispatch (the legacy-ceiling fallback still deserves an
+/// execution bound); `Full` re-runs the cost comparison with observed growth.
+enum HopPolicy {
+    Off,
+    CapOnly,
+    Full(ExpandCostInputs),
+}
+
+/// Resolve the CSR-side borrows for one edge type + direction from a built
+/// graph index (shared by the CSR start and the mid-traversal switch).
+fn resolve_csr_source<'g>(
+    gi: &'g GraphIndex,
+    edge_def: &omnigraph_compiler::catalog::EdgeType,
+    edge_type: &str,
+    direction: Direction,
+) -> Result<ActiveExpandSource<'g>> {
+    let (src_type_name, dst_type_name) = match direction {
+        Direction::Out => (&edge_def.from_type, &edge_def.to_type),
+        Direction::In => (&edge_def.to_type, &edge_def.from_type),
+        // Both requires from_type == to_type (typecheck T22).
+        Direction::Both => (&edge_def.from_type, &edge_def.from_type),
+    };
+    let src_idx = gi
+        .type_index(src_type_name)
+        .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", src_type_name)))?;
+    let dst_idx = gi
+        .type_index(dst_type_name)
+        .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", dst_type_name)))?;
+    let adj = match direction {
+        Direction::Out | Direction::Both => gi.csr(edge_type),
+        Direction::In => gi.csc(edge_type),
+    }
+    .ok_or_else(|| OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type)))?;
+    // Undirected: additionally walk incoming edges (CSC); the BFS gates below
+    // dedup pairs that exist in both directions and self-loops.
+    let adj_rev = match direction {
+        Direction::Both => Some(gi.csc(edge_type).ok_or_else(|| {
+            OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type))
+        })?),
+        _ => None,
+    };
+    Ok(ActiveExpandSource::Csr {
+        adj,
+        adj_rev,
+        src_idx,
+        dst_idx,
+    })
+}
+
+/// The one Expand BFS, shared by both execution strategies. Per hop it asks
+/// the active source for neighbors — a batched `scan_edges_by_endpoint` per
+/// orientation against the persisted src/dst BTREE (Indexed: cost scales with
+/// the frontier, not |E|), or in-memory adjacency slices (Csr). Emission,
+/// dedup, hop gating, and the hydrate+align tail are identical either way, so
+/// both strategies produce the same `(src_row, dst_id)` pairs by construction.
+///
+/// Multi-hop only advances for same-type edges; a cross-type traversal is
+/// structurally single-hop. The Indexed source enforces that BEFORE scanning:
+/// it interns every endpoint string into ONE dense id space, so a cross-type
+/// id-string collision (a Person and a Company sharing an id) would otherwise
+/// let hop 2 de-intern a destination id back to the colliding source-type id
+/// and match its edges, emitting rows the CSR source never produces.
+///
+/// Issue #533 lives here: `hop_policy` is consulted at the top of every
+/// indexed hop after the first with the OBSERVED union frontier, and a
+/// traversal that has outgrown the indexed path swaps to CSR mid-flight,
+/// translating frontier/visited/seen state through the id strings once. Every
+/// emitted destination so far is an edge endpoint, so it exists in the CSR
+/// dictionaries — nothing is lost in translation; a frontier or visited entry
+/// absent from the CSR dictionary has no edges at all and is dropped as
+/// unreachable.
+///
+/// `emit_cap` bounds the number of emitted `(src_row, dst)` pairs; the loop
+/// stops as soon as the cap is reached (limit pushdown — the caller only
+/// engages it when result rows and emitted pairs are 1:1). Returns whether
+/// the traversal stopped early on that cap.
+#[allow(clippy::too_many_arguments)]
+async fn execute_expand_bfs(
     wide: &mut RecordBatch,
+    graph_index: &GraphIndexHandle<'_>,
     snapshot: &Snapshot,
     catalog: &Catalog,
     src_var: &str,
@@ -2035,8 +3099,10 @@ async fn execute_expand_indexed(
     max_hops: Option<u32>,
     dst_filters: &[IRFilter],
     params: &ParamMap,
-    edge_ds: Dataset,
-) -> Result<()> {
+    start_indexed: Option<Dataset>,
+    hop_policy: HopPolicy,
+    emit_cap: Option<usize>,
+) -> Result<bool> {
     let src_id_col_name = format!("{}.id", src_var);
     let src_ids = wide
         .column_by_name(&src_id_col_name)
@@ -2053,48 +3119,71 @@ async fn execute_expand_indexed(
         .get(edge_type)
         .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_type)))?;
     let same_type = edge_def.from_type == edge_def.to_type;
-    // The keyed/opposite endpoint columns for this direction. The edge dataset
-    // and the C6 coverage warn are owned by the caller (`execute_expand`), which
-    // opens the dataset once and threads it in.
     let probes = endpoint_probes(direction);
 
     let max = max_hops.unwrap_or(min_hops.max(1));
-    // Cross-type edges cannot chain (a Company is not a `WorksAt` source), so a
-    // variable-length traversal over one is structurally single-hop. Enforce it
-    // here instead of relying on the hop-2 scan returning empty: this BFS interns
-    // every endpoint string into ONE dense id space, so a cross-type id-string
-    // collision (a Person and a Company sharing an id) would otherwise let hop 2
-    // de-intern a destination id back to the colliding source-type id and match
-    // its edges, emitting rows the CSR path never produces.
+    // Cross-type edges cannot chain (a Company is not a `WorksAt` source): see
+    // the doc comment for why the Indexed source must enforce this before the
+    // hop-2 scan rather than relying on it returning empty.
     let max = if same_type { max } else { max.min(1) };
 
-    // Per-source BFS state in DENSE id space: intern node ids to u32 once via a
-    // per-traversal interner so visited/seen/frontier/neighbor-map avoid string
-    // hashing + cloning in the hot loop (mirrors the CSR path's TypeIndex). The
-    // GraphIndex/CSR is NOT built — only a local id↔u32 dictionary. Strings
-    // survive at the substrate edges only: the per-hop IN-list to Lance, and the
-    // emitted dst ids handed to the string-keyed hydrate+align tail.
-    let mut interner = crate::graph_index::TypeIndex::new();
+    // The active neighbor source. Indexed starts own a per-traversal interner
+    // (local id ↔ u32 dictionary — the GraphIndex/CSR is NOT built); CSR
+    // starts borrow the built graph index's dictionaries.
+    let mut active = match start_indexed {
+        Some(edge_ds) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
+            edge_ds,
+            interner: crate::graph_index::TypeIndex::new(),
+            neighbor_map: HashMap::new(),
+        })),
+        None => {
+            let gi = graph_index.get().await?.ok_or_else(|| {
+                OmniError::manifest("graph index required for CSR traversal".to_string())
+            })?;
+            resolve_csr_source(gi, edge_def, edge_type, direction)?
+        }
+    };
+
+    // Per-source BFS state, dense in the ACTIVE source's id space so both
+    // pure paths run exactly as they did before unification; only a
+    // mid-traversal swap pays a one-time translation.
     let n = src_ids.len();
     let mut frontiers: Vec<Vec<u32>> = Vec::with_capacity(n);
     let mut visited: Vec<HashSet<u32>> = Vec::with_capacity(n);
     let mut seen_dst: Vec<HashSet<u32>> = Vec::with_capacity(n);
     for i in 0..n {
-        let sid = interner.get_or_insert(src_ids.value(i));
+        let seed = match &mut active {
+            ActiveExpandSource::Indexed(src) => Some(src.interner.get_or_insert(src_ids.value(i))),
+            // A seed the CSR dictionary has never seen touches no edge; its
+            // BFS is empty (mirrors the old CSR path's `continue`).
+            ActiveExpandSource::Csr { src_idx, .. } => src_idx.to_dense(src_ids.value(i)),
+        };
         let mut v = HashSet::new();
+        // Only track visited in the destination namespace for same-type edges
+        // (to avoid revisiting the source). For cross-type edges, dense indices
+        // are in different namespaces so collision is impossible.
         if same_type {
-            v.insert(sid);
+            if let Some(s) = seed {
+                v.insert(s);
+            }
         }
-        frontiers.push(vec![sid]);
+        frontiers.push(seed.map(|s| vec![s]).unwrap_or_default());
         visited.push(v);
         seen_dst.push(HashSet::new());
     }
 
-    let mut src_indices: Vec<u32> = Vec::new();
-    let mut dst_dense: Vec<u32> = Vec::new();
+    // Emissions carry the destination as a STRING so they survive an id-space
+    // swap unchanged. Allocation-neutral: both old paths stringified every
+    // emitted pair for the hydrate tail anyway, just later.
+    let mut emitted_src: Vec<u32> = Vec::new();
+    let mut emitted_dst: Vec<String> = Vec::new();
+    let cap = emit_cap.unwrap_or(usize::MAX);
+    let mut stopped_early = false;
+    let mut prev_union_len: usize = 0;
 
-    for hop in 1..=max {
-        // Union of all live frontiers (dense), de-interned once for the IN-list.
+    'hops: for hop in 1..=max {
+        // Union of all live frontiers (dense). Needed for the Indexed scan's
+        // IN-list; also the observed cardinality the hop policy re-decides on.
         let mut union_dense: Vec<u32> = Vec::new();
         {
             let mut seen: HashSet<u32> = HashSet::new();
@@ -2109,85 +3198,177 @@ async fn execute_expand_indexed(
         if union_dense.is_empty() {
             break;
         }
-        let union_keys: Vec<String> = union_dense
-            .iter()
-            .map(|&u| {
-                interner
-                    .to_id(u)
-                    .expect("interned frontier id must resolve")
-                    .to_string()
-            })
-            .collect();
 
-        // dense key -> dense neighbors (scan order; duplicates preserved, like
-        // CSR multi-edges). One probe per orientation: Out/In do one pass;
-        // Both merges the src-keyed and dst-keyed scans into one map (the
-        // per-source `seen_dst` gate below dedups pairs present both ways).
-        let mut neighbor_map: HashMap<u32, Vec<u32>> = HashMap::new();
-        for &(key_col, opp_col) in probes {
-            let batches = crate::table_store::TableStore::scan_edges_by_endpoint(
-                &edge_ds,
-                key_col,
-                opp_col,
-                &union_keys,
-            )
-            .await?;
-            for batch in &batches {
-                let keys = batch
-                    .column_by_name(key_col)
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("edge batch missing '{}'", key_col))
-                    })?
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("edge '{}' is not Utf8", key_col))
-                    })?;
-                let opps = batch
-                    .column_by_name(opp_col)
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("edge batch missing '{}'", opp_col))
-                    })?
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("edge '{}' is not Utf8", opp_col))
-                    })?;
-                for r in 0..batch.num_rows() {
-                    let k = interner.get_or_insert(keys.value(r));
-                    let o = interner.get_or_insert(opps.value(r));
-                    neighbor_map.entry(k).or_default().push(o);
+        // Issue #533: re-decide the mode with the OBSERVED frontier before
+        // paying this hop's indexed scan. Hop 1's frontier is what dispatch
+        // already decided on; later hops are what dispatch could never see.
+        if hop > 1 && matches!(active, ActiveExpandSource::Indexed(_)) {
+            let switch = match &hop_policy {
+                HopPolicy::Off => false,
+                HopPolicy::CapOnly => union_dense.len() > expand_indexed_max_frontier(),
+                HopPolicy::Full(inputs) => should_switch_to_csr(
+                    union_dense.len(),
+                    prev_union_len,
+                    max - hop + 1,
+                    graph_index.is_built(),
+                    inputs,
+                ),
+            };
+            if switch {
+                crate::instrumentation::record_traversal_mid_switch();
+                crate::instrumentation::record_expand_path(false);
+                let gi = graph_index.get().await?.ok_or_else(|| {
+                    OmniError::manifest("graph index required for CSR traversal".to_string())
+                })?;
+                let csr_source = resolve_csr_source(gi, edge_def, edge_type, direction)?;
+                let old = std::mem::replace(&mut active, csr_source);
+                let ActiveExpandSource::Indexed(old_src) = old else {
+                    unreachable!("switch only fires while the Indexed source is active");
+                };
+                let interner = old_src.interner;
+                let ActiveExpandSource::Csr {
+                    src_idx, dst_idx, ..
+                } = &active
+                else {
+                    unreachable!("active source was just replaced with Csr");
+                };
+                // Translate all live state through the id strings once. An
+                // entry the CSR dictionary lacks has no edges: droppable from
+                // a frontier (expands to nothing) and from visited/seen (it
+                // cannot be reached again through adjacency).
+                let translate_set =
+                    |set: &HashSet<u32>, idx: &crate::graph_index::TypeIndex| -> HashSet<u32> {
+                        set.iter()
+                            .filter_map(|&d| interner.to_id(d).and_then(|id| idx.to_dense(id)))
+                            .collect()
+                    };
+                for i in 0..n {
+                    frontiers[i] = frontiers[i]
+                        .iter()
+                        .filter_map(|&d| interner.to_id(d).and_then(|id| src_idx.to_dense(id)))
+                        .collect();
+                    visited[i] = translate_set(&visited[i], src_idx);
+                    seen_dst[i] = translate_set(&seen_dst[i], dst_idx);
+                }
+                tracing::debug!(
+                    target: "omnigraph::traverse",
+                    edge = %edge_type,
+                    hop,
+                    frontier = union_dense.len(),
+                    mode = "csr",
+                    reason = "frontier outgrew the indexed path",
+                    "expand mode switched mid-traversal",
+                );
+            }
+        }
+        prev_union_len = union_dense.len();
+
+        // Indexed source: one batched BTREE scan per orientation for this
+        // hop's union frontier (Both merges both orientations into one map;
+        // the per-source `seen_dst` gate dedups pairs present both ways).
+        if let ActiveExpandSource::Indexed(src) = &mut active {
+            src.neighbor_map.clear();
+            let union_keys: Vec<String> = union_dense
+                .iter()
+                .map(|&u| {
+                    src.interner
+                        .to_id(u)
+                        .expect("interned frontier id must resolve")
+                        .to_string()
+                })
+                .collect();
+            for &(key_col, opp_col) in probes {
+                let batches = crate::table_store::TableStore::scan_edges_by_endpoint(
+                    &src.edge_ds,
+                    key_col,
+                    opp_col,
+                    &union_keys,
+                )
+                .await?;
+                for batch in &batches {
+                    let keys = batch
+                        .column_by_name(key_col)
+                        .ok_or_else(|| {
+                            OmniError::manifest(format!("edge batch missing '{}'", key_col))
+                        })?
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            OmniError::manifest(format!("edge '{}' is not Utf8", key_col))
+                        })?;
+                    let opps = batch
+                        .column_by_name(opp_col)
+                        .ok_or_else(|| {
+                            OmniError::manifest(format!("edge batch missing '{}'", opp_col))
+                        })?
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            OmniError::manifest(format!("edge '{}' is not Utf8", opp_col))
+                        })?;
+                    for r in 0..batch.num_rows() {
+                        let k = src.interner.get_or_insert(keys.value(r));
+                        let o = src.interner.get_or_insert(opps.value(r));
+                        src.neighbor_map.entry(k).or_default().push(o);
+                    }
                 }
             }
         }
 
-        // Advance each source row's frontier independently (dense ids).
+        // Advance each source row's frontier independently (dense ids). A
+        // self-edge is admitted only at hop 1, where the frontier is exactly
+        // the seed (seeded above): the seed's own loop, which the `visited`
+        // pre-mark would otherwise drop. Later it is a cycle return to a
+        // shorter distance. Same-type only: cross-type dense ids differ.
         for i in 0..n {
             let cur = std::mem::take(&mut frontiers[i]);
             let mut next: Vec<u32> = Vec::new();
             for &node in &cur {
-                let Some(neighbors) = neighbor_map.get(&node) else {
-                    continue;
+                let (fwd, rev): (&[u32], &[u32]) = match &active {
+                    ActiveExpandSource::Indexed(src) => (
+                        src.neighbor_map
+                            .get(&node)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                        &[],
+                    ),
+                    ActiveExpandSource::Csr { adj, adj_rev, .. } => (
+                        adj.neighbors(node),
+                        adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]),
+                    ),
                 };
-                for &neighbor in neighbors {
-                    // A self-edge is a valid destination that reaches nothing
-                    // new: emit it without entering the frontier, so the
-                    // seeded-source `visited` pre-mark prunes only multi-hop
-                    // cycle returns. Same-type only: this path interns both
-                    // endpoint types into one dense space, so a cross-type id
-                    // collision could alias node == neighbor.
-                    if same_type && neighbor == node {
-                        if hop >= min_hops && seen_dst[i].insert(neighbor) {
-                            src_indices.push(i as u32);
-                            dst_dense.push(neighbor);
-                        }
+                for &neighbor in fwd.iter().chain(rev) {
+                    let is_self = same_type && hop == 1 && neighbor == node;
+                    if !is_self && same_type && !visited[i].insert(neighbor) {
                         continue;
                     }
-                    if !same_type || visited[i].insert(neighbor) {
+                    if !is_self {
                         next.push(neighbor);
-                        if hop >= min_hops && seen_dst[i].insert(neighbor) {
-                            src_indices.push(i as u32);
-                            dst_dense.push(neighbor);
+                    }
+                    if hop >= min_hops && seen_dst[i].insert(neighbor) {
+                        let dst_id = match &active {
+                            ActiveExpandSource::Indexed(src) => Some(
+                                src.interner
+                                    .to_id(neighbor)
+                                    .expect("interned dst id must resolve")
+                                    .to_string(),
+                            ),
+                            // Dense ids from adjacency always resolve; drop
+                            // defensively rather than panic (mirrors the old
+                            // CSR tail).
+                            ActiveExpandSource::Csr { dst_idx, .. } => {
+                                dst_idx.to_id(neighbor).map(str::to_string)
+                            }
+                        };
+                        if let Some(dst_id) = dst_id {
+                            emitted_src.push(i as u32);
+                            emitted_dst.push(dst_id);
+                            if emitted_src.len() >= cap {
+                                stopped_early = true;
+                                crate::instrumentation::record_expand_cap_stop();
+                                frontiers[i] = next;
+                                break 'hops;
+                            }
                         }
                     }
                 }
@@ -2196,22 +3377,10 @@ async fn execute_expand_indexed(
         }
     }
 
-    // De-intern emitted destination ids (parallel to src_indices) for the
-    // string-keyed hydrate+align tail, exactly as the CSR path does.
-    let dst_ids: Vec<String> = dst_dense
-        .iter()
-        .map(|&d| {
-            interner
-                .to_id(d)
-                .expect("interned dst id must resolve")
-                .to_string()
-        })
-        .collect();
-
     expand_hydrate_and_align(
         wide,
-        src_indices,
-        dst_ids,
+        emitted_src,
+        emitted_dst,
         snapshot,
         catalog,
         dst_type,
@@ -2220,7 +3389,8 @@ async fn execute_expand_indexed(
         params,
         None,
     )
-    .await
+    .await?;
+    Ok(stopped_early)
 }
 
 /// Shared tail for all Expand modes: hydrate the unique destination ids, align
@@ -2313,167 +3483,33 @@ async fn expand_hydrate_and_align(
     Ok(())
 }
 
-/// CSR-backed graph traversal: BFS over the in-memory adjacency index. Used for
-/// dense / whole-graph traversals; selective traversals use
-/// `execute_expand_indexed`. Both share `expand_hydrate_and_align`.
-async fn execute_expand_csr(
-    wide: &mut RecordBatch,
-    graph_index: &GraphIndex,
-    snapshot: &Snapshot,
-    catalog: &Catalog,
-    src_var: &str,
-    dst_var: &str,
-    edge_type: &str,
-    direction: Direction,
-    dst_type: &str,
-    min_hops: u32,
-    max_hops: Option<u32>,
-    dst_filters: &[IRFilter],
-    params: &ParamMap,
-) -> Result<()> {
-    let src_id_col_name = format!("{}.id", src_var);
-    let src_ids = wide
-        .column_by_name(&src_id_col_name)
-        .ok_or_else(|| {
-            OmniError::manifest(format!("wide batch missing '{}' column", src_id_col_name))
-        })?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest(format!("'{}' column is not Utf8", src_id_col_name)))?
-        .clone();
-
-    // Determine which type index to use for source and destination
-    let edge_def = catalog
-        .edge_types
-        .get(edge_type)
-        .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_type)))?;
-
-    let (src_type_name, dst_type_name) = match direction {
-        Direction::Out => (&edge_def.from_type, &edge_def.to_type),
-        Direction::In => (&edge_def.to_type, &edge_def.from_type),
-        // Both requires from_type == to_type (typecheck T22).
-        Direction::Both => (&edge_def.from_type, &edge_def.from_type),
-    };
-
-    let src_type_idx = graph_index
-        .type_index(src_type_name)
-        .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", src_type_name)))?;
-    let dst_type_idx = graph_index
-        .type_index(dst_type_name)
-        .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", dst_type_name)))?;
-
-    let adj = match direction {
-        Direction::Out | Direction::Both => graph_index.csr(edge_type),
-        Direction::In => graph_index.csc(edge_type),
-    }
-    .ok_or_else(|| OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type)))?;
-    // Undirected: additionally walk incoming edges (CSC); the BFS gates below
-    // dedup pairs that exist in both directions and self-loops.
-    let adj_rev = match direction {
-        Direction::Both => Some(graph_index.csc(edge_type).ok_or_else(|| {
-            OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type))
-        })?),
-        _ => None,
-    };
-
-    let max = max_hops.unwrap_or(min_hops.max(1));
-
-    let same_type = src_type_name == dst_type_name;
-    // Cross-type edges cannot chain; a variable-length traversal over one is
-    // structurally single-hop (mirrors the indexed path's guarantee).
-    let max = if same_type { max } else { max.min(1) };
-
-    // BFS to collect (src_row_idx, dst_dense) pairs with per-source dedup.
-    // Dense u32 ids stay in hand through BFS, dedup, and align — we only
-    // stringify the unique set for Lance's SQL IN-list.
-    let mut src_indices: Vec<u32> = Vec::new();
-    let mut dst_dense_list: Vec<u32> = Vec::new();
-    for i in 0..src_ids.len() {
-        let src_id = src_ids.value(i);
-        let Some(src_dense) = src_type_idx.to_dense(src_id) else {
-            continue;
-        };
-
-        // BFS with hop tracking
-        let mut frontier: Vec<u32> = vec![src_dense];
-        let mut visited: HashSet<u32> = HashSet::new();
-        let mut seen_dst_dense: HashSet<u32> = HashSet::new();
-        // Only track visited in the destination namespace for same-type edges
-        // (to avoid revisiting the source). For cross-type edges, dense indices
-        // are in different namespaces so collision is impossible.
-        if same_type {
-            visited.insert(src_dense);
-        }
-
-        for hop in 1..=max {
-            let mut next_frontier = Vec::new();
-            for &node in &frontier {
-                let rev: &[u32] = adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]);
-                for &neighbor in adj.neighbors(node).iter().chain(rev) {
-                    // Self-edge: emit without entering the frontier — same
-                    // contract as execute_expand_indexed. Same-type only:
-                    // cross-type dense ids live in different TypeIndex
-                    // namespaces, where node == neighbor is meaningless.
-                    if same_type && neighbor == node {
-                        if hop >= min_hops && seen_dst_dense.insert(neighbor) {
-                            src_indices.push(i as u32);
-                            dst_dense_list.push(neighbor);
-                        }
-                        continue;
-                    }
-                    if !same_type || visited.insert(neighbor) {
-                        next_frontier.push(neighbor);
-                        if hop >= min_hops && seen_dst_dense.insert(neighbor) {
-                            src_indices.push(i as u32);
-                            dst_dense_list.push(neighbor);
-                        }
-                    }
-                }
-            }
-            frontier = next_frontier;
-            if frontier.is_empty() {
-                break;
-            }
-        }
-    }
-
-    // Map BFS-produced dense destination ids to string ids for the shared
-    // hydrate+align tail. Dense ids always resolve (they came from the index);
-    // drop any that don't, keeping the (src, dst) arrays parallel.
-    let mut tail_src_indices: Vec<u32> = Vec::with_capacity(src_indices.len());
-    let mut dst_ids: Vec<String> = Vec::with_capacity(dst_dense_list.len());
-    for (&s, &d) in src_indices.iter().zip(dst_dense_list.iter()) {
-        if let Some(id) = dst_type_idx.to_id(d) {
-            tail_src_indices.push(s);
-            dst_ids.push(id.to_string());
-        }
-    }
-
-    expand_hydrate_and_align(
-        wide,
-        tail_src_indices,
-        dst_ids,
-        snapshot,
-        catalog,
-        dst_type,
-        dst_var,
-        dst_filters,
-        params,
-        None,
-    )
-    .await
+/// `id IN (ids)` as one structured DataFusion `Expr` — the scan-pushdown
+/// shape shared by `hydrate_nodes` and the rrf prefilter gate's arm push.
+/// The structured form routes the IN-list through the `id` BTREE scalar
+/// index (index-search → take) rather than evaluating a string filter via
+/// DataFusion `InListEval`, which is O(N×M) and was measured at 72× the
+/// indexed cost on a 100k-node hop.
+///
+/// Likely future mechanism: Lance 11 grew
+/// `Scanner::with_row_addr_prefilter(RowAddrMask)` — the caller hands the
+/// scanner a precomputed row-address set directly, composing with FTS and
+/// ANN, instead of an expression Lance must evaluate (BTREE probe per id,
+/// re-done every query). Worth revisiting if the id→row-addr probe or the
+/// gate's id-count cap (`DEFAULT_RRF_GATE_MAX_IDS`, set where in-list
+/// evaluation starts losing) ever shows up as the bottleneck: a mask built
+/// from a cached id→addr mapping would lift both.
+fn id_in_list_expr(ids: &[String]) -> datafusion::prelude::Expr {
+    use datafusion::prelude::{col, lit};
+    let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
+    col("id").in_list(id_list, false)
 }
 
 /// Load full node rows for a set of IDs from a snapshot.
 ///
-/// The `id IN (...)` predicate is built as a structured DataFusion `Expr` and
-/// AND'd with any pushable `dst_filters` (destination-binding filters), then
-/// applied via `Scanner::filter_expr`. The structured form routes the id
-/// IN-list through the `id` BTREE scalar index (index-search → take) rather
-/// than evaluating a string filter via DataFusion `InListEval`, which is
-/// O(N×M) and was measured at 72× the indexed cost on a 100k-node hop
-/// (MR-376). Non-pushable `dst_filters` (`ir_filter_to_expr` → None) are
-/// applied in memory by the caller after hydration.
+/// The `id IN (...)` predicate (`id_in_list_expr`) is AND'd with any
+/// pushable `dst_filters` (destination-binding filters), then applied via
+/// `Scanner::filter_expr`. Non-pushable `dst_filters` (`ir_filter_to_expr`
+/// → None) are applied in memory by the caller after hydration.
 async fn hydrate_nodes(
     snapshot: &Snapshot,
     catalog: &Catalog,
@@ -2482,8 +3518,6 @@ async fn hydrate_nodes(
     dst_filters: &[IRFilter],
     params: &ParamMap,
 ) -> Result<RecordBatch> {
-    use datafusion::prelude::{col, lit};
-
     let node_type = catalog
         .node_types
         .get(type_name)
@@ -2497,8 +3531,7 @@ async fn hydrate_nodes(
     let ds = snapshot.open_lance_dataset(&table_key).await?;
 
     // `id IN (ids)` AND any pushable destination filters, as a structured Expr.
-    let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
-    let mut filter_expr = col("id").in_list(id_list, false);
+    let mut filter_expr = id_in_list_expr(ids);
     if let Some(dst_expr) =
         build_lance_filter_expr(dst_filters, params, Some(&node_type.arrow_schema))
     {
@@ -2708,6 +3741,7 @@ async fn execute_anti_join(
         catalog,
         &mut inner_wide,
         &no_search,
+        None,
         needed_columns,
     )
     .await?;
@@ -2771,7 +3805,22 @@ async fn execute_node_scan(
     // coerce literals to each column's exact type so narrow-numeric BTREEs are
     // used. Other call sites that still take string SQL (count_rows, the
     // mutation delete path) migrate in follow-up MRs.
-    let filter_expr = build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
+    let mut filter_expr = build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
+
+    // The rrf prefilter gate's selective plan: AND the traversal's
+    // eligible-id set into this bm25 arm's scan — `hydrate_nodes`' proven
+    // `id IN (...)` shape, routed through the `id` BTREE, ranked under
+    // `prefilter(true)` (armed below by the filter's presence). The set is a
+    // superset of the traversal's survivors and the arm stays uncapped, so
+    // this changes cost, never the fused answer (up to BM25 score ties; the
+    // gate's coverage fence keeps scores index-global).
+    if let Some(eligible_ids) = search_mode.bm25_eligible_ids_for(variable) {
+        let in_list = id_in_list_expr(eligible_ids);
+        filter_expr = Some(match filter_expr {
+            Some(expr) => expr.and(in_list),
+            None => in_list,
+        });
+    }
 
     // Blob columns must be excluded from scan when a filter is present
     // (Lance bug: BlobsDescriptions + filter triggers a projection assertion).
@@ -2866,6 +3915,17 @@ async fn execute_node_scan(
                     scanner
                         .nearest(prop, &query_arr, k)
                         .map_err(|error| OmniError::storage_context("nearest", error))?;
+                    // Keep Lance's adaptive minimum (one payload partition by
+                    // default) but clamp its centroid-distance heuristic. On
+                    // high-dimensional data that heuristic can otherwise
+                    // promote the minimum to every IVF partition.
+                    let budget = search_mode
+                        .ann_probe_budget
+                        .unwrap_or_else(|| AnnProbeBudget::bounded(ann_nprobes()));
+                    if let Some(maximum) = budget.maximum {
+                        scanner.maximum_nprobes(maximum);
+                    }
+                    crate::instrumentation::record_ann_probe_budget(budget.maximum);
                     // Lance 11's late payload `LanceRead` drops the sorted
                     // candidate stream's ordering metadata. With more than
                     // one output partition, execute_plan may therefore use a
@@ -3315,10 +4375,34 @@ fn prefix_batch(batch: &RecordBatch, variable: &str) -> Result<RecordBatch> {
     RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(OmniError::arrow_internal)
 }
 
+/// A column name present on both sides would let `column_by_name` silently
+/// pick the left one (Arrow admits duplicate field names). The compiler's
+/// plan check keeps this unreachable for lowered plans; this is the last
+/// line, in every build (#605).
+fn refuse_duplicate_columns(left: &RecordBatch, right: &RecordBatch) -> Result<()> {
+    let left_schema = left.schema();
+    let left_names: HashSet<&str> = left_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let right_schema = right.schema();
+    for f in right_schema.fields() {
+        if left_names.contains(f.name().as_str()) {
+            return Err(OmniError::manifest_internal(format!(
+                "duplicate column '{}' when joining batches",
+                f.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn cross_join_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatch> {
     let n = left.num_rows();
     let m = right.num_rows();
     if n == 0 || m == 0 {
+        refuse_duplicate_columns(left, right)?;
         let mut fields: Vec<Field> = left
             .schema()
             .fields()
@@ -3344,22 +4428,10 @@ fn hconcat_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatc
         .iter()
         .map(|f| f.as_ref().clone())
         .collect();
-    if cfg!(debug_assertions) {
-        let left_schema = left.schema();
-        let left_names: HashSet<&str> = left_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        let right_schema = right.schema();
-        for f in right_schema.fields() {
-            debug_assert!(
-                !left_names.contains(f.name().as_str()),
-                "hconcat_batches: duplicate column '{}'",
-                f.name()
-            );
-        }
-    }
+    // Arrow allows duplicate field names and `column_by_name` returns the
+    // first match, so a duplicate here would silently shadow a column; the
+    // refusal holds in every build (#605).
+    refuse_duplicate_columns(left, right)?;
     fields.extend(right.schema().fields().iter().map(|f| f.as_ref().clone()));
     let mut columns: Vec<ArrayRef> = left.columns().to_vec();
     columns.extend(right.columns().to_vec());
@@ -3374,6 +4446,43 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch>
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(OmniError::arrow_internal)?;
     RecordBatch::try_new(batch.schema(), columns).map_err(OmniError::arrow_internal)
+}
+
+#[cfg(test)]
+mod ann_probe_budget_tests {
+    use super::{AnnProbeBudget, DEFAULT_ANN_NPROBES, SearchMode, ann_nprobes_from};
+
+    #[test]
+    fn missing_value_uses_default_maximum() {
+        assert_eq!(ann_nprobes_from(None), DEFAULT_ANN_NPROBES);
+    }
+
+    #[test]
+    fn positive_value_is_used_as_configured() {
+        assert_eq!(ann_nprobes_from(Some("7")), 7);
+    }
+
+    #[test]
+    fn zero_and_invalid_values_use_default() {
+        for value in [Some("0"), Some("not-a-number"), Some("")] {
+            assert_eq!(ann_nprobes_from(value), DEFAULT_ANN_NPROBES);
+        }
+    }
+
+    #[test]
+    fn uncapped_retry_clears_only_the_maximum() {
+        let mode = SearchMode {
+            nearest: Some(("d".into(), "embedding".into(), vec![0.0], 10)),
+            ann_probe_budget: Some(AnnProbeBudget::bounded(7)),
+            ..Default::default()
+        };
+
+        let retry = mode.to_uncapped();
+        assert_eq!(
+            retry.ann_probe_budget,
+            Some(AnnProbeBudget { maximum: None })
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3399,7 +4508,79 @@ mod expand_chooser_tests {
             max_frontier_cap: 1024,
             coverage,
             csr_cached: false,
+            probe_factor: 1.0,
         }
+    }
+
+    #[test]
+    fn undirected_probe_factor_doubles_indexed_cost() {
+        // A directed traversal just under the crossover stays indexed (1 hop ×
+        // frontier 100 × fanout 10 = 1,000 < 1.5·|E| = 1,500); the SAME
+        // cardinalities traversed undirected pay both endpoint probes per hop
+        // (2,000 > 1,500) and flip to CSR. Guards against pricing an
+        // undirected traversal at half its probe count.
+        let mut i = inputs(100, 1_000, 100, 1, IndexCoverage::Indexed);
+        assert_eq!(choose_expand_mode(&i), ExpandMode::IndexedScan);
+        i.probe_factor = 2.0;
+        assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
+    }
+
+    #[test]
+    fn hop_policy_switches_on_observed_frontier_over_cap() {
+        // The hard ceiling becomes an execution bound: observed 2000 > 1024
+        // switches regardless of the cost estimate.
+        let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
+        assert!(should_switch_to_csr(2000, 100, 2, false, &i));
+    }
+
+    #[test]
+    fn hop_policy_switches_on_projected_growth() {
+        // The #533 shape at IMDb scale: an UNDIRECTED traversal (probe factor
+        // 2, like `<coStarredWith>`), fanout ≈ 6.5, observed hop-2 frontier 238
+        // growing from 1. Observed growth 238× saturates the projection at |V|
+        // within a hop; the remaining 3 hops (~2×2.9M units) dwarf the CSR
+        // build (~3.75M) — the switch fires at hop 2, one hop before the hard
+        // ceiling would catch it. (The directed variant stays under the build
+        // cost at hop 2 and is caught by the ceiling at hop 3 instead —
+        // layered, both covered below.)
+        let mut i = inputs(1, 2_500_000, 388_000, 4, IndexCoverage::Indexed);
+        i.probe_factor = 2.0;
+        assert!(should_switch_to_csr(238, 1, 3, false, &i));
+
+        // Directed at hop 2: projection (~2.9M) is under the build cost — no
+        // switch yet…
+        i.probe_factor = 1.0;
+        assert!(!should_switch_to_csr(238, 1, 3, false, &i));
+        // …but hop 3's observed frontier (5,418) crosses the 1024 ceiling,
+        // which the policy enforces as an execution bound.
+        assert!(should_switch_to_csr(5_418, 238, 2, false, &i));
+    }
+
+    #[test]
+    fn hop_policy_keeps_genuinely_selective_traversals_indexed() {
+        // A frontier that stays tiny relative to |V| never switches: observed
+        // growth ~2× on a 1M-node graph, 2 remaining hops, ~thousands of
+        // scans vs a 15M-unit build.
+        let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
+        assert!(!should_switch_to_csr(40, 20, 2, false, &i));
+    }
+
+    #[test]
+    fn hop_policy_switches_cheaply_onto_a_warm_csr() {
+        // With the CSR already built this query, any nonzero remaining indexed
+        // work loses to ~free reuse.
+        let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
+        assert!(should_switch_to_csr(40, 20, 2, true, &i));
+    }
+
+    #[test]
+    fn hop_policy_growth_projection_saturates_at_source_count() {
+        // Explosive observed growth must not project past |V_src|: with
+        // saturation the 3-hop estimate is ~3·|V|·fanout; the switch verdict
+        // holds but the estimate stays finite and comparable.
+        let i = inputs(1, 1_000_000, 1_000, 4, IndexCoverage::Indexed);
+        // observed 900 from 1 → growth 900×; |V| = 1000 caps each later hop.
+        assert!(should_switch_to_csr(900, 1, 3, false, &i));
     }
 
     #[test]

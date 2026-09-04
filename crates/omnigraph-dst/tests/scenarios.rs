@@ -1719,11 +1719,17 @@ fn dst_sidecar_weather_lost_and_misdirected() {
 #[test]
 #[serial]
 fn dst_stale_sidecar_bricks_recovery() {
+    // Seed re-pinned 103 -> 100 (2026-09-01): the graph-index artifact
+    // write (`__graph_index/csr-current.bin`, write_bytes) now consumes a
+    // fault-plan roll, shifting every seed's fault schedule; seed 103 no
+    // longer strands a stale sidecar. Seed 100 reproduces the pinned
+    // intent (both runs brick with the same OCC refusal); found by the
+    // bounded 100..150 search at these exact parameters.
     let sc = Scenario {
-        seed: 103,
+        seed: 100,
         ops: 30,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 10300,
+            seed: 10000,
             error_pct: 10,
             lose_write_pct: 25,
             ..Default::default()
@@ -1762,11 +1768,16 @@ fn dst_stale_sidecar_bricks_recovery() {
 #[test]
 #[serial]
 fn dst_corrupt_write_first_contact() {
+    // Seed re-pinned 101 -> 112 (2026-09-01), for the same reason as the
+    // stale-sidecar pin above. Seed 112 reproduces the pinned intent
+    // (corrupt writes bite, recovery parses stored garbage, a detection
+    // row is recorded); found by the bounded 100..150 search at these
+    // exact parameters.
     let sc = Scenario {
-        seed: 101,
+        seed: 112,
         ops: 30,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 10100,
+            seed: 11200,
             error_pct: 12,
             corrupt_write_pct: 25,
             ..Default::default()
@@ -2148,6 +2159,50 @@ fn dst_predict_triage() {
         .store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// MILESTONE RE-MERGE pin (nightly 2026-09-01, seed 218120): the milestone
+/// driver's `MergeBranch` step gated only on branch EXISTENCE, bypassing the
+/// merge-and-close invariant (`BranchSlot::merged`) the sampler honors. In
+/// this universe the sampler emits its own merge of the milestone branch
+/// first (the window arm matches it, but the adopt path never crosses the
+/// failpoint site — the merge applies cleanly, zero crashes, `merged` set);
+/// the still-pending milestone step then emitted a SECOND merge of the
+/// merged branch — the shape the model declares unpredictable — and
+/// `predict_merge` mispredicted conflict on the rows the first merge
+/// adopted, while the engine correctly accepts the no-op re-merge. Harness
+/// false alarm, no engine defect. The driver now skips the step as
+/// satisfied; this pins the exact nightly universe green, replay-stable.
+#[cfg(feature = "failpoints")]
+#[test]
+#[serial]
+fn dst_milestone_never_remerges_merged_branch() {
+    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let window = "branch_merge.adopt_between_insert_chunks";
+    let sc = Scenario {
+        seed: 218120,
+        ops: 30,
+        crash_on_match: Some((window, 0)),
+        reach_target: Some(window),
+        wide: omnigraph_dst::harness::window_needs_wide(window),
+        ..Default::default()
+    };
+    let a = run_universe("shared-memory://dst-milestone-remerge-a", &sc);
+    // Sanity only: the milestone branch's rows are on main. The pin's real
+    // teeth is the MergePrediction detector — with the guard reverted this
+    // universe dies at op 9 (red control, task 0094).
+    assert!(
+        a.end_state.iter().any(|(name, _, _)| name == "ms1"),
+        "milestone-remerge pin: the milestone branch's merge must reach main"
+    );
+    // Pin the claimed shape: the window arm matches the first merge but the
+    // failpoint site is never crossed — this universe has zero crashes.
+    assert_eq!(
+        a.crashes, 0,
+        "milestone-remerge pin: the scheduled window must never be hit (merge applies cleanly)"
+    );
+    let b = run_universe("shared-memory://dst-milestone-remerge-b", &sc);
+    omnigraph_dst::harness::assert_strict_replay(&a, &b, "milestone-remerge pin: strict replay");
+}
+
 /// BENCH HARNESS — the COUNTING PASS golden: one standard universe's
 /// storage actions, tallied per op kind and per realm-verb at both
 /// interposition points, compared byte-for-byte against the checked-in
@@ -2170,6 +2225,13 @@ fn dst_predict_triage() {
 /// three schema GETs, plus the unnecessary manifest/index reads (Lance GET
 /// 642 -> 622, LIST 72 -> 71). Lance PUT stays 66 and every other op's counts
 /// stay identical: useful maintenance work and verification are unchanged.
+///
+/// The graph-index artifact (`__graph_index/csr-current.bin`) adds one
+/// Optimize adapter PUT (write_bytes, 2 -> 3); its probes surface as adapter
+/// GETs (`read_bytes_if_exists_bounded` tallies as a.get: Optimize 60 -> 63
+/// plus EXISTS 38 -> 42, _audit 114 -> 116, _verify 564 -> 575) and stamp-fresh
+/// loads shave a few cold-build Lance GETs (_audit 1222 -> 1221,
+/// _verify 2079 -> 2074; Optimize l.get 622 -> 628 from the save-side stamping).
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {

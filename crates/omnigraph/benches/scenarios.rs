@@ -21,6 +21,9 @@
 //!   cargo bench -p omnigraph-engine --bench scenarios -- \
 //!     --scenario nearest-prefilter --rows 100000 --dims 64 --selectivity 0.05
 //!   cargo bench -p omnigraph-engine --bench scenarios -- \
+//!     --scenario ann-probe-budget --rows 10000 --dims 32 --selectivity 0.01 \
+//!     --k 50 --ann-partitions 100 --ann-probes 20
+//!   cargo bench -p omnigraph-engine --bench scenarios -- \
 //!     --scenario fenced-small-upsert --rows 100000 --dims 256
 //!   cargo bench -p omnigraph-engine --bench scenarios -- \
 //!     --scenario fenced-adopt-all-new --rows 100000 --dims 256
@@ -76,10 +79,21 @@ struct Args {
     dims: usize,
     seed: u64,
     runs: usize,
-    /// Selectivity for nearest-prefilter: fraction of rows matching the filter.
+    /// Selectivity for nearest-prefilter (fraction of rows matching the
+    /// filter) and for rrf-gate (fraction of ranked rows carrying an edge —
+    /// the gate's eligibility ratio).
     selectivity: f64,
-    /// ANN k (the query's `limit`) for nearest-prefilter.
+    /// ANN k (the query's `limit`) for nearest-prefilter; the rrf `limit`
+    /// for rrf-gate.
     k: usize,
+    /// IVF partition count for the Lance ANN probe-budget reproduction.
+    ann_partitions: usize,
+    /// Minimum/maximum probe count used by the bounded comparator.
+    ann_probes: usize,
+    /// Per-row text payload for rrf-gate: 200 KiB reproduces the issue-#563
+    /// overflow-scale corpus, ~2 KiB the wide variant, and a tiny value turns
+    /// the same scenario into the in-list build + BTREE probe microbench.
+    text_bytes: usize,
     /// How many already-committed rows the source branch MODIFIES, for
     /// `general-merge-updates`. This is the branch delta; `--rows` is the
     /// target size. Holding this small while `--rows` grows is the whole
@@ -120,6 +134,9 @@ impl Args {
             runs: 1,
             selectivity: 0.05,
             k: 10,
+            ann_partitions: 100,
+            ann_probes: 20,
+            text_bytes: 2048,
             delta_rows: 50,
             source_mode: "update".to_string(),
             memory_cap_mb: None,
@@ -145,6 +162,16 @@ impl Args {
                     args.selectivity = take("--selectivity").parse().expect("--selectivity")
                 }
                 "--k" => args.k = take("--k").parse().expect("--k"),
+                "--ann-partitions" => {
+                    args.ann_partitions =
+                        take("--ann-partitions").parse().expect("--ann-partitions")
+                }
+                "--ann-probes" => {
+                    args.ann_probes = take("--ann-probes").parse().expect("--ann-probes")
+                }
+                "--text-bytes" => {
+                    args.text_bytes = take("--text-bytes").parse().expect("--text-bytes")
+                }
                 "--delta-rows" => {
                     args.delta_rows = take("--delta-rows").parse().expect("--delta-rows")
                 }
@@ -179,6 +206,12 @@ impl Args {
             self.selectivity.to_string(),
             "--k".into(),
             self.k.to_string(),
+            "--ann-partitions".into(),
+            self.ann_partitions.to_string(),
+            "--ann-probes".into(),
+            self.ann_probes.to_string(),
+            "--text-bytes".into(),
+            self.text_bytes.to_string(),
             "--delta-rows".into(),
             self.delta_rows.to_string(),
             "--source-mode".into(),
@@ -218,9 +251,10 @@ fn main() {
     let args = Args::parse();
     if args.scenario.is_empty() {
         eprintln!(
-            "usage: --scenario <merge-all-changed|nearest-prefilter|fenced-small-upsert|\
-             fenced-adopt-all-new|general-merge-updates> [--rows N] [--dims D] \
-             [--seed S] [--runs K] [--selectivity F] [--k K] [--delta-rows N] \
+            "usage: --scenario <merge-all-changed|nearest-prefilter|ann-probe-budget|fenced-small-upsert|\
+             fenced-adopt-all-new|general-merge-updates|rrf-gate> [--rows N] [--dims D] \
+             [--seed S] [--runs K] [--selectivity F] [--k K] [--ann-partitions N] \
+             [--ann-probes N] [--text-bytes B] [--delta-rows N] \
              [--source-mode update|insert] [--memory-cap-mb M]"
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
@@ -459,6 +493,9 @@ fn run_once(args: &Args, run: usize) -> serde_json::Value {
             "seed": args.seed,
             "selectivity": args.selectivity,
             "k": args.k,
+            "ann_partitions": args.ann_partitions,
+            "ann_probes": args.ann_probes,
+            "text_bytes": args.text_bytes,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
         },
@@ -742,6 +779,8 @@ fn run_child(args: &Args) {
             }
             ("merge-all-changed", None) => merge_all_changed(args).await,
             ("nearest-prefilter", None) => nearest_prefilter(args).await,
+            ("ann-probe-budget", None) => ann_probe_budget(args).await,
+            ("rrf-gate", None) => rrf_gate(args).await,
             ("fenced-small-upsert", None) => rfc023_scenarios::fenced_small_upsert(args).await,
             (other, phase) => panic!("unknown scenario/phase '{other}/{phase:?}'"),
         }
@@ -1024,6 +1063,480 @@ async fn load_vector_rows(
 }
 
 // ---------------------------------------------------------------------------
+// Scenario: ann-probe-budget
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[derive(Debug, serde::Serialize)]
+struct AnnScanMeasurement {
+    rows_returned: usize,
+    elapsed_us: u64,
+    partitions_searched: usize,
+    partitions_ranked: usize,
+    index_parts_loaded: usize,
+    index_bytes_read: usize,
+    index_iops: usize,
+    storage_requests: usize,
+}
+
+#[cfg(unix)]
+async fn measure_ann_scan(
+    dataset: &lance::Dataset,
+    query: &arrow_array::Float32Array,
+    k: usize,
+    filtered: bool,
+    minimum_nprobes: usize,
+    maximum_nprobes: Option<usize>,
+) -> AnnScanMeasurement {
+    use std::sync::{Arc, Mutex};
+
+    use lance::dataset::scanner::ExecutionSummaryCounts;
+    use lance_datafusion::utils::{PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC};
+
+    let collected = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let callback_target = collected.clone();
+    let mut scanner = dataset.scan();
+    scanner.nearest("vector", query, k).expect("nearest");
+    scanner.minimum_nprobes(minimum_nprobes);
+    if let Some(maximum) = maximum_nprobes {
+        scanner.maximum_nprobes(maximum);
+    }
+    if filtered {
+        scanner.prefilter(true);
+        scanner.filter("eligible = true").expect("eligible filter");
+    }
+    scanner
+        .project(&["id".to_string()])
+        .expect("project id")
+        .target_parallelism(1)
+        .scan_stats_callback(Arc::new(move |summary| {
+            *callback_target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary.clone());
+        }));
+
+    let started = Instant::now();
+    let batch = scanner.try_into_batch().await.expect("ANN scan");
+    let elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
+    let summary = collected
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("Lance scan statistics callback");
+
+    AnnScanMeasurement {
+        rows_returned: batch.num_rows(),
+        elapsed_us,
+        partitions_searched: summary
+            .all_counts
+            .get(PARTITIONS_SEARCHED_METRIC)
+            .copied()
+            .unwrap_or_default(),
+        partitions_ranked: summary
+            .all_counts
+            .get(PARTITIONS_RANKED_METRIC)
+            .copied()
+            .unwrap_or_default(),
+        index_parts_loaded: summary.parts_loaded,
+        index_bytes_read: summary.bytes_read,
+        index_iops: summary.iops,
+        storage_requests: summary.requests,
+    }
+}
+
+#[cfg(unix)]
+async fn measure_fresh_ann_scan(
+    uri: &str,
+    query: &arrow_array::Float32Array,
+    k: usize,
+    filtered: bool,
+    minimum_nprobes: usize,
+    maximum_nprobes: Option<usize>,
+) -> AnnScanMeasurement {
+    let dataset = lance::Dataset::open(uri).await.expect("reopen ANN fixture");
+    measure_ann_scan(
+        &dataset,
+        query,
+        k,
+        filtered,
+        minimum_nprobes,
+        maximum_nprobes,
+    )
+    .await
+}
+
+#[cfg(unix)]
+/// A current-Lance structural reproduction for issue #567 and PR #591. The
+/// fixture gives every IVF partition the same row count and the same number of
+/// filter-eligible rows. Precomputed centroids remove k-means randomness, so
+/// the reported partition counts distinguish Lance's adaptive search from a
+/// hard maximum and from the PR's whole-query retry.
+async fn ann_probe_budget(args: &Args) -> serde_json::Value {
+    use std::sync::Arc;
+
+    use arrow_array::{
+        BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
+        UInt64Array,
+    };
+    use arrow_schema::{DataType, Field, Schema};
+    use lance::Dataset;
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance::index::DatasetIndexExt;
+    use lance::index::vector::VectorIndexParams;
+    use lance_file::version::LanceFileVersion;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_linalg::distance::MetricType;
+
+    const BATCH_ROWS: usize = 8_192;
+    const VECTOR_INDEX_NAME: &str = "vector_idx";
+
+    assert!(args.dims >= 3, "ann-probe-budget requires --dims >= 3");
+    assert!(
+        args.selectivity > 0.0 && args.selectivity <= 1.0,
+        "ann-probe-budget requires 0 < --selectivity <= 1"
+    );
+    assert!(args.ann_partitions > 1, "--ann-partitions must exceed 1");
+    assert!(args.ann_probes > 0, "--ann-probes must be positive");
+    assert!(
+        args.ann_probes < args.ann_partitions,
+        "--ann-probes must be lower than --ann-partitions"
+    );
+    assert_eq!(
+        args.rows % args.ann_partitions,
+        0,
+        "--rows must be divisible by --ann-partitions"
+    );
+
+    let rows_per_partition = args.rows / args.ann_partitions;
+    let eligibility_stride = (1.0 / args.selectivity).round().max(1.0) as usize;
+    let eligible_per_partition = rows_per_partition.div_ceil(eligibility_stride);
+    let eligible_rows = eligible_per_partition * args.ann_partitions;
+    assert!(
+        args.k <= rows_per_partition,
+        "choose --k <= rows per partition so unfiltered Lance-default search can stop after one probe"
+    );
+    assert!(
+        args.k <= eligible_rows,
+        "the fixture must contain at least k eligible rows"
+    );
+    assert!(
+        args.ann_probes * eligible_per_partition < args.k,
+        "choose k/selectivity so the hard probe cap deterministically under-fills"
+    );
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("eligible", DataType::Boolean, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item.clone(), args.dims as i32),
+            false,
+        ),
+    ]));
+
+    let dir = tempfile::tempdir().expect("ANN fixture tempdir");
+    let uri = dir.path().join("ann-probe-budget.lance");
+    let uri = uri.to_str().expect("UTF-8 fixture path");
+
+    let starts = (0..args.rows).step_by(BATCH_ROWS).collect::<Vec<_>>();
+    let batch_schema = schema.clone();
+    let batch_item = item.clone();
+    let rows = args.rows;
+    let dims = args.dims;
+    let partitions = args.ann_partitions;
+    let seed = args.seed;
+    let batches = starts.into_iter().map(move |start| {
+        let end = (start + BATCH_ROWS).min(rows);
+        let mut vector_values = vec![0.0_f32; (end - start) * dims];
+        let mut eligible = Vec::with_capacity(end - start);
+        for (offset, row) in (start..end).enumerate() {
+            let partition = row % partitions;
+            let round = row / partitions;
+            let angle = std::f32::consts::TAU * partition as f32 / partitions as f32;
+            let vector = &mut vector_values[offset * dims..(offset + 1) * dims];
+            vector[0] = angle.cos();
+            vector[1] = angle.sin();
+            let mut state = seed ^ (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            for value in &mut vector[2..] {
+                *value =
+                    ((xorshift64(&mut state) >> 40) as f32 / (1_u32 << 24) as f32 - 0.5) * 0.0001;
+            }
+            eligible.push(round.is_multiple_of(eligibility_stride));
+        }
+        let vectors = FixedSizeListArray::new(
+            batch_item.clone(),
+            dims as i32,
+            Arc::new(Float32Array::from(vector_values)),
+            None,
+        );
+        RecordBatch::try_new(
+            batch_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(start as u64..end as u64)),
+                Arc::new(BooleanArray::from(eligible)),
+                Arc::new(vectors),
+            ],
+        )
+    });
+    let reader = RecordBatchIterator::new(batches, schema);
+
+    let setup_started = Instant::now();
+    let mut dataset = Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("write ANN fixture");
+
+    dataset
+        .create_index_builder(
+            &["eligible"],
+            IndexType::BTree,
+            &ScalarIndexParams::default(),
+        )
+        .name("eligible_idx".to_string())
+        .replace(true)
+        .await
+        .expect("build eligible BTREE");
+
+    let mut centroid_values = vec![0.0_f32; args.ann_partitions * args.dims];
+    for partition in 0..args.ann_partitions {
+        let angle = std::f32::consts::TAU * partition as f32 / args.ann_partitions as f32;
+        let centroid = &mut centroid_values[partition * args.dims..(partition + 1) * args.dims];
+        centroid[0] = angle.cos();
+        centroid[1] = angle.sin();
+    }
+    let centroids = FixedSizeListArray::new(
+        item,
+        args.dims as i32,
+        Arc::new(Float32Array::from(centroid_values)),
+        None,
+    );
+    let ivf = IvfBuildParams::try_with_centroids(args.ann_partitions, Arc::new(centroids))
+        .expect("valid fixed centroids");
+    let vector_params = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf);
+    dataset
+        .create_index_builder(&["vector"], IndexType::Vector, &vector_params)
+        .name(VECTOR_INDEX_NAME.to_string())
+        .replace(true)
+        .await
+        .expect("build IVF_FLAT index");
+    let setup_ms = setup_started.elapsed().as_millis() as u64;
+
+    let index_stats: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics(VECTOR_INDEX_NAME)
+            .await
+            .expect("vector index statistics"),
+    )
+    .expect("vector index statistics JSON");
+    let actual_partitions = index_stats["indices"][0]["num_partitions"]
+        .as_u64()
+        .expect("IVF statistics expose num_partitions") as usize;
+    assert_eq!(actual_partitions, args.ann_partitions);
+
+    if args.baseline {
+        return serde_json::json!({
+            "baseline": true,
+            "setup_ms": setup_ms,
+            "actual_partitions": actual_partitions,
+            "eligible_rows": eligible_rows,
+        });
+    }
+
+    // Two query shapes expose both sides of Lance's heuristic. A query equal
+    // to centroid 0 has nearest-centroid distance zero, so the adaptive
+    // minimum remains one. The orthogonal query is equidistant from every
+    // centroid, so Lance 11's k>=11 distance threshold promotes the minimum
+    // to every partition unless a maximum clamps it.
+    let mut aligned_values = vec![0.0_f32; args.dims];
+    aligned_values[0] = 1.0;
+    let aligned_query = Float32Array::from(aligned_values);
+    let mut equidistant_values = vec![0.0_f32; args.dims];
+    equidistant_values[2] = 1.0;
+    let equidistant_query = Float32Array::from(equidistant_values);
+
+    let aligned_adaptive =
+        measure_fresh_ann_scan(uri, &aligned_query, args.k, false, 1, None).await;
+    let aligned_maximum_only =
+        measure_fresh_ann_scan(uri, &aligned_query, args.k, false, 1, Some(args.ann_probes)).await;
+    let aligned_fixed = measure_fresh_ann_scan(
+        uri,
+        &aligned_query,
+        args.k,
+        false,
+        args.ann_probes,
+        Some(args.ann_probes),
+    )
+    .await;
+    let equidistant_adaptive =
+        measure_fresh_ann_scan(uri, &equidistant_query, args.k, false, 1, None).await;
+    let equidistant_maximum_only = measure_fresh_ann_scan(
+        uri,
+        &equidistant_query,
+        args.k,
+        false,
+        1,
+        Some(args.ann_probes),
+    )
+    .await;
+
+    let unfiltered_large_k = args.ann_probes * rows_per_partition + 1;
+    let unfiltered_large_k_adaptive =
+        measure_fresh_ann_scan(uri, &aligned_query, unfiltered_large_k, false, 1, None).await;
+    let unfiltered_large_k_bounded = measure_fresh_ann_scan(
+        uri,
+        &aligned_query,
+        unfiltered_large_k,
+        false,
+        1,
+        Some(args.ann_probes),
+    )
+    .await;
+    let filtered_adaptive =
+        measure_fresh_ann_scan(uri, &aligned_query, args.k, true, 1, None).await;
+    let filtered_bounded =
+        measure_fresh_ann_scan(uri, &aligned_query, args.k, true, 1, Some(args.ann_probes)).await;
+
+    let retry_dataset = Dataset::open(uri).await.expect("reopen retry fixture");
+    let retry_first = measure_ann_scan(
+        &retry_dataset,
+        &aligned_query,
+        args.k,
+        true,
+        1,
+        Some(args.ann_probes),
+    )
+    .await;
+    let retry_second = if retry_first.rows_returned < args.k {
+        Some(measure_ann_scan(&retry_dataset, &aligned_query, args.k, true, 1, None).await)
+    } else {
+        None
+    };
+    let retry_totals = serde_json::json!({
+        "elapsed_us": retry_first.elapsed_us
+            + retry_second.as_ref().map_or(0, |m| m.elapsed_us),
+        "partitions_searched": retry_first.partitions_searched
+            + retry_second.as_ref().map_or(0, |m| m.partitions_searched),
+        "index_parts_loaded": retry_first.index_parts_loaded
+            + retry_second.as_ref().map_or(0, |m| m.index_parts_loaded),
+        "index_bytes_read": retry_first.index_bytes_read
+            + retry_second.as_ref().map_or(0, |m| m.index_bytes_read),
+        "index_iops": retry_first.index_iops
+            + retry_second.as_ref().map_or(0, |m| m.index_iops),
+        "storage_requests": retry_first.storage_requests
+            + retry_second.as_ref().map_or(0, |m| m.storage_requests),
+        "final_rows_returned": retry_second
+            .as_ref()
+            .map_or(retry_first.rows_returned, |m| m.rows_returned),
+    });
+
+    assert_eq!(aligned_adaptive.rows_returned, args.k);
+    assert_eq!(aligned_maximum_only.rows_returned, args.k);
+    assert_eq!(
+        aligned_adaptive.partitions_searched, 1,
+        "a centroid-aligned query must expose Lance's one-partition fast path"
+    );
+    assert_eq!(
+        aligned_maximum_only.partitions_searched, 1,
+        "a maximum-only guard must preserve the one-partition fast path"
+    );
+    assert_eq!(
+        aligned_fixed.partitions_searched, args.ann_probes,
+        "setting both minimum and maximum must force needless easy-query work"
+    );
+
+    assert_eq!(equidistant_adaptive.rows_returned, args.k);
+    assert_eq!(equidistant_maximum_only.rows_returned, args.k);
+    assert_eq!(
+        equidistant_adaptive.partitions_searched, actual_partitions,
+        "the off-centroid query must reproduce Lance's all-partition expansion"
+    );
+    assert_eq!(
+        equidistant_maximum_only.partitions_searched, args.ann_probes,
+        "the maximum-only guard must clamp the all-partition expansion"
+    );
+    assert!(
+        equidistant_maximum_only.index_parts_loaded < equidistant_adaptive.index_parts_loaded,
+        "the maximum-only guard must reduce payload partition reads"
+    );
+
+    assert_eq!(
+        unfiltered_large_k_adaptive.rows_returned,
+        unfiltered_large_k
+    );
+    assert!(
+        unfiltered_large_k_bounded.rows_returned < unfiltered_large_k,
+        "the hard probe cap must expose unfiltered large-k underfill"
+    );
+    assert_eq!(
+        unfiltered_large_k_bounded.partitions_searched, args.ann_probes,
+        "the hard probe cap must stop unfiltered large-k search at the requested ceiling"
+    );
+
+    assert_eq!(filtered_adaptive.rows_returned, args.k);
+    assert_eq!(
+        filtered_bounded.partitions_searched, args.ann_probes,
+        "maximum_nprobes must impose the requested filtered probe ceiling"
+    );
+    assert!(
+        filtered_bounded.rows_returned < args.k,
+        "the deterministic selective fixture must expose hard-cap underfill"
+    );
+    let retry_second = retry_second.expect("hard-cap underfill must trigger the PR retry");
+    assert_eq!(retry_second.rows_returned, args.k);
+    assert!(
+        retry_first.partitions_searched + retry_second.partitions_searched
+            > filtered_adaptive.partitions_searched,
+        "capped-then-retry must repeat IVF work compared with one adaptive scan"
+    );
+
+    serde_json::json!({
+        "scope": "synthetic local structural reproduction; timing is diagnostic, not the issue's S3 production measurement",
+        "lance_version": "11.0.0",
+        "index_type": "IVF_FLAT",
+        "setup_ms": setup_ms,
+        "fixture": {
+            "rows": args.rows,
+            "dims": args.dims,
+            "partitions": actual_partitions,
+            "rows_per_partition": rows_per_partition,
+            "requested_selectivity": args.selectivity,
+            "actual_selectivity": eligible_rows as f64 / args.rows as f64,
+            "eligible_rows": eligible_rows,
+            "eligible_per_partition": eligible_per_partition,
+            "k": args.k,
+            "maximum_nprobes": args.ann_probes,
+        },
+        "modes": {
+            "centroid_aligned_lance_default": aligned_adaptive,
+            "centroid_aligned_maximum_only": aligned_maximum_only,
+            "centroid_aligned_fixed_minimum_and_maximum": aligned_fixed,
+            "equidistant_lance_default": equidistant_adaptive,
+            "equidistant_maximum_only": equidistant_maximum_only,
+            "unfiltered_large_k": unfiltered_large_k,
+            "unfiltered_large_k_lance_default_min1_no_max": unfiltered_large_k_adaptive,
+            "unfiltered_large_k_maximum_only": unfiltered_large_k_bounded,
+            "filtered_lance_default_min1_no_max": filtered_adaptive,
+            "filtered_maximum_only_first_pass": filtered_bounded,
+            "filtered_maximum_only_then_retry": {
+                "first_pass": retry_first,
+                "retry": retry_second,
+                "totals": retry_totals,
+            },
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Scenario: nearest-prefilter
 // ---------------------------------------------------------------------------
 
@@ -1137,4 +1650,256 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
         "query_iters": QUERY_ITERS,
         "mean_query_ms": total_ms as f64 / QUERY_ITERS as f64,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: rrf-gate
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+/// One cell of the rrf prefilter-gate matrix: a bm25+bm25 `rrf()` read
+/// joined through an edge traversal, where `--selectivity` of the ranked rows
+/// carry edges (fanout 2 — the issue-#563 repro shape; `--text-bytes 204800`
+/// reproduces its overflow-scale corpus, ~2048 the wide variant, and a tiny
+/// value turns the cell into the in-list BTREE-probe microbench).
+///
+/// `--baseline` forces the postfilter plan (v0.9 rrf semantics: uncapped
+/// corpus-wide arms); the default forces the prefilter plan, so the
+/// wall-clock crossover stays measurable ABOVE the natural threshold too.
+/// Query iteration 0 runs against a cold `RuntimeCache` (the gate's
+/// forced-CSR-build case); later iterations are warm. Per-iteration
+/// object-store reads come from one persistent `IOTracker` pair installed
+/// before the graph opens (the `cost_harness` pattern), the gate's verdict
+/// from the `rrf_gate_verdicts` probe, and the in-list `Expr` build over the
+/// eligible ids is timed separately (the predicate-build half). A query
+/// error — e.g. the #563 Offset overflow under the postfilter plan at
+/// 200 KiB text — is recorded as that iteration's `error`, not a crash: an
+/// overflow under the baseline is a data point.
+async fn rrf_gate(args: &Args) -> serde_json::Value {
+    use lance::io::WrappingObjectStore;
+    use lance_io::utils::tracking_store::IOTracker;
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+
+    const ARTIFACTS: usize = 750;
+    const FANOUT: usize = 2;
+    const QUERY_ITERS: usize = 3;
+    const EDGE_BATCH_ROWS: usize = 4_000;
+
+    let table_tracker = IOTracker::default();
+    let manifest_tracker = IOTracker::default();
+    let probes = QueryIoProbes {
+        table_wrapper: Some(
+            std::sync::Arc::new(table_tracker.clone()) as std::sync::Arc<dyn WrappingObjectStore>
+        ),
+        manifest_wrapper: Some(std::sync::Arc::new(manifest_tracker.clone())
+            as std::sync::Arc<dyn WrappingObjectStore>),
+        ..Default::default()
+    };
+    let verdicts = std::sync::Arc::clone(&probes.rrf_gate_verdicts);
+    let args = args.clone();
+    let table = table_tracker.clone();
+    let manifest = manifest_tracker.clone();
+
+    // The whole cell runs under ONE probe scope so every dataset handle —
+    // including cached ones reused by warm iterations — carries the trackers.
+    with_query_io_probes(
+        probes,
+        Box::pin(async move {
+            let schema = "node Chunk {\n    slug: String @key\n    text: String @index\n}\n\n\
+                          node Artifact {\n    slug: String @key\n}\n\n\
+                          edge ChunkOfArtifact: Chunk -> Artifact {\n    label: String\n}\n";
+            let dir = tempfile::tempdir().expect("tempdir");
+            let uri = dir.path().to_str().unwrap();
+            let db = Omnigraph::init(uri, schema).await.expect("init");
+
+            // Both query terms in every row (rank ties are irrelevant here —
+            // this is a cost instrument, not the equality oracle), padded to
+            // `--text-bytes` with a tiny vocabulary of long tokens so the
+            // stored column carries full byte weight while the FTS term
+            // dictionary stays small.
+            let mut text = String::with_capacity(args.text_bytes + 64);
+            text.push_str("needle563 sharp563 ");
+            let filler_unit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+                               cccccccccccccccccccccccccccccccc dddddddddddddddddddddddddddddddd ";
+            while text.len() < args.text_bytes {
+                text.push_str(filler_unit);
+            }
+
+            let seed_start = Instant::now();
+            let mut head = String::new();
+            for a in 0..ARTIFACTS {
+                let _ = writeln!(head, r#"{{"type":"Artifact","data":{{"slug":"art-{a:04}"}}}}"#);
+            }
+            db.load("main", &head, LoadMode::Merge).await.expect("load artifacts");
+
+            let chunk_batch_rows = (24 * 1024 * 1024 / args.text_bytes.max(1)).clamp(1, 4_000);
+            let mut chunk_batch = String::new();
+            for c in 0..args.rows {
+                let _ = writeln!(
+                    chunk_batch,
+                    r#"{{"type":"Chunk","data":{{"slug":"chunk-{c:06}","text":"{text}"}}}}"#
+                );
+                if (c + 1) % chunk_batch_rows == 0 || c + 1 == args.rows {
+                    db.load("main", &chunk_batch, LoadMode::Merge)
+                        .await
+                        .expect("load chunks");
+                    chunk_batch.clear();
+                }
+            }
+
+            // Every stride-th chunk is eligible (carries FANOUT edges).
+            let stride = (1.0 / args.selectivity).round().max(1.0) as usize;
+            let mut eligible_slugs: Vec<String> = Vec::new();
+            let mut edges = String::new();
+            let mut edge_rows = 0usize;
+            for c in (0..args.rows).step_by(stride) {
+                eligible_slugs.push(format!("chunk-{c:06}"));
+                for f in 0..FANOUT {
+                    let a = (c * FANOUT + f) % ARTIFACTS;
+                    let _ = writeln!(
+                        edges,
+                        r#"{{"edge":"ChunkOfArtifact","from":"chunk-{c:06}","to":"art-{a:04}","data":{{"id":"e-{c:06}-{f}","label":"of"}}}}"#
+                    );
+                    edge_rows += 1;
+                    if edge_rows == EDGE_BATCH_ROWS {
+                        db.load("main", &edges, LoadMode::Merge).await.expect("load edges");
+                        edges.clear();
+                        edge_rows = 0;
+                    }
+                }
+            }
+            if edge_rows > 0 {
+                db.load("main", &edges, LoadMode::Merge).await.expect("load edges");
+            }
+            let seed_ms = seed_start.elapsed().as_millis() as u64;
+
+            // FTS + BTREE indices built AFTER the last write: full fragment
+            // coverage, so the gate's coverage fence admits the prefilter plan.
+            let index_start = Instant::now();
+            db.ensure_indices().await.expect("ensure_indices");
+            let index_ms = index_start.elapsed().as_millis() as u64;
+
+            // Query on a FRESH handle: the seeding handle's dataset cache
+            // would otherwise serve the scans through unwrapped stores (the
+            // IO trackers attach at open) and mask the cold-cache cost the
+            // matrix wants — iteration 0 must pay real data opens and the
+            // gate's cold CSR build.
+            drop(db);
+            let db = Omnigraph::open(uri).await.expect("reopen");
+
+            // Constructing one `lit()` per eligible id plus the `IN`-list
+            // `Expr` — the per-id predicate-BUILD cost, which prior
+            // indexed-eval measurements never covered.
+            let inlist_build_start = Instant::now();
+            let id_list: Vec<datafusion::prelude::Expr> = eligible_slugs
+                .iter()
+                .map(|slug| datafusion::prelude::lit(slug.clone()))
+                .collect();
+            let in_list_expr = datafusion::prelude::col("id").in_list(id_list, false);
+            let inlist_build_ms = inlist_build_start.elapsed().as_micros() as f64 / 1000.0;
+            std::hint::black_box(&in_list_expr);
+
+            let query_src = format!(
+                "query recall_rrf($q1: String, $q2: String) {{\n    match {{\n        $c: Chunk\n        $c chunkOfArtifact $a\n    }}\n    return {{ $c.slug, $a.slug }}\n    order {{ rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }}\n    limit {}\n}}\n",
+                args.k
+            );
+            let query_params = helpers::params(&[("$q1", "needle563"), ("$q2", "sharp563")]);
+            let plan_mode: &'static str = if args.baseline {
+                "force_postfilter"
+            } else {
+                "force_prefilter"
+            };
+
+            // Drop the seed/index reads so per-iteration stats start clean.
+            let _ = table.incremental_stats();
+            let _ = manifest.incremental_stats();
+
+            let mut iterations: Vec<serde_json::Value> = Vec::new();
+            for iter in 0..QUERY_ITERS {
+                let started = Instant::now();
+                let outcome = with_rrf_plan(
+                    plan_mode,
+                    db.query(
+                        ReadTarget::branch("main"),
+                        &query_src,
+                        "recall_rrf",
+                        &query_params,
+                    ),
+                )
+                .await;
+                let wall_ms = started.elapsed().as_millis() as u64;
+                let table_stats = table.incremental_stats();
+                let manifest_stats = manifest.incremental_stats();
+                let verdict = verdicts
+                    .lock()
+                    .ok()
+                    .and_then(|v| v.last().cloned())
+                    .map(|v| {
+                        serde_json::json!({
+                            "plan": format!("{:?}", v.plan),
+                            "fallback": v.fallback.map(|f| format!("{f:?}")),
+                            "forced": v.forced,
+                            "eligible": v.eligible,
+                            "corpus": v.corpus,
+                        })
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+                match outcome {
+                    Ok(result) => {
+                        let rows: usize = result.batches().iter().map(|b| b.num_rows()).sum();
+                        iterations.push(serde_json::json!({
+                            "iter": iter,
+                            "wall_ms": wall_ms,
+                            "rows_returned": rows,
+                            "table_read_iops": table_stats.read_iops,
+                            "table_read_bytes": table_stats.read_bytes,
+                            "manifest_read_iops": manifest_stats.read_iops,
+                            "verdict": verdict,
+                            "error": serde_json::Value::Null,
+                        }));
+                    }
+                    Err(error) => {
+                        iterations.push(serde_json::json!({
+                            "iter": iter,
+                            "wall_ms": wall_ms,
+                            "rows_returned": serde_json::Value::Null,
+                            "table_read_iops": table_stats.read_iops,
+                            "table_read_bytes": table_stats.read_bytes,
+                            "manifest_read_iops": manifest_stats.read_iops,
+                            "verdict": verdict,
+                            "error": error.to_string(),
+                        }));
+                        // Later iterations would fail identically; the error
+                        // itself is the cell's result.
+                        break;
+                    }
+                }
+            }
+
+            let warm: Vec<u64> = iterations
+                .iter()
+                .skip(1)
+                .filter(|it| it.get("error") == Some(&serde_json::Value::Null))
+                .filter_map(|it| it.get("wall_ms").and_then(serde_json::Value::as_u64))
+                .collect();
+            serde_json::json!({
+                "plan_mode": plan_mode,
+                "seed_ms": seed_ms,
+                "index_ms": index_ms,
+                "corpus_rows": args.rows,
+                "text_bytes": args.text_bytes,
+                "eligible_rows": eligible_slugs.len(),
+                "fanout": FANOUT,
+                "inlist_build_ms": inlist_build_ms,
+                "cold_wall_ms": iterations.first().and_then(|it| it.get("wall_ms").cloned()),
+                "warm_mean_wall_ms": if warm.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(warm.iter().sum::<u64>() as f64 / warm.len() as f64)
+                },
+                "iterations": iterations,
+            })
+        }),
+    )
+    .await
 }

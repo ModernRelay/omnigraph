@@ -159,6 +159,37 @@ fn parse_declared_param_types(params: &[Param]) -> Result<HashMap<String, PropTy
     Ok(out)
 }
 
+/// Names beginning with `__` are the compiler's: lowering mints `__anon_N`
+/// for anonymous traversal endpoints and `__temp_<var>_N` for cycle-closing
+/// traversals, and the plan check refuses a name introduced twice, so a user
+/// variable spelled like one would fail there with a message about the
+/// plan. Refuse it here, once, with the reason.
+fn refuse_reserved_variable_names(clauses: &[Clause]) -> Result<()> {
+    fn check(name: &str) -> Result<()> {
+        if name.starts_with("__") {
+            return Err(CompilerError::Type(format!(
+                "variable `${name}`: names beginning with `__` are reserved for the compiler"
+            )));
+        }
+        Ok(())
+    }
+    for clause in clauses {
+        match clause {
+            Clause::Binding(binding) => check(&binding.variable)?,
+            Clause::Traversal(traversal) => {
+                check(&traversal.src)?;
+                check(&traversal.dst)?;
+                if let Some(edge) = &traversal.edge_binding {
+                    check(edge)?;
+                }
+            }
+            Clause::Filter(_) => {}
+            Clause::Negation(inner) => refuse_reserved_variable_names(inner)?,
+        }
+    }
+    Ok(())
+}
+
 fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
     let mut ctx = TypeContext {
         bindings: HashMap::new(),
@@ -168,6 +199,8 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     let mut alias_exprs: HashMap<String, &Expr> = HashMap::new();
 
     let params = parse_declared_param_types(&query.params)?;
+
+    refuse_reserved_variable_names(&query.match_clause)?;
 
     // Typecheck match clauses
     typecheck_clauses(catalog, &query.match_clause, &mut ctx, &params, false)?;

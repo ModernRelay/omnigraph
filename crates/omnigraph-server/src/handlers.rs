@@ -28,6 +28,48 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     })
 }
 
+/// Readiness witness (RFC 0049).
+///
+/// Unauthenticated, and therefore minimal: it reports whether this replica
+/// is serving or draining, the applied `config_digest` it booted from, the
+/// ledger revision and CAS it read, and how many graphs it serves and does
+/// not serve. Graph ids are topology and stay behind `GET /graphs`. Answers
+/// 503 once shutdown has begun; `/healthz` stays 200 while the process is
+/// alive.
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "health",
+    operation_id = "readiness",
+    responses(
+        (status = 200, description = "Serving", body = ReadinessOutput),
+        (status = 503, description = "Draining", body = ReadinessOutput),
+    ),
+)]
+pub(crate) async fn server_ready(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<ReadinessOutput>) {
+    let draining = state.draining.load(std::sync::atomic::Ordering::SeqCst);
+    let served_graph_count = state.routing().registry.list().len();
+    let quarantined_graph_count = state.quarantined_graphs().len();
+    let output = ReadinessOutput {
+        ready: !draining,
+        status: if draining { "draining" } else { "serving" }.to_string(),
+        booted_serving_digest: state.witness.booted_serving_digest.clone(),
+        state_revision: state.witness.state_revision,
+        state_cas: state.witness.state_cas.clone(),
+        served_graph_count,
+        quarantined_graph_count,
+        shutdown_grace_seconds: state.shutdown_grace.as_secs(),
+    };
+    let status = if draining {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(output))
+}
+
 #[utoipa::path(
     get,
     path = "/graphs",
@@ -81,7 +123,10 @@ pub(crate) async fn server_graphs_list(
         })
         .collect();
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
-    Ok(Json(GraphListResponse { graphs }))
+    Ok(Json(GraphListResponse {
+        graphs,
+        quarantined: state.quarantined_graphs(),
+    }))
 }
 
 pub(crate) async fn server_openapi(
@@ -114,7 +159,7 @@ const CLUSTER_OPERATION_ID_PREFIX: &str = "cluster_";
 /// always-flat endpoints. `/graphs` is the management enumeration —
 /// it lives at the root in both single mode (405) and multi mode, and
 /// must never be rewritten to `/graphs/{graph_id}/graphs`.
-const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/graphs"];
+const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/readyz", "/graphs"];
 
 /// In multi-mode `server_openapi`, every protected path-item is
 /// reattached under the cluster prefix. Operation IDs gain the

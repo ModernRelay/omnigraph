@@ -5,7 +5,7 @@ This is the ownership map for OmniGraph's tests. Read it before changing code: f
 ## Rules
 
 1. Test at the boundary that owns the promise. Compiler behavior belongs in compiler tests; engine guarantees belong at the public engine API; HTTP and CLI behavior belongs at those transports.
-2. Prefer one new assertion, fixture row, or parameter over another `init_and_load` test.
+2. Prefer one new assertion, fixture row, or parameter over another `init_and_load` test. When the change fixes an issue, the `Fix Regression Gate` keys on `issue_N` in the test's name or the `.gqt` case's file name: extend an owner test by renaming it to carry `issue_N` in the same change, or add a row to the `issue_N_*.gqt` case (`docs/dev/ci.md`).
 3. Test logical results and durable state. Inspect Lance internals only for a compatibility fence, recovery fault, or physical-cost contract.
 4. Every failure path must prove what did *not* move: manifest head, table head, lineage, sidecar, or external I/O as appropriate.
 5. Time and RSS measurements are decision instruments, not ordinary correctness gates. Deterministic operation counts may be CI contracts.
@@ -25,6 +25,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `lane_b.rs`, `torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the crate-local `.cargo/config.toml` sets it when cargo runs from the crate dir; every test file is `#![cfg(tokio_unstable)]`-gated and the crate compiles empty without it, so the default workspace gate is unaffected). `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
+| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus in-source format self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; format in RFC 0045 |
 
 Do not copy server or CLI process setup into a new suite. Their support modules own hermetic configuration, binary startup, temporary roots, and common assertions.
 
@@ -35,8 +36,8 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Concern | Existing owners |
 |---|---|
 | Initialization and representative journeys | `lifecycle.rs`, `end_to_end.rs`, `composite_flow.rs`, `consistency.rs` |
-| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs` |
-| Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs` |
+| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs`; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
+| Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs`, `rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
 | Branches, snapshots, diffs, and merges | `branching.rs`, `point_in_time.rs`, `changes.rs`, `merge_truth_table.rs`, `merge_fast_forward.rs` |
 | Recovery and crash windows | `recovery.rs`, `failpoints.rs`, `failpoint_names_guard.rs`, in-source manifest/recovery tests |
@@ -96,11 +97,29 @@ Focused iteration:
 ```bash
 cargo test -p omnigraph-engine --test traversal
 cargo test -p omnigraph-engine --test writes concurrent
+cargo test -p omnigraph-gqt                                      # every .gqt case + the format self-tests
+cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # the cases whose file name contains issue_563
+cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
 cargo test -p omnigraph-server --test data_routes
 cargo test -p omnigraph-cli --test cli_data
 cargo test -p omnigraph-cluster --test failpoints --features failpoints
 cargo test -p omnigraph-bench --locked
 ```
+
+Every `.gqt` case is its own libtest test named `case::<file>.gqt`, registered
+at run time (`datatest-stable`), so the ordinary name filter selects cases, a
+case-only pull request needs no Rust change, and `cargo-nextest` sees each
+case (an IDE's test-results view lists cases from the
+libtest-shaped output; no per-case gutter runnable exists, since no source
+item does). `--test-threads=<n>` bounds how many cases run
+concurrently (default: the machine's available parallelism); each case fails
+if it exceeds `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>` seconds (default 10);
+`OMNIGRAPH_GQ_BLESS=1` rewrites the failing step's expect rows in place (local
+workflow only, never CI). Every `ok`/`FAIL` line carries the case's elapsed
+time, and a case over budget belongs in a `heavy-repro:` `#[ignore]`d test
+under `crates/omnigraph/tests/repro_issue_*.rs`, not the corpus. A name filter
+that matches no case is libtest's ordinary green zero-test run; read the
+`filtered out` count.
 
 Canonical workspace graph:
 

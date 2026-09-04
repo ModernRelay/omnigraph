@@ -25,7 +25,11 @@ bound, so results are never truncated. Full-text rankings inside `rrf()` are
 never bounded this way: each full-text arm scans every matching entity, and
 fusion ranks the entities that satisfy the graph and property filters, so
 bounding an arm could silently drop an entity's contribution and shift fused
-results. A `nearest()` ranking inside `rrf()` is inherently top-k, as vector
+results. When a traversal constrains the ranked variable and the graph shows
+few entities could satisfy it, the full-text arms instead rank only those
+entities (an unbounded, index-served prefilter — results are identical, the
+scan is just smaller); broad traversals keep the full scan. A `nearest()`
+ranking inside `rrf()` is inherently top-k, as vector
 search always is: an entity outside its window adds no vector contribution
 to its fused score, so a traversal that drops the window's top matches can
 shift fused ranks.
@@ -45,6 +49,20 @@ Raw vectors are ranked with L2 distance. Vectors produced by OmniGraph's
 embedding client are normalized, so L2 and cosine similarity produce the same
 ordering for those generated vectors. See [Embeddings](embeddings.md) for text
 queries and provider configuration.
+
+IVF vector searches keep Lance's adaptive one-partition minimum and use a
+maximum of 20 payload partitions by default. This prevents Lance's
+centroid-distance heuristic from expanding an otherwise small search across
+the entire index. Set `OMNIGRAPH_ANN_NPROBES` to a positive integer to tune
+the maximum: larger values can improve recall at the cost of latency and
+object-store I/O.
+
+If that maximum leaves a standalone nearest query or an RRF nearest arm with
+fewer candidates than requested, OmniGraph retries that scan once without a
+maximum. The retry preserves the requested row budget when enough matches
+exist, but a highly selective query can therefore still take the uncapped
+path. As with every IVF search, a full candidate count does not make the ANN
+ranking exact; the maximum remains a recall/latency tradeoff.
 
 ## Full-text search
 
@@ -78,9 +96,10 @@ query hybrid($vector: Vector(4), $text: String) {
 }
 ```
 
-Ranking order is preserved through ordinary node projections and single-hop edge
-expansion. More complex plans may not expose every intermediate score as a
-normal column; order directly by the search expression when ranking is the goal.
+Ranking order is a contract, not a side effect: search-ordered results are
+sorted on the search score itself, including through multi-hop traversals, with
+secondary keys and the entity-id tie-break applied after the score. The full
+ordering contract lives on the [queries page](../queries/index.md).
 
 ## Indexes
 

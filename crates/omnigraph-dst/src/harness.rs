@@ -918,8 +918,21 @@ fn milestone_op(
             }
         }
         Milestone::MergeBranch => {
-            if !world.branches.contains_key(MILESTONE_BRANCH) {
-                return None; // precondition not built yet; wait
+            let Some(slot) = world.branches.get(MILESTONE_BRANCH) else {
+                // Every recipe puts EnsureBranch before MergeBranch, so an
+                // absent slot here means deleted (or create ruled NotApplied)
+                // — and BRANCH_POOL never recreates the milestone branch, so
+                // the merge is permanently unreachable. Advance, don't stall.
+                *progress += 1;
+                return None;
+            };
+            if slot.merged {
+                // Merge-and-close ([`BranchSlot::merged`]): a sampler-emitted
+                // merge already consumed this branch — a SECOND merge is the
+                // shape the model declares unpredictable, and the sampler's
+                // own filter refuses it. Satisfied — advance, no op this tick.
+                *progress += 1;
+                return None;
             }
             WorldOp::BranchMerge {
                 source: MILESTONE_BRANCH.to_string(),
@@ -2047,6 +2060,13 @@ fn apply_world(world: &mut WorldModel, wop: &WorldOp) {
         }
         WorldOp::BranchMerge { source } => {
             let slot = &world.branches[source.as_str()];
+            // Merge-and-close chokepoint: prediction is only defined for a
+            // branch's FIRST merge; an emitter bug reaching here would fold
+            // a stale-base prediction into `world.main` silently.
+            debug_assert!(
+                !slot.merged,
+                "emitter bug: second BranchMerge of merged branch {source:?} reached apply_world"
+            );
             if let Some(mut merged) = predict_merge(&slot.base, &slot.state, &world.main) {
                 // H: ghost rows ride merges like ordinary rows
                 // (set-level three-way; a bare (X,X) pair has no conflict
@@ -2127,7 +2147,19 @@ fn expects_merge_conflict(world: &WorldModel, wop: &WorldOp) -> bool {
         WorldOp::BranchMerge { source } => world
             .branches
             .get(source.as_str())
-            .map(|slot| predict_merge(&slot.base, &slot.state, &world.main).is_none())
+            .map(|slot| {
+                // Merge-and-close: prediction is undefined for a second
+                // merge; an emitter bug would surface here as a stale-base
+                // misprediction red instead of naming the emitter. The
+                // keep-serving post-ruling re-derive never predicts an op
+                // the ruling itself judged (the ruling's world holds that
+                // op's own effect), so a merged slot here names an emitter.
+                debug_assert!(
+                    !slot.merged,
+                    "emitter bug: predicting a second BranchMerge of merged branch {source:?}"
+                );
+                predict_merge(&slot.base, &slot.state, &world.main).is_none()
+            })
             .unwrap_or(false),
         _ => false,
     }
@@ -2858,6 +2890,21 @@ impl StorageAdapter for FailingStorage {
             .await?;
         Ok(out.map(|text| self.maybe_corrupt("read_text_if_exists_bounded", uri, text)))
     }
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> OmniResult<Option<Vec<u8>>> {
+        self.read_fault("read_bytes_if_exists_bounded", uri).await?;
+        self.latent_fault("read_bytes_if_exists_bounded", uri)?;
+        self.note_persisted_read("read_bytes_if_exists_bounded", uri);
+        // Stale-read replay and `maybe_corrupt` stay text-only: `key_history`
+        // and the corruption helpers are `String`-typed, and a binary body has
+        // no lossless representation there. Every other read fault applies.
+        self.inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await
+    }
     async fn write_text(&self, uri: &str, contents: &str) -> OmniResult<()> {
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
         if let WriteFate::Lost = self.write_fault("write_text", uri, true).await? {
@@ -2879,6 +2926,24 @@ impl StorageAdapter for FailingStorage {
             self.staleness_record(&target, Some(stored.clone()), None);
         }
         self.lose_ack("write_text", uri, out).await
+    }
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> OmniResult<()> {
+        let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
+        if let WriteFate::Lost = self.write_fault("write_bytes", uri, true).await? {
+            return Ok(());
+        }
+        let target = match self.maybe_misdirect("write_bytes", uri) {
+            Some(t) => t,
+            None => uri.to_string(),
+        };
+        // Write corruption and the staleness history stay text-only (see
+        // `read_bytes_if_exists_bounded`): both are `String`-typed. Kill,
+        // write faults, misdirection, completion counting and ack loss apply.
+        let out = self.inner.write_bytes(&target, contents).await;
+        if out.is_ok() {
+            self.count_completion("write_bytes", uri);
+        }
+        self.lose_ack("write_bytes", uri, out).await
     }
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> OmniResult<bool> {
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
@@ -5580,8 +5645,20 @@ pub fn run_universe_caught(
                         // Stale-capture rule on
                         // [`resolve_keep_serving_watch`]: re-derive the
                         // merge prediction from the post-ruling model for
-                        // every judgment of THIS op below.
-                        let expected_conflict = if watch_resolved {
+                        // every judgment of THIS op below — only when the
+                        // resolution did NOT judge this op. A judged
+                        // interrupt's fate is final (exactly-once contract
+                        // on [`WatchRuling::e_outcome`]): every judgment
+                        // below legalizes a judged interrupt before the
+                        // merge-conflict member reads the flag (typed
+                        // `RecoveryRequired`, marked, or damage-attributed
+                        // failures), and the ruling's world already
+                        // holds the op's OWN effect, so re-predicting a
+                        // `BranchMerge` the ruling folded would meet the
+                        // merge-and-close sentinel in
+                        // `expects_merge_conflict` (specimen seed 24, op10:
+                        // the interrupting op is the merge, matched `E+A`).
+                        let expected_conflict = if watch_resolved && interrupt_judged.is_none() {
                             expects_merge_conflict(&world, &wop)
                         } else {
                             expected_conflict

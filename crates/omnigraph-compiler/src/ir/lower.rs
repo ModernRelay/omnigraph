@@ -8,6 +8,29 @@ use crate::types::{Direction, PropType, ScalarType};
 
 use super::*;
 
+/// Fresh synthetic variable names for one query, shared across negation
+/// inners (their pipelines run over the outer batch, so a name must be
+/// unique query-wide). The executor names every column `<var>.<prop>` and
+/// never reconciles two producers of one variable (#605), so each anonymous
+/// `_` endpoint and each cycle-closing temp gets its own name.
+#[derive(Default)]
+struct FreshNames {
+    anon: usize,
+    temp: usize,
+}
+
+impl FreshNames {
+    fn anon(&mut self) -> String {
+        self.anon += 1;
+        format!("__anon_{}", self.anon)
+    }
+
+    fn temp(&mut self, dst: &str) -> String {
+        self.temp += 1;
+        format!("__temp_{}_{}", dst, self.temp)
+    }
+}
+
 pub fn lower_query(
     catalog: &Catalog,
     query: &QueryDecl,
@@ -31,6 +54,7 @@ pub fn lower_query(
 
     let mut pipeline = Vec::new();
     let mut bound_vars = HashSet::new();
+    let mut fresh = FreshNames::default();
 
     lower_clauses(
         catalog,
@@ -40,6 +64,7 @@ pub fn lower_query(
         &mut bound_vars,
         &param_names,
         &param_types,
+        &mut fresh,
     )?;
 
     let return_exprs: Vec<IRProjection> = query
@@ -60,14 +85,16 @@ pub fn lower_query(
         })
         .collect();
 
-    Ok(QueryIR {
+    let ir = QueryIR {
         name: query.name.clone(),
         params: query.params.clone(),
         pipeline,
         return_exprs,
         order_by,
         limit: query.limit,
-    })
+    };
+    super::validate::validate_query(&ir)?;
+    Ok(ir)
 }
 
 pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
@@ -142,6 +169,7 @@ fn lower_clauses(
     bound_vars: &mut HashSet<String>,
     param_names: &HashSet<String>,
     param_types: &HashMap<String, PropType>,
+    fresh: &mut FreshNames,
 ) -> Result<()> {
     // Separate clause types for ordering: bindings first, then traversals, then filters
     let mut bindings = Vec::new();
@@ -225,6 +253,12 @@ fn lower_clauses(
     // Build deferred filters map for variables introduced by traversals
     let mut deferred_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
 
+    // A variable bound again after its first binding (`$p: Person` twice in
+    // one match, or inside `not { }` over an outer `$p`): the typechecker
+    // admits it as the same type, so it is a constraint on the existing
+    // rows, not a second scan. Its inline filters become plain Filter ops.
+    let mut rebind_filters: Vec<IRFilter> = Vec::new();
+
     // Lower bindings into NodeScan ops (skip deferred ones)
     for binding in &bindings {
         let node_type = catalog
@@ -234,11 +268,24 @@ fn lower_clauses(
 
         let binding_filters = build_binding_filters(binding, node_type, param_names);
 
+        // A variable the outer pattern already bound (a negation's inner
+        // clauses run over the outer batch) is never deferred, whatever its
+        // place in the component walk: deferred filters are emitted by the
+        // Expand that introduces a variable, and nothing introduces this one
+        // again, so they would be lost (#605).
+        if bound_vars.contains(&binding.variable) {
+            rebind_filters.extend(binding_filters);
+            continue;
+        }
+
         if deferred_set.contains(&binding.variable) {
             // Save filters for emission after the Expand that introduces
             // this variable.
             if !binding_filters.is_empty() {
-                deferred_filters.insert(binding.variable.clone(), binding_filters);
+                deferred_filters
+                    .entry(binding.variable.clone())
+                    .or_default()
+                    .extend(binding_filters);
             }
             continue;
         }
@@ -307,7 +354,8 @@ fn lower_clauses(
 
             if src_bound && dst_bound {
                 // Cycle closing: expand to a temp var, then filter temp.id = dst.id
-                let temp_var = format!("__temp_{}", traversal.dst);
+                // (temp fresh per traversal, #605).
+                let temp_var = fresh.temp(&traversal.dst);
                 pipeline.push(IROp::Expand {
                     src_var: traversal.src.clone(),
                     dst_var: temp_var.clone(),
@@ -349,9 +397,14 @@ fn lower_clauses(
                 };
                 let introduced_filters =
                     deferred_filters.remove(&traversal.src).unwrap_or_default();
+                let dst_var = if traversal.src == "_" {
+                    fresh.anon()
+                } else {
+                    traversal.src.clone()
+                };
                 pipeline.push(IROp::Expand {
                     src_var: traversal.dst.clone(),
-                    dst_var: traversal.src.clone(),
+                    dst_var,
                     edge_type: edge.name.clone(),
                     direction: reverse_dir,
                     dst_type: src_type,
@@ -368,12 +421,18 @@ fn lower_clauses(
                     bound_vars.insert(traversal.src.clone());
                 }
             } else {
-                // Normal expand: src is bound, dst is not.
+                // Normal expand: src is bound, dst is not (an anonymous `_`
+                // destination gets a fresh name per occurrence, #605).
                 let introduced_filters =
                     deferred_filters.remove(&traversal.dst).unwrap_or_default();
+                let dst_var = if traversal.dst == "_" {
+                    fresh.anon()
+                } else {
+                    traversal.dst.clone()
+                };
                 pipeline.push(IROp::Expand {
                     src_var: traversal.src.clone(),
-                    dst_var: traversal.dst.clone(),
+                    dst_var,
                     edge_type: edge.name.clone(),
                     direction,
                     dst_type,
@@ -436,6 +495,11 @@ fn lower_clauses(
         );
     }
 
+    // Re-binding filters run after every variable is introduced, like the
+    // explicit filters below; the executor hoists the pushable ones onto the
+    // introducing scan.
+    pipeline.extend(rebind_filters.into_iter().map(IROp::Filter));
+
     // Lower explicit filters
     for filter in &filters {
         pipeline.push(IROp::Filter(IRFilter {
@@ -460,6 +524,7 @@ fn lower_clauses(
             &mut inner_bound,
             param_names,
             param_types,
+            fresh,
         )?;
 
         pipeline.push(IROp::AntiJoin {

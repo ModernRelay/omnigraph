@@ -34,7 +34,8 @@ Tools that support `@` imports include these automatically:
 - Storage substrate: Lance 11.0.0
 - Workspace: compiler, storage, engine (`omnigraph-engine` package), policy,
   API types, cluster, CLI, server, Azure admission wrapper, benchmark harness,
-  and `omnigraph-dst` (deterministic simulation testing; needs
+  `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
+  test per case), and `omnigraph-dst` (deterministic simulation testing; needs
   `--cfg tokio_unstable`, set by its crate-local `.cargo/config.toml` when
   cargo runs from the crate dir — compiles empty without it)
 - License: MIT
@@ -149,8 +150,22 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 
 - Preserve unrelated work in a dirty tree. Never discard user changes.
 - Make the smallest coherent change that closes the behavior and test surface.
-- For a bug, reproduce the predicted failure in the existing owning suite,
-  then fix the root cause and prove the regression turns green.
+- For a bug, reproduce the predicted failure at the tier the regression rule
+  below names, then fix the root cause and prove the regression turns green.
+- Query-behavior tests default to `.gqt` logic tests under
+  `crates/omnigraph-gqt/cases/`; a Rust test needs a reason the
+  logic test format cannot express (mechanism assertions, scale symptoms,
+  process environment, concurrency).
+- Every issue fix lands a regression test at the cheapest tier that catches
+  the defect: a `.gqt` logic test when the defect is visible in rows, counts,
+  or errors, a `_issue_NNN` Rust test when it needs mechanism or scale
+  assertions; when the reported symptom additionally needs scale to
+  manifest, a second `#[ignore]`d test in a `tests/repro_issue_*.rs` target
+  guards it, and the two cross-reference each other in comments.
+- Every `#[ignore]`d test opens its ignore message with its species
+  (`instrument:`, `hunt:`, `heavy-repro:`, or the environment it needs);
+  expensive regression repros use `heavy-repro:` and thereby enroll in the
+  nightly job.
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries

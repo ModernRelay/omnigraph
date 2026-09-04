@@ -101,7 +101,8 @@ const RANKED_EDGE_DATA: &str = r#"{"type":"RankedDoc","data":{"slug":"rank-1","e
 {"edge":"RankedLink","from":"rank-3","to":"sink","data":{"id":"edge-c","label":"C"}}
 {"edge":"RankedLink","from":"rank-2","to":"sink","data":{"id":"edge-b","label":"B"}}
 {"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a2","label":"A2"}}
-{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a1","label":"A1"}}"#;
+{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a1","label":"A1"}}
+{"edge":"RankedLink","from":"sink","to":"rank-3","data":{"id":"edge-d","label":"D"}}"#;
 
 const RANKED_EDGE_QUERIES: &str = r#"
 query nearest_edges($q: Vector(4)) {
@@ -122,6 +123,16 @@ query rrf_edges($q1: Vector(4), $q2: Vector(4)) {
     return { $d.slug, $w.label }
     order { rrf(nearest($d.embedding, $q1), nearest($d.embedding, $q2)) }
     limit 4
+}
+
+query nearest_hops($q: Vector(4)) {
+    match {
+        $d: RankedDoc
+        $d rankedLink{1,2} $target
+    }
+    return { $d.slug, $target.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
 }
 "#;
 
@@ -724,6 +735,131 @@ async fn filtered_nearest_clause_spelling_prefilters_like_inline() {
     assert_filtered_nearest_returns_hits("filtered_nearest_clause_range").await;
 }
 
+/// The engine's maximum-only IVF guard must not lower the requested candidate
+/// count. A short standalone scan and each short RRF vector arm retry without
+/// a maximum. The graph-level optimize path creates the multi-partition shape
+/// here, so this covers the real engine scanner rather than only Lance's API.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_bounded_nearest_and_rrf_retry_after_optimized_ivf_underfill() {
+    const ROWS: usize = 20_000;
+
+    fn rows() -> String {
+        (0..ROWS)
+            .map(|row| {
+                let keep = row >= 19_000;
+                let drop = (16_000..19_000).contains(&row);
+                format!(
+                    r#"{{"type":"Doc","data":{{"slug":"n{row:05}","keep":{keep},"drop":{drop},"embedding":[{row}.0,0.0,0.0,0.0]}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    let schema = r#"
+node Doc {
+    slug: String @key
+    keep: Bool @index
+    drop: Bool @index
+    embedding: Vector(4) @index
+}
+"#;
+    let queries = r#"
+query filtered_nearest($q: Vector(4)) {
+    match { $d: Doc { keep: true } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+
+query rrf_all($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $q)) }
+    limit 17000
+}
+"#;
+    let delete_query = r#"
+query delete_middle() {
+    delete Doc where drop = true
+}
+"#;
+
+    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, &rows(), LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+    let deleted = mutate_main(&mut db, delete_query, "delete_middle", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(deleted.affected_nodes, 3_000);
+    db.optimize().await.unwrap();
+
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "filtered_nearest",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.num_rows(), 10);
+    assert_eq!(
+        probes
+            .ann_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a short bounded nearest scan must retry without a maximum"
+    );
+    assert_eq!(
+        probes
+            .ann_max_nprobes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the effective retry plan must record maximum_nprobes=None"
+    );
+    assert_eq!(
+        result_slugs(&result),
+        (19_000..19_010)
+            .map(|row| format!("n{row:05}"))
+            .collect::<Vec<_>>()
+    );
+
+    let rrf_probes = QueryIoProbes::default();
+    let rrf = with_query_io_probes(rrf_probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "rrf_all",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rrf.num_rows(),
+        ROWS - 3_000,
+        "RRF retries must preserve every available candidate"
+    );
+    assert_eq!(
+        rrf_probes
+            .ann_uncapped_retries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "both short nearest arms must retry independently"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn nearest_returns_k_closest() {
@@ -1079,8 +1215,8 @@ async fn bm25_returns_ranked_results() {
 
 // Full rank-ORDER golden (not just top-1 / non-empty): pins ranks 2..k so a
 // regression corrupting the tail or reversing the sort direction fails loudly.
-// nearest skips apply_ordering (is_search_ordered) and returns Lance native
-// order, so result_slugs row order == rank order.
+// Search-ordered plans sort on the appended `_distance` column with the id
+// tie-break, so result_slugs row order == rank order.
 #[tokio::test]
 #[serial]
 async fn nearest_full_rank_order() {
@@ -1114,10 +1250,17 @@ async fn bm25_full_rank_order() {
     )
     .await
     .unwrap();
-    // Descending BM25 score order.
+    // All three matches tie on BM25 score here (each doc matches the query
+    // term once per title over similar lengths, and their `_score` values are
+    // equal — print `_score` to re-verify), so this golden pins the
+    // equal-score contract: the
+    // deterministic id tie-break. If a Lance scoring change breaks the tie,
+    // this expectation changes meaning — re-probe before updating it. The
+    // distinct-score ordering itself is pinned by
+    // `bm25_distinct_scores_rank_descending`.
     assert_eq!(
         result_slugs(&result),
-        vec!["rl-intro", "ml-intro", "dl-basics"]
+        vec!["dl-basics", "ml-intro", "rl-intro"]
     );
 }
 
@@ -1144,6 +1287,114 @@ async fn nearest_rank_survives_bound_edge_fanout() {
             ("rank-3".to_string(), "C".to_string()),
         ],
         "edge-table storage order must not replace the incoming ANN rank"
+    );
+}
+
+// Multi-hop regression for the hop-major BFS (PR #544 review finding 1): the
+// unified core emits every seed's hop 1 before any seed's hop 2, so without
+// the `_distance` sort the final `limit 2` would return (rank-1, sink),
+// (rank-2, sink) instead of both rows of the best-ranked seed. The two
+// surviving rows tie on `_distance`, so their relative order is the id
+// tie-break and deliberately unasserted here. Covers the `_distance` asc leg;
+// `_score` desc runs the same branch and is pinned single-hop by
+// `bm25_distinct_scores_rank_descending`.
+#[tokio::test]
+#[serial]
+async fn nearest_rank_survives_multi_hop_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_ranked_edge_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        RANKED_EDGE_QUERIES,
+        "nearest_hops",
+        &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+
+    let rows = first_two_strings(&result);
+    assert_eq!(rows.len(), 2, "limit 2 must return exactly two rows");
+    assert!(
+        rows.iter().all(|(d, _)| d == "rank-1"),
+        "both top rows must come from the best-ranked seed, got {rows:?}"
+    );
+    let targets: std::collections::HashSet<&str> =
+        rows.iter().map(|(_, target)| target.as_str()).collect();
+    assert_eq!(
+        targets,
+        std::collections::HashSet::from(["sink", "rank-3"]),
+        "the best seed's hop-1 and hop-2 reach must both survive the limit"
+    );
+}
+
+// Secondary order keys after the search function are honored: on the all-tie
+// bm25 fixture the user's `$d.slug desc` must decide the order (reverse of
+// the id tie-break, which only applies after all user keys).
+#[tokio::test]
+#[serial]
+async fn search_order_secondary_keys_are_honored() {
+    const QUERY: &str = r#"
+query bm25_then_slug($q: String) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { bm25($d.title, $q), $d.slug desc }
+    limit 3
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        QUERY,
+        "bm25_then_slug",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result_slugs(&result),
+        vec!["rl-intro", "ml-intro", "dl-basics"],
+        "tied scores must fall to the user's secondary key, not the id tie-break"
+    );
+}
+
+// Distinct-score descending golden: BM25 term-frequency monotonicity gives
+// three strictly different scores (1x/2x/3x "tensor"), so this pins the
+// score ordering itself — the tie-break golden above structurally cannot
+// (its scores are equal). Slugs are chosen so the id tie-break order (n1,
+// n2, n3) is the REVERSE of score order: a broken score sort cannot pass.
+#[tokio::test]
+#[serial]
+async fn bm25_distinct_scores_rank_descending() {
+    const SCHEMA: &str = r#"
+node Note {
+    slug: String @key
+    body: String @index
+}
+"#;
+    const DATA: &str = r#"{"type":"Note","data":{"slug":"n1","body":"tensor"}}
+{"type":"Note","data":{"slug":"n2","body":"tensor tensor"}}
+{"type":"Note","data":{"slug":"n3","body":"tensor tensor tensor"}}"#;
+    const QUERY: &str = r#"
+query bm25_ranked($q: String) {
+    match { $n: Note }
+    return { $n.slug }
+    order { bm25($n.body, $q) }
+    limit 3
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+    let result = query_main(&mut db, QUERY, "bm25_ranked", &params(&[("$q", "tensor")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        result_slugs(&result),
+        vec!["n3", "n2", "n1"],
+        "descending BM25 score order must beat the id tie-break"
     );
 }
 
@@ -1306,17 +1557,25 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
     db.ensure_indices().await.unwrap();
     let mut db = db;
 
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+    // This test pins the POSTFILTER plan's invariants (uncapped one-pass
+    // corpus-wide arms). Force that plan: un-forced, the assertion couples
+    // to the prefilter gate's threshold (4/20 eligible merely happens to
+    // exceed the default ratio), and a retune or ambient OMNIGRAPH_RRF_PLAN
+    // would flip it with a misleading cap-regression message.
     let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(probes.clone(), async {
-        query_main(
-            &mut db,
-            UNDERFILL_RRF_QUERY,
-            "recall_rrf",
-            &params(&[("$q", "needle")]),
-        )
-        .await
-    })
+    let result = with_query_io_probes(
+        probes.clone(),
+        with_rrf_plan("force_postfilter", async {
+            query_main(
+                &mut db,
+                UNDERFILL_RRF_QUERY,
+                "recall_rrf",
+                &params(&[("$q", "needle")]),
+            )
+            .await
+        }),
+    )
     .await
     .unwrap();
 
@@ -1363,17 +1622,23 @@ async fn rrf_decoy_flood_does_not_flip_the_fused_winner() {
     db.ensure_indices().await.unwrap();
     let mut db = db;
 
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+    // Pins the POSTFILTER plan (see rrf_arms_scan_uncapped_in_one_pass for
+    // why the plan is forced); the gate's decoy-flood acceptance under BOTH
+    // plans lives in tests/rrf_prefilter_gate.rs.
     let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(probes.clone(), async {
-        query_main(
-            &mut db,
-            STARVATION_RRF_QUERY,
-            "recall_two_terms",
-            &params(&[("$q1", "alpha"), ("$q2", "beta")]),
-        )
-        .await
-    })
+    let result = with_query_io_probes(
+        probes.clone(),
+        with_rrf_plan("force_postfilter", async {
+            query_main(
+                &mut db,
+                STARVATION_RRF_QUERY,
+                "recall_two_terms",
+                &params(&[("$q1", "alpha"), ("$q2", "beta")]),
+            )
+            .await
+        }),
+    )
     .await
     .unwrap();
 
@@ -1396,6 +1661,103 @@ async fn rrf_decoy_flood_does_not_flip_the_fused_winner() {
             .load(std::sync::atomic::Ordering::Relaxed),
         0,
         "rrf arms are uncapped, so no under-fill retry may arise"
+    );
+}
+
+/// The capped scan's prefix claim ("the capped rows are the uncapped scan's
+/// leading rows") on a PARTIALLY covered FTS index — rows appended after the
+/// index build are scored by a batch-derived scorer rather than the
+/// index-global statistics, and every other cap test runs fully covered.
+/// The appended chunks carry the highest term frequency, so they must win
+/// both runs: agreement here pins that the capped `FullTextSearchQuery`
+/// limit still yields the global top-k when covered and uncovered fragments
+/// mix. Join-free on purpose: no traversal means no under-fill retry, so
+/// the capped pass itself is what answers.
+#[tokio::test]
+#[serial]
+async fn capped_bm25_matches_uncapped_prefix_on_partially_covered_index() {
+    const PREFIX_QUERIES: &str = r#"
+query capped($q: String) {
+    match {
+        $c: Chunk
+        search($c.text, $q)
+    }
+    return { $c.slug }
+    order { bm25($c.text, $q) }
+    limit 2
+}
+
+query uncapped_all($q: String) {
+    match {
+        $c: Chunk
+        search($c.text, $q)
+    }
+    return { $c.slug }
+    order { bm25($c.text, $q) }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
+    load_jsonl(&db, &underfill_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    // Appended AFTER the index build: their fragment is uncovered, and their
+    // term frequency (40 > the seed's max 20) puts them at the top of any
+    // correct ranking.
+    let appended = (0..3)
+        .map(|extra| {
+            let needle = vec!["needle"; 40 - extra].join(" ");
+            format!(
+                r#"{{"type":"Chunk","data":{{"slug":"late-{extra}","text":"{needle} filler"}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    load_jsonl(&db, &appended, LoadMode::Append).await.unwrap();
+    let mut db = db;
+
+    let capped = query_main(
+        &mut db,
+        PREFIX_QUERIES,
+        "capped",
+        &params(&[("$q", "needle")]),
+    )
+    .await
+    .unwrap();
+    let uncapped = query_main(
+        &mut db,
+        PREFIX_QUERIES,
+        "uncapped_all",
+        &params(&[("$q", "needle")]),
+    )
+    .await
+    .unwrap();
+
+    let capped_slugs = result_slugs(&capped);
+    let uncapped_slugs = result_slugs(&uncapped);
+    assert_eq!(
+        uncapped_slugs.len(),
+        23,
+        "the uncapped scan must rank every matching chunk, appended included"
+    );
+    assert_eq!(
+        capped_slugs,
+        uncapped_slugs[..2].to_vec(),
+        "the capped run must return the uncapped ranking's prefix even when \
+         covered and uncovered fragments mix"
+    );
+    // Observed (and deliberately NOT pinned as a golden): the uncovered
+    // rows' batch-derived scores rank BELOW the index-scored rows here
+    // despite double the term frequency — the two scorers are not on one
+    // scale. That cross-domain incomparability is exactly why the rrf
+    // prefilter gate refuses its selective plan on partial coverage; this
+    // test only pins that capped and uncapped runs agree on whatever the
+    // mixed scoring produces.
+    assert!(
+        uncapped_slugs.iter().any(|slug| slug.starts_with("late-")),
+        "the appended uncovered-fragment chunks must still match and rank somewhere"
     );
 }
 

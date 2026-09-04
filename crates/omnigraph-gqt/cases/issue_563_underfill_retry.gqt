@@ -1,0 +1,68 @@
+# issue: 563
+# red_on: 2026-08-28, retry disabled: the capped 8-row scan window held no edge-bearing chunk and the query returned 0 rows instead of 2.
+# notes: chunks 8..=11 carry the only edges; the limit 2 x 4 = 8-row cap
+# notes: window (either scan direction) excludes them, so filling the limit proves
+# notes: the uncapped retry ran. Passes on pre-cap code too (an unbounded scan
+# notes: finds everything): this case guards the retry GIVEN the cap, not the cap
+# notes: itself; the cap is the aggregate case's job. Rust twin:
+# notes: bm25_join_fills_limit_when_capped_scan_underfills_issue_563 (crates/omnigraph/tests/search.rs).
+
+--- schema
+node Chunk {
+    slug: String @key
+    text: String @index
+}
+
+node Artifact {
+    slug: String @key
+}
+
+edge ChunkOfArtifact: Chunk -> Artifact {
+    label: String
+}
+
+--- seed
+{"type":"Artifact","data":{"slug":"art-0"}}
+{"type":"Chunk","data":{"slug":"chunk-00","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-01","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-02","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-03","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-04","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-05","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-06","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-07","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-08","text":"needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-09","text":"needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-10","text":"needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-11","text":"needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-12","text":"needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-13","text":"needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-14","text":"needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-15","text":"needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-16","text":"needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-17","text":"needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-18","text":"needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-19","text":"needle filler"}}
+{"edge":"ChunkOfArtifact","from":"chunk-08","to":"art-0","data":{"id":"e-08","label":"of"}}
+{"edge":"ChunkOfArtifact","from":"chunk-09","to":"art-0","data":{"id":"e-09","label":"of"}}
+{"edge":"ChunkOfArtifact","from":"chunk-10","to":"art-0","data":{"id":"e-10","label":"of"}}
+{"edge":"ChunkOfArtifact","from":"chunk-11","to":"art-0","data":{"id":"e-11","label":"of"}}
+
+--- query
+query recall($q: String) {
+    match {
+        $c: Chunk
+        $c chunkOfArtifact $a
+        search($c.text, $q)
+    }
+    return { $c.slug, $a.slug }
+    order { bm25($c.text, $q) }
+    limit 2
+}
+
+--- params
+{"q": "needle"}
+
+--- expect ordered
+{"c.slug": "chunk-08", "a.slug": "art-0"}
+{"c.slug": "chunk-09", "a.slug": "art-0"}

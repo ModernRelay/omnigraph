@@ -65,9 +65,19 @@ BTREE is priced as a full edge scan per hop. `choose_expand_mode` and
 | `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS` | `6` | A larger effective maximum hop count always selects CSR before the cost comparison. |
 | `OMNIGRAPH_TRAVERSAL_MODE` | unset | `indexed` forces per-hop BTREE scans; `csr` forces the in-memory path. |
 
-The two numeric settings are dispatch caps, not result limits or mid-traversal
-cutoffs. A missing or nonnumeric value uses its default; a zero hop cap also
-uses the default. Both execution paths have identical query semantics, so the
+The hop cap is a dispatch cap (the hop count is fully known at dispatch). A
+missing or nonnumeric value uses its default; a zero hop cap also uses the
+default.
+
+The frontier ceiling additionally binds execution: the cost decision reruns at
+every indexed hop with the observed frontier, and a traversal that outgrows
+the ceiling or the projected cost switches to CSR mid-flight, carrying its
+visited state. `optimize` persists the built CSR/CSC to
+`__graph_index/csr-current.bin` (format v2: self-describing sections inside a
+digested payload); loads verify per-edge identity stamps and fall open to the
+in-memory scan build, and the runtime cache shares one decoded artifact across
+scoped requests with per-request freshness checks. Both execution paths have
+identical query semantics, so the
 mode override is an operational escape hatch and test seam only.
 
 ## Filters and pushdown

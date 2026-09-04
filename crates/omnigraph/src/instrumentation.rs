@@ -21,8 +21,8 @@
 //! module stays generic over the `lance::io`-re-exported trait, so it adds no
 //! production dependency.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -109,6 +109,22 @@ pub struct QueryIoProbes {
     /// path). A cost test asserts a fresh branch whose edge tables are unchanged
     /// from main reuses main's cached index (0 builds) rather than rebuilding it.
     pub graph_build_count: Arc<AtomicU64>,
+    /// Mid-traversal Indexed→CSR switches (the per-hop re-decision firing).
+    /// Lets the switch tests assert the mechanism actually ran — mode
+    /// equivalence alone stays green with the switch disabled.
+    pub traversal_mid_switches: Arc<AtomicU64>,
+    /// Path commitments per Expand: the indexed scan, the CSR walk chosen up
+    /// front, or the CSR walk switched to mid-traversal (an Expand that
+    /// switches counts once on each). A logic test pinned with
+    /// `# traversal:` asserts the other path's counter stayed zero and, for
+    /// a query that expands, the pinned one moved: the pin is a task-local
+    /// override, and mode equivalence alone cannot see a pin the executor
+    /// ignored or a scope that dropped it.
+    pub expand_indexed_runs: Arc<AtomicU64>,
+    pub expand_csr_runs: Arc<AtomicU64>,
+    /// Expand emissions stopped early by a pushed-down `limit` cap. Same
+    /// rationale: capped-subset validity alone cannot prove the cap fired.
+    pub expand_cap_stops: Arc<AtomicU64>,
     /// Edge tables included in topology builds this query (summed over build
     /// invocations). A cost test asserts a query referencing one edge builds only
     /// that edge, not every catalog edge (the cold-build shrink A2 ships).
@@ -172,6 +188,74 @@ pub struct QueryIoProbes {
     /// regression changes this count while every result assertion still
     /// passes.
     pub bm25_scan_rows: Arc<AtomicU64>,
+    /// Uncapped retries taken after a maximum-bounded ANN scan under-filled
+    /// its requested candidate count. Includes standalone nearest queries and
+    /// individual RRF nearest arms.
+    pub ann_uncapped_retries: Arc<AtomicU64>,
+    /// Effective maximum probe budget recorded by the most recent ANN scan.
+    /// Zero represents Lance's `None` (the uncapped retry).
+    pub ann_max_nprobes: Arc<AtomicU64>,
+    /// Plan verdicts recorded by the rrf prefilter gate
+    /// (`execute_rrf_fusion`), one per rrf execution in scope order. The
+    /// gate's two plans are answer-identical by design, so a gate that
+    /// silently always falls back to postfilter passes every result-level
+    /// test — admission and fence tests assert on this probe instead.
+    pub rrf_gate_verdicts: Arc<Mutex<Vec<RrfGateVerdict>>>,
+}
+
+/// The two candidate plans of the rrf prefilter gate. Over FTS-index-covered
+/// data and up to BM25 score ties they are answer-identical — the eligible-set
+/// cardinality decides cost only (`execute_rrf_fusion`'s gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RrfGatePlan {
+    /// Selective plan: the uncapped bm25 arms rank only the traversal's
+    /// eligible ids (`id IN (...)` under `prefilter(true)`).
+    Prefilter,
+    /// Broad plan: the uncapped corpus-wide arms (v0.9 rrf semantics).
+    Postfilter,
+}
+
+/// Why the gate ran the postfilter plan. `None` on the verdict means the
+/// prefilter plan won naturally (or was forced).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RrfGateFallback {
+    /// Eligible set too large for the ratio or absolute-id-count threshold.
+    Threshold,
+    /// Query shape outside the admission table (no top-level Expand
+    /// constrains the ranked variable, the ranked variable is an Expand dst,
+    /// arms target different variables, or no bm25 arm exists).
+    Shape,
+    /// The ranked table's FTS index does not cover every fragment, so a
+    /// prefilter mask could change BM25 scores (filter-dependent scoring of
+    /// uncovered fragments) — a correctness fence, never overridden.
+    Coverage,
+    /// The graph index could not be built or is misaligned; a query must
+    /// never fail because an optimization could not start.
+    BuildErr,
+    /// The eligible set is empty: the postfilter plan yields the same empty
+    /// join and `IN ()` edge semantics never arise (correctness fence).
+    EmptyEligible,
+    /// `OMNIGRAPH_RRF_PLAN=force_postfilter` (or the scoped override) chose.
+    Forced,
+}
+
+/// One rrf prefilter-gate decision, recorded via the `rrf_gate_verdicts`
+/// probe. `eligible`/`corpus` are `None` when the gate fell back before
+/// counting (forced postfilter, shape, coverage, build error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RrfGateVerdict {
+    pub plan: RrfGatePlan,
+    pub fallback: Option<RrfGateFallback>,
+    /// A force was active for this decision (the threshold was not
+    /// consulted). NOT "the force won": a forced prefilter can still fall
+    /// back at a correctness fence — then `plan` is `Postfilter`, `fallback`
+    /// names the fence, and this stays `true`.
+    pub forced: bool,
+    /// |eligible| from the CSR degree walk (count only — ids are not built
+    /// unless the prefilter plan is chosen).
+    pub eligible: Option<u64>,
+    /// The ranked node type's manifest-resident `entity_count`.
+    pub corpus: Option<u64>,
 }
 
 tokio::task_local! {
@@ -215,6 +299,61 @@ where
 /// production (no scope installed), so the env var is consulted instead.
 pub(crate) fn traversal_mode_override() -> Option<&'static str> {
     TRAVERSAL_MODE_OVERRIDE.try_with(|m| *m).ok().flatten()
+}
+
+tokio::task_local! {
+    static RRF_PLAN_OVERRIDE: Option<&'static str>;
+}
+
+/// Force the rrf prefilter gate's plan (`"force_prefilter"` |
+/// `"force_postfilter"`) for the scope of `fut` WITHOUT mutating the
+/// process-global `OMNIGRAPH_RRF_PLAN` env var. Mirrors
+/// [`with_traversal_mode`]: scope-bound (cannot leak) and process-safe (a
+/// forced-plan test never affects a concurrent test in the same binary). The
+/// force overrides only the gate's THRESHOLD decision, never a correctness
+/// fence — a forced-prefilter query rejected by a fence (shape, coverage,
+/// build error, empty eligible set) runs postfilter, and the
+/// `rrf_gate_verdicts` probe records why.
+pub async fn with_rrf_plan<F>(mode: &'static str, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    RRF_PLAN_OVERRIDE.scope(Some(mode), fut).await
+}
+
+/// The scoped rrf-plan override active for this task, if any. `None` in
+/// production (no scope installed), so the env var is consulted instead.
+pub(crate) fn rrf_plan_override() -> Option<&'static str> {
+    RRF_PLAN_OVERRIDE.try_with(|m| *m).ok().flatten()
+}
+
+#[cfg(debug_assertions)]
+tokio::task_local! {
+    static RRF_GATE_SUBSET_DROP: Option<String>;
+}
+
+/// RED CONTROL ONLY: drop `id` from the rrf prefilter gate's materialized
+/// eligible-id set for the scope of `fut` — a deliberate violation of the
+/// gate's superset rule (single owner: `exec::query::rrf_prefilter_gate`'s
+/// invariant doc; a subset changes answers). The differential oracle uses
+/// this to prove its equivalence relation can turn red: dropping one
+/// surviving id MUST make the forced-prefilter and forced-postfilter
+/// answers differ, or the oracle is vacuous. `cfg(debug_assertions)`: an
+/// answer-corrupting API must not exist in release binaries — dev-profile
+/// test runs (where the red control lives) keep it.
+#[cfg(debug_assertions)]
+pub async fn with_rrf_gate_subset_drop<F>(id: String, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    RRF_GATE_SUBSET_DROP.scope(Some(id), fut).await
+}
+
+/// The scoped subset-drop red control active for this task, if any. `None`
+/// in production (no scope installed).
+#[cfg(debug_assertions)]
+pub(crate) fn rrf_gate_subset_drop() -> Option<String> {
+    RRF_GATE_SUBSET_DROP.try_with(|m| m.clone()).ok().flatten()
 }
 
 tokio::task_local! {
@@ -415,6 +554,31 @@ pub(crate) fn record_graph_build(edges: usize) {
     });
 }
 
+/// Record one mid-traversal Indexed→CSR switch. No-op when no probes are
+/// installed (production).
+pub(crate) fn record_traversal_mid_switch() {
+    let _ = current(|p| p.traversal_mid_switches.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record which path one Expand ran (`indexed` true = the indexed scan,
+/// false = the CSR walk). No-op when no probes are installed (production).
+pub(crate) fn record_expand_path(indexed: bool) {
+    let _ = current(|p| {
+        let counter = if indexed {
+            &p.expand_indexed_runs
+        } else {
+            &p.expand_csr_runs
+        };
+        counter.fetch_add(1, Ordering::Relaxed)
+    });
+}
+
+/// Record one Expand stopping early at its pushed-down limit cap. No-op when
+/// no probes are installed (production).
+pub(crate) fn record_expand_cap_stop() {
+    let _ = current(|p| p.expand_cap_stops.fetch_add(1, Ordering::Relaxed));
+}
+
 /// Record `n` IR filters lowered into a scan-level `filter_expr`. No-op when
 /// no probes are installed (production) and when nothing was pushed.
 pub(crate) fn record_pushed_filter_exprs(n: u64) {
@@ -439,6 +603,33 @@ pub(crate) fn record_bm25_uncapped_retry() {
 /// installed (production).
 pub(crate) fn record_bm25_scan_rows(rows: u64) {
     let _ = current(|p| p.bm25_scan_rows.fetch_add(rows, Ordering::Relaxed));
+}
+
+/// Record the effective ANN maximum. No-op when no probes are installed.
+pub(crate) fn record_ann_probe_budget(maximum: Option<usize>) {
+    let _ = current(|p| {
+        p.ann_max_nprobes
+            .store(maximum.unwrap_or_default() as u64, Ordering::Relaxed);
+    });
+}
+
+/// Record one uncapped ANN retry after a bounded scan under-filled. No-op when
+/// no probes are installed.
+pub(crate) fn record_ann_uncapped_retry() {
+    let _ = current(|p| p.ann_uncapped_retries.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one rrf prefilter-gate verdict. No-op when no probes are installed
+/// (production).
+pub(crate) fn record_rrf_gate_verdict(verdict: RrfGateVerdict) {
+    let _ = current(|p| {
+        // Push through a poisoned lock: dropping verdicts after an unrelated
+        // panic would fail a fence test's `len() == 1` assert confusingly.
+        p.rrf_gate_verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(verdict);
+    });
 }
 
 /// Record `commits` walked into a change-feed poll's first-parent chain. No-op
@@ -626,6 +817,18 @@ pub struct MergeWriteProbes {
     pub ordered_cursor_scan_calls: Arc<AtomicU64>,
     pub ordered_cursor_batch_rows: Arc<AtomicU64>,
     pub ordered_cursor_batch_bytes: Arc<AtomicU64>,
+    /// Bounded row hydrations the two-phase ordered merge cursor performs
+    /// after its narrow key sort: take calls, hydrated rows, and measured
+    /// hydrated bytes. Cost tests use these to prove payload bytes flow
+    /// through bounded takes, never through a SortExec input.
+    pub ordered_cursor_hydration_calls: Arc<AtomicU64>,
+    pub ordered_cursor_hydration_rows: Arc<AtomicU64>,
+    pub ordered_cursor_hydration_bytes: Arc<AtomicU64>,
+    /// Largest retained hydration chunk observed, in measured decoded bytes.
+    /// This is the cursor's per-chunk resident-memory contract: bounded-chunk
+    /// tests assert it stays under the hard hydration ceiling instead of
+    /// scaling with a table's planned row count or row widths.
+    pub ordered_cursor_hydration_max_chunk_bytes: Arc<AtomicU64>,
     /// Projected scalar batches fetched by merge validation before the shared
     /// aggregate-retention budget decides whether each one may be kept.
     pub validation_scan_batches: Arc<AtomicU64>,
@@ -698,6 +901,19 @@ impl MergeWriteProbes {
     }
     pub fn ordered_cursor_batch_bytes(&self) -> u64 {
         self.ordered_cursor_batch_bytes.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_calls(&self) -> u64 {
+        self.ordered_cursor_hydration_calls.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_rows(&self) -> u64 {
+        self.ordered_cursor_hydration_rows.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_bytes(&self) -> u64 {
+        self.ordered_cursor_hydration_bytes.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_max_chunk_bytes(&self) -> u64 {
+        self.ordered_cursor_hydration_max_chunk_bytes
+            .load(Ordering::Relaxed)
     }
     pub fn validation_scan_batches(&self) -> u64 {
         self.validation_scan_batches.load(Ordering::Relaxed)
@@ -915,6 +1131,22 @@ pub(crate) fn record_ordered_cursor_scan(batch_rows: usize, batch_bytes: u64) {
     });
 }
 
+/// Record one bounded hydration take performed by the two-phase ordered merge
+/// cursor, with the measured decoded size of the hydrated chunk. No-op when no
+/// test probe is installed.
+pub(crate) fn record_ordered_cursor_hydration(rows: usize, bytes: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.ordered_cursor_hydration_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.ordered_cursor_hydration_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+        p.ordered_cursor_hydration_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        p.ordered_cursor_hydration_max_chunk_bytes
+            .fetch_max(bytes, Ordering::Relaxed);
+    });
+}
+
 /// Record one projected scalar validation batch before it is charged to the
 /// operation-wide retention budget. No-op when no test probe is installed.
 pub(crate) fn record_merge_validation_batch(projected_bytes: u64) {
@@ -1065,11 +1297,13 @@ pub(crate) async fn open_dataset(
 pub struct StorageReadCounts {
     pub read_text: AtomicU64,
     pub read_text_if_exists: AtomicU64,
+    pub read_bytes_if_exists: AtomicU64,
     pub exists: AtomicU64,
     pub read_text_versioned: AtomicU64,
     pub list_dir: AtomicU64,
     pub mutation_calls: AtomicU64,
     pub write_text: AtomicU64,
+    pub write_bytes: AtomicU64,
     pub delete: AtomicU64,
 }
 
@@ -1079,6 +1313,9 @@ impl StorageReadCounts {
     }
     pub fn read_text_if_exists(&self) -> u64 {
         self.read_text_if_exists.load(Ordering::Relaxed)
+    }
+    pub fn read_bytes_if_exists(&self) -> u64 {
+        self.read_bytes_if_exists.load(Ordering::Relaxed)
     }
     pub fn exists(&self) -> u64 {
         self.exists.load(Ordering::Relaxed)
@@ -1094,6 +1331,9 @@ impl StorageReadCounts {
     }
     pub fn write_text(&self) -> u64 {
         self.write_text.load(Ordering::Relaxed)
+    }
+    pub fn write_bytes(&self) -> u64 {
+        self.write_bytes.load(Ordering::Relaxed)
     }
     pub fn delete(&self) -> u64 {
         self.delete.load(Ordering::Relaxed)
@@ -1152,10 +1392,29 @@ impl StorageAdapter for CountingStorageAdapter {
         self.inner.read_text_if_exists_bounded(uri, max_bytes).await
     }
 
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.counts
+            .read_bytes_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await
+    }
+
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
         self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.counts.write_text.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text(uri, contents).await
+    }
+
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.counts.write_bytes.fetch_add(1, Ordering::Relaxed);
+        self.inner.write_bytes(uri, contents).await
     }
 
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {

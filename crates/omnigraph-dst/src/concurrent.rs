@@ -576,9 +576,23 @@ impl StorageAdapter for WriterKillStorage {
         self.gate("read_text_if_exists_bounded", uri, false)?;
         self.inner.read_text_if_exists_bounded(uri, max_bytes).await
     }
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> omnigraph::error::Result<Option<Vec<u8>>> {
+        self.gate("read_bytes_if_exists_bounded", uri, false)?;
+        self.inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await
+    }
     async fn write_text(&self, uri: &str, contents: &str) -> omnigraph::error::Result<()> {
         self.gate("write_text", uri, true)?;
         self.inner.write_text(uri, contents).await
+    }
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> omnigraph::error::Result<()> {
+        self.gate("write_bytes", uri, true)?;
+        self.inner.write_bytes(uri, contents).await
     }
     async fn write_text_if_absent(
         &self,
@@ -706,9 +720,23 @@ impl StorageAdapter for WriterFaultStorage {
         self.roll("read_text_if_exists_bounded", uri)?;
         self.inner.read_text_if_exists_bounded(uri, max_bytes).await
     }
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> omnigraph::error::Result<Option<Vec<u8>>> {
+        self.roll("read_bytes_if_exists_bounded", uri)?;
+        self.inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await
+    }
     async fn write_text(&self, uri: &str, contents: &str) -> omnigraph::error::Result<()> {
         self.roll("write_text", uri)?;
         self.inner.write_text(uri, contents).await
+    }
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> omnigraph::error::Result<()> {
+        self.roll("write_bytes", uri)?;
+        self.inner.write_bytes(uri, contents).await
     }
     async fn write_text_if_absent(
         &self,
@@ -1163,9 +1191,23 @@ impl StorageAdapter for ScheduledStorage {
         let _turn = self.sched.enter(self.actor);
         self.inner.read_text_if_exists_bounded(uri, max_bytes).await
     }
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> omnigraph::error::Result<Option<Vec<u8>>> {
+        let _turn = self.sched.enter(self.actor);
+        self.inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await
+    }
     async fn write_text(&self, uri: &str, contents: &str) -> omnigraph::error::Result<()> {
         let _turn = self.sched.enter(self.actor);
         self.inner.write_text(uri, contents).await
+    }
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> omnigraph::error::Result<()> {
+        let _turn = self.sched.enter(self.actor);
+        self.inner.write_bytes(uri, contents).await
     }
     async fn write_text_if_absent(
         &self,

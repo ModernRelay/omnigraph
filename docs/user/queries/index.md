@@ -49,9 +49,21 @@ Inside `match { ... }`:
 | `$p.age >= 18` | Apply a filter expression. |
 | `not { $p Blocked $other }` | Keep rows for which the inner pattern has no match. |
 
+Hop counts are shortest-path distances from the start node: `{2,2}` returns the
+nodes exactly two hops away. A node is never re-reached through its own
+self-loop or through a cycle back to it. The start node is returned only
+through its own self-loop, which counts as one hop, never through a cycle.
+
 An unbound traversal has set semantics for endpoint pairs. Binding the edge
 returns one result per matching edge, so parallel edges remain distinct. Edge
 bindings are available only for a single hop.
+
+Each `$_` is a distinct anonymous node: two anonymous traversals from one
+variable are independent, so a source with two neighbours matches two by two
+rows. Binding a variable a second time (`$p: Person` after `$p` is already
+bound, at the top level or inside `not { }`) adds the second binding's
+property matches as constraints on the same rows; it never introduces a
+second `$p`. Variable names beginning with `__` are reserved.
 
 Traversal spelling begins with a lowercase letter (`worksAt` for the declared
 edge `WorksAt`); edge lookup itself is case-insensitive.
@@ -87,6 +99,17 @@ Search expressions are documented in [Search](../search/index.md).
 An explicit order is total and deterministic: OmniGraph adds entity ids as a
 final tie-breaker when user keys are equal. Ascending order places nulls first;
 descending order places them last. `nearest(...)` ordering requires a `limit`.
+
+Search orderings share that contract: `nearest(...)` ranks by ascending vector
+distance and `bm25(...)` by descending relevance score, so the score (never
+any internal scan or traversal order) is what the row order means, including
+through multi-hop traversals. Keys after the search function apply as
+secondary sorts before the id tie-breaker; the search function itself must
+lead the order clause. Aggregated queries are outside search ordering: group
+results are not score-ranked. One bound on the tie-break: a `bm25()` ordering
+with no secondary keys reads a bounded set of top-scoring matches, so among
+rows tied exactly at that bound's cut, which rows enter the result follows
+the scan bound rather than entity ids.
 
 ## Blobs
 

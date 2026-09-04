@@ -1,0 +1,65 @@
+# issue: 563
+# red_on: 2026-08-29, pre-fix build: the bm25 scan cap (limit 2 x 4 = 8 rows) fed count() only the capped window, so total was 8, not 20.
+# notes: an aggregate's value is computed over the matching rows, so the BM25
+# notes: scan cap must never apply to aggregate returns. Rust twin:
+# notes: bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan (crates/omnigraph/tests/search.rs).
+# notes: Seed geometry: 20 chunks all matching "needle", strict tf gradient
+# notes: (tf = 20 - c) so BM25 has a real order with no ties.
+
+--- schema
+node Chunk {
+    slug: String @key
+    text: String @index
+}
+
+node Artifact {
+    slug: String @key
+}
+
+edge ChunkOfArtifact: Chunk -> Artifact {
+    label: String
+}
+
+--- seed
+{"type":"Artifact","data":{"slug":"art-0"}}
+{"type":"Chunk","data":{"slug":"chunk-00","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-01","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-02","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-03","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-04","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-05","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-06","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-07","text":"needle needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-08","text":"needle needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-09","text":"needle needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-10","text":"needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-11","text":"needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-12","text":"needle needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-13","text":"needle needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-14","text":"needle needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-15","text":"needle needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-16","text":"needle needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-17","text":"needle needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-18","text":"needle needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-19","text":"needle filler"}}
+{"edge":"ChunkOfArtifact","from":"chunk-08","to":"art-0","data":{"id":"e-08","label":"of"}}
+{"edge":"ChunkOfArtifact","from":"chunk-09","to":"art-0","data":{"id":"e-09","label":"of"}}
+{"edge":"ChunkOfArtifact","from":"chunk-10","to":"art-0","data":{"id":"e-10","label":"of"}}
+{"edge":"ChunkOfArtifact","from":"chunk-11","to":"art-0","data":{"id":"e-11","label":"of"}}
+
+--- query
+query recall_count($q: String) {
+    match {
+        $c: Chunk
+        search($c.text, $q)
+    }
+    return { count($c) as total }
+    order { bm25($c.text, $q) }
+    limit 2
+}
+
+--- params
+{"q": "needle"}
+
+--- expect unordered
+{"total": 20}
