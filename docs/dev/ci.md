@@ -19,8 +19,9 @@ Branch protection currently requires these reporting contexts:
 - `Fix Regression Gate`
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) runs the `.gqt` logic-test corpus on
-every pull request; `Test Workspace` still picks the same target up post-merge
-inside the full workspace suite. It takes the documentation-only skip the way
+every pull request as its own required context; `Test Workspace` runs the same
+target again inside the full workspace suite, also on every pull request but as
+a reporting context. `GQ Logic Tests` takes the documentation-only skip the way
 the AWS job does and reports success without building; its workflow carries a
 verbatim copy of the `Classify Changes` job under the name
 `Classify Changes (GQ Logic Tests)`, and `scripts/check-classify-copy.py`
@@ -88,16 +89,37 @@ Container entrypoint and Azure deployment-validation jobs test argument composit
 
 ## Full correctness graphs
 
-The full workspace suite does not run on pull requests. It runs after a non-documentation merge to `main`, on release tags, and by manual dispatch:
+The full workspace suite (`Test Workspace`) runs on every non-documentation pull request, on every push to `main`, on release tags, and by manual dispatch. The `main`, tag, and dispatch form (a pull request drops `--no-fail-fast`):
 
 ```bash
 cargo test --workspace --locked --no-fail-fast \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
-This is deliberate latency policy, not a lesser standard. Run the canonical suite locally before merging a risky change or dispatch CI on the branch. A red post-merge `main` is stop-the-line.
+On a pull request it is a reporting context, not a required one
+([branch-protection.md](branch-protection.md)), and it fails fast: wait for
+it to report, and read a red result, before merging. On `main`, tags, and
+dispatch it is the post-merge detection channel and keeps `--no-fail-fast`,
+so every independent failure stays attributable; a red run there is
+stop-the-line. The job compiles in one step (`cargo test --no-run`) and runs
+in the next, so compile and run wall clock read apart in the log.
 
-Independent post-merge/tag/manual jobs own contracts that need special infrastructure:
+The `main` run also seeds the dependency cache that pull requests restore.
+Every `Swatinem/rust-cache` step in `ci.yml`, `gq-logic-tests.yml`, and
+`dst.yml` saves only from `main` (`save-if`): a save from any other ref, a
+pull-request branch or a tag, is restorable by no pull request and only
+evicts shared entries under the repository cache cap. The pull-request-path
+jobs also save when red (`cache-on-failure`): dependency artifacts are valid
+whatever the test verdict, and a red seed run would otherwise leave every
+pull request cold until `main` is green again.
+
+Every Rust job in those three workflows installs the `rust-toolchain.toml`
+pin with a bare `rustup toolchain install`; the rustc version is part of
+every cache key, so the pin is what keeps caches warm across Rust releases.
+The release and publish workflows still build on the floating `stable`
+action and save their caches from the tag ref; they are outside this rule.
+
+The remaining post-merge/tag/manual jobs own contracts that need special infrastructure:
 
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps currently
@@ -109,7 +131,7 @@ Independent post-merge/tag/manual jobs own contracts that need special infrastru
   cluster, server, and CLI owners against a digest-pinned Azurite image, then
   verifies that control objects, Lance data, and the admission object use the
   declared container.
-- **AWS feature** builds and tests `omnigraph-server` with `--features aws`.
+- **AWS feature** builds and tests `omnigraph-server` with `--features aws`; unlike the others it also runs on every pull request, as a required context.
 
 Azure remains a qualification preview. Emulator coverage and the completed
 managed-identity smoke proof do not replace the pending adversarial live-Azure

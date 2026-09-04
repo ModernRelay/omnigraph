@@ -126,11 +126,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
-      - name: Install Rust stable
+      # The `rust-toolchain.toml` pin, not a floating `stable` action (see
+      # the `fmt` job in ci.yml): rustc is part of the cache key.
+      - name: Install pinned toolchain
         if: needs.classify_changes.outputs.run_full_ci == 'true'
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: stable
+        run: rustup toolchain install
 
       - name: Cache Rust build data
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -138,9 +138,9 @@ jobs:
         with:
           workspaces: |
             . -> target
-          # PR runs only restore; saving per-PR caches would evict the
-          # main-branch entries every warm run depends on.
-          save-if: ${{ github.event_name == 'push' }}
+          # Save only from main, red or green (same rule as ci.yml's `lint`).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       - name: Run GQ logic tests
         if: needs.classify_changes.outputs.run_full_ci == 'true'

@@ -140,8 +140,9 @@ Bless refuses cases containing loops (one expect body serves every
 iteration).
 
 CI: the workspace `Test Workspace` job picks the target up automatically
-but does not run on pull requests (`ci.yml`); regressions must be
-exercised before merge, so a per-change job (`GQ Logic Tests`) in a new
+and, since the pull-request tier landed, runs it on pull requests as a
+reporting context (`ci.yml`); regressions must block a merge, and only a
+required context can, so a per-change job (`GQ Logic Tests`) in a new
 workflow file, `.github/workflows/gq-logic-tests.yml`, runs
 `cargo test -p omnigraph-gqt --locked -- --nocapture`
 on every PR. The workflow triggers on push to `main`, `workflow_dispatch`,
@@ -204,13 +205,14 @@ residues, are in the Decision log (2026-09-02). The gate is a diff check, and wh
 execution differs by shape: a corpus shape executes, since the target
 registers and runs every `.gqt` in the corpus, refuses a malformed one, and the
 `GQ Logic Tests` job is required; a Rust shape is a test-attributed
-definition, not a run, since, among Rust test targets, only
-`omnigraph-gqt`'s (the corpus target and its unit tests),
-`Test omnigraph-server --features aws`, and `DST pinned suite`
-(`cargo test -p omnigraph-dst`, `dst.yml`) run on a pull request
-(`Test Workspace` runs post-merge, CI above); a test-attributed `issue_N`
-function inside `crates/omnigraph-gqt/`, `crates/omnigraph-server/`, or
-`crates/omnigraph-dst/` therefore does run, and the
+definition, not a run: the gate consults only the required contexts, and
+among Rust test targets only `omnigraph-gqt`'s (the corpus target and its
+unit tests), `Test omnigraph-server --features aws`, and `DST pinned suite`
+(`cargo test -p omnigraph-dst`, `dst.yml`) run on a pull request as
+required contexts (`Test Workspace` runs every workspace target on the
+pull request too, but as a reporting context, CI above); a test-attributed
+`issue_N` function inside `crates/omnigraph-gqt/`, `crates/omnigraph-server/`,
+or `crates/omnigraph-dst/` therefore runs in a required context, and the
 Rust shape stays a naming check everywhere else, where a defined
 function can besides be `#[ignore]`d or cfg-gated (workspace clippy on
 the pull request refuses an unreferenced private function, not those),
@@ -1097,3 +1099,24 @@ listed in Compatibility and reversibility.
     per-case budget, panic capture, and corpus layout (no foreign entry,
     never empty) each keep one test; the traversal-override and
     foreign-entry tests stay.
+- 2026-09-04, amendment from the CI pull-request-tier PR, after #596 and
+  #607 had merged. Where the body or any earlier entry differs from this
+  entry, this entry holds.
+  - CI (User and operational behavior, Enforcement ladder): `Test
+    Workspace` (`ci.yml`) runs on every pull request that is not
+    documentation-only, as a reporting context, and again after merge, on
+    tags, and by dispatch; every Rust test target in the workspace
+    therefore executes on a pull request. `GQ Logic Tests` stays the
+    required per-PR context for the corpus: it exists because only a
+    required context blocks a merge, no longer because the workspace suite
+    skipped pull requests. The `Fix Regression Gate` is unchanged: a Rust
+    match is still a test-attributed definition check, the gate consults
+    only the required contexts, and whether the matched test asserts the
+    right thing stays with review. Superseded: User and operational
+    behavior "but does not run on pull requests (`ci.yml`); regressions
+    must be exercised before merge" and "(`Test Workspace` runs
+    post-merge, CI above)"; the 2026-09-02 amendment's "(`Test Workspace`
+    runs post-merge)" and its "no Rust test target other than
+    `gq_logic_tests` runs on a pull request" premise; the 2026-09-03
+    amendment's "A pull request runs only the corpus walker and `Test
+    omnigraph-server --features aws`" as a description of what runs.

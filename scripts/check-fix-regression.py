@@ -38,11 +38,11 @@ recognize, Python and shell scripts among them, satisfy it only through
 the `no-repro` label, which a maintainer applies. What a match guarantees
 differs by shape: a corpus match ran green in the required `GQ Logic
 Tests` job; a Rust match is a test-attributed definition or an edit inside
-one, not a run. A pull request runs only the corpus target and the
-`omnigraph-server` aws-feature suite among Rust test targets (`Test
-Workspace` runs post-merge), and workspace clippy refuses an unreferenced
-private function but not an `#[ignore]`d or cfg-gated one, so whether
-that test runs in the suite and asserts the right thing stays with review.
+one, not a run. A pull request runs every workspace test target in `Test
+Workspace`, a reporting context the gate does not consult, and workspace
+clippy refuses an unreferenced private function but not an `#[ignore]`d or
+cfg-gated one, so whether that test runs in the suite and asserts the right
+thing stays with review.
 Comments, strings, and fixture lines mentioning the issue do not count.
 N is always followed by a non-digit or the end. Named residue: a
 definition inside an added block comment or raw string still matches

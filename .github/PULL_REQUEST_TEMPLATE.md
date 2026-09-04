@@ -25,7 +25,7 @@
 ## Local verification
 
 <!-- List the exact commands run and their results. Use "not run" with a reason
-instead of implying that post-merge CI has already provided evidence. -->
+instead of implying that CI has already provided evidence. -->
 
 - `command` — result
 
