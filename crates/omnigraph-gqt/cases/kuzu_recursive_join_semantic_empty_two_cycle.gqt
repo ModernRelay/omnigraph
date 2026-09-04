@@ -1,0 +1,37 @@
+# issue: none
+# notes: kuzu test/test_files/recursive_join/semantic_empty.test, -CASE TwoCycle.
+# notes: -DATASET CSV EMPTY plus in-case DDL, so the schema and rows are inline: CREATE
+# notes: NODE TABLE N(id SERIAL, PRIMARY KEY(id)) -> node N with pk assigned 0,1 in
+# notes: creation order, CREATE REL TABLE R(FROM N TO N) -> edge R, and CREATE
+# notes: (a)-[e]->(b),(b)-[]->(a) -> the two edge rows. a.ID -> $a.pk. Statements 5-9
+# notes: live in __stmt_5 .. __stmt_9, split into their own files because their
+# notes: expectation diverges from Kuzu's walk semantics (Kuzu counts walks, GQ bounds
+# notes: are shortest-path distance). The TRAIL and ACYCLIC statements have no GQ
+# notes: spelling.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node N {
+    pk: I64 @key
+}
+edge R: N -> N
+
+--- seed
+{"type":"N","data":{"pk":0}}
+{"type":"N","data":{"pk":1}}
+{"edge":"R","from":"0","to":"1"}
+{"edge":"R","from":"1","to":"0"}
+
+--- query
+query stmt_4() {
+    match {
+        $a: N
+        $b: N
+        $a r{1,1} $b
+        $a.pk = 0
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 1}

@@ -1,0 +1,397 @@
+# issue: none
+# notes: kuzu test/test_files/cyclic/single_label.test, -CASE CyclicSingleLabel, tinysnb
+# notes: seed. Cycles become traversal clauses over the same variables ($a knows $b + $b
+# notes: knows $a); every variable is bound once. a.ID -> $a.pk; DATE('...') ->
+# notes: date("..."); timestamp('...') -> datetime("...Z"). Statements with arithmetic
+# notes: are not translated. -TEST_FWD_ONLY_REL is a runner knob.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Person {
+    pk: I64 @key
+    fName: String?
+    gender: I64?
+    isStudent: Bool?
+    isWorker: Bool?
+    age: I64?
+    eyeSight: F64?
+    birthdate: Date?
+    workedHours: [I64]?
+    usedNames: [String]?
+    height: F32?
+}
+node Organisation {
+    pk: I64 @key
+    name: String?
+    orgCode: I64?
+    mark: F64?
+    score: I64?
+    history: String?
+    rating: F64?
+}
+edge Knows: Person -> Person {
+    date: Date?
+    meetTime: DateTime?
+    comments: [String]?
+}
+edge StudyAt: Person -> Organisation {
+    year: I64?
+    places: [String]?
+    length: I64?
+    level: I64?
+    code: U64?
+    temperature: U32?
+    ulength: U32?
+    ulevel: U32?
+}
+edge WorkAt: Person -> Organisation {
+    year: I64?
+    grading: [F64]?
+    rating: F32?
+}
+
+--- seed
+{"type":"Person","data":{"pk":0,"fName":"Alice","gender":1,"isStudent":true,"isWorker":false,"age":35,"eyeSight":5.0,"birthdate":"1900-01-01","workedHours":[10,5],"usedNames":["Aida"],"height":1.731}}
+{"type":"Person","data":{"pk":2,"fName":"Bob","gender":2,"isStudent":true,"isWorker":false,"age":30,"eyeSight":5.1,"birthdate":"1900-01-01","workedHours":[12,8],"usedNames":["Bobby"],"height":0.99}}
+{"type":"Person","data":{"pk":3,"fName":"Carol","gender":1,"isStudent":false,"isWorker":true,"age":45,"eyeSight":5.0,"birthdate":"1940-06-22","workedHours":[4,5],"usedNames":["Carmen","Fred"],"height":1.0}}
+{"type":"Person","data":{"pk":5,"fName":"Dan","gender":2,"isStudent":false,"isWorker":true,"age":20,"eyeSight":4.8,"birthdate":"1950-07-23","workedHours":[1,9],"usedNames":["Wolfeschlegelstein","Daniel"],"height":1.3}}
+{"type":"Person","data":{"pk":7,"fName":"Elizabeth","gender":1,"isStudent":false,"isWorker":true,"age":20,"eyeSight":4.7,"birthdate":"1980-10-26","workedHours":[2],"usedNames":["Ein"],"height":1.463}}
+{"type":"Person","data":{"pk":8,"fName":"Farooq","gender":2,"isStudent":true,"isWorker":false,"age":25,"eyeSight":4.5,"birthdate":"1980-10-26","workedHours":[3,4,5,6,7],"usedNames":["Fesdwe"],"height":1.51}}
+{"type":"Person","data":{"pk":9,"fName":"Greg","gender":2,"isStudent":false,"isWorker":false,"age":40,"eyeSight":4.9,"birthdate":"1980-10-26","workedHours":[1],"usedNames":["Grad"],"height":1.6}}
+{"type":"Person","data":{"pk":10,"fName":"Hubert Blaine Wolfeschlegelsteinhausenbergerdorff","gender":2,"isStudent":false,"isWorker":true,"age":83,"eyeSight":4.9,"birthdate":"1990-11-27","workedHours":[10,11,12,3,4,5,6,7],"usedNames":["Ad","De","Hi","Kye","Orlan"],"height":1.323}}
+{"type":"Organisation","data":{"pk":1,"name":"ABFsUni","orgCode":325,"mark":3.7,"score":-2,"history":"10 years 5 months 13 hours 24 us","rating":1.0}}
+{"type":"Organisation","data":{"pk":4,"name":"CsWork","orgCode":934,"mark":4.1,"score":-100,"history":"2 years 4 days 10 hours","rating":0.78}}
+{"type":"Organisation","data":{"pk":6,"name":"DEsWork","orgCode":824,"mark":4.1,"score":7,"history":"2 years 4 hours 22 us 34 minutes","rating":0.52}}
+{"edge":"Knows","from":"0","to":"2","data":{"date":"2021-06-30","meetTime":"1986-10-21T21:08:31.521Z","comments":["rnme","m8sihsdnf2990nfiwf"]}}
+{"edge":"Knows","from":"0","to":"3","data":{"date":"2021-06-30","meetTime":"1946-08-25T19:07:22Z","comments":["njnojppo9u0jkmf","fjiojioh9h9h89hph"]}}
+{"edge":"Knows","from":"0","to":"5","data":{"date":"2021-06-30","meetTime":"2012-12-11T20:07:22Z","comments":["ioji232","jifhe8w99u43434"]}}
+{"edge":"Knows","from":"2","to":"0","data":{"date":"2021-06-30","meetTime":"1946-08-25T19:07:22Z","comments":["2huh9y89fsfw23","23nsihufhw723"]}}
+{"edge":"Knows","from":"2","to":"3","data":{"date":"1950-05-14","meetTime":"1946-08-25T19:07:22Z","comments":["fwehu9h9832wewew","23u9h989sdfsss"]}}
+{"edge":"Knows","from":"2","to":"5","data":{"date":"1950-05-14","meetTime":"2012-12-11T20:07:22Z","comments":["fwh9y81232uisuiehuf","ewnuihxy8dyf232"]}}
+{"edge":"Knows","from":"3","to":"0","data":{"date":"2021-06-30","meetTime":"2002-07-31T11:42:53.12342Z","comments":["fnioh8323aeweae34d","osd89e2ejshuih12"]}}
+{"edge":"Knows","from":"3","to":"2","data":{"date":"1950-05-14","meetTime":"2007-02-12T12:11:42.123Z","comments":["fwh983-sdjisdfji","ioh89y32r2huir"]}}
+{"edge":"Knows","from":"3","to":"5","data":{"date":"2000-01-01","meetTime":"1998-10-02T13:09:22.423Z","comments":["psh989823oaaioe","nuiuah1nosndfisf"]}}
+{"edge":"Knows","from":"5","to":"0","data":{"date":"2021-06-30","meetTime":"1936-11-02T11:02:01Z","comments":["fwewe"]}}
+{"edge":"Knows","from":"5","to":"2","data":{"date":"1950-05-14","meetTime":"1982-11-11T13:12:05.123Z","comments":["fewh9182912e3","h9y8y89soidfsf","nuhudf78w78efw","hioshe0f9023sdsd"]}}
+{"edge":"Knows","from":"5","to":"3","data":{"date":"2000-01-01","meetTime":"1999-04-21T15:12:11.42Z","comments":["23h9sdslnfowhu2932","shuhf98922323sf"]}}
+{"edge":"Knows","from":"7","to":"8","data":{"date":"1905-12-12","meetTime":"2025-01-01T11:22:33.52Z","comments":["ahu2333333333333","12weeeeeeeeeeeeeeeeee"]}}
+{"edge":"Knows","from":"7","to":"9","data":{"date":"1905-12-12","meetTime":"2020-03-01T12:11:41.6552Z","comments":["peweeeeeeeeeeeeeeeee","kowje9w0eweeeeeeeee"]}}
+{"edge":"StudyAt","from":"0","to":"1","data":{"year":2021,"places":["wwAewsdndweusd","wek"],"length":5,"level":5,"code":9223372036854775808,"temperature":32800,"ulength":33768,"ulevel":250}}
+{"edge":"StudyAt","from":"2","to":"1","data":{"year":2020,"places":["anew","jsdnwusklklklwewsd"],"length":55,"level":120,"code":6689,"temperature":1,"ulength":90,"ulevel":220}}
+{"edge":"StudyAt","from":"8","to":"1","data":{"year":2020,"places":["awndsnjwejwen","isuhuwennjnuhuhuwewe"],"length":22,"level":2,"code":23,"temperature":20,"ulength":180,"ulevel":12}}
+{"edge":"WorkAt","from":"3","to":"4","data":{"year":2015,"grading":[3.8,2.5],"rating":8.2}}
+{"edge":"WorkAt","from":"5","to":"6","data":{"year":2010,"grading":[2.1,4.4],"rating":7.6}}
+{"edge":"WorkAt","from":"7","to":"6","data":{"year":2015,"grading":[9.2,3.1],"rating":9.2}}
+
+--- query
+query two_node_cycle_test_1() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+        $b knows $a
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 12}
+
+--- query
+query two_node_cycle_test_2() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+        $b knows $a
+        $a knows $b
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 12}
+
+--- query
+query two_node_cycle_with_projection_test() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+        $b knows $a
+    }
+    return { $a.fName, $b.fName }
+}
+
+--- expect unordered
+{"a.fName": "Alice", "b.fName": "Bob"}
+{"a.fName": "Alice", "b.fName": "Carol"}
+{"a.fName": "Alice", "b.fName": "Dan"}
+{"a.fName": "Bob", "b.fName": "Alice"}
+{"a.fName": "Bob", "b.fName": "Carol"}
+{"a.fName": "Bob", "b.fName": "Dan"}
+{"a.fName": "Carol", "b.fName": "Alice"}
+{"a.fName": "Carol", "b.fName": "Bob"}
+{"a.fName": "Carol", "b.fName": "Dan"}
+{"a.fName": "Dan", "b.fName": "Alice"}
+{"a.fName": "Dan", "b.fName": "Bob"}
+{"a.fName": "Dan", "b.fName": "Carol"}
+
+--- query
+query triangle_test() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $a knows $b
+        $b knows $c
+        $a knows $c
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 24}
+
+--- query
+query triangle_test_with_edge_filter() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $a $e1:knows $b
+        $b $e2:knows $c
+        $a $e3:knows $c
+        $e1.date = date("1950-05-14")
+    }
+    return { $a.fName, $e1.date, $b.fName, $e2.date, $c.fName, $e3.date }
+}
+
+--- expect unordered
+{"a.fName": "Bob", "e1.date": "1950-05-14", "b.fName": "Carol", "e2.date": "2021-06-30", "c.fName": "Alice", "e3.date": "2021-06-30"}
+{"a.fName": "Bob", "e1.date": "1950-05-14", "b.fName": "Carol", "e2.date": "2000-01-01", "c.fName": "Dan", "e3.date": "1950-05-14"}
+{"a.fName": "Bob", "e1.date": "1950-05-14", "b.fName": "Dan", "e2.date": "2021-06-30", "c.fName": "Alice", "e3.date": "2021-06-30"}
+{"a.fName": "Bob", "e1.date": "1950-05-14", "b.fName": "Dan", "e2.date": "2000-01-01", "c.fName": "Carol", "e3.date": "1950-05-14"}
+{"a.fName": "Carol", "e1.date": "1950-05-14", "b.fName": "Bob", "e2.date": "2021-06-30", "c.fName": "Alice", "e3.date": "2021-06-30"}
+{"a.fName": "Carol", "e1.date": "1950-05-14", "b.fName": "Bob", "e2.date": "1950-05-14", "c.fName": "Dan", "e3.date": "2000-01-01"}
+{"a.fName": "Dan", "e1.date": "1950-05-14", "b.fName": "Bob", "e2.date": "2021-06-30", "c.fName": "Alice", "e3.date": "2021-06-30"}
+{"a.fName": "Dan", "e1.date": "1950-05-14", "b.fName": "Bob", "e2.date": "1950-05-14", "c.fName": "Carol", "e3.date": "2000-01-01"}
+
+--- query
+query triangle_test3() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Organisation
+        $a knows $b
+        $b studyAt $c
+        $a studyAt $c
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 2}
+
+--- query
+query triangle_test5() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $a $e1:knows $b
+        $b $e2:knows $c
+        $a $e3:knows $c
+        $e1.date = $e2.date
+        $e2.date = $e3.date
+    }
+    return { $a.pk, $b.pk, $c.pk }
+}
+
+--- expect unordered
+
+--- query
+query triangle_test6() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $a $e1:knows $b
+        $b $e2:knows $c
+        $a $e3:knows $c
+        $a.fName = "Alice"
+        $e1.meetTime = datetime("1986-10-21T21:08:31.521Z")
+    }
+    return { $b.fName, $c.fName }
+}
+
+--- expect unordered
+{"b.fName": "Bob", "c.fName": "Carol"}
+{"b.fName": "Bob", "c.fName": "Dan"}
+
+--- query
+query triangle_with_projection_test() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Organisation
+        $a $e1:knows $b
+        $b $e2:studyAt $c
+        $a $e3:studyAt $c
+    }
+    return { $a.fName, $e1.date, $b.fName, $e2.year, $c.name, $e3.year }
+}
+
+--- expect unordered
+{"a.fName": "Alice", "e1.date": "2021-06-30", "b.fName": "Bob", "e2.year": 2020, "c.name": "ABFsUni", "e3.year": 2021}
+{"a.fName": "Bob", "e1.date": "2021-06-30", "b.fName": "Alice", "e2.year": 2021, "c.name": "ABFsUni", "e3.year": 2020}
+
+--- query
+query triangle_filter_test2() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Organisation
+        $a knows $b
+        $b studyAt $c
+        $a studyAt $c
+        $a.fName = "Alice"
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 1}
+
+--- query
+query triangle_filter_with_projection_test() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $a knows $b
+        $b knows $c
+        $a knows $c
+        $a.pk < $b.pk
+        $b.pk < $c.pk
+    }
+    return { $a.fName, $b.fName, $c.fName }
+}
+
+--- expect unordered
+{"a.fName": "Alice", "b.fName": "Bob", "c.fName": "Carol"}
+{"a.fName": "Alice", "b.fName": "Bob", "c.fName": "Dan"}
+{"a.fName": "Alice", "b.fName": "Carol", "c.fName": "Dan"}
+{"a.fName": "Bob", "b.fName": "Carol", "c.fName": "Dan"}
+
+--- query
+query triangle_filter_with_projection_test2() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Organisation
+        $a $e1:knows $b
+        $b $e2:studyAt $c
+        $a $e3:studyAt $c
+        $a.fName = "Bob"
+    }
+    return { $a.fName, $e1.date, $b.fName, $e2.year, $c.name, $e3.year }
+}
+
+--- expect unordered
+{"a.fName": "Bob", "e1.date": "2021-06-30", "b.fName": "Alice", "e2.year": 2021, "c.name": "ABFsUni", "e3.year": 2020}
+
+--- query
+query square_test() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $d: Person
+        $a knows $b
+        $b knows $c
+        $c knows $d
+        $a knows $d
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 84}
+
+--- query
+query square_test2() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $d: Organisation
+        $b knows $a
+        $b knows $c
+        $c studyAt $d
+        $a studyAt $d
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 11}
+
+--- query
+query square_filter_with_projection_test() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $d: Organisation
+        $b knows $a
+        $b knows $c
+        $c studyAt $d
+        $a studyAt $d
+        $a.fName = "Bob"
+    }
+    return { $a.fName, $b.fName, $c.fName, $d.name }
+}
+
+--- expect unordered
+{"a.fName": "Bob", "b.fName": "Alice", "c.fName": "Bob", "d.name": "ABFsUni"}
+{"a.fName": "Bob", "b.fName": "Carol", "c.fName": "Alice", "d.name": "ABFsUni"}
+{"a.fName": "Bob", "b.fName": "Carol", "c.fName": "Bob", "d.name": "ABFsUni"}
+{"a.fName": "Bob", "b.fName": "Dan", "c.fName": "Alice", "d.name": "ABFsUni"}
+{"a.fName": "Bob", "b.fName": "Dan", "c.fName": "Bob", "d.name": "ABFsUni"}
+
+--- query
+query square_filter_test2() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $d: Organisation
+        $b knows $a
+        $b knows $c
+        $c studyAt $d
+        $a studyAt $d
+        $b.fName = "Elizabeth"
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 1}
+
+--- query
+query cross_product_after_wcoj() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $d: Person
+        $a knows $b
+        $b knows $c
+        $a knows $c
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 192}

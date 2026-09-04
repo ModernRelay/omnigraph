@@ -1,0 +1,33 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return_orderby/return_orderby2.test, -CASE Scenario3
+# notes: "Sort on aggregated function". Kuzu's unaliased max(n.age) is aliased `m`
+# notes: (aggregates are always aliased); ORDER BY max(n.age) becomes order over that
+# notes: alias. -CHECK_ORDER but the return carries an aggregate, so expect unordered.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    division: String?
+    age: I64?
+}
+
+--- seed
+{"type":"A","data":{"pk":0,"division":"A","age":22}}
+{"type":"A","data":{"pk":1,"division":"B","age":33}}
+{"type":"A","data":{"pk":2,"division":"B","age":44}}
+{"type":"A","data":{"pk":3,"division":"C","age":55}}
+
+--- query
+query stmt_3() {
+    match {
+        $n: A
+    }
+    return { $n.division, max($n.age) as m }
+    order { m asc }
+}
+
+--- expect unordered
+{"n.division": "A", "m": 22}
+{"n.division": "B", "m": 44}
+{"n.division": "C", "m": 55}

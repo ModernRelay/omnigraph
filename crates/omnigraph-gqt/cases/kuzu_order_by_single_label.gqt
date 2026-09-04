@@ -1,0 +1,537 @@
+# issue: none
+# notes: kuzu test/test_files/order_by/single_label.test, -CASE OrderBySingleLabel,
+# notes: tinysnb seed. One query step per Kuzu -STATEMENT, in file order; `CALL
+# notes: threads=N` steps are runner knobs and are dropped. Statements over dropped
+# notes: columns (registerTime, lastJobDuration, hugedata, the movies node) or with
+# notes: arithmetic in ORDER BY are not translated. Anonymous Cypher endpoints get
+# notes: explicit bindings ($a/$b); `-CHECK_ORDER` plus an order clause and no aggregate
+# notes: → `--- expect ordered`.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Person {
+    pk: I64 @key
+    fName: String?
+    gender: I64?
+    isStudent: Bool?
+    isWorker: Bool?
+    age: I64?
+    eyeSight: F64?
+    birthdate: Date?
+    workedHours: [I64]?
+    usedNames: [String]?
+    height: F32?
+}
+node Organisation {
+    pk: I64 @key
+    name: String?
+    orgCode: I64?
+    mark: F64?
+    score: I64?
+    history: String?
+    rating: F64?
+}
+edge Knows: Person -> Person {
+    date: Date?
+    meetTime: DateTime?
+    comments: [String]?
+}
+edge StudyAt: Person -> Organisation {
+    year: I64?
+    places: [String]?
+    length: I64?
+    level: I64?
+    code: U64?
+    temperature: U32?
+    ulength: U32?
+    ulevel: U32?
+}
+edge WorkAt: Person -> Organisation {
+    year: I64?
+    grading: [F64]?
+    rating: F32?
+}
+
+--- seed
+{"type":"Person","data":{"pk":0,"fName":"Alice","gender":1,"isStudent":true,"isWorker":false,"age":35,"eyeSight":5.0,"birthdate":"1900-01-01","workedHours":[10,5],"usedNames":["Aida"],"height":1.731}}
+{"type":"Person","data":{"pk":2,"fName":"Bob","gender":2,"isStudent":true,"isWorker":false,"age":30,"eyeSight":5.1,"birthdate":"1900-01-01","workedHours":[12,8],"usedNames":["Bobby"],"height":0.99}}
+{"type":"Person","data":{"pk":3,"fName":"Carol","gender":1,"isStudent":false,"isWorker":true,"age":45,"eyeSight":5.0,"birthdate":"1940-06-22","workedHours":[4,5],"usedNames":["Carmen","Fred"],"height":1.0}}
+{"type":"Person","data":{"pk":5,"fName":"Dan","gender":2,"isStudent":false,"isWorker":true,"age":20,"eyeSight":4.8,"birthdate":"1950-07-23","workedHours":[1,9],"usedNames":["Wolfeschlegelstein","Daniel"],"height":1.3}}
+{"type":"Person","data":{"pk":7,"fName":"Elizabeth","gender":1,"isStudent":false,"isWorker":true,"age":20,"eyeSight":4.7,"birthdate":"1980-10-26","workedHours":[2],"usedNames":["Ein"],"height":1.463}}
+{"type":"Person","data":{"pk":8,"fName":"Farooq","gender":2,"isStudent":true,"isWorker":false,"age":25,"eyeSight":4.5,"birthdate":"1980-10-26","workedHours":[3,4,5,6,7],"usedNames":["Fesdwe"],"height":1.51}}
+{"type":"Person","data":{"pk":9,"fName":"Greg","gender":2,"isStudent":false,"isWorker":false,"age":40,"eyeSight":4.9,"birthdate":"1980-10-26","workedHours":[1],"usedNames":["Grad"],"height":1.6}}
+{"type":"Person","data":{"pk":10,"fName":"Hubert Blaine Wolfeschlegelsteinhausenbergerdorff","gender":2,"isStudent":false,"isWorker":true,"age":83,"eyeSight":4.9,"birthdate":"1990-11-27","workedHours":[10,11,12,3,4,5,6,7],"usedNames":["Ad","De","Hi","Kye","Orlan"],"height":1.323}}
+{"type":"Organisation","data":{"pk":1,"name":"ABFsUni","orgCode":325,"mark":3.7,"score":-2,"history":"10 years 5 months 13 hours 24 us","rating":1.0}}
+{"type":"Organisation","data":{"pk":4,"name":"CsWork","orgCode":934,"mark":4.1,"score":-100,"history":"2 years 4 days 10 hours","rating":0.78}}
+{"type":"Organisation","data":{"pk":6,"name":"DEsWork","orgCode":824,"mark":4.1,"score":7,"history":"2 years 4 hours 22 us 34 minutes","rating":0.52}}
+{"edge":"Knows","from":"0","to":"2","data":{"date":"2021-06-30","meetTime":"1986-10-21T21:08:31.521Z","comments":["rnme","m8sihsdnf2990nfiwf"]}}
+{"edge":"Knows","from":"0","to":"3","data":{"date":"2021-06-30","meetTime":"1946-08-25T19:07:22Z","comments":["njnojppo9u0jkmf","fjiojioh9h9h89hph"]}}
+{"edge":"Knows","from":"0","to":"5","data":{"date":"2021-06-30","meetTime":"2012-12-11T20:07:22Z","comments":["ioji232","jifhe8w99u43434"]}}
+{"edge":"Knows","from":"2","to":"0","data":{"date":"2021-06-30","meetTime":"1946-08-25T19:07:22Z","comments":["2huh9y89fsfw23","23nsihufhw723"]}}
+{"edge":"Knows","from":"2","to":"3","data":{"date":"1950-05-14","meetTime":"1946-08-25T19:07:22Z","comments":["fwehu9h9832wewew","23u9h989sdfsss"]}}
+{"edge":"Knows","from":"2","to":"5","data":{"date":"1950-05-14","meetTime":"2012-12-11T20:07:22Z","comments":["fwh9y81232uisuiehuf","ewnuihxy8dyf232"]}}
+{"edge":"Knows","from":"3","to":"0","data":{"date":"2021-06-30","meetTime":"2002-07-31T11:42:53.12342Z","comments":["fnioh8323aeweae34d","osd89e2ejshuih12"]}}
+{"edge":"Knows","from":"3","to":"2","data":{"date":"1950-05-14","meetTime":"2007-02-12T12:11:42.123Z","comments":["fwh983-sdjisdfji","ioh89y32r2huir"]}}
+{"edge":"Knows","from":"3","to":"5","data":{"date":"2000-01-01","meetTime":"1998-10-02T13:09:22.423Z","comments":["psh989823oaaioe","nuiuah1nosndfisf"]}}
+{"edge":"Knows","from":"5","to":"0","data":{"date":"2021-06-30","meetTime":"1936-11-02T11:02:01Z","comments":["fwewe"]}}
+{"edge":"Knows","from":"5","to":"2","data":{"date":"1950-05-14","meetTime":"1982-11-11T13:12:05.123Z","comments":["fewh9182912e3","h9y8y89soidfsf","nuhudf78w78efw","hioshe0f9023sdsd"]}}
+{"edge":"Knows","from":"5","to":"3","data":{"date":"2000-01-01","meetTime":"1999-04-21T15:12:11.42Z","comments":["23h9sdslnfowhu2932","shuhf98922323sf"]}}
+{"edge":"Knows","from":"7","to":"8","data":{"date":"1905-12-12","meetTime":"2025-01-01T11:22:33.52Z","comments":["ahu2333333333333","12weeeeeeeeeeeeeeeeee"]}}
+{"edge":"Knows","from":"7","to":"9","data":{"date":"1905-12-12","meetTime":"2020-03-01T12:11:41.6552Z","comments":["peweeeeeeeeeeeeeeeee","kowje9w0eweeeeeeeee"]}}
+{"edge":"StudyAt","from":"0","to":"1","data":{"year":2021,"places":["wwAewsdndweusd","wek"],"length":5,"level":5,"code":9223372036854775808,"temperature":32800,"ulength":33768,"ulevel":250}}
+{"edge":"StudyAt","from":"2","to":"1","data":{"year":2020,"places":["anew","jsdnwusklklklwewsd"],"length":55,"level":120,"code":6689,"temperature":1,"ulength":90,"ulevel":220}}
+{"edge":"StudyAt","from":"8","to":"1","data":{"year":2020,"places":["awndsnjwejwen","isuhuwennjnuhuhuwewe"],"length":22,"level":2,"code":23,"temperature":20,"ulength":180,"ulevel":12}}
+{"edge":"WorkAt","from":"3","to":"4","data":{"year":2015,"grading":[3.8,2.5],"rating":8.2}}
+{"edge":"WorkAt","from":"5","to":"6","data":{"year":2010,"grading":[2.1,4.4],"rating":7.6}}
+{"edge":"WorkAt","from":"7","to":"6","data":{"year":2015,"grading":[9.2,3.1],"rating":9.2}}
+
+--- query
+query order_by_int16_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.length }
+    order { $e.length asc }
+}
+
+--- expect ordered
+{"e.length": 5}
+{"e.length": 22}
+{"e.length": 55}
+
+--- query
+query order_by_int8_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.level }
+    order { $e.level asc }
+}
+
+--- expect ordered
+{"e.level": 2}
+{"e.level": 5}
+{"e.level": 120}
+
+--- query
+query order_by_uint64_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.code }
+    order { $e.code asc }
+}
+
+--- expect ordered
+{"e.code": 23}
+{"e.code": 6689}
+{"e.code": 9223372036854775808}
+
+--- query
+query order_by_uint32_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.temperature }
+    order { $e.temperature asc }
+}
+
+--- expect ordered
+{"e.temperature": 1}
+{"e.temperature": 20}
+{"e.temperature": 32800}
+
+--- query
+query order_by_uint16_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.ulength }
+    order { $e.ulength asc }
+}
+
+--- expect ordered
+{"e.ulength": 90}
+{"e.ulength": 180}
+{"e.ulength": 33768}
+
+--- query
+query order_by_uint8_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.ulevel }
+    order { $e.ulevel asc }
+}
+
+--- expect ordered
+{"e.ulevel": 12}
+{"e.ulevel": 220}
+{"e.ulevel": 250}
+
+--- query
+query order_by_boolean_test() {
+    match {
+        $p: Person
+    }
+    return { $p.isStudent }
+    order { $p.isStudent desc }
+}
+
+--- expect ordered
+{"p.isStudent": true}
+{"p.isStudent": true}
+{"p.isStudent": true}
+{"p.isStudent": false}
+{"p.isStudent": false}
+{"p.isStudent": false}
+{"p.isStudent": false}
+{"p.isStudent": false}
+
+--- query
+query order_by_double_test() {
+    match {
+        $p: Person
+    }
+    return { $p.eyeSight }
+    order { $p.eyeSight asc }
+}
+
+--- expect ordered
+{"p.eyeSight": 4.5}
+{"p.eyeSight": 4.7}
+{"p.eyeSight": 4.8}
+{"p.eyeSight": 4.9}
+{"p.eyeSight": 4.9}
+{"p.eyeSight": 5.0}
+{"p.eyeSight": 5.0}
+{"p.eyeSight": 5.1}
+
+--- query
+query order_by_date_test() {
+    match {
+        $p: Person
+    }
+    return { $p.birthdate }
+    order { $p.birthdate desc }
+}
+
+--- expect ordered
+{"p.birthdate": "1990-11-27"}
+{"p.birthdate": "1980-10-26"}
+{"p.birthdate": "1980-10-26"}
+{"p.birthdate": "1980-10-26"}
+{"p.birthdate": "1950-07-23"}
+{"p.birthdate": "1940-06-22"}
+{"p.birthdate": "1900-01-01"}
+{"p.birthdate": "1900-01-01"}
+
+--- query
+query order_by_string_test() {
+    match {
+        $p: Person
+    }
+    return { $p.fName }
+    order { $p.fName desc }
+}
+
+--- expect ordered
+{"p.fName": "Hubert Blaine Wolfeschlegelsteinhausenbergerdorff"}
+{"p.fName": "Greg"}
+{"p.fName": "Farooq"}
+{"p.fName": "Elizabeth"}
+{"p.fName": "Dan"}
+{"p.fName": "Carol"}
+{"p.fName": "Bob"}
+{"p.fName": "Alice"}
+
+--- query
+query order_by_str_multiple_col_test() {
+    match {
+        $p: Person
+    }
+    return { $p.age, $p.eyeSight }
+    order { $p.isWorker desc, $p.age asc, $p.eyeSight desc }
+}
+
+--- expect ordered
+{"p.age": 20, "p.eyeSight": 4.8}
+{"p.age": 20, "p.eyeSight": 4.7}
+{"p.age": 45, "p.eyeSight": 5.0}
+{"p.age": 83, "p.eyeSight": 4.9}
+{"p.age": 25, "p.eyeSight": 4.5}
+{"p.age": 30, "p.eyeSight": 5.1}
+{"p.age": 35, "p.eyeSight": 5.0}
+{"p.age": 40, "p.eyeSight": 4.9}
+
+--- query
+query order_by_three_hop_test() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $d: Person
+        $a knows $b
+        $b knows $c
+        $c knows $d
+    }
+    return { $a.fName }
+    order { $d.age desc, $c.age asc, $b.age asc, $a.age desc }
+    limit 10
+}
+
+--- expect ordered
+{"a.fName": "Carol"}
+{"a.fName": "Alice"}
+{"a.fName": "Dan"}
+{"a.fName": "Carol"}
+{"a.fName": "Bob"}
+{"a.fName": "Dan"}
+{"a.fName": "Alice"}
+{"a.fName": "Bob"}
+{"a.fName": "Dan"}
+{"a.fName": "Carol"}
+
+--- query
+query order_by_scan_single_tuple_test() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.fName }
+    order { $b.fName asc, $a.fName asc }
+}
+
+--- expect ordered
+{"a.fName": "Bob"}
+{"a.fName": "Carol"}
+{"a.fName": "Dan"}
+{"a.fName": "Alice"}
+{"a.fName": "Carol"}
+{"a.fName": "Dan"}
+{"a.fName": "Alice"}
+{"a.fName": "Bob"}
+{"a.fName": "Dan"}
+{"a.fName": "Alice"}
+{"a.fName": "Bob"}
+{"a.fName": "Carol"}
+{"a.fName": "Elizabeth"}
+{"a.fName": "Elizabeth"}
+
+--- query
+query order_by_empty_result() {
+    match {
+        $p: Person
+        $p.age > 100
+    }
+    return { $p.age }
+    order { $p.age asc }
+}
+
+--- expect unordered
+
+--- query
+query order_by_limit_empty_result() {
+    match {
+        $p: Person
+        $p.age > 100
+    }
+    return { $p.age }
+    order { $p.age asc }
+    limit 10
+}
+
+--- expect unordered
+
+--- query
+query order_by_aggregate_test1() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.age, count($b) as c }
+    order { $a.age asc }
+}
+
+--- expect unordered
+{"a.age": 20, "c": 5}
+{"a.age": 30, "c": 3}
+{"a.age": 35, "c": 3}
+{"a.age": 45, "c": 3}
+
+--- query
+query order_by_flat_unflat() {
+    match {
+        $p: Person
+        $p1: Person
+        $p knows $p1
+    }
+    return { $p.pk, $p1.pk }
+    order { $p.pk asc, $p1.pk asc }
+    limit 13
+}
+
+--- expect ordered
+{"p.pk": 0, "p1.pk": 2}
+{"p.pk": 0, "p1.pk": 3}
+{"p.pk": 0, "p1.pk": 5}
+{"p.pk": 2, "p1.pk": 0}
+{"p.pk": 2, "p1.pk": 3}
+{"p.pk": 2, "p1.pk": 5}
+{"p.pk": 3, "p1.pk": 0}
+{"p.pk": 3, "p1.pk": 2}
+{"p.pk": 3, "p1.pk": 5}
+{"p.pk": 5, "p1.pk": 0}
+{"p.pk": 5, "p1.pk": 2}
+{"p.pk": 5, "p1.pk": 3}
+{"p.pk": 7, "p1.pk": 8}
+
+--- query
+query order_by_flat_unflat1() {
+    match {
+        $p: Person
+        $p1: Person
+        $p knows $p1
+    }
+    return { $p.pk, $p1.pk }
+    order { $p.pk asc, $p1.pk asc }
+}
+
+--- expect ordered
+{"p.pk": 0, "p1.pk": 2}
+{"p.pk": 0, "p1.pk": 3}
+{"p.pk": 0, "p1.pk": 5}
+{"p.pk": 2, "p1.pk": 0}
+{"p.pk": 2, "p1.pk": 3}
+{"p.pk": 2, "p1.pk": 5}
+{"p.pk": 3, "p1.pk": 0}
+{"p.pk": 3, "p1.pk": 2}
+{"p.pk": 3, "p1.pk": 5}
+{"p.pk": 5, "p1.pk": 0}
+{"p.pk": 5, "p1.pk": 2}
+{"p.pk": 5, "p1.pk": 3}
+{"p.pk": 7, "p1.pk": 8}
+{"p.pk": 7, "p1.pk": 9}
+
+--- query
+query top_k_int64_test() {
+    match {
+        $p: Person
+    }
+    return { $p.pk }
+    order { $p.pk desc }
+    limit 4
+}
+
+--- expect ordered
+{"p.pk": 10}
+{"p.pk": 9}
+{"p.pk": 8}
+{"p.pk": 7}
+
+--- query
+query top_k_int16_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.length }
+    order { $e.length asc }
+    limit 2
+}
+
+--- expect ordered
+{"e.length": 5}
+{"e.length": 22}
+
+--- query
+query top_k_int8_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.level }
+    order { $e.level asc }
+    limit 2
+}
+
+--- expect ordered
+{"e.level": 2}
+{"e.level": 5}
+
+--- query
+query top_k_uint64_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.code }
+    order { $e.code asc }
+    limit 1
+}
+
+--- expect ordered
+{"e.code": 23}
+
+--- query
+query top_k_uint32_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.temperature }
+    order { $e.temperature asc }
+    limit 1
+}
+
+--- expect ordered
+{"e.temperature": 1}
+
+--- query
+query top_k_uint16_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.ulength }
+    order { $e.ulength asc }
+    limit 1
+}
+
+--- expect ordered
+{"e.ulength": 90}
+
+--- query
+query top_k_uint8_test() {
+    match {
+        $a: Person
+        $b: Organisation
+        $a $e:studyAt $b
+    }
+    return { $e.ulevel }
+    order { $e.ulevel asc }
+    limit 2
+}
+
+--- expect ordered
+{"e.ulevel": 12}
+{"e.ulevel": 220}

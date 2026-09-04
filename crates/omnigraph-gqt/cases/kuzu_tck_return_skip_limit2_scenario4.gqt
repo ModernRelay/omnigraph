@@ -1,0 +1,28 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return_skip_limit/return_skip_limit2.test, -CASE
+# notes: Scenario4 "Handle ORDER BY with LIMIT 1". ID SERIAL -> pk 0,1 in creation
+# notes: order. -CHECK_ORDER + order + no aggregate -> ordered.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Person {
+    pk: I64 @key
+    name: String?
+}
+
+--- seed
+{"type":"Person","data":{"pk":0,"name":"Steven"}}
+{"type":"Person","data":{"pk":1,"name":"Craig"}}
+
+--- query
+query stmt_3() {
+    match {
+        $p: Person
+    }
+    return { $p.name as name }
+    order { $p.name asc }
+    limit 1
+}
+
+--- expect ordered
+{"name": "Craig"}

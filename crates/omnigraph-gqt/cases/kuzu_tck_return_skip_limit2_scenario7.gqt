@@ -1,0 +1,32 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return_skip_limit/return_skip_limit2.test, -CASE
+# notes: Scenario7 "Limit to more rows than actual results 1". ORDER BY x refers to the
+# notes: projection alias, which GQ takes bare. -CHECK_ORDER + order + no aggregate ->
+# notes: ordered.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    num: I64?
+}
+
+--- seed
+{"type":"A","data":{"pk":0,"num":1}}
+{"type":"A","data":{"pk":1,"num":3}}
+{"type":"A","data":{"pk":2,"num":2}}
+
+--- query
+query stmt_3() {
+    match {
+        $foo: A
+    }
+    return { $foo.num as x }
+    order { x desc }
+    limit 4
+}
+
+--- expect ordered
+{"x": 3}
+{"x": 2}
+{"x": 1}

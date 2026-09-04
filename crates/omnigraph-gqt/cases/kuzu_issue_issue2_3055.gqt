@@ -1,0 +1,281 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue2.test, -CASE 3055 (kuzudb/kuzu issue 3055),
+# notes: -DATASET CSV empty; the case builds its own schema and rows. Tables `test` /
+# notes: `res` become types Test / Res and the rel table `etable` becomes edge type
+# notes: Etable (GQ type names start uppercase); the string primary key `id` becomes
+# notes: `pk` (engine system field). MERGE has no GQ spelling: each MERGE is not
+# notes: translated and its values are carried into the seed. The two tables Kuzu
+# notes: creates mid-case are hoisted into the single schema section; their DDL
+# notes: statements stay unexpressible. Kuzu asserts only `ok` on the six node reads;
+# notes: the expected rows there are read off the seed the MERGEs build. `RETURN n` is
+# notes: spelled as the property list. The two `COUNT(*)` reads (stmt_34, stmt_52) are
+# notes: the only rows Kuzu asserts: their unlabeled endpoints are pinned by the typed
+# notes: edge etable, and the count is over the bound edge's target node. Two
+# notes: MATCH+CREATE statements target a non-existent test key, where Kuzu creates
+# notes: nothing and a GQ insert has no conditional form.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Test {
+    pk: String @key
+    prop1: String?
+    prop2: I64?
+    prop3: String?
+    prop4: String?
+}
+node Res {
+    name: String @key
+}
+edge Etable: Res -> Test {
+    eprop1: String?
+    eprop2: String?
+    eprop3: String?
+}
+
+--- seed
+{"type":"Test","data":{"pk":"ewm8ewnn@l23:","prop1":"model","prop2":6,"prop3":"trips_2","prop4":"0bbhfwnenwafnw88989382932wwewej332938293jiwojewie923892389283923"}}
+{"type":"Test","data":{"pk":"ewm8ewnn ewweklnbgeireg@l23:ewe","prop1":"model","prop2":16,"prop3":"normalize_data","prop4":"1bbhfwnenwafnw88989234342wwewej332938293jiwojewie923892389283923"}}
+{"type":"Test","data":{"pk":"ewm8ewnn ewweklnbgew888g@lew3:ewe","prop1":"model","prop2":74,"prop3":"zones","prop4":"2bbhfwnenaafnw88989234342wwewej332938293jiwojewie923192389283923"}}
+{"type":"Test","data":{"pk":"ewm8ew43lnbgew888g@lew3:ewe","prop1":"expectation","prop2":27,"prop3":"test_trips_1","prop4":"3bbhfwnenaafnw88989234342wwewej332938213jiwojewie923192389283923"}}
+{"type":"Test","data":{"pk":"ewm8ew43ffbgew888g@lew3:ewe","prop1":"expectation","prop2":37,"prop3":"test_trips_2","prop4":"4bbhfwnenaafnw88989234312wwewej332938213jiwojewie923192389283923"}}
+{"type":"Test","data":{"pk":"ewm8ew43ffrrr88g@lew3:ewe","prop1":"expectation","prop2":47,"prop3":"test_norm_data_1","prop4":"5bbhfwnenaafnw88989234312wwewej332938213jiwojewie923192389283923"}}
+{"type":"Test","data":{"pk":"fwfwfe8g@lew3:ewe","prop1":"model","prop4":"6bbhfwnenaafnw88989234312wwewej332938213jiwojewie923192389283923"}}
+{"type":"Test","data":{"pk":"nfewnfwn+wnfw"}}
+{"type":"Test","data":{"pk":"nfewn32n+wnfw"}}
+{"type":"Res","data":{"name":"nfewnnfw"}}
+{"type":"Res","data":{"name":"fwfsiewmk"}}
+{"type":"Res","data":{"name":"pdanwewer"}}
+{"type":"Res","data":{"name":"another_dep"}}
+{"type":"Res","data":{"name":"numpy"}}
+
+--- query
+query stmt_10() {
+    match {
+        $n: Test
+        $n.pk = "ewm8ewnn ewweklnbgew888g@lew3:ewe"
+        $n.prop1 = "model"
+        $n.prop2 = 74
+        $n.prop3 = "zones"
+    }
+    return { $n.pk, $n.prop1, $n.prop2, $n.prop3, $n.prop4 }
+}
+
+--- expect unordered
+{"n.pk": "ewm8ewnn ewweklnbgew888g@lew3:ewe", "n.prop1": "model", "n.prop2": 74, "n.prop3": "zones", "n.prop4": "2bbhfwnenaafnw88989234342wwewej332938293jiwojewie923192389283923"}
+
+--- query
+query stmt_11() {
+    match {
+        $n: Test
+        $n.pk = "ewm8ewnn@l23:"
+        $n.prop1 = "model"
+        $n.prop2 = 6
+        $n.prop3 = "trips_2"
+    }
+    return { $n.pk, $n.prop1, $n.prop2, $n.prop3, $n.prop4 }
+}
+
+--- expect unordered
+{"n.pk": "ewm8ewnn@l23:", "n.prop1": "model", "n.prop2": 6, "n.prop3": "trips_2", "n.prop4": "0bbhfwnenwafnw88989382932wwewej332938293jiwojewie923892389283923"}
+
+--- query
+query stmt_12() {
+    match {
+        $n: Test
+        $n.pk = "ewm8ewnn ewweklnbgeireg@l23:ewe"
+        $n.prop1 = "model"
+        $n.prop2 = 16
+        $n.prop3 = "normalize_data"
+    }
+    return { $n.pk, $n.prop1, $n.prop2, $n.prop3, $n.prop4 }
+}
+
+--- expect unordered
+{"n.pk": "ewm8ewnn ewweklnbgeireg@l23:ewe", "n.prop1": "model", "n.prop2": 16, "n.prop3": "normalize_data", "n.prop4": "1bbhfwnenwafnw88989234342wwewej332938293jiwojewie923892389283923"}
+
+--- query
+query stmt_13() {
+    match {
+        $n: Test
+        $n.pk = "ewm8ew43lnbgew888g@lew3:ewe"
+        $n.prop1 = "expectation"
+        $n.prop2 = 27
+        $n.prop3 = "test_trips_1"
+    }
+    return { $n.pk, $n.prop1, $n.prop2, $n.prop3, $n.prop4 }
+}
+
+--- expect unordered
+{"n.pk": "ewm8ew43lnbgew888g@lew3:ewe", "n.prop1": "expectation", "n.prop2": 27, "n.prop3": "test_trips_1", "n.prop4": "3bbhfwnenaafnw88989234342wwewej332938213jiwojewie923192389283923"}
+
+--- query
+query stmt_14() {
+    match {
+        $n: Test
+        $n.pk = "ewm8ew43ffbgew888g@lew3:ewe"
+        $n.prop1 = "expectation"
+        $n.prop2 = 37
+        $n.prop3 = "test_trips_2"
+    }
+    return { $n.pk, $n.prop1, $n.prop2, $n.prop3, $n.prop4 }
+}
+
+--- expect unordered
+{"n.pk": "ewm8ew43ffbgew888g@lew3:ewe", "n.prop1": "expectation", "n.prop2": 37, "n.prop3": "test_trips_2", "n.prop4": "4bbhfwnenaafnw88989234312wwewej332938213jiwojewie923192389283923"}
+
+--- query
+query stmt_15() {
+    match {
+        $n: Test
+        $n.pk = "ewm8ew43ffrrr88g@lew3:ewe"
+        $n.prop1 = "expectation"
+        $n.prop2 = 47
+        $n.prop3 = "test_norm_data_1"
+    }
+    return { $n.pk, $n.prop1, $n.prop2, $n.prop3, $n.prop4 }
+}
+
+--- expect unordered
+{"n.pk": "ewm8ew43ffrrr88g@lew3:ewe", "n.prop1": "expectation", "n.prop2": 47, "n.prop3": "test_norm_data_1", "n.prop4": "5bbhfwnenaafnw88989234312wwewej332938213jiwojewie923192389283923"}
+
+--- mutate
+query stmt_21() {
+    insert Etable { from: "nfewnnfw", to: "nfewnfwn+wnfw", eprop1: "1.1.1", eprop3: "nfewj932-ew2b-5f33-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_23() {
+    insert Etable { from: "fwfsiewmk", to: "nfewnfwn+wnfw", eprop1: "0.0.0", eprop3: "nfewj932-ew2b-5f33-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_25() {
+    insert Etable { from: "nfewnnfw", to: "nfewn32n+wnfw", eprop1: "1.1.1", eprop3: "mdewj932-ew2b-5f44-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_28() {
+    insert Etable { from: "fwfsiewmk", to: "nfewn32n+wnfw", eprop1: "0.0.0", eprop3: "mdewj932-ew2b-5f44-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_31() {
+    insert Etable { from: "nfewnnfw", to: "ewm8ewnn ewweklnbgew888g@lew3:ewe", eprop1: "1.1.1", eprop3: "qqewj932-ew2b-5f88-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_32() {
+    insert Etable { from: "nfewnnfw", to: "ewm8ewnn@l23:", eprop1: "1.1.1", eprop3: "qqewj932-ew2b-5f88-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_33() {
+    insert Etable { from: "nfewnnfw", to: "ewm8ew43ffrrr88g@lew3:ewe", eprop1: "1.1.1", eprop3: "qqewj932-ew2b-5f88-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- query
+query stmt_34() {
+    match {
+        $f: Res
+        $t: Test
+        $f $r:etable $t
+        $t.pk = "ewm8ewnn@l23:"
+        $r.eprop3 = "qqewj932-ew2b-5f88-nfew"
+    }
+    return { count($t) as n }
+}
+
+--- expect unordered
+{"n": 1}
+
+--- mutate
+query stmt_35() {
+    insert Etable { from: "nfewnnfw", to: "ewm8ew43ffbgew888g@lew3:ewe", eprop1: "1.1.1", eprop3: "ooewj932-ew2b-5f19-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_37() {
+    insert Etable { from: "pdanwewer", to: "ewm8ew43ffbgew888g@lew3:ewe", eprop1: "1.2.4", eprop3: "ooewj932-ew2b-5f19-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_39() {
+    insert Etable { from: "another_dep", to: "ewm8ew43ffbgew888g@lew3:ewe", eprop1: "9.9.9", eprop3: "ooewj932-ew2b-5f19-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_41() {
+    insert Etable { from: "nfewnnfw", to: "ewm8ewnn ewweklnbgeireg@l23:ewe", eprop1: "1.1.1", eprop3: "rrewj932-ew2b-5f92-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_43() {
+    insert Etable { from: "pdanwewer", to: "ewm8ewnn ewweklnbgeireg@l23:ewe", eprop1: "1.1.1", eprop3: "rrewj932-ew2b-5f92-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_45() {
+    insert Etable { from: "numpy", to: "ewm8ewnn ewweklnbgeireg@l23:ewe", eprop1: "2.2.2", eprop3: "rrewj932-ew2b-5f92-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_47() {
+    insert Etable { from: "nfewnnfw", to: "fwfwfe8g@lew3:ewe", eprop1: "1.1.1", eprop3: "mmewj932-ew2b-5f00-nfew" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_49() {
+    insert Etable { from: "nfewnnfw", to: "ewm8ew43lnbgew888g@lew3:ewe", eprop1: "1.1.1", eprop3: "piewj932-ew2b-5f00-nfrr" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_51() {
+    insert Etable { from: "pdanwewer", to: "ewm8ew43lnbgew888g@lew3:ewe", eprop1: "1.2.3", eprop3: "piewj932-ew2b-5f00-nfrr" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- query
+query stmt_52() {
+    match {
+        $f: Res
+        $t: Test
+        $f $r:etable $t
+        $t.pk = "ewm8ewnn@l23:"
+        $r.eprop3 = "qqewj932-ew2b-5f88-nfew"
+    }
+    return { count($t) as n }
+}
+
+--- expect unordered
+{"n": 1}

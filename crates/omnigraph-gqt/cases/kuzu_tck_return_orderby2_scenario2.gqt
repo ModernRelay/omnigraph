@@ -1,0 +1,30 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return_orderby/return_orderby2.test, -CASE Scenario2.
+# notes: Same seed as Scenario1, ORDER BY ... DESC. ID SERIAL -> pk 0,1,2 in creation
+# notes: order; MATCH (n) binds as $n: A.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    num: I64?
+}
+
+--- seed
+{"type":"A","data":{"pk":0,"num":1}}
+{"type":"A","data":{"pk":1,"num":3}}
+{"type":"A","data":{"pk":2,"num":-5}}
+
+--- query
+query stmt_3() {
+    match {
+        $n: A
+    }
+    return { $n.num as prop }
+    order { $n.num desc }
+}
+
+--- expect ordered
+{"prop": 3}
+{"prop": 1}
+{"prop": -5}

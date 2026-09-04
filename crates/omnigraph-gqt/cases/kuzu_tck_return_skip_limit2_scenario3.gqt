@@ -1,0 +1,30 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return_skip_limit/return_skip_limit2.test, -CASE
+# notes: Scenario3 "LIMIT 0 should return an empty result". Table A carries only the
+# notes: SERIAL key, so RETURN n is spelled as $n.pk (whole_entity_spelled_as_props). No
+# notes: -CHECK_ORDER -> expect unordered, empty body. Kuzu's statement has no ORDER BY;
+# notes: an order clause is added for uniformity with the other limit steps; with limit
+# notes: 0 the result is empty under any order.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+}
+
+--- seed
+{"type":"A","data":{"pk":0}}
+{"type":"A","data":{"pk":1}}
+{"type":"A","data":{"pk":2}}
+
+--- query
+query stmt_3() {
+    match {
+        $n: A
+    }
+    return { $n.pk }
+    order { $n.pk asc }
+    limit 0
+}
+
+--- expect unordered

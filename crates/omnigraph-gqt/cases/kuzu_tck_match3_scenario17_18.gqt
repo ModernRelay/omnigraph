@@ -1,0 +1,55 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match3.test, -CASE Scenario17&18, -DATASET CSV
+# notes: tck (empty schema; the case builds its own). Node tables are named T1/T2 and
+# notes: rel tables A/B in Kuzu; kept verbatim. The anonymous middle node of statement 5
+# notes: gets a named binding ($b), which is the same pattern statement 6 writes out as
+# notes: two comma-joined parts.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node T1 {
+    pk: I64 @key
+    name: String?
+}
+node T2 {
+    pk: I64 @key
+    name: String?
+}
+edge A: T1 -> T2
+edge B: T2 -> T1
+
+--- seed
+{"type":"T1","data":{"pk":0,"name":"a"}}
+{"type":"T2","data":{"pk":0,"name":"a"}}
+{"type":"T1","data":{"pk":1,"name":"c"}}
+{"edge":"A","from":"0","to":"0","data":{}}
+{"edge":"B","from":"0","to":"0","data":{}}
+{"edge":"B","from":"0","to":"1","data":{}}
+
+--- query
+query stmt_6() {
+    match {
+        $a: T1
+        $b: T2
+        $a a $b
+        $b b $a
+    }
+    return { $a.name }
+}
+
+--- expect unordered
+{"a.name": "a"}
+
+--- query
+query stmt_7() {
+    match {
+        $a: T1
+        $b: T2
+        $a a $b
+        $b b $a
+    }
+    return { $a.name }
+}
+
+--- expect unordered
+{"a.name": "a"}

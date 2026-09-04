@@ -1,0 +1,43 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match3.test, -CASE Scenario20, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). The anonymous arrows resolve to KNOWS,
+# notes: the schema's only rel table; the two MATCH clauses are one match block.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    name: String?
+}
+edge KNOWS: A -> A
+
+--- seed
+{"type":"A","data":{"pk":0,"name":"A"}}
+{"type":"A","data":{"pk":1,"name":"x1"}}
+{"type":"A","data":{"pk":2,"name":"x2"}}
+{"type":"A","data":{"pk":3,"name":"B"}}
+{"type":"A","data":{"pk":4,"name":"C"}}
+{"edge":"KNOWS","from":"0","to":"1","data":{}}
+{"edge":"KNOWS","from":"0","to":"2","data":{}}
+{"edge":"KNOWS","from":"3","to":"1","data":{}}
+{"edge":"KNOWS","from":"3","to":"2","data":{}}
+{"edge":"KNOWS","from":"4","to":"1","data":{}}
+{"edge":"KNOWS","from":"4","to":"2","data":{}}
+
+--- query
+query stmt_4() {
+    match {
+        $a: A { name: "A" }
+        $b: A { name: "B" }
+        $c: A { name: "C" }
+        $x: A
+        $a knows $x
+        $b knows $x
+        $c knows $x
+    }
+    return { $x.name }
+}
+
+--- expect unordered
+{"x.name": "x1"}
+{"x.name": "x2"}

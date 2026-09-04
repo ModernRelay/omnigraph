@@ -1,0 +1,32 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match3.test, -CASE Scenario10, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). The anonymous arrows --> resolve to T,
+# notes: the schema's only rel table, and the unlabeled nodes to A, its only node table.
+# notes: Self-referencing (b)-->(b) has no match.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+}
+edge T: A -> A
+
+--- seed
+{"type":"A","data":{"pk":0}}
+{"type":"A","data":{"pk":1}}
+{"type":"A","data":{"pk":2}}
+{"edge":"T","from":"0","to":"1","data":{}}
+{"edge":"T","from":"1","to":"2","data":{}}
+
+--- query
+query stmt_4() {
+    match {
+        $a: A
+        $b: A
+        $a t $b
+        $b t $b
+    }
+    return { $b.pk }
+}
+
+--- expect unordered

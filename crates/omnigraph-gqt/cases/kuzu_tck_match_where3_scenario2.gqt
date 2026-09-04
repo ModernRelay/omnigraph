@@ -1,0 +1,33 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match_where/match_where3.test, -CASE Scenario2. tck
+# notes: dataset, inline schema/seed. Kuzu property `id` (the declared primary key)
+# notes: becomes `pk`. RETURN a, b is spelled as each node's declared scalar props,
+# notes: which for A and B is pk alone.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+}
+node B {
+    pk: I64 @key
+}
+
+--- seed
+{"type":"A","data":{"pk":1}}
+{"type":"A","data":{"pk":2}}
+{"type":"B","data":{"pk":2}}
+{"type":"B","data":{"pk":3}}
+
+--- query
+query stmt_4() {
+    match {
+        $a: A
+        $b: B
+        $a.pk = $b.pk
+    }
+    return { $a.pk, $b.pk }
+}
+
+--- expect unordered
+{"a.pk": 2, "b.pk": 2}

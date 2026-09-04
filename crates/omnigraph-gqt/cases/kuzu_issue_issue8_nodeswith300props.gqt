@@ -1,0 +1,630 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue8.test, -CASE NodesWith300Props, -DATASET CSV
+# notes: empty; the case builds its own schema and rows. Table `person` becomes type
+# notes: Person; the primary key is the STRING column prop1, and Kuzu's `create
+# notes: (p:person {prop1: 5})` implicitly casts 5 to the string "5". Even-numbered
+# notes: props are INT64, odd-numbered are STRING. `RETURN p` is spelled as the
+# notes: 300-property list; Kuzu prints only the set property, GQ prints every projected
+# notes: column with an explicit null. The 300 properties are generated
+# notes: (even-numbered INT64, odd-numbered STRING); regenerate by script if a column
+# notes: changes.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Person {
+    prop0: I64?
+    prop1: String @key
+    prop2: I64?
+    prop3: String?
+    prop4: I64?
+    prop5: String?
+    prop6: I64?
+    prop7: String?
+    prop8: I64?
+    prop9: String?
+    prop10: I64?
+    prop11: String?
+    prop12: I64?
+    prop13: String?
+    prop14: I64?
+    prop15: String?
+    prop16: I64?
+    prop17: String?
+    prop18: I64?
+    prop19: String?
+    prop20: I64?
+    prop21: String?
+    prop22: I64?
+    prop23: String?
+    prop24: I64?
+    prop25: String?
+    prop26: I64?
+    prop27: String?
+    prop28: I64?
+    prop29: String?
+    prop30: I64?
+    prop31: String?
+    prop32: I64?
+    prop33: String?
+    prop34: I64?
+    prop35: String?
+    prop36: I64?
+    prop37: String?
+    prop38: I64?
+    prop39: String?
+    prop40: I64?
+    prop41: String?
+    prop42: I64?
+    prop43: String?
+    prop44: I64?
+    prop45: String?
+    prop46: I64?
+    prop47: String?
+    prop48: I64?
+    prop49: String?
+    prop50: I64?
+    prop51: String?
+    prop52: I64?
+    prop53: String?
+    prop54: I64?
+    prop55: String?
+    prop56: I64?
+    prop57: String?
+    prop58: I64?
+    prop59: String?
+    prop60: I64?
+    prop61: String?
+    prop62: I64?
+    prop63: String?
+    prop64: I64?
+    prop65: String?
+    prop66: I64?
+    prop67: String?
+    prop68: I64?
+    prop69: String?
+    prop70: I64?
+    prop71: String?
+    prop72: I64?
+    prop73: String?
+    prop74: I64?
+    prop75: String?
+    prop76: I64?
+    prop77: String?
+    prop78: I64?
+    prop79: String?
+    prop80: I64?
+    prop81: String?
+    prop82: I64?
+    prop83: String?
+    prop84: I64?
+    prop85: String?
+    prop86: I64?
+    prop87: String?
+    prop88: I64?
+    prop89: String?
+    prop90: I64?
+    prop91: String?
+    prop92: I64?
+    prop93: String?
+    prop94: I64?
+    prop95: String?
+    prop96: I64?
+    prop97: String?
+    prop98: I64?
+    prop99: String?
+    prop100: I64?
+    prop101: String?
+    prop102: I64?
+    prop103: String?
+    prop104: I64?
+    prop105: String?
+    prop106: I64?
+    prop107: String?
+    prop108: I64?
+    prop109: String?
+    prop110: I64?
+    prop111: String?
+    prop112: I64?
+    prop113: String?
+    prop114: I64?
+    prop115: String?
+    prop116: I64?
+    prop117: String?
+    prop118: I64?
+    prop119: String?
+    prop120: I64?
+    prop121: String?
+    prop122: I64?
+    prop123: String?
+    prop124: I64?
+    prop125: String?
+    prop126: I64?
+    prop127: String?
+    prop128: I64?
+    prop129: String?
+    prop130: I64?
+    prop131: String?
+    prop132: I64?
+    prop133: String?
+    prop134: I64?
+    prop135: String?
+    prop136: I64?
+    prop137: String?
+    prop138: I64?
+    prop139: String?
+    prop140: I64?
+    prop141: String?
+    prop142: I64?
+    prop143: String?
+    prop144: I64?
+    prop145: String?
+    prop146: I64?
+    prop147: String?
+    prop148: I64?
+    prop149: String?
+    prop150: I64?
+    prop151: String?
+    prop152: I64?
+    prop153: String?
+    prop154: I64?
+    prop155: String?
+    prop156: I64?
+    prop157: String?
+    prop158: I64?
+    prop159: String?
+    prop160: I64?
+    prop161: String?
+    prop162: I64?
+    prop163: String?
+    prop164: I64?
+    prop165: String?
+    prop166: I64?
+    prop167: String?
+    prop168: I64?
+    prop169: String?
+    prop170: I64?
+    prop171: String?
+    prop172: I64?
+    prop173: String?
+    prop174: I64?
+    prop175: String?
+    prop176: I64?
+    prop177: String?
+    prop178: I64?
+    prop179: String?
+    prop180: I64?
+    prop181: String?
+    prop182: I64?
+    prop183: String?
+    prop184: I64?
+    prop185: String?
+    prop186: I64?
+    prop187: String?
+    prop188: I64?
+    prop189: String?
+    prop190: I64?
+    prop191: String?
+    prop192: I64?
+    prop193: String?
+    prop194: I64?
+    prop195: String?
+    prop196: I64?
+    prop197: String?
+    prop198: I64?
+    prop199: String?
+    prop200: I64?
+    prop201: String?
+    prop202: I64?
+    prop203: String?
+    prop204: I64?
+    prop205: String?
+    prop206: I64?
+    prop207: String?
+    prop208: I64?
+    prop209: String?
+    prop210: I64?
+    prop211: String?
+    prop212: I64?
+    prop213: String?
+    prop214: I64?
+    prop215: String?
+    prop216: I64?
+    prop217: String?
+    prop218: I64?
+    prop219: String?
+    prop220: I64?
+    prop221: String?
+    prop222: I64?
+    prop223: String?
+    prop224: I64?
+    prop225: String?
+    prop226: I64?
+    prop227: String?
+    prop228: I64?
+    prop229: String?
+    prop230: I64?
+    prop231: String?
+    prop232: I64?
+    prop233: String?
+    prop234: I64?
+    prop235: String?
+    prop236: I64?
+    prop237: String?
+    prop238: I64?
+    prop239: String?
+    prop240: I64?
+    prop241: String?
+    prop242: I64?
+    prop243: String?
+    prop244: I64?
+    prop245: String?
+    prop246: I64?
+    prop247: String?
+    prop248: I64?
+    prop249: String?
+    prop250: I64?
+    prop251: String?
+    prop252: I64?
+    prop253: String?
+    prop254: I64?
+    prop255: String?
+    prop256: I64?
+    prop257: String?
+    prop258: I64?
+    prop259: String?
+    prop260: I64?
+    prop261: String?
+    prop262: I64?
+    prop263: String?
+    prop264: I64?
+    prop265: String?
+    prop266: I64?
+    prop267: String?
+    prop268: I64?
+    prop269: String?
+    prop270: I64?
+    prop271: String?
+    prop272: I64?
+    prop273: String?
+    prop274: I64?
+    prop275: String?
+    prop276: I64?
+    prop277: String?
+    prop278: I64?
+    prop279: String?
+    prop280: I64?
+    prop281: String?
+    prop282: I64?
+    prop283: String?
+    prop284: I64?
+    prop285: String?
+    prop286: I64?
+    prop287: String?
+    prop288: I64?
+    prop289: String?
+    prop290: I64?
+    prop291: String?
+    prop292: I64?
+    prop293: String?
+    prop294: I64?
+    prop295: String?
+    prop296: I64?
+    prop297: String?
+    prop298: I64?
+    prop299: String?
+}
+
+--- seed
+{"type":"Person","data":{"prop1":"5"}}
+
+--- query
+query stmt_3() {
+    match {
+        $p: Person
+    }
+    return {
+        $p.prop0,
+        $p.prop1,
+        $p.prop2,
+        $p.prop3,
+        $p.prop4,
+        $p.prop5,
+        $p.prop6,
+        $p.prop7,
+        $p.prop8,
+        $p.prop9,
+        $p.prop10,
+        $p.prop11,
+        $p.prop12,
+        $p.prop13,
+        $p.prop14,
+        $p.prop15,
+        $p.prop16,
+        $p.prop17,
+        $p.prop18,
+        $p.prop19,
+        $p.prop20,
+        $p.prop21,
+        $p.prop22,
+        $p.prop23,
+        $p.prop24,
+        $p.prop25,
+        $p.prop26,
+        $p.prop27,
+        $p.prop28,
+        $p.prop29,
+        $p.prop30,
+        $p.prop31,
+        $p.prop32,
+        $p.prop33,
+        $p.prop34,
+        $p.prop35,
+        $p.prop36,
+        $p.prop37,
+        $p.prop38,
+        $p.prop39,
+        $p.prop40,
+        $p.prop41,
+        $p.prop42,
+        $p.prop43,
+        $p.prop44,
+        $p.prop45,
+        $p.prop46,
+        $p.prop47,
+        $p.prop48,
+        $p.prop49,
+        $p.prop50,
+        $p.prop51,
+        $p.prop52,
+        $p.prop53,
+        $p.prop54,
+        $p.prop55,
+        $p.prop56,
+        $p.prop57,
+        $p.prop58,
+        $p.prop59,
+        $p.prop60,
+        $p.prop61,
+        $p.prop62,
+        $p.prop63,
+        $p.prop64,
+        $p.prop65,
+        $p.prop66,
+        $p.prop67,
+        $p.prop68,
+        $p.prop69,
+        $p.prop70,
+        $p.prop71,
+        $p.prop72,
+        $p.prop73,
+        $p.prop74,
+        $p.prop75,
+        $p.prop76,
+        $p.prop77,
+        $p.prop78,
+        $p.prop79,
+        $p.prop80,
+        $p.prop81,
+        $p.prop82,
+        $p.prop83,
+        $p.prop84,
+        $p.prop85,
+        $p.prop86,
+        $p.prop87,
+        $p.prop88,
+        $p.prop89,
+        $p.prop90,
+        $p.prop91,
+        $p.prop92,
+        $p.prop93,
+        $p.prop94,
+        $p.prop95,
+        $p.prop96,
+        $p.prop97,
+        $p.prop98,
+        $p.prop99,
+        $p.prop100,
+        $p.prop101,
+        $p.prop102,
+        $p.prop103,
+        $p.prop104,
+        $p.prop105,
+        $p.prop106,
+        $p.prop107,
+        $p.prop108,
+        $p.prop109,
+        $p.prop110,
+        $p.prop111,
+        $p.prop112,
+        $p.prop113,
+        $p.prop114,
+        $p.prop115,
+        $p.prop116,
+        $p.prop117,
+        $p.prop118,
+        $p.prop119,
+        $p.prop120,
+        $p.prop121,
+        $p.prop122,
+        $p.prop123,
+        $p.prop124,
+        $p.prop125,
+        $p.prop126,
+        $p.prop127,
+        $p.prop128,
+        $p.prop129,
+        $p.prop130,
+        $p.prop131,
+        $p.prop132,
+        $p.prop133,
+        $p.prop134,
+        $p.prop135,
+        $p.prop136,
+        $p.prop137,
+        $p.prop138,
+        $p.prop139,
+        $p.prop140,
+        $p.prop141,
+        $p.prop142,
+        $p.prop143,
+        $p.prop144,
+        $p.prop145,
+        $p.prop146,
+        $p.prop147,
+        $p.prop148,
+        $p.prop149,
+        $p.prop150,
+        $p.prop151,
+        $p.prop152,
+        $p.prop153,
+        $p.prop154,
+        $p.prop155,
+        $p.prop156,
+        $p.prop157,
+        $p.prop158,
+        $p.prop159,
+        $p.prop160,
+        $p.prop161,
+        $p.prop162,
+        $p.prop163,
+        $p.prop164,
+        $p.prop165,
+        $p.prop166,
+        $p.prop167,
+        $p.prop168,
+        $p.prop169,
+        $p.prop170,
+        $p.prop171,
+        $p.prop172,
+        $p.prop173,
+        $p.prop174,
+        $p.prop175,
+        $p.prop176,
+        $p.prop177,
+        $p.prop178,
+        $p.prop179,
+        $p.prop180,
+        $p.prop181,
+        $p.prop182,
+        $p.prop183,
+        $p.prop184,
+        $p.prop185,
+        $p.prop186,
+        $p.prop187,
+        $p.prop188,
+        $p.prop189,
+        $p.prop190,
+        $p.prop191,
+        $p.prop192,
+        $p.prop193,
+        $p.prop194,
+        $p.prop195,
+        $p.prop196,
+        $p.prop197,
+        $p.prop198,
+        $p.prop199,
+        $p.prop200,
+        $p.prop201,
+        $p.prop202,
+        $p.prop203,
+        $p.prop204,
+        $p.prop205,
+        $p.prop206,
+        $p.prop207,
+        $p.prop208,
+        $p.prop209,
+        $p.prop210,
+        $p.prop211,
+        $p.prop212,
+        $p.prop213,
+        $p.prop214,
+        $p.prop215,
+        $p.prop216,
+        $p.prop217,
+        $p.prop218,
+        $p.prop219,
+        $p.prop220,
+        $p.prop221,
+        $p.prop222,
+        $p.prop223,
+        $p.prop224,
+        $p.prop225,
+        $p.prop226,
+        $p.prop227,
+        $p.prop228,
+        $p.prop229,
+        $p.prop230,
+        $p.prop231,
+        $p.prop232,
+        $p.prop233,
+        $p.prop234,
+        $p.prop235,
+        $p.prop236,
+        $p.prop237,
+        $p.prop238,
+        $p.prop239,
+        $p.prop240,
+        $p.prop241,
+        $p.prop242,
+        $p.prop243,
+        $p.prop244,
+        $p.prop245,
+        $p.prop246,
+        $p.prop247,
+        $p.prop248,
+        $p.prop249,
+        $p.prop250,
+        $p.prop251,
+        $p.prop252,
+        $p.prop253,
+        $p.prop254,
+        $p.prop255,
+        $p.prop256,
+        $p.prop257,
+        $p.prop258,
+        $p.prop259,
+        $p.prop260,
+        $p.prop261,
+        $p.prop262,
+        $p.prop263,
+        $p.prop264,
+        $p.prop265,
+        $p.prop266,
+        $p.prop267,
+        $p.prop268,
+        $p.prop269,
+        $p.prop270,
+        $p.prop271,
+        $p.prop272,
+        $p.prop273,
+        $p.prop274,
+        $p.prop275,
+        $p.prop276,
+        $p.prop277,
+        $p.prop278,
+        $p.prop279,
+        $p.prop280,
+        $p.prop281,
+        $p.prop282,
+        $p.prop283,
+        $p.prop284,
+        $p.prop285,
+        $p.prop286,
+        $p.prop287,
+        $p.prop288,
+        $p.prop289,
+        $p.prop290,
+        $p.prop291,
+        $p.prop292,
+        $p.prop293,
+        $p.prop294,
+        $p.prop295,
+        $p.prop296,
+        $p.prop297,
+        $p.prop298,
+        $p.prop299,
+    }
+}
+
+--- expect unordered
+{"p.prop0": null, "p.prop1": "5", "p.prop2": null, "p.prop3": null, "p.prop4": null, "p.prop5": null, "p.prop6": null, "p.prop7": null, "p.prop8": null, "p.prop9": null, "p.prop10": null, "p.prop11": null, "p.prop12": null, "p.prop13": null, "p.prop14": null, "p.prop15": null, "p.prop16": null, "p.prop17": null, "p.prop18": null, "p.prop19": null, "p.prop20": null, "p.prop21": null, "p.prop22": null, "p.prop23": null, "p.prop24": null, "p.prop25": null, "p.prop26": null, "p.prop27": null, "p.prop28": null, "p.prop29": null, "p.prop30": null, "p.prop31": null, "p.prop32": null, "p.prop33": null, "p.prop34": null, "p.prop35": null, "p.prop36": null, "p.prop37": null, "p.prop38": null, "p.prop39": null, "p.prop40": null, "p.prop41": null, "p.prop42": null, "p.prop43": null, "p.prop44": null, "p.prop45": null, "p.prop46": null, "p.prop47": null, "p.prop48": null, "p.prop49": null, "p.prop50": null, "p.prop51": null, "p.prop52": null, "p.prop53": null, "p.prop54": null, "p.prop55": null, "p.prop56": null, "p.prop57": null, "p.prop58": null, "p.prop59": null, "p.prop60": null, "p.prop61": null, "p.prop62": null, "p.prop63": null, "p.prop64": null, "p.prop65": null, "p.prop66": null, "p.prop67": null, "p.prop68": null, "p.prop69": null, "p.prop70": null, "p.prop71": null, "p.prop72": null, "p.prop73": null, "p.prop74": null, "p.prop75": null, "p.prop76": null, "p.prop77": null, "p.prop78": null, "p.prop79": null, "p.prop80": null, "p.prop81": null, "p.prop82": null, "p.prop83": null, "p.prop84": null, "p.prop85": null, "p.prop86": null, "p.prop87": null, "p.prop88": null, "p.prop89": null, "p.prop90": null, "p.prop91": null, "p.prop92": null, "p.prop93": null, "p.prop94": null, "p.prop95": null, "p.prop96": null, "p.prop97": null, "p.prop98": null, "p.prop99": null, "p.prop100": null, "p.prop101": null, "p.prop102": null, "p.prop103": null, "p.prop104": null, "p.prop105": null, "p.prop106": null, "p.prop107": null, "p.prop108": null, "p.prop109": null, "p.prop110": null, "p.prop111": null, "p.prop112": null, "p.prop113": null, "p.prop114": null, "p.prop115": null, "p.prop116": null, "p.prop117": null, "p.prop118": null, "p.prop119": null, "p.prop120": null, "p.prop121": null, "p.prop122": null, "p.prop123": null, "p.prop124": null, "p.prop125": null, "p.prop126": null, "p.prop127": null, "p.prop128": null, "p.prop129": null, "p.prop130": null, "p.prop131": null, "p.prop132": null, "p.prop133": null, "p.prop134": null, "p.prop135": null, "p.prop136": null, "p.prop137": null, "p.prop138": null, "p.prop139": null, "p.prop140": null, "p.prop141": null, "p.prop142": null, "p.prop143": null, "p.prop144": null, "p.prop145": null, "p.prop146": null, "p.prop147": null, "p.prop148": null, "p.prop149": null, "p.prop150": null, "p.prop151": null, "p.prop152": null, "p.prop153": null, "p.prop154": null, "p.prop155": null, "p.prop156": null, "p.prop157": null, "p.prop158": null, "p.prop159": null, "p.prop160": null, "p.prop161": null, "p.prop162": null, "p.prop163": null, "p.prop164": null, "p.prop165": null, "p.prop166": null, "p.prop167": null, "p.prop168": null, "p.prop169": null, "p.prop170": null, "p.prop171": null, "p.prop172": null, "p.prop173": null, "p.prop174": null, "p.prop175": null, "p.prop176": null, "p.prop177": null, "p.prop178": null, "p.prop179": null, "p.prop180": null, "p.prop181": null, "p.prop182": null, "p.prop183": null, "p.prop184": null, "p.prop185": null, "p.prop186": null, "p.prop187": null, "p.prop188": null, "p.prop189": null, "p.prop190": null, "p.prop191": null, "p.prop192": null, "p.prop193": null, "p.prop194": null, "p.prop195": null, "p.prop196": null, "p.prop197": null, "p.prop198": null, "p.prop199": null, "p.prop200": null, "p.prop201": null, "p.prop202": null, "p.prop203": null, "p.prop204": null, "p.prop205": null, "p.prop206": null, "p.prop207": null, "p.prop208": null, "p.prop209": null, "p.prop210": null, "p.prop211": null, "p.prop212": null, "p.prop213": null, "p.prop214": null, "p.prop215": null, "p.prop216": null, "p.prop217": null, "p.prop218": null, "p.prop219": null, "p.prop220": null, "p.prop221": null, "p.prop222": null, "p.prop223": null, "p.prop224": null, "p.prop225": null, "p.prop226": null, "p.prop227": null, "p.prop228": null, "p.prop229": null, "p.prop230": null, "p.prop231": null, "p.prop232": null, "p.prop233": null, "p.prop234": null, "p.prop235": null, "p.prop236": null, "p.prop237": null, "p.prop238": null, "p.prop239": null, "p.prop240": null, "p.prop241": null, "p.prop242": null, "p.prop243": null, "p.prop244": null, "p.prop245": null, "p.prop246": null, "p.prop247": null, "p.prop248": null, "p.prop249": null, "p.prop250": null, "p.prop251": null, "p.prop252": null, "p.prop253": null, "p.prop254": null, "p.prop255": null, "p.prop256": null, "p.prop257": null, "p.prop258": null, "p.prop259": null, "p.prop260": null, "p.prop261": null, "p.prop262": null, "p.prop263": null, "p.prop264": null, "p.prop265": null, "p.prop266": null, "p.prop267": null, "p.prop268": null, "p.prop269": null, "p.prop270": null, "p.prop271": null, "p.prop272": null, "p.prop273": null, "p.prop274": null, "p.prop275": null, "p.prop276": null, "p.prop277": null, "p.prop278": null, "p.prop279": null, "p.prop280": null, "p.prop281": null, "p.prop282": null, "p.prop283": null, "p.prop284": null, "p.prop285": null, "p.prop286": null, "p.prop287": null, "p.prop288": null, "p.prop289": null, "p.prop290": null, "p.prop291": null, "p.prop292": null, "p.prop293": null, "p.prop294": null, "p.prop295": null, "p.prop296": null, "p.prop297": null, "p.prop298": null, "p.prop299": null}

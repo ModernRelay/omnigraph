@@ -1,0 +1,26 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return/return1.test, -CASE Scenario1. tck dataset,
+# notes: inline schema/seed. One node table, so the unlabeled (n) binds A. RETURN n is
+# notes: spelled as A's declared scalar props (pk, numbers); Kuzu's _ID/_LABEL cells
+# notes: have no GQ spelling.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    numbers: [I64]?
+}
+
+--- seed
+{"type":"A","data":{"pk":0,"numbers":[1,2,3]}}
+
+--- query
+query stmt_3() {
+    match {
+        $n: A
+    }
+    return { $n.pk, $n.numbers }
+}
+
+--- expect unordered
+{"n.pk": 0, "n.numbers": [1, 2, 3]}

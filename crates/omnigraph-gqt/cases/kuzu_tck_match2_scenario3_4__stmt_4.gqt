@@ -1,0 +1,31 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match2.test, -CASE Scenario3&4, statement 4,
+# notes: split out because GQ's answer diverges from Kuzu. -DATASET CSV tck (empty
+# notes: schema; the case builds its own). Kuzu expects the undirected self-loop MATCH
+# notes: (a)-[:T]-(a) to yield the node TWICE (once per adjacency direction); GQ's $a
+# notes: <t> $a has set semantics on the endpoint pair and yields it once. Expectation
+# notes: rewritten to the openCypher TCK reading, one row per matched node by project
+# notes: decision (2026-09-04); Kuzu expects the row twice.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    name: String @key
+}
+edge T: A -> A
+
+--- seed
+{"type":"A","data":{"name":"xx"}}
+{"edge":"T","from":"xx","to":"xx","data":{}}
+
+--- query
+query stmt_4() {
+    match {
+        $a: A
+        $a <t> $a
+    }
+    return { $a.name }
+}
+
+--- expect unordered
+{"a.name": "xx"}

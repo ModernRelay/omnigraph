@@ -1,0 +1,27 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return_orderby/return_orderby2.test, -CASE Scenario7
+# notes: "Ordering with aggregation". count(*) -> count($n) as foo. -CHECK_ORDER but the
+# notes: return carries an aggregate, so the harness refuses `ordered`: expect
+# notes: unordered.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    name: String?
+}
+
+--- seed
+{"type":"A","data":{"pk":0,"name":"nisse"}}
+
+--- query
+query stmt_3() {
+    match {
+        $n: A
+    }
+    return { $n.name, count($n) as foo }
+    order { $n.name asc }
+}
+
+--- expect unordered
+{"n.name": "nisse", "foo": 1}

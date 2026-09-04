@@ -1,0 +1,25 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return/return2.test, -CASE Scenario11. tck dataset,
+# notes: inline schema/seed. Kuzu property `id` (the declared primary key) becomes `pk`;
+# notes: the point of the case is that the large I64 value survives the round trip
+# notes: exactly.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node TheLabel {
+    pk: I64 @key
+}
+
+--- seed
+{"type":"TheLabel","data":{"pk":4611686018427387905}}
+
+--- query
+query stmt_3() {
+    match {
+        $p: TheLabel
+    }
+    return { $p.pk }
+}
+
+--- expect unordered
+{"p.pk": 4611686018427387905}

@@ -1,0 +1,41 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue.test, -CASE 2701 (kuzudb/kuzu issue 2701),
+# notes: -DATASET CSV empty; the case builds its own schema and rows. Property `id`
+# notes: becomes `pk`; the unlabeled nodes of the seeding CREATE resolve to T, the
+# notes: schema's only node table. The MATCH + CREATE self-loop is a mutate step. The
+# notes: closing read's untyped edges bind R, the schema's only rel table, so it is
+# notes: expressible: it is the read that pins the self-loop the Kuzu issue is about.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node T {
+    pk: I64 @key
+}
+edge R: T -> T
+
+--- seed
+{"type":"T","data":{"pk":1}}
+{"type":"T","data":{"pk":2}}
+{"edge":"R","from":"1","to":"2","data":{}}
+
+--- mutate
+query stmt_4() {
+    insert R { from: "1", to: "1" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- query
+query stmt_5() {
+    match {
+        $n1: T
+        $n2: T
+        $n2 r $n2
+        $n2 r $n1
+    }
+    return { $n1.pk, $n2.pk }
+}
+
+--- expect unordered
+{"n1.pk": 1, "n2.pk": 1}
+{"n1.pk": 2, "n2.pk": 1}

@@ -1,0 +1,63 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue3.test, -CASE BUG, -DATASET CSV EMPTY; the case
+# notes: builds its own schema and rows. Tables `n` and `f` become types N and F (GQ
+# notes: type names start uppercase); their string primary key `id` becomes `pk` (engine
+# notes: system field). MERGE has no GQ spelling: each MERGE is not translated and its
+# notes: values are carried into the seed, so the four MATCH+CREATE edge inserts see the
+# notes: same rows.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node N {
+    pk: String @key
+    name: String?
+}
+node F {
+    pk: String @key
+    prop1: String?
+    prop2: String?
+    prop3: I64?
+    prop4: String?
+    prop5: String?
+}
+edge E: N -> F {
+    prop: Bool?
+}
+
+--- seed
+{"type":"F","data":{"pk":"fewnjw32i3o#new","prop1":"wen3","prop2":"ewfw23","prop5":"d6112fewnfw2323ir203092323f78r2r"}}
+{"type":"F","data":{"pk":"nj2r2br2&323h^w8","prop1":"wen3","prop2":"wpy","prop3":6,"prop4":"tpi32","prop5":"s12"}}
+{"type":"N","data":{"pk":"wfw24sd","name":"fs23"}}
+{"type":"N","data":{"pk":"fwfw232few","name":"fw3dds"}}
+{"type":"N","data":{"pk":"7fnfjwe*33","name":"89njfew23"}}
+{"type":"N","data":{"pk":"8nfw*","name":"fs23"}}
+{"type":"N","data":{"pk":"wefn&323","name":"89njfew23"}}
+{"type":"N","data":{"pk":"njwf&33bnjkfw*f","name":"cs"}}
+
+--- mutate
+query stmt_6() {
+    insert E { from: "wfw24sd", to: "fewnjw32i3o#new", prop: true }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_8() {
+    insert E { from: "fwfw232few", to: "fewnjw32i3o#new", prop: true }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_10() {
+    insert E { from: "7fnfjwe*33", to: "fewnjw32i3o#new", prop: true }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query stmt_15() {
+    insert E { from: "njwf&33bnjkfw*f", to: "nj2r2br2&323h^w8", prop: false }
+}
+
+--- expect affected: nodes=0 edges=1

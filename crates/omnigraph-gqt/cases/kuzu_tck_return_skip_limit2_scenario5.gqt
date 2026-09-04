@@ -1,0 +1,26 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return_skip_limit/return_skip_limit2.test, -CASE
+# notes: Scenario5 "ORDER BY with LIMIT 0 should not generate errors". The case creates
+# notes: the table and no rows, so --- seed is empty. -CHECK_ORDER + order + no
+# notes: aggregate -> ordered, empty body.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Person {
+    pk: I64 @key
+    name: String?
+}
+
+--- seed
+
+--- query
+query stmt_2() {
+    match {
+        $p: Person
+    }
+    return { $p.name as name }
+    order { $p.name asc }
+    limit 0
+}
+
+--- expect ordered

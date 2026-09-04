@@ -1,0 +1,23 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return/return1.test, -CASE Scenario2. Kuzu refuses
+# notes: `RETURN foo` because foo is not in scope; GQ has the same notion of a bound
+# notes: variable, so the refusal is the same reason. Kuzu's MATCH () becomes an
+# notes: explicit binding of the one table.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+}
+
+--- seed
+
+--- query
+query stmt_2() {
+    match {
+        $a: A
+    }
+    return { $foo }
+}
+
+--- expect error: variable `$foo` is not bound

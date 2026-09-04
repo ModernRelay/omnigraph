@@ -1,0 +1,37 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match1.test, -CASE Scenario5, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). A(num INT64 PRIMARY KEY) keeps the
+# notes: name num as the @key. MATCH (n), (m) is two bindings with no traversal
+# notes: (cartesian product); both unlabeled patterns bind A, the schema's only node
+# notes: table.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    num: I64 @key
+}
+
+--- seed
+{"type":"A","data":{"num":1}}
+{"type":"A","data":{"num":2}}
+{"type":"A","data":{"num":3}}
+
+--- query
+query stmt_3() {
+    match {
+        $n: A
+        $m: A
+    }
+    return { $n.num as n, $m.num as m }
+}
+
+--- expect unordered
+{"n": 1, "m": 1}
+{"n": 1, "m": 2}
+{"n": 1, "m": 3}
+{"n": 2, "m": 1}
+{"n": 2, "m": 2}
+{"n": 2, "m": 3}
+{"n": 3, "m": 1}
+{"n": 3, "m": 2}
+{"n": 3, "m": 3}

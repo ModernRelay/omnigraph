@@ -1,0 +1,40 @@
+# issue: none
+# notes: kuzu test/test_files/issue/issue6.test, -CASE issue3576 (kuzudb/kuzu issue
+# notes: 3576), -DATASET CSV empty; the case builds its own schema and rows. SERIAL
+# notes: primary key `uid` becomes `pk`, assigned 0 per table in creation order. BEGIN
+# notes: TRANSACTION / COMMIT have no GQ spelling and are not translated; the two bare
+# notes: CREATEs are the seed.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node MyNode {
+    pk: I64 @key
+}
+node MyOtherNode {
+    pk: I64 @key
+}
+edge MyRel: MyNode -> MyOtherNode
+
+--- seed
+{"type":"MyNode","data":{"pk":0}}
+{"type":"MyOtherNode","data":{"pk":0}}
+
+--- mutate
+query stmt_7() {
+    insert MyRel { from: "0", to: "0" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- query
+query stmt_9() {
+    match {
+        $n: MyNode
+        $m: MyOtherNode
+        $n myRel $m
+    }
+    return { $n.pk, $m.pk }
+}
+
+--- expect unordered
+{"n.pk": 0, "m.pk": 0}

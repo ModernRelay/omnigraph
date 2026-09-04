@@ -1,0 +1,39 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match_where/match_where1.test, -CASE Scenario4. tck
+# notes: dataset: the case builds its own schema and rows, so --- schema / --- seed are
+# notes: inline. SERIAL ID -> pk with 0,1,... in creation order per table. `-->`
+# notes: resolves to the single rel table T. RETURN n is spelled as n's declared scalar
+# notes: props.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node Person {
+    pk: I64 @key
+    name: String?
+}
+node A {
+    pk: I64 @key
+}
+
+edge T: Person -> A
+
+--- seed
+{"type":"Person","data":{"pk":0,"name":"Alice"}}
+{"type":"Person","data":{"pk":1,"name":"Bob"}}
+{"type":"A","data":{"pk":0}}
+{"type":"A","data":{"pk":1}}
+{"edge":"T","from":"0","to":"0","data":{}}
+{"edge":"T","from":"1","to":"1","data":{}}
+
+--- query
+query stmt_5() {
+    match {
+        $n: Person
+        $n t $_
+        $n.name = "Bob"
+    }
+    return { $n.pk, $n.name }
+}
+
+--- expect unordered
+{"n.pk": 1, "n.name": "Bob"}

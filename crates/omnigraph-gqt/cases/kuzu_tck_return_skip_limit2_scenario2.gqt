@@ -1,0 +1,35 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return_skip_limit/return_skip_limit2.test, -CASE
+# notes: Scenario2 "Limit to two hits with explicit order". -DATASET CSV tck is empty,
+# notes: so the case's CREATE NODE TABLE becomes --- schema and its CREATE rows ---
+# notes: seed; ID SERIAL -> pk 0..4 in creation order. RETURN n is spelled as the node's
+# notes: scalar properties (whole_entity_spelled_as_props). -CHECK_ORDER + order + no
+# notes: aggregate -> expect ordered.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    name: String?
+}
+
+--- seed
+{"type":"A","data":{"pk":0,"name":"A"}}
+{"type":"A","data":{"pk":1,"name":"B"}}
+{"type":"A","data":{"pk":2,"name":"C"}}
+{"type":"A","data":{"pk":3,"name":"D"}}
+{"type":"A","data":{"pk":4,"name":"E"}}
+
+--- query
+query stmt_3() {
+    match {
+        $n: A
+    }
+    return { $n.pk, $n.name }
+    order { $n.name asc }
+    limit 2
+}
+
+--- expect ordered
+{"n.pk": 0, "n.name": "A"}
+{"n.pk": 1, "n.name": "B"}

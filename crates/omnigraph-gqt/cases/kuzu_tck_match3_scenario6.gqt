@@ -1,0 +1,35 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match3.test, -CASE Scenario6, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). The seed CREATE leaves its nodes
+# notes: unlabeled; T(FROM A TO Foo) pins a to A and b1/b2 to Foo, so the rows are A pk
+# notes: 0 and Foo pk 0, 1. COUNT(*) -> count($a) as n.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+}
+node Foo {
+    pk: I64 @key
+}
+edge T: A -> Foo
+
+--- seed
+{"type":"A","data":{"pk":0}}
+{"type":"Foo","data":{"pk":0}}
+{"type":"Foo","data":{"pk":1}}
+{"edge":"T","from":"0","to":"0","data":{}}
+{"edge":"T","from":"0","to":"1","data":{}}
+
+--- query
+query stmt_5() {
+    match {
+        $a: A
+        $b: Foo
+        $a t $b
+    }
+    return { count($a) as n }
+}
+
+--- expect unordered
+{"n": 2}

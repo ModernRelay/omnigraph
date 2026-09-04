@@ -1,0 +1,33 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match3.test, -CASE Scenario22, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). c is bound but not part of the
+# notes: traversal, so it is a binding line with no edge clause. RETURN a, b, c is
+# notes: spelled as their declared scalar properties (whole_entity_spelled_as_props).
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+    name: String?
+}
+edge KNOWS: A -> A
+
+--- seed
+{"type":"A","data":{"pk":0,"name":"A"}}
+{"type":"A","data":{"pk":1,"name":"B"}}
+{"type":"A","data":{"pk":2,"name":"C"}}
+{"edge":"KNOWS","from":"0","to":"1","data":{}}
+
+--- query
+query stmt_4() {
+    match {
+        $a: A { name: "A" }
+        $c: A { name: "C" }
+        $b: A
+        $a knows $b
+    }
+    return { $a.pk, $a.name, $b.pk, $b.name, $c.pk, $c.name }
+}
+
+--- expect unordered
+{"a.pk": 0, "a.name": "A", "b.pk": 1, "b.name": "B", "c.pk": 2, "c.name": "C"}

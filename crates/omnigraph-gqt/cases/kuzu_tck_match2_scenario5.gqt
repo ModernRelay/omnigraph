@@ -1,0 +1,36 @@
+# issue: none
+# notes: kuzu test/test_files/tck/match/match2.test, -CASE Scenario5, -DATASET CSV tck
+# notes: (empty schema; the case builds its own). A(ID INT64 PRIMARY KEY) -> pk (id is
+# notes: the engine system field). The inline edge predicate [r:KNOWS {name: 'monkey'}]
+# notes: is spelled as a bound edge plus a filter clause on $r.name. RETURN a is spelled
+# notes: as a.pk.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node A {
+    pk: I64 @key
+}
+edge KNOWS: A -> A {
+    name: String?
+}
+
+--- seed
+{"type":"A","data":{"pk":1}}
+{"type":"A","data":{"pk":3}}
+{"type":"A","data":{"pk":5}}
+{"edge":"KNOWS","from":"3","to":"1","data":{"name":"monkey"}}
+{"edge":"KNOWS","from":"3","to":"5","data":{"name":"woot"}}
+
+--- query
+query stmt_4() {
+    match {
+        $n: A
+        $a: A
+        $n $r:knows $a
+        $r.name = "monkey"
+    }
+    return { $a.pk }
+}
+
+--- expect unordered
+{"a.pk": 1}

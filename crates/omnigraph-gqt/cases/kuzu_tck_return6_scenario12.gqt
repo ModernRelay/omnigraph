@@ -1,0 +1,36 @@
+# issue: none
+# notes: kuzu test/test_files/tck/return/return6.test, -CASE Scenario12. tck dataset,
+# notes: inline schema/seed. The rel table is named A and the node tables L and B; the
+# notes: traversal spells the edge lowercase. RETURN a is spelled as L's only declared
+# notes: scalar prop, pk; count(*) is count($a) aliased.
+# notes: derived from kuzudb/kuzu test/test_files (MIT License, see crates/omnigraph-gqt/README.md); the query is translated to GQ and the expected rows are Kuzu's unless a line above says they were rewritten.
+
+--- schema
+node L {
+    pk: I64 @key
+}
+node B {
+    pk: I64 @key
+}
+
+edge A: L -> B
+
+--- seed
+{"type":"L","data":{"pk":0}}
+{"type":"B","data":{"pk":0}}
+{"type":"B","data":{"pk":1}}
+{"edge":"A","from":"0","to":"0","data":{}}
+{"edge":"A","from":"0","to":"1","data":{}}
+
+--- query
+query stmt_5() {
+    match {
+        $a: L
+        $b: B
+        $a $rel:a $b
+    }
+    return { $a.pk, count($a) as cnt }
+}
+
+--- expect unordered
+{"a.pk": 0, "cnt": 2}
