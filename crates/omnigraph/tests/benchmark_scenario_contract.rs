@@ -343,6 +343,41 @@ fn general_update_reports_completed_classifiers_and_keeps_update_semantics() {
     assert!(operation.contains("args.delta_rows as u64"));
     assert!(!operation.contains("snapshot_of("));
     assert!(source.contains("pub(super) async fn general_merge_verify"));
+    let wrapper = operation.find("helpers::cost::cost_harness").unwrap();
+    let open = operation.find("Omnigraph::open(uri)").unwrap();
+    let measure = operation.find("helpers::cost::measure").unwrap();
+    let timer = operation
+        .find("let operation_start = Instant::now()")
+        .unwrap();
+    assert!(wrapper < open && open < measure && measure < timer);
+    assert!(operation.contains("operation_io_metrics(&io)"));
+    assert!(operation.contains("\"operation_open_us\""));
+    let setup = source
+        .split_once("pub(super) async fn general_merge_setup")
+        .unwrap()
+        .1
+        .split_once("pub(super) async fn general_merge_operation")
+        .unwrap()
+        .0;
+    assert!(
+        setup.find("age_fixture(&db, args)").unwrap()
+            < setup
+                .find("db.branch_create(GENERAL_MERGE_SOURCE_BRANCH)")
+                .unwrap()
+    );
+    let verify = source
+        .split_once("pub(super) async fn general_merge_verify")
+        .unwrap()
+        .1;
+    assert!(
+        verify
+            .contains("args.rows <= 256 || args.history_commits > 0 || args.retired_branches > 0")
+    );
+    assert!(verify.contains("verify_general_all_rows(&table, args, true)"));
+    assert!(verify.contains("verify_general_all_rows(&source_table, args, false)"));
+    assert!(source.contains("scanner.batch_size(256)"));
+    assert!(source.contains("duplicate aged fixture ID"));
+    assert!(source.contains("aged fixture row missing"));
 }
 
 #[test]
@@ -353,7 +388,12 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     for phase in ["setup", "operation", "verify"] {
         assert!(harness.contains(&format!("branch_control::{phase}(args).await")));
     }
-    for argument in ["--branches", "--tables"] {
+    for argument in [
+        "--branches",
+        "--tables",
+        "--history-commits",
+        "--retired-branches",
+    ] {
         assert!(
             harness.matches(argument).count() >= 3,
             "workload dimensions must parse, propagate, and be documented"
@@ -406,4 +446,52 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     assert!(compact.contains("assert_eq!(listed,names,"));
     assert!(compact.contains("assert_ne!(source.tables,branches[\"main\"].tables,"));
     assert!(source.contains("\"verification_passed\": true"));
+    assert!(
+        operation.find("helpers::cost::cost_harness").unwrap()
+            < operation.find("Omnigraph::open(").unwrap()
+    );
+    assert!(operation.find("helpers::cost::measure").unwrap() < timer);
+    assert!(operation.find("operation_io_metrics(&io)").unwrap() > completion);
+    let setup = source
+        .split_once("pub(super) async fn setup")
+        .unwrap()
+        .1
+        .split_once("pub(super) async fn operation")
+        .unwrap()
+        .0;
+    assert!(
+        setup.find("age_fixture(&db, args)").unwrap()
+            < setup.find("for branch in 0..args.branches").unwrap()
+    );
+    assert!(harness.contains("rfc023_scenarios::validate_fixture_age(&args)"));
+    let aging = include_str!("../benches/scenarios/rfc023.rs");
+    assert!(aging.contains("args.age_options_supplied && !supported"));
+    assert!(aging.contains("args.history_commits > 256"));
+    assert!(aging.contains("!args.history_commits.is_multiple_of(2)"));
+    assert!(aging.contains("args.retired_branches > 32"));
+    let age = aging
+        .split_once("pub(super) async fn age_fixture")
+        .unwrap()
+        .1
+        .split_once("pub(super) fn operation_io_metrics")
+        .unwrap()
+        .0;
+    assert!(age.contains("after.checked_sub(before)"));
+    assert!(age.contains("Some(args.history_commits)"));
+    assert!(age.contains("verify_fixture_row(&table, \"base\", 0, args.dims, args.seed)"));
+    assert!(age.contains("db.wait_for_fork_reclaims().await"));
+    assert!(age.contains("retired native fork was not reclaimed"));
+    assert!(age.contains("retirement must not publish on main"));
+    assert!(!age.contains("Dataset::write"));
+    for field in [
+        "setup_history_commits_applied",
+        "setup_main_history_after_age",
+        "setup_retired_branches_applied",
+        "setup_age_content_verified",
+        "operation_io_manifest_reads",
+        "operation_io_data_reads",
+        "operation_io_boundary",
+    ] {
+        assert!(aging.contains(field), "missing age/IO evidence {field}");
+    }
 }

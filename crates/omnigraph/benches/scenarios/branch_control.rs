@@ -169,6 +169,7 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
             .expect("populate scalar table");
         assert_eq!(loaded.nodes_loaded.values().sum::<usize>(), 1);
     }
+    let age = rfc023_scenarios::age_fixture(&db, args).await;
     for branch in 0..args.branches {
         db.branch_create(&format!("control-sibling-{branch}"))
             .await
@@ -242,7 +243,8 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
         serde_json::to_vec(&fixture).unwrap(),
     )
     .unwrap();
-    serde_json::json!({
+    let mut metrics = serde_json::json!({
+        "setup_fingerprint": format!("branch-control-v2:rows={}:dims={}:seed={}:branches={}:tables={}:history={}:retired={}", args.rows, args.dims, args.seed, args.branches, args.tables, args.history_commits, args.retired_branches),
         "setup_wall_us": started.elapsed().as_micros() as u64,
         "existing_sibling_branches": args.branches,
         "initial_branch_count_including_main": expected_count,
@@ -253,10 +255,16 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
         "victim_owned_table_count": if args.scenario == "branch-delete" { args.tables } else { 0 },
         "source_branch": if args.scenario == "branch-create-from" { SOURCE } else { "main" },
         "setup_verified": true,
-    })
+    });
+    metrics
+        .as_object_mut()
+        .unwrap()
+        .extend(age.as_object().unwrap().clone());
+    metrics
 }
 
 pub(super) async fn operation(args: &Args) -> serde_json::Value {
+    super::helpers::cost::cost_harness(async {
     let root = root(args);
     let open_start = Instant::now();
     let db = Omnigraph::open(root.to_str().unwrap())
@@ -264,6 +272,9 @@ pub(super) async fn operation(args: &Args) -> serde_json::Value {
         .expect("open branch fixture");
     let operation_open_us = open_start.elapsed().as_micros() as u64;
     let operation_pre_peak_rss_bytes = super::current_process_peak_rss_bytes();
+    let ((listed, operation_wall_us, operation_post_peak_rss_bytes,
+        post_ack_reclaim_wait_us, operation_complete_wall_us,
+        operation_completion_peak_rss_bytes), io) = super::helpers::cost::measure(async {
     let started = Instant::now();
     let listed = match args.scenario.as_str() {
         "branch-create" => {
@@ -301,6 +312,9 @@ pub(super) async fn operation(args: &Args) -> serde_json::Value {
     };
     let operation_complete_wall_us = started.elapsed().as_micros() as u64;
     let operation_completion_peak_rss_bytes = super::current_process_peak_rss_bytes();
+    (listed, operation_wall_us, operation_post_peak_rss_bytes,
+        post_ack_reclaim_wait_us, operation_complete_wall_us, operation_completion_peak_rss_bytes)
+    }).await;
     // Persist only the operation's output after timing. The verification child
     // checks list contents against the prepared registry, not merely its size.
     if let Some(listed) = &listed {
@@ -310,7 +324,7 @@ pub(super) async fn operation(args: &Args) -> serde_json::Value {
         )
         .unwrap();
     }
-    serde_json::json!({
+    let mut metrics = serde_json::json!({
         "routing": "production-omnigraph-branch-control",
         "operation": args.scenario,
         "completed_operations": 1,
@@ -328,7 +342,10 @@ pub(super) async fn operation(args: &Args) -> serde_json::Value {
         "measurement_boundary": "exactly one public branch operation after fresh open; operation_wall is acknowledgement, operation_complete_wall also waits for delete fork reclaim; setup and final verification run in separate children",
         "rss_boundary": "operation child whole-process wait4 HWM includes runtime, graph open, delete fork reclaim and output recording, excludes setup/verify; pre/post/completion self HWM is not isolated allocation",
         "listed_branch_count": listed.as_ref().map(Vec::len),
-    })
+    });
+    metrics.as_object_mut().unwrap().extend(rfc023_scenarios::operation_io_metrics(&io).as_object().unwrap().clone());
+    metrics
+    }).await
 }
 
 pub(super) async fn verify(args: &Args) -> serde_json::Value {

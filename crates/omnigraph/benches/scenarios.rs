@@ -35,6 +35,10 @@
 //! existing siblings, excluding main and the deletion victim; `--tables`
 //! counts populated tables. Chunk carries `--rows` vectors and each remaining
 //! table carries one scalar row. Every run measures one real operation.
+//! These controls and `general-merge-updates` also admit `--history-commits`
+//! (even, at most 256) and `--retired-branches` (at most 32), both defaulting to
+//! zero. Aging uses real current-format writes and returns to the same logical
+//! rows before the scenario forks; it does not simulate a legacy storage format.
 //!
 //! Mechanism: the parent re-invokes `current_exe()` with `--child` per run (or
 //! per phase for RFC-023 adopt), reaps it with `libc::wait4`, and reads
@@ -120,6 +124,12 @@ struct Args {
     branches: usize,
     /// Populated tables for branch-control scenarios; Chunk plus small scalar tables.
     tables: usize,
+    /// Extra paired main commits before any scenario branches are created.
+    history_commits: usize,
+    /// Temporary branches written once, deleted, and fully reclaimed in setup.
+    retired_branches: usize,
+    /// Reject explicit age flags on scenarios that would otherwise ignore them.
+    age_options_supplied: bool,
     memory_cap_mb: Option<u64>,
     /// Results-log override; see `results_path`.
     out: Option<String>,
@@ -157,6 +167,9 @@ impl Args {
             source_mode: "update".to_string(),
             branches: 8,
             tables: 4,
+            history_commits: 0,
+            retired_branches: 0,
+            age_options_supplied: false,
             memory_cap_mb: None,
             out: None,
             baseline: false,
@@ -196,6 +209,18 @@ impl Args {
                 "--source-mode" => args.source_mode = take("--source-mode"),
                 "--branches" => args.branches = take("--branches").parse().expect("--branches"),
                 "--tables" => args.tables = take("--tables").parse().expect("--tables"),
+                "--history-commits" => {
+                    args.history_commits = take("--history-commits")
+                        .parse()
+                        .expect("--history-commits");
+                    args.age_options_supplied = true;
+                }
+                "--retired-branches" => {
+                    args.retired_branches = take("--retired-branches")
+                        .parse()
+                        .expect("--retired-branches");
+                    args.age_options_supplied = true;
+                }
                 "--out" => args.out = Some(take("--out")),
                 "--memory-cap-mb" => {
                     args.memory_cap_mb = Some(take("--memory-cap-mb").parse().expect("cap"))
@@ -242,6 +267,14 @@ impl Args {
             self.tables.to_string(),
             "--child".into(),
         ];
+        if self.age_options_supplied {
+            v.extend([
+                "--history-commits".into(),
+                self.history_commits.to_string(),
+                "--retired-branches".into(),
+                self.retired_branches.to_string(),
+            ]);
+        }
         if self.baseline {
             v.push("--baseline".into());
         }
@@ -279,13 +312,17 @@ fn main() {
              fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|rrf-gate> [--rows N] [--dims D] \
              [--seed S] [--runs K] [--selectivity F] [--k K] [--ann-partitions N] \
              [--ann-probes N] [--text-bytes B] [--delta-rows N] \
-             [--source-mode update|insert] [--branches N] [--tables N] [--memory-cap-mb M]"
+             [--source-mode update|insert] [--branches N] [--tables N] [--memory-cap-mb M] \
+             [--history-commits N (even, 0..256)] [--retired-branches N (0..32)]\n\
+             Age flags apply only to branch controls and general-merge-updates."
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
         // any blanket `cargo bench` invocation.
         return;
     }
-    let shape = if args.runs == 0 {
+    let shape = if let Err(error) = rfc023_scenarios::validate_fixture_age(&args) {
+        Err(error)
+    } else if args.runs == 0 {
         Err("--runs must be greater than zero".to_string())
     } else if branch_control::is_scenario(&args.scenario) {
         branch_control::validate_args(&args)
@@ -528,6 +565,8 @@ fn run_once(args: &Args, run: usize) -> serde_json::Value {
             "ann_partitions": args.ann_partitions,
             "ann_probes": args.ann_probes,
             "text_bytes": args.text_bytes,
+            "history_commits": args.history_commits,
+            "retired_branches": args.retired_branches,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
         },
@@ -607,6 +646,27 @@ fn run_phased_adopt_once(args: &Args, run: usize) -> serde_json::Value {
 
     let setup_args = phased_child_args(args, "setup", fixture_root, false);
     let setup = run_child_process(&setup_args);
+    // Metadata-only size census for explicitly selected age diagnostics. This
+    // runs after setup exits and before the fresh operation process starts.
+    let fixture_size = (setup.exit_status == 0 && args.age_options_supplied).then(|| {
+        let mut directories = vec![fixture.path().to_path_buf()];
+        let (mut files, mut bytes) = (0_u64, 0_u64);
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).expect("census fixture directory") {
+                let entry = entry.expect("census fixture entry");
+                let kind = entry.file_type().expect("census fixture type");
+                if kind.is_dir() {
+                    directories.push(entry.path());
+                } else if kind.is_file() {
+                    files += 1;
+                    bytes += entry.metadata().expect("census fixture size").len();
+                } else {
+                    panic!("unexpected non-file in generated age fixture");
+                }
+            }
+        }
+        (files, bytes)
+    });
 
     let operation = (setup.exit_status == 0).then(|| {
         let operation_args = phased_child_args(args, "operation", fixture_root, true);
@@ -640,6 +700,10 @@ fn run_phased_adopt_once(args: &Args, run: usize) -> serde_json::Value {
     extend_metrics(&mut metrics, Some(&setup));
     extend_metrics(&mut metrics, operation.as_ref());
     extend_metrics(&mut metrics, verify.as_ref());
+    if let Some((files, bytes)) = fixture_size {
+        metrics.insert("fixture_files".into(), serde_json::json!(files));
+        metrics.insert("fixture_bytes".into(), serde_json::json!(bytes));
+    }
     metrics.insert(
         "setup_peak_rss_bytes".into(),
         serde_json::json!(setup.peak_rss_bytes),
@@ -679,6 +743,8 @@ fn run_phased_adopt_once(args: &Args, run: usize) -> serde_json::Value {
             "source_mode": args.source_mode,
             "branches": args.branches,
             "tables": args.tables,
+            "history_commits": args.history_commits,
+            "retired_branches": args.retired_branches,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
         },
