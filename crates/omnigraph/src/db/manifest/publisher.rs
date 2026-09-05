@@ -142,8 +142,9 @@ pub(super) struct PublishOutcome {
     /// Exact successful-attempt base, when its branch lifetime was checked.
     pub base_incarnation: Option<ManifestIncarnation>,
     /// Compact fold returned with `known_state`, absent for the compatibility
-    /// no-op that reads only table state. Never a second durable state.
-    pub projection: Option<ProjectionAccumulator>,
+    /// no-op that reads only table state. Never a second durable state. Boxed
+    /// to keep the outcome small across nested async publication callers.
+    pub projection: Option<Box<ProjectionAccumulator>>,
 }
 
 #[async_trait]
@@ -1168,7 +1169,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     parent_commit_id,
                     known_state,
                     base_incarnation,
-                    projection: Some(projection),
+                    projection: Some(Box::new(projection)),
                 });
             }
 
@@ -1208,7 +1209,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                         parent_commit_id,
                         known_state,
                         base_incarnation,
-                        projection: Some(projection),
+                        projection: Some(Box::new(projection)),
                     });
                 }
                 Err(err) => {
