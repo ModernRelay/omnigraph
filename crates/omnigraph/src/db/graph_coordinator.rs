@@ -772,7 +772,7 @@ impl GraphCoordinator {
         precondition: &PublishPrecondition,
     ) -> Result<PublishedSnapshot> {
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
-        let outcome = self
+        let mut outcome = self
             .manifest
             .commit_changes_with_lineage_and_precondition(
                 changes,
@@ -783,6 +783,7 @@ impl GraphCoordinator {
             .await?;
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         let commit = self.apply_lineage_to_cache(intent, &outcome);
+        self.manifest.acknowledge_published_lineage(&mut outcome);
         Ok(PublishedSnapshot {
             graph_manifest_version: outcome.version,
             _snapshot_id: SnapshotId::new(commit.graph_commit_id.clone()),

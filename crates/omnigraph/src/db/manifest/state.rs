@@ -426,9 +426,29 @@ pub(super) fn assemble_manifest_state(
     tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
     graph_heads: HashMap<String, String>,
 ) -> Result<ManifestState> {
+    assemble_manifest_projection(
+        version,
+        registrations,
+        version_entries,
+        tombstones,
+        graph_heads,
+    )
+    .map(|(state, _)| state)
+}
+
+/// Return the exact compact accumulators alongside the visible state. The
+/// publisher already folds these inputs; retaining the result avoids another
+/// scan after the graph coordinator has adopted the corresponding lineage.
+pub(super) fn assemble_manifest_projection(
+    version: u64,
+    registrations: HashMap<TableIdentity, TableRegistration>,
+    version_entries: Vec<DatasetEntry>,
+    tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
+    graph_heads: HashMap<String, String>,
+) -> Result<(ManifestState, ProjectionAccumulator)> {
     let mut accumulator = ProjectionAccumulator::empty();
     accumulator.fold_parts(registrations, version_entries, tombstones, graph_heads)?;
-    accumulator.finish(version)
+    Ok((accumulator.finish(version)?, accumulator))
 }
 
 /// The shared reduction tail (tombstone filter, alias-uniqueness check, sort)

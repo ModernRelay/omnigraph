@@ -3019,8 +3019,9 @@ impl Omnigraph {
         // An ordinary write to a surviving branch can only replace an inherited
         // target fork with that branch's own fork, so a concurrent write can
         // make this check conservatively stale-true, never stale-false. The
-        // candidate branch's native incarnation is therefore not part of this
-        // proof and must not add two discarded BranchContents reads per branch.
+        // cold proof therefore does not need a discarded full incarnation
+        // capture. Reusing an already loaded snapshot does require a fresh
+        // incarnation probe, which replaces the cold manifest reconstruction.
         // General coordinator/OCC/feed opens retain the coherent incarnation
         // capture required by RFC-030.
         let session = self.control_session();
