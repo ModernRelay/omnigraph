@@ -178,4 +178,4 @@ This table is the human index for the canonical RFC corpus.
 | [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | complete |
 | [0051](0051-json-output-via-arrow.md) | JSON output via Arrow | maintainer | draft | partial |
 | [0052](0052-managed-control-plane-cli.md) | Managed control-plane CLI | maintainer | accepted | complete |
-| [0053](0053-offline-data-token-verification.md) | Offline data-token verification | maintainer | accepted | in-progress |
+| [0053](0053-offline-data-token-verification.md) | Offline data-token verification | maintainer | accepted | complete |

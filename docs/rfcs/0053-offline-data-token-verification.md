@@ -3,12 +3,12 @@ rfc: "0053"
 title: "Offline data-token verification"
 track: maintainer
 status: accepted
-implementation: in-progress
+implementation: complete
 authors:
   - andrew
 created: 2026-09-05
 updated: 2026-09-05
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/pull/633
 supersedes: []
 superseded_by: []
 blocked_on: []
@@ -274,24 +274,46 @@ changes. The public API gains authentication semantics, not a new graph route.
 
 ## Evidence and tests
 
-Extend `auth_policy`, `multi_graph`, `stored_queries`, `boot_settings`, and
-`openapi`, using their existing shared fixtures. Add focused verifier unit
-cases for valid signatures, tampering, wrong algorithms/keys/bindings,
-duplicate or oversized fields, invalid curves, key fingerprints, exact time
-boundaries, unsupported scope versions, and kind/assurance mismatches.
+The existing `auth_policy`, `multi_graph`, `stored_queries`, `boot_settings`,
+`data_routes`, and `openapi` owners plus server unit tests passed 359 checks.
+The eight verifier cases cover the issuer's shared golden signature,
+tampering, wrong algorithms/keys/bindings, duplicate and oversized fields,
+invalid curves, key fingerprints, exact time boundaries, unsupported versions,
+and kind/assurance mismatches. A focused Core regression verifies that directory
+and storage-URI snapshots report the same canonical root and state CAS.
 
-Protected-route tests must prove the grant ceiling despite a permissive Cedar
-policy, Cedar denial despite a permissive credential, actor-header spoofing
-failure, stored-read/write double gating, cross-graph and registry isolation,
-and unchanged static/unauthenticated behavior. Every denied mutation proves
-unchanged graph head and contents. Boot tests include wrong canonical root,
-no static credentials, invalid trust, and overlapping rotation keys.
+Protected-route tests prove the grant ceiling despite permissive Cedar policy,
+Cedar denial despite a valid credential, actor-header spoofing failure,
+stored-read/write double gating, cross-graph and registry isolation, and
+unchanged static/unauthenticated behavior. Denied mutations leave the published
+graph head unchanged. Boot coverage includes refusal before recovery opens a
+graph, trust without static credentials, invalid trust, and overlapping keys.
+The CLI passed 99 unit and 133 process tests; strict lint and documentation
+checks passed for the implemented server and client surfaces.
 
-The managed companion proof issues through per-cluster KMS, exercises actual
-CLI query/mutate, and stops the Intent API while a valid token keeps working.
-Expiry then refuses. A local test signing key cannot substitute for the KMS
-custody qualification. No claim of complete managed isolation or provisioning
-is implied by these server tests.
+The 2026-09-05 managed pilot used the server implementation at `463290a9` and
+native CLI binary with SHA-256
+`cb464cb72bb0d48ec885896e2361bee46b860b995c457cee9d33f9ca17eace0a`.
+Generated evidence records real WorkOS session issuance through the API and a
+per-cluster AWS KMS key, with a request for an ungranted export action refused.
+The actual operator retained kubelet's final container exit on a Ready node,
+completed its ordinary drain and apply, and verified that serving reported the
+finalized receipt's ledger after trust and Cedar policy were installed.
+
+Seven real-KMS verifier cases produced the expected results: a valid read
+returned 200; expired, wrong-cluster, and wrong-incarnation credentials returned
+401; missing read authority, another graph's grant, and an absent Cedar actor
+returned 403. With the Intent API at zero Pods, the actual CLI inserted one
+node and read it back at the same graph commit with the immutable principal
+actor. Its 60-second credential then produced `data_credential_expired`, and
+the API was restored. This separately exercises server expiry and client cache
+expiry; no credential was included in the generated CLI output.
+
+This qualification covers one existing cluster and one enrolled human
+principal. It does not complete the companion control-plane G4 identity, auth,
+and credential-transport gate or G5 managed-product gate, provide cell
+infrastructure, or qualify backup/restore, distributed writer fencing, or the
+full tenant adversarial matrix. Those boundaries remain outside this RFC.
 
 ## Rollout
 
@@ -325,3 +347,10 @@ remains required before claiming the implementation complete.
 This replaces the proposed 512-byte graph-id bound; the grant-count bound
 remains 64. Managed issuance uses the intersection with Core configuration
 identifiers rather than changing the independent server routing contract.
+
+2026-09-05: Completed the bounded server and CLI implementation after the
+focused regressions and real WorkOS/KMS qualification above. The live pilot
+used the ordinary managed drain, receipt, and readiness path, preserving
+existing engine and storage behavior. The
+later CLI diagnostic-redaction fix is covered by its focused regression and
+does not change the successfully qualified data path.
