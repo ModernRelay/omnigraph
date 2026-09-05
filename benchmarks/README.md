@@ -41,6 +41,54 @@ Hold the delta fixed while changing `--rows` to measure scaling, and run
 classification paths. Verify mode executes both paths and is not comparable
 to a single-path throughput sample.
 
+### Small graph-age fixtures
+
+`--history-commits N` adds paired, real updates of one existing row before
+forking, then restores its original embedding. The accepted row count and
+content stay fixed while graph commits, table versions, and deletion history
+accumulate. N defaults to zero and must be even, at most 256.
+`--retired-branches N` creates, writes, deletes, and awaits reclamation of N
+temporary branches before the measured workload, at most 32. This is a
+separate churn dimension; retired branches do not add reachable main history.
+Both options apply to branch controls and `general-merge-updates` only.
+The setup records and checks actual history growth and content restoration.
+Explicit age diagnostics also record fixture file count and byte size through
+a metadata-only census between setup and the operation process.
+
+Use the small sequential matrix to compare accumulated history without a
+large data fixture:
+
+```bash
+python3 scripts/bench-branch-age.py --plan
+python3 scripts/bench-branch-age.py \
+  --binary /absolute/path/to/scenarios \
+  --build-receipt /absolute/path/to/build.json \
+  --output /tmp/branch-age-results
+```
+
+The runner requires a saved release scenario executable and a matching clean
+source build receipt (`source.before/after`, successful locked Cargo command,
+and `binary.path/sha256`). It never compiles implicitly. Its default matrix
+uses 16 rows, four-dimensional vectors, 0/16/64 extra history commits, and a
+separate eight-retired-branch case. Branch controls use two populated tables
+and two sibling branches; general merge uses one table, two source updates,
+and eight disjoint target updates. Each point collects three samples.
+`--extended` additionally varies live siblings and populated tables to eight;
+`--smoke --runs 1` checks one tiny aged/churned fixture per operation.
+
+The runner uses one process group at a time, lower scheduling priority, two
+threads per Tokio/Lance CPU/Rayon pool, two Lance I/O slots, a 256 MiB Lance
+memory pool, and three-second pauses between points. These are recorded
+runtime settings, not a hard CPU or process-memory cap. Each point has a
+180-second whole-process watchdog. All child phases and fixture parameters
+must verify before a sample is accepted. Counters cover foreground operation
+I/O; deferred reclaim I/O is outside their task-local scope. Open time and
+delete completion time remain separate from acknowledgement latency.
+
+These fixtures model accumulated history on the current format. They do not
+claim compatibility with old binary formats or legacy bare branch refs, and
+their constrained-runtime timings are not comparable to unrestricted runs.
+
 ## Layout
 
 - `cases/*.case-v1.yaml` assigns the fixture, workload, environment, and
