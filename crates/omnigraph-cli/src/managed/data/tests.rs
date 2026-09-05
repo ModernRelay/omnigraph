@@ -465,6 +465,8 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
         (200, json!(DATA_TOKEN).to_string()),
         (401, format!("{{\"error\":\"rejected {encoded}\"}}")),
         (403, format!("rejected {DATA_TOKEN}")),
+        (403, json!({DATA_TOKEN: "rejected"}).to_string()),
+        (403, format!("{{\"{encoded}\":\"rejected\"}}")),
         (
             412,
             json!({"error":format!("rejected {DATA_TOKEN}"),"precondition_failure":{"expected":DATA_TOKEN,"actual":null}}).to_string(),

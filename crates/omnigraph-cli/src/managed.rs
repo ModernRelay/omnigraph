@@ -16,12 +16,14 @@ pub(crate) mod data;
 
 /// Managed transports must not render an endpoint's reflected credential.
 pub(crate) fn scrub_response_error(text: String, secret: &str) -> String {
-    if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
+    let text = if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
         auth::scrub_value(&mut value, secret);
         value.to_string()
     } else {
-        text.replace(secret, "[redacted]")
-    }
+        text
+    };
+    // JSON object keys can reflect credentials too; normalization decodes escapes first.
+    text.replace(secret, "[redacted]")
 }
 
 const MAX_CONTEXT: u64 = 16 * 1024;
