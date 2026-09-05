@@ -39,6 +39,9 @@ futures = { workspace = true }
 url = { workspace = true }
 headers = "0.4.1"
 sha2 = { workspace = true }
+base64 = { workspace = true }
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+libc = "0.2"
 subtle = { workspace = true }
 async-trait = { workspace = true }
 arc-swap = { workspace = true }

@@ -23,9 +23,13 @@ struct Cli {
     cluster: Option<PathBuf>,
     #[arg(long)]
     bind: Option<String>,
-    /// Run without bearer tokens and without a policy file (MR-723).
-    /// Required when neither is configured — otherwise the server
-    /// refuses to start to prevent shipping the illusion of protection.
+    /// Public JSON trust for offline signed data credentials (RFC 0053).
+    /// Its canonical root must match this serving snapshot. Read once at boot.
+    #[arg(long)]
+    data_token_trust: Option<PathBuf>,
+    /// Run without credential sources and without a policy file (MR-723).
+    /// Required when no static tokens, signed-token trust, or policy is
+    /// configured — otherwise startup refuses to prevent an unprotected deployment.
     /// Equivalent to setting `OMNIGRAPH_UNAUTHENTICATED=1`.
     #[arg(long)]
     unauthenticated: bool,
@@ -57,5 +61,6 @@ async fn main() -> Result<()> {
     )
     .await?;
     settings.shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
+    settings.data_token_trust = cli.data_token_trust;
     serve(settings).await
 }

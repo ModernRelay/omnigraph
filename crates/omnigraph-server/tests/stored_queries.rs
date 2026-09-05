@@ -9,6 +9,70 @@ use serde_json::{Value, json};
 mod support;
 use support::*;
 
+#[tokio::test]
+async fn signed_stored_invocation_requires_both_outer_and_inner_grants() {
+    let tokens = data_tokens::DataTokens::new();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    let policy = format!(
+        "{}\n  - id: invoke\n    allow:\n      actors: {{group: permitted}}\n      actions: [invoke_query]\n",
+        permit_all_policy_yaml(&[&tokens.actor])
+    );
+    std::fs::write(&policy_path, policy).unwrap();
+    let registry = stored_query_registry(&[
+        (
+            "signed_read",
+            "query signed_read() { match { $p: Person } return { $p.name } }",
+            true,
+        ),
+        (
+            "signed_insert",
+            "query signed_insert($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+            true,
+        ),
+    ]);
+    let state = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        vec![],
+        Some(&policy_path),
+        registry,
+    )
+    .await
+    .unwrap()
+    .with_data_token_trust(tokens.trust.clone());
+    let app = omnigraph_server::build_app(state);
+    let read = tokens.token(json!([{"graph_id":"default","actions":["read"]}]));
+    let (status, _) = json_response(&app, invoke_request("signed_read", &read, json!({}))).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "missing invoke grant must hide the query"
+    );
+    let invoke = tokens.token(json!([{"graph_id":"default","actions":["invoke_query","read"]}]));
+    let (status, _) = json_response(&app, invoke_request("signed_read", &invoke, json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, before) = json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
+    let params = json!({"params":{"name":"Scoped","age":31}});
+    let (status, _) = json_response(
+        &app,
+        invoke_request("signed_insert", &invoke, params.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "invoke must not authorize an inner mutation"
+    );
+    let (_, after) = json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
+    assert_eq!(after, before);
+    let write =
+        tokens.token(json!([{"graph_id":"default","actions":["invoke_query","change","read"]}]));
+    let (status, body) = json_response(&app, invoke_request("signed_insert", &write, params)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["actor_id"], tokens.actor);
+}
+
 async fn assert_receipt_commit_matches_get(app: &axum::Router, output: &Value, token: &str) {
     let receipt = output
         .get("commit")
