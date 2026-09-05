@@ -427,6 +427,9 @@ def failure_message(n: str, code_paths: list[str], hints: list[str]) -> str:
         "",
         "    --- expect unordered",
         '    {"p.name": "alice"}',
+        "",
+        "    --- expect shape",
+        "    p.name: String",
     ]
     return "\n".join(parts)
 

@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-04
+updated: 2026-09-05
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -124,12 +124,25 @@ restricts the run to cases whose file name contains the argument, and
 expect-test drives with `UPDATE_EXPECT=1`): `OMNIGRAPH_GQ_BLESS=1`
 rewrites only the `--- expect` sections of the selected cases' failing
 steps, one step per case per run since a case stops at its first failure,
-so bless converges over reruns for row-body mismatches; a header-line
-mismatch stops its case until hand-edited. It rewrites row bodies only,
-in the comparison's normalized form (scale-12 decimals with trailing
-zeros trimmed, object keys sorted, null cells explicit, one row per
-line), in canonical sorted row order for `unordered` expects and the
-run's positional order for `ordered`. Header-line expectations (`error:`
+so bless converges over reruns for row-body and shape mismatches; a
+header-line mismatch stops its case until hand-edited. It rewrites the
+body the failing check owns: the shape body when the shape check failed
+(one line per executed column, the name as executed, the `.pg` spelling of
+the Arrow type, `?` exactly when the column holds a null cell; the
+executor's nullable flag is not read (Comparison semantics says why), so a
+hand-written line without `?` survives where the data holds no null; a
+column whose Arrow type has no `.pg` spelling fails bless with the type
+named), the rows body when the rows failed, and nothing when the computed
+check failed (that red is the executor disagreeing with the compiler, which
+no expectation should absorb), in
+the comparison's normalized form (scale-12 decimals with trailing zeros
+trimmed, object keys sorted, null cells omitted, one row per line), in
+canonical sorted row order for `unordered` expects and the run's
+positional order for `ordered`. Bless pins the executed schema as it
+stands, so a blessed shape can pin a wrong type, which the reviewed diff is
+the gate for: a shape rewrite outside a migration PR is a review flag, and
+the reviewer maps each rewritten line to the return clause's projection
+and its `.pg` declaration. Header-line expectations (`error:`
 substrings, `affected:` counts) stay hand-written, since pasting a full
 error message would defeat the stable-fragment rule in Comparison
 semantics. Bless never runs in CI; the diff of the logic test file is the
@@ -301,6 +314,9 @@ query recall_count($q: String) {
 
 --- expect unordered
 {"total": 2}
+
+--- expect shape
+total: I64
 ```
 
 A multi-step feature case, showing mutation steps, a restart, and a loop:
@@ -344,6 +360,9 @@ query all_names() {
 {"p.name": "alice"}
 {"p.name": "bob"}
 {"p.name": "carol"}
+
+--- expect shape
+p.name: String
 ```
 
 Grammar, fail-closed throughout: a section starts at a line beginning `--- `
@@ -380,7 +399,34 @@ included) is refused. A step is one of:
   by an optional `--- params` section (JSON object) and a mandatory
   `--- expect` section with mode word `unordered`, `ordered`, or
   `error: <substring>`, where the substring is the trimmed remainder of the
-  header line and the section body must be empty.
+  header line and the section body must be empty. A ***rows step*** (an
+  `unordered` or `ordered` expect) is followed by a mandatory
+  `--- expect shape` section, the ***shape section***: one
+  `<name>: <type>` line per result column in `return`-list order, in `.pg`
+  property syntax with `?` permitting a null cell (`p.age: I32?`); a `?` on
+  a `.pg`-nullable property is never wrong, and a line without `?` asserts
+  that no cell is null. The name is the executed column name: `p.name` for
+  an unaliased property or an aggregate over one, `p` for an aggregate over
+  a bare variable (`count($p)`), the alias for `expr as alias`, `literal`
+  for an unaliased literal, `x` for a bare `$x`, `__nanograph_now` for
+  `now()`. A bare node projection (`return { $p }`) has no green shape
+  today: the executor returns the node's id column while the compiler infers
+  the node object, so the computed check refuses the step whatever the shape
+  line says; no corpus case carries one until the engine returns the node
+  object. `x` for a bare `$x` therefore names a bare parameter. The type is
+  a `.pg` `type_ref` (`schema.pest`) parsed by the product schema parser as
+  the one property of a `node Shape { }` declaration the runner wraps around
+  it; annotations, body constraints, `enum(...)` (its Arrow type is `Utf8`,
+  write `String`), `Blob` (not a read value, T24), comment lines, and `${`
+  are refused, blank lines are ignored, and an empty body is accepted as the
+  bless target (it asserts zero columns and is never green). An aggregate's
+  type is `I64` for `count`, `F64` for `sum` and `avg`, and the argument's
+  type for `min` and `max`; a literal's is the compiler's literal inference
+  (`I64` for an integer, `F64` for a float, `String`, `Bool`, `Date`,
+  `DateTime`). A shape section anywhere but directly after a rows expect is
+  refused, and so is a rows expect without one; the latter refusal names the
+  two routes: write it from the `.pg` schema, or fill it with
+  `OMNIGRAPH_GQ_BLESS=1` and review the diff.
 - `--- mutate` holding exactly one GQ declaration with a mutation body,
   followed by an optional `--- params` and a mandatory `--- expect` with
   mode word `ok` (success, counts unasserted),
@@ -433,9 +479,10 @@ loop, or any other name, is refused); no escape syntax exists for a
 literal `${`.
 
 Null cells: a seed row sets a nullable property to null by writing JSON
-`null` for it. A result row always carries every projected column key, with
-null cells rendered as JSON `null` (never an absent key), and expected rows
-are written the same way.
+`null` for it. A result row omits a null cell's key (the Arrow JSON writer,
+RFC 0051), and expected rows are written the same way; the column's type
+and its `?` live in the step's shape section, which is why a rows body
+alone can never pin a type.
 
 File names are `issue_<N>_<short_name>.gqt`, `<short_name>` over `[a-z0-9_]`,
 and `<N>` must equal the `# issue:` header; the harness refuses
@@ -594,6 +641,40 @@ expect section is JSONL, one object per row, same keys.
   raw message fragment is the pin.
 - `expect affected: nodes=<N> edges=<M>`: exact equality on both counts.
   `expect ok` asserts success only.
+- The shape section of a rows step is checked first, against the executed
+  result (`QueryResult::schema()` and the batches), in order: the column
+  count equals the number of shape lines; per position the executed field
+  name equals the line's name; per position the executed `DataType` equals
+  the line's type through `PropType::to_arrow` (Arrow equality, child field
+  included); per position, when the line carries no `?`, no executed cell
+  in that column is null, summed over the batches. The executor's own
+  nullable flag is not compared: `project_return` derives it from the data
+  and the aggregate path declares every column nullable, so only the data
+  can be held to the author's statement, and a `.pg`-nullable property may
+  be written without `?` when the step's data holds no null. The first
+  failing check fails the step with the column position, the column name,
+  and both sides in `.pg` spelling where the executed type has one
+  (`expected Date, the executor returned F64`), Arrow spelling otherwise.
+  When the compiler infers the shape line's type too, the message says so
+  (`the compiler infers I32 too; the executor is wrong, not the shape
+  line`), and bless does not rewrite a shape whose executed schema the
+  compiler disputes: it reports the disagreement instead, since a blessed
+  line would pin an executor defect.
+- When the shape section passes, the executed schema is checked against
+  the schema the compiler infers for the step's declaration against the
+  case's catalog (`infer_query_result_schema`): count, executed-spelling
+  names (`executed_column_name`), `DataType`, and no null cell in a column
+  the compiler infers non-nullable. This costs the author nothing and is
+  the only check that ties `lint --json`'s promise to the executed result.
+  Only then are the rows compared; a schema failure of either kind never
+  reaches the rows comparison and bless never rewrites rows over it. The
+  two checks exist because a row comparison cannot see a type: the JSON
+  writer omits a null cell's key (RFC 0051), so a zero-row aggregate typed
+  `Float64` instead of the declared `Date32` renders as `{"n": 0}` either
+  way ([#623](https://github.com/ModernRelay/omnigraph/issues/623)); the
+  shape section is the author's statement of the columns, the way the rows
+  body is the author's statement of the values, and the computed check
+  proves the compiler and the executor agree.
 
 Ranking scores stay unprojected in logic tests (existing search-test
 practice): assert the resulting row order, never the score values.
@@ -1199,3 +1280,58 @@ listed in Compatibility and reversibility.
     crate still goes through the label); "docs-only fixes" as a reason the
     label exists, narrowed to a rustdoc-only change inside a crate; the
     quotable guarantee's two-way form.
+- 2026-09-05, amendment from the PR that added the result-schema check to
+  the runner. Trigger: the pending fix for #623 removes a zero-row
+  aggregate shortcut that typed every non-`count` column `Float64` against
+  the
+  declared type, and its `.gqt` case could not tell: the JSON writer omits
+  a null cell's key (RFC 0051), so `{"n": 0}` renders from the wrong type
+  and the right one alike. The check that a Rust test had to carry now
+  runs on every rows step.
+  - Comparison semantics: a `unordered`/`ordered` step compares the
+    executed `QueryResult::schema()` against the compiler's
+    `infer_query_result_schema` for the step's declaration before its rows
+    are compared: column count; per position the executed column name
+    (`executed_column_name`, the spelling the executor uses and T25 guards,
+    not `projection_name`'s, which names an unaliased property by the
+    property alone), the Arrow `DataType`, and no null cell in a column the
+    compiler infers non-nullable. The executor's own nullable flag is
+    outside the comparison (data-derived on the projection path, always
+    `true` on the aggregate path). A mismatch fails the step naming the
+    position, the column, and both types; bless does not run over it.
+  - Invariant added: a `.gqt` step that passes has an executed result
+    schema equal in count and Arrow types to the schema the compiler
+    infers for it, with the executed column names
+    (`executed_column_name`), and holds no null in a column inferred
+    non-nullable. A type-level regression in the executor therefore turns
+    a case red even when every affected cell is null.
+  - Runner mechanics: the runner keeps each query step's parsed declaration
+    and typechecks it against the open store's catalog after execution; the
+    typecheck cannot fail for a query that just executed, and a failure
+    there is reported as the step's failure.
+  - File format, the shape section: every rows step carries a mandatory
+    `--- expect shape` section, the author's statement of the result
+    columns in `.pg` property syntax, checked against the executed result
+    before the computed check and the rows (File format, Comparison
+    semantics, Bless mode). The computed check alone proves the executor
+    agrees with the compiler and cannot see a rule both share; its
+    expectation is produced by the code under test, while the rows body is
+    the author's, and the columns should be too (sqllogictest's per-query
+    type string, in the engine's own type vocabulary rather than three
+    letters). Names follow the executed spelling; the compiler's inferred
+    schema and `lint --json` still spell an unaliased property by the
+    property alone, and whether that spelling folds into the executed one
+    is a separate compiler decision. Landing order: until that fix lands, a
+    rows step whose zero-row result carries a non-`count` aggregate is red
+    by design (the executor types the column `Float64`; the `.pg` shape line
+    is right and the failure message says so), and no corpus case carries
+    one. Superseded: File format "a mandatory
+    `--- expect` section with mode word `unordered`, `ordered`, or
+    `error: <substring>`" as the whole of a query step's expectations;
+    File format "A result row always carries every projected column key,
+    with null cells rendered as JSON `null` (never an absent key)" (false
+    since RFC 0051 landed); Bless mode "rewrites row bodies only" and
+    "null cells explicit"; Motivation's "type strings" among the omitted
+    sqllogictest mistakes, for the three-letter form only; and this
+    entry's earlier "No new section, no opt-out", which described the
+    computed check alone.

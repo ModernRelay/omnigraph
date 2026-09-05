@@ -24,3 +24,6 @@ query not_prefixed() {
 
 --- expect unordered
 {"p.name": "bob"}
+
+--- expect shape
+p.name: String
