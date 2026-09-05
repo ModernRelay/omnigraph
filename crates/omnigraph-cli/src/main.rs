@@ -47,6 +47,10 @@ mod blob_cli;
 mod cli;
 mod client;
 mod helpers;
+mod managed;
+#[cfg(test)]
+#[path = "../tests/support/managed_http.rs"]
+mod managed_http_fixture;
 mod output;
 mod planes;
 mod scope;
@@ -144,6 +148,13 @@ async fn main() -> Result<()> {
             .get_matches_from(raw_args);
         Cli::from_arg_matches(&matches)?
     };
+    if let Some(result) = managed::dispatch(&cli).await {
+        let code = result.emit()?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     let http_client = build_http_client()?;
     // RFC-010 Slice 1: reject scope-addressing flags a verb can't consume,
     // from one declared flag × capability matrix — before any per-command
@@ -153,7 +164,10 @@ async fn main() -> Result<()> {
     // resolver and the guard share one classification (planes.rs).
     let capability = planes::command_capability(&cli.command);
     match cli.command {
-        Command::Login { name, token, json } => {
+        Command::Login {
+            name, token, json, ..
+        } => {
+            let name = name.expect("clap requires a server name without --api");
             let token = match token {
                 Some(token) => token,
                 None => {
@@ -172,7 +186,8 @@ async fn main() -> Result<()> {
             let path = crate::operator::write_credential(&name, &token)?;
             finish_login(&name, &path, declared, json)?;
         }
-        Command::Logout { name, json } => {
+        Command::Logout { name, json, .. } => {
+            let name = name.expect("clap requires a server name without --api");
             let path = crate::operator::remove_credential(&name)?;
             finish_logout(&name, &path, json)?;
         }
@@ -1586,7 +1601,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Cluster { command } => match command {
+        Command::Use { .. } => unreachable!("managed dispatch handles use"),
+        Command::Cluster { command, .. } => match command {
             ClusterCommand::Validate { config, json } => {
                 let output = validate_config_dir(config);
                 finish_cluster_validate(&output, json)?;
@@ -1595,6 +1611,7 @@ async fn main() -> Result<()> {
                 config,
                 json,
                 observe,
+                ..
             } => {
                 let output = plan_config_dir_with_options(config, PlanOptions { observe }).await;
                 finish_cluster_plan(&output, json)?;
@@ -1603,7 +1620,7 @@ async fn main() -> Result<()> {
                 let output = observe_config_dir(config).await;
                 finish_cluster_state_sync(&output, json)?;
             }
-            ClusterCommand::Apply { config, json } => {
+            ClusterCommand::Apply { config, json, .. } => {
                 // The actor attributes graph-moving operations (sidecars,
                 // audit entries, engine schema-apply commits). Cluster FACTS
                 // stay unlayered; the operator's identity resolves --as flag
@@ -1625,7 +1642,7 @@ async fn main() -> Result<()> {
                 let output = approve_config_dir(config, &resource, &approver).await;
                 finish_cluster_approve(&output, json)?;
             }
-            ClusterCommand::Status { config, json } => {
+            ClusterCommand::Status { config, json, .. } => {
                 let output = status_config_dir(config).await;
                 finish_cluster_status(&output, json)?;
             }
@@ -1644,6 +1661,9 @@ async fn main() -> Result<()> {
             } => {
                 let output = force_unlock_config_dir(config, lock_id).await;
                 finish_cluster_force_unlock(&output, json)?;
+            }
+            ClusterCommand::History { .. } | ClusterCommand::Cancel { .. } => {
+                unreachable!("managed dispatch refuses managed-only verbs without context")
             }
         },
         Command::Graphs { command } => match command {
