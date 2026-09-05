@@ -1423,7 +1423,18 @@ async fn open_case_store(case: &Case) -> Result<(Omnigraph, String, tempfile::Te
     Ok((db, uri, dir))
 }
 
-async fn execute_case(case: &Case, path: &Path, bless: bool) -> Result<(), String> {
+// Keep the complete case state machine off its callers' stack. In particular,
+// direct lib tests can execute multiple cases on the default Tokio test stack.
+// This synchronous wrapper finishes constructing the boxed future before polling.
+fn execute_case<'a>(
+    case: &'a Case,
+    path: &'a Path,
+    bless: bool,
+) -> futures::future::BoxFuture<'a, Result<(), String>> {
+    execute_case_inner(case, path, bless).boxed()
+}
+
+async fn execute_case_inner(case: &Case, path: &Path, bless: bool) -> Result<(), String> {
     let (mut db, uri, _dir) = open_case_store(case).await?;
 
     let mut first_fail: Option<StepFail> = None;
