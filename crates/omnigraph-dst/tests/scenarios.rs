@@ -2235,8 +2235,9 @@ fn dst_milestone_never_remerges_merged_branch() {
 ///
 /// Graph-wide borrower proofs add reads at this universe's two first touches:
 /// AddFriend GET/LIST 382/74 -> 425/78; InsertLegacy 291/60 -> 338/64.
-/// Empty cleanup sweeps skip the proof and the old eager branch-registry read,
-/// reducing Cleanup GET/LIST 227/136 -> 209/134. Other counts are unchanged.
+/// Empty cleanup sweeps skip the proof and two old branch-registry LISTs.
+/// Count retention uses version_refs() to avoid 18 manifest GETs, reducing
+/// Cleanup GET/LIST 227/136 -> 209/134. Other counts are unchanged.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {
