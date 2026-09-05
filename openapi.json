@@ -3196,7 +3196,7 @@
           "queries"
         ],
         "summary": "**Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.",
-        "description": "Execute a GQ read query. Behavior is unchanged from prior releases; the\nroute is kept indefinitely for byte-stable back-compat. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: <query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
+        "description": "Execute a GQ read query. The route is kept indefinitely with a byte-stable\nenvelope; cell spelling follows the JSON writer. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: <query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
         "operationId": "cluster_read",
         "parameters": [
           {
@@ -4052,7 +4052,7 @@
             ]
           },
           "properties": {
-            "description": "Exact logical property values; user-schema keys verbatim."
+            "description": "Exact logical property values, user-schema keys verbatim; a null cell\nkeeps its key, an absent key was outside that commit's schema."
           }
         }
       },
@@ -4825,7 +4825,7 @@
       },
       "LegacyReadOutput": {
         "type": "object",
-        "description": "Indefinitely byte-stable response shape for the deprecated `POST /read`\nroute. The canonical [`ReadOutput`] may grow additive fields; this legacy\nenvelope deliberately cannot carry them.",
+        "description": "Indefinitely byte-stable envelope of the deprecated `POST /read` route; cell\nspelling follows the JSON writer. The canonical [`ReadOutput`] may grow\nadditive fields; this legacy envelope deliberately cannot carry them.",
         "required": [
           "query_name",
           "target",

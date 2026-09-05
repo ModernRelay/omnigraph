@@ -39,7 +39,8 @@ async fn s3_compatible_graph_lifecycle_works() {
     )
     .await
     .unwrap()
-    .to_rust_json();
+    .to_rust_json()
+    .unwrap();
     assert_eq!(alice[0]["p.name"], "Alice");
 
     reopened
@@ -72,7 +73,8 @@ async fn s3_compatible_graph_lifecycle_works() {
     )
     .await
     .unwrap()
-    .to_rust_json();
+    .to_rust_json()
+    .unwrap();
     assert_eq!(eve[0]["p.name"], "RustFS-Eve");
 
     let run_only = query_main(
@@ -83,7 +85,8 @@ async fn s3_compatible_graph_lifecycle_works() {
     )
     .await
     .unwrap()
-    .to_rust_json();
+    .to_rust_json()
+    .unwrap();
     assert_eq!(run_only[0]["p.name"], "RunOnly");
 }
 
@@ -133,7 +136,8 @@ async fn s3_branch_change_merge_flow_works() {
     )
     .await
     .unwrap()
-    .to_rust_json();
+    .to_rust_json()
+    .unwrap();
     assert_eq!(after_merge[0]["p.name"], "Feature-Eve");
     assert_eq!(
         reopened.branch_list().await.unwrap(),
@@ -175,7 +179,8 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
     )
     .await
     .unwrap()
-    .to_rust_json();
+    .to_rust_json()
+    .unwrap();
     assert_eq!(loaded[0]["p.name"], "Loaded-Over-S3");
 
     // RFC-033's only server-safe source scheme is S3. Exercise it against the

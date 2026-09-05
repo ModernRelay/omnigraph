@@ -88,7 +88,11 @@ Parameters can be supplied inline or from a file:
 ```
 
 Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
-stable machine-readable form for commands that do not use `--format`.
+stable machine-readable form for commands that do not use `--format`. Result
+cells come from the JSON spelling in
+[JSON result spelling](../queries/index.md#json-result-spelling); `table`,
+`csv`, and `kv` print strings unquoted. `--format json` prints the envelope
+pretty and the `rows` array compact, verbatim.
 
 ### Machine-readable read and write positions
 

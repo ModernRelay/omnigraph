@@ -1801,7 +1801,7 @@ query insert_then_replace_blob(
         .await
         .unwrap();
     assert_eq!(qr.num_rows(), 1);
-    let json = qr.to_sdk_json();
+    let json = qr.to_rust_json().unwrap();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "letter");
     assert_eq!(row["d.note"], "draft 1");

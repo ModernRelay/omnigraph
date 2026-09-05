@@ -873,6 +873,18 @@ impl ApiError {
         }
     }
 
+    /// HTTP 406 for an `Accept` that names neither JSON nor the Arrow IPC
+    /// stream; `ErrorCode` is a closed wire contract, so the code stays
+    /// [`ErrorCode::BadRequest`] as it does for 415.
+    pub(crate) fn not_acceptable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_ACCEPTABLE,
+            code: Some(ErrorCode::BadRequest),
+            message: message.into().into_boxed_str(),
+            details: None,
+        }
+    }
+
     /// The HTTP status this error maps to. Test-only: production reads the
     /// status through `IntoResponse`.
     #[cfg(test)]

@@ -141,6 +141,27 @@ conditional mutation.
 
 See [Branches, Commits, and History](../branching/index.md).
 
+## JSON result spelling
+
+JSON `rows` follow Arrow's JSON conventions: OmniGraph writes them with the
+`arrow-json` writer from the result batches and keeps no per-type spelling of
+its own. The spellings a consumer sees:
+
+- A null cell's key is omitted from its row, and from a struct cell; a null
+  element inside a list value stays `null`.
+- `Date` is `"2024-01-01"`; `DateTime` is `"2024-01-01T12:34:56.789"` in UTC
+  with no `Z`, and no fractional part when it is zero.
+- Integers of every width are bare numbers; JavaScript's `JSON.parse` rounds
+  values beyond 2^53.
+- `F32` prints at 32-bit width (`0.99`) and `F64` at 64-bit width; integral
+  floats carry `.0`; magnitudes from 1e10 up or below 1e-5 take exponent form
+  (`1.0e20`, `1.0e-7`); a non-finite computed value is `null`.
+- `Vector(N)` and list properties are JSON arrays.
+
+A `Date` or `DateTime` count outside the range the writer can format is refused
+on load. A read that meets one fails with status 500; the error names the
+column, the result row, and the count, and an `update` of that row repairs it.
+
 ## Linting
 
 Validate queries without running them:

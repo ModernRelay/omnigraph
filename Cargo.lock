@@ -5205,6 +5205,7 @@ dependencies = [
  "arrow-array",
  "arrow-cast",
  "arrow-ipc",
+ "arrow-json",
  "arrow-ord",
  "arrow-schema",
  "arrow-select",

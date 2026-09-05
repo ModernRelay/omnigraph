@@ -1881,8 +1881,6 @@ async fn ingest_endpoint_emits_deprecation_headers() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn read_endpoint_emits_deprecation_headers() {
-    // `/read` is kept indefinitely for byte-stable back-compat but flagged
-    // at runtime per RFC 9745 + RFC 8288. Successor is `/query`.
     let (_temp, app) = app_for_loaded_graph().await;
 
     let request = ReadRequest {
@@ -1923,12 +1921,12 @@ async fn read_endpoint_emits_deprecation_headers() {
     assert_eq!(
         body_bytes.as_ref(),
         br#"{"query_name":"get_person","target":{"branch":"main","snapshot":null},"row_count":1,"columns":["p.name","p.age"],"rows":[{"p.name":"Alice","p.age":30}]}"#,
-        "POST /read's legacy response bytes are an indefinite compatibility contract"
+        "POST /read's envelope is an indefinite compatibility contract (this fixture has no cell whose spelling RFC 0051 changes)"
     );
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert!(
         body.get("graph_commit_id").is_none(),
-        "POST /read has an indefinite byte-stable body contract and must not gain the canonical route's graph_commit_id: {body}"
+        "POST /read has an indefinite byte-stable envelope and must not gain the canonical route's graph_commit_id: {body}"
     );
 }
 
@@ -1969,6 +1967,43 @@ async fn query_endpoint_does_not_emit_deprecation_headers() {
     assert!(
         body["graph_commit_id"].as_str().is_some(),
         "POST /query must expose the pinned graph-commit token used by conditional writes: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_rows_omit_null_cells() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let request = QueryRequest {
+        query: "query knows_since() {\n    match {\n        $a: Person\n        $a $k:knows $b\n    }\n    return { $a.name, $k.since }\n}\n"
+            .to_string(),
+        name: Some("knows_since".to_string()),
+        params: None,
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/query"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = std::str::from_utf8(&body_bytes).unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["columns"], json!(["a.name", "k.since"]), "{body}");
+    assert_eq!(body["row_count"], 3, "{body}");
+    assert!(
+        text.contains(r#""rows":[{"a.name":""#) && !text.contains("k.since\":"),
+        "a null cell's key is omitted from its row, and rows travel as the writer's bytes: {text}"
     );
 }
 

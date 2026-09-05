@@ -15,6 +15,8 @@ pub enum ReadOutputFormat {
     Csv,
     Jsonl,
     Json,
+    /// The result as an Arrow IPC stream on stdout.
+    Arrow,
 }
 
 /// How an over-wide table cell is laid out when rendering `--format table`.
@@ -40,8 +42,11 @@ pub fn render_read(
         ReadOutputFormat::Json => Ok(serde_json::to_string_pretty(output)?),
         ReadOutputFormat::Jsonl => render_jsonl(output),
         ReadOutputFormat::Csv => render_csv(output),
-        ReadOutputFormat::Kv => Ok(render_kv(output)),
-        ReadOutputFormat::Table => Ok(render_table(output, options)),
+        ReadOutputFormat::Kv => render_kv(output),
+        ReadOutputFormat::Table => render_table(output, options),
+        ReadOutputFormat::Arrow => color_eyre::eyre::bail!(
+            "`--format arrow` writes an Arrow IPC byte stream to stdout and has no text rendering"
+        ),
     }
 }
 
@@ -53,14 +58,14 @@ fn render_jsonl(output: &ReadOutput) -> Result<String> {
         "target": output.target,
         "row_count": output.row_count,
     }))?);
-    for row in rows(output) {
+    for row in rows(output)? {
         lines.push(serde_json::to_string(&row)?);
     }
     Ok(lines.join("\n"))
 }
 
 fn render_csv(output: &ReadOutput) -> Result<String> {
-    let rows = rows(output);
+    let rows = rows(output)?;
     let columns = columns(output, &rows);
     let mut lines = Vec::new();
     lines.push(
@@ -82,12 +87,12 @@ fn render_csv(output: &ReadOutput) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
-fn render_kv(output: &ReadOutput) -> String {
+fn render_kv(output: &ReadOutput) -> Result<String> {
     let mut lines = vec![header_line(output)];
-    let rows = rows(output);
+    let rows = rows(output)?;
     if rows.is_empty() {
         lines.push("(no rows)".to_string());
-        return lines.join("\n");
+        return Ok(lines.join("\n"));
     }
 
     for (idx, row) in rows.iter().enumerate() {
@@ -103,17 +108,17 @@ fn render_kv(output: &ReadOutput) -> String {
             ));
         }
     }
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
-fn render_table(output: &ReadOutput, options: &ReadRenderOptions) -> String {
+fn render_table(output: &ReadOutput, options: &ReadRenderOptions) -> Result<String> {
     let mut lines = vec![header_line(output)];
-    let rows = rows(output);
+    let rows = rows(output)?;
     let columns = columns(output, &rows);
 
     if columns.is_empty() {
         lines.push("(no rows)".to_string());
-        return lines.join("\n");
+        return Ok(lines.join("\n"));
     }
 
     let widths = columns
@@ -169,7 +174,7 @@ fn render_table(output: &ReadOutput, options: &ReadRenderOptions) -> String {
         }
     }
 
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
 fn render_table_line(columns: &[String], widths: &[usize]) -> String {
@@ -202,9 +207,9 @@ fn header_line(output: &ReadOutput) -> String {
     )
 }
 
-fn rows(output: &ReadOutput) -> Vec<Map<String, Value>> {
-    output
-        .rows
+fn rows(output: &ReadOutput) -> Result<Vec<Map<String, Value>>> {
+    let parsed: Value = serde_json::from_str(output.rows.get())?;
+    Ok(parsed
         .as_array()
         .into_iter()
         .flatten()
@@ -216,7 +221,7 @@ fn rows(output: &ReadOutput) -> Vec<Map<String, Value>> {
                 map
             }
         })
-        .collect()
+        .collect())
 }
 
 fn columns(output: &ReadOutput, rows: &[Map<String, Value>]) -> Vec<String> {
@@ -310,7 +315,10 @@ mod tests {
             },
             row_count: 1,
             columns: vec!["name".to_string(), "age".to_string()],
-            rows: serde_json::json!([{ "name": "Alice", "age": 30 }]),
+            rows: serde_json::value::RawValue::from_string(
+                r#"[{"name":"Alice","age":30}]"#.to_string(),
+            )
+            .unwrap(),
             graph_commit_id: None,
         }
     }
@@ -329,6 +337,25 @@ mod tests {
 
         assert!(rendered.lines().next().unwrap().contains("name,age"));
         assert!(rendered.contains("Alice,30"));
+    }
+
+    #[test]
+    fn json_format_prints_the_envelope_pretty_and_the_rows_compact() {
+        let rendered = render_read(
+            &sample_output(),
+            ReadOutputFormat::Json,
+            &ReadRenderOptions {
+                max_column_width: 80,
+                cell_layout: TableCellLayout::Truncate,
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.contains("\n  \"row_count\": 1,\n"), "{rendered}");
+        assert!(
+            rendered.contains(r#""rows": [{"name":"Alice","age":30}]"#),
+            "{rendered}"
+        );
     }
 
     #[test]

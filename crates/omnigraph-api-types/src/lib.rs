@@ -7,17 +7,31 @@ use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Sn
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{LoadMode, LoadReceipt, LoadResult};
 use omnigraph_compiler::SchemaMigrationStep;
+use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 use utoipa::{IntoParams, ToSchema};
 
 /// Lowercase wire name for the raw graph-head conditional-write token.
 /// Documentation presents the canonical spelling
 /// `Omnigraph-If-Graph-Commit`; HTTP header names are case-insensitive.
 pub const GRAPH_COMMIT_PRECONDITION_HEADER: &str = "omnigraph-if-graph-commit";
+
+/// The `Accept` / `Content-Type` value that selects an Arrow IPC stream on the
+/// query routes (RFC 0051); JSON is the default.
+pub const ARROW_STREAM_MEDIA_TYPE: &str = "application/vnd.apache.arrow.stream";
+/// Response header carrying `ReadOutput.query_name` beside an Arrow IPC body.
+pub const QUERY_NAME_HEADER: &str = "omnigraph-query-name";
+/// Response header carrying `ReadOutput.target.branch` beside an Arrow IPC body.
+pub const BRANCH_HEADER: &str = "omnigraph-branch";
+/// Response header carrying `ReadOutput.target.snapshot` beside an Arrow IPC body.
+pub const SNAPSHOT_ID_HEADER: &str = "omnigraph-snapshot-id";
+/// Response header carrying `ReadOutput.graph_commit_id` beside an Arrow IPC body.
+pub const GRAPH_COMMIT_ID_HEADER: &str = "omnigraph-graph-commit-id";
 
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
 #[derive(ToSchema)]
@@ -274,7 +288,8 @@ pub struct ReadOutput {
     pub row_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
-    pub rows: Value,
+    #[schema(value_type = Value)]
+    pub rows: Box<RawValue>,
     /// Effective graph head commit id of the exact snapshot this read was
     /// served from. On a fresh named branch this is the inherited source head,
     /// so it is immediately usable as `Omnigraph-If-Graph-Commit` (CLI:
@@ -284,9 +299,9 @@ pub struct ReadOutput {
     pub graph_commit_id: Option<String>,
 }
 
-/// Indefinitely byte-stable response shape for the deprecated `POST /read`
-/// route. The canonical [`ReadOutput`] may grow additive fields; this legacy
-/// envelope deliberately cannot carry them.
+/// Indefinitely byte-stable envelope of the deprecated `POST /read` route; cell
+/// spelling follows the JSON writer. The canonical [`ReadOutput`] may grow
+/// additive fields; this legacy envelope deliberately cannot carry them.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LegacyReadOutput {
     pub query_name: String,
@@ -294,7 +309,8 @@ pub struct LegacyReadOutput {
     pub row_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
-    pub rows: Value,
+    #[schema(value_type = Value)]
+    pub rows: Box<RawValue>,
 }
 
 impl From<ReadOutput> for LegacyReadOutput {
@@ -433,7 +449,8 @@ pub struct ChangeEndpointsOutput {
 /// One exact logical entity image, decoded with the commit-era schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ChangeImageOutput {
-    /// Exact logical property values; user-schema keys verbatim.
+    /// Exact logical property values, user-schema keys verbatim; a null cell
+    /// keeps its key, an absent key was outside that commit's schema.
     pub properties: Value,
     /// Present for edge images only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1495,21 +1512,27 @@ pub fn read_output(
     target: &ReadTarget,
     result: QueryResult,
     graph_commit_id: Option<String>,
-) -> ReadOutput {
+) -> Result<ReadOutput, CompilerError> {
     let columns = result
         .schema()
         .fields()
         .iter()
         .map(|field| field.name().clone())
         .collect();
-    ReadOutput {
+    let rows = String::from_utf8(result.to_json_bytes()?).map_err(|err| {
+        CompilerError::Execution(format!("query result rendered invalid UTF-8: {err}"))
+    })?;
+    let rows = RawValue::from_string(rows).map_err(|err| {
+        CompilerError::Execution(format!("query result rendered invalid JSON: {err}"))
+    })?;
+    Ok(ReadOutput {
         query_name,
         target: read_target_output(target),
         row_count: result.num_rows(),
         columns,
-        rows: result.to_rust_json(),
+        rows,
         graph_commit_id,
-    }
+    })
 }
 
 pub fn ingest_output(
