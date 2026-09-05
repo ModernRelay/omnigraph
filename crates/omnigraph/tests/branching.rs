@@ -1828,9 +1828,35 @@ async fn branch_merge_applies_node_insert_to_main() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
+    // Warm this handle before another writer adds an edge. Creating a fresh
+    // branch must inherit the new edge even though this handle predates it.
+    assert_eq!(count_rows(&main, "edge:Knows").await, 3);
+    let writer = Omnigraph::open(uri).await.unwrap();
+    writer
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Alice"), ("$to", "Diana")]),
+        )
+        .await
+        .unwrap();
+    let expected_edge = snapshot_main(&writer)
+        .await
+        .unwrap()
+        .dataset("edge:Knows")
+        .unwrap()
+        .clone();
+    let mut expected_ids = collect_column_strings(&read_table(&writer, "edge:Knows").await, "id");
+    expected_ids.sort();
+    assert_eq!(expected_ids.len(), 4);
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(
+        count_rows_branch(&feature, "feature", "edge:Knows").await,
+        4
+    );
     mutate_branch(
         &mut feature,
         "feature",
@@ -1840,6 +1866,32 @@ async fn branch_merge_applies_node_insert_to_main() {
     )
     .await
     .unwrap();
+
+    let branch_edge = snapshot_branch(&feature, "feature")
+        .await
+        .unwrap()
+        .dataset("edge:Knows")
+        .unwrap()
+        .clone();
+    assert_eq!(branch_edge.dataset_path, expected_edge.dataset_path);
+    assert_eq!(
+        branch_edge.native_dataset_branch,
+        expected_edge.native_dataset_branch
+    );
+    assert_eq!(
+        branch_edge.published_dataset_version,
+        expected_edge.published_dataset_version
+    );
+    assert_eq!(branch_edge.entity_count, expected_edge.entity_count);
+    let mut branch_ids = collect_column_strings(
+        &read_table_branch(&feature, "feature", "edge:Knows").await,
+        "id",
+    );
+    branch_ids.sort();
+    assert_eq!(
+        branch_ids, expected_ids,
+        "an unrelated node write must preserve every inherited edge"
+    );
 
     let outcome = feature.branch_merge("feature", "main").await.unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
@@ -1854,6 +1906,387 @@ async fn branch_merge_applies_node_insert_to_main() {
     .await
     .unwrap();
     assert_eq!(qr.num_rows(), 1);
+    for handle in [&main, &feature, &reopened] {
+        let mut ids = collect_column_strings(&read_table(handle, "edge:Knows").await, "id");
+        ids.sort();
+        assert_eq!(
+            ids, expected_ids,
+            "fast-forward must preserve untouched edge IDs on warm and fresh handles"
+        );
+    }
+}
+
+// The .gqt runner exposes query, mutate, and restart, but no branch create or
+// merge steps. Rust also lets these regressions inspect native table versions
+// and arrange an external commit between a cached read and merge planning.
+#[tokio::test]
+async fn branch_merge_preserves_untouched_edges_after_external_commit_and_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+    assert_eq!(count_rows(&main, "edge:Knows").await, 3);
+
+    let writer = Omnigraph::open(uri).await.unwrap();
+    writer
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Alice"), ("$to", "Diana")]),
+        )
+        .await
+        .unwrap();
+    writer
+        .mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+    // Refresh main's table view through the old handle before asking that same
+    // handle to classify the now-divergent branches.
+    assert_eq!(count_rows(&main, "edge:Knows").await, 4);
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+    for handle in [&main, &Omnigraph::open(uri).await.unwrap()] {
+        assert_eq!(count_rows(handle, "edge:Knows").await, 4);
+        let friends = handle
+            .query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "Alice")]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_column_sorted(&friends), ["Bob", "Charlie", "Diana"]);
+        assert_eq!(count_rows(handle, "node:Person").await, 5);
+    }
+}
+
+#[tokio::test]
+async fn branch_merge_preserves_untouched_edges_after_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    // Build a longer native history on the branch than replaying its net
+    // changes will produce on main. Every pair returns to the same three rows.
+    for _ in 0..8 {
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Diana"), ("$to", "Alice")]),
+        )
+        .await
+        .unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "remove_friendship",
+            &params(&[("$from", "Diana")]),
+        )
+        .await
+        .unwrap();
+    }
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "remove_friendship",
+        &params(&[("$from", "Bob")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.branch_merge("feature", "main").await.unwrap(),
+        MergeOutcome::FastForward
+    );
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Alice"), ("$to", "Diana")]),
+    )
+    .await
+    .unwrap();
+    let expected_rows = read_table(&db, "edge:Knows").await;
+    let mut expected_ids = collect_column_strings(&expected_rows, "id");
+    expected_ids.sort();
+    assert_eq!(expected_ids.len(), 3);
+    let main_edge = snapshot_main(&db)
+        .await
+        .unwrap()
+        .dataset("edge:Knows")
+        .unwrap()
+        .clone();
+    let feature_edge = snapshot_branch(&db, "feature")
+        .await
+        .unwrap()
+        .dataset("edge:Knows")
+        .unwrap()
+        .clone();
+    assert!(feature_edge.published_dataset_version > main_edge.published_dataset_version);
+    assert_eq!(
+        db.branch_merge("main", "feature").await.unwrap(),
+        MergeOutcome::FastForward
+    );
+    let inherited_count = count_rows_branch(&db, "feature", "edge:Knows").await;
+    // Only the Person table changes before the final merge. The edge added on
+    // main must survive the round trip, including a fresh handle's raw scan.
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.branch_merge("feature", "main").await.unwrap(),
+        MergeOutcome::FastForward
+    );
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    let mut actual_ids = collect_column_strings(&read_table(&reopened, "edge:Knows").await, "id");
+    actual_ids.sort();
+    assert_eq!(
+        actual_ids, expected_ids,
+        "an unrelated node edit and merge must not remove the edge inserted on main"
+    );
+    assert_eq!(
+        inherited_count, 3,
+        "main's added edge must already be visible on feature before its unrelated edit"
+    );
+}
+
+#[tokio::test]
+async fn branch_merge_preserves_state_when_native_versions_differ() {
+    // The short histories make native versions equal; the long histories put
+    // the source below the target. A lazy child additionally requires
+    // recovery-owned first-touch forking without changing the indexed schema.
+    for branch_updates in [8, 2] {
+        for lazy_target in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let main = init_and_load(&dir).await;
+            main.branch_create("feature").await.unwrap();
+            let history_branch = if lazy_target { "main" } else { "feature" };
+            let history_updates = branch_updates + i64::from(lazy_target);
+            for age in 40..40 + history_updates {
+                main.mutate(
+                    history_branch,
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+                )
+                .await
+                .unwrap();
+            }
+            let (source, target) = if lazy_target {
+                // Keep the changes disjoint: a long main history and one Bob
+                // edit on feature merge into one additional feature commit.
+                main.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    main.branch_merge("main", "feature").await.unwrap(),
+                    MergeOutcome::Merged
+                );
+                main.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", 50)]),
+                )
+                .await
+                .unwrap();
+                // Inherit main's root-owned indexed table. Cloning feature's
+                // already-cloned indexes would hit the separate Lance #7840
+                // bug pinned by second_generation_branch_index_reads_fail_upstream
+                // in lance_surface_guards.rs. This first-generation fork still
+                // exercises the merge's lazy-target recovery route.
+                main.branch_create_from(ReadTarget::branch("main"), "child")
+                    .await
+                    .unwrap();
+                ("feature", "child")
+            } else {
+                assert_eq!(
+                    main.branch_merge("feature", "main").await.unwrap(),
+                    MergeOutcome::FastForward
+                );
+                main.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", 50)]),
+                )
+                .await
+                .unwrap();
+                ("main", "feature")
+            };
+            let target_native = graph_native_ref(uri, target).await;
+            let source_entry = snapshot_branch(&main, source)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            let target_entry = snapshot_branch(&main, target)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            if branch_updates == 2 {
+                assert_eq!(
+                    source_entry.published_dataset_version, target_entry.published_dataset_version,
+                    "fixture must exercise equal numeric versions on different refs"
+                );
+            } else {
+                assert!(
+                    source_entry.published_dataset_version < target_entry.published_dataset_version,
+                    "fixture must exercise a lower source version"
+                );
+            }
+            assert_ne!(
+                source_entry.native_dataset_branch,
+                target_entry.native_dataset_branch
+            );
+            assert_eq!(
+                target_entry.native_dataset_branch.as_deref() == Some(target_native.as_str()),
+                !lazy_target
+            );
+            assert_eq!(
+                main.branch_merge(source, target).await.unwrap(),
+                MergeOutcome::FastForward
+            );
+            let merged_entry = snapshot_branch(&main, target)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            assert!(
+                merged_entry.published_dataset_version > target_entry.published_dataset_version,
+                "{target}, {branch_updates} updates: changed rows must advance target's own version"
+            );
+            assert_eq!(
+                merged_entry.native_dataset_branch.as_deref(),
+                Some(target_native.as_str())
+            );
+            let reopened = Omnigraph::open(uri).await.unwrap();
+            for handle in [&main, &reopened] {
+                let result = handle
+                    .query(
+                        ReadTarget::branch(target),
+                        TEST_QUERIES,
+                        "get_person",
+                        &params(&[("$name", "Alice")]),
+                    )
+                    .await
+                    .unwrap();
+                let batch = result.concat_batches().unwrap();
+                assert_eq!(
+                    batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0),
+                    50,
+                    "{target}, {branch_updates} updates: source value must survive adoption"
+                );
+            }
+            main.mutate(
+                target,
+                MUTATION_QUERIES,
+                "add_friend",
+                &params(&[("$from", "Alice"), ("$to", "Diana")]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                main.branch_merge(target, "main").await.unwrap(),
+                MergeOutcome::FastForward
+            );
+            let result = main
+                .query(
+                    ReadTarget::branch("main"),
+                    TEST_QUERIES,
+                    "get_person",
+                    &params(&[("$name", "Alice")]),
+                )
+                .await
+                .unwrap();
+            let batch = result.concat_batches().unwrap();
+            assert_eq!(
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                50,
+                "{target}, {branch_updates} updates: an unrelated edit must not roll back main"
+            );
+
+            // Main now has the same Person rows at a lower or equal version.
+            // Bringing it back is an empty delta: retain the target's complete
+            // public registration and do not create a physical table commit.
+            let before_empty = snapshot_branch(&main, target)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            let table_uri = format!("{uri}/{}", before_empty.dataset_path);
+            let head_before =
+                open_dataset_head(&table_uri, before_empty.native_dataset_branch.as_deref())
+                    .await
+                    .version()
+                    .version;
+            assert_eq!(
+                main.branch_merge("main", target).await.unwrap(),
+                MergeOutcome::FastForward
+            );
+            let reopened = Omnigraph::open(uri).await.unwrap();
+            for handle in [&main, &reopened] {
+                let after_empty = snapshot_branch(handle, target)
+                    .await
+                    .unwrap()
+                    .dataset("node:Person")
+                    .unwrap()
+                    .clone();
+                assert_eq!(after_empty.type_key, before_empty.type_key);
+                assert_eq!(after_empty.dataset_path, before_empty.dataset_path);
+                assert_eq!(
+                    after_empty.native_dataset_branch,
+                    before_empty.native_dataset_branch
+                );
+                assert_eq!(
+                    after_empty.published_dataset_version,
+                    before_empty.published_dataset_version
+                );
+                assert_eq!(after_empty.entity_count, before_empty.entity_count);
+            }
+            assert_eq!(
+                open_dataset_head(&table_uri, before_empty.native_dataset_branch.as_deref())
+                    .await
+                    .version()
+                    .version,
+                head_before,
+                "empty adoption must not advance the physical target HEAD"
+            );
+        }
+    }
 }
 
 #[tokio::test]

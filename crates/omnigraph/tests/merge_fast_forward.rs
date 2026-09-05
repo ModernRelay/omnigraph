@@ -1392,149 +1392,196 @@ async fn fast_forward_merge_streams_blob_columns() {
 /// so publication must use the update-only keyed stage introduced by #481.
 /// Overwrite retains the admitted external descriptor on the source branch;
 /// merge owns the copied bytes while leaving unchanged valid-empty and null
-/// siblings distinct.
+/// siblings distinct. Cover both feature-to-main adoption and main-to-feature
+/// adoption when main's native version is lower than the owned target's.
 #[tokio::test]
 async fn blob_changed_only_adopt_uses_known_present_update() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let external_dir = tempfile::tempdir().unwrap();
-    let external_path = external_dir.path().join("changed.txt");
-    std::fs::write(&external_path, b"Changed externally").unwrap();
-    let external_uri = url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
-        .expect("external Blob path is absolute")
-        .to_string();
-    let empty_path = external_dir.path().join("valid-empty.txt");
-    std::fs::write(&empty_path, b"").unwrap();
-    let empty_uri = url::Url::from_file_path(std::fs::canonicalize(&empty_path).unwrap())
-        .expect("empty external Blob path is absolute")
-        .to_string();
-    let external_base = url::Url::from_directory_path(external_dir.path())
-        .expect("external Blob base is absolute")
-        .to_string();
-    let policy = ExternalBlobPolicy::allow(vec![
-        ExternalBlobBase::new(external_base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
-    ])
-    .unwrap();
+    const SET_NOTE: &str = r#"
+query set_note($title: String, $note: String) {
+    update Document set { note: $note } where title = $title
+}
+"#;
 
-    let main = Omnigraph::init(uri, BLOB_SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy.clone())
-        .unwrap();
-    let base_data = [
-        serde_json::json!({
-            "type": "Document",
-            "data": {"title": "changed", "content": "base64:QmFzZQ==", "note": "base"},
-        }),
-        serde_json::json!({
-            "type": "Document",
-            "data": {"title": "valid-empty", "content": empty_uri.clone(), "note": "empty"},
-        }),
-        serde_json::json!({
-            "type": "Document",
-            "data": {"title": "null", "content": null, "note": "null"},
-        }),
-    ]
-    .into_iter()
-    .map(|row| row.to_string())
-    .collect::<Vec<_>>()
-    .join("\n");
-    main.load("main", &base_data, LoadMode::Overwrite)
-        .await
-        .unwrap();
-    main.branch_create("feature").await.unwrap();
-
-    let feature = Omnigraph::open(uri)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy.clone())
-        .unwrap();
-    let source_data = [
-        serde_json::json!({
-            "type": "Document",
-            "data": {"title": "changed", "content": external_uri, "note": "source"},
-        }),
-        serde_json::json!({
-            "type": "Document",
-            "data": {"title": "valid-empty", "content": empty_uri.clone(), "note": "empty"},
-        }),
-        serde_json::json!({
-            "type": "Document",
-            "data": {"title": "null", "content": null, "note": "null"},
-        }),
-    ]
-    .into_iter()
-    .map(|row| row.to_string())
-    .collect::<Vec<_>>()
-    .join("\n");
-    feature
-        .load("feature", &source_data, LoadMode::Overwrite)
-        .await
+    for source_main in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let external_dir = tempfile::tempdir().unwrap();
+        let external_path = external_dir.path().join("changed.txt");
+        std::fs::write(&external_path, b"Changed externally").unwrap();
+        let external_uri = url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
+            .expect("external Blob path is absolute")
+            .to_string();
+        let empty_path = external_dir.path().join("valid-empty.txt");
+        std::fs::write(&empty_path, b"").unwrap();
+        let empty_uri = url::Url::from_file_path(std::fs::canonicalize(&empty_path).unwrap())
+            .expect("empty external Blob path is absolute")
+            .to_string();
+        let external_base = url::Url::from_directory_path(external_dir.path())
+            .expect("external Blob base is absolute")
+            .to_string();
+        let policy = ExternalBlobPolicy::allow(vec![
+            ExternalBlobBase::new(external_base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+        ])
         .unwrap();
 
-    let merger = Omnigraph::open(uri)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy)
-        .unwrap();
-    let probes = MergeWriteProbes::default();
-    let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge("feature", "main"))
-        .await
-        .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
-    assert_eq!(probes.stage_known_present_update_calls(), 1);
-    assert_eq!(probes.stage_known_present_update_rows(), 1);
-    assert_eq!(probes.stage_merge_insert_calls(), 0);
-    assert_eq!(probes.stage_fenced_insert_calls(), 0);
-    assert_eq!(probes.strict_insert_preflight_calls(), 0);
-    assert_eq!(
-        probes.stage_vector_index_calls(),
-        0,
-        "general Blob adoption must also defer derived index work"
-    );
-    assert_eq!(
-        probes.external_blob_probe_inputs(),
-        1,
-        "only the changed external descriptor belongs to the adopt delta"
-    );
-    assert_eq!(probes.external_blob_probe_calls(), 1);
-    assert_eq!(probes.external_blob_payload_read_calls(), 1);
+        let main = Omnigraph::init(uri, BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap();
+        let base_data = [
+            serde_json::json!({
+                "type": "Document",
+                "data": {"title": "changed", "content": "base64:QmFzZQ==", "note": "base"},
+            }),
+            serde_json::json!({
+                "type": "Document",
+                "data": {"title": "valid-empty", "content": empty_uri.clone(), "note": "empty"},
+            }),
+            serde_json::json!({
+                "type": "Document",
+                "data": {"title": "null", "content": null, "note": "null"},
+            }),
+        ]
+        .into_iter()
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        main.load("main", &base_data, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        main.branch_create("feature").await.unwrap();
 
-    assert_eq!(count_rows(&merger, "node:Document").await, 3);
-    let changed = read_managed_blob_bytes(
-        &merger,
-        ReadTarget::branch("main"),
-        node_blob_cell("Document", "changed", "content"),
-    )
-    .await;
-    assert_eq!(&changed[..], b"Changed externally");
+        let feature = Omnigraph::open(uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap();
+        let source_data = [
+            serde_json::json!({
+                "type": "Document",
+                "data": {"title": "changed", "content": external_uri, "note": "source"},
+            }),
+            serde_json::json!({
+                "type": "Document",
+                "data": {"title": "valid-empty", "content": empty_uri.clone(), "note": "empty"},
+            }),
+            serde_json::json!({
+                "type": "Document",
+                "data": {"title": "null", "content": null, "note": "null"},
+            }),
+        ]
+        .into_iter()
+        .map(|row| row.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let (source, target) = if source_main {
+            // Churn only one note, then merge its net change into main. The owned
+            // feature table now has a higher native version than main while both
+            // have the same logical rows. Main's next overwrite remains below it.
+            for step in 0..8 {
+                feature
+                    .mutate(
+                        "feature",
+                        SET_NOTE,
+                        "set_note",
+                        &params(&[("$title", "changed"), ("$note", &format!("step-{step}"))]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                main.branch_merge("feature", "main").await.unwrap(),
+                MergeOutcome::FastForward
+            );
+            ("main", "feature")
+        } else {
+            ("feature", "main")
+        };
+        feature
+            .load(source, &source_data, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        if source_main {
+            let source_snapshot = snapshot_branch(&main, source).await.unwrap();
+            let target_snapshot = snapshot_branch(&main, target).await.unwrap();
+            assert!(
+                source_snapshot
+                    .dataset("node:Document")
+                    .unwrap()
+                    .published_dataset_version
+                    < target_snapshot
+                        .dataset("node:Document")
+                        .unwrap()
+                        .published_dataset_version,
+                "source-main fixture must require target-lineage adoption"
+            );
+        }
 
-    let empty = merger
-        .read_blob_at(
-            ReadTarget::branch("main"),
-            node_blob_cell("Document", "valid-empty", "content"),
+        let merger = Omnigraph::open(uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap();
+        let probes = MergeWriteProbes::default();
+        let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge(source, target))
+            .await
+            .unwrap();
+        assert_eq!(outcome, MergeOutcome::FastForward);
+        assert_eq!(probes.stage_known_present_update_calls(), 1);
+        assert_eq!(probes.stage_known_present_update_rows(), 1);
+        assert_eq!(probes.stage_merge_insert_calls(), 0);
+        assert_eq!(probes.stage_fenced_insert_calls(), 0);
+        assert_eq!(probes.strict_insert_preflight_calls(), 0);
+        assert_eq!(
+            probes.stage_vector_index_calls(),
+            0,
+            "general Blob adoption must also defer derived index work"
+        );
+        assert_eq!(
+            probes.external_blob_probe_inputs(),
+            1,
+            "only the changed external descriptor belongs to the adopt delta"
+        );
+        assert_eq!(probes.external_blob_probe_calls(), 1);
+        assert_eq!(probes.external_blob_payload_read_calls(), 1);
+
+        assert_eq!(count_rows_branch(&merger, target, "node:Document").await, 3);
+        let changed = read_managed_blob_bytes(
+            &merger,
+            ReadTarget::branch(target),
+            node_blob_cell("Document", "changed", "content"),
         )
-        .await
-        .unwrap();
-    let BlobContent::External(empty) = empty.content else {
-        panic!("an unchanged retained descriptor must stay pointer-only");
-    };
-    assert_eq!(empty.uri, empty_uri);
-    assert_eq!(empty.offset, 0);
-    assert_eq!(empty.length, None);
+        .await;
+        assert_eq!(&changed[..], b"Changed externally");
 
-    let null = merger
-        .read_blob_at(
-            ReadTarget::branch("main"),
-            node_blob_cell("Document", "null", "content"),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            null,
-            OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::NotFound
-        ),
-        "an unchanged null Blob must remain null rather than becoming valid-empty: {null:?}"
-    );
+        let empty = merger
+            .read_blob_at(
+                ReadTarget::branch(target),
+                node_blob_cell("Document", "valid-empty", "content"),
+            )
+            .await
+            .unwrap();
+        let BlobContent::External(empty) = empty.content else {
+            panic!("an unchanged retained descriptor must stay pointer-only");
+        };
+        assert_eq!(empty.uri, empty_uri);
+        assert_eq!(empty.offset, 0);
+        assert_eq!(empty.length, None);
+
+        let null = merger
+            .read_blob_at(
+                ReadTarget::branch(target),
+                node_blob_cell("Document", "null", "content"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                null,
+                OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::NotFound
+            ),
+            "an unchanged null Blob must remain null rather than becoming valid-empty: {null:?}"
+        );
+    }
 }

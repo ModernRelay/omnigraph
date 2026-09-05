@@ -26,6 +26,11 @@ composition: follow it with `branch delete <source>`. A merge statement takes
 no commit precondition -- `POST /mutate/if-graph-commit` and `--if-commit`
 refuse one beside it -- and no front offers a conditional merge today.
 
+A merge preserves changes already integrated into a branch when you later
+merge that branch back. For example, after merging a new edge from `main`
+into `review`, editing only a node on `review` and merging it into `main`
+preserves that edge.
+
 ## Outcomes
 
 - **Already up to date**: the target already contains the source changes.
