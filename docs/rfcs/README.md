@@ -177,3 +177,4 @@ This table is the human index for the canonical RFC corpus.
 | [0046](0046-index-status.md) | Read-only index status | maintainer | draft | not-started |
 | [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | complete |
 | [0051](0051-json-output-via-arrow.md) | JSON output via Arrow | maintainer | draft | not-started |
+| [0052](0052-managed-control-plane-cli.md) | Managed control-plane CLI | maintainer | draft | in-progress |
