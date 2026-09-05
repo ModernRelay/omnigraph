@@ -3838,20 +3838,40 @@ async fn execute_node_scan(
     // key, RRF fusion key, `apply_ordering` tie-break) and the type's key
     // columns (the row's declared identity, retained as cheap insurance).
     // `None` (unreferenced binding) and `All` (bare `$var`) fail open to the
-    // full non-blob projection; so do search scans, because Lance
-    // autoprojects `_distance`/`_score` onto explicit projections that omit
-    // them, with a deprecation warning. Only NodeScan bindings prune:
+    // full non-blob projection; so do search scans (a pruned search
+    // projection is untested, and the Blob-bearing search projection names
+    // its ranking column below). Only NodeScan bindings prune:
     // `hydrate_nodes` (Expand dst hydration) and edge-property attach keep
     // the full non-blob width.
-    let is_search_scan = search_mode
+    let nearest_here = search_mode
         .nearest
         .as_ref()
-        .is_some_and(|(var, ..)| var == variable)
-        || search_mode
-            .bm25
-            .as_ref()
-            .is_some_and(|(var, ..)| var == variable)
-        || filters.iter().any(is_search_filter);
+        .is_some_and(|(var, ..)| var == variable);
+    let bm25_here = search_mode
+        .bm25
+        .as_ref()
+        .is_some_and(|(var, ..)| var == variable);
+    // Search filters resolve once, here: the list decides the projection
+    // below and configures the scanner in the closure.
+    let fts_queries: Vec<lance_index::scalar::FullTextSearchQuery> = filters
+        .iter()
+        .filter(|filter| is_search_filter(filter))
+        .filter_map(|filter| build_fts_query(&filter.left, params))
+        .collect();
+    let is_search_scan = nearest_here || bm25_here || filters.iter().any(is_search_filter);
+    // A search scan behind an explicit projection (the Blob-bearing type's
+    // non-blob list) names its ranking column: Lance still autoprojects
+    // `_distance`/`_score` onto explicit projections that omit them, but
+    // labels that behavior deprecated and warns on every such scan, and the
+    // projection-free path never depended on it. `add_null_blob_columns`
+    // carries the column through the post-scan rebuild.
+    let mut blob_scan_cols: Vec<&str> = non_blob_cols.clone();
+    if has_blobs && nearest_here {
+        blob_scan_cols.push("_distance");
+    }
+    if has_blobs && (bm25_here || !fts_queries.is_empty()) {
+        blob_scan_cols.push("_score");
+    }
     let pruned_cols: Option<Vec<&str>> = match binding_columns {
         Some(NeededColumns::Columns(columns)) if !is_search_scan => Some(
             non_blob_cols
@@ -3871,7 +3891,7 @@ async fn execute_node_scan(
     };
     let projection = match &pruned_cols {
         Some(columns) => Some(columns.as_slice()),
-        None => has_blobs.then_some(non_blob_cols.as_slice()),
+        None => has_blobs.then_some(blob_scan_cols.as_slice()),
     };
     let batches = crate::table_store::TableStore::scan_stream_with(
         &ds,
@@ -3898,14 +3918,10 @@ async fn execute_node_scan(
             }
 
             // Apply FTS queries from hoisted search filters (search/fuzzy/match_text in match clause)
-            for filter in filters {
-                if is_search_filter(filter) {
-                    if let Some(fts_query) = build_fts_query(&filter.left, params) {
-                        scanner.full_text_search(fts_query).map_err(|error| {
-                            OmniError::storage_context("full_text_search filter", error)
-                        })?;
-                    }
-                }
+            for fts_query in fts_queries {
+                scanner.full_text_search(fts_query).map_err(|error| {
+                    OmniError::storage_context("full_text_search filter", error)
+                })?;
             }
 
             // Apply nearest vector search if this variable is the target
@@ -4019,11 +4035,16 @@ async fn execute_node_scan(
 /// Uses column_by_name (not positional) so it's order-independent, and
 /// silently skips non-blob fields absent from the batch — LOAD-BEARING for
 /// pruned scans (#564), which legitimately omit undemanded non-blob columns.
+/// Every column the scan produced beside the catalog's rides through after
+/// the catalog columns, as the no-blob path (batch passed through untouched)
+/// already delivers it: a search scan's `_distance`/`_score` must survive
+/// this rebuild because `search_score_orderings` ranks on it.
 fn add_null_blob_columns(
     batch: &RecordBatch,
     node_type: &omnigraph_compiler::catalog::NodeType,
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
+    let batch_schema = batch.schema();
     let mut fields = Vec::with_capacity(node_type.arrow_schema.fields().len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(node_type.arrow_schema.fields().len());
 
@@ -4032,7 +4053,6 @@ fn add_null_blob_columns(
             fields.push(Field::new(field.name(), DataType::Utf8, true));
             columns.push(Arc::new(StringArray::from(vec![None::<&str>; num_rows])));
         } else if let Some(col) = batch.column_by_name(field.name()) {
-            let batch_schema = batch.schema();
             let batch_field = batch_schema
                 .field_with_name(field.name())
                 .map_err(OmniError::arrow_internal)?;
@@ -4040,6 +4060,23 @@ fn add_null_blob_columns(
             columns.push(col.clone());
         }
     }
+    for (field, col) in batch_schema.fields().iter().zip(batch.columns()) {
+        if node_type.arrow_schema.fields().find(field.name()).is_none() {
+            fields.push(field.as_ref().clone());
+            columns.push(col.clone());
+        }
+    }
+    debug_assert_eq!(
+        columns.len(),
+        batch.num_columns()
+            + node_type
+                .arrow_schema
+                .fields()
+                .iter()
+                .filter(|field| node_type.blob_properties.contains(field.name()))
+                .count(),
+        "add_null_blob_columns dropped or replaced a scan column"
+    );
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(OmniError::arrow_internal)
 }

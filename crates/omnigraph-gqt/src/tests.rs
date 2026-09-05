@@ -5,7 +5,9 @@ const SCHEMA: &str = "--- schema\nnode Person {\n    name: String @key\n}\n";
 const SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n";
 const QUERY: &str =
     "--- query\nquery all() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
-const EXPECT: &str = "--- expect unordered\n{\"p.name\": \"alice\"}\n";
+const EXPECT: &str =
+    "--- expect unordered\n{\"p.name\": \"alice\"}\n--- expect shape\np.name: String\n";
+const SHAPE: &str = "--- expect shape\np.name: String\n";
 const MUTATE: &str = "--- mutate\nquery ins($n: String) {\n    insert Person { name: $n }\n}\n";
 const PARAMS: &str = "--- params\n{\"n\": \"bob\"}\n";
 const EXPECT_OK: &str = "--- expect ok\n";
@@ -431,7 +433,7 @@ fn refuses_nearest_over_a_string_param() {
 
 #[test]
 fn accepts_empty_expect_body_as_empty_result_assertion() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n");
+    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{SHAPE}");
     parse_case("x", &text).unwrap();
 }
 
@@ -440,7 +442,7 @@ fn search_construct_sets_the_index_decision() {
     let schema = "--- schema\nnode Doc {\n    slug: String @key\n    text: String @index\n}\n";
     let query = "--- query\nquery q($q: String) {\n    match {\n        $d: Doc\n        search($d.text, $q)\n    }\n    return { $d.slug }\n}\n";
     let text = format!(
-        "{HDR}{schema}--- seed\n{query}--- params\n{{\"q\": \"needle\"}}\n--- expect unordered\n"
+        "{HDR}{schema}--- seed\n{query}--- params\n{{\"q\": \"needle\"}}\n--- expect unordered\n--- expect shape\nd.slug: String\n"
     );
     let case = parse_case("x", &text).unwrap();
     assert!(case.needs_indices);
@@ -500,10 +502,458 @@ fn ordered_comparison_is_positional() {
     compare_rows(&expected, &expected.clone(), true).unwrap();
 }
 
+mod schema_drift {
+    use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field};
+
+    use super::*;
+
+    const AGG_QUERY: &str =
+        "query q() {\n    match { $p: Person }\n    return { count($p) as n, min($p.age) as m }\n}";
+    const NAME_QUERY: &str = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}";
+
+    fn decl(source: &str) -> QueryDecl {
+        parse_query(source).unwrap().queries.remove(0)
+    }
+
+    fn agg_inferred() -> Schema {
+        Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("m", DataType::Int32, true),
+        ])
+    }
+
+    fn result(fields: Vec<Field>, columns: Vec<ArrayRef>) -> QueryResult {
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        QueryResult::new(schema, vec![batch])
+    }
+
+    #[test]
+    fn names_the_column_whose_type_differs_from_the_inferred_field() {
+        let executed = result(
+            vec![
+                Field::new("n", DataType::Int64, true),
+                Field::new("m", DataType::Float64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Float64Array::from(vec![None::<f64>])),
+            ],
+        );
+        let msg = schema_drift(&decl(AGG_QUERY), &agg_inferred(), &executed).unwrap();
+        assert!(msg.contains("column 1 `m`"), "got: {msg}");
+        assert!(msg.contains("inferred Int32"), "got: {msg}");
+        assert!(msg.contains("returned Float64"), "got: {msg}");
+    }
+
+    #[test]
+    fn accepts_a_matching_schema_whatever_the_executor_declares_nullable() {
+        let executed = result(
+            vec![
+                Field::new("n", DataType::Int64, false),
+                Field::new("m", DataType::Int32, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![Some(7)])),
+            ],
+        );
+        assert_eq!(
+            schema_drift(&decl(AGG_QUERY), &agg_inferred(), &executed),
+            None
+        );
+    }
+
+    #[test]
+    fn reports_a_column_count_mismatch() {
+        let executed = result(
+            vec![Field::new("n", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![0]))],
+        );
+        let msg = schema_drift(&decl(AGG_QUERY), &agg_inferred(), &executed).unwrap();
+        assert!(msg.contains("inferred 2 column(s)"), "got: {msg}");
+        assert!(msg.contains("returned 1"), "got: {msg}");
+    }
+
+    #[test]
+    fn reports_an_executed_name_off_the_compiler_rule() {
+        let inferred = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+        let executed = result(
+            vec![Field::new("name", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["alice"]))],
+        );
+        let msg = schema_drift(&decl(NAME_QUERY), &inferred, &executed).unwrap();
+        assert!(msg.contains("expected name `p.name`"), "got: {msg}");
+        assert!(msg.contains("returned `name`"), "got: {msg}");
+    }
+
+    #[test]
+    fn reports_nulls_in_a_column_inferred_non_nullable() {
+        let inferred = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+        let executed = result(
+            vec![Field::new("p.name", DataType::Utf8, true)],
+            vec![Arc::new(StringArray::from(vec![Some("alice"), None]))],
+        );
+        let msg = schema_drift(&decl(NAME_QUERY), &inferred, &executed).unwrap();
+        assert!(msg.contains("column 0 `p.name`"), "got: {msg}");
+        assert!(msg.contains("returned 1 null(s)"), "got: {msg}");
+    }
+}
+
+mod shape_section {
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
+    use arrow_schema::{DataType, Field, Fields};
+
+    use super::*;
+    use crate::shape::{ShapeLine, bless_shape_lines, parse_shape_body, shape_mismatch};
+
+    fn mismatch(shape: &[ShapeLine], result: &QueryResult) -> Option<String> {
+        shape_mismatch(shape, result, &Schema::empty())
+    }
+
+    const AGE_SCHEMA: &str = "--- schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n";
+    const AGE_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n{\"type\":\"Person\",\"data\":{\"name\":\"bob\"}}\n";
+    const AGE_QUERY: &str =
+        "--- query\nquery all() {\n    match { $p: Person }\n    return { $p.name, $p.age }\n}\n";
+    const AGE_ROWS: &str =
+        "--- expect unordered\n{\"p.name\": \"alice\", \"p.age\": 30}\n{\"p.name\": \"bob\"}\n";
+
+    fn lines(body: &str) -> Vec<ShapeLine> {
+        let owned: Vec<(usize, &str)> = body.lines().enumerate().collect();
+        parse_shape_body(&owned).unwrap()
+    }
+
+    fn shape_refusal(body: &str) -> String {
+        let owned: Vec<(usize, &str)> = body.lines().enumerate().collect();
+        parse_shape_body(&owned).expect_err("expected the shape body to be refused")
+    }
+
+    fn result(fields: Vec<Field>, columns: Vec<ArrayRef>) -> QueryResult {
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        QueryResult::new(schema, vec![batch])
+    }
+
+    #[test]
+    fn a_rows_expect_without_a_shape_section_is_refused() {
+        let text =
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"alice\"}}\n");
+        let reason = refusal("x", &text);
+        assert!(
+            reason.contains("line 13: the rows expect needs an `--- expect shape` section"),
+            "{reason}"
+        );
+        assert!(reason.contains("OMNIGRAPH_GQ_BLESS=1"), "{reason}");
+        let text = format!(
+            "{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"alice\"}}\n{QUERY}{EXPECT}"
+        );
+        assert!(
+            refusal("x", &text).contains("the rows expect needs an `--- expect shape` section")
+        );
+    }
+
+    #[test]
+    fn a_shape_section_must_directly_follow_a_rows_expect() {
+        let placement = "must directly follow a query step's unordered or ordered expect";
+        let text = format!("{HDR}{SCHEMA}{SEED}{SHAPE}{QUERY}{EXPECT}");
+        assert!(refusal("x", &text).contains(placement));
+        let text = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{EXPECT_OK}{SHAPE}");
+        assert!(refusal("x", &text).contains(placement));
+        let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{SHAPE}");
+        assert!(refusal("x", &text).contains(placement));
+        let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SHAPE}");
+        assert!(refusal("x", &text).contains(placement));
+        let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect error: T1\n{SHAPE}");
+        assert!(refusal("x", &text).contains(placement));
+    }
+
+    #[test]
+    fn shape_lines_accept_plain_and_dotted_names_and_every_pg_type_ref() {
+        let parsed = lines(
+            "p.name: String\ntotal: I64?\np.tags: [I32]?\np.emb: Vector(2)\n__nanograph_now: DateTime\n\n",
+        );
+        let spelled: Vec<String> = parsed
+            .iter()
+            .map(|l| format!("{}: {}", l.name, l.prop_type.display_name()))
+            .collect();
+        assert_eq!(
+            spelled,
+            [
+                "p.name: String",
+                "total: I64?",
+                "p.tags: [I32]?",
+                "p.emb: Vector(2)",
+                "__nanograph_now: DateTime",
+            ]
+        );
+        assert!(lines("").is_empty());
+    }
+
+    #[test]
+    fn shape_body_refusals_name_the_line() {
+        assert!(shape_refusal("# nope").contains("comments are refused"));
+        assert!(shape_refusal("// nope").contains("comments are refused"));
+        assert!(
+            shape_refusal("p.name String").contains("line 1: not a `<name>: <type>` shape line")
+        );
+        assert!(
+            shape_refusal("p.name: String\n1x: I64").contains("line 2: `1x` is not a column name")
+        );
+        assert!(shape_refusal("a.b.c: I64").contains("is not a column name"));
+        assert!(
+            shape_refusal("p.name: String @key")
+                .contains("annotations and body constraints are not allowed")
+        );
+        assert!(shape_refusal("p: Person").contains("line 1: unknown type `Person`"));
+        assert!(shape_refusal("Name: String").contains("`Name` is not a column name"));
+        assert!(shape_refusal("p.name: String // note").contains("comments are refused"));
+        assert!(shape_refusal("p.name: String /* note */").contains("comments are refused"));
+        assert!(shape_refusal("p.name: string").contains("unknown type `string`"));
+        assert!(shape_refusal("kind: enum(a, b)").contains("`enum(...)` is refused"));
+        assert!(shape_refusal("doc: Blob").contains("`Blob` is refused"));
+    }
+
+    #[test]
+    fn substitution_markers_are_refused_inside_a_shape_body() {
+        let text = format!(
+            "{HDR}{SCHEMA}{SEED}--- foreach $x a b\n{QUERY}--- expect unordered\n--- expect shape\np.${{x}}: String\n--- endloop\n"
+        );
+        assert!(refusal("x", &text).contains("`${` is refused in a shape body"));
+    }
+
+    #[test]
+    fn mismatch_names_the_column_and_spells_both_types_in_pg() {
+        let shape = lines("n: I64?\nm: I32?");
+        let executed = result(
+            vec![
+                Field::new("n", DataType::Int64, true),
+                Field::new("m", DataType::Float64, true),
+            ],
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![0])),
+                Arc::new(arrow_array::Float64Array::from(vec![None::<f64>])),
+            ],
+        );
+        let msg = mismatch(&shape, &executed).unwrap();
+        assert_eq!(
+            msg,
+            "result shape mismatch at column 1 `m`: expected I32, the executor returned F64"
+        );
+        let msg = mismatch(&lines("n: I64?"), &executed).unwrap();
+        assert!(
+            msg.contains("names 1 column(s), the executor returned 2"),
+            "{msg}"
+        );
+        let msg = mismatch(&lines("n: I64?\nmm: I32?"), &executed).unwrap();
+        assert!(
+            msg.contains("expected name `mm`, the executor returned `m`"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_null_cell_fails_a_column_written_without_the_marker() {
+        let executed = result(
+            vec![Field::new("p.age", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![Some(30), None]))],
+        );
+        let msg = mismatch(&lines("p.age: I32"), &executed).unwrap();
+        assert!(
+            msg.contains("written without `?`, the executor returned 1 null(s)"),
+            "{msg}"
+        );
+        assert_eq!(mismatch(&lines("p.age: I32?"), &executed), None);
+        let no_nulls = result(
+            vec![Field::new("p.age", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![Some(30)]))],
+        );
+        assert_eq!(mismatch(&lines("p.age: I32"), &no_nulls), None);
+        assert_eq!(mismatch(&lines("p.age: I32?"), &no_nulls), None);
+    }
+
+    #[test]
+    fn bless_spells_the_executed_type_and_marks_only_columns_holding_a_null() {
+        let executed = result(
+            vec![
+                Field::new("p.name", DataType::Utf8, true),
+                Field::new("p.age", DataType::Int32, false),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec![Some("alice"), None])),
+                Arc::new(Int32Array::from(vec![30, 31])),
+            ],
+        );
+        assert_eq!(
+            bless_shape_lines(&executed).unwrap(),
+            ["p.name: String?", "p.age: I32"]
+        );
+    }
+
+    #[test]
+    fn a_shape_header_with_arguments_is_an_unknown_mode() {
+        let text = format!(
+            "{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"alice\"}}\n--- expect shape foo\np.name: String\n"
+        );
+        assert!(refusal("x", &text).contains("unknown expect mode `shape foo`"));
+    }
+
+    #[test]
+    fn an_empty_shape_count_mismatch_names_the_bless_route() {
+        let executed = result(
+            vec![Field::new("n", DataType::Int64, true)],
+            vec![Arc::new(arrow_array::Int64Array::from(vec![0]))],
+        );
+        let msg = mismatch(&lines(""), &executed).unwrap();
+        assert!(
+            msg.contains(
+                "names 0 column(s), the executor returned 1; fill it with OMNIGRAPH_GQ_BLESS=1"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_type_mismatch_the_compiler_sides_with_names_the_executor_as_wrong() {
+        let executed = result(
+            vec![Field::new("m", DataType::Float64, true)],
+            vec![Arc::new(arrow_array::Float64Array::from(vec![None::<f64>]))],
+        );
+        let inferred = Schema::new(vec![Field::new("m", DataType::Int32, true)]);
+        let msg = shape_mismatch(&lines("m: I32?"), &executed, &inferred).unwrap();
+        assert!(msg.ends_with("expected I32, the executor returned F64; the compiler infers I32 too, so the executor is wrong, not the shape line"), "{msg}");
+        let disagreeing = Schema::new(vec![Field::new("m", DataType::Float64, true)]);
+        let msg = shape_mismatch(&lines("m: I32?"), &executed, &disagreeing).unwrap();
+        assert!(
+            msg.ends_with("expected I32, the executor returned F64"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn bless_refuses_a_column_name_the_shape_grammar_cannot_spell() {
+        let executed = result(
+            vec![Field::new("?", DataType::Int64, true)],
+            vec![Arc::new(arrow_array::Int64Array::from(vec![0]))],
+        );
+        let err = bless_shape_lines(&executed).unwrap_err();
+        assert!(
+            err.contains("column `?` is not a column name the shape section can spell"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bless_refuses_an_arrow_type_with_no_pg_spelling() {
+        let inner = Fields::from(vec![Field::new("id", DataType::Utf8, false)]);
+        let column: ArrayRef = Arc::new(StructArray::new(
+            inner.clone(),
+            vec![Arc::new(StringArray::from(vec!["alice"])) as ArrayRef],
+            None,
+        ));
+        let executed = result(
+            vec![Field::new("p", DataType::Struct(inner), false)],
+            vec![column],
+        );
+        let err = bless_shape_lines(&executed).unwrap_err();
+        assert!(err.contains("column `p` has Arrow type Struct"), "{err}");
+        let msg = mismatch(&lines("p: String"), &executed).unwrap();
+        assert!(
+            msg.contains("expected String, the executor returned Struct"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_shape_is_checked_before_the_rows() {
+        let text = format!(
+            "{HDR}{AGE_SCHEMA}{AGE_SEED}{AGE_QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n--- expect shape\np.name: String\np.age: I64?\n"
+        );
+        let case = parse_case("x", &text).unwrap();
+        let err = execute_case(&case, Path::new("unused.gqt"), false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("step 1 (query): result shape mismatch at column 1 `p.age`: expected I64, the executor returned I32"), "got: {err}");
+        assert!(!err.contains("row mismatch"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_nullable_property_without_a_null_cell_may_be_written_strict() {
+        let seed = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n";
+        let text = format!(
+            "{HDR}{AGE_SCHEMA}{seed}{AGE_QUERY}--- expect unordered\n{{\"p.name\": \"alice\", \"p.age\": 30}}\n--- expect shape\np.name: String\np.age: I32\n"
+        );
+        let case = parse_case("x", &text).unwrap();
+        execute_case(&case, Path::new("unused.gqt"), false)
+            .await
+            .unwrap();
+        let text = format!(
+            "{HDR}{AGE_SCHEMA}{AGE_SEED}{AGE_QUERY}{AGE_ROWS}--- expect shape\np.name: String\np.age: I32\n"
+        );
+        let case = parse_case("x", &text).unwrap();
+        let err = execute_case(&case, Path::new("unused.gqt"), false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("`p.age`: written without `?`, the executor returned 1 null(s)"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bless_fills_an_empty_shape_section_from_the_data_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bless_shape.gqt");
+        let text = format!("{HDR}{AGE_SCHEMA}{AGE_SEED}{AGE_QUERY}{AGE_ROWS}--- expect shape\n");
+        std::fs::write(&path, &text).unwrap();
+        let case = parse_case("bless_shape", &text).unwrap();
+        let err = execute_case(&case, &path, true).await.unwrap_err();
+        assert!(
+            err.contains("names 0 column(s), the executor returned 2"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("expect rewritten in place (2 lines)"),
+            "got: {err}"
+        );
+
+        let blessed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            blessed.ends_with("--- expect shape\np.name: String\np.age: I32?\n"),
+            "got: {blessed}"
+        );
+        let case = parse_case("bless_shape", &blessed).unwrap();
+        execute_case(&case, &path, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bless_never_rewrites_a_shape_over_a_row_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bless_rows_only.gqt");
+        let text = format!(
+            "{HDR}{AGE_SCHEMA}{AGE_SEED}{AGE_QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n--- expect shape\np.name: String\np.age: I32?\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        let case = parse_case("bless_rows_only", &text).unwrap();
+        let err = execute_case(&case, &path, true).await.unwrap_err();
+        assert!(err.contains("row mismatch"), "got: {err}");
+        let blessed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            blessed.ends_with("--- expect shape\np.name: String\np.age: I32?\n"),
+            "got: {blessed}"
+        );
+        assert!(
+            blessed.contains("{\"p.age\":30,\"p.name\":\"alice\"}"),
+            "got: {blessed}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn execution_reports_a_row_mismatch() {
-    let text =
-        format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n");
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n{SHAPE}"
+    );
     let case = parse_case("mismatch", &text).unwrap();
     let err = execute_case(&case, Path::new("unused.gqt"), false)
         .await
@@ -516,8 +966,9 @@ async fn execution_reports_a_row_mismatch() {
 async fn bless_rewrites_the_failing_expect_and_converges() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bless_case.gqt");
-    let text =
-        format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n");
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n{SHAPE}"
+    );
     std::fs::write(&path, &text).unwrap();
     let case = parse_case("bless_case", &text).unwrap();
     let err = execute_case(&case, &path, true).await.unwrap_err();
@@ -678,7 +1129,8 @@ const TRAVERSAL_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":
 const TRAVERSAL_QUERY: &str = "--- query\nquery friends($n: String) {\n    match {\n        $a: Person\n        \
                                $a.name = $n\n        $a knows $b\n    }\n    return { $b.name }\n}\n";
 const TRAVERSAL_PARAMS: &str = "--- params\n{\"n\": \"alice\"}\n";
-const TRAVERSAL_EXPECT: &str = "--- expect unordered\n{\"b.name\": \"bob\"}\n";
+const TRAVERSAL_EXPECT: &str =
+    "--- expect unordered\n{\"b.name\": \"bob\"}\n--- expect shape\nb.name: String\n";
 
 /// The pin reaches the executor on both paths: a pinned step runs its
 /// expands on the pinned path only, and the probes see them (a zero count
@@ -698,7 +1150,7 @@ async fn pinned_step_runs_only_its_pinned_path() {
         let Some(Item::Step(Step::Query(step))) = case.items.first() else {
             panic!("first item is the query step");
         };
-        let params = build_params(step.params_raw.as_ref(), &step.ast_params, None).unwrap();
+        let params = build_params(step.params_raw.as_ref(), &step.decl.params, None).unwrap();
         let (outcome, counts) = under_traversal(
             Some(mode),
             db.query(
@@ -736,7 +1188,7 @@ fn refuses_ordered_expect_on_an_rrf_led_order() {
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
     let message = refusal("x", &text);
     assert!(message.contains("led by `rrf()`"), "{message}");
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
+    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n{SHAPE}");
     parse_case("x", &text).unwrap();
 }
 
@@ -746,7 +1198,8 @@ fn refuses_ordered_expect_with_an_aggregate_in_return() {
                  return { count($p) as total }\n    order { bm25($p.name, $t) }\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
     assert!(refusal("x", &text).contains("aggregate in its `return` list"));
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
+    let text =
+        format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n--- expect shape\ntotal: I64?\n");
     parse_case("x", &text).unwrap();
 }
 
@@ -857,7 +1310,7 @@ async fn bless_refuses_cases_containing_loops() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bless_loop_case.gqt");
     let text = format!(
-        "{HDR}{SCHEMA}{SEED}--- foreach $x a b\n{QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n--- endloop\n"
+        "{HDR}{SCHEMA}{SEED}--- foreach $x a b\n{QUERY}--- expect unordered\n{{\"p.name\": \"nobody\"}}\n{SHAPE}--- endloop\n"
     );
     std::fs::write(&path, &text).unwrap();
     let case = parse_case("bless_loop_case", &text).unwrap();
@@ -871,7 +1324,9 @@ async fn bless_never_rewrites_on_a_kind_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bless_kind_case.gqt");
     let query = "--- query\nquery q() {\n    match { $p: Person }\n    return { $p.nope }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n{{\"p.nope\": \"x\"}}\n");
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n{{\"p.nope\": \"x\"}}\n--- expect shape\np.nope: String\n"
+    );
     std::fs::write(&path, &text).unwrap();
     let case = parse_case("bless_kind_case", &text).unwrap();
     let err = execute_case(&case, &path, true).await.unwrap_err();

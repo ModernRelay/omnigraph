@@ -94,7 +94,12 @@ limit 20
 
 Return expressions include variables, properties, literals, `now()`, earlier
 projection aliases, and the aggregates `count`, `sum`, `avg`, `min`, and `max`.
-'''''' Each projection produces one result column, named by its alias or, without
+`min` and `max` accept a numeric, `String`, `Bool`, `Date`, or `DateTime`
+column and return the column's own type; `Bool` orders `false` before `true`,
+dates and datetimes chronologically. When no row matches, a query whose
+projections are all aggregates returns one row: `count` is 0 and every other
+aggregate is null; a query that also projects a group value returns no rows.
+Each projection produces one result column, named by its alias or, without
 one, by its expression (`$p.name` gives `p.name`). Two projections that would
 produce the same column name are refused at compile time (`T25`); give each
 its own alias.
