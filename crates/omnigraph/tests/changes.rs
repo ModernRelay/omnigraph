@@ -1937,7 +1937,8 @@ edge Refs: Note -> Note {
     );
     assert_eq!(
         note_a.after.as_ref().unwrap().properties["body"],
-        serde_json::Value::Null
+        serde_json::Value::Null,
+        "a null cell keeps its key in a change image: absent means outside that commit's schema"
     );
     let note_b = &page.block.changes[1];
     assert_eq!(

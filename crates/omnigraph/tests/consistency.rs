@@ -1787,7 +1787,10 @@ async fn long_lived_handle_prepares_strict_mutation_from_current_head() {
     .await
     .unwrap();
     assert_eq!(result.num_rows(), 1);
-    assert_eq!(result.to_rust_json()[0]["p.age"], serde_json::json!(99));
+    assert_eq!(
+        result.to_rust_json().unwrap()[0]["p.age"],
+        serde_json::json!(99)
+    );
 
     let eve = query_main(
         &mut db2,

@@ -11,6 +11,7 @@ documentation = "https://docs.rs/omnigraph-compiler"
 [dependencies]
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
+arrow-json = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 arrow-cast = { workspace = true }

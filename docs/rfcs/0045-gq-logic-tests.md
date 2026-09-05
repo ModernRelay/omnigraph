@@ -540,8 +540,8 @@ expect section is JSONL, one object per row, same keys.
   route would collapse distinct integers above 2^53 into equality);
   float-shaped values round at the twelfth decimal place. A hand-written
   `2` then equals a serialized `2.0`, and `f64` noise below the twelfth
-  decimal place cannot fail a case (DataFusion's rule). Non-finite values compare as the strings
-  `"NaN"`, `"Infinity"`, `"-Infinity"`, matching `json_float_value`.
+  decimal place cannot fail a case (DataFusion's rule). A non-finite value renders as
+  `null` (RFC 0051) and compares as `null`.
 - `expect unordered` (the default): after normalization, each row
   serializes to a canonical string (object keys sorted; the serde_json
   map in use is already order-deterministic), both row lists sort, and

@@ -3,11 +3,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
-    Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray,
-    ListArray, RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array, new_null_array,
-};
+use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
@@ -4296,194 +4292,10 @@ fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema
     )))
 }
 
-fn record_batch_row_to_json(batch: &RecordBatch, row: usize) -> Result<serde_json::Value> {
-    let mut obj = serde_json::Map::new();
-    for (i, field) in batch.schema().fields().iter().enumerate() {
-        obj.insert(
-            field.name().clone(),
-            json_value_from_array(batch.column(i).as_ref(), row)?,
-        );
-    }
-    Ok(serde_json::Value::Object(obj))
-}
-
-fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Value> {
-    if array.is_null(row) {
-        return Ok(serde_json::Value::Null);
-    }
-
-    match array.data_type() {
-        DataType::Utf8 => Ok(serde_json::Value::String(
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected StringArray"))?
-                .value(row)
-                .to_string(),
-        )),
-        DataType::LargeUtf8 => Ok(serde_json::Value::String(
-            array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected LargeStringArray"))?
-                .value(row)
-                .to_string(),
-        )),
-        DataType::Boolean => Ok(serde_json::Value::Bool(
-            array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected BooleanArray"))?
-                .value(row),
-        )),
-        DataType::Int32 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Int32Array"))?
-                .value(row),
-        ))),
-        DataType::Int64 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Int64Array"))?
-                .value(row),
-        ))),
-        DataType::UInt32 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected UInt32Array"))?
-                .value(row),
-        ))),
-        DataType::UInt64 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected UInt64Array"))?
-                .value(row),
-        ))),
-        DataType::Float32 => {
-            let value = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Float32Array"))?
-                .value(row) as f64;
-            Ok(serde_json::Value::Number(
-                serde_json::Number::from_f64(value).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "cannot encode f32 value '{}' as JSON",
-                        value
-                    ))
-                })?,
-            ))
-        }
-        DataType::Float64 => {
-            let value = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Float64Array"))?
-                .value(row);
-            Ok(serde_json::Value::Number(
-                serde_json::Number::from_f64(value).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "cannot encode f64 value '{}' as JSON",
-                        value
-                    ))
-                })?,
-            ))
-        }
-        DataType::Date32 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Date32Array"))?
-                .value(row),
-        ))),
-        DataType::Date64 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<Date64Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Date64Array"))?
-                .value(row),
-        ))),
-        DataType::Binary => Ok(serde_json::Value::String(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected BinaryArray"))?
-                .value(row),
-        ))),
-        DataType::LargeBinary => Ok(serde_json::Value::String(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected LargeBinaryArray"))?
-                .value(row),
-        ))),
-        DataType::List(_) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected ListArray"))?;
-            let values = list.value(row);
-            let mut out = Vec::with_capacity(values.len());
-            for idx in 0..values.len() {
-                out.push(json_value_from_array(values.as_ref(), idx)?);
-            }
-            Ok(serde_json::Value::Array(out))
-        }
-        DataType::LargeList(_) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<LargeListArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected LargeListArray"))?;
-            let values = list.value(row);
-            let mut out = Vec::with_capacity(values.len());
-            for idx in 0..values.len() {
-                out.push(json_value_from_array(values.as_ref(), idx)?);
-            }
-            Ok(serde_json::Value::Array(out))
-        }
-        DataType::FixedSizeList(_, _) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected FixedSizeListArray"))?;
-            let values = list.value(row);
-            let mut out = Vec::with_capacity(values.len());
-            for idx in 0..values.len() {
-                out.push(json_value_from_array(values.as_ref(), idx)?);
-            }
-            Ok(serde_json::Value::Array(out))
-        }
-        DataType::Struct(fields) => {
-            let struct_array = array
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected StructArray"))?;
-            let mut obj = serde_json::Map::new();
-            for (field_idx, field) in fields.iter().enumerate() {
-                obj.insert(
-                    field.name().clone(),
-                    json_value_from_array(struct_array.column(field_idx).as_ref(), row)?,
-                );
-            }
-            Ok(serde_json::Value::Object(obj))
-        }
-        _ => {
-            let value = arrow_cast::display::array_value_to_string(array, row)
-                .map_err(OmniError::arrow_internal)?;
-            Ok(serde_json::Value::String(value))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use arrow_array::Int32Array;
+
     use super::*;
     use crate::db::manifest::ManifestCoordinator;
     use async_trait::async_trait;
@@ -5059,9 +4871,14 @@ edge WorksAt: Person -> Company
         batches
             .into_iter()
             .flat_map(|batch| {
-                (0..batch.num_rows())
-                    .map(|row| record_batch_row_to_json(&batch, row).unwrap())
-                    .collect::<Vec<_>>()
+                let rows =
+                    omnigraph_compiler::result::QueryResult::new(batch.schema(), vec![batch])
+                        .to_rust_json()
+                        .unwrap();
+                match rows {
+                    Value::Array(rows) => rows,
+                    other => vec![other],
+                }
             })
             .collect()
     }

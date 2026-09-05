@@ -2610,12 +2610,12 @@ fn parse_date32_json_value(value: &JsonValue) -> Result<Option<i32>> {
     if let Some(days) = value.as_i64() {
         let days = i32::try_from(days)
             .map_err(|_| OmniError::manifest(format!("Date value out of range: {}", days)))?;
-        return Ok(Some(days));
+        return Ok(Some(checked_date32(days)?));
     }
     if let Some(days) = value.as_u64() {
         let days = i32::try_from(days)
             .map_err(|_| OmniError::manifest(format!("Date value out of range: {}", days)))?;
-        return Ok(Some(days));
+        return Ok(Some(checked_date32(days)?));
     }
     if let Some(value) = value.as_str() {
         return Ok(Some(parse_date32_literal(value)?));
@@ -2628,17 +2628,35 @@ fn parse_date64_json_value(value: &JsonValue) -> Result<Option<i64>> {
         return Ok(None);
     }
     if let Some(ms) = value.as_i64() {
-        return Ok(Some(ms));
+        return Ok(Some(checked_date64(ms)?));
     }
     if let Some(ms) = value.as_u64() {
         let ms = i64::try_from(ms)
             .map_err(|_| OmniError::manifest(format!("DateTime value out of range: {}", ms)))?;
-        return Ok(Some(ms));
+        return Ok(Some(checked_date64(ms)?));
     }
     if let Some(value) = value.as_str() {
         return Ok(Some(parse_date64_literal(value)?));
     }
     Ok(None)
+}
+
+fn checked_date32(days: i32) -> Result<i32> {
+    if !omnigraph_compiler::json_output::date32_renderable(days) {
+        return Err(OmniError::manifest(format!(
+            "Date value {days} is outside the range the JSON writer can format"
+        )));
+    }
+    Ok(days)
+}
+
+fn checked_date64(ms: i64) -> Result<i64> {
+    if !omnigraph_compiler::json_output::date64_renderable(ms) {
+        return Err(OmniError::manifest(format!(
+            "DateTime value {ms} is outside the range the JSON writer can format"
+        )));
+    }
+    Ok(ms)
 }
 
 fn generate_id() -> String {
@@ -2663,6 +2681,13 @@ pub(crate) fn parse_date32_literal(value: &str) -> Result<i32> {
 }
 
 pub(crate) fn parse_date64_literal(value: &str) -> Result<i64> {
+    if value.starts_with(['+', '-']) {
+        return ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"]
+            .iter()
+            .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+            .map(|datetime| datetime.and_utc().timestamp_millis())
+            .ok_or_else(|| OmniError::manifest(format!("invalid DateTime literal '{value}'")));
+    }
     let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(value)]));
     let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date64)
         .map_err(|e| OmniError::manifest(format!("invalid DateTime literal '{}': {}", value, e)))?;
@@ -3130,6 +3155,58 @@ edge WorksAt: Person -> Company
 {"edge": "Knows", "from": "Alice", "to": "Bob"}
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 "#;
+
+    #[test]
+    fn signed_year_datetime_strings_read_back_as_the_writer_spells_them() {
+        assert_eq!(
+            parse_date64_literal("+10000-01-01T00:00:00").unwrap(),
+            253_402_300_800_000
+        );
+        assert_eq!(
+            parse_date64_literal("+10000-01-01T00:00:00.789").unwrap(),
+            253_402_300_800_789
+        );
+        assert_eq!(
+            parse_date64_literal("-0001-12-31T00:00:00").unwrap(),
+            chrono::NaiveDate::from_ymd_opt(-1, 12, 31)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        );
+        assert!(parse_date64_literal("+10000-13-01T00:00:00").is_err());
+    }
+
+    #[test]
+    fn date_counts_outside_the_render_range_are_refused() {
+        assert_eq!(
+            parse_date32_json_value(&serde_json::json!(19_723)).unwrap(),
+            Some(19_723)
+        );
+        assert_eq!(
+            parse_date64_json_value(&serde_json::json!(1_704_067_200_000_i64)).unwrap(),
+            Some(1_704_067_200_000)
+        );
+        for days in [i32::MAX, i32::MIN] {
+            let err = parse_date32_json_value(&serde_json::json!(days)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "Date value {days} is outside the range the JSON writer can format"
+                )),
+                "{err}"
+            );
+        }
+        for ms in [i64::MAX, i64::MIN] {
+            let err = parse_date64_json_value(&serde_json::json!(ms)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "DateTime value {ms} is outside the range the JSON writer can format"
+                )),
+                "{err}"
+            );
+        }
+    }
 
     #[test]
     fn strict_json_conversion_rejects_nullable_wrong_types_and_list_items() {

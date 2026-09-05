@@ -1102,7 +1102,10 @@ async fn cross_handle_reclaim_never_deletes_live_intent_owned_fork() {
     )
     .await
     .unwrap();
-    assert_eq!(alice.to_rust_json()[0]["p.age"], serde_json::json!(99));
+    assert_eq!(
+        alice.to_rust_json().unwrap()[0]["p.age"],
+        serde_json::json!(99)
+    );
 }
 
 #[tokio::test]

@@ -111,13 +111,31 @@ fn canonical_export_rows(bytes: &[u8]) -> Vec<String> {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .expect("valid export JSONL")
-                .to_string()
+            let mut value =
+                serde_json::from_str::<serde_json::Value>(line).expect("valid export JSONL");
+            normalize_f32_and_nulls(&mut value);
+            value.to_string()
         })
         .collect::<Vec<_>>();
     rows.sort();
     rows
+}
+
+/// v0.9 exported an F32 cell as widened 64-bit digits and a null cell as
+/// `"k":null`; the current writer prints 32-bit digits and omits the key.
+fn normalize_f32_and_nulls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number) if number.is_f64() => {
+            let narrowed = number.as_f64().expect("f64") as f32;
+            *value = serde_json::json!(narrowed as f64);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(normalize_f32_and_nulls),
+        serde_json::Value::Object(map) => {
+            map.retain(|_, member| !member.is_null());
+            map.values_mut().for_each(normalize_f32_and_nulls);
+        }
+        _ => {}
+    }
 }
 
 fn assert_export_fidelity(label: &str, original: &[u8], rebuilt: &[u8]) {

@@ -178,7 +178,7 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(http_read["rows"][0]["p.name"], "Mina");
     assert!(
         http_read.get("graph_commit_id").is_none(),
-        "deprecated /read must preserve its byte-stable legacy body"
+        "deprecated /read must preserve its byte-stable legacy envelope"
     );
 
     let local_verify = parse_stdout_json(&output_success(

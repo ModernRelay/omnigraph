@@ -2311,7 +2311,8 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                         query_main(&db, MUTATION_QUERIES, "all_persons", &Default::default())
                             .await
                             .expect("query channel at final audit")
-                            .to_rust_json();
+                            .to_rust_json()
+                            .expect("query rows render as JSON at final audit");
                     let mut query_map: BTreeMap<String, i64> = BTreeMap::new();
                     if let serde_json::Value::Array(rows) = via_query {
                         for row in rows {
