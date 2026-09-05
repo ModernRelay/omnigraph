@@ -119,7 +119,11 @@ being silently ignored. The issuer may issue a shorter token than the caller
 requests according to its current permissions and configured limit.
 
 `grants` contains 1–64 unique graph ids. Each id passes the server's existing
-graph-id validation and is at most 512 bytes. Each action set is nonempty,
+graph-id validation: 1–64 ASCII letters, digits, or hyphens, excluding
+`policies`, `healthz`, `openapi`, and `graphs`. The managed issuer additionally
+requires Core configuration validity, so it issues only for the intersection
+of those grammars. Core graph names unsupported by existing server routing
+remain unsupported; this increment does not widen routing. Each action set is nonempty,
 contains no duplicate, and uses only these existing exact policy action names:
 `read`, `export`, `change`, `branch_create`, `branch_delete`, `branch_merge`,
 `invoke_query`, `graph_list`. Wildcards, `schema_apply`, `admin`, and unknown
@@ -310,3 +314,8 @@ wire bounds, static-first exact credential matching, required Cedar permit,
 and same-snapshot canonical root accessor. Companion control-plane DEC-08-23
 owns issuance, permissions, KMS custody, and operator preparation. Qualification
 remains required before claiming the implementation complete.
+
+2026-09-05: Retained the existing server graph-id grammar and reserved names.
+This replaces the proposed 512-byte graph-id bound; the grant-count bound
+remains 64. Managed issuance uses the intersection with Core configuration
+identifiers rather than changing the independent server routing contract.
