@@ -60,10 +60,11 @@ token.
 | `cleanup` | Delete old versions under an explicit retention policy | direct |
 | `graphs list` | List graphs on a server | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
-| `cluster validate/plan/apply/...` | Operate declarative cluster state | cluster config |
+| `cluster validate/plan/apply/...` | Operate declarative cluster state | cluster config or managed context |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
-| `login`, `logout` | Manage a named server credential | local |
+| `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
+| `use` | Select a managed cluster for a config directory | managed API |
 | `profile list/show` | Inspect operator profiles | local |
 | `alias` | Invoke a personal stored-query alias | served |
 | `version` | Print build and storage-format information | local |
@@ -200,6 +201,103 @@ by a profile.
 Bearer tokens never belong in `config.yaml`. Store a token with
 `omnigraph login <server>` or provide `OMNIGRAPH_BEARER_TOKEN` for the current
 invocation.
+
+## Managed cluster commands
+
+`omnigraph login --api ORIGIN` prints a verification URL and user code to
+stderr. Complete the browser login while the CLI polls. The resulting opaque
+service session is stored in the OS keychain under the canonical API origin:
+macOS Keychain, Windows Credential Manager, or encrypted Secret Service on
+Linux and BSD. There is no plaintext fallback. Sessions expire within 15
+minutes, and the CLI stores no refresh token; run login again after expiry.
+An unavailable keychain refuses the operation. Login JSON includes identity
+and expiry, never a token or device secret.
+
+`omnigraph logout --api ORIGIN` revokes that session and removes only that
+origin's local entry. If revocation fails, the local entry is still removed
+and the error reports `revocation_confirmed: false`; the remote session
+remains subject to its expiry. Accepted runs continue after logout.
+The existing `login SERVER --token` and `logout SERVER` commands retain their
+named-server credential behavior.
+
+`omnigraph use CLUSTER_ID --api ORIGIN [--config DIR] [--json]` verifies access
+to the cluster, then atomically writes `DIR/.omnigraph/context`:
+
+```yaml
+version: 1
+cluster: CLUSTER_ID
+api: https://control.example
+```
+
+The context contains no secret and is read only from the selected `--config`
+directory, which defaults to `.`. Parent directories are not searched.
+Unknown fields, versions, malformed files, symbolic links, and files over
+16 KiB are refused. API addresses must be origins without credentials, path,
+query, or fragment. HTTPS is required except for exact localhost,
+127.0.0.1, and `[::1]` API hosts used for local integration.
+
+| Command with managed context | Behavior |
+|---|---|
+| `cluster plan [--rev REVISION]` | Plan the pushed revision, or the bound head when omitted |
+| `cluster apply --plan PLAN_RUN_ID` | Apply exactly that saved plan with current permissions |
+| `cluster status [RUN_ID]` | Read the cluster projections, or one run belonging to that cluster |
+| `cluster history [--limit N] [--since RFC3339]` | Read up to N runs, default 100, maximum 1000 |
+| `cluster cancel RUN_ID` | Cancel a pending run; abandon a converged unused plan and release its lease |
+
+All accept `--config DIR` and `--json`. Managed plan and apply accept
+`--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. Without a
+supplied key, plan or apply generates one
+and prints it to stderr before submission. Reuse that key with the same body
+to recover from an uncertain response; changing the body under a key is
+refused by the API. Retry cancellation or abandonment using the same run id.
+The CLI does not upload local files or infer a revision
+from uncommitted changes. A saved plan retains the service's change lease
+until it is applied, abandoned, or expires under the API's rules.
+
+Plan and apply normally poll every two seconds for up to 300 seconds.
+`--timeout` accepts 1–3600 seconds. Reaching the deadline stops only the local
+wait; inspect `cluster status RUN_ID` to continue following the run.
+`--no-wait` prints the accepted run and exits 0. Every HTTP request has a
+10-second deadline and an 8 MiB response limit; redirects are refused.
+`--json` prints one API envelope to stdout with its provenance and
+requested/effective/observed labels intact. Progress and idempotency keys use
+stderr; refusals use a JSON problem object with a `type` field.
+
+| Managed run result | Exit code |
+|---|---|
+| Converged | 0 |
+| Failed or transport error | 1 |
+| Refused or blocked | 2 |
+| Partially converged | 3 |
+| Recovery required | 4 |
+| Stalled or wait deadline reached | 5 |
+| Cancelled, including successful pending-run cancellation | 6 |
+
+Status and history reads exit 0 when retrieved successfully. Abandoning a
+saved plan preserves its converged result and exits 0. Managed apply does not
+prompt for an additional approval: the API checks the authenticated caller's
+permissions. `--as`, `--server`, `--profile`, `--graph`, `--store`, and the
+global `--cluster` selector do not apply to managed commands.
+
+For unattended execution, provide an explicitly scoped automation token and
+its API origin together:
+
+```bash
+export OMNIGRAPH_CONTROL_API=https://control.example
+# Supply OMNIGRAPH_CONTROL_TOKEN through your CI secret mechanism.
+omnigraph cluster apply --plan PLAN_RUN_ID --idempotency-key DEPLOYMENT_KEY --json
+```
+
+The canonical `OMNIGRAPH_CONTROL_API` must match the selected context. A
+missing or mismatched pair refuses before any request. These credentials are
+separate from `OMNIGRAPH_BEARER_TOKEN`, named servers, and operator profiles.
+
+Without a context, existing direct cluster commands behave as before.
+`--direct` explicitly selects that path, ignoring even a malformed context;
+`cluster.yaml` still owns the storage root. Managed-only arguments with
+`--direct` or without a context refuse. Other cluster verbs, including
+`approve`, `observe`, `refresh`, and `force-unlock`, refuse when a managed
+context is present. API failures never trigger direct execution.
 
 ## Confirmation rules
 

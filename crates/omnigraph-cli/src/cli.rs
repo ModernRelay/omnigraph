@@ -366,6 +366,9 @@ pub(crate) enum Command {
     // ── Control plane ── manage a cluster directory (--config <dir>).
     /// Validate and plan read-only cluster configuration.
     Cluster {
+        /// Explicitly use the direct Core path, ignoring folder context.
+        #[arg(long, global = true)]
+        direct: bool,
         #[command(subcommand)]
         command: ClusterCommand,
     },
@@ -382,7 +385,11 @@ pub(crate) enum Command {
     Login {
         /// Server name (keys the credential; declare its url under
         /// `servers:` in ~/.omnigraph/config.yaml)
-        name: String,
+        #[arg(required_unless_present = "api", conflicts_with = "api")]
+        name: Option<String>,
+        /// Log in to a managed Intent API using browser device authorization.
+        #[arg(long, conflicts_with = "token")]
+        api: Option<String>,
         /// The token. Prefer piping via stdin over this flag (shell
         /// history).
         #[arg(long)]
@@ -392,7 +399,21 @@ pub(crate) enum Command {
     },
     /// Remove a named server's stored credential. Idempotent.
     Logout {
-        name: String,
+        #[arg(required_unless_present = "api", conflicts_with = "api")]
+        name: Option<String>,
+        /// Revoke the managed session and remove its OS keychain entry.
+        #[arg(long)]
+        api: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Select a managed cluster for this config directory.
+    Use {
+        cluster_id: String,
+        #[arg(long)]
+        api: String,
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -518,6 +539,11 @@ pub(crate) enum ClusterCommand {
         /// any lock instead of refusing, and label the output `observed`.
         #[arg(long)]
         observe: bool,
+        /// Managed: select a pushed revision; omission uses the bound head.
+        #[arg(long = "rev", alias = "revision")]
+        revision: Option<String>,
+        #[command(flatten)]
+        managed: ManagedRunArgs,
     },
     /// Converge the cluster to its config: create graphs, apply schema updates
     /// (soft drops), write stored-query/policy catalog resources, and execute
@@ -530,6 +556,11 @@ pub(crate) enum ClusterCommand {
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
+        /// Managed: apply this exact saved plan run. Required in managed mode.
+        #[arg(long)]
+        plan: Option<String>,
+        #[command(flatten)]
+        managed: ManagedRunArgs,
     },
     /// Record a digest-bound approval for a gated (irreversible) change,
     /// e.g. a graph delete. Requires the global --as actor.
@@ -545,10 +576,32 @@ pub(crate) enum ClusterCommand {
     },
     /// Read the local JSON state ledger without scanning live graph resources.
     Status {
+        /// Managed: inspect a run instead of the cluster projections.
+        run_id: Option<String>,
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read managed run history with its provenance and outcomes.
+    History {
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+        /// Include runs since this RFC 3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Cancel a pending managed run, or abandon an unused saved plan.
+    Cancel {
+        run_id: String,
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -592,6 +645,19 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Default, Args)]
+pub(crate) struct ManagedRunArgs {
+    /// Return the accepted managed run without waiting for its outcome.
+    #[arg(long)]
+    pub(crate) no_wait: bool,
+    /// Managed wait deadline in seconds (default 300, maximum 3600).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub(crate) timeout: Option<u64>,
+    /// Reuse this key to safely replay the same managed request.
+    #[arg(long)]
+    pub(crate) idempotency_key: Option<String>,
 }
 
 /// Operations on the graph registry of a multi-graph server (MR-668).
