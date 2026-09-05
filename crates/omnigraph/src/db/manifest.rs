@@ -938,6 +938,26 @@ pub(crate) enum LineageRefresh {
 }
 
 impl ManifestCoordinator {
+    /// Take an operation-local copy of this exact immutable view. The caller
+    /// still checks its authority after acquiring the operation's gates.
+    pub(crate) fn capture(&self) -> Self {
+        Self {
+            root_uri: self.root_uri.clone(),
+            dataset: self.dataset.clone(),
+            known_state: self.known_state.clone(),
+            active_branch: self.active_branch.clone(),
+            native_branch: self.native_branch.clone(),
+            branch_identifier: self.branch_identifier.clone(),
+            publisher: Arc::clone(&self.publisher),
+            // Native controls use this exact state and then discard the
+            // capture; they never incrementally refresh or publish content.
+            // Avoid copying accumulators that also retain retired table
+            // lifetimes. A future refresh of this copy safely takes the full
+            // reconstruction path.
+            projection: None,
+        }
+    }
+
     fn default_batch_publisher(
         root_uri: &str,
         active_branch: Option<&str>,
@@ -1847,20 +1867,28 @@ impl ManifestCoordinator {
         Ok(all)
     }
 
-    /// Every live native branch ref except `main`, sorted. Cleanup compares
-    /// per-table fork refs against exactly this set.
-    pub(crate) async fn list_native_graph_branches(&self) -> Result<Vec<String>> {
+    /// One operation-local branch listing for deletion's namespace and
+    /// ancestry checks. The caller holds the schema-control gate, so no native
+    /// branch create/delete can intervene in the supported control envelope.
+    pub(crate) async fn native_branches_and_descendants(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
         let branches = list_branch_contents(&self.dataset).await?;
-        let mut names: Vec<String> = branches.into_keys().filter(|name| name != "main").collect();
-        names.sort();
-        Ok(names)
+        let descendants = Self::descendants_from_branch_contents(name, &branches)?;
+        let mut natives = branches
+            .into_keys()
+            .filter(|native| native != "main")
+            .collect::<Vec<_>>();
+        natives.sort();
+        Ok((natives, descendants))
     }
 
-    /// Logical names of every branch forked (transitively) from `name`.
-    /// Lance records parents by native ref, so the walk runs on native names
-    /// and maps each child back to its logical name.
-    pub async fn descendant_branches(&self, name: &str) -> Result<Vec<String>> {
-        let branches = list_branch_contents(&self.dataset).await?;
+    /// Walk Lance's native parents and return logical descendant names.
+    fn descendants_from_branch_contents(
+        name: &str,
+        branches: &HashMap<String, lance::dataset::refs::BranchContents>,
+    ) -> Result<Vec<String>> {
         let Some(native) =
             crate::branch_names::resolve_native_branch(branches.keys().map(String::as_str), name)?
         else {
