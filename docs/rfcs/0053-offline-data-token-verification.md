@@ -96,7 +96,7 @@ or unknown fields:
 }
 ```
 
-`iss` is the canonical control API origin, without a trailing slash, userinfo,
+`iss` is the canonical control API origin, at most 2,048 bytes, without a trailing slash, userinfo,
 path, query, or fragment. HTTPS is required except exact loopback HTTP origins
 for local qualification. `aud` is the exact string
 `urn:omnigraph:data:<cluster_id>`, not an array. The account, cluster id, and
@@ -153,6 +153,8 @@ declared `kid` must match the SPKI digest. Identity and origin bounds match
 the credential. An invalid file or any invalid key refuses startup; an
 unknown request `kid` refuses without fetching anything.
 
+`canonical_root` is nonempty and at most 4,096 bytes. Issuer and endpoint
+origins are at most 2,048 bytes in addition to their containing object bounds.
 The server compares `canonical_root` with the actual root selected by
 `--cluster`. The Core exposes `ServingSnapshot.canonical_root` from the same
 store and snapshot resolution; it does not reparse configuration or reread
