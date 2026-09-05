@@ -2,13 +2,13 @@
 rfc: "0052"
 title: "Managed control-plane CLI"
 track: maintainer
-status: draft
-implementation: in-progress
+status: accepted
+implementation: complete
 authors:
   - andrew
 created: 2026-09-05
 updated: 2026-09-05
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/pull/629
 supersedes: []
 superseded_by: []
 blocked_on: []
@@ -154,20 +154,24 @@ The server SDK and Python SDK gain no new authority or dependencies.
 
 ## Evidence and tests
 
-Extend the existing CLI operator and cluster owners before adding another
-process harness. Establish direct baselines before edits. Add fixture-backed
-HTTP tests for exact saved-plan/idempotency bodies, envelope and outcome
-parity, device pending/slowdown/expiry, credential-origin isolation, malformed
-context, redirect and size limits, and API-down refusal without Core effects.
-Unit tests inject a credential store; process tests must not touch user
-keychains or operator configuration.
+The existing CLI unit and cluster process owners cover exact saved-plan and
+idempotency bodies, envelope and outcome parity, device pending/slowdown/expiry,
+credential-origin isolation, malformed context, redirect and size limits, and
+API-down refusal without Core effects. Unit tests inject a credential store;
+process tests do not touch user keychains or operator configuration. The
+focused baseline passed 91 unit tests and 45 cluster process tests, including
+the existing direct behavior.
 
 The control-plane repository owns transactional permission/revocation,
 device replay, and abandon/apply race tests plus a kind proof driven by this
-actual CLI binary. That proof compares CLI/API plan and bundle digests,
+actual CLI binary. The passing proof compares CLI/API plan and bundle digests,
 terminal outcome, receipts and readiness witness, and tests cancellation,
-idempotency and denied access. Live WorkOS login needs a configured external
-organization and is separately reported from deterministic provider fixtures.
+idempotency and denied access. A separate live WorkOS pilot passed native
+device login, real OS keychain storage, exact-plan apply through readiness,
+permission removal and restoration for the same session, and logout. This
+live evidence covers one identity and a nondestructive plan; it does not
+replace deterministic provider fixtures or claim a full browser/two-user
+qualification matrix.
 
 ## Rollout
 
@@ -176,8 +180,7 @@ release notes. The companion API adds device sessions and plan abandonment
 without changing executor or engine gates. Existing CLI/direct and managed
 HTTP tests must pass before recommending the managed client. Data-plane
 tokens, managed-store editing, provisioning, console, SSE, and persistent
-refresh tokens remain out of scope. Implementation maturity advances only
-with generated evidence; this draft does not claim upstream ratification.
+refresh tokens remain out of scope.
 
 ## Unresolved questions
 
@@ -188,3 +191,9 @@ None for this bounded increment.
 2026-09-05: Recorded the requested managed CLI increment before code. Reused
 the existing config-directory addressing contract with explicit `--direct`
 rather than introducing a root-URI override the Core does not currently expose.
+
+2026-09-05: Accepted after maintainer-authorized review of the implementation,
+compatibility, bounded HTTP and credential handling, focused regression
+suites, the full native CLI kind proof, and the separate live WorkOS pilot.
+No engine or storage contract changes are required. Data access remains a
+separate increment; this decision authorizes control-plane operations only.

@@ -24,6 +24,7 @@ default-members = [
 [workspace.dependencies]
 arrow-array = "58"
 arrow-ipc = "58"
+arrow-json = "58"
 arrow-schema = "58"
 arrow-select = "58"
 arrow-cast = { version = "58", features = ["prettyprint"] }

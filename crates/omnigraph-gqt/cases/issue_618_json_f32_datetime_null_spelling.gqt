@@ -1,0 +1,31 @@
+# issue: 618
+# red_on: 2026-09-04, main @ a09176d7: `p.score` read back as 0.9900000095367432 and `p.embedding` as the widened 64-bit digits; `p.note` printed as null instead of omitting its key.
+# notes: pins RFC 0051: an F32 scalar and a Vector(N) cell read back at
+# notes: 32-bit width (0.99, not the widened 0.9900000095367432), a DateTime with
+# notes: and without milliseconds (no `Z`, no `.000`), and a null cell's key
+# notes: omitted from its row (the expected row carries no `p.note`).
+
+--- schema
+node Point {
+    name: String @key
+    score: F32
+    embedding: Vector(3)
+    at: DateTime
+    note: String?
+}
+
+--- seed
+{"type":"Point","data":{"name":"p","score":0.99,"embedding":[0.1,0.2,0.3],"at":"2024-01-01T11:54:56.789Z"}}
+{"type":"Point","data":{"name":"q","score":1,"embedding":[1,2,3],"at":"2024-01-01T00:00:00Z","note":"kept"}}
+
+--- query
+query point_values() {
+    match {
+        $p: Point
+    }
+    return { $p.name, $p.score, $p.embedding, $p.at, $p.note }
+}
+
+--- expect unordered
+{"p.name": "p", "p.score": 0.99, "p.embedding": [0.1, 0.2, 0.3], "p.at": "2024-01-01T11:54:56.789"}
+{"p.name": "q", "p.score": 1, "p.embedding": [1, 2, 3], "p.at": "2024-01-01T00:00:00", "p.note": "kept"}

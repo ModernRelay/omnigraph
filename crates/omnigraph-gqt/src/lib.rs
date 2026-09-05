@@ -1311,7 +1311,10 @@ async fn run_query_step(
             span,
         } => {
             let result = outcome.map_err(|e| fail(format!("query failed: {e}")))?;
-            let Value::Array(actual) = result.to_rust_json() else {
+            let rows = result
+                .to_rust_json()
+                .map_err(|e| fail(format!("query rows failed to render as JSON: {e}")))?;
+            let Value::Array(actual) = rows else {
                 return Err(fail("engine returned a non-array row set".into()));
             };
             let expected = parse_expect_rows(&substitute(body_raw, binding)).map_err(&fail)?;
