@@ -253,7 +253,11 @@ pub struct Omnigraph {
     /// that hot shape without multiplying complete lineage by live branches.
     /// A merge between two non-bound branches temporarily references both
     /// complete maps through O(1)-to-clone immutable snapshots, but persists
-    /// only the most recently used coordinator.
+    /// only the most recently used coordinator. A non-bound publisher
+    /// may take the exact captured target view from this slot as its starting
+    /// state; its independent fresh graph-head CAS remains authoritative. A
+    /// successful publish returns the updated coordinator, while failure drops
+    /// the taken view so the next capture starts fresh.
     /// The mutex serializes merge captures — acceptable because the schema
     /// serial queue already serializes merges at capture time.
     merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
@@ -3715,22 +3719,7 @@ impl Omnigraph {
         branch: Option<&str>,
         actor_id: Option<&str>,
     ) -> Result<crate::db::manifest::LineageIntent> {
-        let current_branch = self
-            .coordinator
-            .read()
-            .await
-            .current_branch()
-            .map(str::to_string);
-        if branch.map(str::to_string) == current_branch {
-            return self
-                .coordinator
-                .read()
-                .await
-                .new_lineage_intent(actor_id, None);
-        }
-        self.open_coordinator_for_branch(branch)
-            .await?
-            .new_lineage_intent(actor_id, None)
+        GraphCoordinator::new_lineage_intent_for_branch(branch, actor_id, None)
     }
 
     /// Invalidate the cached graph index. Called after edge mutations.

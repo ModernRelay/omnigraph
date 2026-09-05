@@ -1970,15 +1970,42 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         // An operation on a non-bound branch owns its coordinator locally;
         // it must never temporarily change this handle's query/write binding.
         drop(active);
-        let mut coordinator = db.open_coordinator_for_branch(branch).await?;
-        coordinator
+        let cache_key = branch.unwrap_or("main");
+        let captured = {
+            let mut cache = db.merge_authority_cache.lock().await;
+            let matches = if let Some((key, coordinator)) = cache.as_ref() {
+                key == cache_key
+                    && coordinator.current_branch() == branch
+                    && coordinator.branch_identifier().await? == txn.authority.branch_identifier
+                    && coordinator.exact_graph_head() == txn.authority.graph_head
+                    && coordinator.version() == txn.base.graph_manifest_version()
+            } else {
+                false
+            };
+            if matches {
+                cache.take().map(|(_, coordinator)| coordinator)
+            } else {
+                None
+            }
+        };
+        let mut coordinator = match captured {
+            Some(coordinator) => coordinator,
+            None => db.open_coordinator_for_branch(branch).await?,
+        };
+        // The cache supplies only the already captured starting view. The
+        // publisher still reads fresh state and enforces ExactGraphHead on
+        // every CAS attempt. On error, drop a taken cache view; recovery and
+        // the next capture must resolve any ambiguous durable publication.
+        let published = coordinator
             .commit_changes_with_intent_and_expected(
                 &changes,
                 expected_table_versions,
                 lineage_intent,
                 &precondition,
             )
-            .await?
+            .await?;
+        *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
+        published
     };
     Ok(published.commit)
 }

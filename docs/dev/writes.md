@@ -45,10 +45,15 @@ planning and validation step uses that view.
 
 Branch merge also uses the captured target for physical table opens and
 publication. It never changes the `Omnigraph` handle's active branch while the
-merge runs. Publication reuses the active coordinator only when its branch
-identity, graph head, and manifest version match the captured transaction;
-otherwise it opens the target coordinator from durable state. The existing
-schema and branch gates still serialize conflicting control operations.
+merge runs. Publication reuses the active coordinator, or takes the cached
+non-active target coordinator, only when its branch identity, graph head, and
+manifest version match the captured transaction; otherwise it opens the target
+coordinator from durable state. The publisher independently reads fresh authority
+and enforces the exact graph-head precondition on every attempt. Successful
+publication returns a taken coordinator to the one-entry merge cache; failure
+drops it. Commit IDs and timestamps are minted for the captured branch without
+reloading manifest history. The existing schema and branch gates still serialize
+conflicting control operations.
 
 Finalization acquires the root-shared gate order:
 
