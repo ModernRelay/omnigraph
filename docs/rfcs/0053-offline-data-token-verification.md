@@ -113,7 +113,9 @@ not a persisted replay ledger: data credentials are reusable until expiry.
 
 `iat` and `exp` are integer Unix seconds. Lifetime `exp - iat` is 60–86,400
 seconds inclusive. Admission requires `now < exp`, with zero expiry leeway,
-and `iat <= now + 30`. Time arithmetic is checked. Other temporal claims,
+and `iat <= now + 30`. A maximum-lifetime credential issued by a clock 30
+seconds ahead can therefore have 86,430 seconds remaining at admission.
+Time arithmetic is checked. Other temporal claims,
 including `nbf`, are unsupported in this fixed version and refuse rather than
 being silently ignored. The issuer may issue a shorter token than the caller
 requests according to its current permissions and configured limit.
@@ -167,10 +169,12 @@ realization the operator uses its validated `Cluster.status.identity`; the
 mount is provisioning authority, not independent evidence of storage identity.
 
 Trust is immutable for the process lifetime. Rotation installs both old and
-new public keys before the issuer starts using the new key; retiring a key
+new public keys before the issuer starts using the new key. Keep an old key
+installed for at least 86,430 seconds after its final issuance; retiring it
 requires another controlled restart. A control-plane outage does not cause a
 server-side call or change already loaded trust. Its offline bound is each
-credential's actual remaining lifetime, with a maximum of 24 hours.
+credential's actual remaining lifetime, bounded by 86,430 seconds including
+the permitted issuance-clock skew. Expiry still has zero leeway.
 
 ### Authorization and compatibility
 
