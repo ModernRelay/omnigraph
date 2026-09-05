@@ -55,6 +55,27 @@ The setup records and checks actual history growth and content restoration.
 Explicit age diagnostics also record fixture file count and byte size through
 a metadata-only census between setup and the operation process.
 
+Two optional controls separate history from physical layout and reusable
+views. `--cache-state cold` (the default) uses a fresh operation process and
+graph handle without prewarming; it does not evict the OS page cache.
+`--cache-state warm` performs one read-only branch-registry and accepted
+snapshot metadata pass over every live branch on that same handle. It opens
+no user-table payloads. Fresh open, prewarm, and the operation each have their
+own timers and foreground I/O counters.
+
+`--manifest-layout uncompacted` (the default) preserves the generated layout.
+`--manifest-layout compacted` runs Lance compaction on every live `__manifest`
+native ref after setup. This is direct physical preparation of a disposable,
+exclusively owned benchmark fixture, not a public graph-maintenance API. It
+does not optimize user tables, build indexes, or clean up versions. Setup
+compares every typed manifest cell before/after and verifies retained native
+versions, full reachable graph history, heads, table pins, and branch identity.
+The receipt records fragment counts, logical row counts, and native versions;
+the compacted arm must actually rewrite fragments. Physical compaction keeps
+logical history, so fewer files must not be reported as less retained history.
+Warm or compacted controls are limited to 256 rows, 16 dimensions, eight
+siblings, and eight tables. Existing scenario defaults remain unchanged.
+
 Use the small sequential matrix to compare accumulated history without a
 large data fixture:
 
@@ -75,6 +96,17 @@ and two sibling branches; general merge uses one table, two source updates,
 and eight disjoint target updates. Each point collects three samples.
 `--extended` additionally varies live siblings and populated tables to eight;
 `--smoke --runs 1` checks one tiny aged/churned fixture per operation.
+`--history-only` selects just H0/H16/H64, and `--scenario` can select fewer
+operations. Cache/layout selectors choose one condition per invocation;
+the runner never expands a Cartesian matrix implicitly. For example, inspect
+matched history plans, then run each with the same saved binary and separate
+output directories:
+
+```bash
+python3 scripts/bench-branch-age.py --plan --history-only --scenario branch-delete
+python3 scripts/bench-branch-age.py --plan --history-only --scenario branch-delete --cache-state warm
+python3 scripts/bench-branch-age.py --plan --history-only --scenario branch-delete --manifest-layout compacted
+```
 
 The runner uses one process group at a time, lower scheduling priority, two
 threads per Tokio/Lance CPU/Rayon pool, two Lance I/O slots, a 256 MiB Lance
@@ -84,6 +116,13 @@ runtime settings, not a hard CPU or process-memory cap. Each point has a
 must verify before a sample is accepted. Counters cover foreground operation
 I/O; deferred reclaim I/O is outside their task-local scope. Open time and
 delete completion time remain separate from acknowledgement latency.
+Explicit age runs of create/create-from additionally time the first accepted
+snapshot, pinned opens, and one payload row per inherited table after the fork.
+Those reads have separate counters and do not enter acknowledgement or
+operation-completion time. The operation child's whole-process RSS includes
+open, optional prewarm and first read; its pre/post-operation high-water marks
+remain available. Final exact branch/table verification still runs in the
+third process. The bounded SHA reader works on Python 3.9 and later.
 
 These fixtures model accumulated history on the current format. They do not
 claim compatibility with old binary formats or legacy bare branch refs, and

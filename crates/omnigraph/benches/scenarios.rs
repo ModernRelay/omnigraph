@@ -75,6 +75,10 @@ mod child_protocol;
 #[cfg(unix)]
 mod branch_control;
 
+#[path = "scenarios/fixture_controls.rs"]
+#[cfg(unix)]
+mod fixture_controls;
+
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::time::Instant;
@@ -128,6 +132,10 @@ struct Args {
     history_commits: usize,
     /// Temporary branches written once, deleted, and fully reclaimed in setup.
     retired_branches: usize,
+    /// Optional read-only preparation on the same measured handle.
+    cache_state: String,
+    /// Setup-only physical layout of live manifest refs; never changes retention.
+    manifest_layout: String,
     /// Reject explicit age flags on scenarios that would otherwise ignore them.
     age_options_supplied: bool,
     memory_cap_mb: Option<u64>,
@@ -169,6 +177,8 @@ impl Args {
             tables: 4,
             history_commits: 0,
             retired_branches: 0,
+            cache_state: "cold".into(),
+            manifest_layout: "uncompacted".into(),
             age_options_supplied: false,
             memory_cap_mb: None,
             out: None,
@@ -219,6 +229,14 @@ impl Args {
                     args.retired_branches = take("--retired-branches")
                         .parse()
                         .expect("--retired-branches");
+                    args.age_options_supplied = true;
+                }
+                "--cache-state" => {
+                    args.cache_state = take("--cache-state");
+                    args.age_options_supplied = true;
+                }
+                "--manifest-layout" => {
+                    args.manifest_layout = take("--manifest-layout");
                     args.age_options_supplied = true;
                 }
                 "--out" => args.out = Some(take("--out")),
@@ -273,6 +291,10 @@ impl Args {
                 self.history_commits.to_string(),
                 "--retired-branches".into(),
                 self.retired_branches.to_string(),
+                "--cache-state".into(),
+                self.cache_state.clone(),
+                "--manifest-layout".into(),
+                self.manifest_layout.clone(),
             ]);
         }
         if self.baseline {
@@ -314,6 +336,7 @@ fn main() {
              [--ann-probes N] [--text-bytes B] [--delta-rows N] \
              [--source-mode update|insert] [--branches N] [--tables N] [--memory-cap-mb M] \
              [--history-commits N (even, 0..256)] [--retired-branches N (0..32)]\n\
+             [--cache-state cold|warm] [--manifest-layout uncompacted|compacted]\n\
              Age flags apply only to branch controls and general-merge-updates."
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
@@ -567,6 +590,8 @@ fn run_once(args: &Args, run: usize) -> serde_json::Value {
             "text_bytes": args.text_bytes,
             "history_commits": args.history_commits,
             "retired_branches": args.retired_branches,
+            "cache_state": args.cache_state,
+            "manifest_layout": args.manifest_layout,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
         },
@@ -745,6 +770,8 @@ fn run_phased_adopt_once(args: &Args, run: usize) -> serde_json::Value {
             "tables": args.tables,
             "history_commits": args.history_commits,
             "retired_branches": args.retired_branches,
+            "cache_state": args.cache_state,
+            "manifest_layout": args.manifest_layout,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
         },

@@ -46,8 +46,7 @@ pub(super) fn validate_fixture_age(args: &Args) -> Result<(), String> {
         || args.scenario == "general-merge-updates";
     if args.age_options_supplied && !supported {
         return Err(
-            "--history-commits/--retired-branches require branch controls or general-merge-updates"
-                .into(),
+            "age/cache/layout controls require branch controls or general-merge-updates".into(),
         );
     }
     if args.history_commits > 256 || !args.history_commits.is_multiple_of(2) {
@@ -55,6 +54,14 @@ pub(super) fn validate_fixture_age(args: &Args) -> Result<(), String> {
     }
     if args.retired_branches > 32 {
         return Err("--retired-branches must be at most 32".into());
+    }
+    rfc023_limits::validate_view_controls(&args.cache_state, &args.manifest_layout)?;
+    if (args.cache_state == "warm" || args.manifest_layout == "compacted")
+        && (args.rows > 256 || args.dims > 16 || args.branches > 8 || args.tables > 8)
+    {
+        return Err(
+            "warm/compacted controls require rows <= 256, dims <= 16, branches/tables <= 8".into(),
+        );
     }
     Ok(())
 }
@@ -1132,7 +1139,8 @@ pub(super) async fn fenced_adopt_operation(args: &Args) -> serde_json::Value {
 
     serde_json::json!({
         "routing": "production-omnigraph-branch-merge",
-        "measurement_boundary": "operation_wall_ms starts after the common fresh Omnigraph::open and covers Omnigraph::branch_merge; no post-op scan",
+        "measurement_boundary": "operation_wall starts after separately recorded fresh Omnigraph::open and optional metadata prewarm, and covers Omnigraph::branch_merge; no post-op scan",
+        "rss_boundary": "operation child whole-process wait4 HWM includes runtime, graph open, optional metadata prewarm, merge and output; setup and final verification are separate children",
         "production_path": true,
         "baseline": false,
         "operation_open_ms": operation_open_ms,
@@ -1759,6 +1767,7 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         .await
         .expect("advance main after the branch forked");
     let target_diverge_ms = diverge_start.elapsed().as_millis() as u64;
+    let layout = super::fixture_controls::prepare_layout(uri, args).await;
 
     let verify_start = Instant::now();
     let main_snapshot = db
@@ -1843,6 +1852,10 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         .unwrap()
         .extend(age.as_object().unwrap().clone());
     metrics
+        .as_object_mut()
+        .unwrap()
+        .extend(layout.as_object().unwrap().clone());
+    metrics
 }
 
 /// Phase 2: the measured child. Opens the fixture and runs exactly one
@@ -1852,13 +1865,17 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
     super::helpers::cost::cost_harness(async {
     let root = general_merge_fixture_root(args);
     let uri = root.to_str().expect("UTF-8 benchmark fixture root");
+    let ((db, operation_open_elapsed), open_io) = super::helpers::cost::measure(async {
     let open_start = Instant::now();
     let db = Omnigraph::open(uri)
         .await
         .expect("fresh-open general-merge fixture");
     let operation_open_elapsed = open_start.elapsed();
+    (db, operation_open_elapsed)
+    }).await;
     let operation_open_ms = operation_open_elapsed.as_millis() as u64;
     let operation_open_us = operation_open_elapsed.as_micros() as u64;
+    let prewarm = super::fixture_controls::prewarm(&db, args).await;
     let operation_pre_peak_rss_bytes = super::current_process_peak_rss_bytes();
 
     let probes = MergeWriteProbes::default();
@@ -1965,6 +1982,8 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
         "probe_phase_us": merge_phase_metrics(&probes),
     });
     metrics.as_object_mut().unwrap().extend(operation_io_metrics(&io).as_object().unwrap().clone());
+    metrics.as_object_mut().unwrap().extend(super::fixture_controls::io_metrics("open", &open_io).as_object().unwrap().clone());
+    metrics.as_object_mut().unwrap().extend(prewarm.as_object().unwrap().clone());
     metrics
     }).await
 }
