@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 #[derive(Default)]
-struct MemoryStore(RefCell<HashMap<String, String>>);
+pub(in crate::managed) struct MemoryStore(RefCell<HashMap<String, String>>);
 impl Store for MemoryStore {
     fn get(&self, origin: &str) -> Result<Option<String>> {
         Ok(self.0.borrow().get(origin).cloned())
