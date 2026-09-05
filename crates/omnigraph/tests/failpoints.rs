@@ -5391,7 +5391,7 @@ async fn s3_load_recovers_after_publisher_failure_without_reopen() {
     }
 
     // Same-handle follow-up load: the entry heal LISTs __recovery/ on
-    // S3, rolls the sidecar forward, DELETEs it, and the write lands.
+    // S3, rolls the sidecar forward, issues a DELETE for it, and the write lands.
     load_jsonl(
         &db,
         r#"{"type":"Person","data":{"name":"Bob","age":25}}

@@ -93,6 +93,7 @@ jobs:
   check_agents_md:
     name: Check AGENTS.md Links
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -132,6 +133,18 @@ jobs:
 
       - name: Verify documentation structure and RFC registry
         run: python3 scripts/check-docs.py
+
+      # Spelling gate: docs/dev/ci.md, "Pull-request gates". typos also reads
+      # a sibling typos.toml / _typos.toml, so refuse a second config first.
+      - name: Refuse a second typos config
+        run: |
+          if [ -e typos.toml ] || [ -e _typos.toml ]; then
+            echo "::error::every typos exemption lives in .typos.toml; remove typos.toml / _typos.toml"
+            exit 1
+          fi
+
+      - name: Check spelling
+        uses: crate-ci/typos@d43b6c087ac471e2ea7b8af622ff15f05c0c365b # v1.50.1
 
   workflow_action_pins:
     name: Check Workflow Action Pins
