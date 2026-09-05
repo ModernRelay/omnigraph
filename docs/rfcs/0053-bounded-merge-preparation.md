@@ -420,23 +420,20 @@ compatible dataset commits. Neither substitutes for Omnigraph's graph
 three-way merge. Distributed fragment writing is a separate, per-dataset
 durable-write mechanism. This RFC changes none of those upstream mechanisms.
 
-The dev-graph inventory was read on 2026-09-05 from `modernrelay/dev` at
-commit `01M1RQ45Q4SQVP9Q3TKK194J9G`, with a fresh schema before each query.
-These are stable type/slug references, not invented web links:
-
-| Existing record or issue | Relationship to this decision |
+| Public issue | Relationship to this decision |
 |---|---|
-| `Issue/iss-branch-ops-sprint`; `Learning/lrn-write-serial-backbone-measured` | Branch-operation latency umbrella and measured serial work. |
-| `Gap/gap-write-path-rederivation`; `Issue/iss-write-txn`; `Issue/iss-write-cost-gate` | Accepted-context/rederivation history. Prior completion/cancellation does not close the measured merge opener path. |
-| `Issue/iss-gh504-mutate-stages-tables-serially`; [Omnigraph #504](https://github.com/ModernRelay/omnigraph/issues/504) | Related mutation concurrency work; not evidence that branch merge preparation is already parallel. |
-| `Issue/iss-gh384-merge-scales-target-table`; [Omnigraph #384](https://github.com/ModernRelay/omnigraph/issues/384) | Related target-size scaling, which this RFC does not eliminate. |
+| [Omnigraph #310](https://github.com/ModernRelay/omnigraph/issues/310) | Earlier branch-operation request amplification work. The completed fork/delete changes do not establish that merge preparation is bounded. |
+| [Omnigraph #504](https://github.com/ModernRelay/omnigraph/issues/504) | Related mutation concurrency work; not evidence that branch merge preparation is already parallel. |
+| [Omnigraph #384](https://github.com/ModernRelay/omnigraph/issues/384) | Related target-size scaling, which this RFC does not eliminate. |
+| [Omnigraph #641](https://github.com/ModernRelay/omnigraph/issues/641) | Remaining catalog, history, and fragment metadata costs, including fragmented historical merge bases after optimize. |
+| [Omnigraph #642](https://github.com/ModernRelay/omnigraph/issues/642) | Fork/delete amplification with live sibling branches; separate from merge table preparation. |
+| [Omnigraph #643](https://github.com/ModernRelay/omnigraph/issues/643) | Independent-target merge serialization. This RFC retains the existing graph-wide guards. |
 | [Lance #6444](https://github.com/lance-format/lance/issues/6444), [#7363](https://github.com/lance-format/lance/issues/7363), [#8853](https://github.com/lance-format/lance/issues/8853) | Upstream join/update/pruning context; not prerequisites for the two proposed changes. |
 | [Lance #7263](https://github.com/lance-format/lance/issues/7263) | Native branch-merge feature request, not an available graph-merge replacement. |
-| `Issue/iss-gh624-ff-merge-poisons-target`; `ExternalBlocker/blk-lance-7840`; [Omnigraph #624](https://github.com/ModernRelay/omnigraph/issues/624); [Lance #7840](https://github.com/lance-format/lance/issues/7840) | Reproduced inherited-index defect; an independent correctness issue, not fixed by this optimization. |
+| [Omnigraph #624](https://github.com/ModernRelay/omnigraph/issues/624); [Lance #7840](https://github.com/lance-format/lance/issues/7840) | Reproduced inherited-index defect; an independent correctness issue, not fixed by this optimization. |
 
-These links establish related tracking, not closure of this proposal. The
-investigation found no exact standalone GitHub issue for the repeated merge
-opener. No separate issue has been created for this RFC; its discussion is tracked by the RFC PR.
+Review this proposal in [RFC PR #638](https://github.com/ModernRelay/omnigraph/pull/638).
+The issues above track related performance and correctness work separately.
 
 ## Rollout
 
