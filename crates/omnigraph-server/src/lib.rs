@@ -7,6 +7,7 @@ use handlers::*;
 use settings::*;
 pub use settings::{ServerRuntimeState, classify_server_runtime_state, load_server_settings};
 pub mod auth;
+pub mod data_tokens;
 pub mod graph_id;
 pub mod identity;
 pub mod policy;
@@ -176,8 +177,12 @@ pub struct ServerConfig {
     /// routes.
     pub mode: ServerConfigMode,
     pub bind: String,
+    /// Resolved by the same Core snapshot as the graphs; never inferred from a token.
+    pub canonical_root: String,
+    /// Optional immutable public trust for RFC 0053 signed data credentials.
+    pub data_token_trust: Option<PathBuf>,
     /// Operator opt-in for fully-unauthenticated dev mode (MR-723).
-    /// When neither bearer tokens nor a policy file are configured,
+    /// When no static tokens, signed-token trust, or policy are configured,
     /// `serve()` refuses to start unless this is true (set via
     /// `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1`). The
     /// motivation is that "no tokens + no policy" looks like protection
@@ -336,6 +341,7 @@ pub struct AppState {
     /// see MR-668 decision Q6.
     workload: Arc<workload::WorkloadController>,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
+    data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     /// Server-level Cedar policy. Used by management endpoints (`GET
     /// /graphs`) which act on the registry resource, not on a per-graph
     /// resource. Loaded from the cluster-scoped policy binding when
@@ -632,6 +638,7 @@ impl AppState {
             workload,
             bearer_tokens,
             server_policy: None,
+            data_token_trust: None,
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -662,6 +669,7 @@ impl AppState {
             workload: Arc::new(workload),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
+            data_token_trust: None,
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -713,8 +721,16 @@ impl AppState {
         &self.routing
     }
 
+    /// Attach already validated boot trust. Production validates the root
+    /// before opening any graph; embedded HTTP hosts own their boot binding.
+    #[must_use]
+    pub fn with_data_token_trust(mut self, trust: data_tokens::DataTokenTrust) -> Self {
+        self.data_token_trust = Some(Arc::new(trust));
+        self
+    }
+
     fn requires_bearer_auth(&self) -> bool {
-        if !self.bearer_tokens.is_empty() {
+        if !self.bearer_tokens.is_empty() || self.data_token_trust.is_some() {
             return true;
         }
         if self.server_policy.is_some() {
@@ -738,7 +754,15 @@ impl AppState {
                 matched = Some(Arc::clone(actor));
             }
         }
-        matched.map(ResolvedActor::cluster_static)
+        matched.map(ResolvedActor::cluster_static).or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            self.data_token_trust
+                .as_ref()?
+                .verify_at(provided_token, now)
+        })
     }
 }
 
@@ -1958,6 +1982,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         });
     }
 
+    let data_token_trust = config
+        .data_token_trust
+        .as_ref()
+        .map(|path| data_tokens::DataTokenTrust::read(path, &config.canonical_root))
+        .transpose()?;
     let token_source = resolve_token_source().await?;
     info!(source = token_source.name(), "loaded bearer token source");
     let tokens = token_source.load().await?;
@@ -1974,7 +2003,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         } => server_policy.is_some() || graphs.iter().any(|g| g.policy.is_some()),
     };
     let runtime_state = classify_server_runtime_state(
-        !tokens.is_empty(),
+        !tokens.is_empty() || data_token_trust.is_some(),
         has_policy_configured,
         config.allow_unauthenticated,
     )?;
@@ -1986,8 +2015,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         ),
         ServerRuntimeState::DefaultDeny => warn!(
             "bearer tokens are configured but no policy file is set — running in \
-             default-deny mode (only `read` actions are permitted for authenticated \
-             actors). Configure a graph or cluster policy bundle in the cluster config, \
+             default-deny mode (static credentials permit `read`; signed data \
+             credentials require an explicit policy permit). Configure a graph or cluster policy bundle in the cluster config, \
              run `omnigraph cluster apply`, and restart to enable Cedar rules."
         ),
         ServerRuntimeState::PolicyEnabled => {}
@@ -2018,6 +2047,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         }
     };
 
+    let state = match data_token_trust {
+        Some(trust) => state.with_data_token_trust(trust),
+        None => state,
+    };
     let listener = TcpListener::bind(&bind).await?;
     let listen_addr = listener.local_addr()?;
     {

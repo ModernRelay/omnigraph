@@ -22,6 +22,11 @@ Run `omnigraph <command> --help` for the flags supported by your installed
 version. The [CLI reference](reference.md) summarizes addressing, commands,
 configuration, and output formats.
 
+For a managed cluster, first select it with `use` and request a scoped data
+credential with `cluster token`. Then run `query` or `mutate` from that folder
+with an explicit `--graph`. See [managed data access](managed-data.md)
+for permissions, expiry, offline operation, and local credential clearing.
+
 ## Create, load, and query a graph
 
 ```bash

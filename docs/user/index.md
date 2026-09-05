@@ -29,6 +29,7 @@ deployment.
 
 - [CLI guide](cli/index.md)
 - [CLI reference](cli/reference.md)
+- [Managed data credentials and queries](cli/managed-data.md)
 - [HTTP server](operations/server.md)
 - [Troubleshooting](operations/troubleshooting.md)
 

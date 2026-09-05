@@ -37,6 +37,8 @@ pub struct ServingPolicy {
 /// Everything a server needs to boot from the cluster catalog (RFC-005 §D2).
 #[derive(Debug, Clone)]
 pub struct ServingSnapshot {
+    /// Canonical root of the store used for this snapshot (RFC 0053).
+    pub canonical_root: String,
     pub graphs: Vec<ServingGraph>,
     pub queries: Vec<ServingQuery>,
     pub policies: Vec<ServingPolicy>,
@@ -469,6 +471,7 @@ async fn read_snapshot_with_store(
         return Err(diagnostics);
     }
     Ok(ServingSnapshot {
+        canonical_root: backend.canonical_root().map_err(|error| vec![error])?,
         graphs,
         queries,
         policies,

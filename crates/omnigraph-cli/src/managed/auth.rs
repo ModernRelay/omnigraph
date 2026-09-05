@@ -5,16 +5,24 @@ use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::Instant;
 
-const SERVICE: &str = "omnigraph.control-plane.session.v1";
 const MAX_SECRET: usize = 16 * 1024;
 
-trait Store {
+pub(super) trait Store {
     fn get(&self, origin: &str) -> Result<Option<String>>;
     fn put(&self, origin: &str, value: &str) -> Result<()>;
     fn remove(&self, origin: &str) -> Result<()>;
 }
 
-pub(super) struct OsStore;
+pub(super) struct OsStore {
+    service: &'static str,
+}
+
+pub(super) const CONTROL_STORE: OsStore = OsStore {
+    service: "omnigraph.control-plane.session.v1",
+};
+pub(super) const DATA_STORE: OsStore = OsStore {
+    service: "omnigraph.data-plane.credential.v1",
+};
 
 fn keychain_failed() -> Failure {
     // Some keyring errors contain raw secret bytes: never render the error.
@@ -34,7 +42,7 @@ fn keychain_failed() -> Failure {
 ))]
 impl Store for OsStore {
     fn get(&self, origin: &str) -> Result<Option<String>> {
-        let entry = keyring::Entry::new(SERVICE, origin).map_err(|_| keychain_failed())?;
+        let entry = keyring::Entry::new(self.service, origin).map_err(|_| keychain_failed())?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -42,12 +50,12 @@ impl Store for OsStore {
         }
     }
     fn put(&self, origin: &str, value: &str) -> Result<()> {
-        keyring::Entry::new(SERVICE, origin)
+        keyring::Entry::new(self.service, origin)
             .and_then(|entry| entry.set_password(value))
             .map_err(|_| keychain_failed())
     }
     fn remove(&self, origin: &str) -> Result<()> {
-        let entry = keyring::Entry::new(SERVICE, origin).map_err(|_| keychain_failed())?;
+        let entry = keyring::Entry::new(self.service, origin).map_err(|_| keychain_failed())?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(_) => Err(keychain_failed()),
@@ -214,7 +222,7 @@ fn scrub(mut failure: Failure, secret: &str) -> Failure {
     failure
 }
 
-fn scrub_value(value: &mut Value, secret: &str) {
+pub(super) fn scrub_value(value: &mut Value, secret: &str) {
     match value {
         Value::String(s) => *s = s.replace(secret, "[redacted]"),
         Value::Array(items) => {
@@ -414,4 +422,4 @@ pub(super) async fn logout(store: &OsStore, origin: String) -> Result<Value> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

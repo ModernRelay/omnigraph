@@ -40,7 +40,7 @@ breaking the directory's config can change where boot looks for applied state.
 
 ## Authentication
 
-Choose one token source:
+Choose one static token source:
 
 ```bash
 # One token, actor name "default"
@@ -65,11 +65,51 @@ Authorization: Bearer secret-a
 The token selects the actor used by authorization and commit attribution.
 Clients cannot claim another actor. See [Authorization and actors](policy.md).
 
-A server with neither tokens nor policy refuses to start unless you explicitly
+A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
 on a trusted development network. Tokens without a policy allow only the
 `read` action. Stored-query invocation, export, graph listing, writes, and other
 actions remain denied.
+
+### Signed data credentials
+
+To accept short-lived credentials from an issuer, mount its public trust file
+and select it explicitly:
+
+```bash
+omnigraph-server --cluster s3://company-data/company-brain \
+  --data-token-trust /run/omnigraph/data-token-trust.json
+```
+
+The file binds public signing keys to the exact storage root, issuer, account,
+cluster id, and cluster incarnation. Invalid trust or a root mismatch refuses
+startup before graphs open. Trust alone requires bearer authentication. The
+server verifies tokens locally; it does not contact an identity or control
+service. The provisioning operator owns supplying the correct identity binding.
+The [trust and credential format](../../rfcs/0053-offline-data-token-verification.md#public-trust-and-root-binding)
+defines the machine-written file.
+
+Signed credentials use the actor `principal:<immutable-principal-id>`. Apply a
+Cedar policy permitting that exact actor through the ordinary cluster loop
+before using the credential. Its graph/action grants only narrow that policy:
+no policy, an unknown actor, or an action absent from either permission source
+is denied. A caller cannot change its actor through request headers or JSON.
+Graph listing reveals only graphs with an explicit `graph_list` grant.
+
+Tokens live for 60–86,400 seconds from issuance. The server permits an issuance
+clock up to 30 seconds ahead, so at most 86,430 seconds can remain on admission.
+Expiry has no grace period. Logout or a permission change at the issuer does
+not revoke an issued token; already accepted operations can finish after
+expiry. Stored-query calls need `invoke_query` plus `read` or `change` for the
+body. Schema changes still use `cluster apply`; data tokens cannot grant
+`schema_apply` or `admin`.
+
+Static credentials can coexist for operator recovery. An exact configured
+static credential keeps its existing authority, including credentials with
+dots; an invalid signed credential never falls back to static or anonymous
+access. Restart to change public trust. Install new and old keys together
+before issuing with a new key, and retain the old key for at least 86,430
+seconds after its final issuance before removing it with another restart.
 
 ## Route families
 
