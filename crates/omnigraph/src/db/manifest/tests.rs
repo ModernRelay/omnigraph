@@ -1401,7 +1401,7 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
 }
 
 /// Regression (PR #307 review — Cursor Bugbot High + Codex P2): the post-publish
-/// fold (`#1b`) must reflect an owner-branch handoff. A handoff UPDATEs a
+/// fold (`#1b`) must reflect an owner-branch handoff. A handoff updates a
 /// `table_version` row IN PLACE at the SAME Lance version with a new
 /// `table_branch` — merge-insert `UpdateAll` on the deterministic
 /// `version_object_id(table_key, version)`, so `__manifest` ends with one row

@@ -3741,7 +3741,7 @@ fn dst_merge_duplicates_born_on_both_edge() {
         omnigraph::dst_clock::install_logical_clock();
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-classe-probe",
+            "shared-memory://dst-class-probe",
             TEST_SCHEMA,
             storage.clone(),
             InitOptions::default(),
