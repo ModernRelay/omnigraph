@@ -8,7 +8,7 @@ authors:
   - Codex
 created: 2026-09-05
 updated: 2026-09-05
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/pull/638
 supersedes: []
 superseded_by: []
 blocked_on:
