@@ -345,11 +345,15 @@ fn general_update_reports_completed_classifiers_and_keeps_update_semantics() {
     assert!(source.contains("pub(super) async fn general_merge_verify"));
     let wrapper = operation.find("helpers::cost::cost_harness").unwrap();
     let open = operation.find("Omnigraph::open(uri)").unwrap();
-    let measure = operation.find("helpers::cost::measure").unwrap();
+    let prewarm = operation
+        .find("fixture_controls::prewarm(&db, args)")
+        .unwrap();
+    let measure = operation[prewarm..].find("helpers::cost::measure").unwrap() + prewarm;
     let timer = operation
         .find("let operation_start = Instant::now()")
         .unwrap();
-    assert!(wrapper < open && open < measure && measure < timer);
+    assert!(wrapper < open && open < prewarm && prewarm < measure && measure < timer);
+    assert!(operation.contains("fixture_controls::io_metrics(\"open\", &open_io)"));
     assert!(operation.contains("operation_io_metrics(&io)"));
     assert!(operation.contains("\"operation_open_us\""));
     let setup = source
@@ -393,6 +397,8 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
         "--tables",
         "--history-commits",
         "--retired-branches",
+        "--cache-state",
+        "--manifest-layout",
     ] {
         assert!(
             harness.matches(argument).count() >= 3,
@@ -428,6 +434,14 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     assert!(acknowledgement < reclaim_join && reclaim_join < completion);
     assert!(operation.contains("\"post_ack_reclaim_wait_us\""));
     assert!(operation.contains("\"operation_complete_wall_us\""));
+    let prewarm = operation
+        .find("fixture_controls::prewarm(&db, args)")
+        .unwrap();
+    let first_read = operation
+        .find("fixture_controls::first_read(&db, TARGET, args.tables)")
+        .unwrap();
+    assert!(prewarm < timer && completion < first_read);
+    assert!(operation.contains("fixture_controls::io_metrics(\"open\", &open_io)"));
     assert!(
         operation.find("std::fs::write(").unwrap()
             > operation.find("let operation_wall_us").unwrap()
@@ -464,11 +478,26 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
             < setup.find("for branch in 0..args.branches").unwrap()
     );
     assert!(harness.contains("rfc023_scenarios::validate_fixture_age(&args)"));
+    for cache in ["cold", "warm"] {
+        for layout in ["uncompacted", "compacted"] {
+            rfc023_limits::validate_view_controls(cache, layout).unwrap();
+        }
+    }
+    for (cache, layout) in [
+        ("hot", "compacted"),
+        ("cold", "optimized"),
+        ("", "uncompacted"),
+    ] {
+        assert!(rfc023_limits::validate_view_controls(cache, layout).is_err());
+    }
     let aging = include_str!("../benches/scenarios/rfc023.rs");
     assert!(aging.contains("args.age_options_supplied && !supported"));
     assert!(aging.contains("args.history_commits > 256"));
     assert!(aging.contains("!args.history_commits.is_multiple_of(2)"));
     assert!(aging.contains("args.retired_branches > 32"));
+    assert!(
+        aging.contains("args.rows > 256 || args.dims > 16 || args.branches > 8 || args.tables > 8")
+    );
     let age = aging
         .split_once("pub(super) async fn age_fixture")
         .unwrap()
@@ -494,4 +523,14 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     ] {
         assert!(aging.contains(field), "missing age/IO evidence {field}");
     }
+    let controls = include_str!("../benches/scenarios/fixture_controls.rs");
+    assert!(setup.contains("fixture_controls::prepare_layout(uri, args)"));
+    assert!(controls.contains("compaction changed a retained manifest cell"));
+    assert!(controls.contains("versions.is_subset(&retained)"));
+    assert!(controls.contains("compaction changed branch history/head/table pins"));
+    assert!(controls.contains("compaction changed native branch identity or registry"));
+    assert!(controls.contains("compacted arm must perform physical work"));
+    assert!(controls.contains("one payload row from every table"));
+    assert!(!controls.contains("cleanup_old_versions("));
+    assert!(!controls.contains(".optimize().await"));
 }
