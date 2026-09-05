@@ -308,50 +308,321 @@ async fn cold_other_branch_resolution_uses_one_coherent_manifest_open() {
     .await;
 }
 
-/// Native branch controls must take one post-gate operation-local coordinator
-/// capture, not refresh the handle-local coordinator before and after table
-/// gates. Delete additionally takes one fresh manifest-only dependency
-/// snapshot for each surviving branch and opens the native main ref once for
-/// its exact BranchIdentifier-fenced classifier. The fixture below has one
-/// survivor (`main`).
+/// Branch controls reuse a verified current view or take one coherent capture
+/// on a miss. The owned source cannot change the handle's branch binding.
+/// Deletion reuses a verified surviving-main view and still opens its target
+/// plus the native main ref for the exact BranchIdentifier-fenced classifier.
 #[tokio::test]
 async fn native_branch_controls_use_one_post_gate_manifest_capture() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
         let mut db = init_and_load(&dir).await;
         commit_many(&mut db, 20).await;
+        let mut writer = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
 
-        let (created, create_io) = measure(db.branch_create("feature")).await;
-        created.unwrap();
-        assert_eq!(
-            (create_io.internal_open_count, create_io.manifest_scan_count),
-            (1, 1),
-            "branch create must use one coherent post-gate source capture"
-        );
-
-        let (deleted, delete_io) = measure(db.branch_delete("feature")).await;
-        deleted.unwrap();
-        assert_eq!(
-            (delete_io.internal_open_count, delete_io.manifest_scan_count),
-            (3, 2),
-            "branch delete needs one coherent target capture, one fresh manifest-only \
-             snapshot for surviving main, and one native-ref opener"
-        );
-
-        db.branch_create("feature").await.unwrap();
-        let (created_from, create_from_io) =
-            measure(db.branch_create_from("feature", "review")).await;
-        created_from.unwrap();
-        assert_eq!(
-            (
-                create_from_io.internal_open_count,
-                create_from_io.manifest_scan_count,
-            ),
-            (1, 1),
-            "branch create-from must use one coherent post-gate source capture"
-        );
+        // Keep each assertion phase on the heap: their control/write futures
+        // are large in debug builds. All phases share this one tracked fixture.
+        Box::pin(assert_bound_branch_control_cost(&db, &mut writer)).await;
+        Box::pin(assert_non_bound_branch_control_cost(&db, &mut writer)).await;
+        Box::pin(assert_branch_control_source_incarnation(&db, &mut writer)).await;
+        #[cfg(feature = "failpoints")]
+        Box::pin(assert_cached_borrower_blocks_branch_delete(&db, &mut writer)).await;
     })
     .await;
+}
+
+async fn assert_bound_branch_control_cost(db: &Omnigraph, writer: &mut Omnigraph) {
+    let (created, create_io) = measure(db.branch_create("feature")).await;
+    created.unwrap();
+    assert_eq!(
+        (create_io.internal_open_count, create_io.manifest_scan_count),
+        (0, 0),
+        "warm branch create must reuse its coherent post-gate source view"
+    );
+    assert_eq!(
+        create_io.version_probes, 1,
+        "source reuse must prove freshness"
+    );
+
+    let (deleted, delete_io) = measure(db.branch_delete("feature")).await;
+    deleted.unwrap();
+    assert_eq!(
+        (delete_io.internal_open_count, delete_io.manifest_scan_count),
+        (2, 1),
+        "branch delete needs one coherent target capture and one native-ref \
+         opener; surviving main is already loaded and freshly verified"
+    );
+    assert_eq!(
+        delete_io.version_probes, 1,
+        "dependency reuse must prove freshness"
+    );
+
+    db.branch_create("cold_delete").await.unwrap();
+    mutate_main(
+        writer,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "external_main")], &[("$age", 32)]),
+    )
+    .await
+    .unwrap();
+    let (deleted, stale_delete_io) = measure(db.branch_delete("cold_delete")).await;
+    deleted.unwrap();
+    assert_eq!(
+        (
+            stale_delete_io.internal_open_count,
+            stale_delete_io.manifest_scan_count
+        ),
+        (3, 2),
+        "a stale surviving-main view must fall back to its fresh manifest-only proof"
+    );
+    let (created, stale_create_io) = measure(db.branch_create("main_fresh")).await;
+    created.unwrap();
+    assert_eq!(
+        (
+            stale_create_io.internal_open_count,
+            stale_create_io.manifest_scan_count
+        ),
+        (1, 1),
+        "a stale bound source must take one coherent fresh capture"
+    );
+    let main_fresh = db
+        .query(
+            ReadTarget::branch("main_fresh"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "external_main")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(main_fresh.num_rows(), 1);
+}
+
+async fn assert_non_bound_branch_control_cost(db: &Omnigraph, writer: &mut Omnigraph) {
+    db.branch_create("feature").await.unwrap();
+    let (created_from, create_from_io) = measure(db.branch_create_from("feature", "review")).await;
+    created_from.unwrap();
+    assert_eq!(
+        (
+            create_from_io.internal_open_count,
+            create_from_io.manifest_scan_count,
+        ),
+        (1, 1),
+        "branch create-from must use one coherent post-gate source capture"
+    );
+
+    let (created_from, warm_from_io) =
+        measure(db.branch_create_from("feature", "review_warm")).await;
+    created_from.unwrap();
+    assert_eq!(
+        (
+            warm_from_io.internal_open_count,
+            warm_from_io.manifest_scan_count
+        ),
+        (0, 0),
+        "repeat create-from must share the existing exact non-bound source view"
+    );
+    assert_eq!(warm_from_io.version_probes, 1);
+
+    // A different handle advances the cached source. The next capture must
+    // refresh before forking, not treat the previous successful probe as a
+    // durable lease. Keep the fixture small while checking real contents.
+    mutate_branch(
+        writer,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "fresh_source")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    db.branch_create_from("feature", "review_fresh")
+        .await
+        .unwrap();
+    let fresh = db
+        .query(
+            ReadTarget::branch("review_fresh"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "fresh_source")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh.num_rows(),
+        1,
+        "fork must include the external source commit"
+    );
+
+    db.branch_create("binding_check").await.unwrap();
+    let bound = db
+        .query(
+            ReadTarget::branch("binding_check"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "fresh_source")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bound.num_rows(),
+        0,
+        "source captures must preserve main binding"
+    );
+}
+
+async fn assert_branch_control_source_incarnation(db: &Omnigraph, writer: &mut Omnigraph) {
+    // External deletion/recreation does not invalidate this handle's cache.
+    // Reusing that slot must therefore compare native lifetime, including
+    // when the replacement starts again at the same manifest version.
+    db.branch_create_from("feature", "aba_seed").await.unwrap();
+    let old_source_version = db.graph_manifest_version_of("feature").await.unwrap();
+    for child in ["review", "review_warm", "review_fresh", "aba_seed"] {
+        writer.branch_delete(child).await.unwrap();
+    }
+    writer.branch_delete("feature").await.unwrap();
+    writer.wait_for_fork_reclaims().await;
+    writer.branch_create("feature").await.unwrap();
+    mutate_branch(
+        writer,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "replacement_source")], &[("$age", 33)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        writer.graph_manifest_version_of("feature").await.unwrap(),
+        old_source_version,
+        "ABA fixture must reuse a manifest version in a different native lifetime"
+    );
+    db.branch_create_from("feature", "review_recreated")
+        .await
+        .unwrap();
+    let recreated = db
+        .query(
+            ReadTarget::branch("review_recreated"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "fresh_source")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recreated.num_rows(),
+        0,
+        "fork must use the recreated source lifetime"
+    );
+    let replacement = db
+        .query(
+            ReadTarget::branch("review_recreated"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "replacement_source")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replacement.num_rows(), 1);
+}
+
+#[cfg(feature = "failpoints")]
+async fn assert_cached_borrower_blocks_branch_delete(db: &Omnigraph, writer: &mut Omnigraph) {
+    // Reuse the same fixture and the existing legacy-pointer test seam. A
+    // sibling whose manifest was forked from main can still borrow feature's
+    // table ref; native ancestry alone cannot prove that deleting it is safe.
+    for branch in ["main_fresh", "review_recreated"] {
+        writer.branch_delete(branch).await.unwrap();
+    }
+    writer.wait_for_fork_reclaims().await;
+    writer
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "binding_check",
+            "node:Person",
+            Some("feature"),
+        )
+        .await
+        .unwrap();
+    db.sync_branch("binding_check").await.unwrap();
+
+    let manifest_uri = format!("{}/__manifest", db.uri());
+    let manifest = lance::Dataset::open(&manifest_uri).await.unwrap();
+    let refs_before = manifest.list_branches().await.unwrap();
+    let borrower_native = helpers::graph_native_ref(db.uri(), "binding_check").await;
+    assert_eq!(
+        refs_before[&borrower_native].parent_branch,
+        None,
+        "borrower must not be a native descendant of the delete target"
+    );
+    let source = db.snapshot_of("feature").await.unwrap();
+    let source_entry = source.dataset("node:Person").unwrap();
+    let borrower = db.snapshot_of("binding_check").await.unwrap();
+    let borrowed_entry = borrower.dataset("node:Person").unwrap();
+    assert_eq!(
+        borrowed_entry.native_dataset_branch, source_entry.native_dataset_branch,
+        "legacy sibling must retain the target's exact table ref"
+    );
+    assert_eq!(
+        borrowed_entry.published_dataset_version, source_entry.published_dataset_version
+    );
+    assert!(source_entry.native_dataset_branch.is_some());
+
+    let table_uri = format!("{}/{}", db.uri(), source_entry.dataset_path);
+    let table = lance::Dataset::open(&table_uri).await.unwrap();
+    let table_refs_before = table.list_branches().await.unwrap();
+    let mut before = std::collections::BTreeMap::new();
+    for branch in ["main", "binding_check", "feature"] {
+        let snapshot = db.snapshot_of(branch).await.unwrap();
+        let mut entries = snapshot.datasets().collect::<Vec<_>>();
+        entries.sort_by(|a, b| a.type_key.cmp(&b.type_key));
+        before.insert(
+            branch,
+            (
+                snapshot.graph_manifest_version(),
+                db.resolve_snapshot(branch).await.unwrap(),
+                format!("{entries:?}"),
+                helpers::read_table_branch(db, branch, "node:Person").await,
+            ),
+        );
+    }
+
+    let (deleted, io) = measure(db.branch_delete("feature")).await;
+    let error = deleted.unwrap_err();
+    assert!(
+        error.to_string().contains("because branch 'binding_check' still depends on it"),
+        "must refuse at the table-borrower proof, not native ancestry: {error}"
+    );
+    assert_eq!(
+        (io.internal_open_count, io.manifest_scan_count, io.version_probes),
+        (2, 2, 1),
+        "only target capture and cold-main proof may scan; the bound borrower \
+         must refuse from its freshly verified cache, before the delete classifier"
+    );
+    db.wait_for_fork_reclaims().await;
+
+    assert_eq!(
+        serde_json::to_value(manifest.list_branches().await.unwrap()).unwrap(),
+        serde_json::to_value(refs_before).unwrap(),
+        "refused deletion must preserve every graph branch incarnation"
+    );
+    assert_eq!(
+        serde_json::to_value(table.list_branches().await.unwrap()).unwrap(),
+        serde_json::to_value(table_refs_before).unwrap(),
+        "refused deletion must preserve the borrowed native table ref"
+    );
+    for (branch, (version, head, pins, rows)) in before {
+        let snapshot = db.snapshot_of(branch).await.unwrap();
+        assert_eq!(snapshot.graph_manifest_version(), version, "{branch} version moved");
+        assert_eq!(db.resolve_snapshot(branch).await.unwrap(), head, "{branch} head moved");
+        let mut entries = snapshot.datasets().collect::<Vec<_>>();
+        entries.sort_by(|a, b| a.type_key.cmp(&b.type_key));
+        assert_eq!(format!("{entries:?}"), pins, "{branch} pins moved");
+        assert_eq!(
+            helpers::read_table_branch(db, branch, "node:Person").await,
+            rows,
+            "{branch} payload changed"
+        );
+    }
 }
 
 /// A non-main branch can be deleted and recreated at the same Lance version
