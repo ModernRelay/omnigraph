@@ -2871,7 +2871,7 @@ async fn execute_expand_bound(
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", key_col)))?
                 .clone();
-            let opps = batch
+            let opposites = batch
                 .column_by_name(opp_col)
                 .ok_or_else(|| OmniError::manifest(format!("edge batch missing '{}'", opp_col)))?
                 .as_any()
@@ -2888,7 +2888,7 @@ async fn execute_expand_bound(
             for r in 0..batch.num_rows() {
                 // Undirected probes both orientations; a self-loop row would
                 // match the same wide row through both, so emit it only once.
-                if probe_idx == 1 && keys.value(r) == opps.value(r) {
+                if probe_idx == 1 && keys.value(r) == opposites.value(r) {
                     continue;
                 }
                 let Some(wide_rows) = rows_by_src.get(keys.value(r)) else {
@@ -2897,7 +2897,7 @@ async fn execute_expand_bound(
                 for &wide_row in wide_rows {
                     matches.push((
                         wide_row,
-                        opps.value(r).to_string(),
+                        opposites.value(r).to_string(),
                         batch_idx,
                         r,
                         edge_ids.value(r).to_string(),
@@ -3296,7 +3296,7 @@ async fn execute_expand_bfs(
                         .ok_or_else(|| {
                             OmniError::manifest(format!("edge '{}' is not Utf8", key_col))
                         })?;
-                    let opps = batch
+                    let opposites = batch
                         .column_by_name(opp_col)
                         .ok_or_else(|| {
                             OmniError::manifest(format!("edge batch missing '{}'", opp_col))
@@ -3308,7 +3308,7 @@ async fn execute_expand_bfs(
                         })?;
                     for r in 0..batch.num_rows() {
                         let k = src.interner.get_or_insert(keys.value(r));
-                        let o = src.interner.get_or_insert(opps.value(r));
+                        let o = src.interner.get_or_insert(opposites.value(r));
                         src.neighbor_map.entry(k).or_default().push(o);
                     }
                 }

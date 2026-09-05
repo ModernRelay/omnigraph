@@ -136,6 +136,7 @@ cargo clippy --workspace --all-targets --locked -- \
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
+typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
 ```
 
 S3 suites require `OMNIGRAPH_S3_TEST_BUCKET` and the documented `AWS_*`

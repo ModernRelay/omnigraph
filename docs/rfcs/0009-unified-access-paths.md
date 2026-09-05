@@ -207,7 +207,7 @@ registration — the migration is a worthwhile but orthogonal cleanup, deferred.
 - CLI `--json` output is observable contract; Phase 1 freezes it before
   Phase 3 moves code. Any field-level unification that *changes* output is a
   deliberate, release-noted decision, not a refactor side effect.
-- Error-message text for mis-planed commands changes in Phase 4 — release-note
+- Error-message text for mis-planned commands changes in Phase 4 — release-note
   it (Hyrum).
 - `openapi.json` should be byte-stable through Phase 2 if the DTO move is
   faithful; the regeneration test enforces this.
