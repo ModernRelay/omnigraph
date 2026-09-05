@@ -366,6 +366,25 @@ fn trust_file_reads_are_bounded_and_allow_projected_regular_files() {
     assert!(
         DataTokenTrust::from_json(&serde_json::to_vec(&bad).unwrap(), "file:///fixture").is_err()
     );
+    // Valid SPKI for a different EC curve is still outside this fixed profile.
+    bad["keys"][0]["public_key_pem"] = json!(concat!(
+        "-----BEGIN PUBLIC KEY-----\n",
+        "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAENZvc2bpMEtW1sf4GV905mNLjJzTsoLAN\n",
+        "QAt0OJTcapKwgYfcT7og3GSfKZf5H/WCIJCtfA1hNAHNck2uKqFeOCPcY/Ci6QV8\n",
+        "79TGgOXMmHNQC0W1kcZRixyx2ffP5h4/\n",
+        "-----END PUBLIC KEY-----\n"
+    ));
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(concat!(
+            "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAENZvc2bpMEtW1sf4GV905mNLjJzTsoLAN",
+            "QAt0OJTcapKwgYfcT7og3GSfKZf5H/WCIJCtfA1hNAHNck2uKqFeOCPcY/Ci6QV8",
+            "79TGgOXMmHNQC0W1kcZRixyx2ffP5h4/"
+        ))
+        .unwrap();
+    bad["keys"][0]["kid"] = json!(format!("{:x}", Sha256::digest(der)));
+    assert!(
+        DataTokenTrust::from_json(&serde_json::to_vec(&bad).unwrap(), "file:///fixture").is_err()
+    );
     let duplicate = document().to_string().replacen('{', "{\"version\":1,", 1);
     assert!(DataTokenTrust::from_json(duplicate.as_bytes(), "file:///fixture").is_err());
 }
