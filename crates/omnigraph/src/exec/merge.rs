@@ -3499,11 +3499,27 @@ fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
     Ok(ids.value(row).to_string())
 }
 
+/// The manifest projects the greatest numeric version for each table identity.
+/// Native refs have independent version histories, so adopting an equal or
+/// lower source version cannot replace the target's current registration.
+/// This selects a publication route; row comparison still determines the delta.
+fn adopt_requires_target_lineage(
+    source_entry: &crate::db::DatasetEntry,
+    target_entry: Option<&crate::db::DatasetEntry>,
+) -> bool {
+    target_entry.is_some_and(|target| {
+        source_entry.published_dataset_version <= target.published_dataset_version
+    })
+}
+
 fn adopt_advances_head(
     target_active: Option<&str>,
     source_entry: &crate::db::DatasetEntry,
     target_entry: Option<&crate::db::DatasetEntry>,
 ) -> bool {
+    if adopt_requires_target_lineage(source_entry, target_entry) {
+        return true;
+    }
     match (target_active, source_entry.native_dataset_branch.as_deref()) {
         // Source on a branch, target on main — delta applied onto main's lineage.
         (None, Some(_)) => true,
@@ -3512,7 +3528,7 @@ fn adopt_advances_head(
             target_entry.and_then(|entry| entry.native_dataset_branch.as_deref())
                 == Some(target_branch)
         }
-        // Source on main (pointer switch) or target doesn't own (fork): no advance.
+        // A newer source on main (pointer switch) or an unowned target (fork).
         _ => false,
     }
 }
@@ -3525,10 +3541,9 @@ fn adopt_advances_head(
 /// forks become [`CandidateTableState::AdoptSourceState`] and do not advance
 /// data HEAD.
 ///
-/// The HEAD-advancing subcases mirror [`publish_adopted_source_state`]: source
-/// on a branch with the target either on main or owning the table. Computing the
-/// delta here (rather than inside the publish) is what closes the recovery gap —
-/// the classifier knows whether the publish will move Lance HEAD.
+/// The HEAD-advancing subcases also include adoption that cannot replace the
+/// target's greatest registered version. Computing the delta here (rather than
+/// inside the publish) lets recovery own every required target-lineage write.
 async fn classify_adopt(
     target_db: &Omnigraph,
     catalog: &Catalog,
@@ -3740,10 +3755,11 @@ fn keep_publishing_candidate(
         CandidateTableState::AdoptSourceState {
             validation_delta: None
         }
-    ) && matches!(
-        plan_adopted_source_state(target_active, source_entry, target_entry, table_key),
-        AdoptPublish::Nothing
-    );
+    ) && (adopt_requires_target_lineage(source_entry, target_entry)
+        || matches!(
+            plan_adopted_source_state(target_active, source_entry, target_entry, table_key),
+            AdoptPublish::Nothing
+        ));
     if publishes_nothing {
         return None;
     }
