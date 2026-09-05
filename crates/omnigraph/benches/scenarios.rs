@@ -27,6 +27,14 @@
 //!     --scenario fenced-small-upsert --rows 100000 --dims 256
 //!   cargo bench -p omnigraph-engine --bench scenarios -- \
 //!     --scenario fenced-adopt-all-new --rows 100000 --dims 256
+//!   cargo bench -p omnigraph-engine --bench scenarios -- \
+//!     --scenario branch-create-from --branches 8 --tables 4 --rows 1000 --dims 32
+//!
+//! `branch-create`, `branch-create-from`, `branch-list`, and `branch-delete`
+//! reuse the phased setup/operation/verify controller. `--branches` counts
+//! existing siblings, excluding main and the deletion victim; `--tables`
+//! counts populated tables. Chunk carries `--rows` vectors and each remaining
+//! table carries one scalar row. Every run measures one real operation.
 //!
 //! Mechanism: the parent re-invokes `current_exe()` with `--child` per run (or
 //! per phase for RFC-023 adopt), reaps it with `libc::wait4`, and reads
@@ -58,6 +66,10 @@ mod rfc023_limits;
 #[path = "scenarios/child_protocol.rs"]
 #[cfg(unix)]
 mod child_protocol;
+
+#[path = "scenarios/branch_control.rs"]
+#[cfg(unix)]
+mod branch_control;
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -104,6 +116,10 @@ struct Args {
     /// after the fork, which is what distinguishes this from the adopt
     /// scenario's untouched target.
     source_mode: String,
+    /// Existing sibling branches (excluding main and a deletion victim).
+    branches: usize,
+    /// Populated tables for branch-control scenarios; Chunk plus small scalar tables.
+    tables: usize,
     memory_cap_mb: Option<u64>,
     /// Results-log override; see `results_path`.
     out: Option<String>,
@@ -139,6 +155,8 @@ impl Args {
             text_bytes: 2048,
             delta_rows: 50,
             source_mode: "update".to_string(),
+            branches: 8,
+            tables: 4,
             memory_cap_mb: None,
             out: None,
             baseline: false,
@@ -176,6 +194,8 @@ impl Args {
                     args.delta_rows = take("--delta-rows").parse().expect("--delta-rows")
                 }
                 "--source-mode" => args.source_mode = take("--source-mode"),
+                "--branches" => args.branches = take("--branches").parse().expect("--branches"),
+                "--tables" => args.tables = take("--tables").parse().expect("--tables"),
                 "--out" => args.out = Some(take("--out")),
                 "--memory-cap-mb" => {
                     args.memory_cap_mb = Some(take("--memory-cap-mb").parse().expect("cap"))
@@ -216,6 +236,10 @@ impl Args {
             self.delta_rows.to_string(),
             "--source-mode".into(),
             self.source_mode.clone(),
+            "--branches".into(),
+            self.branches.to_string(),
+            "--tables".into(),
+            self.tables.to_string(),
             "--child".into(),
         ];
         if self.baseline {
@@ -252,17 +276,24 @@ fn main() {
     if args.scenario.is_empty() {
         eprintln!(
             "usage: --scenario <merge-all-changed|nearest-prefilter|ann-probe-budget|fenced-small-upsert|\
-             fenced-adopt-all-new|general-merge-updates|rrf-gate> [--rows N] [--dims D] \
+             fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|rrf-gate> [--rows N] [--dims D] \
              [--seed S] [--runs K] [--selectivity F] [--k K] [--ann-partitions N] \
              [--ann-probes N] [--text-bytes B] [--delta-rows N] \
-             [--source-mode update|insert] [--memory-cap-mb M]"
+             [--source-mode update|insert] [--branches N] [--tables N] [--memory-cap-mb M]"
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
         // any blanket `cargo bench` invocation.
         return;
     }
-    if let Err(error) = rfc023_scenarios::validate_args(&args) {
-        eprintln!("invalid RFC-023 benchmark shape: {error}");
+    let shape = if args.runs == 0 {
+        Err("--runs must be greater than zero".to_string())
+    } else if branch_control::is_scenario(&args.scenario) {
+        branch_control::validate_args(&args)
+    } else {
+        rfc023_scenarios::validate_args(&args)
+    };
+    if let Err(error) = shape {
+        eprintln!("invalid benchmark shape: {error}");
         std::process::exit(2);
     }
     if args.child {
@@ -274,7 +305,8 @@ fn main() {
         let record = if matches!(
             args.scenario.as_str(),
             "fenced-adopt-all-new" | "general-merge-updates"
-        ) {
+        ) || branch_control::is_scenario(&args.scenario)
+        {
             run_phased_adopt_once(&args, run)
         } else {
             run_once(&args, run)
@@ -645,6 +677,8 @@ fn run_phased_adopt_once(args: &Args, run: usize) -> serde_json::Value {
             "k": args.k,
             "delta_rows": args.delta_rows,
             "source_mode": args.source_mode,
+            "branches": args.branches,
+            "tables": args.tables,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
         },
@@ -776,6 +810,15 @@ fn run_child(args: &Args) {
             }
             ("general-merge-updates", Some("verify")) => {
                 rfc023_scenarios::general_merge_verify(args).await
+            }
+            (name, Some("setup")) if branch_control::is_scenario(name) => {
+                branch_control::setup(args).await
+            }
+            (name, Some("operation")) if branch_control::is_scenario(name) => {
+                branch_control::operation(args).await
+            }
+            (name, Some("verify")) if branch_control::is_scenario(name) => {
+                branch_control::verify(args).await
             }
             ("merge-all-changed", None) => merge_all_changed(args).await,
             ("nearest-prefilter", None) => nearest_prefilter(args).await,

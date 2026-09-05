@@ -1,6 +1,6 @@
 //! The full crash-window catalog for the hunt
 //! (`dst_hunt_crash_window_sweep`): the engine's `src/failpoints.rs`
-//! name set, 71 windows at the pinned engine version. A window added to
+//! name set, 72 windows at the pinned engine version. A window added to
 //! the engine enters here as never-reached until its workload exists.
 //!
 //! Kept honest by `catalog_names_are_engine_failpoints` below: every
@@ -10,7 +10,7 @@
 //! `names::*` consts directly would be stronger still; the guard covers
 //! the failure mode until then.)
 
-pub const CRASH_WINDOWS: [&str; 71] = [
+pub const CRASH_WINDOWS: [&str; 72] = [
     "blob_read.post_capture",
     "branch_control.post_recovery_barrier",
     "branch_create.post_native",
@@ -82,6 +82,9 @@ pub const CRASH_WINDOWS: [&str; 71] = [
     "schema_apply.post_table_commit",
     "schema_reload.before_contract_read",
     "storage.local_create_if_absent_probe",
+    // Append new windows so index-derived census seeds for existing windows
+    // remain stable.
+    "branch_merge.rewrite_after_insert_pre_update",
 ];
 
 #[cfg(test)]

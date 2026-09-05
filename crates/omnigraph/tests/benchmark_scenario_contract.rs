@@ -142,8 +142,15 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
         "measured operation phase must not scan final rows"
     );
     assert!(
-        !operation.contains("snapshot_of("),
-        "measured operation phase must not scan graph-visible final state"
+        operation
+            .find("source_head_builder(uri, &source_snapshot)")
+            .unwrap()
+            < pre_hwm,
+        "source ref resolution must be common unmeasured preparation"
+    );
+    assert!(
+        !operation[pre_hwm..].contains("snapshot_of("),
+        "the measured operation must not read final graph state"
     );
 
     let baseline = source
@@ -153,7 +160,27 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
         .split_once("/// Phase 2: measured bulk all-new operation")
         .expect("baseline function boundary")
         .0;
-    assert!(baseline.contains(".with_branch(\"adopt-source\", None)"));
+    assert!(baseline.contains("let source_table = source_builder"));
+    assert!(
+        !source.contains(".with_branch(\"adopt-source\","),
+        "physical source opens must use captured native refs, not logical branch names"
+    );
+    assert_eq!(
+        source
+            .matches("source_head_builder(uri, &source_snapshot)")
+            .count(),
+        3
+    );
+    let source_opener = source
+        .split_once("fn source_head_builder")
+        .unwrap()
+        .1
+        .split_once("fn adopt_fixture_root")
+        .unwrap()
+        .0;
+    assert!(source_opener.contains("entry.dataset_path"));
+    assert!(source_opener.contains("entry.native_dataset_branch.as_deref()"));
+    assert!(source_opener.contains("builder.with_branch(native_ref, None)"));
     assert!(baseline.contains(".with_session(main_table.session())"));
     assert!(baseline.contains(".filter(\"id LIKE 'adopt-new-%'\")"));
     assert!(baseline.contains(".execute_stream(source)"));
@@ -290,4 +317,93 @@ fn child_record_protocol_rejects_missing_duplicate_malformed_and_non_object_evid
         refusal.protocol_error.is_none(),
         "a refused child reports cap evidence but no scenario metrics"
     );
+}
+
+#[test]
+fn general_update_reports_completed_classifiers_and_keeps_update_semantics() {
+    let source = include_str!("../benches/scenarios/rfc023.rs");
+    let operation = source
+        .split_once("pub(super) async fn general_merge_operation")
+        .unwrap()
+        .1
+        .split_once("async fn verify_fixture_row")
+        .unwrap()
+        .0;
+    assert!(operation.contains("probes.completed_full_walk_classification_calls()"));
+    assert!(operation.contains("probes.completed_lineage_classification_calls()"));
+    assert!(operation.contains("full_walk_classifications + lineage_classifications > 0"));
+    assert!(!operation.contains("ordered_cursor_scan_calls > 0"));
+    assert!(operation.contains("MergeOutcome::Merged"));
+    assert!(
+        operation.contains(
+            "probes.stage_merge_insert_rows() + probes.stage_known_present_update_rows()"
+        )
+    );
+    assert!(operation.contains("\"classifier_route\": classifier_route"));
+    assert!(operation.contains("args.delta_rows as u64"));
+    assert!(!operation.contains("snapshot_of("));
+    assert!(source.contains("pub(super) async fn general_merge_verify"));
+}
+
+#[test]
+fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
+    let harness = include_str!("../benches/scenarios.rs");
+    let source = include_str!("../benches/scenarios/branch_control.rs");
+    assert!(harness.contains("branch_control::is_scenario(&args.scenario)"));
+    for phase in ["setup", "operation", "verify"] {
+        assert!(harness.contains(&format!("branch_control::{phase}(args).await")));
+    }
+    for argument in ["--branches", "--tables"] {
+        assert!(
+            harness.matches(argument).count() >= 3,
+            "workload dimensions must parse, propagate, and be documented"
+        );
+    }
+    assert!(source.contains("args.branches == 0 || args.tables == 0 || args.runs == 0"));
+    assert!(source.contains("if args.baseline"));
+    let operation = source
+        .split_once("pub(super) async fn operation")
+        .unwrap()
+        .1
+        .split_once("pub(super) async fn verify")
+        .unwrap()
+        .0;
+    let timer = operation.find("let started = Instant::now()").unwrap();
+    assert!(operation.find("Omnigraph::open(").unwrap() < timer);
+    for call in [
+        "db.branch_create(TARGET)",
+        "db.branch_create_from(",
+        "db.branch_list()",
+        "db.branch_delete(TARGET)",
+    ] {
+        assert!(operation.find(call).unwrap() > timer);
+    }
+    assert!(!operation.contains("branch_view("));
+    assert!(!operation.contains("snapshot_of("));
+    assert!(operation.contains("\"completed_operations\": 1"));
+    assert!(operation.contains("\"rss_boundary\""));
+    let acknowledgement = operation.find("let operation_wall_us").unwrap();
+    let reclaim_join = operation.find("db.wait_for_fork_reclaims().await").unwrap();
+    let completion = operation.find("let operation_complete_wall_us").unwrap();
+    assert!(acknowledgement < reclaim_join && reclaim_join < completion);
+    assert!(operation.contains("\"post_ack_reclaim_wait_us\""));
+    assert!(operation.contains("\"operation_complete_wall_us\""));
+    assert!(
+        operation.find("std::fs::write(").unwrap()
+            > operation.find("let operation_wall_us").unwrap()
+    );
+    assert!(source.contains("created.tables, fixture.branches[parent].tables"));
+    assert!(source.contains("!refs.contains_key(native_ref)"));
+    assert!(source.contains("assert_eq!(verified_reclaimed_table_refs, args.tables)"));
+    let compact = source
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    assert!(compact.contains("entry.native_ref.as_deref()"));
+    assert!(compact.contains("dataset.list_branches().await"));
+    assert!(compact.contains("created.effective_head,fixture.branches[parent].effective_head"));
+    assert!(compact.contains(".resolve_snapshot(branch)"));
+    assert!(compact.contains("assert_eq!(listed,names,"));
+    assert!(compact.contains("assert_ne!(source.tables,branches[\"main\"].tables,"));
+    assert!(source.contains("\"verification_passed\": true"));
 }

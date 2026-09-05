@@ -380,6 +380,13 @@ async fn maintain_indices_for_branch(
     )
     .await?;
     let live_snapshot = db.revalidate_write_txn(&txn).await?;
+    let first_touch_references = if first_touch_sources.is_empty() {
+        None
+    } else {
+        Some(Box::pin(crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
+            db.root_uri(), &db.control_session(),
+        )).await?)
+    };
 
     for pin in &recovery_pins {
         let prepared_entry = snapshot.dataset(&pin.table_key).ok_or_else(|| {
@@ -439,6 +446,16 @@ async fn maintain_indices_for_branch(
                     pin.table_key,
                 ))
             })?;
+            if first_touch_references
+                .as_ref()
+                .expect("first-touch liveness proof")
+                .contains(pin.identity, target_branch)
+            {
+                return Err(crate::db::manifest::detached_native_lineage_error(
+                    &pin.table_key,
+                    target_branch,
+                ));
+            }
             let branches = crate::branch_control::list_branch_contents(source.dataset()).await?;
             if branches.contains_key(target_branch) {
                 return Err(OmniError::manifest_conflict(format!(
@@ -1038,8 +1055,8 @@ async fn plan_index_work_edge_on_dataset(
 /// Result of opening a sub-table for mutation. `handle` is `None` only when a
 /// non-strict (Insert/Merge) op on the WriteTxn's own branch skipped the
 /// accumulation open (RFC-013 step 3b collapse #1) — there the caller needs just
-/// `expected_version`. It is ALWAYS `Some` for strict ops, the fork path, and
-/// every no-`txn` caller (branch merge), which use [`Self::require_handle`].
+/// `expected_version`. It is always `Some` for strict operations, the fork
+/// path, and the test-only non-transactional opener.
 #[derive(Debug)]
 pub(crate) struct OpenedForMutation {
     /// Immutable logical table lifetime captured from the same manifest entry
@@ -1066,36 +1083,15 @@ pub(crate) struct DeferredTableFork {
     pub(crate) target_branch: String,
 }
 
+#[cfg(test)]
 impl OpenedForMutation {
-    /// Destructure for a caller that REQUIRES the handle (strict ops, the fork
-    /// path, every no-`txn` caller). The `None` skip fires solely on the
-    /// non-strict `txn` path, which these callers are not — so a panic here means
-    /// a future change broke that contract, named by `ctx`.
+    /// Raw-write fixtures use the no-transaction path, which must open a handle.
     pub(crate) fn require_handle(self, ctx: &str) -> (SnapshotHandle, String, Option<String>) {
         let handle = self.handle.unwrap_or_else(|| {
             panic!("{ctx}: open_for_mutation returned no handle on a path that requires one")
         });
         (handle, self.full_path, self.table_branch)
     }
-}
-
-pub(super) async fn open_for_mutation(
-    db: &Omnigraph,
-    table_key: &str,
-    op_kind: crate::db::MutationOpKind,
-) -> Result<OpenedForMutation> {
-    let current_branch = db
-        .coordinator
-        .read()
-        .await
-        .current_branch()
-        .map(str::to_string);
-    // `open_for_mutation` is the no-txn entry (branch merge). Passing `None`
-    // keeps the exact pre-WriteTxn code path (a fresh `resolved_branch_target`
-    // that re-validates the schema). With `txn = None` the non-strict early-skip
-    // in `open_for_mutation_on_branch` never fires, so this always returns a
-    // `Some(handle)` for its callers.
-    open_for_mutation_on_branch(db, current_branch.as_deref(), table_key, op_kind, None).await
 }
 
 /// Open a sub-table for mutation. The `op_kind` selects the strict-vs-relaxed
@@ -1149,8 +1145,8 @@ pub(super) async fn open_for_mutation_on_branch(
     // drift guards. So skip `open_dataset_head` entirely and source the
     // expected version from the pinned entry.
     //
-    // Gated on `txn.is_some()`: without a txn (branch merge's `open_for_mutation`)
-    // every arm below is byte-identical to before. STRICT ops (Update/Delete/
+    // Gated on `txn.is_some()`: callers without an accumulation transaction
+    // always open a handle. STRICT ops (Update/Delete/
     // SchemaRewrite) always open live HEAD + run `ensure_expected_version`
     // (read-modify-write SI), and any write that must FORK (the table isn't yet on
     // the resolved branch) opens too (the fork is a real Lance state advance the
@@ -1386,6 +1382,9 @@ pub(super) async fn fork_dataset_from_entry_state(
 pub(crate) enum ForkRefStatus {
     /// The manifest places `T` on `B` — a legitimate fork. Never destroy.
     Legitimate,
+    /// Another graph branch still pins this ref after its owner detached.
+    /// Re-forking would overwrite the borrower's immutable history.
+    Borrowed,
     /// The manifest does not reference this fork (`T` not on `B`, or `B` absent
     /// from the manifest entirely). Reclaimable.
     Orphan,
@@ -1395,8 +1394,8 @@ pub(crate) enum ForkRefStatus {
 }
 
 /// Classify a fork ref from FRESH manifest authority (bypasses the coordinator
-/// cache). MUST be called with the per-`(table, branch)` write queue held, so
-/// the classification is stable against in-process writers for the caller's
+/// cache). MUST be called with the schema-control and per-`(table, branch)`
+/// write queues held, so the classification is stable for the caller's
 /// critical section. Both reclaim sites map the result to their own action
 /// (write path: reclaim vs retryable; cleanup: delete vs skip), but the
 /// destroy-only-on-`Orphan` rule is enforced here, once.
@@ -1407,18 +1406,33 @@ pub(crate) async fn classify_fork_ref(
     branch: &str,
     excluding_operation_id: Option<&str>,
 ) -> ForkRefStatus {
-    // `branch` is the native fork ref. Sidecars record the logical branch and
-    // the native table ref separately; manifest lookups take the logical name.
-    let logical = crate::branch_names::logical_branch_name(branch);
-    // Deferred mutation/load forks are created only after their v9 sidecar is
-    // durable. Until the manifest publish places this table on `branch`, that
-    // sidecar is the only durable ownership record for the ref. Treat a
-    // matching pending intent as indeterminate rather than an orphan so neither
-    // destructive caller can steal a live writer's fork. The writer that owns
-    // the intent may exclude itself while reclaiming a genuinely stale ref it
-    // collided with; every other sidecar remains a hard stop. A list failure is
-    // likewise indeterminate -- cleanup must never turn missing authority into
-    // permission to delete.
+    let references =
+        match crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
+            db.root_uri(),
+            &db.control_session(),
+        )
+        .await
+        {
+            Ok(references) => references,
+            Err(_) => return ForkRefStatus::Indeterminate,
+        };
+    classify_fork_ref_with_references(db, identity, branch, excluding_operation_id, &references)
+        .await
+}
+
+/// Use a graph-wide proof captured under the same held schema control gate.
+/// Recovery pins are checked separately because an unpublished first-touch ref
+/// may be live even though no graph snapshot references it yet.
+pub(crate) async fn classify_fork_ref_with_references(
+    db: &Omnigraph,
+    identity: crate::db::manifest::TableIdentity,
+    branch: &str,
+    excluding_operation_id: Option<&str>,
+    references: &crate::db::manifest::NativeForkReferences,
+) -> ForkRefStatus {
+    if crate::failpoints::maybe_fail(crate::failpoints::names::CLASSIFY_FRESH_READ).is_err() {
+        return ForkRefStatus::Indeterminate;
+    }
     let sidecars =
         match crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await {
             Ok(sidecars) => sidecars,
@@ -1426,7 +1440,6 @@ pub(crate) async fn classify_fork_ref(
         };
     if sidecars.iter().any(|sidecar| {
         Some(sidecar.operation_id.as_str()) != excluding_operation_id
-            && sidecar.branch.as_deref() == Some(logical)
             && sidecar
                 .tables
                 .iter()
@@ -1434,37 +1447,12 @@ pub(crate) async fn classify_fork_ref(
     }) {
         return ForkRefStatus::Indeterminate;
     }
-
-    // `classify.fresh_read` failpoint: simulate a transient failure of the
-    // fresh-authority read (no-op without the `failpoints` feature). Lets a
-    // test exercise the Indeterminate path — a read failure on a live branch
-    // must classify as Indeterminate (skip), never Orphan (destroy).
-    let fresh = match crate::failpoints::maybe_fail(crate::failpoints::names::CLASSIFY_FRESH_READ) {
-        Ok(()) => db.fresh_snapshot_for_branch(Some(logical)).await,
-        Err(injected) => Err(injected),
-    };
-    match fresh {
-        Ok(snap) => {
-            let placed = snap
-                .datasets()
-                .find(|entry| entry.identity == identity)
-                .map(|e| e.native_dataset_branch.as_deref() == Some(branch))
-                .unwrap_or(false);
-            if placed {
-                ForkRefStatus::Legitimate
-            } else {
-                // Branch resolves but the manifest does not place this table on
-                // it — a manifest-unreferenced fork.
-                ForkRefStatus::Orphan
-            }
-        }
-        // Branch did not resolve. `all_branches` lists `_refs/branches/` live, so
-        // absent there = genuinely no such manifest branch (origin-1 orphan);
-        // present (or a list error) = transient read — never destroy on that.
-        Err(_) => match db.coordinator.read().await.all_native_branches().await {
-            Ok(fresh) if !fresh.iter().any(|b| b == branch) => ForkRefStatus::Orphan,
-            _ => ForkRefStatus::Indeterminate,
-        },
+    if references.owner_contains(identity, branch) {
+        ForkRefStatus::Legitimate
+    } else if references.contains(identity, branch) {
+        ForkRefStatus::Borrowed
+    } else {
+        ForkRefStatus::Orphan
     }
 }
 
@@ -1473,11 +1461,10 @@ pub(crate) async fn classify_fork_ref(
 /// Reached when `fork_branch_from_state` reports `RefAlreadyExists`. This is a
 /// destructive op (it force-deletes a Lance branch ref), so it owns its own
 /// safety precondition rather than trusting the caller's: it re-derives, via
-/// [`classify_fork_ref`], that the manifest does not place this table on
+/// [`classify_fork_ref`], that no live graph branch references this table on
 /// `active_branch`. The caller's earlier proof may have come from the
 /// coordinator's *cached* branch snapshot (`resolved_branch_target` returns
-/// the cache when the handle is bound to `active_branch` — an embedded handle
-/// on the branch, or `branch_merge`'s target swap); trusting it could
+/// the cache when the embedded handle is bound to `active_branch`); trusting it could
 /// force-delete a fork a concurrent writer just legitimately published. Only
 /// once fresh authority confirms the ref is unreferenced does it drop the ref
 /// (idempotent `force_delete_branch`) and re-fork, exactly once.
@@ -1522,7 +1509,6 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
     let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
     if let Some(owner) = sidecars.iter().find(|sidecar| {
         Some(sidecar.operation_id.as_str()) != current_operation_id
-            && sidecar.branch.as_deref() == Some(logical_active)
             && sidecar.tables.iter().any(|pin| {
                 pin.identity == identity && pin.table_branch.as_deref() == Some(active_branch)
             })
@@ -1541,6 +1527,12 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
     // than stranding the manifest at a version the recreated ref won't have.
     match classify_fork_ref(db, table_key, identity, active_branch, current_operation_id).await {
         ForkRefStatus::Orphan => {}
+        ForkRefStatus::Borrowed => {
+            return Err(crate::db::manifest::detached_native_lineage_error(
+                table_key,
+                active_branch,
+            ));
+        }
         ForkRefStatus::Legitimate => {
             let actual = db
                 .fresh_snapshot_for_branch(Some(logical_active))
@@ -1917,6 +1909,11 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     lineage_intent: crate::db::manifest::LineageIntent,
 ) -> Result<crate::db::GraphCommit> {
     db.ensure_schema_apply_not_locked("write commit").await?;
+    if branch != txn.branch.as_deref() {
+        return Err(OmniError::manifest_internal(
+            "publication branch differs from its captured write transaction",
+        ));
+    }
     let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn)).await?;
 
     debug_assert_eq!(lineage_intent.actor_id.as_deref(), actor_id);
@@ -1932,17 +1929,21 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     );
     let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation);
 
-    let current_branch = db
-        .coordinator
-        .read()
-        .await
-        .current_branch()
-        .map(str::to_string);
-    let requested_branch = branch.map(str::to_string);
-    let published = if requested_branch == current_branch {
-        db.coordinator
-            .write()
-            .await
+    // Choose and publish through one coordinator lock. A same-name cached
+    // coordinator can still hold another incarnation or incomplete lineage,
+    // so only an exact captured view is reused without a fresh open.
+    let mut active = db.coordinator.write().await;
+    let published = if branch == active.current_branch() {
+        let captured_view_matches = active.branch_identifier().await?
+            == txn.authority.branch_identifier
+            && active.exact_graph_head() == txn.authority.graph_head
+            && active.version() == txn.base.graph_manifest_version();
+        if !captured_view_matches {
+            // Keep the handle's binding while replacing only stale state.
+            // The publisher still reads fresh authority and applies its CAS.
+            *active = db.open_coordinator_for_branch(branch).await?;
+        }
+        active
             .commit_changes_with_intent_and_expected(
                 &changes,
                 expected_table_versions,
@@ -1951,25 +1952,10 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             )
             .await?
     } else {
-        let mut coordinator = match requested_branch.as_deref() {
-            Some(branch) => {
-                GraphCoordinator::open_branch_with_session(
-                    db.uri(),
-                    branch,
-                    Arc::clone(&db.storage),
-                    &db.control_session(),
-                )
-                .await?
-            }
-            None => {
-                GraphCoordinator::open_with_session(
-                    db.uri(),
-                    Arc::clone(&db.storage),
-                    &db.control_session(),
-                )
-                .await?
-            }
-        };
+        // An operation on a non-bound branch owns its coordinator locally;
+        // it must never temporarily change this handle's query/write binding.
+        drop(active);
+        let mut coordinator = db.open_coordinator_for_branch(branch).await?;
         coordinator
             .commit_changes_with_intent_and_expected(
                 &changes,

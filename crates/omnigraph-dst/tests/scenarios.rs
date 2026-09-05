@@ -2232,6 +2232,11 @@ fn dst_milestone_never_remerges_merged_branch() {
 /// plus EXISTS 38 -> 42, _audit 114 -> 116, _verify 564 -> 575) and stamp-fresh
 /// loads shave a few cold-build Lance GETs (_audit 1222 -> 1221,
 /// _verify 2079 -> 2074; Optimize l.get 622 -> 628 from the save-side stamping).
+///
+/// Graph-wide borrower proofs add reads at this universe's two first touches:
+/// AddFriend GET/LIST 382/74 -> 425/78; InsertLegacy 291/60 -> 338/64.
+/// Empty cleanup sweeps skip the proof and the old eager branch-registry read,
+/// reducing Cleanup GET/LIST 227/136 -> 209/134. Other counts are unchanged.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {

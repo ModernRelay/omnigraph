@@ -832,6 +832,12 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
                 MergeBranch,
             ];
         }
+        // Diverge main after the branch insert so this reaches the general
+        // rewrite publisher, whose insert commit precedes the update phase.
+        // The hook also fires when that phase has no update payload.
+        "branch_merge.rewrite_after_insert_pre_update" => {
+            return vec![EnsureBranch, DataOnBranch, MutateMain, MergeBranch];
+        }
         // ensure_indices deferred-fork route: put data on the branch first
         // (forks ONE table and places it) so the branch ensure_indices has
         // work to do and the remaining tables are first-touch.

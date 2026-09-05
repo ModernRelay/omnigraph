@@ -5,6 +5,42 @@ harness. A case describes one benchmark point. A suite selects cases and says
 how many samples to collect. These files are experiment definitions, not run
 records, fixtures, or result storage.
 
+## Branch operation diagnostics
+
+The engine's `scenarios` target supplements the declarative merge cases with
+one-operation create, create-from, list, and delete measurements:
+
+```bash
+cargo bench --locked -p omnigraph-engine --bench scenarios -- \
+  --scenario branch-create-from --branches 8 --tables 4 \
+  --rows 1000 --dims 32 --runs 5 --out /tmp/branch-create-from.jsonl
+```
+
+Use `branch-create`, `branch-create-from`, `branch-list`, or `branch-delete`.
+`--branches` counts existing siblings, excluding `main` and the delete target;
+`--tables` counts populated tables. One table contains `--rows` vectors of
+`--dims` dimensions, and each remaining table contains one scalar row.
+Create-from uses a named source with data distinct from main. The delete
+target owns a native fork for every table. Counts must be positive and these
+scenarios do not accept `--baseline`.
+
+Each repetition prepares a fresh fixture, measures one public operation, and
+verifies the resulting branch registry and pinned table views in separate
+processes. Operation time excludes graph open. Operation-process peak RSS
+includes runtime initialization and graph open, but excludes setup and final
+verification. Delete reports acknowledgement and completed reclamation
+separately. Compare identical parameters, builds, and machines; these JSONL
+records are diagnostic evidence and do not enter the durable archive.
+
+`fenced-adopt-all-new` measures an insertion-only merge into an unchanged
+target. `general-merge-updates --delta-rows 50 --source-mode update` measures
+updates into a diverged target; `--source-mode insert` selects new IDs instead.
+Their route counters report the classifier and write adapter actually used.
+Hold the delta fixed while changing `--rows` to measure scaling, and run
+`OMNIGRAPH_MERGE_LINEAGE=off`, `on`, and `verify` separately when comparing
+classification paths. Verify mode executes both paths and is not comparable
+to a single-path throughput sample.
+
 ## Layout
 
 - `cases/*.case-v1.yaml` assigns the fixture, workload, environment, and
