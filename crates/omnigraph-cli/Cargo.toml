@@ -22,7 +22,7 @@ omnigraph-server = { path = "../omnigraph-server", version = "0.10.0" }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util"] }
 reqwest = { workspace = true, features = ["blocking", "stream"] }

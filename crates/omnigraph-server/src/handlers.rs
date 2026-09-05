@@ -560,12 +560,12 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
     security(("bearer_token" = [])),
 )]
 #[deprecated(
-    note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat"
+    note = "use POST /query instead; /read is kept indefinitely with a byte-stable envelope"
 )]
 /// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
 ///
-/// Execute a GQ read query. Behavior is unchanged from prior releases; the
-/// route is kept indefinitely for byte-stable back-compat. New integrations
+/// Execute a GQ read query. The route is kept indefinitely with a byte-stable
+/// envelope; cell spelling follows the JSON writer. New integrations
 /// should target `POST /query`, which has clean field names (`query` /
 /// `name`) and a 400-on-mutation guard. Responses from this route include
 /// `Deprecation: true` and `Link: <query>; rel="successor-version"`
@@ -589,10 +589,11 @@ pub(crate) async fn server_read(
     .await?;
     Ok((
         deprecation_headers("<query>; rel=\"successor-version\""),
-        // `/read` has an indefinite byte-stable response contract. The
-        // canonical `/query` route exposes the additive graph-commit token;
-        // omitting it here preserves the legacy JSON body exactly.
-        Json(api::read_output(selected_name, &target, result, None).into()),
+        Json(
+            api::read_output(selected_name, &target, result, None)
+                .map_err(render_error)?
+                .into(),
+        ),
     ))
 }
 
@@ -636,12 +637,14 @@ pub(crate) async fn server_query(
         true, // /query is read-only; reject mutations
     )
     .await?;
-    Ok(Json(api::read_output(
-        selected_name,
-        &target,
-        result,
-        graph_commit_id,
-    )))
+    Ok(Json(
+        api::read_output(selected_name, &target, result, graph_commit_id).map_err(render_error)?,
+    ))
+}
+
+/// A result the JSON writer refuses to render answers 500 (RFC 0051), never 400.
+fn render_error(err: impl std::fmt::Display) -> ApiError {
+    ApiError::internal(err.to_string())
 }
 
 /// OpenAPI-only marker for an unstructured octet-stream response body.
@@ -1565,12 +1568,9 @@ async fn invoke_stored_query(
             true,
         )
         .await?;
-        Ok(Json(InvokeStoredQueryResponse::Read(api::read_output(
-            selected,
-            &target,
-            result,
-            graph_commit_id,
-        ))))
+        Ok(Json(InvokeStoredQueryResponse::Read(
+            api::read_output(selected, &target, result, graph_commit_id).map_err(render_error)?,
+        )))
     }
 }
 

@@ -885,7 +885,12 @@ impl GraphClient {
                 let (result, graph_commit_id) = db
                     .query_with_head(target.clone(), query_source, &selected_name, &params)
                     .await?;
-                Ok(read_output(selected_name, &target, result, graph_commit_id))
+                Ok(read_output(
+                    selected_name,
+                    &target,
+                    result,
+                    graph_commit_id,
+                )?)
             }
         }
     }

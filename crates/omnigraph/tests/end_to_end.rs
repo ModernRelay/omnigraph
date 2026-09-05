@@ -172,7 +172,10 @@ node Doc {
         .unwrap()
         .unwrap();
 
-    assert!(missing["embedding"].is_null());
+    assert!(
+        missing.get("embedding").is_none(),
+        "entity fetch omits a null cell's key (RFC 0051): {missing}"
+    );
     assert_eq!(present["embedding"], serde_json::json!([1.0, 2.0]));
 }
 
@@ -1045,7 +1048,7 @@ async fn blob_bearing_query_filters_without_projecting_blob() {
 
         assert_eq!(result.num_rows(), 1, "{query_name}");
 
-        let json = result.to_sdk_json();
+        let json = result.to_rust_json().unwrap();
         let row = json.as_array().unwrap().first().unwrap();
         assert_eq!(row["d.title"], "readme", "{query_name}");
         assert!(
@@ -1074,7 +1077,7 @@ async fn blob_null_does_not_break_non_blob_projection() {
     .unwrap();
 
     assert_eq!(result.num_rows(), 1);
-    let json = result.to_sdk_json();
+    let json = result.to_rust_json().unwrap();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "empty");
     assert!(
@@ -1110,7 +1113,7 @@ async fn blob_insert_mutation() {
     .await
     .unwrap();
     assert_eq!(qr.num_rows(), 1);
-    let json = qr.to_sdk_json();
+    let json = qr.to_rust_json().unwrap();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "new-doc");
     // Blob columns are not part of ordinary query projection.

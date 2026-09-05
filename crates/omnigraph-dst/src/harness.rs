@@ -6187,6 +6187,7 @@ pub fn run_universe_caught(
             .await
             .expect("query-digest read must succeed on a quiesced universe")
             .to_rust_json()
+            .expect("query-digest rows render as JSON")
             .to_string();
 
         // OCC invariant, per branch (cross-branch id reuse is legal — shared
