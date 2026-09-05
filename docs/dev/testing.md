@@ -153,6 +153,29 @@ Commit the generated file with the API change. CI checks drift; it never updates
 
 Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; the engine's deterministic benchmark contracts remain in `crates/omnigraph/tests/`.
 
+The three ignored topology diagnostics in
+[`branch_control_cost.rs`](../../crates/omnigraph/tests/branch_control_cost.rs)
+use 11 logical rows across four tables per branch and 16 same-row history
+commits. They compare leaf depth 2 versus 3 at fixed live width, modern versus
+legacy bare refs (including a repeated fork from the same source), and serial
+versus two in-flight merges into distinct targets:
+
+```bash
+LANCE_CPU_THREADS=2 LANCE_IO_THREADS=2 RAYON_NUM_THREADS=2 \
+  cargo test --workspace --locked --jobs 1 \
+  --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
+  --test branch_control_cost topology_diagnostics:: -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Expect three passed tests and 18 `TOPOLOGY_DIAGNOSTIC_JSON` records: two
+variants with three fresh fixtures each per test. Each record follows exact
+row, pin, lineage and native-ref verification. These debug-profile timings are
+supplemental diagnostics, kept separate from release benchmark results; the
+current-thread runtime permits overlapping operation lifetimes, not two CPU
+workers. Record matching source, binary, profile and runtime settings for
+comparisons.
+
 The current runner executes the narrow, fail-closed local envelope documented
 in `crates/omnigraph-bench/README.md`. It requires a release binary, restores
 every repetition at the fixture's stable path from a never-opened APFS
