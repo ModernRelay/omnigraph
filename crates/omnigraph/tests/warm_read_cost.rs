@@ -326,7 +326,11 @@ async fn native_branch_controls_use_one_post_gate_manifest_capture() {
         Box::pin(assert_non_bound_branch_control_cost(&db, &mut writer)).await;
         Box::pin(assert_branch_control_source_incarnation(&db, &mut writer)).await;
         #[cfg(feature = "failpoints")]
-        Box::pin(assert_cached_borrower_blocks_branch_delete(&db, &mut writer)).await;
+        Box::pin(assert_cached_borrower_blocks_branch_delete(
+            &db,
+            &mut writer,
+        ))
+        .await;
     })
     .await;
 }
@@ -550,8 +554,7 @@ async fn assert_cached_borrower_blocks_branch_delete(db: &Omnigraph, writer: &mu
     let refs_before = manifest.list_branches().await.unwrap();
     let borrower_native = helpers::graph_native_ref(db.uri(), "binding_check").await;
     assert_eq!(
-        refs_before[&borrower_native].parent_branch,
-        None,
+        refs_before[&borrower_native].parent_branch, None,
         "borrower must not be a native descendant of the delete target"
     );
     let source = db.snapshot_of("feature").await.unwrap();
@@ -563,7 +566,8 @@ async fn assert_cached_borrower_blocks_branch_delete(db: &Omnigraph, writer: &mu
         "legacy sibling must retain the target's exact table ref"
     );
     assert_eq!(
-        borrowed_entry.published_dataset_version, source_entry.published_dataset_version
+        borrowed_entry.published_dataset_version,
+        source_entry.published_dataset_version
     );
     assert!(source_entry.native_dataset_branch.is_some());
 
@@ -589,11 +593,17 @@ async fn assert_cached_borrower_blocks_branch_delete(db: &Omnigraph, writer: &mu
     let (deleted, io) = measure(db.branch_delete("feature")).await;
     let error = deleted.unwrap_err();
     assert!(
-        error.to_string().contains("because branch 'binding_check' still depends on it"),
+        error
+            .to_string()
+            .contains("because branch 'binding_check' still depends on it"),
         "must refuse at the table-borrower proof, not native ancestry: {error}"
     );
     assert_eq!(
-        (io.internal_open_count, io.manifest_scan_count, io.version_probes),
+        (
+            io.internal_open_count,
+            io.manifest_scan_count,
+            io.version_probes
+        ),
         (2, 2, 1),
         "only target capture and cold-main proof may scan; the bound borrower \
          must refuse from its freshly verified cache, before the delete classifier"
@@ -612,8 +622,16 @@ async fn assert_cached_borrower_blocks_branch_delete(db: &Omnigraph, writer: &mu
     );
     for (branch, (version, head, pins, rows)) in before {
         let snapshot = db.snapshot_of(branch).await.unwrap();
-        assert_eq!(snapshot.graph_manifest_version(), version, "{branch} version moved");
-        assert_eq!(db.resolve_snapshot(branch).await.unwrap(), head, "{branch} head moved");
+        assert_eq!(
+            snapshot.graph_manifest_version(),
+            version,
+            "{branch} version moved"
+        );
+        assert_eq!(
+            db.resolve_snapshot(branch).await.unwrap(),
+            head,
+            "{branch} head moved"
+        );
         let mut entries = snapshot.datasets().collect::<Vec<_>>();
         entries.sort_by(|a, b| a.type_key.cmp(&b.type_key));
         assert_eq!(format!("{entries:?}"), pins, "{branch} pins moved");
