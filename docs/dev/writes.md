@@ -55,6 +55,23 @@ drops it. Commit IDs and timestamps are minted for the captured branch without
 reloading manifest history. The existing schema and branch gates still serialize
 conflicting control operations.
 
+Native branch creation uses an operation-local capture of the bound coordinator
+or that same one-entry cache after the control gates and recovery checks. Reuse
+requires a fresh match of the complete manifest incarnation, including the
+native branch lifetime; a stale or missing view takes the existing refresh/open
+path. Captures share immutable lineage and the Lance session, copy current
+table state, and leave the handle's active branch unchanged.
+
+After a content publication, the publisher returns the projection it already
+folded from the successful attempt's freshly read base. The coordinator retains
+it only when that exact base matches its previously coherent view and its graph
+cache has adopted the published lineage. A foreign advance, unsupported base,
+or failure before lineage adoption leaves the full-refresh fallback armed.
+Registration replacement, rename, tombstone, and same-version physical-owner
+handoff use the existing complete fold. This is disposable process memory;
+`__manifest` remains the only durable graph authority. Publication still scans
+history for collision, expected-version, and lineage validation.
+
 Finalization acquires the root-shared gate order:
 
 1. schema;
@@ -153,6 +170,12 @@ pre-existing ref could have a different fork point and cannot become this
 attempt's recovery effect. It returns a conflict naming cleanup as the remedy.
 This liveness view is
 derived under the control gates and is not persisted as another authority.
+Deletion derives native refs and descendants from one registry listing. It
+reuses already loaded borrower snapshots only when their native ref matches
+that listing and their manifest incarnation matches a fresh probe; other
+branches use the bounded manifest-only proof. Unreadable candidates still
+prevent deletion. This reduces repeated work under the existing gates without
+changing their scope.
 
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, pointer, or recovery effect belongs to the

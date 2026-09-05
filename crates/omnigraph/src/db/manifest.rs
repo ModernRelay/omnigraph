@@ -116,6 +116,9 @@ pub(crate) struct CommitOutcome {
     /// no lineage was recorded or the commit is the genesis. Lets the caller
     /// update its in-memory commit cache without re-reading the manifest.
     pub parent_commit_id: Option<String>,
+    /// Installed only after the graph coordinator has adopted its lineage.
+    /// Absent if the successful publisher attempt had a different base.
+    projection: Option<ProjectionAccumulator>,
 }
 
 /// The on-disk internal-schema stamp of `__manifest` at `branch` (main when
@@ -923,8 +926,8 @@ pub(crate) struct ManifestCoordinator {
     /// O(history). The tag is the staleness fence: a path that advances
     /// `dataset` without folding must clear this, and a missed clear is
     /// caught by the tag mismatch — stale accumulators degrade to a full
-    /// scan, never serve as current. One extra lineage-row copy beside the
-    /// commit graph's; the maps are O(tables + branches).
+    /// scan, never serve as current. Lineage remains owned by the commit graph;
+    /// these maps are O(table lifetimes + branches), including retired tables.
     projection: Option<(u64, ProjectionAccumulator)>,
 }
 
@@ -1471,7 +1474,7 @@ impl ManifestCoordinator {
             return Ok(None);
         }
 
-        // Exception safety: fold a compact O(tables + branches) clone and
+        // Exception safety: fold an O(table lifetimes + branches) clone and
         // install only after every row classification succeeds.
         let mut folded = projection.clone();
         for (fragment, offsets) in &dead_head_rows {
@@ -1671,6 +1674,7 @@ impl ManifestCoordinator {
             return Ok(CommitOutcome {
                 version: self.version(),
                 parent_commit_id: None,
+                projection: None,
             });
         }
 
@@ -1678,23 +1682,42 @@ impl ManifestCoordinator {
             dataset,
             parent_commit_id,
             known_state,
+            base_incarnation,
+            projection,
         } = self
             .publisher
             .publish_with_precondition(changes, expected_table_versions, lineage, precondition)
             .await?;
+        let retain_projection = self.projection.as_ref().is_some_and(|(version, _)| {
+            *version == self.version()
+                && base_incarnation.as_ref().is_some_and(|base| {
+                    base.matches(&self.incarnation())
+                        && (dataset.version().version == base.version
+                            || base.version.checked_add(1) == Some(dataset.version().version))
+                })
+        });
         // RFC-013 PR2 #1b: the publisher folded the new visible state in-memory
         // (byte-identical to a re-scan via the shared `assemble_manifest_state`),
         // so adopt it directly instead of an O(fragments) `read_manifest_state`.
         self.dataset = dataset;
         self.known_state = known_state;
-        // The projection accumulators do not ride this fold — cleared so a
-        // later incremental refresh cannot serve the pre-publish lineage as
-        // "unchanged" (the staleness fence on the `projection` field).
+        // Until the caller has adopted the committed lineage, refresh must
+        // still rebuild it. This also covers failures after durable publication
+        // and compatibility callers that do not maintain a graph cache.
         self.projection = None;
         Ok(CommitOutcome {
             version: self.version(),
             parent_commit_id,
+            projection: if retain_projection { projection } else { None },
         })
+    }
+
+    /// Complete the in-memory handoff after the caller updated its graph cache.
+    /// An intervening foreign publish keeps the existing full-refresh path.
+    pub(crate) fn acknowledge_published_lineage(&mut self, outcome: &mut CommitOutcome) {
+        if outcome.version == self.version() {
+            self.projection = outcome.projection.take().map(|p| (outcome.version, p));
+        }
     }
 
     /// Project the graph-lineage rows out of `__manifest` at `branch` without an

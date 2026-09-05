@@ -151,6 +151,15 @@ history. `optimize` can reduce fragment overhead but does not make journal
 decoding independent of retained history. The decoder reduces one Arrow batch
 at a time rather than retaining the complete batch collection.
 
+Successful local publication preserves the existing coherent projection after
+lineage adoption, avoiding a full reconstruction on the next unchanged refresh.
+The publisher still reads historical records needed for its validation; its
+fold consumes those maps instead of copying them. Cold opens and publication
+therefore remain sensitive to retained history. See
+[captured authority](writes.md#captured-authority) for the freshness and fallback
+rules, and the small cache/layout controls in the
+[benchmark guide](../../benchmarks/README.md) to separate these costs.
+
 ## Diagnosing a slow merge
 
 `MergeWriteProbes` is a task-local test and benchmark seam; production leaves
