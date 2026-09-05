@@ -40,6 +40,16 @@ it with a `table version … already exists` error.
 - **Merged**: both branches changed, so OmniGraph performs a three-way,
   entity-level merge and creates a commit with two parents.
 
+When a target already owns a table history, merges keep writing that history.
+A child that inherited an older table snapshot keeps reading its original
+values through a parent merge, later parent writes, and cleanup.
+
+If an older build already detached a table history that a child still uses,
+a write can report `detached native lineage`. Create a replacement branch from
+the affected branch and continue writes there. Existing children retain their
+original snapshots; retrying the same write on the affected branch cannot
+repair its detached history.
+
 The source branch is unchanged by the merge. Use `--delete-branch` for the
 normal review-branch lifecycle:
 
@@ -110,8 +120,9 @@ type's declared identity:
 
 `OMNIGRAPH_MERGE_LINEAGE` selects how a branch merge finds what changed. `on`
 (the release default) discovers candidates from Lance version metadata —
-fragment lists and deletion files — and reads only the changed data, so merge
-cost tracks the delta size instead of the dataset size; a fail-closed
+fragment lists and deletion files — and compares candidate rows. Known deleted
+row positions use bounded direct reads. Candidate filtering may still scan data
+when an applicable index is absent; a fail-closed
 precondition gate falls back to the full three-way scan whenever any
 assumption cannot be proven (Blob-bearing schema, differing schemas or storage
 paths across the pins, version pins not matching the manifest entries, missing
@@ -123,6 +134,10 @@ scan's result, and fails the merge loudly on any divergence (the debug-build
 default, used for validation; it costs both paths). A merge that succeeds
 produces the same result in every mode; only cost differs. An unrecognized
 value logs a warning and behaves as `off`.
+
+If merge reports an unowned target ref and asks for cleanup, it has refused
+before creating recovery state. Run the supported cleanup operation, then retry
+the merge. Cleanup preserves refs still used by another branch or pending write.
 
 ## After a large merge
 

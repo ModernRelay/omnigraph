@@ -26,6 +26,7 @@ use helpers::cost::{
     IoCounts, assert_flat, assert_grows, cost_harness, local_graph, measure, measure_with_staged,
 };
 use helpers::{MUTATION_QUERIES, commit_many, mixed_params};
+use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 
 /// Run an async test body on a thread with a large stack. The debug merge future
 /// is deep enough to overflow the default test-thread stack under the cost
@@ -85,7 +86,12 @@ fn merge_validation_is_delta_scoped() {
         .unwrap();
 
         // Measure the merge.
-        let (res, io, staged) = measure_with_staged(db.branch_merge("feature", "main")).await;
+        let insert_probes = MergeWriteProbes::default();
+        let (res, io, staged) = measure_with_staged(with_merge_write_probes(
+            insert_probes.clone(),
+            db.branch_merge("feature", "main"),
+        ))
+        .await;
         res.unwrap();
 
         eprintln!(
@@ -100,7 +106,8 @@ fn merge_validation_is_delta_scoped() {
         eprintln!(
             "MERGE    1-Person-row delta   : data_open_count={} internal_open_count={} \
              manifest_scan_count={} data_reads={} manifest_reads={} \
-             [stage_append={} stage_merge_insert={} stage_fenced_insert={} stage_vector_index={}]",
+             [stage_append={} stage_merge_insert={} stage_fenced_insert={} stage_vector_index={}] \
+             proven_history_reads={}",
             io.data_open_count,
             io.internal_open_count,
             io.manifest_scan_count,
@@ -110,6 +117,12 @@ fn merge_validation_is_delta_scoped() {
             staged.stage_merge_insert,
             staged.stage_fenced_insert,
             staged.stage_vector_index,
+            insert_probes.proven_insert_history_read_calls(),
+        );
+
+        assert!(
+            (1..=1024).contains(&insert_probes.proven_insert_history_read_calls()),
+            "pure-insert history must use the bounded transaction-only reader"
         );
 
         // The proof: only Person changed, so the merge opens only Person-related
@@ -160,17 +173,143 @@ fn merge_validation_is_delta_scoped() {
         )
         .await
         .unwrap();
-        let (res, three_way_io, three_way_staged) =
-            measure_with_staged(db.branch_merge("scalar-three-way", "main")).await;
+        db.mutate(
+            "scalar-three-way",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "ctrl")], &[("$age", 31)]),
+        )
+        .await
+        .unwrap();
+        let probes = MergeWriteProbes::default();
+        let (res, three_way_io) = measure(with_merge_write_probes(
+            probes.clone(),
+            db.branch_merge("scalar-three-way", "main"),
+        ))
+        .await;
         res.unwrap();
+        assert_eq!(probes.stage_fenced_insert_calls(), 1);
+        assert_eq!(probes.stage_fenced_insert_rows(), 1);
+        assert_eq!(probes.stage_known_present_update_calls(), 1);
+        assert_eq!(probes.stage_known_present_update_rows(), 1);
         assert_eq!(
-            three_way_staged.ordered_cursor_scan, 3,
-            "a scalar three-way merge must scan base/source/target once each, not repeat them for Blob selection"
+            probes.stage_merge_insert_calls(),
+            0,
+            "general merge must preserve insertion/update presence instead of staging upserts"
+        );
+        let walks = probes.completed_full_walk_classification_calls();
+        let lineage = probes.completed_lineage_classification_calls();
+        assert!(
+            (1..=2).contains(&(walks + lineage)),
+            "one table must complete classification"
+        );
+        assert!(walks <= 1 && lineage <= 1, "each classifier may run once");
+        assert_eq!(
+            probes.ordered_cursor_scan_calls(),
+            3 * walks,
+            "only the full-walk classifier opens three full cursors; Blob selection must not repeat them"
         );
         eprintln!(
-            "MERGE    scalar three-way      : data_reads={} ordered_cursors={}",
-            three_way_io.data_reads, three_way_staged.ordered_cursor_scan,
+            "MERGE    scalar three-way      : data_reads={} ordered_cursors={} full_walks={} lineage={}",
+            three_way_io.data_reads,
+            probes.ordered_cursor_scan_calls(),
+            walks,
+            lineage,
         );
+
+        // One deletion inside a shared fragment must fetch only its known
+        // base-live offset. Grow that fragment with a fixed one-row delta;
+        // default debug Verify checks both classifiers against the same pins.
+        for rows in [32, 1024] {
+            let prefix = format!("dv-{rows}");
+            let jsonl = (0..rows).map(|i| format!(
+                "{{\"type\":\"Person\",\"data\":{{\"name\":\"{prefix}-{i}\",\"age\":20}}}}\n"
+            )).collect::<String>();
+            db.load("main", &jsonl, omnigraph::loader::LoadMode::Append)
+                .await
+                .unwrap();
+            db.branch_create(&prefix).await.unwrap();
+            let deleted_name = format!("{prefix}-0");
+            db.mutate(
+                &prefix,
+                MUTATION_QUERIES,
+                "remove_person",
+                &mixed_params(&[("$name", &deleted_name)], &[]),
+            )
+            .await
+            .unwrap();
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", &format!("{prefix}-target"))], &[("$age", 42)]),
+            )
+            .await
+            .unwrap();
+            let deletion = MergeWriteProbes::default();
+            let (result, deletion_io) = measure(with_merge_write_probes(
+                deletion.clone(),
+                db.branch_merge(&prefix, "main"),
+            ))
+            .await;
+            eprintln!(
+                "MERGE    shared-fragment delete: fragment_rows={rows} data_reads={} manifest_reads={} full_walks={} lineage={} candidate_scan_rows={} address_take_calls={} address_take_rows={} address_take_max_rows={}",
+                deletion_io.data_reads,
+                deletion_io.manifest_reads,
+                deletion.completed_full_walk_classification_calls(),
+                deletion.completed_lineage_classification_calls(),
+                deletion.lineage_candidate_scan_rows(),
+                deletion.lineage_candidate_address_take_calls(),
+                deletion.lineage_candidate_address_take_rows(),
+                deletion.lineage_candidate_address_take_max_rows(),
+            );
+            assert_eq!(result.unwrap(), omnigraph::db::MergeOutcome::Merged);
+            if std::env::var("OMNIGRAPH_MERGE_LINEAGE").as_deref() != Ok("off") {
+                assert_eq!(
+                    deletion.completed_lineage_classification_calls(),
+                    1,
+                    "the eligible deletion fixture must exercise lineage discovery, not silently fall back"
+                );
+            }
+            if deletion.completed_lineage_classification_calls() != 0 {
+                assert_eq!(deletion.lineage_candidate_address_take_calls(), 1);
+                assert_eq!(deletion.lineage_candidate_address_take_rows(), 1);
+                assert_eq!(deletion.lineage_candidate_address_take_max_rows(), 1);
+                assert_eq!(
+                    deletion.lineage_candidate_scan_rows(),
+                    1,
+                    "only the target's new one-row fragment may be scanned, not the {rows}-row deletion fragment"
+                );
+            } else {
+                assert_eq!(deletion.completed_full_walk_classification_calls(), 1);
+            }
+            let snapshot = db
+                .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+                .await
+                .unwrap();
+            let table = snapshot.open_dataset("node:Person").await.unwrap();
+            assert_eq!(
+                table
+                    .count_rows(Some(format!("name = '{deleted_name}'")))
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                table
+                    .count_rows(Some(format!("name = '{prefix}-1'")))
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                table
+                    .count_rows(Some(format!("name = '{prefix}-target'")))
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
     });
 }
 

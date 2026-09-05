@@ -30,12 +30,17 @@ The table classifier chooses one of four routes:
 3. **Proven insertion replay:** target still permits data replay and the
    complete retained source interval proves a contiguous sequence of exact-ID,
    insertion-only transactions.
-4. **General ordered merge:** stream base/source/target in logical `id` order,
-   classify each row, and stage the selected delta.
+4. **General merge:** compare base/source/target through proven lineage
+   candidates or an ordered full walk, and stage the selected delta.
 
 An optimization miss is not a merge failure. Missing transaction history,
-unknown certificate fields, incomplete ancestry, or an unfamiliar Lance shape
+unknown certificate fields, or an unfamiliar Lance shape
 falls back to the general route.
+
+A named target that already owns a table ref keeps that write lineage, even
+when the source has a greater numeric version. Lazy children can still pin
+older versions of the owned ref. Detaching it would make later first-touch
+reclamation unsafe. An empty delta keeps the complete target entry.
 
 ## Proven insertion route
 
@@ -51,12 +56,25 @@ interval is present and structurally proves:
 - physical-row totals matching the manifest delta;
 - exact source and target native branch incarnations under the final gates.
 
+History proof reads transaction records directly with an ordered window of
+eight reads and a 1,024-version limit; it does not open a Dataset for every
+historical version. Missing or unprovable history falls back.
+
 The route stages bounded immutable fragments, then commits the same certified
 filter-bearing Update shape. It performs no target MergeInsert join or target
 ID preflight. The marker is not a signature and raw Lance writers remain
 unsupported. RFC 0023 owns the detailed proof and performance evidence.
 
 ## General route
+
+`OMNIGRAPH_MERGE_LINEAGE=on` (the release default) derives candidate IDs from
+compatible pinned fragment and deletion metadata. Deletion differences remain
+compressed until bounded offset chunks are needed; known positions use direct
+reads against the pinned before-image. The 32 MiB candidate budget is checked
+before keys are copied. Candidate row filters may still scan data when a
+usable ID index is absent. A proof or budget miss falls back to the ordered
+walk. `off` uses that walk directly; `verify` executes both classifiers and
+compares their results.
 
 The fallback is an ordered three-way cursor merge. Each cursor streams one
 snapshot's rows in `id` order in two phases so no payload column ever reaches
@@ -75,7 +93,8 @@ a SortExec input:
   wider than the ceiling still hydrates alone;
 - Blob columns hydrate as descriptors; Blob-bearing rows are materialized
   under the same operation budget;
-- all selected constructive rows stage as upserts and removals as deletes;
+- selected new IDs stage as strict inserts, existing IDs as known-present
+  updates, and removals as deletes;
 - the transaction plan is pre-minted and bounded before recovery arm;
 - selected validation deltas share one operation-wide memory budget.
 
@@ -94,11 +113,10 @@ versions, and `C` the bounded publish chunks.
 | Pointer adoption | Metadata-only when no validation delta is needed; otherwise the delta may require base/source ordered scans | Native-ref or manifest-pointer change; no row copy |
 | Proven insertion replay | Walk `K <= 1,024` transaction records and scan only the certified source interval | `C <= 1,024` join-free fenced inserts; no target ID preflight or MergeInsert join |
 | Adopt with delta | At least two full ordered scans, base and source | New rows use preflighted fenced inserts; changed rows use update-only `KnownPresentUpdate`; deletes are chunked |
-| General three-way | At least three full ordered scans, base, source, and target | Constructive rows use insertion-capable upsert; deletes are chunked |
+| General three-way | Lineage candidate discovery and filtered reads when proven; otherwise at least three full ordered scans | New rows use preflighted fenced inserts; existing rows use `KnownPresentUpdate`; deletes are chunked |
 
-Insertion-capable upsert forces Lance's v2 path (`use_index(false)`) so the
-transaction carries the exact-`id` conflict filter. Each constructive chunk
-may therefore join the full target. `KnownPresentUpdate` can use an `id` index
+Strict insertion keeps Lance's index-disabled, filter-bearing path so the
+transaction carries the exact-`id` conflict proof. `KnownPresentUpdate` can use an `id` index
 when its coverage is safe, falls back to the full join otherwise, and never
 inserts.
 
@@ -129,8 +147,9 @@ defer index construction to reconciliation.
 
 Cost tests cap common fast-forward manifest opens/scans at three and diverged
 merges at four. Each scan still folds the surviving append-only `__manifest`
-history, so tiny merges can slow down on an uncompacted graph; `optimize` is
-the operational remedy.
+history. `optimize` can reduce fragment overhead but does not make journal
+decoding independent of retained history. The decoder reduces one Arrow batch
+at a time rather than retaining the complete batch collection.
 
 ## Diagnosing a slow merge
 
@@ -144,7 +163,7 @@ it unset, so timing does not read the clock. Its top-level timing flow is:
 
 The parenthesized classification routes are chosen per table, so a mixed-table
 operation can record both route families. `TableWalk` covers one general
-three-way ordered walk and merged-row staging; for Blob tables it begins after
+classifier (lineage candidates or ordered fallback) and delta staging; for Blob tables it begins after
 the operation-wide descriptor preflight. `KeyedStage` and `KeyedCommit` are
 sub-buckets of `PhysicalPublish`.
 `merge_timing_snapshot` reports total, maximum, and exact interval count for
@@ -159,10 +178,13 @@ below correspond to
 |---|---:|---:|---:|---:|---:|
 | Proven insertion replay | `0` | `C` | `0` | `0` | `0` |
 | Adopt with delta | at least `2` | insert chunks | changed-row chunks | `0` | insert chunks |
-| General three-way | at least `3` | `0` | `0` | constructive-row chunks | `0` |
+| General three-way | `0` for lineage candidates; at least `3` for ordered fallback | insert chunks | updated-row chunks | `0` | insert chunks |
 
 Blob descriptor selection can add cursor passes, so the fallback counts are
-lower bounds. Other useful signals are:
+lower bounds. Debug verification runs both classifiers; use the completed
+classifier counters to distinguish it from either single route. Candidate
+scan-row, exact-address-take, and provenance-read counters expose work that
+ordered-cursor counts do not measure. Other useful signals are:
 
 - high `ProvenInsertHistory` means the retained transaction walk dominates;
 - high `ProvenInsertPlanScan` means scanning or materializing the certified

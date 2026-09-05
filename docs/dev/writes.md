@@ -43,6 +43,13 @@ schema/catalog, target graph branch, optional graph head, native branch
 identity, table-incarnation identities, and expected table versions. Every
 planning and validation step uses that view.
 
+Branch merge also uses the captured target for physical table opens and
+publication. It never changes the `Omnigraph` handle's active branch while the
+merge runs. Publication reuses the active coordinator only when its branch
+identity, graph head, and manifest version match the captured transaction;
+otherwise it opens the target coordinator from durable state. The existing
+schema and branch gates still serialize conflicting control operations.
+
 Finalization acquires the root-shared gate order:
 
 1. schema;
@@ -131,6 +138,16 @@ inside the protected effect window. Recovery may delete only a ref or dataset
 whose exact creation it owns. Table forks are named by the branch's native ref;
 sidecar table pins carry that native name while the sidecar's `branch` stays
 logical.
+
+Reclamation checks the current table pins of every live graph branch, not just
+the fork's original owner. A detached native ref can still hold a child's
+accepted snapshot. Cleanup and recovery retain such refs, and a first-touch
+writer refuses to recreate them before arming recovery. A first-touch merge
+also requires its target native ref to be absent before arming: an unregistered
+pre-existing ref could have a different fork point and cannot become this
+attempt's recovery effect. It returns a conflict naming cleanup as the remedy.
+This liveness view is
+derived under the control gates and is not persisted as another authority.
 
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, pointer, or recovery effect belongs to the

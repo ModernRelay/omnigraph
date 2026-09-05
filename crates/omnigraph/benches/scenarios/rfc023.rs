@@ -31,7 +31,7 @@ use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, SnapshotDataset};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, Snapshot, SnapshotDataset};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use sha2::{Digest as _, Sha256};
@@ -430,11 +430,11 @@ pub(super) async fn fenced_small_upsert(args: &Args) -> serde_json::Value {
     })
 }
 
-fn graph_schema(dims: usize) -> String {
+pub(super) fn graph_schema(dims: usize) -> String {
     format!("node Chunk {{\n  slug: String @key\n  embedding: Vector({dims})\n}}\n")
 }
 
-fn vector_json_patterns(dims: usize, seed: u64) -> Vec<String> {
+pub(super) fn vector_json_patterns(dims: usize, seed: u64) -> Vec<String> {
     (0..16)
         .map(|pattern| {
             let id = format!("benchmark-vector-pattern-{pattern}");
@@ -467,7 +467,7 @@ fn graph_jsonl_chunk(prefix: &str, start: usize, end: usize, vector_patterns: &[
     jsonl
 }
 
-async fn load_graph_rows(
+pub(super) async fn load_graph_rows(
     db: &Omnigraph,
     branch: &str,
     prefix: &str,
@@ -528,6 +528,19 @@ fn only_node_table_uri(root: &std::path::Path) -> String {
         .to_str()
         .expect("UTF-8 benchmark table URI")
         .to_string()
+}
+
+/// Physical checks intentionally read HEAD, using the exact ref captured in
+/// graph metadata. Logical names are not native refs after branch recreation.
+fn source_head_builder(graph_uri: &str, snapshot: &Snapshot) -> DatasetBuilder {
+    let entry = snapshot
+        .dataset("node:Chunk")
+        .expect("source table metadata");
+    let builder = DatasetBuilder::from_uri(format!("{graph_uri}/{}", entry.dataset_path));
+    match entry.native_dataset_branch.as_deref() {
+        Some(native_ref) => builder.with_branch(native_ref, None),
+        None => builder,
+    }
 }
 
 fn adopt_fixture_root(args: &Args) -> &std::path::Path {
@@ -642,8 +655,7 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
             .expect("count prepared physical main rows"),
         args.rows
     );
-    let physical_source = DatasetBuilder::from_uri(&table_uri)
-        .with_branch("adopt-source", None)
+    let physical_source = source_head_builder(uri, &source_snapshot)
         .load()
         .await
         .expect("open prepared physical source table");
@@ -716,6 +728,7 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
 async fn direct_lance_append_baseline(
     args: &Args,
     table_uri: &str,
+    source_builder: DatasetBuilder,
     source_plan: &rfc023_limits::ChunkPlan,
     operation_open_ms: u64,
     operation_pre_peak_rss_bytes: u64,
@@ -728,9 +741,8 @@ async fn direct_lance_append_baseline(
             .load()
             .await
             .expect("open prepared physical main dataset");
-        let source_table = DatasetBuilder::from_uri(table_uri)
+        let source_table = source_builder
             .with_session(main_table.session())
-            .with_branch("adopt-source", None)
             .load()
             .await
             .expect("open prepared physical source branch");
@@ -859,8 +871,15 @@ pub(super) async fn fenced_adopt_operation(args: &Args) -> serde_json::Value {
     let db = Omnigraph::open(uri)
         .await
         .expect("fresh-open phased RFC-023 benchmark fixture");
-    let operation_open_ms = open_start.elapsed().as_millis() as u64;
     let table_uri = only_node_table_uri(root);
+    // Both arms resolve physical source identity before the timer/HWM boundary.
+    // This is preparation, not a final-state verification scan.
+    let source_snapshot = db
+        .snapshot_of(ReadTarget::branch("adopt-source"))
+        .await
+        .expect("resolve prepared source ref");
+    let source_builder = source_head_builder(uri, &source_snapshot);
+    let operation_open_ms = open_start.elapsed().as_millis() as u64;
     let source_plan = adopt_source_plan(args);
     let operation_pre_peak_rss_bytes = super::current_process_peak_rss_bytes();
 
@@ -870,6 +889,7 @@ pub(super) async fn fenced_adopt_operation(args: &Args) -> serde_json::Value {
         let metrics = direct_lance_append_baseline(
             args,
             &table_uri,
+            source_builder,
             &source_plan,
             operation_open_ms,
             operation_pre_peak_rss_bytes,
@@ -1309,8 +1329,7 @@ pub(super) async fn fenced_adopt_verify(args: &Args) -> serde_json::Value {
         .load()
         .await
         .expect("open physical main after measured operation");
-    let physical_source = DatasetBuilder::from_uri(&table_uri)
-        .with_branch("adopt-source", None)
+    let physical_source = source_head_builder(uri, &source_snapshot)
         .load()
         .await
         .expect("open physical source after measured operation");
@@ -1684,15 +1703,28 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
     );
     let ordered_cursor_scan_calls = probes.ordered_cursor_scan_calls();
     let fenced_insert_calls = probes.stage_fenced_insert_calls();
+    let full_walk_classifications = probes.completed_full_walk_classification_calls();
+    let lineage_classifications = probes.completed_lineage_classification_calls();
+    let classifier_route = match (full_walk_classifications > 0, lineage_classifications > 0) {
+        (true, true) => "full-walk-and-lineage",
+        (true, false) => "full-walk",
+        (false, true) => "lineage",
+        (false, false) => "no-general-classifier",
+    };
     // `update` mode must be on the general route — that is the whole point.
     // `insert` mode deliberately asserts nothing about the route: it exists to
     // DISCOVER whether the proven adopt shortcut survives a moved target, so
     // the route is recorded as a result rather than pinned as a precondition.
     if args.source_mode == "update" {
         assert!(
-            ordered_cursor_scan_calls > 0,
-            "update-mode run did not enter the ordered diff — it took a shortcut path \
-             and is not measuring the route issue #384 reports"
+            full_walk_classifications + lineage_classifications > 0,
+            "update-mode run must complete a three-way classifier"
+        );
+        assert_eq!(fenced_insert_calls, 0, "update-only workload inserted rows");
+        assert_eq!(
+            probes.stage_merge_insert_rows() + probes.stage_known_present_update_rows(),
+            args.delta_rows as u64,
+            "every selected source update must be written once"
         );
         assert_eq!(
             probes.strict_insert_preflight_calls(),
@@ -1700,11 +1732,21 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
             "an update-only delta must not preflight strict inserts"
         );
     }
-    let took_proven_shortcut = fenced_insert_calls > 0 && ordered_cursor_scan_calls == 0;
+    let took_proven_shortcut =
+        fenced_insert_calls > 0 && full_walk_classifications == 0 && lineage_classifications == 0;
 
     serde_json::json!({
         "routing": "production-omnigraph-branch-merge-diverged-target",
         "source_mode": args.source_mode,
+        "classifier_route": classifier_route,
+        "probe_completed_full_walk_classifications": full_walk_classifications,
+        "probe_completed_lineage_classifications": lineage_classifications,
+        "probe_lineage_candidate_scan_rows": probes.lineage_candidate_scan_rows(),
+        "probe_lineage_candidate_address_take_calls": probes.lineage_candidate_address_take_calls(),
+        "probe_lineage_candidate_address_take_rows": probes.lineage_candidate_address_take_rows(),
+        "probe_proven_insert_history_read_calls": probes.proven_insert_history_read_calls(),
+        "probe_stage_known_present_update_calls": probes.stage_known_present_update_calls(),
+        "probe_stage_known_present_update_rows": probes.stage_known_present_update_rows(),
         "took_proven_shortcut": took_proven_shortcut,
         "measurement_boundary": "operation_wall_ms starts after the common fresh Omnigraph::open and covers Omnigraph::branch_merge; no post-op scan",
         "production_path": true,

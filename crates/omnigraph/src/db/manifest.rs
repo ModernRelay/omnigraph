@@ -197,6 +197,31 @@ pub struct Snapshot {
     read_caches: Option<Arc<crate::runtime_cache::ReadCaches>>,
 }
 
+/// Ephemeral native-table liveness proof derived from every live graph branch.
+/// Never persist or reuse this across the control-gate envelope that captured it.
+pub(crate) struct NativeForkReferences {
+    referenced: HashSet<(TableIdentity, String)>,
+    owned: HashSet<(TableIdentity, String)>,
+}
+
+impl NativeForkReferences {
+    pub(crate) fn contains(&self, identity: TableIdentity, native: &str) -> bool {
+        self.referenced.contains(&(identity, native.to_string()))
+    }
+
+    pub(crate) fn owner_contains(&self, identity: TableIdentity, native: &str) -> bool {
+        self.owned.contains(&(identity, native.to_string()))
+    }
+}
+
+pub(crate) fn detached_native_lineage_error(table_key: &str, native: &str) -> OmniError {
+    OmniError::manifest(format!(
+        "table '{table_key}' has detached native lineage '{native}' still pinned by another graph branch; \
+         writing would destroy that branch's history. Create a new branch from this branch's current \
+         snapshot and write there"
+    ))
+}
+
 /// Read-only view of one backing dataset pinned by a [`Snapshot`].
 ///
 /// The underlying Lance [`Dataset`] is deliberately private: a snapshot dataset
@@ -1133,8 +1158,8 @@ impl ManifestCoordinator {
     ) -> Result<(Self, Vec<GraphLineageRow>)> {
         // Boxed wholesale for the same stack-depth reason as
         // `refresh_with_lineage`: this body now builds the projection
-        // accumulators and is awaited inside the merge future via
-        // coordinator swaps.
+        // accumulators and is awaited inside merge authority capture and
+        // publication.
         Box::pin(Self::open_with_lineage_inner(
             root_uri,
             branch,
@@ -1204,16 +1229,79 @@ impl ManifestCoordinator {
         delete_target_native: &str,
         control_session: &Arc<lance::session::Session>,
     ) -> Result<bool> {
+        let snapshot =
+            Self::snapshot_native_under_control_gates(root_uri, candidate_native, control_session)
+                .await?;
+        Ok(snapshot
+            .datasets()
+            .any(|entry| entry.native_dataset_branch.as_deref() == Some(delete_target_native)))
+    }
+
+    /// Read one exact native manifest ref for a control-plane liveness proof.
+    /// The caller must hold the schema-control gate (and the target's ordinary
+    /// branch/table gates before destroying it), or full recovery quiescence.
+    /// Native refs must come from a listing in that same envelope. This does
+    /// not capture a BranchIdentifier and must not serve general reads or OCC.
+    pub(crate) async fn snapshot_native_under_control_gates(
+        root_uri: &str,
+        candidate_native: Option<&str>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<Snapshot> {
         let root = root_uri.trim_end_matches('/');
         // The caller resolved every candidate from one listing; open the
         // native ref directly rather than paying a listing per branch.
         let dataset =
             open_manifest_dataset_native_with_session(root, candidate_native, control_session)
                 .await?;
-        let snapshot = Self::snapshot_from_state(root, read_manifest_state(&dataset).await?);
-        Ok(snapshot
-            .datasets()
-            .any(|entry| entry.native_dataset_branch.as_deref() == Some(delete_target_native)))
+        Ok(Self::snapshot_from_state(
+            root,
+            read_manifest_state(&dataset).await?,
+        ))
+    }
+
+    /// Prove native-table liveness from main and every live branch, including
+    /// lazy borrowers whose logical owner no longer uses the ref. Any unreadable
+    /// branch fails the entire proof closed. See the control-envelope contract
+    /// on `snapshot_native_under_control_gates`.
+    pub(crate) async fn native_fork_references_under_control_gates(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<NativeForkReferences> {
+        let root = root_uri.trim_end_matches('/');
+        let main = open_manifest_dataset_native_with_session(root, None, control_session).await?;
+        let mut branches: Vec<_> = list_branch_contents(&main)
+            .await?
+            .into_keys()
+            .filter(|name| name != "main")
+            .collect();
+        branches.sort();
+        let mut references = NativeForkReferences {
+            referenced: HashSet::new(),
+            owned: HashSet::new(),
+        };
+        let mut add = |native: Option<&str>, snapshot: Snapshot| {
+            for entry in snapshot.datasets() {
+                if let Some(table_native) = entry.native_dataset_branch.as_deref() {
+                    let key = (entry.identity, table_native.to_string());
+                    references.referenced.insert(key.clone());
+                    if native == Some(table_native) {
+                        references.owned.insert(key);
+                    }
+                }
+            }
+        };
+        add(
+            None,
+            Self::snapshot_from_state(root, read_manifest_state(&main).await?),
+        );
+        for native in branches {
+            add(
+                Some(&native),
+                Self::snapshot_native_under_control_gates(root, Some(&native), control_session)
+                    .await?,
+            );
+        }
+        Ok(references)
     }
 
     /// Return a Snapshot from the known manifest state. No storage I/O.

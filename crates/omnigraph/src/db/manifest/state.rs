@@ -692,11 +692,8 @@ async fn read_manifest_scan_fragments(
         // delta (a DV-only refresh window) must read nothing.
         scanner.with_fragments(fragments);
     }
-    let batches: Vec<RecordBatch> = scanner
+    let mut batches = scanner
         .try_into_stream()
-        .await
-        .map_err(OmniError::storage)?
-        .try_collect()
         .await
         .map_err(OmniError::storage)?;
 
@@ -706,7 +703,10 @@ async fn read_manifest_scan_fragments(
     let mut lineage_rows = Vec::new();
     let mut graph_heads = HashMap::new();
 
-    for batch in &batches {
+    while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+        // Reduce each batch before polling the next; the owned projection is
+        // retained, but Arrow buffers for the complete journal are not.
+        let batch = &batch;
         let object_types = string_column(batch, "object_type")?;
         let locations = string_column(batch, "location")?;
         let metadata = string_column(batch, "metadata")?;
@@ -927,19 +927,19 @@ pub(crate) async fn read_graph_lineage(
     dataset: &Dataset,
 ) -> Result<(Vec<GraphLineageRow>, HashMap<String, String>)> {
     crate::instrumentation::record_manifest_scan();
-    let batches: Vec<RecordBatch> = dataset
+    let mut batches = dataset
         .scan()
         .try_into_stream()
-        .await
-        .map_err(OmniError::storage)?
-        .try_collect()
         .await
         .map_err(OmniError::storage)?;
 
     let mut graph_commits = Vec::new();
     let mut graph_heads = HashMap::new();
 
-    for batch in &batches {
+    while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+        // Reduce each batch before polling the next; the owned projection is
+        // retained, but Arrow buffers for the complete journal are not.
+        let batch = &batch;
         let object_ids = string_column(batch, "object_id")?;
         let object_types = string_column(batch, "object_type")?;
         let metadata = string_column(batch, "metadata")?;

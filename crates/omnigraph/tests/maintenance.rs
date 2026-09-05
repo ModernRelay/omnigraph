@@ -2122,6 +2122,81 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
     assert_eq!(count_rows(&db, "node:Company").await, main_companies);
 }
 
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let main_companies = count_rows(&db, "node:Company").await;
+    db.branch_create("feature").await.unwrap();
+    db.load_as(
+        "feature",
+        None,
+        r#"{"type":"Company","data":{"name":"BorrowedCo"}}"#,
+        LoadMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+    db.branch_create_from(ReadTarget::branch("feature"), "child")
+        .await
+        .unwrap();
+    let before = db.snapshot_of(ReadTarget::branch("child")).await.unwrap();
+    let borrowed = before.dataset("node:Company").unwrap().clone();
+
+    // The former adoption route was reachable when main's native version
+    // exceeded the owner's version. Preserve that production-shaped precondition.
+    for index in 0..5 {
+        db.load_as(
+            "main",
+            None,
+            &format!(r#"{{"type":"Company","data":{{"name":"MainCo{index}"}}}}"#),
+            LoadMode::Merge,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    // Recreate a snapshot written by the former pointer-adoption path: the
+    // owner points at main, while its lazy child still pins the old native ref.
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("feature", "node:Company", None)
+        .await
+        .unwrap();
+    db = Omnigraph::open(db.uri()).await.unwrap();
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Company").await,
+        main_companies + 5
+    );
+    assert_eq!(
+        count_rows_branch(&db, "child", "node:Company").await,
+        main_companies + 1
+    );
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    let reopened = Omnigraph::open(db.uri()).await.unwrap();
+    for handle in [&db, &reopened] {
+        let after = handle
+            .snapshot_of(ReadTarget::branch("child"))
+            .await
+            .unwrap();
+        assert_same_dataset_entry(&borrowed, after.dataset("node:Company").unwrap());
+        assert_eq!(
+            count_rows_branch(handle, "child", "node:Company").await,
+            main_companies + 1
+        );
+        assert_eq!(
+            count_rows_branch(handle, "feature", "node:Company").await,
+            main_companies + 5
+        );
+    }
+}
+
 // A fork named by a dead incarnation of a LIVE logical branch is garbage:
 // the live incarnation's forks are named by its own suffix, so nothing can
 // resolve to the dead one. Cleanup reclaims it and keeps the live fork.

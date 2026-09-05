@@ -419,6 +419,16 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/manifest.rs",
         "ManifestCoordinator",
+        "snapshot_native_under_control_gates",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "native_fork_references_under_control_gates",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
         "refresh_with_lineage",
     ),
     (
@@ -842,6 +852,8 @@ durable_calls! {
     ("db/manifest/recovery.rs", "discard_exact_schema_staging(", 2, WriteProtocol::RecoveryExecutor),
     ("exec/merge.rs", "TableStore::create_empty_dataset(", 1, WriteProtocol::EphemeralScratch),
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
+    // First-touch merge: enumerate native refs before arming recovery; no mutation.
+    ("exec/merge.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
