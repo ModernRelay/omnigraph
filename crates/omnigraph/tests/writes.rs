@@ -923,7 +923,7 @@ async fn overlapping_delete_predicates_do_not_double_count_affected() {
 }
 
 /// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior
-/// delete predicate referencing a NULLable column must NOT drop a later
+/// delete predicate referencing a nullable column must NOT drop a later
 /// statement's matching row just because that column is NULL (SQL UNKNOWN).
 /// With `NOT (age > 30)`, a row with NULL `age` makes the clause UNKNOWN and the
 /// row is filtered out of `deleted_ids` — skipping its cascade (orphaned edges),
