@@ -1637,64 +1637,128 @@ async fn load_without_explicit_base_does_not_add_main_to_recovery_scope() {
 #[serial]
 async fn armed_first_touch_recovery_reclaims_exact_no_effect_fork() {
     let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::init_and_load(&dir).await;
-    let main_rows = helpers::count_rows(&db, "node:Person").await;
-    db.branch_create("feature").await.unwrap();
+    for borrowed in [false, true] {
+        Box::pin(async {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap().to_string();
+            let mut db = helpers::init_and_load(&dir).await;
+            let main_rows = helpers::count_rows(&db, "node:Person").await;
+            if borrowed {
+                db.branch_create("child").await.unwrap();
+                db.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+                )
+                .await
+                .unwrap();
+            }
+            db.branch_create("feature").await.unwrap();
+            let feature_native = helpers::graph_native_ref(&uri, "feature").await;
 
-    {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FORK_PRE_COMMIT, "return");
-        let err = db
-            .mutate(
-                "feature",
-                MUTATION_QUERIES,
-                "insert_person",
-                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-            )
-            .await
-            .expect_err("failure after the fork must require recovery");
-        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+            {
+                let _failpoint =
+                    ScopedFailPoint::new(names::MUTATION_POST_FORK_PRE_COMMIT, "return");
+                let err = db
+                    .mutate(
+                        "feature",
+                        MUTATION_QUERIES,
+                        "insert_person",
+                        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+                    )
+                    .await
+                    .expect_err("failure after the fork must require recovery");
+                assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+            }
+            let operation_id = single_sidecar_operation_id(dir.path());
+            let person_uri = node_table_uri(&db, "Person").await;
+            assert!(
+                lance::Dataset::open(&person_uri)
+                    .await
+                    .unwrap()
+                    .list_branches()
+                    .await
+                    .unwrap()
+                    .keys()
+                    .any(|name| helpers::is_incarnation_of(name, "feature")),
+                "precondition: intent-owned target ref exists without a committed effect"
+            );
+            if borrowed {
+                // Recreate a legacy published borrower of this no-effect first-touch
+                // ref. Its newer pin must survive even though the abandoned writer's
+                // own manifest still inherits main and its sidecar may be retired.
+                db.failpoint_publish_table_head_without_index_rebuild_for_test(
+                    "child",
+                    "node:Person",
+                    Some(&feature_native),
+                )
+                .await
+                .unwrap();
+            }
+            drop(db);
+
+            let recovered = Omnigraph::open(&uri).await.unwrap();
+            assert_eq!(
+                helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+                main_rows,
+                "recovery must leave the feature table inherited"
+            );
+            assert_eq!(
+                lance::Dataset::open(&person_uri)
+                    .await
+                    .unwrap()
+                    .list_branches()
+                    .await
+                    .unwrap()
+                    .keys()
+                    .any(|name| helpers::is_incarnation_of(name, "feature")),
+                borrowed,
+                "recovery must reclaim only an unreferenced no-effect ref"
+            );
+            if borrowed {
+                let child = recovered
+                    .snapshot_of(ReadTarget::branch("child"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    child
+                        .dataset("node:Person")
+                        .unwrap()
+                        .native_dataset_branch
+                        .as_deref(),
+                    Some(feature_native.as_str())
+                );
+                let rows = recovered
+                    .query(
+                        ReadTarget::branch("child"),
+                        TEST_QUERIES,
+                        "get_person",
+                        &params(&[("$name", "Alice")]),
+                    )
+                    .await
+                    .unwrap()
+                    .concat_batches()
+                    .unwrap();
+                assert_eq!(
+                    rows.column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0),
+                    31
+                );
+            }
+            assert!(
+                !dir.path()
+                    .join("__recovery")
+                    .join(format!("{operation_id}.json"))
+                    .exists(),
+                "full recovery must delete the abandoned sidecar"
+            );
+        })
+        .await;
     }
-    let operation_id = single_sidecar_operation_id(dir.path());
-    let person_uri = node_table_uri(&db, "Person").await;
-    assert!(
-        lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .keys()
-            .any(|name| helpers::is_incarnation_of(name, "feature")),
-        "precondition: intent-owned target ref exists without a committed effect"
-    );
-    drop(db);
-
-    let recovered = Omnigraph::open(&uri).await.unwrap();
-    assert_eq!(
-        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
-        main_rows,
-        "recovery must leave the feature table inherited"
-    );
-    assert!(
-        !lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .keys()
-            .any(|name| helpers::is_incarnation_of(name, "feature")),
-        "full recovery must reclaim the exact unpublished no-effect ref"
-    );
-    assert!(
-        !dir.path()
-            .join("__recovery")
-            .join(format!("{operation_id}.json"))
-            .exists(),
-        "full recovery must delete the abandoned sidecar"
-    );
 }
 
 /// A live writer keeps its schema/branch/table guards through Phase D. A
@@ -9704,7 +9768,7 @@ async fn branch_merge_confirmed_ref_only_effect_rolls_forward() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::init_and_load(&dir).await;
+    let mut db = helpers::init_and_load(&dir).await;
     let main_rows = helpers::count_rows(&db, "node:Person").await;
     db.branch_create("source").await.unwrap();
     db.branch_create("target").await.unwrap();
@@ -9716,6 +9780,95 @@ async fn branch_merge_confirmed_ref_only_effect_rolls_forward() {
     )
     .await
     .unwrap();
+
+    // A stale physical target is not owned by this new merge attempt. It can
+    // survive an older interrupted writer while the graph still inherits main.
+    // Refuse it before arming, so even a crash before the fork cannot leave a
+    // recovery envelope that mistakes its old fork point for this merge's.
+    let person_uri = node_table_uri(&db, "Person").await;
+    let target_native = helpers::graph_native_ref(&uri, "target").await;
+    let mut person = lance::Dataset::open(&person_uri).await.unwrap();
+    let orphan_version = person.version().version;
+    let source_person = helpers::open_dataset_head(&person_uri, Some("source")).await;
+    assert!(source_person.version().version > orphan_version);
+    // forbidden-api-allow: test synthesizes an unregistered target ref from an older main version.
+    person
+        .create_branch(&target_native, orphan_version, None)
+        .await
+        .unwrap();
+    let orphan = person.checkout_branch(&target_native).await.unwrap();
+    let orphan_identifier = orphan.branch_identifier().await.unwrap();
+    let main_head_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let source_head_before = branch_head_commit_id(dir.path(), "source").await.unwrap();
+    let target_head_before = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
+
+    let error = db
+        .branch_merge("source", "target")
+        .await
+        .expect_err("an unowned target ref must be refused before recovery is armed");
+    assert!(
+        matches!(&error, OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::Conflict),
+        "expected a pre-arm conflict, got {error}"
+    );
+    assert!(
+        error.to_string().contains("cleanup"),
+        "the refusal must name the supported cleanup remedy: {error}"
+    );
+    assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        main_head_before
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "source").await.unwrap(),
+        source_head_before
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        target_head_before
+    );
+    let unchanged = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch(&target_native)
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged.branch_identifier().await.unwrap(),
+        orphan_identifier
+    );
+    assert_eq!(unchanged.version().version, orphan_version);
+    assert_eq!(
+        helpers::count_rows_branch(&db, "target", "node:Person").await,
+        main_rows
+    );
+    drop(unchanged);
+    drop(orphan);
+    drop(source_person);
+    drop(person);
+    drop(
+        Omnigraph::open(&uri)
+            .await
+            .expect("pre-arm refusal must leave read-write open usable"),
+    );
+
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    let person = lance::Dataset::open(&person_uri).await.unwrap();
+    assert!(
+        !person
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key(&target_native),
+        "cleanup must reclaim the unreferenced target ref before the merge retry"
+    );
+    drop(person);
 
     let operation_id = {
         let _failpoint = ScopedFailPoint::new(
@@ -10326,6 +10479,7 @@ enum MergeScenario {
 enum MergePartialFailpoint {
     AdoptAfterAppend,
     AdoptAfterUpsert,
+    RewriteAfterInsert,
     RewriteAfterMerge,
     RewriteAfterDelete,
 }
@@ -10335,6 +10489,7 @@ impl MergePartialFailpoint {
         match self {
             Self::AdoptAfterAppend => names::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT,
             Self::AdoptAfterUpsert => names::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE,
+            Self::RewriteAfterInsert => names::BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE,
             Self::RewriteAfterMerge => names::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE,
             Self::RewriteAfterDelete => names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
         }
@@ -10370,6 +10525,30 @@ async fn assert_partial_merge_rolls_back(
     failpoint: MergePartialFailpoint,
 ) {
     use omnigraph::loader::load_jsonl;
+
+    let carol_ages = |batches: &[RecordBatch]| {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let names = batch
+                    .column_by_name("name")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let ages = batch
+                    .column_by_name("age")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                (0..batch.num_rows())
+                    .filter(|&row| names.value(row) == "carol")
+                    .map(|row| ages.value(row))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
 
     let failpoint = failpoint.name();
     let _scenario = FailScenario::setup();
@@ -10448,6 +10627,7 @@ async fn assert_partial_merge_rolls_back(
             "partial Phase B at {failpoint} must roll back to base \
              (no bob, dave kept, carol's upsert reverted); the merge must NOT be recorded",
         );
+        assert_eq!(carol_ages(&read_table(&db, "node:Person").await), [50]);
         db.branch_merge("feature", "main").await.unwrap();
         assert_eq!(
             sorted_person_names(&db).await,
@@ -10455,6 +10635,7 @@ async fn assert_partial_merge_rolls_back(
             "re-merge after rollback must re-apply the full delta \
              (bob added, dave removed) — proof the partial was not silently recorded",
         );
+        assert_eq!(carol_ages(&read_table(&db, "node:Person").await), [55]);
     }
 }
 
@@ -10484,11 +10665,12 @@ async fn branch_merge_adopt_partial_after_upsert_rolls_back() {
 #[serial]
 #[serial(branch_merge_phase_b)]
 async fn branch_merge_rewrite_partial_after_merge_rolls_back() {
-    assert_partial_merge_rolls_back(
-        MergeScenario::Rewrite,
+    for window in [
+        MergePartialFailpoint::RewriteAfterInsert,
         MergePartialFailpoint::RewriteAfterMerge,
-    )
-    .await;
+    ] {
+        assert_partial_merge_rolls_back(MergeScenario::Rewrite, window).await;
+    }
 }
 
 #[tokio::test]
@@ -12405,9 +12587,8 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
 }
 
 /// `sync_branch` replaces a handle's active coordinator. It must join the same
-/// schema authority gate held by branch merge, otherwise it can overwrite the
-/// temporary target coordinator inside merge's swap -> publish -> restore
-/// window and redirect physical effects or the merge commit.
+/// schema authority gate held by branch merge, so the handle's binding remains
+/// stable throughout the captured operation and its publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn branch_merge_fences_concurrent_sync_on_same_handle() {
@@ -12448,7 +12629,7 @@ async fn branch_merge_fences_concurrent_sync_on_same_handle() {
     );
 }
 
-/// The post-table-gate merge check must read storage, not the swapped
+/// The post-table-gate merge check must read storage, not a warm
 /// coordinator's cached snapshot. Advance the target branch while merge is
 /// parked after authority capture; the legacy publish seam moves both the
 /// table pin and graph lineage, so fresh authority comparison catches the

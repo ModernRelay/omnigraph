@@ -2549,7 +2549,9 @@ mod tests {
         assert_eq!(outcome, MergeOutcome::Merged);
         assert_eq!(probes.table_walk_interval_count(), 2);
         let route = MergeRouteObservation::from_probes(&probes);
-        assert!(route.stage_merge_insert_calls >= 2);
+        assert!(route.stage_known_present_update_calls >= 2);
+        assert!(route.stage_fenced_insert_calls >= 2);
+        assert_eq!(route.stage_merge_insert_calls, 0);
         let phases = phase_observations(probes.merge_timing_snapshot());
         validate_successful_merge_phase_topology(
             &phases,

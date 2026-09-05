@@ -49,7 +49,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
     }
 
     // Cell b: Merge × Merge, same target / distinct sources.
-    // Both want to land in main. merge_exclusive serializes; both should
+    // Both want to land in main. The schema/branch gates serialize; both should
     // succeed and main should contain BOTH sources' contributions.
     {
         let cell = "b:merge×merge:same-target-distinct-sources";
@@ -73,8 +73,8 @@ async fn concurrent_branch_ops_morphological_matrix() {
     }
 
     // Cell c: Merge × Merge, same source / distinct targets (fanout).
-    // One source merged into two targets simultaneously. merge_exclusive
-    // serializes; both targets should reflect the source's content.
+    // One source merged into two targets simultaneously. Each merge captures
+    // its own target; both targets should reflect the source's content.
     {
         let cell = "c:merge×merge:same-source-distinct-targets";
         let h = matrix::Harness::new().await;

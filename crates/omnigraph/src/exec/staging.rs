@@ -1167,6 +1167,20 @@ impl StagedMutation {
         // the target branch fresh on any mismatch, returning the snapshot from
         // that same authority view. No prepared table pin is patched forward.
         let snapshot = db.revalidate_write_txn(txn).await?;
+        // An older pointer-adopting merge may have detached a target ref that
+        // a lazy child still pins. A new first-touch fork must not reclaim that
+        // history. Prove this before arming: the existing recovery envelope
+        // cannot represent reseeding an unrelated, already-existing lineage.
+        let fork_references = if staged
+            .iter()
+            .any(|entry| entry.path.deferred_fork.is_some())
+        {
+            Some(Box::pin(crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
+                db.root_uri(), &db.control_session(),
+            )).await?)
+        } else {
+            None
+        };
         for entry in &staged {
             let current = snapshot
                 .dataset(&entry.table_key)
@@ -1194,9 +1208,19 @@ impl StagedMutation {
             // A deferred fork is intentionally staged from the exact inherited
             // source entry. The source ref (often main) may advance after the
             // graph branch was cut; that is unrelated to this branch's pinned
-            // snapshot. The target ref does not exist yet, so there is no live
-            // target HEAD to compare until after the recovery intent is armed.
-            if entry.path.deferred_fork.is_some() {
+            // snapshot. The liveness proof above excludes borrowed target refs;
+            // any remaining orphan collision is checked under the same gates.
+            if let Some(fork) = entry.path.deferred_fork.as_ref() {
+                if fork_references
+                    .as_ref()
+                    .expect("deferred-fork liveness proof")
+                    .contains(entry.path.identity, &fork.target_branch)
+                {
+                    return Err(crate::db::manifest::detached_native_lineage_error(
+                        &entry.table_key,
+                        &fork.target_branch,
+                    ));
+                }
                 if entry.dataset.version() != current {
                     return Err(OmniError::manifest_read_set_changed(
                         format!("published_dataset_version:{}", entry.table_key),

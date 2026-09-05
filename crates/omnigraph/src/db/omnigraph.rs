@@ -9,6 +9,7 @@ use arrow_array::{
     ListArray, RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow_schema::{DataType, Field, Schema};
+use futures::StreamExt;
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::scanner::ColumnOrdering;
@@ -32,6 +33,10 @@ use crate::storage::{
 };
 use crate::storage_layer::SnapshotHandle;
 use crate::table_store::TableStore;
+
+// Bound independent control-plane reads and per-table reclaim without
+// multiplying the existing branch/table gate envelope.
+const BRANCH_CONTROL_IO_CONCURRENCY: usize = 8;
 
 mod export;
 mod optimize;
@@ -239,30 +244,6 @@ pub struct Omnigraph {
     /// paths, and both live/open-time recovery). Sharing across independently
     /// opened handles is required because Restore/ref deletion is destructive.
     write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
-    /// Handle-local mutex held across the swap → operate → restore window
-    /// in `branch_merge_impl`. Two concurrent merges through the same handle
-    /// with distinct targets
-    /// would otherwise interleave their three separate
-    /// `coordinator.write().await` acquisitions, leaving each merge's
-    /// inner body running against the other's swapped coord. Pinned by
-    /// `concurrent_branch_merges_distinct_targets_do_not_swap_into_each_other`
-    /// in `crates/omnigraph-server/tests/server.rs`.
-    ///
-    /// Cost: serializes all concurrent branch merges through one handle.
-    /// Independently opened handles own independent coordinators and mutexes;
-    /// their physical effects still meet at the root-scoped ordered gates.
-    /// Acceptable because branch merges are heavy (table rewrites, index
-    /// rebuilds), per-(table, branch) queues inside `commit_all` already
-    /// serialize the data path, and merges are rare relative to /change
-    /// or /ingest. A finer-grained per-target-branch mutex is a follow-up
-    /// if telemetry shows merge concurrency matters.
-    ///
-    /// The deeper fix — refactor `branch_merge_on_current_target` to take
-    /// an explicit target coord parameter so `self.coordinator` is never
-    /// used as scratch space — is the round-1 shape applied to
-    /// `branch_create_from_impl`. Deferred because it requires unwinding
-    /// every `self.snapshot()` call inside the merge body.
-    merge_exclusive: Arc<tokio::sync::Mutex<()>>,
     /// One hot non-bound merge-authority coordinator, so a repeated merge
     /// stops paying a fresh open with a full O(history) `__manifest` scan.
     /// Each use revalidates with the
@@ -598,7 +579,6 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             merge_authority_cache: tokio::sync::Mutex::new(None),
             fork_reclaims: std::sync::Mutex::new(Vec::new()),
             policy: None,
@@ -779,7 +759,6 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             merge_authority_cache: tokio::sync::Mutex::new(None),
             fork_reclaims: std::sync::Mutex::new(Vec::new()),
             policy: None,
@@ -1093,15 +1072,6 @@ impl Omnigraph {
         Arc::clone(&self.write_queue)
     }
 
-    /// Engine-internal access to the merge-exclusive mutex. Held across
-    /// the swap → operate → restore window in `branch_merge_impl` so
-    /// concurrent merges with distinct targets don't corrupt
-    /// `self.coordinator` mid-operation. See the field doc on
-    /// `Omnigraph::merge_exclusive` for the full design rationale.
-    pub(crate) fn merge_exclusive(&self) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(&self.merge_exclusive)
-    }
-
     /// Engine-level access to the graph's normalized root URI. Used by
     /// the recovery sidecar protocol to compute `__recovery/` paths.
     pub(crate) fn root_uri(&self) -> &str {
@@ -1155,19 +1125,6 @@ impl Omnigraph {
                 .await
             }
         }
-    }
-
-    pub(crate) async fn swap_coordinator_for_branch(
-        &self,
-        branch: Option<&str>,
-    ) -> Result<GraphCoordinator> {
-        let next = self.open_coordinator_for_branch(branch).await?;
-        let mut coord = self.coordinator.write().await;
-        Ok(std::mem::replace(&mut *coord, next))
-    }
-
-    pub(crate) async fn restore_coordinator(&self, coordinator: GraphCoordinator) {
-        *self.coordinator.write().await = coordinator;
     }
 
     /// Open a capture-once write transaction (RFC-013 step 3b): validate the schema
@@ -1805,10 +1762,9 @@ impl Omnigraph {
 
     /// Synchronize this handle's write base to the latest head of the named branch.
     pub async fn sync_branch(&self, branch: &str) -> Result<()> {
-        // Coordinator selection is handle-local, but branch merge temporarily
-        // swaps this same coordinator and native controls derive authority from
-        // its active branch. Join their root-shared schema gate so sync cannot
-        // replace the coordinator during either authority window. This also
+        // Coordinator selection is handle-local. Join the root-shared schema
+        // gate so sync cannot change the binding during a control or write
+        // authority window. This also
         // captures the schema contract and target coordinator coherently across
         // a concurrent schema apply. Lock order remains schema -> coordinator.
         let _schema_guard = self
@@ -2898,22 +2854,6 @@ impl Omnigraph {
             .map(str::to_string)
     }
 
-    /// Whether the handle's active coordinator is exactly the freshly captured
-    /// target authority. A warm coordinator can lag an external process; branch
-    /// merge may skip its historical swap only when native ref identity, graph
-    /// head, and manifest version all match the capture.
-    pub(crate) async fn active_coordinator_matches(&self, txn: &WriteTxn) -> Result<bool> {
-        let coord = self.coordinator.read().await;
-        if coord.current_branch() != txn.branch.as_deref() {
-            return Ok(false);
-        }
-        Ok(
-            coord.branch_identifier().await? == txn.authority.branch_identifier
-                && coord.exact_graph_head() == txn.authority.graph_head
-                && coord.version() == txn.base.graph_manifest_version(),
-        )
-    }
-
     /// Conservative table-gate envelope for graph-level control/maintenance.
     ///
     /// Current legacy sidecar writers acquire `(table_key, target_branch)` gates
@@ -3001,36 +2941,50 @@ impl Omnigraph {
         // proof and must not add two discarded BranchContents reads per branch.
         // General coordinator/OCC/feed opens retain the coherent incarnation
         // capture required by RFC-030.
-        for other_branch in branches
+        let session = self.control_session();
+        let candidates = branches
             .iter()
             .filter(|candidate| candidate.as_str() != branch)
-        {
-            let candidate_branch = Self::normalize_branch_name(other_branch)?;
-            let candidate_native = match candidate_branch.as_deref() {
-                None => None,
-                Some(logical) => Some(
-                    crate::branch_names::resolve_native_branch(
-                        natives.iter().map(String::as_str),
-                        logical,
-                    )?
-                    .ok_or_else(|| OmniError::BranchNotFound {
-                        branch: logical.to_string(),
-                    })?,
-                ),
-            };
-            if crate::db::manifest::ManifestCoordinator::branch_depends_on_delete_target_under_control_gates(
-                self.uri(),
-                candidate_native.as_deref(),
-                delete_target_native,
-                &self.control_session(),
-            )
-            .await?
-            {
-                return Err(OmniError::manifest_conflict(format!(
-                    "cannot delete branch '{}' because branch '{}' still depends on it",
-                    branch, other_branch
-                )));
-            }
+            .cloned()
+            .collect::<Vec<_>>();
+        let checks = candidates.into_iter().map(|other_branch| {
+                let session = &session;
+                async move {
+                let candidate_branch = Self::normalize_branch_name(&other_branch)?;
+                let candidate_native = match candidate_branch.as_deref() {
+                    None => None,
+                    Some(logical) => Some(
+                        crate::branch_names::resolve_native_branch(
+                            natives.iter().map(String::as_str),
+                            logical,
+                        )?
+                        .ok_or_else(|| OmniError::BranchNotFound {
+                            branch: logical.to_string(),
+                        })?,
+                    ),
+                };
+                if crate::db::manifest::ManifestCoordinator::branch_depends_on_delete_target_under_control_gates(
+                    self.uri(),
+                    candidate_native.as_deref(),
+                    delete_target_native,
+                    session,
+                )
+                .await?
+                {
+                    return Err(OmniError::manifest_conflict(format!(
+                        "cannot delete branch '{}' because branch '{}' still depends on it",
+                        branch, other_branch
+                    )));
+                }
+                Ok(())
+                }
+            });
+        // Keep the existing deterministic refusal order while overlapping a
+        // bounded number of independent manifest reads. The gates remain held
+        // until every dependency proof succeeds and publication completes.
+        let mut checks = futures::stream::iter(checks).buffered(BRANCH_CONTROL_IO_CONCURRENCY);
+        while let Some(check) = checks.next().await {
+            check?;
         }
 
         Ok(())
@@ -3054,24 +3008,30 @@ impl Omnigraph {
             .collect::<Vec<_>>();
         cleanup_targets.sort_by(|left, right| left.0.cmp(&right.0));
 
-        for (table_key, table_path) in cleanup_targets {
-            let dataset_uri = store.dataset_uri(&table_path);
-            let outcome = match crate::failpoints::maybe_fail(
-                crate::failpoints::names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP,
-            ) {
-                Ok(()) => store.force_delete_branch(&dataset_uri, &branch).await,
-                Err(injected) => Err(injected),
-            };
-            if let Err(err) = outcome {
-                tracing::warn!(
-                    target: "omnigraph::branch_delete::cleanup",
-                    branch = %branch,
-                    table = %table_key,
-                    error = %err,
-                    "best-effort fork reclaim failed; cleanup will reconcile the orphan",
-                );
-            }
-        }
+        futures::stream::iter(cleanup_targets)
+            .for_each_concurrent(BRANCH_CONTROL_IO_CONCURRENCY, |(table_key, table_path)| {
+                let store = &store;
+                let branch = &branch;
+                async move {
+                    let dataset_uri = store.dataset_uri(&table_path);
+                    let outcome = match crate::failpoints::maybe_fail(
+                        crate::failpoints::names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP,
+                    ) {
+                        Ok(()) => store.force_delete_branch(&dataset_uri, branch).await,
+                        Err(injected) => Err(injected),
+                    };
+                    if let Err(err) = outcome {
+                        tracing::warn!(
+                            target: "omnigraph::branch_delete::cleanup",
+                            branch = %branch,
+                            table = %table_key,
+                            error = %err,
+                            "best-effort fork reclaim failed; cleanup will reconcile the orphan",
+                        );
+                    }
+                }
+            })
+            .await;
     }
 
     /// Run the post-flip fork reclaim in a background task that holds the
@@ -3572,17 +3532,16 @@ impl Omnigraph {
         Ok(commits)
     }
 
-    /// Open a sub-table for mutation with version-drift guard.
-    ///
-    /// Checks that the dataset's current version matches the snapshot-pinned
-    /// version. If another writer has advanced the version, returns an error
-    /// prompting the caller to refresh and retry (optimistic concurrency).
-    pub(crate) async fn open_for_mutation(
+    /// Legacy no-transaction opener retained only by the raw-write unit fixtures.
+    #[cfg(test)]
+    async fn open_for_mutation(
         &self,
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
     ) -> Result<OpenedForMutation> {
-        table_ops::open_for_mutation(self, table_key, op_kind).await
+        let branch = self.active_branch().await;
+        self.open_for_mutation_on_branch(branch.as_deref(), table_key, op_kind, None)
+            .await
     }
 
     pub(crate) async fn open_for_mutation_on_branch(
