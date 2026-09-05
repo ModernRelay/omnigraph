@@ -13,7 +13,7 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use serde::{Deserialize, Serialize};
 
-use super::{Args, rfc023_limits, rfc023_scenarios};
+use super::{Args, fixture_controls, rfc023_limits, rfc023_scenarios};
 
 const SOURCE: &str = "control-sibling-0";
 const TARGET: &str = "control-target";
@@ -210,6 +210,7 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
                 .expect("own victim scalar table");
         }
     }
+    let layout = fixture_controls::prepare_layout(uri, args).await;
     let mut names = db.branch_list().await.expect("list prepared branches");
     names.sort();
     let expected_count = args.branches + 1 + usize::from(args.scenario == "branch-delete");
@@ -261,16 +262,24 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
         .unwrap()
         .extend(age.as_object().unwrap().clone());
     metrics
+        .as_object_mut()
+        .unwrap()
+        .extend(layout.as_object().unwrap().clone());
+    metrics
 }
 
 pub(super) async fn operation(args: &Args) -> serde_json::Value {
     super::helpers::cost::cost_harness(async {
     let root = root(args);
+    let ((db, operation_open_us), open_io) = super::helpers::cost::measure(async {
     let open_start = Instant::now();
     let db = Omnigraph::open(root.to_str().unwrap())
         .await
         .expect("open branch fixture");
     let operation_open_us = open_start.elapsed().as_micros() as u64;
+    (db, operation_open_us)
+    }).await;
+    let prewarm = fixture_controls::prewarm(&db, args).await;
     let operation_pre_peak_rss_bytes = super::current_process_peak_rss_bytes();
     let ((listed, operation_wall_us, operation_post_peak_rss_bytes,
         post_ack_reclaim_wait_us, operation_complete_wall_us,
@@ -315,6 +324,11 @@ pub(super) async fn operation(args: &Args) -> serde_json::Value {
     (listed, operation_wall_us, operation_post_peak_rss_bytes,
         post_ack_reclaim_wait_us, operation_complete_wall_us, operation_completion_peak_rss_bytes)
     }).await;
+    let first_read = if args.age_options_supplied && matches!(args.scenario.as_str(), "branch-create" | "branch-create-from") {
+        fixture_controls::first_read(&db, TARGET, args.tables).await
+    } else {
+        serde_json::json!({})
+    };
     // Persist only the operation's output after timing. The verification child
     // checks list contents against the prepared registry, not merely its size.
     if let Some(listed) = &listed {
@@ -339,11 +353,14 @@ pub(super) async fn operation(args: &Args) -> serde_json::Value {
         "operation_post_peak_rss_bytes": operation_post_peak_rss_bytes,
         "operation_completion_peak_rss_bytes": operation_completion_peak_rss_bytes,
         "operation_hwm_increase_bytes": operation_post_peak_rss_bytes.checked_sub(operation_pre_peak_rss_bytes).filter(|v| *v > 0),
-        "measurement_boundary": "exactly one public branch operation after fresh open; operation_wall is acknowledgement, operation_complete_wall also waits for delete fork reclaim; setup and final verification run in separate children",
-        "rss_boundary": "operation child whole-process wait4 HWM includes runtime, graph open, delete fork reclaim and output recording, excludes setup/verify; pre/post/completion self HWM is not isolated allocation",
+        "measurement_boundary": "exactly one public branch operation after separately recorded fresh open and optional prewarm; operation_wall is acknowledgement, operation_complete_wall also waits for delete fork reclaim; optional fork first_read is separate and later; setup and final verification run in separate children",
+        "rss_boundary": "operation child whole-process wait4 HWM includes runtime, graph open, optional prewarm/first payload read, delete fork reclaim and output recording, excludes setup/verify; pre/post/completion self HWM is not isolated allocation",
         "listed_branch_count": listed.as_ref().map(Vec::len),
     });
     metrics.as_object_mut().unwrap().extend(rfc023_scenarios::operation_io_metrics(&io).as_object().unwrap().clone());
+    metrics.as_object_mut().unwrap().extend(fixture_controls::io_metrics("open", &open_io).as_object().unwrap().clone());
+    metrics.as_object_mut().unwrap().extend(prewarm.as_object().unwrap().clone());
+    metrics.as_object_mut().unwrap().extend(first_read.as_object().unwrap().clone());
     metrics
     }).await
 }

@@ -26,8 +26,11 @@ def require(condition, message):
 
 
 def sha256(path):
+    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def source_identity():
@@ -37,20 +40,24 @@ def source_identity():
             "clean": not git("status", "--porcelain=v1", "--untracked-files=normal")}
 
 
-def matrix(smoke, extended, selected):
+def matrix(smoke, extended, selected, history_only=False,
+           cache_state="cold", manifest_layout="uncompacted"):
     shapes = [("smoke", 2, 1, 2, 2)] if smoke else [
         ("fresh", 0, 0, 2, 2), ("history16", 16, 0, 2, 2),
         ("history64", 64, 0, 2, 2), ("retired8", 0, 8, 2, 2),
     ]
     if extended:
         shapes += [("siblings8", 0, 0, 8, 2), ("tables8", 0, 0, 2, 8)]
+    if history_only:
+        shapes = [shape for shape in shapes if shape[0] != "retired8"]
     points = []
     for shape, history, retired, branches, tables in shapes:
         for scenario in selected:
             if shape in ("siblings8", "tables8") and scenario == "general-merge-updates":
                 continue  # That existing merge owner has one table and two branches.
             params = {"rows": 16, "dims": 4, "seed": 42,
-                      "history_commits": history, "retired_branches": retired}
+                      "history_commits": history, "retired_branches": retired,
+                      "cache_state": cache_state, "manifest_layout": manifest_layout}
             if scenario == "general-merge-updates":
                 params.update(delta_rows=2, source_mode="update")
             else:
@@ -86,9 +93,53 @@ def admit(records, point, runs, identity, binary_hash):
             require(metrics.get(f"setup_{label}_requested") == point["params"][parameter]
                     == metrics.get(f"setup_{label}_applied"), "Fixture aging was not applied")
         require(metrics.get("setup_age_content_verified") is True, "Missing age content proof")
+        require(metrics.get("setup_retired_native_refs_reclaimed") == point["params"]["retired_branches"],
+                "Retired fixture refs were not reclaimed")
         require(metrics["setup_main_history_after_age"] - metrics["setup_main_history_before_age"]
                 == point["params"]["history_commits"], "Actual reachable history did not match")
         require(isinstance(metrics.get("operation_io_manifest_reads"), int), "Missing manifest I/O evidence")
+        cache_state = point["params"]["cache_state"]
+        require(metrics.get("cache_state") == cache_state, "Wrong cache preparation")
+        expected_branches = (2 if point["scenario"] == "general-merge-updates"
+                             else metrics.get("initial_branch_count_including_main"))
+        require(isinstance(expected_branches, int) and expected_branches > 0, "Missing fixture branch count")
+        require(metrics.get("prewarm_wall_us", -1) >= 0, "Missing prewarm timing")
+        require(metrics.get("prewarm_branch_views") == (expected_branches if cache_state == "warm" else 0),
+                "Prewarm did not capture the requested branch views")
+        expected_tables = 1 if point["scenario"] == "general-merge-updates" else point["params"]["tables"]
+        require(metrics.get("prewarm_table_views") == (expected_branches * expected_tables if cache_state == "warm" else 0),
+                "Prewarm did not capture the requested table views")
+        layout = point["params"]["manifest_layout"]
+        require(metrics.get("setup_manifest_layout") == layout
+                and metrics.get("setup_layout_preserved_graph_contract") is True, "Unverified manifest layout")
+        manifests = metrics.get("setup_layout_native_manifests", [])
+        require(len(manifests) == expected_branches, "Missing native manifest layout receipts")
+        native_refs = [m.get("native_ref") for m in manifests]
+        require(native_refs.count(None) == 1 and len(set(native_refs)) == expected_branches,
+                "Duplicate or missing native manifest refs")
+        for manifest in manifests:
+            require(manifest["logical_rows_before"] == manifest["logical_rows_after"] > 0,
+                    "Manifest logical rows changed")
+            require(manifest["version_after"] >= manifest["version_before"] > 0,
+                    "Manifest version moved backwards")
+            require(0 < manifest["fragments_after"] <= manifest["fragments_before"],
+                    "Unexpected manifest fragment layout")
+            if layout == "uncompacted":
+                require(manifest["version_after"] == manifest["version_before"]
+                        and manifest["fragments_after"] == manifest["fragments_before"],
+                        "Uncompacted fixture was modified")
+        require(metrics.get("setup_layout_full_rows_verified") == (layout == "compacted"),
+                "Compacted fixture needs exact full-row verification")
+        require(metrics.get("setup_layout_fragments_removed", -1) > 0 if layout == "compacted"
+                else metrics.get("setup_layout_fragments_removed") == 0, "Vacuous or unexpected compaction")
+        for prefix in ("open", "prewarm"):
+            require(isinstance(metrics.get(f"{prefix}_io_manifest_reads"), int), f"Missing {prefix} accounting")
+        if point["scenario"] in ("branch-create", "branch-create-from"):
+            require(metrics.get("first_read_wall_us", -1) >= 0
+                    and metrics.get("first_read_table_count") == expected_tables
+                    and metrics.get("first_read_payload_rows") == expected_tables,
+                    "Missing non-vacuous fork first-read proof")
+            require(isinstance(metrics.get("first_read_io_manifest_reads"), int), "Missing first-read accounting")
         if point["scenario"] == "general-merge-updates":
             require(metrics.get("merge_outcome") == "merged" and metrics.get("final_rows") == 16,
                     "Merge did not verify the expected route and row count")
@@ -102,8 +153,12 @@ def admit(records, point, runs, identity, binary_hash):
 def summarize(point, records):
     summary = {**point, "samples": len(records)}
     for key in ("operation_wall_us", "operation_complete_wall_us", "operation_open_us",
-                "operation_open_ms", "post_ack_reclaim_wait_us", "operation_io_manifest_reads",
+                "operation_open_ms", "prewarm_wall_us", "first_read_wall_us",
+                "setup_layout_wall_us", "post_ack_reclaim_wait_us", "operation_io_manifest_reads",
                 "operation_io_manifest_read_bytes", "operation_io_manifest_scan_count",
+                "open_io_manifest_reads", "open_io_manifest_read_bytes",
+                "prewarm_io_manifest_reads", "prewarm_io_manifest_read_bytes",
+                "first_read_io_manifest_reads", "first_read_io_manifest_read_bytes",
                 "fixture_bytes", "fixture_files"):
         values = [r["metrics"].get(key) for r in records]
         if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
@@ -129,13 +184,20 @@ def main():
     parser.add_argument("--scenario", choices=SCENARIOS, action="append")
     parser.add_argument("--smoke", action="store_true", help="one tiny aged/churned fixture per operation")
     parser.add_argument("--extended", action="store_true", help="also vary sibling count and table count separately")
+    parser.add_argument("--history-only", action="store_true", help="only H0/H16/H64; omit retired-branch churn")
+    parser.add_argument("--cache-state", choices=("cold", "warm"), default="cold",
+                        help="fresh handle, or separately recorded metadata prewarm on that handle")
+    parser.add_argument("--manifest-layout", choices=("uncompacted", "compacted"), default="uncompacted",
+                        help="setup-only live manifest compaction; no cleanup or user-table optimization")
     parser.add_argument("--plan", action="store_true", help="print parameters without building or running")
     args = parser.parse_args()
     require(1 <= args.runs <= 10, "--runs must be between 1 and 10")
     require(0 <= args.pause_seconds <= 60, "--pause-seconds must be between 0 and 60")
     require(1 <= args.timeout_seconds <= 600, "--timeout-seconds must be between 1 and 600")
     require(not (args.smoke and args.extended), "Choose smoke or extended")
-    points = matrix(args.smoke, args.extended, list(dict.fromkeys(args.scenario or SCENARIOS)))
+    require(not (args.history_only and (args.smoke or args.extended)), "--history-only is separate from smoke/extended")
+    points = matrix(args.smoke, args.extended, list(dict.fromkeys(args.scenario or SCENARIOS)),
+                    args.history_only, args.cache_state, args.manifest_layout)
     if args.plan:
         print(json.dumps(points, indent=2))
         return

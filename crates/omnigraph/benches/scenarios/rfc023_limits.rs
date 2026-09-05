@@ -9,6 +9,20 @@ pub(crate) const RECOVERY_MAX_TRANSACTIONS: usize = 1024;
 /// Maximum source-version interval eligible for the pure-insert proof walk.
 pub(crate) const PURE_INSERT_HISTORY_MAX_VERSIONS: usize = 1024;
 
+/// Explicit controls are diagnostic setup choices, never silent fallbacks.
+pub(crate) fn validate_view_controls(
+    cache_state: &str,
+    manifest_layout: &str,
+) -> Result<(), String> {
+    if !matches!(cache_state, "cold" | "warm") {
+        return Err("--cache-state must be cold or warm".into());
+    }
+    if !matches!(manifest_layout, "uncompacted" | "compacted") {
+        return Err("--manifest-layout must be uncompacted or compacted".into());
+    }
+    Ok(())
+}
+
 // Arrow's value buffers dominate these vector batches. Reserve a deliberately
 // conservative fixed allowance for ArrayData/offset buffers and per-row slack
 // for string offsets, validity/alignment, and implementation bookkeeping. The
