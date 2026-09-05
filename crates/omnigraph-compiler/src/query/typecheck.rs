@@ -1586,7 +1586,6 @@ fn resolve_expr_type(
             let arg_type = resolve_expr_type(catalog, arg, ctx, params)?;
             reject_blob_read_value(&arg_type, arg)?;
 
-            // T8: sum/avg require numeric; min/max require numeric or string
             match func {
                 AggFunc::Sum | AggFunc::Avg => {
                     if let ResolvedType::Scalar(s) = &arg_type
@@ -1601,10 +1600,10 @@ fn resolve_expr_type(
                 }
                 AggFunc::Min | AggFunc::Max => {
                     if let ResolvedType::Scalar(s) = &arg_type
-                        && (s.list || (!s.scalar.is_numeric() && s.scalar != ScalarType::String))
+                        && (s.list || !s.scalar.is_orderable())
                     {
                         return Err(CompilerError::Type(format!(
-                            "T8: {} requires numeric or string type, got {}",
+                            "T8: {} requires a numeric, String, Bool, Date, or DateTime scalar, got {}",
                             func,
                             s.display_name()
                         )));

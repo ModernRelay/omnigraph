@@ -101,6 +101,15 @@ impl ScalarType {
             Self::I32 | Self::I64 | Self::U32 | Self::U64 | Self::F32 | Self::F64
         )
     }
+
+    /// The scalar argument types `min` and `max` accept.
+    pub(crate) fn is_orderable(&self) -> bool {
+        self.is_numeric()
+            || matches!(
+                self,
+                Self::String | Self::Bool | Self::Date | Self::DateTime
+            )
+    }
 }
 
 impl std::fmt::Display for ScalarType {
