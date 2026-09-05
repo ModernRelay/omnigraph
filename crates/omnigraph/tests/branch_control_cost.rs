@@ -302,7 +302,7 @@ mod topology_diagnostics {
                     .collect::<Vec<_>>();
             history.sort();
             let effective_head = db
-                .snapshot_id_of(ReadTarget::branch(&branch))
+                .resolve_snapshot(&branch)
                 .await
                 .unwrap()
                 .as_str()
