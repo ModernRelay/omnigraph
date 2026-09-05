@@ -5301,6 +5301,8 @@ dependencies = [
 name = "omnigraph-gqt"
 version = "0.10.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "datatest-stable",
  "futures",
  "omnigraph-compiler",

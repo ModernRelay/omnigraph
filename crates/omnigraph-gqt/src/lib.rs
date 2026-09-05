@@ -27,16 +27,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use arrow_schema::{DataType, Schema};
 use futures::FutureExt as _;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::query::ast::{Clause, Expr, Literal, Param, QueryDecl};
 use omnigraph_compiler::query::parser::parse_query;
+use omnigraph_compiler::query::typecheck::{
+    executed_column_name, infer_query_result_schema, typecheck_query,
+};
 use omnigraph_compiler::schema::ast::{Annotation, PropDecl, SchemaDecl};
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::{JsonParamMode, json_params_to_param_map};
+use omnigraph_compiler::{JsonParamMode, QueryResult, json_params_to_param_map};
 use serde_json::Value;
+
+mod shape;
+use shape::{ShapeExpect, bless_shape_lines, parse_shape_body, shape_mismatch};
 
 pub const CASE_TIMEOUT_ENV: &str = "OMNIGRAPH_GQ_CASE_TIMEOUT_SECS";
 pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 10;
@@ -80,7 +87,7 @@ struct QueryStep {
     ordinal: usize,
     source: String,
     name: String,
-    ast_params: Vec<Param>,
+    decl: Box<QueryDecl>,
     params_raw: Option<String>,
     expect: QueryExpect,
     /// The match clause carries an unbound traversal, so a successful run
@@ -104,6 +111,7 @@ enum QueryExpect {
         ordered: bool,
         body_raw: String,
         span: BodySpan,
+        shape: ShapeExpect,
     },
     Error {
         needle: String,
@@ -675,7 +683,7 @@ struct PendingStep {
     ordinal: usize,
     source: String,
     name: String,
-    ast_params: Vec<Param>,
+    decl: Box<QueryDecl>,
     ordered_refusal: Option<String>,
     expects_expand: bool,
     params_raw: Option<String>,
@@ -718,9 +726,22 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut items: Vec<Item> = Vec::new();
     let mut open_loop: Option<(String, Vec<String>, Vec<Step>)> = None;
     let mut pending: Option<PendingStep> = None;
+    let mut awaiting_shape: Option<QueryStep> = None;
     let mut ordinal = 0usize;
     let mut qm_steps = 0usize;
     let mut substitutable_lines: HashSet<usize> = HashSet::new();
+
+    /// The refusal for a rows step whose `--- expect shape` did not arrive
+    /// next: any other section, or the end of the file, ends the case here.
+    fn missing_shape(step: &QueryStep) -> String {
+        let line = match &step.expect {
+            QueryExpect::Rows { span, .. } => span.start_line,
+            QueryExpect::Error { .. } => 0,
+        };
+        format!(
+            "line {line}: the rows expect needs an `--- expect shape` section directly after it; write it from the .pg schema, or fill it with OMNIGRAPH_GQ_BLESS=1 and review the diff"
+        )
+    }
 
     fn push_step(
         items: &mut Vec<Item>,
@@ -738,6 +759,11 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
             Some((k, rest)) => (k, rest),
             None => (section.name.as_str(), ""),
         };
+        if let Some(waiting) = &awaiting_shape
+            && !(kind == "expect" && rest.trim().starts_with("shape"))
+        {
+            return Err(missing_shape(waiting));
+        }
         match kind {
             "schema" | "seed" => {
                 return Err(format!(
@@ -793,7 +819,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     ordinal,
                     source: source.clone(),
                     name: decl.name.clone(),
-                    ast_params: decl.params.clone(),
+                    decl: Box::new(decl.clone()),
                     ordered_refusal: ordered_refusal(decl),
                     expects_expand: expects_expand(&decl.match_clause),
                     params_raw: None,
@@ -826,13 +852,41 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 step.params_raw = Some(body);
             }
             "expect" => {
+                if rest.trim() == "shape" {
+                    let Some(mut step) = awaiting_shape.take() else {
+                        return Err(format!(
+                            "line {}: `--- expect shape` must directly follow a query step's unordered or ordered expect",
+                            section.header_line + 1
+                        ));
+                    };
+                    let lines = parse_shape_body(&section.body)?;
+                    match &mut step.expect {
+                        QueryExpect::Rows { shape, .. } => {
+                            *shape = ShapeExpect {
+                                lines,
+                                span: BodySpan {
+                                    start_line: section.header_line + 1,
+                                    len: section.body.len(),
+                                },
+                            };
+                        }
+                        QueryExpect::Error { .. } => {
+                            return Err(format!(
+                                "line {}: internal: the step awaiting a shape section carries no rows expect",
+                                section.header_line + 1
+                            ));
+                        }
+                    }
+                    push_step(&mut items, &mut open_loop, Step::Query(step));
+                    continue;
+                }
+                let mode = parse_expect_header(rest)?;
                 let Some(step) = pending.take() else {
                     return Err(format!(
                         "line {}: `--- expect` has no query or mutate step to bind to",
                         section.header_line + 1
                     ));
                 };
-                let mode = parse_expect_header(rest)?;
                 let completed = match (&mode, step.is_mutation) {
                     (ExpectHeader::Unordered | ExpectHeader::Ordered, true) => {
                         return Err(
@@ -866,7 +920,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                             ordinal: step.ordinal,
                             source: step.source,
                             name: step.name,
-                            ast_params: step.ast_params,
+                            decl: step.decl,
                             params_raw: step.params_raw,
                             expects_expand: step.expects_expand,
                             expect: QueryExpect::Rows {
@@ -875,6 +929,13 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                 span: BodySpan {
                                     start_line: section.header_line + 1,
                                     len: section.body.len(),
+                                },
+                                shape: ShapeExpect {
+                                    lines: Vec::new(),
+                                    span: BodySpan {
+                                        start_line: 0,
+                                        len: 0,
+                                    },
                                 },
                             },
                         })
@@ -886,7 +947,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                 ordinal: step.ordinal,
                                 source: step.source,
                                 name: step.name,
-                                ast_params: step.ast_params,
+                                ast_params: step.decl.params,
                                 params_raw: step.params_raw,
                                 expect: MutateExpect::Error {
                                     needle: needle.clone(),
@@ -897,7 +958,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                 ordinal: step.ordinal,
                                 source: step.source,
                                 name: step.name,
-                                ast_params: step.ast_params,
+                                decl: step.decl,
                                 params_raw: step.params_raw,
                                 expects_expand: step.expects_expand,
                                 expect: QueryExpect::Error {
@@ -912,7 +973,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                             ordinal: step.ordinal,
                             source: step.source,
                             name: step.name,
-                            ast_params: step.ast_params,
+                            ast_params: step.decl.params,
                             params_raw: step.params_raw,
                             expect: MutateExpect::Ok,
                         })
@@ -923,7 +984,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                             ordinal: step.ordinal,
                             source: step.source,
                             name: step.name,
-                            ast_params: step.ast_params,
+                            ast_params: step.decl.params,
                             params_raw: step.params_raw,
                             expect: MutateExpect::Affected {
                                 nodes: *nodes,
@@ -932,7 +993,15 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         })
                     }
                 };
-                push_step(&mut items, &mut open_loop, completed);
+                match completed {
+                    Step::Query(
+                        step @ QueryStep {
+                            expect: QueryExpect::Rows { .. },
+                            ..
+                        },
+                    ) => awaiting_shape = Some(step),
+                    other => push_step(&mut items, &mut open_loop, other),
+                }
             }
             "restart" => {
                 if !rest.is_empty() {
@@ -990,6 +1059,9 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     }
     if pending.is_some() {
         return Err("the final step is missing its `--- expect`".into());
+    }
+    if let Some(waiting) = &awaiting_shape {
+        return Err(missing_shape(waiting));
     }
     if open_loop.is_some() {
         return Err("a loop is not closed with `--- endloop`".into());
@@ -1138,7 +1210,7 @@ fn compare_rows(
 struct StepFail {
     label: String,
     message: String,
-    bless_rows: Option<(BodySpan, Vec<String>)>,
+    bless_lines: Option<(BodySpan, Vec<String>)>,
 }
 
 fn step_label(ordinal: usize, kind: &str, binding: Option<(&str, &str)>) -> String {
@@ -1263,6 +1335,51 @@ fn expects_expand(clauses: &[Clause]) -> bool {
     })
 }
 
+/// Why the executed result disagrees with the schema the compiler inferred
+/// for `decl`, if it does: the column count, then per position the executed
+/// name, the Arrow type, and nulls in a column the compiler inferred non-null.
+fn schema_drift(decl: &QueryDecl, inferred: &Schema, result: &QueryResult) -> Option<String> {
+    let executed = result.schema();
+    if executed.fields().len() != inferred.fields().len() {
+        return Some(format!(
+            "result schema mismatch: the compiler inferred {} column(s), the executor returned {}",
+            inferred.fields().len(),
+            executed.fields().len()
+        ));
+    }
+    for (i, (want, got)) in inferred.fields().iter().zip(executed.fields()).enumerate() {
+        let proj = &decl.return_clause[i];
+        let name = executed_column_name(&proj.expr, proj.alias.as_deref());
+        if got.name() != &name {
+            return Some(format!(
+                "result schema mismatch at column {i}: expected name `{name}`, the executor returned `{}`",
+                got.name()
+            ));
+        }
+        if got.data_type() != want.data_type() {
+            let hint = if matches!(want.data_type(), DataType::Struct(_)) {
+                "; a bare node projection executes as the id column today and has no green shape until the engine returns the node object"
+            } else {
+                "; the compiler and the executor disagree: an engine defect to file, not a case error"
+            };
+            return Some(format!(
+                "result schema mismatch at column {i} `{name}`: the compiler inferred {:?}, the executor returned {:?}{hint}",
+                want.data_type(),
+                got.data_type()
+            ));
+        }
+        if !want.is_nullable() {
+            let nulls = shape::null_cells(result, i);
+            if nulls > 0 {
+                return Some(format!(
+                    "result schema mismatch at column {i} `{name}`: the compiler inferred it non-nullable, the executor returned {nulls} null(s)"
+                ));
+            }
+        }
+    }
+    None
+}
+
 async fn run_query_step(
     db: &Omnigraph,
     mode: Option<&'static str>,
@@ -1273,11 +1390,11 @@ async fn run_query_step(
     let fail = |message: String| StepFail {
         label: label.clone(),
         message,
-        bless_rows: None,
+        bless_lines: None,
     };
     // A params refusal is one of the ways "the query must fail": route it
     // into an `error:` expectation instead of always failing the step.
-    let params = match build_params(step.params_raw.as_ref(), &step.ast_params, binding) {
+    let params = match build_params(step.params_raw.as_ref(), &step.decl.params, binding) {
         Ok(params) => params,
         Err(e) => {
             return match &step.expect {
@@ -1309,8 +1426,34 @@ async fn run_query_step(
             ordered,
             body_raw,
             span,
+            shape,
         } => {
             let result = outcome.map_err(|e| fail(format!("query failed: {e}")))?;
+            let catalog = db.catalog();
+            let inferred = typecheck_query(&catalog, &step.decl)
+                .and_then(|ctx| infer_query_result_schema(&catalog, &step.decl, &ctx))
+                .map_err(|e| fail(format!("result schema inference failed: {e}")))?;
+            let drift = schema_drift(&step.decl, &inferred, &result);
+            if let Some(mismatch) = shape_mismatch(&shape.lines, &result, &inferred) {
+                let (message, bless_lines) = match (&drift, bless_shape_lines(&result)) {
+                    (Some(drift), _) => (
+                        format!(
+                            "{mismatch}\nthe executor disagrees with the compiler's schema, so bless does not rewrite the shape: {drift}"
+                        ),
+                        None,
+                    ),
+                    (None, Ok(lines)) => (mismatch, Some((shape.span, lines))),
+                    (None, Err(unspellable)) => (format!("{mismatch}\n{unspellable}"), None),
+                };
+                return Err(StepFail {
+                    label: label.clone(),
+                    message,
+                    bless_lines,
+                });
+            }
+            if let Some(drift) = drift {
+                return Err(fail(drift));
+            }
             let rows = result
                 .to_rust_json()
                 .map_err(|e| fail(format!("query rows failed to render as JSON: {e}")))?;
@@ -1321,7 +1464,7 @@ async fn run_query_step(
             compare_rows(&expected, &actual, *ordered).map_err(|(message, rows)| StepFail {
                 label: label.clone(),
                 message,
-                bless_rows: Some((*span, rows)),
+                bless_lines: Some((*span, rows)),
             })
         }
         QueryExpect::Error { needle } => match outcome {
@@ -1350,7 +1493,7 @@ async fn run_mutate_step(
     let fail = |message: String| StepFail {
         label: label.clone(),
         message,
-        bless_rows: None,
+        bless_lines: None,
     };
     let params = match build_params(step.params_raw.as_ref(), &step.ast_params, binding) {
         Ok(params) => params,
@@ -1468,15 +1611,15 @@ async fn execute_case(case: &Case, path: &Path, bless: bool) -> Result<(), Strin
     };
     let mut detail = format!("{}: {}", fail.label, fail.message);
     if bless {
-        if let Some((span, rows)) = &fail.bless_rows {
+        if let Some((span, lines)) = &fail.bless_lines {
             if case.has_loops() {
                 detail.push_str("\nbless: refused, the case contains loops");
             } else {
-                bless_rewrite(path, *span, rows)?;
+                bless_rewrite(path, *span, lines)?;
                 let _ = write!(
                     detail,
-                    "\nbless: expect rewritten in place ({} rows), re-run to confirm",
-                    rows.len()
+                    "\nbless: expect rewritten in place ({} lines), re-run to confirm",
+                    lines.len()
                 );
             }
         }
@@ -1484,33 +1627,33 @@ async fn execute_case(case: &Case, path: &Path, bless: bool) -> Result<(), Strin
     Err(detail)
 }
 
-fn splice_lines(original: &str, span: BodySpan, rows: &[String]) -> String {
-    let lines: Vec<&str> = original.lines().collect();
-    let body = &lines[span.start_line..span.start_line + span.len];
+fn splice_lines(original: &str, span: BodySpan, lines: &[String]) -> String {
+    let original_lines: Vec<&str> = original.lines().collect();
+    let body = &original_lines[span.start_line..span.start_line + span.len];
     let trailing_blanks = body
         .iter()
         .rev()
         .take_while(|l| l.trim().is_empty())
         .count();
-    let mut out: Vec<&str> = lines[..span.start_line].to_vec();
-    out.extend(rows.iter().map(String::as_str));
+    let mut out: Vec<&str> = original_lines[..span.start_line].to_vec();
+    out.extend(lines.iter().map(String::as_str));
     out.extend(std::iter::repeat_n("", trailing_blanks));
-    out.extend(&lines[span.start_line + span.len..]);
+    out.extend(&original_lines[span.start_line + span.len..]);
     let mut joined = out.join("\n");
     joined.push('\n');
     joined
 }
 
-fn bless_rewrite(path: &Path, span: BodySpan, rows: &[String]) -> Result<(), String> {
+fn bless_rewrite(path: &Path, span: BodySpan, lines: &[String]) -> Result<(), String> {
     let original =
         std::fs::read_to_string(path).map_err(|e| format!("bless: cannot re-read case: {e}"))?;
-    std::fs::write(path, splice_lines(&original, span, rows))
+    std::fs::write(path, splice_lines(&original, span, lines))
         .map_err(|e| format!("bless: cannot write case: {e}"))
 }
 
 /// Parses and executes one case file; `bless` rewrites a failing step's
-/// `--- expect` rows in place and still reports the step (`expect
-/// rewritten`), so the run stays red until the re-run confirms.
+/// `--- expect` rows or shape lines in place and still reports the step
+/// (`expect rewritten`), so the run stays red until the re-run confirms.
 pub async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
     let stem = stem_of(&path);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read case file: {e}"))?;

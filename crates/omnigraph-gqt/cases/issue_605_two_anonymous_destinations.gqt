@@ -31,6 +31,9 @@ query knows_anyone_twice() {
 {"p.name": "alice"}
 {"p.name": "bob"}
 
+--- expect shape
+p.name: String
+
 --- query
 query bound_twice() {
     match {
@@ -42,6 +45,9 @@ query bound_twice() {
 
 --- expect unordered
 {"p.name": "bob"}
+
+--- expect shape
+p.name: String
 
 --- query
 query bound_twice_in_negation() {
@@ -55,6 +61,9 @@ query bound_twice_in_negation() {
 --- expect unordered
 {"p.name": "alice"}
 
+--- expect shape
+p.name: String
+
 --- query
 query self_loop_twice() {
     match {
@@ -67,6 +76,9 @@ query self_loop_twice() {
 
 --- expect unordered
 {"p.name": "bob"}
+
+--- expect shape
+p.name: String
 
 --- query
 query rebind_inside_negation_non_root() {
@@ -85,3 +97,6 @@ query rebind_inside_negation_non_root() {
 --- expect unordered
 {"p.name": "alice"}
 {"p.name": "bob"}
+
+--- expect shape
+p.name: String

@@ -66,3 +66,7 @@ query recall($q: String) {
 --- expect ordered
 {"c.slug": "chunk-08", "a.slug": "art-0"}
 {"c.slug": "chunk-09", "a.slug": "art-0"}
+
+--- expect shape
+c.slug: String
+a.slug: String

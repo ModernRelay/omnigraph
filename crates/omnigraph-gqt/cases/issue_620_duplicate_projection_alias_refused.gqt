@@ -115,6 +115,10 @@ query distinct_aliases() {
 --- expect unordered
 {"who": "p", "how_many": 7}
 
+--- expect shape
+who: String
+how_many: I64
+
 --- query
 query property_and_aliased_aggregate() {
     match {
@@ -126,6 +130,10 @@ query property_and_aliased_aggregate() {
 --- expect unordered
 {"a.name": "p", "n": 1}
 
+--- expect shape
+a.name: String
+n: I64
+
 --- query
 query two_aliased_literals() {
     match {
@@ -136,3 +144,7 @@ query two_aliased_literals() {
 
 --- expect unordered
 {"one": 1, "two": 2}
+
+--- expect shape
+one: I64
+two: I64

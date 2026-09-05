@@ -1691,7 +1691,7 @@ fn infer_projection_field(
 /// spelling and names an unaliased property by the property alone; the two
 /// spellings drift for unaliased projections today, and this function
 /// follows the executor because T25 guards the batch the executor builds.
-fn executed_column_name(expr: &Expr, alias: Option<&str>) -> String {
+pub fn executed_column_name(expr: &Expr, alias: Option<&str>) -> String {
     if let Some(alias) = alias {
         return alias.to_string();
     }
