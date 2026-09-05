@@ -242,6 +242,21 @@ impl GraphCoordinator {
         })
     }
 
+    /// An operation-local source for native branch controls. Current table
+    /// state is copied; cached lineage and the Lance session are shared.
+    /// Callers must first probe the complete manifest incarnation. This copy
+    /// does not establish lineage completeness after a state-only refresh;
+    /// native creation uses only its manifest, and other uses must refresh.
+    pub(crate) fn capture_for_branch_control(&self) -> Self {
+        Self {
+            root_uri: self.root_uri.clone(),
+            storage: Arc::clone(&self.storage),
+            manifest: self.manifest.capture(),
+            commit_graph: self.commit_graph.capture(),
+            bound_branch: self.bound_branch.clone(),
+        }
+    }
+
     pub fn root_uri(&self) -> &str {
         &self.root_uri
     }
@@ -362,21 +377,20 @@ impl GraphCoordinator {
         self.manifest.native_branch()
     }
 
-    /// Every live native branch ref except `main` (logical names may differ).
-    pub(crate) async fn all_native_branches(&self) -> Result<Vec<String>> {
-        self.manifest.list_native_graph_branches().await
-    }
-
-    pub async fn branch_descendants(&self, name: &str) -> Result<Vec<String>> {
-        self.manifest
-            .descendant_branches(name)
-            .await
-            .map(|branches| {
-                branches
-                    .into_iter()
-                    .filter(|branch| !is_internal_system_branch(branch))
-                    .collect()
-            })
+    /// Capture deletion's native registry and descendants from one listing
+    /// while the caller holds the schema-control gate.
+    pub(crate) async fn native_branches_and_descendants(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let (natives, descendants) = self.manifest.native_branches_and_descendants(name).await?;
+        Ok((
+            natives,
+            descendants
+                .into_iter()
+                .filter(|branch| !is_internal_system_branch(branch))
+                .collect(),
+        ))
     }
 
     pub(crate) async fn branch_create(&mut self, name: &str) -> Result<()> {

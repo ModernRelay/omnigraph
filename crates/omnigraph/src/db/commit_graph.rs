@@ -63,6 +63,17 @@ pub(crate) struct CommitGraphSnapshot {
 }
 
 impl CommitGraph {
+    /// Capture this exact lineage view without copying historical commits.
+    /// Later updates use copy-on-write and cannot change the captured view.
+    pub(crate) fn capture(&self) -> Self {
+        Self {
+            root_uri: self.root_uri.clone(),
+            active_branch: self.active_branch.clone(),
+            commit_by_id: Arc::clone(&self.commit_by_id),
+            head_commit: self.head_commit.clone(),
+        }
+    }
+
     /// Seed the in-memory cache for a fresh graph from the `__manifest` genesis
     /// lineage (folded into the manifest init write — RFC-013 Phase 7). No Lance
     /// dataset is created or opened — the projection sees genesis identically to

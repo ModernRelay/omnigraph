@@ -241,8 +241,9 @@ pub struct Omnigraph {
     /// paths, and both live/open-time recovery). Sharing across independently
     /// opened handles is required because Restore/ref deletion is destructive.
     write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
-    /// One hot non-bound merge-authority coordinator, so a repeated merge
-    /// stops paying a fresh open with a full O(history) `__manifest` scan.
+    /// One hot non-bound authority coordinator, shared by merge preparation
+    /// and branch-source capture, so repeated operations stop paying a fresh
+    /// open with a full O(history) `__manifest` scan.
     /// Each use revalidates with the
     /// manifest-incarnation probe (the same currency the bound-branch fast
     /// path trusts, including the BranchIdentifier delete/recreate fence)
@@ -258,8 +259,8 @@ pub struct Omnigraph {
     /// state; its independent fresh graph-head CAS remains authoritative. A
     /// successful publish returns the updated coordinator, while failure drops
     /// the taken view so the next capture starts fresh.
-    /// The mutex serializes merge captures — acceptable because the schema
-    /// serial queue already serializes merges at capture time.
+    /// The mutex serializes captures — the schema serial queue already
+    /// serializes merges and branch controls at capture time.
     merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
     /// In-flight background fork reclaims spawned by `branch_delete`, keyed
     /// by the deleted branch name; joined by
@@ -1169,6 +1170,34 @@ impl Omnigraph {
         }
     }
 
+    /// Capture a source after the branch-control gates and recovery checks.
+    /// Reuse only a view whose complete manifest incarnation still matches;
+    /// the returned coordinator belongs to this operation and never changes
+    /// the handle's active branch. A miss uses the existing bounded authority
+    /// cache, whose refresh keeps manifest and lineage state coherent.
+    async fn capture_branch_control_source(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<GraphCoordinator> {
+        {
+            let coord = self.coordinator.read().await;
+            if branch == coord.current_branch() {
+                let held = coord.manifest_incarnation();
+                if coord.probe_latest_incarnation().await?.matches(&held) {
+                    return Ok(coord.capture_for_branch_control());
+                }
+            }
+        }
+        // Keep the large cold-open / incremental-refresh future out of every
+        // native-create caller's frame, as the merge capture already does.
+        let cache = Box::pin(self.validated_cached_coordinator(branch)).await?;
+        Ok(cache
+            .as_ref()
+            .expect("validated authority cache entry is present")
+            .1
+            .capture_for_branch_control())
+    }
+
     /// Open a capture-once write transaction (RFC-013 step 3b): validate the schema
     /// contract ONCE and pin the base snapshot. The per-table opens take
     /// `Option<&WriteTxn>` and, on the bound branch for the non-strict (Insert/Merge)
@@ -1593,6 +1622,30 @@ impl Omnigraph {
         CommitGraphSnapshot,
         crate::db::manifest::CapturedManifestProbe,
     )> {
+        let cache = self.validated_cached_coordinator(branch).await?;
+        let coord = &cache
+            .as_ref()
+            .expect("validated authority cache entry is present")
+            .1;
+        Ok((
+            coord.branch_identifier().await?,
+            coord.exact_graph_head(),
+            coord
+                .head_commit_id()
+                .await?
+                .map(|head| head.as_str().to_string()),
+            coord.snapshot(),
+            coord.commit_graph_snapshot(),
+            coord.captured_manifest_probe(),
+        ))
+    }
+
+    /// Select and freshly validate the existing single-entry authority cache.
+    /// Returning its guard keeps selection and capture in one critical section.
+    async fn validated_cached_coordinator(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<(String, GraphCoordinator)>>> {
         let key = branch.unwrap_or("main").to_string();
         let mut cache = self.merge_authority_cache.lock().await;
         if cache
@@ -1620,23 +1673,9 @@ impl Omnigraph {
             }
         } else {
             let coord = self.open_coordinator_for_branch(branch).await?;
-            *cache = Some((key.clone(), coord));
+            *cache = Some((key, coord));
         }
-        let coord = cache
-            .as_ref()
-            .map(|(_, coord)| coord)
-            .expect("merge authority cache entry inserted above");
-        Ok((
-            coord.branch_identifier().await?,
-            coord.exact_graph_head(),
-            coord
-                .head_commit_id()
-                .await?
-                .map(|head| head.as_str().to_string()),
-            coord.snapshot(),
-            coord.commit_graph_snapshot(),
-            coord.captured_manifest_probe(),
-        ))
+        Ok(cache)
     }
 
     /// Revalidate a prepared mutation/load attempt after its branch/table
@@ -2948,6 +2987,7 @@ impl Omnigraph {
         branch: &str,
         branches: &[String],
         natives: &[String],
+        descendants: &[String],
     ) -> Result<()> {
         // Surviving branches inherit forks by native ref, so dependency
         // detection compares against the delete target's native name.
@@ -2965,7 +3005,6 @@ impl Omnigraph {
             )));
         }
 
-        let descendants = control.branch_descendants(branch).await?;
         if let Some(descendant) = descendants.first() {
             return Err(OmniError::manifest_conflict(format!(
                 "cannot delete branch '{}' because descendant branch '{}' still depends on it",
@@ -3006,14 +3045,25 @@ impl Omnigraph {
                         })?,
                     ),
                 };
-                if crate::db::manifest::ManifestCoordinator::branch_depends_on_delete_target_under_control_gates(
-                    self.uri(),
-                    candidate_native.as_deref(),
-                    delete_target_native,
-                    session,
-                )
-                .await?
+                let depends = match self
+                    .verified_dependency_snapshot_under_control_gates(
+                        candidate_branch.as_deref(),
+                        candidate_native.as_deref(),
+                    )
+                    .await?
                 {
+                    Some(snapshot) => snapshot.datasets().any(|entry| {
+                        entry.native_dataset_branch.as_deref() == Some(delete_target_native)
+                    }),
+                    None => crate::db::manifest::ManifestCoordinator::branch_depends_on_delete_target_under_control_gates(
+                        self.uri(),
+                        candidate_native.as_deref(),
+                        delete_target_native,
+                        session,
+                    )
+                    .await?,
+                };
+                if depends {
                     return Err(OmniError::manifest_conflict(format!(
                         "cannot delete branch '{}' because branch '{}' still depends on it",
                         branch, other_branch
@@ -3031,6 +3081,38 @@ impl Omnigraph {
         }
 
         Ok(())
+    }
+
+    /// Reuse an already loaded dependency view only inside deletion's control
+    /// envelope. Its native ref must be the one just listed, and its complete
+    /// incarnation must still be current. Stale/missing views use the existing
+    /// manifest-only proof; unreadable authority still fails closed. This does
+    /// not populate or refresh the cache while surveying surviving branches.
+    async fn verified_dependency_snapshot_under_control_gates(
+        &self,
+        branch: Option<&str>,
+        native: Option<&str>,
+    ) -> Result<Option<Snapshot>> {
+        {
+            let coord = self.coordinator.read().await;
+            if coord.current_branch() == branch && coord.native_branch() == native {
+                let held = coord.manifest_incarnation();
+                if coord.probe_latest_incarnation().await?.matches(&held) {
+                    return Ok(Some(coord.snapshot()));
+                }
+            }
+        }
+        let cache = self.merge_authority_cache.lock().await;
+        if let Some((_, coord)) = cache.as_ref()
+            && coord.current_branch() == branch
+            && coord.native_branch() == native
+        {
+            let held = coord.manifest_incarnation();
+            if coord.probe_latest_incarnation().await?.matches(&held) {
+                return Ok(Some(coord.snapshot()));
+            }
+        }
+        Ok(None)
     }
 
     /// Best-effort reclaim of the per-table Lance forks a just-deleted branch
@@ -3320,7 +3402,9 @@ impl Omnigraph {
             .await?;
         self.ensure_schema_apply_not_locked("branch_create").await?;
         self.ensure_schema_state_valid().await?;
-        let mut source_coord = self.open_coordinator_for_branch(source.as_deref()).await?;
+        let mut source_coord = self
+            .capture_branch_control_source(source.as_deref())
+            .await?;
         validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
         let branches = source_coord.all_branches().await?;
         Self::ensure_branch_create_namespace_safe(&target, &branches)?;
@@ -3414,20 +3498,22 @@ impl Omnigraph {
         self.ensure_schema_apply_not_locked("branch_create_from")
             .await?;
         self.ensure_schema_state_valid().await?;
-        let mut source_coord = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        let mut source_coord = self
+            .capture_branch_control_source(branch.as_deref())
+            .await?;
         validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
         let branches = source_coord.all_branches().await?;
         Self::ensure_branch_create_namespace_safe(&target_branch, &branches)?;
-        // Operate on a freshly-opened source coordinator that's owned locally
-        // — never touch `self.coordinator`. The pre-fix implementation used
+        // Operate on a freshly verified source coordinator that's owned locally.
+        // The pre-fix implementation used
         // `swap_coordinator_for_branch` + operate + `restore_coordinator` as
         // three separate `coordinator.write().await` acquisitions; under
         // `&self` concurrency, a second `branch_create_from` could swap
         // self.coordinator between this caller's swap and operate steps,
         // making the operate run against the wrong source branch and
         // forking off the wrong HEAD. Pinned by
-        // `concurrent_branch_create_from_distinct_parents_does_not_corrupt_coordinator`
-        // in `crates/omnigraph-server/tests/server.rs`.
+        // the distinct-parent create pair in
+        // `crates/omnigraph-server/tests/multi_graph.rs`.
         //
         // The manifest ref write is durable regardless of which coordinator
         // handle issued it. Discarding `source_coord` after the call is the
@@ -3504,9 +3590,11 @@ impl Omnigraph {
             .open_coordinator_for_branch(Some(branch.as_str()))
             .await?;
         validate_bound_catalog_against_snapshot(&control_catalog, &target_control.snapshot())?;
-        // One ref listing serves the existence check, the namespace check,
-        // and every candidate's native ref for the dependency probe.
-        let natives = target_control.all_native_branches().await?;
+        // One ref listing serves existence, namespace, ancestry and every
+        // candidate's native ref for the dependency probe.
+        let (natives, descendants) = target_control
+            .native_branches_and_descendants(&branch)
+            .await?;
         let branches: Vec<String> = std::iter::once("main".to_string())
             .chain(
                 natives
@@ -3522,7 +3610,7 @@ impl Omnigraph {
             )));
         }
 
-        self.ensure_branch_delete_safe(&target_control, &branch, &branches, &natives)
+        self.ensure_branch_delete_safe(&target_control, &branch, &branches, &natives, &descendants)
             .await?;
         let (native, owned_tables) = self
             .delete_captured_branch_storage(&branch, &mut target_control)
