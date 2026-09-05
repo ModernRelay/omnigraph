@@ -118,7 +118,7 @@ pub(crate) struct CommitOutcome {
     pub parent_commit_id: Option<String>,
     /// Installed only after the graph coordinator has adopted its lineage.
     /// Absent if the successful publisher attempt had a different base.
-    projection: Option<ProjectionAccumulator>,
+    projection: Option<Box<ProjectionAccumulator>>,
 }
 
 /// The on-disk internal-schema stamp of `__manifest` at `branch` (main when
@@ -1716,7 +1716,7 @@ impl ManifestCoordinator {
     /// An intervening foreign publish keeps the existing full-refresh path.
     pub(crate) fn acknowledge_published_lineage(&mut self, outcome: &mut CommitOutcome) {
         if outcome.version == self.version() {
-            self.projection = outcome.projection.take().map(|p| (outcome.version, p));
+            self.projection = outcome.projection.take().map(|p| (outcome.version, *p));
         }
     }
 
