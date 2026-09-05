@@ -785,9 +785,25 @@ impl GraphCoordinator {
         actor_id: Option<&str>,
         merged_parent_commit_id: Option<String>,
     ) -> Result<LineageIntent> {
+        Self::new_lineage_intent_for_branch(
+            self.current_branch(),
+            actor_id,
+            merged_parent_commit_id,
+        )
+    }
+
+    /// Mint identity for an explicitly captured branch without reading graph
+    /// state. Parentage and branch authority are resolved by the publisher's
+    /// precondition; minting an ID and timestamp does not need a coordinator.
+    pub(crate) fn new_lineage_intent_for_branch(
+        branch: Option<&str>,
+        actor_id: Option<&str>,
+        merged_parent_commit_id: Option<String>,
+    ) -> Result<LineageIntent> {
+        let branch = normalize_branch_name(branch.unwrap_or("main"))?;
         Ok(LineageIntent {
             graph_commit_id: crate::dst_ids::new_ulid().to_string(),
-            branch: self.current_branch().map(str::to_string),
+            branch,
             actor_id: actor_id.map(str::to_string),
             merged_parent_commit_id,
             created_at: crate::db::now_micros()?,

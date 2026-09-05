@@ -314,7 +314,7 @@ fn merge_validation_is_delta_scoped() {
 }
 
 /// CLAIM 2: a merge's `__manifest` cost grows with commit-history depth on an
-/// un-compacted graph. The route performs four coherent manifest scans, and
+/// un-compacted graph. The bound route performs four coherent manifest scans (five for a non-bound target), and
 /// each surviving append-only journal fold scans O(fragments) of `__manifest`.
 /// Contrast with `write_cost.rs`, where a single write's manifest scan is held
 /// FLAT *after compaction* — here we deliberately do NOT compact, modelling the
@@ -324,85 +324,114 @@ fn merge_validation_is_delta_scoped() {
 fn merge_manifest_cost_grows_with_history() {
     on_big_stack(|| {
         cost_harness(async {
-            let dir = tempfile::tempdir().unwrap();
-            let mut db = local_graph(&dir).await;
+            for inactive_target in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut db = local_graph(&dir).await;
 
-            let mut curve: Vec<(u64, IoCounts)> = Vec::new();
-            let mut current = 0u64;
-            for d in [5u64, 80] {
-                if d > current {
-                    commit_many(&mut db, (d - current) as usize).await;
-                    current = d;
+                let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+                let mut current = 0u64;
+                for d in [5u64, 80] {
+                    if d > current {
+                        commit_many(&mut db, (d - current) as usize).await;
+                        current = d;
+                    }
+                    // Keep the handle bound to main in both variants. Named targets
+                    // must use captured authority without opening it again solely
+                    // to mint lineage or to begin the independently fenced publish.
+                    let target = if inactive_target {
+                        let target = format!("target_{d}");
+                        db.branch_create(&target).await.unwrap();
+                        target
+                    } else {
+                        "main".to_string()
+                    };
+                    let br = format!("feat_{d}");
+                    db.branch_create(&br).await.unwrap();
+                    db.mutate(
+                        &br,
+                        MUTATION_QUERIES,
+                        "insert_person",
+                        &mixed_params(&[("$name", &format!("p_{d}"))], &[("$age", 30)]),
+                    )
+                    .await
+                    .unwrap();
+                    current += 1; // the branch write advanced depth
+
+                    // Control single write at this depth, to quantify the merge's
+                    // manifest-open multiplication vs a normal write.
+                    let (cres, ctrl) = measure(db.mutate(
+                        &target,
+                        MUTATION_QUERIES,
+                        "insert_person",
+                        &mixed_params(&[("$name", &format!("c_{d}"))], &[("$age", 30)]),
+                    ))
+                    .await;
+                    cres.unwrap();
+                    current += 1;
+
+                    let (res, io) = measure(db.branch_merge(&br, &target)).await;
+                    assert_eq!(res.unwrap(), omnigraph::db::MergeOutcome::Merged);
+                    let merged = db
+                        .snapshot_of(omnigraph::db::ReadTarget::branch(&target))
+                        .await
+                        .unwrap();
+                    let people = merged.open_dataset("node:Person").await.unwrap();
+                    for name in [format!("p_{d}"), format!("c_{d}")] {
+                        assert_eq!(
+                            people
+                                .count_rows(Some(format!("name = '{name}'")))
+                                .await
+                                .unwrap(),
+                            1,
+                            "{target} must contain both sides after merge"
+                        );
+                    }
+                    current += 1; // the merge advanced depth
+
+                    eprintln!(
+                        "inactive_target={inactive_target} depth~{d}: MERGE manifest_reads={} data_reads={} data_open_count={} \
+                         internal_open_count={} manifest_scan_count={}  | single-write \
+                         manifest_reads={} internal_open_count={} manifest_scan_count={} \
+                         (merge/write ratio = {:.1}x)",
+                        io.manifest_reads,
+                        io.data_reads,
+                        io.data_open_count,
+                        io.internal_open_count,
+                        io.manifest_scan_count,
+                        ctrl.manifest_reads,
+                        ctrl.internal_open_count,
+                        ctrl.manifest_scan_count,
+                        io.manifest_reads as f64 / ctrl.manifest_reads.max(1) as f64,
+                    );
+                    curve.push((d, io));
                 }
-                let br = format!("feat_{d}");
-                db.branch_create(&br).await.unwrap();
-                db.mutate(
-                    &br,
-                    MUTATION_QUERIES,
-                    "insert_person",
-                    &mixed_params(&[("$name", &format!("p_{d}"))], &[("$age", 30)]),
-                )
-                .await
-                .unwrap();
-                current += 1; // the branch write advanced depth
 
-                // Control single write at this depth, to quantify the merge's
-                // manifest-open multiplication vs a normal write.
-                let (cres, ctrl) = measure(db.mutate(
-                    "main",
-                    MUTATION_QUERIES,
-                    "insert_person",
-                    &mixed_params(&[("$name", &format!("c_{d}"))], &[("$age", 30)]),
-                ))
-                .await;
-                cres.unwrap();
-                current += 1;
-
-                let (res, io) = measure(db.branch_merge(&br, "main")).await;
-                res.unwrap();
-                current += 1; // the merge advanced depth
-
-                eprintln!(
-                    "depth~{d}: MERGE manifest_reads={} data_reads={} data_open_count={} \
-                     internal_open_count={} manifest_scan_count={}  | single-write \
-                     manifest_reads={} internal_open_count={} manifest_scan_count={} \
-                     (merge/write ratio = {:.1}x)",
-                    io.manifest_reads,
-                    io.data_reads,
-                    io.data_open_count,
-                    io.internal_open_count,
-                    io.manifest_scan_count,
-                    ctrl.manifest_reads,
-                    ctrl.internal_open_count,
-                    ctrl.manifest_scan_count,
-                    io.manifest_reads as f64 / ctrl.manifest_reads.max(1) as f64,
-                );
-                curve.push((d, io));
+                // Regime A: merge __manifest cost still grows with history because
+                // each of the fixed-count coherent scans folds the uncompacted
+                // append-only journal.
+                assert_grows(&curve, |c| c.manifest_reads, 1, "merge __manifest scan");
+                // A named, non-bound target adds one coherent authority capture.
+                // Lineage minting and the cached starting publication view must
+                // not add two more full-history reads.
+                let manifest_ceiling = if inactive_target { 5 } else { 4 };
+                for (depth, io) in &curve {
+                    assert!(
+                        io.internal_open_count <= manifest_ceiling,
+                        "diverged merge inactive_target={inactive_target} at depth {depth} opened internal tables {} times; expected \
+                         <= {manifest_ceiling}",
+                        io.internal_open_count,
+                    );
+                    assert!(
+                        io.manifest_scan_count <= manifest_ceiling,
+                        "diverged merge inactive_target={inactive_target} at depth {depth} scanned __manifest {} times; expected \
+                         <= {manifest_ceiling}",
+                        io.manifest_scan_count,
+                    );
+                }
+                // But validation table-opens are now Δ-scoped: flat across history
+                // depth (the merge no longer scans the catalog's tables per merge).
+                assert_flat(&curve, |c| c.data_open_count, 1, "merge data-table opens");
             }
-
-            // Regime A: merge __manifest cost still grows with history because
-            // each of the fixed-count coherent scans folds the uncompacted
-            // append-only journal.
-            assert_grows(&curve, |c| c.manifest_reads, 1, "merge __manifest scan");
-            const DIVERGED_MERGE_MANIFEST_OPEN_CEILING: u64 = 4;
-            const DIVERGED_MERGE_MANIFEST_SCAN_CEILING: u64 = 4;
-            for (depth, io) in &curve {
-                assert!(
-                    io.internal_open_count <= DIVERGED_MERGE_MANIFEST_OPEN_CEILING,
-                    "diverged merge at depth {depth} opened internal tables {} times; expected \
-                     <= {DIVERGED_MERGE_MANIFEST_OPEN_CEILING}",
-                    io.internal_open_count,
-                );
-                assert!(
-                    io.manifest_scan_count <= DIVERGED_MERGE_MANIFEST_SCAN_CEILING,
-                    "diverged merge at depth {depth} scanned __manifest {} times; expected \
-                     <= {DIVERGED_MERGE_MANIFEST_SCAN_CEILING}",
-                    io.manifest_scan_count,
-                );
-            }
-            // But validation table-opens are now Δ-scoped: flat across history
-            // depth (the merge no longer scans the catalog's tables per merge).
-            assert_flat(&curve, |c| c.data_open_count, 1, "merge data-table opens");
         })
     });
 }
