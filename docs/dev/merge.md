@@ -26,7 +26,8 @@ The table classifier chooses one of four routes:
 1. **No change:** source contributes nothing.
 2. **Pointer adoption:** target still equals the base and the exact source table
    state can become the target's visible pointer without copying rows. A
-   first-touch lazy target stays on this ref-only route.
+   first-touch lazy target can use this ref-only route when the version check
+   below permits it.
 3. **Proven insertion replay:** target still permits data replay and the
    complete retained source interval proves a contiguous sequence of exact-ID,
    insertion-only transactions.
@@ -36,6 +37,16 @@ The table classifier chooses one of four routes:
 An optimization miss is not a merge failure. Missing transaction history,
 unknown certificate fields, incomplete ancestry, or an unfamiliar Lance shape
 falls back to the general route.
+
+Native Lance version numbers are local to each native branch. The manifest
+projection nevertheless selects the highest registered version for a table
+lifetime, so adopting a source version less than or equal to the target's
+version cannot safely replace its pointer. A nonempty source delta uses the
+existing target-lineage writer, creating a native target ref lazily when
+needed. A proved empty delta retains the target's complete table entry,
+including its native ref and version metadata. The version comparison selects
+the publication route; it never proves row equality. This rule also governs
+Blob preflight so validation and publication agree on which rows are copied.
 
 ## Proven insertion route
 

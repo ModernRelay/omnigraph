@@ -10,6 +10,11 @@ omnigraph branch merge review/2026-04-25 --into main \
 
 The source is positional. `--into` defaults to `main`.
 
+A merge preserves changes already integrated into a branch when you later
+merge that branch back. For example, after merging a new edge from `main`
+into `review`, editing only a node on `review` and merging it into `main`
+preserves that edge.
+
 ## Outcomes
 
 - **Already up to date**: the target already contains the source changes.

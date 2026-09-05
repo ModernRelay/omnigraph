@@ -10600,7 +10600,8 @@ async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
 /// (D2) — without `CommitGraph::open_at_branch`, the recovery sweep
 /// would record the global head as the merge parent on a non-main
 /// target, and future merges between the same pair would lose
-/// already-up-to-date detection.
+/// already-up-to-date detection. Fast-forwards from an equal or lower native
+/// source version must also recover the delta written onto the target ref.
 #[tokio::test]
 #[serial]
 #[serial(branch_merge_phase_b)]
@@ -10608,16 +10609,13 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let operation_id;
-
-    // Setup:
-    //   main: alice
-    //   target_branch (off main): + bob (target moved past base)
-    //   source_branch (off main): + carol (source moved past base)
-    // Merge: source_branch → target_branch
-    {
+    for (case, target_updates, source_branch) in [
+        ("three-way", 0, "source_branch"),
+        ("equal native versions", 2, "main"),
+        ("lower source native version", 8, "main"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
         let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
         load_jsonl(
             &db,
@@ -10628,85 +10626,201 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
         .await
         .unwrap();
         db.branch_create("target_branch").await.unwrap();
-        db.mutate(
-            "target_branch",
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Bob")], &[("$age", 40)]),
-        )
-        .await
-        .unwrap();
-        db.branch_create("source_branch").await.unwrap();
-        db.mutate(
-            "source_branch",
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Carol")], &[("$age", 50)]),
-        )
-        .await
-        .unwrap();
-    }
+        if target_updates == 0 {
+            // Preserve the divergent source/target merge coverage.
+            db.mutate(
+                "target_branch",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Bob")], &[("$age", 40)]),
+            )
+            .await
+            .unwrap();
+            db.branch_create(source_branch).await.unwrap();
+            db.mutate(
+                source_branch,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Carol")], &[("$age", 50)]),
+            )
+            .await
+            .unwrap();
+        } else {
+            // Replaying these updates onto main takes one native commit.
+            // Main then advances graph lineage while its table version remains
+            // equal to or lower than the target's independent native history.
+            for age in 40..40 + target_updates {
+                db.mutate(
+                    "target_branch",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "alice")], &[("$age", age)]),
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                db.branch_merge("target_branch", "main").await.unwrap(),
+                omnigraph::db::MergeOutcome::FastForward,
+                "{case}"
+            );
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "alice")], &[("$age", 50)]),
+            )
+            .await
+            .unwrap();
+        }
 
-    let main_person_pin = {
-        let db = Omnigraph::open(&uri).await.unwrap();
-        db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        let main_person_pin = db
+            .snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
             .dataset("node:Person")
             .expect("main must have Person")
-            .published_dataset_version
-    };
-    let target_parent_commit_id = branch_head_commit_id(dir.path(), "target_branch")
+            .published_dataset_version;
+        let source_person = db
+            .snapshot_of(ReadTarget::branch(source_branch))
+            .await
+            .unwrap()
+            .dataset("node:Person")
+            .unwrap()
+            .clone();
+        if target_updates > 0 {
+            let target_version = db
+                .snapshot_of(ReadTarget::branch("target_branch"))
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .published_dataset_version;
+            assert_eq!(
+                source_person.published_dataset_version.cmp(&target_version),
+                if target_updates == 2 {
+                    std::cmp::Ordering::Equal
+                } else {
+                    std::cmp::Ordering::Less
+                },
+                "fixture must exercise {case}"
+            );
+        }
+        let source_head = branch_head_commit_id(dir.path(), source_branch)
+            .await
+            .unwrap();
+        let target_parent_commit_id = branch_head_commit_id(dir.path(), "target_branch")
+            .await
+            .unwrap();
+        drop(db);
+
+        // The fixed effect set is confirmed, but graph publication has not
+        // happened. Recovery must publish it onto this non-main target.
+        let operation_id = {
+            let db = Omnigraph::open(&uri).await.unwrap();
+            let _failpoint = ScopedFailPoint::new(
+                names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+                "return",
+            );
+            let err = db
+                .branch_merge(source_branch, "target_branch")
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(
+                    "injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit"
+                ),
+                "{case}: unexpected error: {err}"
+            );
+            single_sidecar_operation_id(dir.path())
+        };
+
+        let db = Omnigraph::open(&uri).await.unwrap();
+        drop(db);
+        assert_post_recovery_invariants(
+            dir.path(),
+            &operation_id,
+            RecoveryExpectation::RolledForwardOriginalLineage {
+                tables: vec![
+                    TableExpectation::branch("node:Person", "target_branch")
+                        .expected_main_manifest_pin(main_person_pin)
+                        .expected_recovery_parent_commit_id(target_parent_commit_id),
+                ],
+            },
+        )
         .await
         .unwrap();
 
-    // Setup: failpoint fires after the per-table publish loop completes
-    // but before commit_manifest_updates. Sidecar persists with
-    // branch=Some("target_branch").
-    {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(
-            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
-        let err = db
-            .branch_merge("source_branch", "target_branch")
+        let recovered_source = db
+            .snapshot_of(ReadTarget::branch(source_branch))
             .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains(
-                "injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit"
-            ),
-            "unexpected error: {err}"
-        );
-        let recovery_dir = dir.path().join("__recovery");
-        let sidecar_count = std::fs::read_dir(&recovery_dir).unwrap().count();
+            .unwrap();
+        let recovered_source_person = recovered_source.dataset("node:Person").unwrap();
         assert_eq!(
-            sidecar_count, 1,
-            "exactly one sidecar must persist after non-main branch_merge failure"
+            recovered_source_person.published_dataset_version,
+            source_person.published_dataset_version,
+            "{case}: recovery must not advance the source table"
         );
-        operation_id = single_sidecar_operation_id(dir.path());
+        assert_eq!(
+            recovered_source_person.native_dataset_branch, source_person.native_dataset_branch,
+            "{case}: recovery must preserve the source ref"
+        );
+        assert_eq!(
+            branch_head_commit_id(dir.path(), source_branch)
+                .await
+                .unwrap(),
+            source_head,
+            "{case}: recovery must not change source lineage"
+        );
+        let recovered_commit =
+            omnigraph::db::commit_graph::CommitGraph::open_at_branch(&uri, "target_branch")
+                .await
+                .unwrap()
+                .head_commit()
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            recovered_commit.merged_parent_commit_id.as_deref(),
+            Some(source_head.as_str()),
+            "{case}: recovery must retain the captured source parent"
+        );
+        let expected = if target_updates == 0 {
+            vec![("Bob", 40), ("Carol", 50), ("alice", 30)]
+        } else {
+            vec![("alice", 50)]
+        };
+        let rows = helpers::read_table_branch(&db, "target_branch", "node:Person").await;
+        assert_eq!(
+            rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            expected.len(),
+            "{case}: recovery must retain every merged row"
+        );
+        for (name, expected_age) in expected {
+            let result = db
+                .query(
+                    ReadTarget::branch("target_branch"),
+                    TEST_QUERIES,
+                    "get_person",
+                    &params(&[("$name", name)]),
+                )
+                .await
+                .unwrap();
+            let batch = result.concat_batches().unwrap();
+            assert_eq!(batch.num_rows(), 1, "{case}: missing {name}");
+            assert_eq!(
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                expected_age,
+                "{case}: recovery must publish {name}'s captured source value"
+            );
+        }
     }
-
-    // Recovery: reopen runs full sweep. The BranchMerge sidecar's branch
-    // = Some("target_branch"); D2 fix opens a per-branch CommitGraph
-    // for the audit append so the merge-parent linkage is correct.
-    let db = Omnigraph::open(&uri).await.unwrap();
-    drop(db);
-
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledForwardOriginalLineage {
-            tables: vec![
-                TableExpectation::branch("node:Person", "target_branch")
-                    .expected_main_manifest_pin(main_person_pin)
-                    .expected_recovery_parent_commit_id(target_parent_commit_id),
-            ],
-        },
-    )
-    .await
-    .unwrap();
 }
 
 /// Contract: the BranchMerge sidecar's per-table `table_branch` MUST be
