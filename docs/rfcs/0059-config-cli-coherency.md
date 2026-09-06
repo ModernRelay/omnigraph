@@ -8,7 +8,7 @@ authors:
   - andrew
 created: 2026-09-06
 updated: 2026-09-06
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
 blocked_on: []
