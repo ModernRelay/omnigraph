@@ -73,6 +73,12 @@ Here, `Person.email` and `Company.slug` are single-property String keys, so thei
 derived ids are exactly `ada@example.com` and `acme`. The edge uses those ids in
 `from` and `to`.
 
+A `Date` value is an integer day count since 1970-01-01 or a `YYYY-MM-DD`
+string; a `DateTime` value is an integer millisecond count since the Unix epoch
+or an ISO 8601 string. Any other JSON type (a float such as `19723.0`, a
+boolean, an object) fails the load with `invalid Date value` or `invalid
+DateTime value` naming the property.
+
 Choose the mode explicitly:
 
 | Mode | Existing id | Use |

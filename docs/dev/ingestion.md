@@ -27,7 +27,7 @@ The HTTP handler authorizes both change and any requested branch creation before
 
 ### Compatibility loader
 
-`POST /graphs/{graph_id}/load` and the engine `load_as` accept a JSON envelope whose `data` field contains loader-compatible NDJSON. This preserves historical coercions and shapes that the strict graph-batch boundary intentionally refuses.
+`POST /graphs/{graph_id}/load` and the engine `load_as` accept a JSON envelope whose `data` field contains loader-compatible NDJSON. This preserves historical coercions and shapes that the strict graph-batch boundary intentionally refuses: a nullable scalar or list item of the wrong JSON type becomes NULL (a non-nullable property then refuses the load), and a list that is not a JSON array is refused. `Date` and `DateTime` are the exception on both paths: their string form already goes through a fallible parser, so a NULL for a wrong-typed value would be a lost error rather than a coercion, and such a value is refused with the property named.
 
 `POST /graphs/{graph_id}/ingest`, the CLI `ingest` command, and the engine `ingest*` methods are deprecated compatibility aliases over the same loader. They do not have a separate fast path or durability contract. New integrations use `load` or `/load/ndjson`.
 
