@@ -121,8 +121,9 @@ fn canonical_export_rows(bytes: &[u8]) -> Vec<String> {
     rows
 }
 
-/// v0.9 exported an F32 cell as widened 64-bit digits and a null cell as
-/// `"k":null`; the current writer prints 32-bit digits and omits the key.
+/// Every predecessor binary exported an F32 cell as widened 64-bit digits and
+/// a null cell as `"k":null`; the current writer prints 32-bit digits and
+/// omits the key.
 fn normalize_f32_and_nulls(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Number(number) if number.is_f64() => {
@@ -144,8 +145,10 @@ fn assert_export_fidelity(label: &str, original: &[u8], rebuilt: &[u8]) {
         nonblank_lines(rebuilt),
         "row count must round-trip {label}",
     );
-    let original_ml_intro = exported_row_with_slug(original, "ml-intro");
-    let rebuilt_ml_intro = exported_row_with_slug(rebuilt, "ml-intro");
+    let mut original_ml_intro = exported_row_with_slug(original, "ml-intro");
+    let mut rebuilt_ml_intro = exported_row_with_slug(rebuilt, "ml-intro");
+    normalize_f32_and_nulls(&mut original_ml_intro);
+    normalize_f32_and_nulls(&mut rebuilt_ml_intro);
     assert_eq!(
         rebuilt_ml_intro["data"]["embedding"], original_ml_intro["data"]["embedding"],
         "{label} rebuild must preserve vector values, not merely row count",
