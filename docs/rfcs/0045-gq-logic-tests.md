@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-05
+updated: 2026-09-06
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -385,9 +385,10 @@ list; no line ever continues a previous entry); a key given twice is
 refused, except `# notes:`, which repeats to carry a multi-line note;
 `# notes:` and `# traversal:` are optional. `# issue:` takes a number in canonical
 spelling (no sign, no leading zeros) or `none`; any other spelling is
-refused. `# traversal:` takes `indexed` or `csr` and pins every step to
-that mode, for cases whose subject is one traversal path (Execution
-semantics owns the default).
+refused. `# traversal:` takes `indexed` or `csr` and pins every
+declaration step to that mode, for cases whose subject is one traversal
+path (Execution semantics owns the default); a statement step traverses
+nothing and runs outside the pin.
 
 A file is: `--- schema`, then `--- seed`, then one or more steps, of
 which at least one is a query or mutate step; a file missing either
@@ -437,6 +438,37 @@ included) is refused. A step is one of:
   there is no row expect on a mutate step.
 - `--- restart`, body empty: drop the store handle and reopen it from the
   same URI before the next step.
+
+`--- query` and `--- mutate` take one optional argument, `branch: <name>`
+(a word, a colon, the trimmed remainder, the shape of `error:
+<substring>`), the branch a declaration step runs against; absent, `main`.
+The name is taken verbatim and unquoted, so a `/` needs no quoting there
+and a quoted name targets a branch whose name carries the quotes.
+Anything else after the section name is refused with the grammar. A
+`--- mutate` step may hold a ***control write*** (`branch create`, `branch
+delete`, `branch merge`) and a `--- query` step may hold `branch list`, the
+branch statements of RFC 0055; the compiler classifies the body, and the
+wrong kind is refused beside the read/mutation refusals (`a control write
+under `--- query` is refused; use `--- mutate``, ``branch list` under
+`--- mutate` is refused; use `--- query``). A statement step takes no
+`branch:` argument (`a branch statement names its branches itself; drop the
+`branch:` argument`) and no
+`--- params` (`a branch statement takes no params`); its name in labels is
+the statement's two words. `branch create` and `branch delete` take `ok` or
+`error: <substring>`; `branch merge` takes `ok`, `error: <substring>`, or
+`outcome: <word>`, body empty, `<word>` one of `already_up_to_date`,
+`fast_forward`, `merged`, asserting the engine's merge outcome. `ok` on a
+`branch merge` is satisfied by a no-op merge too (`already_up_to_date` is a
+success), so `outcome:` is what pins a landing; `outcome:`
+on any other step is refused, and so is `affected:` on a control write (no
+counts exist). `branch list` is a rows step: it takes `unordered`,
+`ordered`, or `error: <substring>` over rows `{"name": "…"}`, its rows are
+sorted by `name` in byte order (a total order, so `ordered` is accepted and
+the `order`-clause refusal for declarations does not apply), and it
+carries the mandatory shape section, one line, `name: String`. A statement
+step has no params, so an iterating value never reaches its body; `${` in a
+quoted statement name parses and is refused by the runner's `${` fence, and
+`${` anywhere else in a statement body does not parse.
 
 The read/mutation classification is the compiler's own
 (`query_body = { read_query_body | mutation_body }` in `query.pest`); the
@@ -523,21 +555,41 @@ scalar-index fallbacks keep non-search results correct, only slower.
 Then the steps run in file order against the case's handle:
 
 - A query step runs
-  `db.query(ReadTarget::branch("main"), query_source, name, &params)`.
-- A mutate step runs `db.mutate("main", query_source, name, &params)`; its
+  `db.query(ReadTarget::branch(branch), query_source, name, &params)`,
+  `branch` the step's `branch:` argument or `main`.
+- A mutate step runs `db.mutate(branch, query_source, name, &params)`; its
   `MutationResult` carries `affected_nodes` and `affected_edges`, compared
   against an `affected:` expect, ignored under `ok`.
+- A control write runs `branch_create_from_as` (from `main` when `from` is
+  unspelled), `branch_delete_as`, or `branch_merge_as` (into `main` when
+  `into` is unspelled), each with no actor, so a statement exercises the
+  compiler and the engine and never the server's policy dispatch. After a
+  `branch delete` the runner awaits `wait_for_fork_reclaims` before the
+  next step: the delete returns at the manifest flip and reclaims the
+  branch's forks in a background task, and no next step, reopen,
+  `branch list`, or teardown may overlap a fork delete still in flight
+  (dropping the handle detaches those tasks, it does not abort them). A
+  conflicting merge is an error
+  whose message begins `merge conflicts: `, so `ok` fails on it and
+  `error: merge conflicts` pins it.
+- `branch list` runs `branch_list` and presents the names as one non-null
+  `Utf8` column `name`, rows in byte order; the shape check holds against
+  that column as against any rows step, and the computed check against
+  the compiler's inferred schema is skipped, since a statement has no
+  declaration to infer from.
 - A restart step drops the handle and reopens with `Omnigraph::open(uri)`;
   later steps use the reopened handle. What survives the reopen is exactly
   what the store committed, which is what the step exists to pin.
 
 Traversal mode: by default a case runs on the production traversal
 path, with no override, so the corpus exercises the path that ships. A
-`# traversal:` header is an opt-in pin: every step of that case executes
-through the scoped seam
+`# traversal:` header is an opt-in pin: every declaration step of that case
+executes through the scoped seam
 `instrumentation::with_traversal_mode("indexed" | "csr", fut)`, and the
 index step runs for it regardless of the constructs the steps use, so the
-pinned path runs covered rather than on a fallback. The trade-off in one
+pinned path runs covered rather than on a fallback. A statement step
+traverses nothing, so it runs outside the seam and carries no pin. The
+trade-off in one
 sentence: the default corpus exercises the shipped path, and a pin
 reproduces a mode-specific defect. The `OMNIGRAPH_TRAVERSAL_MODE` process
 variable would reach an unpinned case, so every case fails with a
@@ -1349,3 +1401,53 @@ listed in Compatibility and reversibility.
     and refuses a struct that is no type's object. Superseded: File format
     "A bare node projection (`return { $p }`) has no green shape today ...
     no corpus case carries one until the engine returns the node object".
+- 2026-09-06, amendment from RFC 0055 (`0055-gq-branch-statements.md`,
+  Design, Logic tests), which adds branch statements to GQ. Trigger: the
+  merge-family findings (#583, #600, the seed-221206 re-adoption) are
+  five-step stories (fork, write, write, merge, read) the format could not
+  hold, since every step ran against `main` and no step could create,
+  merge, delete, or list a branch.
+  - File format, the step list: `--- query` and `--- mutate` take one
+    optional argument, `branch: <name>`; a `--- mutate` step may hold a
+    control write and a `--- query` step `branch list`, classified by the
+    compiler and refused under the wrong section; a statement step refuses
+    `branch:` and `--- params`; `branch merge` takes the new expect mode
+    `outcome: <word>`, refused on any other step; `affected:` is refused
+    on a control write; `branch list` is a rows step over `{"name": "…"}`
+    whose shape section is `name: String`. Superseded: "`--- query`
+    holding exactly one GQ declaration with a read body" and "`--- mutate`
+    holding exactly one GQ declaration with a mutation body" as the only
+    bodies a step holds.
+  - Execution semantics: a declaration step runs against its `branch:`
+    argument; a control write runs `branch_create_from_as`,
+    `branch_delete_as` (joined by `wait_for_fork_reclaims`), or
+    `branch_merge_as` with no actor; `branch list` runs `branch_list` and
+    is presented as one non-null `Utf8` column `name` in byte order, shape
+    checked, computed check skipped. Superseded: "A query step runs
+    `db.query(ReadTarget::branch("main"), …)`" and "A mutate step runs
+    `db.mutate("main", …)`" as the only targets.
+  - Compatibility: the fail-closed rule names sections and header keys;
+    for the step argument and the expect mode it rests on the runner's own
+    refusals (`takes no arguments`, `unknown expect mode`, and the refusal
+    of a statement body), so an older harness refuses a case using either
+    amendment and never mis-runs it.
+  - Invariant added: a `branch list` rows step that passes has one
+    non-null `Utf8` column `name` with its rows in byte order.
+  - 2026-09-06, from the implementation of that PR:
+    sentence rewrites in the sections this entry amends. Superseded: File
+    format "`# traversal:` takes `indexed` or `csr` and pins every step to
+    that mode" and Execution semantics "every step of that case executes
+    through the scoped seam", both of which read onto statement steps, which
+    traverse nothing and run outside the pin; Execution semantics "which a
+    following `--- restart` would otherwise drop with the handle" (the
+    reclaims are `JoinHandle`s with no `Drop` and no `abort`, so dropping the
+    handle detaches them; the join is there because no next step, reopen,
+    `branch list`, or teardown may overlap a fork delete still in flight);
+    File format "an iterating value never reaches it" and "`${` in a
+    statement body is refused as in any other step body" (a quoted name
+    carries `${` past the compiler and the runner's own fence refuses it);
+    File format's `branch: <name>` sentence, silent on the name being taken
+    verbatim and unquoted; File format's `branch merge` expect sentence,
+    silent on `ok` being satisfied by a no-op merge; and the refusal string
+    `a branch statement names its branches itself`, which now names the next
+    action. Frontmatter `updated:` bumped to 2026-09-06.

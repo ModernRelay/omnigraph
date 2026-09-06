@@ -67,6 +67,21 @@ omnigraph branch delete <branch-name> --store $REPO
 All support `--json`. `--delete-branch` removes the source only after a
 successful merge publication.
 
+Each operation is also a GQ statement through the data verbs. Wrong-door rule:
+`branch create`, `branch delete`, and `branch merge` are control writes and go
+through `mutate`; `branch list` is a read and goes through `query`. A statement
+takes no `--branch`, `--snapshot`, `--if-commit`, positional name, or `--params`.
+
+```bash
+omnigraph mutate -e 'branch create "<branch-name>" from main' --store $REPO
+omnigraph query  -e 'branch list' --format table --store $REPO
+omnigraph mutate -e 'branch merge "<branch-name>" into main' --store $REPO
+omnigraph mutate -e 'branch delete "<branch-name>"' --store $REPO   # --yes or a TTY answer against a non-local target
+```
+
+A name outside the identifier alphabet `[a-z_][a-z0-9_]*` is quoted (see
+[`data.md`](data.md)); quoting a name that needs no quotes is always allowed.
+
 ## Commits (History)
 
 ```bash
@@ -164,6 +179,7 @@ Aliases are read-only. Invoke a served stored mutation with `omnigraph mutate
 <name> --server ...`.
 
 > `query` and `mutate` also accept inline source via `-e/--query-string '<gq>'` instead of `--query <file>`.
+> The source may be one branch statement: `mutate -e 'branch create|delete|merge …'`, `query -e 'branch list'` (see Branches above).
 
 ## Maintenance
 

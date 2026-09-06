@@ -33,16 +33,16 @@ Common global flags:
 | `--yes` | Non-interactive consent for destructive writes to non-local storage |
 | `--quiet` | Suppress the resolved write target printed to stderr |
 
-Served writes ignore `--as`: the server derives the actor from the bearer
-token.
+A served write refuses `--as` ("`--as` is not allowed on a served write"): the
+server resolves the actor from the bearer token. Drop it, or use `--store <uri>`.
 
 ## Commands
 
 | Command | Purpose | Scope |
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
-| `query` | Run a read query | direct or served |
-| `mutate` | Run an insert/update/delete query | direct or served |
+| `query` | Run a read query, or the `branch list` statement | direct or served |
+| `mutate` | Run an insert/update/delete query, or a `branch create`, `branch delete`, or `branch merge` statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
 | `branch create/list/delete/merge` | Manage graph branches | direct or served |
@@ -104,14 +104,14 @@ Use `lint --store graph.omni --query actors.gq` for accepted types;
 
 For ad-hoc source, pass `--query <FILE>` or `-e/--query-string <GQ>`. When the
 source contains multiple declarations, the positional name selects one. For a
-stored server query, omit the source and pass its registry name.
+stored server query, omit the source and pass its registry name. Parameters
+come inline, `--params '{"name":"Ada"}'`, or from a file, `--params-file
+params.json`.
 
-Parameters can be supplied inline or from a file:
-
-```bash
---params '{"name":"Ada"}'
---params-file params.json
-```
+The source may instead be one branch statement, `mutate -e 'branch create b0'`
+or `query -e 'branch list'` (control writes through `mutate`, the listing
+through `query`), which takes no `--branch`, `--snapshot`, `--if-commit`, name,
+or params; see [Work with branches](index.md#work-with-branches).
 
 Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
@@ -335,7 +335,7 @@ for permissions, offline behavior, expiry, and local credential clearing.
 `cleanup` changes nothing until `--confirm` is present. Destructive operations
 against non-local storage also require interactive confirmation or `--yes`; in
 non-interactive and JSON modes they fail closed. The same non-local consent
-rule applies to overwrite loads and branch deletion.
+rule applies to overwrite loads and branch deletion, verb or statement.
 
 ## Compatibility aliases
 

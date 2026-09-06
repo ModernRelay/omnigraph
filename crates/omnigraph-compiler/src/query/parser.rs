@@ -20,16 +20,105 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Par
     let pairs = QueryParser::parse(Rule::query_file, input).map_err(pest_error_to_diagnostic)?;
 
     let mut queries = Vec::new();
+    let mut branch = None;
     for pair in pairs {
         if let Rule::query_file = pair.as_rule() {
             for inner in pair.into_inner() {
-                if let Rule::query_decl = inner.as_rule() {
-                    queries.push(parse_query_decl(inner).map_err(compiler_error_to_diagnostic)?);
+                match inner.as_rule() {
+                    Rule::branch_stmt => {
+                        branch = Some(parse_branch_stmt(inner)?);
+                    }
+                    Rule::statement_trailer => {
+                        return Err(ParseDiagnostic::new(
+                            "a branch statement stands alone in its file".to_string(),
+                            Some(pair_span(&inner)),
+                        ));
+                    }
+                    Rule::query_decl => {
+                        queries
+                            .push(parse_query_decl(inner).map_err(compiler_error_to_diagnostic)?);
+                    }
+                    _ => {}
                 }
             }
         }
     }
-    Ok(QueryFile { queries })
+    if let Some(stmt) = branch {
+        return Ok(QueryFile::Branch(stmt));
+    }
+    Ok(QueryFile::Queries(queries))
+}
+
+fn pair_span(pair: &pest::iterators::Pair<Rule>) -> SourceSpan {
+    let span = pair.as_span();
+    render_span(SourceSpan::new(span.start(), span.end()))
+}
+
+fn parse_branch_stmt(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<BranchStmt, ParseDiagnostic> {
+    let form = pair
+        .into_inner()
+        .find(|inner| inner.as_rule() != Rule::kw_branch)
+        .expect("grammar: branch_stmt holds one form after kw_branch");
+    let rule = form.as_rule();
+    let names = form
+        .into_inner()
+        .filter(|inner| inner.as_rule() == Rule::branch_name)
+        .map(parse_branch_name)
+        .collect::<std::result::Result<Vec<_>, ParseDiagnostic>>()?;
+    let mut names = names.into_iter();
+    match (rule, names.next(), names.next()) {
+        (Rule::branch_create, Some(name), from) => {
+            Ok(BranchStmt::Write(BranchWrite::Create { name, from }))
+        }
+        (Rule::branch_delete, Some(name), None) => {
+            Ok(BranchStmt::Write(BranchWrite::Delete { name }))
+        }
+        (Rule::branch_merge, Some(source), into) => {
+            Ok(BranchStmt::Write(BranchWrite::Merge { source, into }))
+        }
+        (Rule::branch_list, None, None) => Ok(BranchStmt::List),
+        (other, _, _) => {
+            unreachable!("grammar: every branch form fixes its name arity, got {other:?}")
+        }
+    }
+}
+
+fn parse_branch_name(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<String, ParseDiagnostic> {
+    let span = pair_span(&pair);
+    let token = pair
+        .into_inner()
+        .next()
+        .expect("grammar: branch_name wraps an ident or a string_lit");
+    let name = match token.as_rule() {
+        Rule::string_lit => {
+            parse_string_lit(token.as_str()).map_err(compiler_error_to_diagnostic)?
+        }
+        Rule::ident => token.as_str().to_string(),
+        other => unreachable!("grammar: branch_name admits no {other:?}"),
+    };
+    if name.chars().any(char::is_control) {
+        return Err(ParseDiagnostic::new(
+            format!("branch name {name:?} contains a control character"),
+            Some(span),
+        ));
+    }
+    if name.trim() != name {
+        return Err(ParseDiagnostic::new(
+            format!("branch name {name:?} has leading or trailing whitespace"),
+            Some(span),
+        ));
+    }
+    if name.is_empty() {
+        return Err(ParseDiagnostic::new(
+            format!("branch name {name:?} cannot be empty"),
+            Some(span),
+        ));
+    }
+    Ok(name)
 }
 
 fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {

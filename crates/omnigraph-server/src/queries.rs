@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::QueryDecl;
+use omnigraph_compiler::query::ast::{QueryDecl, QueryFile};
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query_decl;
 use omnigraph_compiler::types::{PropType, ScalarType};
@@ -106,31 +106,37 @@ impl QueryRegistry {
 
         for spec in specs {
             match parse_query(&spec.source) {
-                Ok(file) => match file.queries.into_iter().find(|q| q.name == spec.name) {
-                    Some(decl) => {
-                        by_name.insert(
-                            spec.name.clone(),
-                            StoredQuery {
-                                name: spec.name,
-                                source: Arc::from(spec.source),
-                                decl,
-                                expose: spec.expose,
-                                tool_name: spec.tool_name,
-                            },
-                        );
-                    }
-                    None => errors.push(LoadError {
-                        query: Some(spec.name.clone()),
-                        message: format!(
-                            "no `query {}` declaration found in its `.gq` file \
+                Ok(QueryFile::Branch(stmt)) => errors.push(LoadError {
+                    query: Some(spec.name),
+                    message: stmt.not_a_declaration_message(),
+                }),
+                Ok(QueryFile::Queries(queries)) => {
+                    match queries.into_iter().find(|q| q.name == spec.name) {
+                        Some(decl) => {
+                            by_name.insert(
+                                spec.name.clone(),
+                                StoredQuery {
+                                    name: spec.name,
+                                    source: Arc::from(spec.source),
+                                    decl,
+                                    expose: spec.expose,
+                                    tool_name: spec.tool_name,
+                                },
+                            );
+                        }
+                        None => errors.push(LoadError {
+                            query: Some(spec.name.clone()),
+                            message: format!(
+                                "no `query {}` declaration found in its `.gq` file \
                                  (the registry key must match the query symbol)",
-                            spec.name
-                        ),
-                    }),
-                },
+                                spec.name
+                            ),
+                        }),
+                    }
+                }
                 Err(err) => errors.push(LoadError {
                     query: Some(spec.name),
-                    message: format!("parse error: {err}"),
+                    message: err.to_string(),
                 }),
             }
         }
@@ -425,7 +431,21 @@ mod tests {
             QueryRegistry::from_specs(vec![spec("broken", "query broken( {{ not valid", false)])
                 .unwrap_err();
         assert_eq!(errors[0].query.as_deref(), Some("broken"));
-        assert!(errors[0].message.contains("parse error"));
+        let message = &errors[0].message;
+        assert!(message.starts_with("parse error: "), "{message}");
+        assert_eq!(message.matches("parse error:").count(), 1, "{message}");
+    }
+
+    #[test]
+    fn branch_statement_is_refused_per_entry() {
+        let errors =
+            QueryRegistry::from_specs(vec![spec("b0", "branch create b0", false)]).unwrap_err();
+        assert_eq!(errors[0].query.as_deref(), Some("b0"));
+        assert!(
+            errors[0].message.contains("branch statement"),
+            "{}",
+            errors[0].message
+        );
     }
 
     #[test]

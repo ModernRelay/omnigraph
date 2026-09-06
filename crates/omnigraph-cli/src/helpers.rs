@@ -4,6 +4,11 @@
 
 use std::io::IsTerminal;
 
+use omnigraph_api_types::{
+    ChangeRequest, QueryRequest, branch_statement_refusals, query_file_refusals,
+};
+use omnigraph_compiler::query::ast::{BranchStmt, BranchWrite, QueryFile};
+
 use super::*;
 use crate::operator;
 
@@ -843,19 +848,28 @@ pub(crate) fn load_params_json(params: &ParamsArgs) -> Result<Option<Value>> {
     }
 }
 
+/// Pick the query the caller named out of an already-parsed source. The
+/// `Branch` arm stays as the guard: a statement never reaches a declaration
+/// path.
 pub(crate) fn select_named_query(
-    query_source: &str,
+    query_file: QueryFile,
     requested_name: Option<&str>,
 ) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
-    let parsed = parse_query(query_source)?;
+    let queries = match query_file {
+        QueryFile::Queries(queries) => queries,
+        QueryFile::Branch(stmt) => {
+            bail!("{}", stmt.not_a_declaration_message())
+        }
+    };
     let query = if let Some(name) = requested_name {
-        parsed
-            .queries
+        queries
             .into_iter()
             .find(|query| query.name == name)
             .ok_or_else(|| color_eyre::eyre::eyre!("query '{}' not found", name))?
-    } else if parsed.queries.len() == 1 {
-        parsed.queries.into_iter().next().unwrap()
+    } else if queries.len() == 1 {
+        queries.into_iter().next().unwrap()
+    } else if queries.is_empty() {
+        bail!(query_file_refusals::NO_QUERY);
     } else {
         bail!("query file contains multiple queries; pass --name");
     };
@@ -869,6 +883,65 @@ pub(crate) fn query_params_from_json(
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
+}
+
+/// The server's refusal for a control write sent through `query`. The door
+/// rule and its rationale live on `refuse_wrong_door` in
+/// `crates/omnigraph-server/src/handlers/dispatch.rs`; this side only restates it.
+pub(crate) fn control_write_at_read_door(write: &BranchWrite) -> String {
+    branch_statement_refusals::with_statement(
+        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
+        write.statement_name(),
+    )
+}
+
+/// The server's refusal for `branch list` sent through `mutate`.
+pub(crate) fn read_at_write_door() -> String {
+    branch_statement_refusals::with_statement(
+        branch_statement_refusals::READ_AT_WRITE_DOOR,
+        BranchStmt::List.statement_name(),
+    )
+}
+
+/// The server's envelope refusals for a branch statement, checked in its
+/// order: a request target, then a query name or parameters, then a commit
+/// precondition. Runs before any round trip or engine open.
+pub(crate) fn refuse_statement_envelope(
+    has_target: bool,
+    has_name_or_params: bool,
+    has_expected_head: bool,
+) -> Result<()> {
+    if has_target {
+        bail!(branch_statement_refusals::REQUEST_TARGET);
+    }
+    if has_name_or_params {
+        bail!(branch_statement_refusals::NAME_OR_PARAMS);
+    }
+    if has_expected_head {
+        bail!(branch_statement_refusals::COMMIT_PRECONDITION);
+    }
+    Ok(())
+}
+
+/// The `POST /query` body for `branch list`: the source alone.
+pub(crate) fn branch_statement_query_request(query_source: &str) -> QueryRequest {
+    QueryRequest {
+        query: query_source.to_string(),
+        name: None,
+        params: None,
+        branch: None,
+        snapshot: None,
+    }
+}
+
+/// The `POST /mutate` body for a control write: the source alone.
+pub(crate) fn branch_statement_change_request(query_source: &str) -> ChangeRequest {
+    ChangeRequest {
+        query: query_source.to_string(),
+        name: None,
+        params: None,
+        branch: None,
+    }
 }
 
 pub(crate) async fn execute_query_lint(
@@ -1187,6 +1260,15 @@ mod tests {
         assert_eq!(
             graph_resource_id_for_selection(None, "/tmp/graph.omni"),
             "/tmp/graph.omni"
+        );
+    }
+
+    #[test]
+    fn select_named_query_refuses_a_branch_statement() {
+        let err = select_named_query(parse_query("branch create b0").unwrap(), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`branch create` is a branch statement, not a query declaration"
         );
     }
 
