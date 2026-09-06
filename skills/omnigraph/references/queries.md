@@ -355,7 +355,7 @@ Prefer ISO strings on both paths:
 | Path | Date | DateTime |
 |---|---|---|
 | `mutate --params` | ISO string `"2026-04-29"` | ISO string `"2026-04-29T10:00:00Z"` |
-| `load` JSONL | ISO string `"2026-04-29"` (integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` |
+| `load` JSONL | ISO string `"2026-04-29"` (integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` (integer epoch milliseconds also accepted) |
 
 Integer epoch days remain useful for generated Arrow-oriented input, but are
 not required for hand-authored JSONL.
