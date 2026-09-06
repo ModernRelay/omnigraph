@@ -1,37 +1,45 @@
 ---
-rfc: "0053"
+rfc: "0057"
 title: "Accepted-context reuse and bounded merge preparation"
 track: maintainer
-status: draft
-implementation: not-started
+status: accepted
+implementation: in-progress
 authors:
   - Codex
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-06
 discussion: https://github.com/ModernRelay/omnigraph/pull/638
 supersedes: []
 superseded_by: []
 blocked_on:
-  - Qualify aggregate preparation accounting, width fallback, and scratch cleanup with wide and skewed tables.
-  - Pass the authority, deterministic-result, Blob, and existing recovery regression matrix described below.
-  - Reproduce the latency benefit in a release build with the bounded production scheduler and a checked-in benchmark driver.
+  - Native decoder allocation and serial-valid acceptance qualification
+  - Useful parallel failure, fallback, Blob, cancellation, and recovery coverage
+  - Release performance gate and deployed AWS benchmark evidence
+  - Request-independent operation ownership before enabling HTTP parallelism
 ---
 
-# RFC 0053: Accepted-context reuse and bounded merge preparation
+# RFC 0057: Accepted-context reuse and bounded merge preparation
 
 ## Summary
 
-Make two focused changes to branch merge: open an existing owned target from
-the merge attempt's accepted context, and prepare up to four independent
-non-Blob tables concurrently. Retain the existing three-way classifier,
+Prepare up to four eligible non-Blob tables concurrently, using the merge
+attempt's accepted context. Retain the existing three-way classifier,
 combined graph validation, lock acquisition boundaries, recovery ownership,
 serial durable table effects, and single graph publication.
 
-An isolated prototype measured **2.35× faster eight-table merges** and
-**2.51× faster 29-table merges** with 17 ms added per physical storage request.
-This RFC productionizes that bounded change. It requires no Lance upgrade,
-storage migration, new transaction protocol, or public API. It does not make
+The earlier isolated prototype motivated this work; its measurements below
+are not results for the implementation in this RFC. This change requires no Lance upgrade,
+storage migration, new transaction protocol, or wire API. It does not make
 merge cost constant in catalog size, history depth, or unrelated fragments.
+
+The accepted-context opener is implemented in pending [PR #662](https://github.com/ModernRelay/omnigraph/pull/662),
+at `86aa508580097cf46fb4c32b55f053d41f98e412`; it is not shipped by this RFC.
+Pending [PR #668](https://github.com/ModernRelay/omnigraph/pull/668) adds the diagnostic scheduler
+on that base. The opener's historical savings must not be counted again as
+scheduler gains. That implementation extends the
+existing scenario harness with small multi-table fixtures, scoped width controls
+and delayed ObjectStore calls; that delay is an API-level diagnostic, not a
+claim of wire-level S3 latency equivalence.
 
 ## Motivation
 
@@ -74,7 +82,9 @@ This proposal does not improve branch create/delete directly or establish
 concurrent merges to different targets: the current exclusive coordination
 remains. Existing index defects and merge-base bugs require their own fixes.
 
-Concurrency is an internal cap, initially four. There is no new CLI flag,
+Concurrency is an internal cap of at most four. Production remains at one
+until the qualification gates pass; HTTP has a separate hard ceiling of one
+because its request owner cannot drain on disconnect. There is no new CLI flag,
 HTTP field, or environment-variable API. The prototype's
 `OMNIGRAPH_DESIGN_VARIANT` switch is investigation instrumentation only.
 
@@ -156,6 +166,42 @@ graph recovery intent, or publish graph content. Scratch ownership transfers
 to the existing candidate owner only when the collector accepts the result.
 
 ### 3. Bound the additional retained working set
+
+The initial scheduler drains fixed ordered windows before refilling. A singleton
+window uses serial preparation immediately. Source-state adoption is an ordered
+serial barrier because it can enter transaction-history proofs and their source
+normalizer; those allocation owners remain to be qualified. General non-Blob
+cursor, lineage, comparison and staging routes use shared preparation accounting. Small metadata is charged conservatively
+until collection, so a large merge may fall back earlier than its live bytes
+alone require. Scratch telemetry counts successful logical Arrow payload, not
+physical disk usage. Parallel scans set both the scanner and execution-context
+concurrency to one, one fragment of read-ahead, and an 8 MiB I/O buffer per
+scan. Typed stable row-ID masks keep hydration on the configured filtered-read
+path instead of Lance's take shortcut. Serial scans retain their existing
+tuning. The caller-owned allowance is not an RSS cap.
+
+Qualification admits only small, known V2.2 snapshots: at most 64 fragments,
+one data file per fragment, 8 MiB aggregate encoded data, and 8,192 physical
+rows. Unknown sizes/counts, overlays, any persisted index section and external
+row-ID metadata use serial fallback. Inline row-ID metadata and deletion
+counts are checked separately. The primary store and every referenced data or
+deletion base must report I/O parallelism no greater than 64. Qualification
+uses accepted metadata and existing store resolution; it does not HEAD unknown
+files, rewrite native base identities, or construct replacement stores.
+
+Inherited branch files retain their original base IDs. Lance 11 ignores the
+supplied 8 MiB scheduler for those files and constructs a native scheduler
+with `32 MiB * io_parallelism` soft capacity instead. Their decoder options
+still follow the configured reader path. The small-file gate narrows admitted
+encoded input; compressed file size does not bound decoded memory. Native
+decoder expansion and process RSS remain independent activation gates.
+
+The native resource envelope is separate: an ordered cursor retains its existing
+150 MiB spill pool and 100 GiB scratch ceiling. Three cursors per table and four
+workers can expose up to twelve such pools (1,800 MiB total capacity), not twelve
+fully allocated buffers. Native I/O buffers apply soft backpressure; an oversized
+page/request can exceed the requested 8 MiB. Qualification records process RSS
+as well as controlled retained bytes, and does not claim a 128 MiB process bound.
 
 Four workers alone are not a byte bound. Preserve the existing per-row,
 keyed-write, hydration, lineage-candidate, and operation-wide validation
@@ -287,8 +333,8 @@ different write phase.
 | Alternative | Assessment |
 |---|---|
 | Keep current behavior | Lowest change risk, but retains demonstrated repeated reads and avoidable serial wait. |
-| Ship context reuse alone | Valid first phase: about 1.13× in both multi-table fixtures. Smaller gain, independently useful. |
-| Parallelize only | About 1.90×/2.01× for eight/29 tables, but leaves the repeated opener work. |
+| Ship context reuse alone | Valid first phase: about 1.13× in both historical prototype multi-table fixtures. Smaller gain, independently useful. |
+| Parallelize only | Historical prototype: about 1.90×/2.01× for eight/29 tables, but leaves the repeated opener work. |
 | Global schema cache | Introduces lifetime/invalidation concerns and does not by itself reuse the accepted native binding. Attempt-local reuse is sufficient. |
 | Parallel durable commits or shorter locks | Changes recovery/interleaving obligations; unnecessary for the measured improvement. Requires a separate proposal. |
 | Replace comparison with Lance merge-insert | Lance upsert does not supply graph ancestry, three-way conflict semantics, or multi-table validation/publication. |
@@ -296,13 +342,98 @@ different write phase.
 
 ## Evidence and tests
 
-### Measured evidence and limits
+### Current implementation evidence and disposition
+
+The design is accepted; its implementation remains in the pending PR stack.
+The [portable diagnostic receipt](assets/0057-merge-preparation-diagnostics.json)
+records the paired samples, fixture parameters, resource settings, source
+identities, and executable hashes. These are local scenario-harness diagnostics,
+not an authoritative benchmark archive or a production latency prediction.
+
+The serial source is [cbd66386](https://github.com/ModernRelay/omnigraph/commit/cbd66386015f890a885d2e22998c7d7834fce141),
+based on PR #662's `86aa5085`, which already contains accepted-context reuse.
+The scheduler source is [28488d7c](https://github.com/ModernRelay/omnigraph/commit/28488d7c39cb547e551158dbfb614703a042a257).
+Both clean trees were built with the same bench release profile via
+`cargo bench --locked -p omnigraph-engine --bench scenarios --no-run --jobs 1`.
+No local compilation ran during measurement. Documentation corrections after
+these commits do not change the measured implementation.
+
+Five alternating matched pairs per point used 121 populated node tables,
+four rows per table (484 live rows per branch), and 17 ms delay per observed
+ObjectStore API call. Setup, the timed merge, and complete result verification
+ran in separate processes; the operation timer starts after graph open.
+The scheduler used a scoped diagnostic width-four override.
+
+| Touched tables | Serial median | Diagnostic width-four median | Ratio of medians |
+|---|---:|---:|---:|
+| 1 | 0.802 s | 0.812 s | 0.987× |
+| 8 | 3.619 s | 1.956 s | 1.85× |
+| 29 | 12.604 s | 6.598 s | 1.91× |
+
+Both multi-table points **fail the 2× activation gate**. The one-table change
+is approximately 1.34% slower, within the 10% regression allowance. Median
+paired ratios are 1.86× and 1.90× at eight and 29 tables and reach the same
+no-go conclusion. At 29 tables, candidate preparation takes 3.116 s and serial
+physical publication 3.096 s (47% of total). Both variants issue 741 delayed
+API calls: scheduling overlaps waits but does not remove this work.
+
+Two alternating pairs per history point used four populated/touched tables
+and 16 live rows. H16/H64 add real current-format writes and restore logical
+contents before divergence, keeping the live graph small.
+
+| Reachable history | Serial median | Diagnostic width-four median | Ratio of medians |
+|---|---:|---:|---:|
+| H0 | 2.022 s | 1.174 s | 1.72× |
+| H16 | 2.651 s | 1.839 s | 1.44× |
+| H64 | 4.353 s | 3.535 s | 1.23× |
+
+At H64, outer preparation (1.111 s) and manifest publication (1.391 s) consume
+about 71% of the new operation time; candidate preparation takes 0.490 s.
+Manifest reads rise from 13 at H0 to 269 at H64 in both variants. History
+resolution and publication therefore remain separate optimization work.
+These controls do not qualify every legacy physical format or migration path.
+
+All 58 timed merges passed separate setup and exact result verification,
+including source preservation and single graph publication. Peak measured
+whole-process RSS was 71.5 MiB and the largest persisted fixture 9.605 MiB.
+Runs were sequential at nice 15, with two Lance CPU/I/O, Tokio, and Rayon
+threads and `LANCE_MEM_POOL_SIZE=268435456`. Small-fixture RSS does not establish
+a native decoder bound. Production-default controls used an eight-table
+catalog: one touched table was 0.832 → 0.810 s; eight were 3.689 → 3.709 s
+(+0.55%). Zero-delay controls used 121 populated tables: one touched table
+was 24.456 → 24.171 ms; eight were 83.817 → 66.447 ms. Both controls used two
+pairs per point, adding 16 merges to the 30 main-matrix and 12 history merges.
+No production speedup is claimed.
+
+The delay and concurrency counters exclude GET body transfer, wire retries,
+and unwrapped scratch I/O. This is not S3 latency emulation, a cold-cache
+proof, or a p95 study. **The cloud AWS performance benchmark has not run.**
+AWS-feature correctness CI is separate evidence.
+
+[Implementation CI](https://github.com/ModernRelay/omnigraph/actions/runs/34030407884)
+at `28488d7c` passed 2,984 workspace tests (27 ignored, including a completed
+genuine v0.9 upgrade case among the passes) and 371 AWS-server tests
+(2 ignored). Local crate-local DST passed 78 tests with 30 ignored.
+Focused cases prove useful width-four overlap; broad default tests and DST
+do not qualify every parallel interleaving.
+
+Production therefore remains width one. Activation still requires native
+pre-decode allocation/serial-valid acceptance proof, useful parallel overlap
+in mixed scalar/Blob workloads while retaining the Blob serial barrier,
+failure/fallback/recovery coverage, and the stated performance evidence.
+Pinned Lance 11 exposes no supported pre-decode allocation cap for compressed
+indivisible rows; encoded-file eligibility and post-decode accounting do not
+supply that proof. HTTP additionally requires an operation owner that outlives
+a request and participates in shutdown drain. A real TCP disconnect drops the
+current request-owned future, so its hard width-one ceiling remains.
+
+### Historical prototype evidence and limits
 
 The experiment used Omnigraph commit
 `a09176d72601ce9c965de638cb4fc4179ab710c4`, Lance **11.0.0**, and upstream
 commit `ab6b5bbe46009ed78746b444df8db59a8bc5d842`. The retained
-[24-run CSV](assets/0053-merge-preparation-results.csv) and
-[investigation patch archive](assets/0053-merge-preparation-prototype.zip) establish
+[24-run CSV](assets/0057-merge-preparation-prototype-results.csv) and
+[investigation patch archive](assets/0057-merge-preparation-prototype.zip) establish
 which runs and code produced these observations. The archive preserves the
 exact patch bytes; CSV line endings are normalized without changing cells.
 The patch is evidence, not
@@ -385,12 +516,16 @@ ordinary CI.
 | Performance: `merge_cost.rs`, `write_cost_s3.rs`, shared instrumentation | Add a checked-in repeatable benchmark driver with exact fixture/build/store settings, separate elapsed and overlapping intervals, and export-based correctness checks. Record peak accounted bytes, allocation overshoot, active workers, requests/bytes, and fallback counts. |
 
 For the performance gate, use a release build and at least five paired,
-alternating repetitions of baseline versus the combined production design.
+alternating repetitions against a frozen serial base. The current comparison
+base already includes context reuse, so qualify the incremental scheduler gain
+without counting that earlier benefit twice.
 With the same eight- and 29-table, 17 ms fixtures, require at least **2.0×
 median speedup**. For the one-table fixture, require no more than **10% median
-regression**. These are proposed promotion thresholds, not measured release
-results. If they fail, context reuse may still ship independently; revise the
-parallel proposal using the observed bottleneck instead of claiming 2.5×.
+regression**. These are activation thresholds. The current release diagnostics
+pass the one-table regression control but fail both speedup thresholds. Context
+reuse may still ship independently; keep production width one and address the
+observed bottleneck instead of claiming the prototype's 2.5× or lowering the
+threshold to fit the result.
 
 Also qualify cold starts, 50 ms delay, bandwidth limits, jitter/throttling,
 wide/skewed rows, indexes, catalog size, history depth, and unrelated fragments.
@@ -437,11 +572,14 @@ The issues above track related performance and correctness work separately.
 
 ## Rollout
 
-1. Implement the private accepted-context opener and its cost/authority tests.
-   This can ship alone once its gates pass; mark implementation `partial`.
-2. Implement the ordered scheduler, operation-local accounting, width
-   fallback, and cleanup in existing merge/staging owners. Qualify with scoped
-   test controls at widths one, two, and four while retaining serial effects.
+1. Review and land the private accepted-context opener in pending PR #662
+   after its correctness dependency, PR #630. This can ship alone once its
+   gates pass; mark implementation `partial` when delivered.
+2. Review pending PR #668's ordered scheduler, operation-local accounting,
+   width fallback, and scratch ownership. It remains a diagnostic implementation
+   with production width one. Qualify useful overlap at scoped widths two and
+   four, including the remaining failure and recovery cases, while retaining
+   serial effects. Accepting this RFC does not merge either implementation PR.
 3. Enable the internal width-four cap only after every relevant correctness,
    resource, and release-benchmark gate passes. Update the measured evidence
    and mark implementation `complete` only when both changes are delivered.
@@ -469,3 +607,35 @@ requires a different policy.
 
 - 2026-09-05: Allocated 0053 for publication after checking current main and
   open RFC PRs; 0050 was already reserved by the engine-crate topology proposal.
+
+- 2026-09-06: The maintainer approved implementing the bounded-preparation plan.
+  Reallocated this proposal to 0054 because the implementation base reserves
+  0053 for retained merged ancestry; checked the registry and open RFC PRs.
+  Kept the existing accepted-context opener and publication protocol. The
+  resource, cancellation and release qualification gates remain required before
+  enabling the production cap.
+
+- 2026-09-06: A real TCP disconnect test confirmed that the pinned Axum/Hyper
+  HTTP/1 owner drops a pending merge service future. The HTTP entry therefore
+  retains a hard width-one ceiling, including under diagnostic overrides.
+  The same authorization and publication body serves both entry points. The
+  embedded path remains eligible for bounded preparation under the forced-drop
+  private-scratch contract above; a general served-operation supervisor is
+  outside this RFC.
+
+- 2026-09-06: Native-reader review found that inherited branch files bypass
+  the caller's I/O scheduler. Added conservative metadata eligibility rather
+  than altering Lance source identities. Small inherited fixtures can qualify
+  at diagnostic widths; unsupported layouts replay serially. This does not
+  establish a total-memory bound or waive production activation gates.
+
+- 2026-09-06: Consolidated the amended implementation proposal into this
+  canonical RFC under 0057. Main now owns 0053 and 0054 for other decisions;
+  0055 is allocated and PR #670 reserves 0056. Retained merged ancestry in
+  PR #662 is a separate draft, reallocated to 0058. The earlier 0053/0054
+  allocation entries above describe historical drafts, not current references.
+  Recorded the maintainer's approval to merge the design independently of
+  production activation. Current paired diagnostics supersede the prototype
+  as implementation evidence: the 2× gate is unmet, history work remains, and
+  AWS performance benchmarking has not run. Preserve the original prototype
+  archive bytes as historical evidence.
