@@ -93,6 +93,13 @@ stdout; and existing engine/server authorization and attribution tests.
 Run write, schema, merge, recovery and deterministic simulation suites to
 verify removal of the additional participant preserves graph atomicity.
 
+The early refusal reads the live and staged schema version on each open. The
+deterministic counting pass measures exactly two additional adapter GETs per
+open: setup increases by 2, audit by 6, and verification by 26. Every other
+counter remains unchanged, and both same-seed counting runs agree. The cost
+golden records this bounded compatibility check; it does not hide additional
+graph writes or Lance effects.
+
 ## Decision log
 
 - **2026-09-06:** Accepted and implemented the original default-materialization
