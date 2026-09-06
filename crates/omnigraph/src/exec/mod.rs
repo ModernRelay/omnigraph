@@ -43,7 +43,6 @@ use crate::graph_index::GraphIndex;
 use crate::storage_layer::SnapshotHandle;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
-pub(crate) mod actor_provenance;
 mod merge;
 mod mutation;
 mod projection;

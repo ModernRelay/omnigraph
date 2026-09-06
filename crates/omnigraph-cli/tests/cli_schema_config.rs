@@ -124,129 +124,20 @@ fn init_creates_graph_successfully_on_missing_local_directory() {
     assert!(graph.join("__manifest").exists());
     // RFC-008 stage 3: init no longer scaffolds the legacy config file.
     assert!(!temp.path().join("omnigraph.yaml").exists());
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let db = Omnigraph::open_read_only(graph.to_str().unwrap())
-            .await
-            .unwrap();
-        assert!(db.actor_provenance_enabled().await.unwrap());
-    });
-    let shown = output_success(cli().args(["schema", "show", "--json"]).arg(&graph));
-    let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
-    assert_eq!(shown["schema_source"], fs::read_to_string(&schema).unwrap());
-    assert_eq!(
-        shown["accepted_schema"]["actor_provenance"]["enabled"],
-        true
-    );
-    assert!(
-        shown["accepted_schema"]["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|node| node["name"] == "OmniActor")
-    );
-    let human = stdout_string(&output_success(cli().args(["schema", "show"]).arg(&graph)));
-    assert!(human.contains("Customer schema source (.pg):"));
-    assert!(human.contains("System type: OmniActor { actorId: String @key }"));
-    let actors_query = temp.path().join("actors.gq");
-    fs::write(
-        &actors_query,
-        "query actors() { match { $a: OmniActor } return { $a.actorId } }",
-    )
-    .unwrap();
-    let lint = output_success(
-        cli()
-            .args(["lint", "--store"])
-            .arg(&graph)
-            .arg("--query")
-            .arg(&actors_query)
-            .arg("--json"),
-    );
-    let lint: Value = serde_json::from_slice(&lint.stdout).unwrap();
-    assert_eq!(lint["schema_source"]["kind"], "graph");
-    let unbound = output_failure(
-        cli()
-            .args(["lint", "--schema"])
-            .arg(&schema)
-            .arg("--query")
-            .arg(&actors_query)
-            .arg("--json"),
-    );
-    let unbound: Value = serde_json::from_slice(&unbound.stdout).unwrap();
-    assert_eq!(unbound["status"], "error");
 }
 
 #[test]
-fn schema_actor_provenance_options_preserve_and_plan_explicit_transitions() {
+fn schema_show_preserves_plain_source_and_json_contract() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let schema = fixture("test.pg");
-    output_success(
-        cli()
-            .arg("init")
-            .arg("--schema")
-            .arg(&schema)
-            .args(["--actor-provenance", "false"])
-            .arg(&graph),
-    );
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let accepted = || {
-        runtime.block_on(async {
-            Omnigraph::open_read_only(graph.to_str().unwrap())
-                .await
-                .unwrap()
-                .actor_provenance_enabled()
-                .await
-                .unwrap()
-        })
-    };
-    assert!(!accepted());
-    for enabled in [true, false, true] {
-        let value = enabled.to_string();
-        let plan = output_success(
-            cli()
-                .args(["schema", "plan", "--schema"])
-                .arg(&schema)
-                .args(["--actor-provenance", &value, "--json"])
-                .arg(&graph),
-        );
-        let plan: Value = serde_json::from_slice(&plan.stdout).unwrap();
-        assert!(
-            plan["steps"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|step| step["kind"] == "set_actor_provenance" && step["enabled"] == enabled),
-            "{plan}"
-        );
-        assert_eq!(accepted(), !enabled, "planning must be read-only");
-        let applied = output_success(
-            cli()
-                .args(["schema", "apply", "--schema"])
-                .arg(&schema)
-                .args(["--actor-provenance", &value, "--json"])
-                .arg(&graph),
-        );
-        let applied: Value = serde_json::from_slice(&applied.stdout).unwrap();
-        assert_eq!(applied["applied"], true);
-        assert_eq!(accepted(), enabled);
-        let omitted = output_success(
-            cli()
-                .args(["schema", "apply", "--schema"])
-                .arg(&schema)
-                .arg("--json")
-                .arg(&graph),
-        );
-        let omitted: Value = serde_json::from_slice(&omitted.stdout).unwrap();
-        assert_eq!(omitted["applied"], false);
-        assert_eq!(accepted(), enabled);
-    }
-    output_failure(
-        cli()
-            .args(["schema", "plan", "--schema"])
-            .arg(&schema)
-            .args(["--actor-provenance", "yes"])
-            .arg(&graph),
-    );
+    init_graph(&graph);
+    let source = fs::read_to_string(fixture("test.pg")).unwrap();
+
+    let plain = output_success(cli().args(["schema", "show"]).arg(&graph));
+    assert_eq!(stdout_string(&plain).trim_end(), source.trim_end());
+    let json = output_success(cli().args(["schema", "show", "--json"]).arg(&graph));
+    let payload: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(payload, serde_json::json!({ "schema_source": source }));
 }
 
 #[test]

@@ -579,9 +579,6 @@ pub(crate) fn print_schema_plan_human(uri: &str, plan: &SchemaMigrationPlan) {
 
 pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
     match step {
-        SchemaMigrationStep::SetActorProvenance { enabled } => {
-            format!("set actor provenance to {enabled}")
-        }
         SchemaMigrationStep::AddType { type_kind, name } => {
             format!("add {} type '{}'", schema_type_kind_label(*type_kind), name)
         }

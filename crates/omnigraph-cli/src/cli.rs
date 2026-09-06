@@ -292,9 +292,6 @@ pub(crate) enum Command {
         /// overwrites an initialized graph or purges its Lance datasets.
         #[arg(long)]
         force: bool,
-        /// Materialize attributed writers as OmniActor nodes (default: true).
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        actor_provenance: Option<bool>,
     },
     /// Compact small Lance fragments in every backing dataset of the graph
     Optimize {
@@ -763,9 +760,6 @@ pub(crate) enum SchemaCommand {
         /// so the plan output reflects the destructive intent.
         #[arg(long, default_value_t = false)]
         allow_data_loss: bool,
-        /// Change automatic actor materialization; omission preserves the accepted setting.
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        actor_provenance: Option<bool>,
     },
     /// Apply a supported schema migration
     Apply {
@@ -786,11 +780,8 @@ pub(crate) enum SchemaCommand {
         /// making the prior data unreachable.
         #[arg(long, default_value_t = false)]
         allow_data_loss: bool,
-        /// Change automatic actor materialization; omission preserves the accepted setting.
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        actor_provenance: Option<bool>,
     },
-    /// Show customer source and effective system types; --json includes the accepted schema
+    /// Show the current accepted schema source
     #[command(alias = "get")]
     Show {
         /// Graph URI

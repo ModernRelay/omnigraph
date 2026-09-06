@@ -25,20 +25,7 @@ use super::schema_shape::{
     SchemaShape, ShapePropertyRef, constraint_sort_key, schema_shape_hash,
 };
 
-/// Latest accepted schema format. Version 2 remains byte-compatible when unbound.
-pub const SCHEMA_IR_VERSION: u32 = 3;
-pub const LEGACY_SCHEMA_IR_VERSION: u32 = 2;
-pub const ACTOR_TYPE_NAME: &str = "OmniActor";
-pub const ACTOR_ID_PROPERTY_NAME: &str = "actorId";
-
-/// Durable identity of the engine-owned actor table; retained when disabled.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ActorProvenanceBinding {
-    pub enabled: bool,
-    pub type_id: StableTypeId,
-    pub table_incarnation_id: TableIncarnationId,
-    pub actor_id_property_id: StablePropertyId,
-}
+pub const SCHEMA_IR_VERSION: u32 = 2;
 
 /// Opaque namespace for every numeric identity in one graph root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -155,8 +142,6 @@ pub struct SchemaIR {
     pub interfaces: Vec<InterfaceIR>,
     pub nodes: Vec<NodeIR>,
     pub edges: Vec<EdgeIR>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actor_provenance: Option<ActorProvenanceBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -358,158 +343,13 @@ pub fn initialize_schema_ir(
 
 /// Resolve evolution against the one accepted identity authority.
 pub fn resolve_schema_ir(accepted: &SchemaIR, shape: &SchemaShape) -> Result<SchemaResolution> {
-    resolve_schema_ir_with_actor_provenance(accepted, shape, None)
-}
-
-/// Initialize the requested actor binding without changing customer source semantics.
-pub fn initialize_schema_ir_with_actor_provenance(
-    domain: SchemaIdentityDomain,
-    shape: &SchemaShape,
-    enabled: bool,
-) -> Result<SchemaResolution> {
-    if !enabled {
-        return initialize_schema_ir(domain, shape);
-    }
-    let shape = augment_actor_shape(shape)?;
-    let mut resolution = resolve(domain, 1, None, &shape)?;
-    bind_actor(&mut resolution.schema_ir, true)?;
-    Ok(resolution)
-}
-
-/// Evolve customer source while retaining the protected table and its identity.
-/// Omission preserves legacy absence as well as an existing enabled/disabled binding.
-pub fn resolve_schema_ir_with_actor_provenance(
-    accepted: &SchemaIR,
-    shape: &SchemaShape,
-    enabled: Option<bool>,
-) -> Result<SchemaResolution> {
     validate_schema_ir(accepted)?;
-    if accepted.actor_provenance.is_none()
-        && enabled == Some(true)
-        && (accepted
-            .nodes
-            .iter()
-            .any(|node| node.name == ACTOR_TYPE_NAME)
-            || accepted
-                .interfaces
-                .iter()
-                .any(|entry| entry.name == ACTOR_TYPE_NAME)
-            || accepted
-                .edges
-                .iter()
-                .any(|entry| entry.name == ACTOR_TYPE_NAME))
-    {
-        return resolution_error("cannot adopt an unbound OmniActor declaration; rename it in a separate schema migration before enabling actor provenance".to_string());
-    }
-    let has_binding = accepted.actor_provenance.is_some() || enabled == Some(true);
-
-    let augmented = has_binding
-        .then(|| augment_actor_shape(shape))
-        .transpose()?;
-    let mut resolution = resolve(
+    resolve(
         accepted.schema_identity_domain.clone(),
         accepted.next_identity_id,
         Some(accepted),
-        augmented.as_ref().unwrap_or(shape),
-    )?;
-    if has_binding {
-        bind_actor(
-            &mut resolution.schema_ir,
-            enabled.unwrap_or_else(|| {
-                accepted
-                    .actor_provenance
-                    .as_ref()
-                    .is_some_and(|b| b.enabled)
-            }),
-        )?;
-        if let Some(previous) = &accepted.actor_provenance {
-            let next = resolution
-                .schema_ir
-                .actor_provenance
-                .as_ref()
-                .expect("just bound");
-            if previous.type_id != next.type_id
-                || previous.table_incarnation_id != next.table_incarnation_id
-                || previous.actor_id_property_id != next.actor_id_property_id
-            {
-                return resolution_error("protected OmniActor identity cannot change".to_string());
-            }
-        }
-    }
-    Ok(resolution)
-}
-
-fn actor_node_shape() -> NodeShape {
-    NodeShape {
-        name: ACTOR_TYPE_NAME.to_string(),
-        rename_from: None,
-        annotations: Vec::new(),
-        implements: Vec::new(),
-        properties: vec![PropertyShape {
-            name: ACTOR_ID_PROPERTY_NAME.to_string(),
-            rename_from: None,
-            prop_type: PropType::scalar(crate::types::ScalarType::String, false),
-            annotations: Vec::new(),
-            property_constraints: vec![PropertyConstraintShape::Key],
-            embed_source: None,
-            declared_directly: true,
-            satisfies_interface_properties: Vec::new(),
-        }],
-        constraints: vec![Constraint::Key(vec![ACTOR_ID_PROPERTY_NAME.to_string()])],
-    }
-}
-
-fn augment_actor_shape(shape: &SchemaShape) -> Result<SchemaShape> {
-    if shape
-        .interfaces
-        .iter()
-        .any(|entry| entry.name == ACTOR_TYPE_NAME)
-        || shape
-            .nodes
-            .iter()
-            .any(|entry| entry.name == ACTOR_TYPE_NAME)
-        || shape
-            .edges
-            .iter()
-            .any(|entry| entry.name == ACTOR_TYPE_NAME)
-    {
-        return resolution_error("OmniActor is reserved for the engine-owned actor binding; rename an existing domain declaration before enabling actor provenance".to_string());
-    }
-    let mut augmented = shape.clone();
-    augmented.nodes.push(actor_node_shape());
-    augmented
-        .nodes
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(augmented)
-}
-
-fn bind_actor(ir: &mut SchemaIR, enabled: bool) -> Result<()> {
-    let node = ir
-        .nodes
-        .iter()
-        .find(|node| node.name == ACTOR_TYPE_NAME)
-        .ok_or_else(|| {
-            SchemaIdentityError::Resolution(
-                "actor augmentation did not produce OmniActor".to_string(),
-            )
-        })?;
-    let property = node
-        .properties
-        .iter()
-        .find(|property| property.name == ACTOR_ID_PROPERTY_NAME)
-        .ok_or_else(|| {
-            SchemaIdentityError::Resolution(
-                "actor augmentation did not produce actorId".to_string(),
-            )
-        })?;
-    ir.actor_provenance = Some(ActorProvenanceBinding {
-        enabled,
-        type_id: node.type_id,
-        table_incarnation_id: node.table_incarnation_id,
-        actor_id_property_id: property.property_id,
-    });
-    ir.ir_version = SCHEMA_IR_VERSION;
-    validate_schema_ir(ir)
+        shape,
+    )
 }
 
 fn resolve(
@@ -809,13 +649,12 @@ fn resolve(
         .collect::<Result<Vec<_>>>()?;
 
     let schema_ir = SchemaIR {
-        ir_version: LEGACY_SCHEMA_IR_VERSION,
+        ir_version: SCHEMA_IR_VERSION,
         schema_identity_domain: domain,
         next_identity_id: allocator.next,
         interfaces,
         nodes,
         edges,
-        actor_provenance: None,
     };
     validate_schema_ir(&schema_ir)?;
     Ok(SchemaResolution {
@@ -1225,16 +1064,12 @@ pub(crate) fn constraint_from_ir(constraint: &ConstraintIR) -> Constraint {
 
 /// Fail closed on malformed or hand-authored identity authority.
 pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
-    if !matches!(
-        (ir.ir_version, ir.actor_provenance.is_some()),
-        (LEGACY_SCHEMA_IR_VERSION, false) | (SCHEMA_IR_VERSION, true)
-    ) {
+    if ir.ir_version != SCHEMA_IR_VERSION {
         return invalid_ir(format!(
-            "unsupported ir_version {} or actor binding (expected version 2 without a binding or version 3 with a binding)",
+            "unsupported ir_version {} (expected {SCHEMA_IR_VERSION})",
             ir.ir_version
         ));
     }
-    validate_actor_binding(ir)?;
     SchemaIdentityDomain::parse(ir.schema_identity_domain.as_str())?;
     if ir.next_identity_id == 0 {
         return invalid_ir("next_identity_id must be nonzero".to_string());
@@ -1472,48 +1307,6 @@ pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
     Ok(())
 }
 
-fn validate_actor_binding(ir: &SchemaIR) -> Result<()> {
-    let Some(binding) = &ir.actor_provenance else {
-        return Ok(());
-    };
-    let Some(node) = ir.nodes.iter().find(|node| node.type_id == binding.type_id) else {
-        return invalid_ir("actor binding names a missing node identity".to_string());
-    };
-    let expected = actor_node_shape();
-    if node.name != ACTOR_TYPE_NAME
-        || node.table_incarnation_id != binding.table_incarnation_id
-        || !node.annotations.is_empty()
-        || !node.implements.is_empty()
-        || node.properties.len() != 1
-        || node.properties[0].property_id != binding.actor_id_property_id
-        || property_shape_from_ir(&node.properties[0]) != expected.properties[0]
-        || node
-            .constraints
-            .iter()
-            .map(constraint_from_ir)
-            .collect::<Vec<_>>()
-            != expected.constraints
-        || ir
-            .interfaces
-            .iter()
-            .any(|entry| entry.name == ACTOR_TYPE_NAME)
-        || ir.edges.iter().any(|entry| entry.name == ACTOR_TYPE_NAME)
-    {
-        return invalid_ir("actor binding must retain exact protected OmniActor { actorId: String @key } shape and identities".to_string());
-    }
-    Ok(())
-}
-
-/// Hash only the customer-owned source projection. The full IR hash separately
-/// binds the protected builtin and setting to the accepted schema authority.
-pub fn schema_source_shape_hash_from_ir(ir: &SchemaIR) -> Result<String> {
-    let mut shape = schema_shape_from_ir(ir)?;
-    if ir.actor_provenance.is_some() {
-        shape.nodes.retain(|node| node.name != ACTOR_TYPE_NAME);
-    }
-    schema_shape_hash(&shape)
-}
-
 fn validate_annotations(annotations: &[Annotation], entity: &str) -> Result<()> {
     for annotation in annotations {
         if matches!(
@@ -1691,214 +1484,6 @@ mod tests {
         let parsed = parse_schema(source).unwrap();
         let shape = compile_schema_shape(&parsed).unwrap();
         initialize_schema_ir(domain(), &shape).unwrap().schema_ir
-    }
-
-    fn actor_ir(source: &str, enabled: bool) -> SchemaIR {
-        let shape = crate::compile_schema_source_shape(&parse_schema(source).unwrap()).unwrap();
-        initialize_schema_ir_with_actor_provenance(domain(), &shape, enabled)
-            .unwrap()
-            .schema_ir
-    }
-
-    #[test]
-    fn actor_binding_accepts_customer_edges_to_builtin_before_catalog_validation() {
-        let source = "node Document { key: String @key } edge AuthoredBy: Document -> OmniActor {}";
-        let active = actor_ir(source, true);
-        let catalog = crate::build_catalog_from_ir(&active).unwrap();
-        assert_eq!(catalog.edge_types["AuthoredBy"].to_type, "OmniActor");
-        let parsed = parse_schema(source).unwrap();
-        assert!(compile_schema_shape(&parsed).is_err());
-        let shape = crate::compile_schema_source_shape(&parsed).unwrap();
-        assert!(initialize_schema_ir(domain(), &shape).is_err());
-        assert_eq!(
-            resolve_schema_ir(&active, &shape).unwrap().schema_ir,
-            active
-        );
-        assert_eq!(
-            schema_source_shape_hash_from_ir(&active).unwrap(),
-            schema_shape_hash(&shape).unwrap()
-        );
-    }
-
-    #[test]
-    fn actor_binding_is_explicit_v3_and_legacy_serialization_stays_v2() {
-        let source = "node Actor { slug: String @key name: String }";
-        let legacy = initialize(source);
-        let disabled = actor_ir(source, false);
-        assert_eq!(legacy, disabled);
-        assert_eq!(legacy.ir_version, 2);
-        assert!(
-            !schema_ir_json(&legacy)
-                .unwrap()
-                .contains("actor_provenance")
-        );
-        let active = actor_ir(source, true);
-        assert_eq!(active.ir_version, 3);
-        let binding = active.actor_provenance.as_ref().unwrap();
-        assert!(binding.enabled);
-        let catalog = crate::build_catalog_from_ir(&active).unwrap();
-        assert!(catalog.node_types.contains_key("Actor"));
-        assert!(catalog.is_protected_actor_type("OmniActor"));
-        assert!(!catalog.is_protected_actor_type("Actor"));
-        assert_eq!(catalog.actor_provenance(), Some(binding));
-        assert_eq!(
-            schema_source_shape_hash_from_ir(&active).unwrap(),
-            schema_shape_hash_from_ir(&legacy).unwrap()
-        );
-        assert_ne!(
-            schema_shape_hash_from_ir(&active).unwrap(),
-            schema_source_shape_hash_from_ir(&active).unwrap()
-        );
-    }
-
-    #[test]
-    fn actor_binding_enable_disable_reenable_keeps_identity() {
-        let source = "node N { name: String @key }";
-        let shape = compile_schema_shape(&parse_schema(source).unwrap()).unwrap();
-        let legacy = initialize(source);
-        assert_eq!(
-            resolve_schema_ir(&legacy, &shape).unwrap().schema_ir,
-            legacy
-        );
-        let enabled = resolve_schema_ir_with_actor_provenance(&legacy, &shape, Some(true))
-            .unwrap()
-            .schema_ir;
-        let disabled = resolve_schema_ir_with_actor_provenance(&enabled, &shape, Some(false))
-            .unwrap()
-            .schema_ir;
-        let mut expected = enabled.clone();
-        expected.actor_provenance.as_mut().unwrap().enabled = false;
-        assert_eq!(disabled, expected);
-        assert_eq!(
-            resolve_schema_ir(&disabled, &shape).unwrap().schema_ir,
-            disabled
-        );
-        assert_eq!(
-            resolve_schema_ir_with_actor_provenance(&disabled, &shape, Some(true))
-                .unwrap()
-                .schema_ir,
-            enabled
-        );
-        let plan = crate::plan_schema_migration(&enabled, &disabled).unwrap();
-        assert!(plan.supported);
-        assert_eq!(
-            plan.steps,
-            [crate::SchemaMigrationStep::SetActorProvenance { enabled: false }]
-        );
-    }
-
-    #[test]
-    fn actor_binding_refuses_unbound_name_collision_and_rename_attempts() {
-        for source in [
-            "node OmniActor { actorId: String @key }",
-            "interface OmniActor { name: String }",
-            "node N {} edge OmniActor: N -> N {}",
-        ] {
-            let shape = compile_schema_shape(&parse_schema(source).unwrap()).unwrap();
-            assert!(initialize_schema_ir_with_actor_provenance(domain(), &shape, true).is_err());
-            let legacy = initialize(source);
-            assert!(resolve_schema_ir_with_actor_provenance(&legacy, &shape, Some(true)).is_err());
-            let empty = compile_schema_shape(&parse_schema("node N {}").unwrap()).unwrap();
-            assert!(resolve_schema_ir_with_actor_provenance(&legacy, &empty, Some(true)).is_err());
-        }
-        let active = actor_ir("node N {}", true);
-        for source in [
-            "node N {} node Renamed @rename_from(\"OmniActor\") { actorId: String @key }",
-            "node N {} node OmniActor { actorId: String @key name: String }",
-        ] {
-            let shape = compile_schema_shape(&parse_schema(source).unwrap()).unwrap();
-            assert!(resolve_schema_ir(&active, &shape).is_err());
-        }
-    }
-
-    #[test]
-    fn actor_binding_allows_stale_hint_after_separate_collision_rename() {
-        let legacy = initialize("node OmniActor { slug: String @key }");
-        let source = "node CustomerActor @rename_from(\"OmniActor\") { slug: String @key }";
-        let shape = compile_schema_shape(&parse_schema(source).unwrap()).unwrap();
-        let renamed = resolve_schema_ir(&legacy, &shape).unwrap().schema_ir;
-        let enabled = resolve_schema_ir_with_actor_provenance(&renamed, &shape, Some(true))
-            .unwrap()
-            .schema_ir;
-        assert_eq!(
-            enabled
-                .nodes
-                .iter()
-                .find(|node| node.name == "CustomerActor")
-                .unwrap()
-                .type_id,
-            legacy.nodes[0].type_id
-        );
-        assert_ne!(
-            enabled.actor_provenance.as_ref().unwrap().type_id,
-            legacy.nodes[0].type_id
-        );
-    }
-
-    #[test]
-    fn actor_binding_validates_exact_shape_and_version_pairing() {
-        let active = actor_ir("node N {}", true);
-        let mut invalid = active.clone();
-        invalid.ir_version = 2;
-        assert!(validate_schema_ir(&invalid).is_err());
-        invalid = active.clone();
-        invalid.actor_provenance = None;
-        assert!(validate_schema_ir(&invalid).is_err());
-        invalid = active.clone();
-        invalid.actor_provenance.as_mut().unwrap().type_id = invalid
-            .nodes
-            .iter()
-            .find(|node| node.name == "N")
-            .unwrap()
-            .type_id;
-        assert!(validate_schema_ir(&invalid).is_err());
-        invalid = active.clone();
-        invalid
-            .nodes
-            .iter_mut()
-            .find(|node| node.name == ACTOR_TYPE_NAME)
-            .unwrap()
-            .properties[0]
-            .prop_type
-            .nullable = true;
-        assert!(validate_schema_ir(&invalid).is_err());
-        invalid = active.clone();
-        invalid
-            .nodes
-            .iter_mut()
-            .find(|node| node.name == ACTOR_TYPE_NAME)
-            .unwrap()
-            .constraints
-            .clear();
-        assert!(validate_schema_ir(&invalid).is_err());
-        invalid = active.clone();
-        invalid
-            .actor_provenance
-            .as_mut()
-            .unwrap()
-            .table_incarnation_id = TableIncarnationId::try_from(999).unwrap();
-        assert!(validate_schema_ir(&invalid).is_err());
-        invalid = active.clone();
-        invalid
-            .actor_provenance
-            .as_mut()
-            .unwrap()
-            .actor_id_property_id = StablePropertyId::try_from(999).unwrap();
-        assert!(validate_schema_ir(&invalid).is_err());
-    }
-
-    #[test]
-    fn actor_binding_cannot_be_dropped_or_rebound_by_a_hand_authored_plan() {
-        let active = actor_ir("node N {}", true);
-        let mut dropped = active.clone();
-        dropped.actor_provenance = None;
-        dropped.ir_version = 2;
-        assert!(crate::plan_schema_migration(&active, &dropped).is_err());
-
-        let legacy = initialize("node OmniActor { actorId: String @key }");
-        let mut adopted = legacy.clone();
-        bind_actor(&mut adopted, true).unwrap();
-        assert!(crate::plan_schema_migration(&legacy, &adopted).is_err());
     }
 
     #[test]

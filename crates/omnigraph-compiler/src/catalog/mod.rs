@@ -153,17 +153,6 @@ impl Catalog {
         }
     }
 
-    /// Resolve actor configuration only from this catalog's accepted schema.
-    pub fn actor_provenance(&self) -> Option<&schema_ir::ActorProvenanceBinding> {
-        self.bound_schema_ir()?.actor_provenance.as_ref()
-    }
-
-    /// A disabled binding remains protected; names alone never confer ownership.
-    pub fn is_protected_actor_type(&self, name: &str) -> bool {
-        self.actor_provenance()
-            .is_some_and(|binding| self.node_type_id(name) == Some(binding.type_id))
-    }
-
     pub fn type_id(&self, name: &str) -> Option<schema_ir::StableTypeId> {
         let mut matches = [
             self.interface_type_id(name),

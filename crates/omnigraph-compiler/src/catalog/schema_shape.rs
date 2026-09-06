@@ -95,21 +95,6 @@ pub enum PropertyConstraintShape {
 }
 
 pub fn compile_schema_shape(schema: &SchemaFile) -> Result<SchemaShape> {
-    compile_schema_shape_inner(schema, false)
-}
-
-/// Compile customer source for later resolution against an accepted actor binding.
-/// The reserved actor endpoint may be absent from this source projection; only
-/// subsequent IR resolution and catalog validation can establish its authority.
-/// Generic source-only compilation remains strict through `compile_schema_shape`.
-pub fn compile_schema_source_shape(schema: &SchemaFile) -> Result<SchemaShape> {
-    compile_schema_shape_inner(schema, true)
-}
-
-fn compile_schema_shape_inner(
-    schema: &SchemaFile,
-    allow_actor_endpoint: bool,
-) -> Result<SchemaShape> {
     let interfaces_by_name = schema
         .declarations
         .iter()
@@ -244,7 +229,7 @@ fn compile_schema_shape_inner(
         nodes,
         edges,
     };
-    validate_shape(&shape, allow_actor_endpoint)?;
+    validate_shape(&shape)?;
     Ok(shape)
 }
 
@@ -443,7 +428,7 @@ pub(crate) fn constraint_sort_key(constraint: &Constraint) -> String {
     }
 }
 
-fn validate_shape(shape: &SchemaShape, allow_actor_endpoint: bool) -> Result<()> {
+fn validate_shape(shape: &SchemaShape) -> Result<()> {
     let interface_names = shape
         .interfaces
         .iter()
@@ -472,11 +457,9 @@ fn validate_shape(shape: &SchemaShape, allow_actor_endpoint: bool) -> Result<()>
                 edge.name
             )));
         }
-        let resolved_endpoint = |name: &str| {
-            node_names.contains(name)
-                || (allow_actor_endpoint && name == super::schema_ir::ACTOR_TYPE_NAME)
-        };
-        if !resolved_endpoint(&edge.from_type) || !resolved_endpoint(&edge.to_type) {
+        if !node_names.contains(edge.from_type.as_str())
+            || !node_names.contains(edge.to_type.as_str())
+        {
             return Err(CompilerError::Catalog(format!(
                 "edge '{}' has an unresolved endpoint",
                 edge.name

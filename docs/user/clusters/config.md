@@ -35,7 +35,6 @@ providers:
 graphs:
   knowledge:
     schema: knowledge.pg
-    actor_provenance: true
     queries: queries/
     embedding_provider: default
     external_blobs:
@@ -82,7 +81,6 @@ Optional fields:
 
 | Field | Meaning |
 |---|---|
-| `actor_provenance` | Optional `true` or `false`; defaults to enabled on creation and preserves the accepted setting on existing graphs |
 | `queries` | Stored-query files, directories, or explicit name mappings |
 | `embedding_provider` | Name under `providers.embedding` |
 | `external_blobs` | Allow-list for new external Blob references |
@@ -103,34 +101,7 @@ queries:
 ```
 
 Unreadable files, parse errors, duplicate query names, and queries that do not
-type-check against the graph's desired schema fail validation. Static
-`validate` permits references to the built-in `OmniActor` type provisionally:
-only `plan` and `apply` can consult an existing graph's accepted schema to
-determine whether that type is bound. They recheck stored queries against the
-accepted or proposed catalog before publication. Existing catalog-only
-reconciliation with a missing graph uses source-only validation and never
-assumes a system binding.
-
-### Actor provenance
-
-New graphs enable automatic actor provenance unless `actor_provenance: false`
-is explicit. The accepted schema adds the protected system type
-`OmniActor { actorId: String @key }`; customer `.pg` files should not declare
-it. Effective discovery through `schema show --json` includes the type and
-its stable identity binding in `accepted_schema`, alongside unchanged
-customer `schema_source`.
-
-On an existing graph, omitting the field preserves its accepted setting,
-including legacy graphs that have no system binding. An explicit value is
-applied even when the `.pg` file has not changed. Disabling an existing
-binding stops automatic materialization and retains the system type, actor
-rows, stable identities, and history; enabling it again reuses that binding.
-An unbound customer type named `OmniActor` is never adopted automatically;
-explicit enablement refuses the name collision.
-
-This field is desired intent. The graph's accepted schema owns the effective
-setting. Cluster state records an observed projection for reconciliation and
-recovery; it does not override the graph at server startup.
+type-check against the graph's desired schema fail validation.
 
 ## Embedding providers
 
