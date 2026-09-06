@@ -355,28 +355,19 @@ async fn invalid_issuance_never_replaces_cached_authority() {
 }
 
 #[test]
-fn managed_routing_refuses_scope_overrides_and_other_data_verbs_before_keychain() {
+fn managed_routing_preserves_selected_managed_authority_without_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let context = context();
     super::super::save_context(dir.path(), &context).unwrap();
     let store = MemoryStore::default();
     for args in [
         vec!["query", "q"],
-        vec![
-            "query",
-            "q",
-            "--graph",
-            "knowledge",
-            "--server",
-            "https://foreign.example",
-        ],
         vec!["mutate", "m", "--graph", "knowledge", "--as", "fake"],
-        vec!["snapshot", "--store", "/tmp/never-open"],
-        vec!["alias", "dangerous"],
-        vec!["graphs", "list"],
     ] {
         let cli = Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
-        let failure = resolve(&cli, dir.path(), &store).err().unwrap();
+        let failure = resolve(&cli, dir.path(), &store, || Ok(false))
+            .err()
+            .unwrap();
         assert_ne!(failure.body["type"], "data_credential_required");
     }
     let direct = Cli::try_parse_from([
@@ -388,24 +379,134 @@ fn managed_routing_refuses_scope_overrides_and_other_data_verbs_before_keychain(
         "https://legacy.example",
     ])
     .unwrap();
-    assert!(resolve(&direct, dir.path(), &store).unwrap().is_none());
+    assert!(
+        resolve(&direct, dir.path(), &store, || panic!(
+            "explicit selection read operator defaults"
+        ))
+        .unwrap()
+        .is_none()
+    );
     let child = dir.path().join("child");
     std::fs::create_dir(&child).unwrap();
     let query = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
-    assert!(resolve(&query, &child, &store).unwrap().is_none());
+    assert!(
+        resolve(&query, &child, &store, || panic!(
+            "absent context read operator defaults"
+        ))
+        .unwrap()
+        .is_none()
+    );
     assert_eq!(
-        resolve(&query, dir.path(), &store).err().unwrap().body["type"],
+        resolve(&query, dir.path(), &store, || Ok(false))
+            .err()
+            .unwrap()
+            .body["type"],
         "data_credential_required"
     );
     let cached = credential(&context, "https://data.example");
     save(&store, &context, &cached);
-    assert!(resolve(&query, dir.path(), &store).unwrap().is_some());
+    assert!(
+        resolve(&query, dir.path(), &store, || Ok(false))
+            .unwrap()
+            .is_some()
+    );
     let mut narrowed = cached;
     narrowed.grants[0].actions = vec!["read".into()];
     save(&store, &context, &narrowed);
     assert_eq!(
-        resolve(&query, dir.path(), &store).err().unwrap().body["type"],
+        resolve(&query, dir.path(), &store, || Ok(false))
+            .err()
+            .unwrap()
+            .body["type"],
         "data_scope_missing"
+    );
+}
+
+struct NoCredentialAccess;
+
+impl Store for NoCredentialAccess {
+    fn get(&self, _: &str) -> Result<Option<String>> {
+        panic!("routing preflight accessed credentials")
+    }
+    fn put(&self, _: &str, _: &str) -> Result<()> {
+        panic!("routing preflight wrote credentials")
+    }
+    fn remove(&self, _: &str) -> Result<()> {
+        panic!("routing preflight removed credentials")
+    }
+}
+
+#[test]
+fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::save_context(dir.path(), &context()).unwrap();
+    // An unreadable-as-context object makes an accidental context read fail;
+    // the ambient callback and store also fail if either is consulted.
+    std::fs::remove_file(dir.path().join(".omnigraph/context")).unwrap();
+    std::fs::create_dir(dir.path().join(".omnigraph/context")).unwrap();
+    for args in [
+        vec!["query", "q", "--server", "legacy"],
+        vec!["read", "q", "--profile", "legacy"],
+        vec!["mutate", "--store", "file:///scratch", "-e", "source"],
+        vec!["change", "m", "--cluster", "local"],
+        vec!["query", "q", "--direct"],
+        vec!["init", "--schema", "schema.pg", "file:///scratch"],
+        vec!["load", "--data", "data.jsonl", "--mode", "append"],
+        vec!["schema", "plan", "--schema", "schema.pg"],
+        vec!["commit", "list"],
+        vec!["graphs", "list"],
+        vec!["alias", "people"],
+        vec!["queries", "list"],
+        vec!["queries", "validate"],
+        vec!["lint", "--schema", "schema.pg", "--query", "q.gq"],
+        vec!["snapshot"],
+        vec!["branch", "list"],
+        vec!["cluster", "status"],
+    ] {
+        let cli = Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
+        assert!(
+            resolve(&cli, dir.path(), &NoCredentialAccess, || {
+                panic!("bypassed command read operator routing")
+            })
+            .unwrap()
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn managed_data_issue_633_ambiguity_and_invalid_context_precede_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    super::super::save_context(dir.path(), &context()).unwrap();
+    for verb in ["query", "read", "mutate", "change"] {
+        let cli = Cli::try_parse_from(["omnigraph", verb, "q", "--graph", "knowledge"]).unwrap();
+        assert_eq!(
+            resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
+                .err()
+                .unwrap()
+                .body["type"],
+            "managed_target_ambiguous"
+        );
+        assert_eq!(
+            resolve(&cli, dir.path(), &NoCredentialAccess, || {
+                Err(Failure::refused("operator_config_invalid", "fixture"))
+            })
+            .err()
+            .unwrap()
+            .body["type"],
+            "operator_config_invalid"
+        );
+    }
+    std::fs::write(dir.path().join(".omnigraph/context"), "malformed").unwrap();
+    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
+    assert_eq!(
+        resolve(&cli, dir.path(), &NoCredentialAccess, || {
+            panic!("invalid context consulted another target")
+        })
+        .err()
+        .unwrap()
+        .body["type"],
+        "context_invalid"
     );
 }
 

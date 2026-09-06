@@ -101,7 +101,7 @@ pub(crate) async fn server_ready(
 /// deterministic output across requests).
 pub(crate) async fn server_graphs_list(
     State(state): State<AppState>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<GraphListResponse>, ApiError> {
     let registry = &state.routing().registry;
 
@@ -279,6 +279,10 @@ pub(crate) async fn require_bearer_auth(
     mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
+    // Request extensions supplied by an embedder are projections, never an
+    // authentication result for this request. Rebuild both from its credential.
+    request.extensions_mut().remove::<ResolvedActor>();
+    request.extensions_mut().remove::<AuthenticatedActor>();
     if !state.requires_bearer_auth() {
         return Ok(next.run(request).await);
     }
@@ -298,6 +302,7 @@ pub(crate) async fn require_bearer_auth(
     let Some(actor) = state.authenticate_bearer_token(provided_token) else {
         return Err(ApiError::unauthorized("invalid bearer token"));
     };
+    request.extensions_mut().insert(actor.actor().clone());
     request.extensions_mut().insert(actor);
 
     Ok(next.run(request).await)
@@ -340,7 +345,7 @@ pub(crate) async fn resolve_graph_handle(
         })?;
     let graph_id = GraphId::try_from(graph_id_str.to_string())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if let Some(actor) = request.extensions_mut().get_mut::<ResolvedActor>() {
+    if let Some(actor) = request.extensions_mut().get_mut::<AuthenticatedActor>() {
         if !actor.select_graph(&graph_id) {
             return Err(ApiError::forbidden("credential does not permit this graph"));
         }
@@ -408,7 +413,7 @@ pub(crate) enum Authz {
 /// request. See `actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers`
 /// at `tests/server.rs`.
 pub(crate) fn authorize(
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     policy: Option<&PolicyEngine>,
     request: PolicyRequest,
 ) -> std::result::Result<Authz, ApiError> {
@@ -504,7 +509,7 @@ pub(crate) fn authorize(
 /// [`Authz`] decision directly to hide a denial as a 404 while letting an
 /// operational failure keep its true status.
 pub(crate) fn authorize_request(
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     policy: Option<&PolicyEngine>,
     request: PolicyRequest,
 ) -> std::result::Result<(), ApiError> {
@@ -534,7 +539,7 @@ pub(crate) fn authorize_request(
 /// branch. Defaults to `main` when `branch` is omitted. Read-only.
 pub(crate) async fn server_snapshot(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<SnapshotQuery>,
 ) -> std::result::Result<Json<api::SnapshotOutput>, ApiError> {
     let branch = query.branch.unwrap_or_else(|| "main".to_string());
@@ -608,7 +613,7 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
 /// signal.
 pub(crate) async fn server_read(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<ReadRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<LegacyReadOutput>), ApiError> {
     let output = run_query(
@@ -661,7 +666,7 @@ pub(crate) async fn server_read(
 /// 400; send them to `POST /mutate`.
 pub(crate) async fn server_query(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<QueryRequest>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
     let output = run_query(
@@ -759,7 +764,7 @@ struct BlobBinaryBody(Vec<u8>);
 /// resolution share the exact helper used by `/query`.
 pub(crate) async fn server_blob_get(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
     query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
 ) -> std::result::Result<Response, ApiError> {
@@ -823,7 +828,7 @@ pub(crate) async fn server_blob_get(
 /// deliberately ignored while If-None-Match is still evaluated.
 pub(crate) async fn server_blob_head(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
     query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
 ) -> std::result::Result<Response, ApiError> {
@@ -846,7 +851,7 @@ fn parse_blob_read_query(
 
 async fn read_blob_for_delivery(
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     query: BlobReadQuery,
 ) -> std::result::Result<omnigraph::BlobRead, ApiError> {
     let target = resolve_authorized_read_target(handle, actor, query.branch, query.snapshot)
@@ -918,7 +923,7 @@ fn redact_blob_api_error(mapped: ApiError) -> ApiError {
 pub(crate) async fn server_export(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     request: std::result::Result<Json<ExportRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
     let Json(request) = request
@@ -1073,7 +1078,7 @@ fn reject_graph_commit_expected_head(
 pub(crate) async fn run_mutate(
     state: AppState,
     handle: Arc<GraphHandle>,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     door: Door,
     query: &str,
     name: Option<&str>,
@@ -1164,7 +1169,7 @@ pub(crate) async fn run_mutate(
 /// reads are not admission-gated, so there is no `state.workload` consumer.
 pub(crate) async fn run_query(
     handle: Arc<GraphHandle>,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     door: Door,
     query: &str,
     name: Option<&str>,
@@ -1221,7 +1226,7 @@ pub(crate) async fn run_query(
 /// helper so snapshot-to-policy-branch resolution cannot drift by route.
 pub(crate) async fn resolve_authorized_read_target(
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     branch: Option<String>,
     snapshot: Option<String>,
 ) -> std::result::Result<ReadTarget, ApiError> {
@@ -1287,7 +1292,7 @@ pub(crate) async fn resolve_authorized_read_target(
 pub(crate) async fn server_change(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
@@ -1356,7 +1361,7 @@ pub(crate) async fn server_change(
 pub(crate) async fn server_mutate(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
@@ -1408,7 +1413,7 @@ pub(crate) async fn server_mutate(
 pub(crate) async fn server_mutate_if_graph_commit(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
@@ -1486,7 +1491,7 @@ pub(crate) fn parse_optional_invoke_body(
 pub(crate) async fn server_invoke_query(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -1528,7 +1533,7 @@ pub(crate) async fn server_invoke_query(
 pub(crate) async fn server_invoke_query_if_graph_commit(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -1540,7 +1545,7 @@ pub(crate) async fn server_invoke_query_if_graph_commit(
 async fn invoke_stored_query(
     state: AppState,
     handle: Arc<GraphHandle>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     name: String,
     body: Bytes,
     expected_head: Option<String>,
@@ -1677,7 +1682,7 @@ async fn invoke_stored_query(
 /// lacks (a known gap until per-query authorization lands).
 pub(crate) async fn server_list_queries(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<QueriesCatalogOutput>, ApiError> {
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
@@ -1719,7 +1724,7 @@ pub(crate) async fn server_list_queries(
 /// accepted schema view; the system type is never appended to customer source.
 pub(crate) async fn server_schema_get(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<SchemaOutput>, ApiError> {
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
@@ -1769,7 +1774,7 @@ pub(crate) async fn server_schema_get(
 pub(crate) async fn server_schema_apply(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<SchemaApplyRequest>,
 ) -> std::result::Result<Json<SchemaApplyOutput>, ApiError> {
     let actor_arc = actor
@@ -1842,7 +1847,7 @@ pub(crate) async fn server_schema_apply(
 /// Authorize one load target without touching request data.
 async fn authorize_load_scope(
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     branch: &str,
     from: Option<&str>,
 ) -> std::result::Result<(), ApiError> {
@@ -1892,7 +1897,7 @@ async fn authorize_load_scope(
 async fn run_ingest(
     state: AppState,
     handle: Arc<GraphHandle>,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     request: IngestRequest,
 ) -> std::result::Result<IngestOutput, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
@@ -1959,7 +1964,7 @@ async fn run_ingest(
 pub(crate) async fn server_load(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<IngestRequest>,
 ) -> std::result::Result<Json<IngestOutput>, ApiError> {
     Ok(Json(
@@ -2034,7 +2039,7 @@ async fn collect_graph_batch_body(body: Body) -> std::result::Result<Bytes, ApiE
 pub(crate) async fn server_load_ndjson(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<GraphBatchLoadQuery>,
     request: Request,
 ) -> std::result::Result<Json<GraphBatchLoadOutput>, ApiError> {
@@ -2131,7 +2136,7 @@ pub(crate) async fn server_load_ndjson(
 pub(crate) async fn server_ingest(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<IngestRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<IngestOutput>), ApiError> {
     let output = run_ingest(
@@ -2165,7 +2170,7 @@ pub(crate) async fn server_ingest(
 /// `branch list` on `POST /query` runs the same body.
 pub(crate) async fn server_branch_list(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<BranchListOutput>, ApiError> {
     let branches = branch_list_body(&handle, actor.as_ref().map(|Extension(actor)| actor)).await?;
     Ok(Json(BranchListOutput { branches }))
@@ -2175,7 +2180,7 @@ pub(crate) async fn server_branch_list(
 /// scope-free `read` check, then the names in byte order.
 async fn branch_list_body(
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
 ) -> std::result::Result<Vec<String>, ApiError> {
     authorize_request(
         actor,
@@ -2221,7 +2226,7 @@ async fn branch_list_body(
 pub(crate) async fn server_branch_create(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<BranchCreateRequest>,
 ) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
     let from = request.from.unwrap_or_else(|| "main".to_string());
@@ -2246,7 +2251,7 @@ pub(crate) async fn server_branch_create(
 async fn branch_create_body(
     state: &AppState,
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     from: &str,
     name: &str,
 ) -> std::result::Result<(), ApiError> {
@@ -2321,7 +2326,7 @@ pub(crate) struct BranchPath {
 pub(crate) async fn server_branch_delete(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(BranchPath { branch }): Path<BranchPath>,
 ) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
@@ -2338,7 +2343,7 @@ pub(crate) async fn server_branch_delete(
 async fn branch_delete_body(
     state: &AppState,
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     name: &str,
 ) -> std::result::Result<(), ApiError> {
     let actor_arc = actor
@@ -2401,7 +2406,7 @@ async fn branch_delete_body(
 pub(crate) async fn server_branch_merge(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<BranchMergeRequest>,
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
     let target = request.target.unwrap_or_else(|| "main".to_string());
@@ -2431,7 +2436,7 @@ pub(crate) async fn server_branch_merge(
 async fn branch_merge_body(
     state: &AppState,
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     source: &str,
     target: &str,
 ) -> std::result::Result<MergeOutcome, ApiError> {
@@ -2468,7 +2473,7 @@ async fn branch_merge_body(
 /// already durable, so the request must not report failure for it.
 async fn delete_merged_source_branch(
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     source: &str,
 ) -> std::result::Result<(), String> {
     match authorize(
@@ -2516,7 +2521,7 @@ async fn delete_merged_source_branch(
 /// order. Read-only.
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
     // An omitted `branch` means main's history, so the policy gate must
@@ -2573,7 +2578,7 @@ pub(crate) struct CommitPath {
 /// metadata. Read-only.
 pub(crate) async fn server_commit_show(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(CommitPath { commit_id }): Path<CommitPath>,
 ) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
     authorize_request(
@@ -2909,7 +2914,7 @@ pub(crate) fn parse_change_query(
 /// a large commit continues via the opaque `page_token`.
 pub(crate) async fn server_commit_changes(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(CommitPath { commit_id }): Path<CommitPath>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::CommitChangesOutput>, ApiError> {
@@ -3121,7 +3126,7 @@ fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, 
 /// state.
 pub(crate) async fn server_changes_feed(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), CHANGE_FEED_PARAMS)?;
@@ -3199,7 +3204,7 @@ pub(crate) async fn server_changes_feed(
 pub(crate) async fn server_changes_baseline(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<api::ChangeBaselineRequest>,
 ) -> std::result::Result<Response, ApiError> {
     let branch = normalize_change_branch(request.branch.as_deref())?;

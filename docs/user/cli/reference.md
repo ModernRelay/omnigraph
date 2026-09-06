@@ -254,8 +254,8 @@ cluster: CLUSTER_ID
 api: https://control.example
 ```
 
-The context contains no secret and is read only from the selected `--config`
-directory, which defaults to `.`. Parent directories are not searched.
+The context contains no secret. Cluster commands read it only from the selected
+`--config` directory, which defaults to `.`. Parent directories are not searched.
 Unknown fields, versions, malformed files, symbolic links, and files over
 16 KiB are refused. API addresses must be origins without credentials, path,
 query, or fragment. HTTPS is required except for exact localhost,

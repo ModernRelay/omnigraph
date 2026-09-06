@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use color_eyre::eyre::Result;
 use omnigraph_server::{
-    ServerConfig, init_tracing, load_server_settings, resolve_shutdown_grace, serve,
+    init_tracing, load_server_settings, load_server_settings_with_data_token_trust,
+    resolve_shutdown_grace, serve, serve_with_data_token_trust,
 };
 
 #[derive(Debug, Parser)]
@@ -53,14 +54,29 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let mut settings: ServerConfig = load_server_settings(
-        cli.cluster.as_ref(),
-        cli.bind,
-        cli.unauthenticated,
-        cli.require_all_graphs,
-    )
-    .await?;
-    settings.shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
-    settings.data_token_trust = cli.data_token_trust;
-    serve(settings).await
+    match cli.data_token_trust {
+        Some(trust_path) => {
+            let settings = load_server_settings_with_data_token_trust(
+                cli.cluster.as_ref(),
+                cli.bind,
+                cli.unauthenticated,
+                cli.require_all_graphs,
+                &trust_path,
+            )
+            .await?
+            .with_shutdown_grace(resolve_shutdown_grace(cli.shutdown_grace_seconds)?);
+            serve_with_data_token_trust(settings).await
+        }
+        None => {
+            let mut settings = load_server_settings(
+                cli.cluster.as_ref(),
+                cli.bind,
+                cli.unauthenticated,
+                cli.require_all_graphs,
+            )
+            .await?;
+            settings.shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
+            serve(settings).await
+        }
+    }
 }

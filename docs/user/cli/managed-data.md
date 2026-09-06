@@ -46,13 +46,31 @@ signing trust is retired. Each request refuses redirects, has a 10-second
 deadline, and accepts at most 8 MiB of response data.
 
 Missing, malformed, expired, or insufficient cached authority refuses before
-a request. In a managed folder, other data commands, aliases, and storage
-maintenance are unsupported. Explicit `--server`, `--profile`, `--store`,
-`--cluster`, and `--as` refuse.
-Inherited profiles and legacy token settings are ignored. Use global
-`--direct` to explicitly select legacy addressing and credentials, including
-when the context is malformed. Existing `cluster --direct` remains valid.
-Without managed context, existing data commands retain their behavior.
+a request. An explicit `--server`, `--profile`, `--store`, or `--cluster`
+selects ordinary addressing and follows that command's existing support
+rules, even in a managed folder or beside malformed context. Other data
+commands, aliases, and storage maintenance also keep their ordinary behavior;
+this does not give them managed credentials. Explicit `--as` alone is not a
+target and remains prohibited on managed requests.
+
+Implicit `query`/`mutate` refuses with `managed_target_ambiguous` when valid
+folder context competes with `OMNIGRAPH_PROFILE` or an operator default server
+or store. No credential is read and neither destination is contacted. Choose
+the ordinary target explicitly, or use `--direct` to select ordinary ambient
+resolution. To use the managed folder, unset the environment profile and
+remove the competing default target, using a separate operator home if needed.
+Presentation defaults and profiles that are merely defined do not conflict.
+
+For example, this keeps using staging from a folder bound to production:
+
+```bash
+omnigraph query find_person --profile staging --graph knowledge --json
+```
+
+Legacy token settings never supply managed authority. Global `--direct`
+continues to select ordinary addressing and credentials, including when the
+context is malformed. Existing `cluster --direct` remains valid. Without
+managed context, existing data commands retain their behavior.
 
 `cluster token --clear [--config DIR]` forgets that cluster's local data
 entry, independently of the control-plane session. Do not combine `--clear`

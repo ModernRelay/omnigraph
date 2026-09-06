@@ -1,4 +1,5 @@
 use super::*;
+use crate::AuthSource;
 use p256::ecdsa::{SigningKey, signature::Signer};
 use serde_json::{Value, json};
 
@@ -43,13 +44,18 @@ fn issuer_golden_signature_and_per_graph_ceiling() {
     let trust = trust();
     let now = fixture["verification_time"].as_u64().unwrap();
     let mut actor = trust
-        .verify_at(fixture["token"].as_str().unwrap(), now)
+        .verify_authenticated_at(fixture["token"].as_str().unwrap(), now)
         .unwrap();
     assert_eq!(
         actor.actor_id_str(),
         format!("principal:{}", fixture["claims"]["sub"].as_str().unwrap())
     );
     assert_eq!(actor.source, AuthSource::SignedData);
+    let projected: ResolvedActor = trust
+        .verify_at(fixture["token"].as_str().unwrap(), now)
+        .unwrap();
+    assert_eq!(projected.actor_id, actor.actor().actor_id);
+    assert_eq!(projected.source, actor.source);
     assert_eq!(
         serde_json::to_value(actor.data_claims().unwrap()).unwrap(),
         fixture["claims"]
@@ -325,7 +331,7 @@ fn action_ceiling_has_no_implicit_permissions() {
     for allowed in actions {
         let mut claims = fixture["claims"].clone();
         claims["grants"] = json!([{"graph_id":"graph-a","actions":[allowed]}]);
-        let mut actor = trust.verify_at(&sign(&claims), now).unwrap();
+        let mut actor = trust.verify_authenticated_at(&sign(&claims), now).unwrap();
         assert!(actor.select_graph(&GraphId::try_from("graph-a").unwrap()));
         for checked in actions {
             assert_eq!(

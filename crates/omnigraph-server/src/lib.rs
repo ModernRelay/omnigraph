@@ -5,7 +5,10 @@ mod handlers;
 mod settings;
 use handlers::*;
 use settings::*;
-pub use settings::{ServerRuntimeState, classify_server_runtime_state, load_server_settings};
+pub use settings::{
+    ServerRuntimeState, classify_server_runtime_state, load_server_settings,
+    load_server_settings_with_data_token_trust,
+};
 pub mod auth;
 pub mod data_tokens;
 pub mod graph_id;
@@ -16,7 +19,7 @@ pub mod registry;
 pub mod workload;
 
 pub use graph_id::GraphId;
-pub use identity::{AuthSource, GraphKey, ResolvedActor, Scope, TenantId};
+pub use identity::{AuthSource, AuthenticatedActor, GraphKey, ResolvedActor, Scope, TenantId};
 pub use registry::{GraphHandle, GraphRegistry, InsertError, RegistryLookup, RegistrySnapshot};
 
 use crate::queries::{QueryRegistry, check, format_check_breakages};
@@ -177,10 +180,6 @@ pub struct ServerConfig {
     /// routes.
     pub mode: ServerConfigMode,
     pub bind: String,
-    /// Resolved by the same Core snapshot as the graphs; never inferred from a token.
-    pub canonical_root: String,
-    /// Optional immutable public trust for RFC 0053 signed data credentials.
-    pub data_token_trust: Option<PathBuf>,
     /// Operator opt-in for fully-unauthenticated dev mode (MR-723).
     /// When no static tokens, signed-token trust, or policy are configured,
     /// `serve()` refuses to start unless this is true (set via
@@ -201,6 +200,34 @@ pub struct ServerConfig {
     /// in-flight requests drain, and at this deadline the process exits 2
     /// (RFC 0049). Resolved by [`resolve_shutdown_grace`]; default 25 s.
     pub shutdown_grace: std::time::Duration,
+}
+
+/// Applied server settings paired with already validated offline token trust.
+///
+/// Constructed only by [`load_server_settings_with_data_token_trust`]. The
+/// settings are exposed read-only so their graphs cannot be replaced after the
+/// canonical serving root has been checked against the trust document.
+#[derive(Debug, Clone)]
+pub struct ManagedServerConfig {
+    config: ServerConfig,
+    canonical_root: String,
+    trust: data_tokens::DataTokenTrust,
+}
+
+impl ManagedServerConfig {
+    pub fn config(&self) -> &ServerConfig {
+        &self.config
+    }
+
+    pub fn canonical_root(&self) -> &str {
+        &self.canonical_root
+    }
+
+    /// Change only the shutdown bound, preserving the validated root binding.
+    pub fn with_shutdown_grace(mut self, grace: std::time::Duration) -> Self {
+        self.config.shutdown_grace = grace;
+        self
+    }
 }
 
 /// The default bound on graceful shutdown.
@@ -743,7 +770,7 @@ impl AppState {
         self.routing.registry.snapshot_ref().any_per_graph_policy
     }
 
-    fn authenticate_bearer_token(&self, provided_token: &str) -> Option<ResolvedActor> {
+    fn authenticate_bearer_token(&self, provided_token: &str) -> Option<AuthenticatedActor> {
         // Hash the incoming token and compare against every stored digest in
         // constant time. Iterate all entries unconditionally so total work —
         // and therefore response timing — doesn't depend on which slot matches.
@@ -754,14 +781,14 @@ impl AppState {
                 matched = Some(Arc::clone(actor));
             }
         }
-        matched.map(ResolvedActor::cluster_static).or_else(|| {
+        matched.map(AuthenticatedActor::cluster_static).or_else(|| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()?
                 .as_secs();
             self.data_token_trust
                 .as_ref()?
-                .verify_at(provided_token, now)
+                .verify_authenticated_at(provided_token, now)
         })
     }
 }
@@ -1856,7 +1883,7 @@ pub fn build_app(state: AppState) -> Router {
     // The per-graph protected routes, identical in single + multi mode.
     // Two middleware layers wrap them (outer first, inner last):
     //   1. `require_bearer_auth` — extracts the bearer token and injects
-    //      `ResolvedActor` (or rejects 401).
+    //      `AuthenticatedActor` (or rejects 401).
     //   2. `resolve_graph_handle` — injects `Arc<GraphHandle>` based on
     //      the active mode (single: the only handle; multi: lookup by
     //      `{graph_id}` in the URI path).
@@ -1966,6 +1993,19 @@ pub fn build_app(state: AppState) -> Router {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
+    serve_config(config, None).await
+}
+
+/// Serve settings whose offline data-token trust was validated against their
+/// applied snapshot's canonical root before any graph engine open.
+pub async fn serve_with_data_token_trust(config: ManagedServerConfig) -> Result<()> {
+    serve_config(config.config, Some(config.trust)).await
+}
+
+async fn serve_config(
+    config: ServerConfig,
+    data_token_trust: Option<data_tokens::DataTokenTrust>,
+) -> Result<()> {
     // RFC 0049: the signal listener is installed before anything else, so
     // the shutdown bound covers startup. On the signal it sets `draining`,
     // arms the watchdog thread, and releases the graceful shutdown.
@@ -1982,11 +2022,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         });
     }
 
-    let data_token_trust = config
-        .data_token_trust
-        .as_ref()
-        .map(|path| data_tokens::DataTokenTrust::read(path, &config.canonical_root))
-        .transpose()?;
     let token_source = resolve_token_source().await?;
     info!(source = token_source.name(), "loaded bearer token source");
     let tokens = token_source.load().await?;

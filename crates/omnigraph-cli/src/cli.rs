@@ -23,7 +23,9 @@ control — manage or inspect a cluster (cluster via --config; policy & queries 
 --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
 MANAGED FOLDERS: cluster commands use .omnigraph/context; cluster token caches data access.\n\
-query and mutate require --graph and a cached data credential. --direct selects legacy addressing.\n\
+Implicit query and mutate use folder context and require --graph plus a cached data credential.\n\
+Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
+--direct selects ordinary addressing, including operator profiles and defaults.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
     /// Explicitly use legacy addressing and credentials, ignoring folder context.

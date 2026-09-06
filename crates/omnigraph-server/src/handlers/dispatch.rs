@@ -113,7 +113,7 @@ pub(super) fn refuse_statement_envelope(
 pub(super) async fn run_branch_statement(
     state: &AppState,
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     write: BranchWrite,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let query_name = write.statement_name().to_string();

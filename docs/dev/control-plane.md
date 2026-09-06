@@ -87,11 +87,11 @@ Servers do not hot-reload. Apply the new revision and restart every server that 
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
 
 The optional [offline data-token profile](../rfcs/0053-offline-data-token-verification.md)
-uses immutable public trust loaded before graph open. The Core's serving
-snapshot supplies the canonical storage root from the same resolution as the
-applied revision; the server checks that root against trust without reading a
-managed identity marker. The verifier resolves `principal:<sub>` and retains
-per-graph action ceilings. Graph selection checks the ceiling before registry
+uses immutable public trust loaded before graph open. The Core's opt-in
+root-bound serving snapshot supplies the canonical storage root from the same
+resolution as the applied revision; the server checks that root against trust
+without reading a managed identity marker. The verifier resolves
+`principal:<sub>` and retains per-graph action ceilings. Graph selection checks the ceiling before registry
 lookup; the common authorization gate checks actions before Cedar, which must
 explicitly permit signed identities even when no static credentials exist.
 Static credential authority remains unchanged. Issuer reachability is outside
@@ -105,6 +105,36 @@ which also lists the quarantined ones. Graceful shutdown is bounded by one
 deadline (`--shutdown-grace-seconds`, default 25), kept by a thread and armed
 by a listener installed before graphs open, after which the process exits 2
 without claiming success.
+
+### Public embedding APIs
+
+Ordinary callers use `read_serving_snapshot` or
+`read_serving_snapshot_from_storage`, `load_server_settings`, and `serve`.
+`ServingSnapshot` and `ServerConfig` contain their ordinary public fields;
+trust-disabled boot does not add root canonicalization solely for signed
+credentials.
+
+Managed callers use `read_root_bound_serving_snapshot` or its `_from_storage`
+counterpart to obtain an opaque `RootBoundServingSnapshot`. Its snapshot and
+canonical-root accessors refer to the same opened store. Do not reconstruct
+that binding by reopening a caller-supplied path. Server embedders use
+`load_server_settings_with_data_token_trust` and
+`serve_with_data_token_trust`; `ManagedServerConfig` keeps the configuration
+and validated trust together. `with_shutdown_grace` changes only the shutdown
+bound. A failed managed load must not be retried through ordinary `serve`.
+The binary's `--data-token-trust FILE` selects this managed path.
+
+`ResolvedActor` is a public identity projection, not proof of authentication.
+Middleware and protected handlers retain `AuthenticatedActor`, whose private
+state carries verified claims and graph selection. `DataTokenTrust::verify_at`
+returns the identity projection for existing callers;
+`verify_authenticated_at` returns the opaque authenticated result used by the
+server. Public actor construction cannot grant signed-token permissions.
+
+In-process hosts that assemble `AppState` and call its existing
+`with_data_token_trust` method continue to own their graph/root binding. Use
+the managed settings loader when the library should validate the applied
+snapshot and trust binding together.
 
 ## Azure boundary
 

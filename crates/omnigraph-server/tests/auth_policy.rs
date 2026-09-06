@@ -46,10 +46,28 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
         {"graph_id":"default","actions":["read"]},
         {"graph_id":"reports","actions":["change"]}
     ]));
+    let wider = tokens.token(json!([{"graph_id":"default","actions":["change"]}]));
+    let unrelated_authentication = tokens
+        .trust
+        .verify_authenticated_at(
+            &wider,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
     let request = || {
         Request::builder().uri(g("/mutate")).method(Method::POST)
         .header("authorization",format!("Bearer {read}"))
         .header("x-actor-id","breakglass")
+        .extension(omnigraph_server::ResolvedActor {
+            actor_id: "breakglass".into(),
+            tenant_id: None,
+            scopes: vec![omnigraph_server::Scope::Full],
+            source: omnigraph_server::AuthSource::Static,
+        })
+        .extension(unrelated_authentication.clone())
         .header("content-type","application/json")
         .body(Body::from(json!({"query":MUTATION_QUERIES,"name":"insert_person","params":{"name":"Signed","age":28},"branch":"main"}).to_string())).unwrap()
     };
@@ -60,7 +78,7 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "another graph's change grant must not leak"
+        "neither another graph's grant nor a forged public actor may widen signed authority"
     );
     let (_, after) = json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
     assert_eq!(after, before, "denial must not publish a commit");
@@ -142,6 +160,63 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     assert_eq!(
         renewed_actors["rows"], actors["rows"],
         "a new credential for the same principal reuses its actor node"
+    );
+    let (_, before_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
+    let other_graph_create = tokens.token(json!([
+        {"graph_id":"default","actions":["read"]},
+        {"graph_id":"reports","actions":["branch_create"]}
+    ]));
+    for token in [&read, &wider, &other_graph_create] {
+        let (status, body) = json_response(
+            &app,
+            statement_request("/mutate", token, "branch create signed_branch"),
+        )
+        .await;
+        assert_forbidden(
+            status,
+            body,
+            "branch statements retain the selected graph's action ceiling",
+        );
+    }
+    let (_, after_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
+    assert_eq!(
+        after_branches, before_branches,
+        "denied branch statements have no effect"
+    );
+
+    let create = tokens.token(json!([{"graph_id":"default","actions":["branch_create"]}]));
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", &create, "branch create signed_branch"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["actor_id"], tokens.actor);
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", &create, "branch delete signed_branch"),
+    )
+    .await;
+    assert_forbidden(
+        status,
+        body,
+        "branch creation authority cannot delete a branch",
+    );
+    let (status, body) =
+        json_response(&app, statement_request("/query", &read, "branch list")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"],
+        json!([{"name":"main"},{"name":"signed_branch"}])
+    );
+
+    let mut hidden = statement_request("/query", &read, "branch list");
+    *hidden.uri_mut() = "/graphs/hidden/query".parse().unwrap();
+    let (status, body) = json_response(&app, hidden).await;
+    assert_forbidden(
+        status,
+        body,
+        "branch list cannot probe a graph outside the signed grant",
     );
 }
 

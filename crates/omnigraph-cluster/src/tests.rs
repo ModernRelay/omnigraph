@@ -4301,8 +4301,18 @@ async fn storage_root_file_uri_relocates_the_cluster() {
     assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
     assert!(!dir.path().join("graphs").exists());
 
-    // The serving snapshot follows the root.
+    // Both readers follow the declared root, never the config directory.
     let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+    let bound = read_root_bound_serving_snapshot(dir.path()).await.unwrap();
+    assert_eq!(
+        bound.canonical_root(),
+        format!(
+            "file://{}",
+            fs::canonicalize(storage.path()).unwrap().display()
+        )
+    );
+    assert_eq!(bound.snapshot().state_cas, snapshot.state_cas);
+
     assert!(
         snapshot.graphs[0].root.starts_with(storage.path()),
         "{:?}",
@@ -4423,15 +4433,22 @@ async fn serving_snapshot_reads_converged_cluster() {
     let snapshot = read_serving_snapshot(dir.path())
         .await
         .expect("converged cluster must serve");
+    let bound = read_root_bound_serving_snapshot(dir.path()).await.unwrap();
     assert_eq!(
-        snapshot.canonical_root,
+        bound.canonical_root(),
         format!("file://{}", fs::canonicalize(dir.path()).unwrap().display())
     );
-    let direct = read_serving_snapshot_from_storage(&snapshot.canonical_root)
+    assert_eq!(bound.snapshot().state_cas, snapshot.state_cas);
+    let direct = read_serving_snapshot_from_storage(bound.canonical_root())
         .await
         .unwrap();
-    assert_eq!(direct.canonical_root, snapshot.canonical_root);
+    let direct_bound = read_root_bound_serving_snapshot_from_storage(bound.canonical_root())
+        .await
+        .unwrap();
+    assert_eq!(direct_bound.canonical_root(), bound.canonical_root());
+    assert_eq!(direct_bound.snapshot().state_cas, snapshot.state_cas);
     assert_eq!(direct.state_cas, snapshot.state_cas);
+    assert_eq!(bound.into_snapshot().config_digest, snapshot.config_digest);
     assert_eq!(snapshot.graphs.len(), 1);
     assert_eq!(snapshot.graphs[0].graph_id, "knowledge");
     assert!(snapshot.graphs[0].root.ends_with("graphs/knowledge.omni"));
