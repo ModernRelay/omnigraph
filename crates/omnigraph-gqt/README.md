@@ -12,8 +12,11 @@ or `--workspace` reaches it.
   `issue_NNN_<short_name>.gqt`; `scripts/check-fix-regression.py` looks for it
   here.
 - `src/lib.rs`: the runner (case parsing, execution against a fresh
-  temporary store, row comparison, bless). Format self-tests and the corpus
-  layout check are its unit tests (`src/tests.rs`).
+  temporary store, the `--- expect shape` check of each rows step's result
+  columns, the result-schema check against the compiler's inferred schema,
+  row comparison, bless); `src/shape.rs` parses and compares the shape
+  section. Format self-tests and the corpus layout check are its unit
+  tests (`src/tests.rs`).
 - `tests/gq_logic_tests.rs`: one libtest test per case, named
   `case::<file>.gqt`, registered at run time by `datatest-stable`
   (`harness = false`). A new case file is picked up without any Rust change.

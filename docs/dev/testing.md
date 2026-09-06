@@ -114,8 +114,13 @@ libtest-shaped output; no per-case gutter runnable exists, since no source
 item does). `--test-threads=<n>` bounds how many cases run
 concurrently (default: the machine's available parallelism); each case fails
 if it exceeds `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>` seconds (default 10);
-`OMNIGRAPH_GQ_BLESS=1` rewrites the failing step's expect rows in place (local
-workflow only, never CI). Every `ok`/`FAIL` line carries the case's elapsed
+`OMNIGRAPH_GQ_BLESS=1` rewrites the failing step's expect rows, or its shape
+lines, in place (local workflow only, never CI). Every rows step carries a `--- expect shape`
+section, one `<name>: <type>` line per result column in `.pg` property syntax
+(`p.age: I32?`), checked against the executed result before the rows, and the
+executed schema is also checked against the compiler's inferred schema, so a
+wrongly typed column fails even when every cell is null (RFC 0045
+§Comparison semantics). Every `ok`/`FAIL` line carries the case's elapsed
 time, and a case over budget belongs in a `heavy-repro:` `#[ignore]`d test
 under `crates/omnigraph/tests/repro_issue_*.rs`, not the corpus. A name filter
 that matches no case is libtest's ordinary green zero-test run; read the

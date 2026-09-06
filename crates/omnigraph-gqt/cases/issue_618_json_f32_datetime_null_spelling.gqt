@@ -29,3 +29,10 @@ query point_values() {
 --- expect unordered
 {"p.name": "p", "p.score": 0.99, "p.embedding": [0.1, 0.2, 0.3], "p.at": "2024-01-01T11:54:56.789"}
 {"p.name": "q", "p.score": 1, "p.embedding": [1, 2, 3], "p.at": "2024-01-01T00:00:00", "p.note": "kept"}
+
+--- expect shape
+p.name: String
+p.score: F32
+p.embedding: Vector(3)
+p.at: DateTime
+p.note: String?

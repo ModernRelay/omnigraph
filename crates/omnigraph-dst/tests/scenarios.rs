@@ -1317,7 +1317,13 @@ fn dst_keep_serving_wedge_issue_554() {
     // (effectful / excluded-class intents the engine correctly refuses to
     // retire live — the detector's precision boundary, observed in the
     // wild; not panel material).
-    const PANEL: [u64; 14] = [0, 4, 10, 11, 14, 15, 17, 20, 21, 22, 23, 25, 26, 28];
+    // RFC 0054's default actor table changes the physical fault schedule.
+    // Re-screening excludes 10 and 11: both now strand Optimize at op 2
+    // while staging Knows' BTree index, then refuse the next two writes on
+    // that same Optimize intent. This is an excluded maintenance class,
+    // not effect-free mutation/load retirement. Keep the default-on
+    // universe, the existing qualified seeds, and the three-refusal budget.
+    const PANEL: [u64; 12] = [0, 4, 14, 15, 17, 20, 21, 22, 23, 25, 26, 28];
     let mut wedged: Vec<String> = Vec::new();
     let mut defer_rows = 0usize;
     for seed in PANEL {
@@ -3741,7 +3747,7 @@ fn dst_merge_duplicates_born_on_both_edge() {
         omnigraph::dst_clock::install_logical_clock();
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-classe-probe",
+            "shared-memory://dst-class-probe",
             TEST_SCHEMA,
             storage.clone(),
             InitOptions::default(),

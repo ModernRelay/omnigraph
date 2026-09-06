@@ -94,7 +94,10 @@ boundary and one graph-manifest publication.
 The D2 rule keeps one mutation query constructive (insert/update) or
 destructive (delete), never both. Compose mixed work through separate
 mutations, or through a branch when a later merge must expose one combined
-result.
+result. The protected actor participant is protocol-owned: a delete-only query
+may insert its missing actor in the disjoint `OmniActor` table while deleting
+customer rows. The caller cannot write that table, and no table mixes insert
+and delete effects.
 
 ## Keyed writes
 
@@ -172,6 +175,23 @@ gate in the engine. The trusted server resolves the actor; direct embedded
 callers must pass one when a policy checker is installed. Actor attribution
 travels with the pre-minted graph lineage and is published with the same
 manifest CAS.
+
+On an enabled graph, a successful attributed content write also stages a
+missing `OmniActor` row against the captured branch and accepted schema binding.
+Mutation and Load use the same strict keyed staging as customer rows; Merge
+includes the row in its existing bounded delta and recovery transaction chain.
+The actor never has a separate publication. Customer overwrite mode does not
+overwrite the actor table, and actor rows are excluded from customer affected
+row counts. Invalid actor identifiers, protected-table writes, and customer
+validation failures refuse before effects. Zero-effect mutations and empty-load
+lineage events do not create actor-only content.
+
+Schema configuration and empty-table creation need no actor participant. A
+schema operation that rewrites or drops populated content currently refuses
+first-use actor materialization before its effects; an existing actor remains
+supported. Physical maintenance and branch controls do not invent data changes.
+The accepted schema binding, including opt-out and stable identity, is defined
+in [actor provenance](../user/schema/index.md#actor-provenance).
 
 ## Maintenance of this protocol
 

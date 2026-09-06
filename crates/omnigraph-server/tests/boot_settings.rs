@@ -14,13 +14,70 @@ use tower::ServiceExt;
 mod support;
 use support::*;
 
+#[tokio::test]
+async fn data_trust_root_mismatch_refuses_before_recovery_open() {
+    use omnigraph_server::queries::QueryRegistry;
+    use omnigraph_server::{
+        BootWitness, DEFAULT_SHUTDOWN_GRACE, GraphStartupConfig, ServerConfig, ServerConfigMode,
+    };
+
+    let tokens = data_tokens::DataTokens::new();
+    let temp = tempfile::tempdir().unwrap();
+    let graph = temp.path().join("graph.omni");
+    let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+    Omnigraph::init(graph.to_str().unwrap(), &schema)
+        .await
+        .unwrap();
+    // A read-write engine open normally cleans matching no-op schema staging.
+    // Wrong public trust must refuse before even that recovery effect.
+    let staging = graph.join("_schema.pg.staging");
+    fs::write(&staging, &schema).unwrap();
+    let trust_path = temp.path().join("trust.json");
+    fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+    let result = omnigraph_server::serve(ServerConfig {
+        mode: ServerConfigMode::Multi {
+            graphs: vec![GraphStartupConfig {
+                graph_id: "graph-a".into(),
+                uri: graph.to_str().unwrap().into(),
+                policy: None,
+                embedding: None,
+                external_blob_policy: Default::default(),
+                queries: QueryRegistry::default(),
+            }],
+            config_path: temp.path().into(),
+            server_policy: None,
+        },
+        bind: "127.0.0.1:0".into(),
+        canonical_root: "file:///another-root".into(),
+        data_token_trust: Some(trust_path),
+        allow_unauthenticated: true,
+        require_all_graphs: true,
+        witness: BootWitness::default(),
+        shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+    })
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("serving-root binding")
+    );
+    assert!(
+        staging.exists(),
+        "invalid trust must not open the graph for recovery"
+    );
+}
+
 mod multi_graph_startup {
     use super::*;
     use omnigraph::storage::normalize_root_uri;
     use omnigraph_server::{GraphHandle, GraphId, GraphKey, GraphRegistry, InsertError};
     use std::sync::Arc;
 
-    async fn build_multi_mode_app(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {
+    async fn build_multi_mode_state(
+        graph_ids: &[&str],
+        policy: Option<omnigraph_policy::PolicyEngine>,
+    ) -> (Vec<tempfile::TempDir>, AppState) {
         let mut dirs = Vec::with_capacity(graph_ids.len());
         let mut handles = Vec::with_capacity(graph_ids.len());
         for id in graph_ids {
@@ -38,9 +95,51 @@ mod multi_graph_startup {
             dirs.push(dir);
         }
         let workload = omnigraph_server::workload::WorkloadController::from_env();
-        let state = AppState::new_multi(handles, Vec::new(), None, workload, None).unwrap();
+        let state = AppState::new_multi(handles, Vec::new(), policy, workload, None).unwrap();
+        (dirs, state)
+    }
+
+    async fn build_multi_mode_app(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {
+        let (dirs, state) = build_multi_mode_state(graph_ids, None).await;
+        (dirs, build_app(state))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signed_registry_lists_only_granted_served_and_quarantined_graphs() {
+        let tokens = data_tokens::DataTokens::new();
+        let policy = omnigraph_policy::PolicyEngine::load_server_from_source(&format!(
+            "version: 1\ngroups:\n  viewers: [\"{}\"]\nrules:\n  - id: list\n    allow:\n      actors: {{group: viewers}}\n      actions: [graph_list]\n",tokens.actor
+        )).unwrap();
+        let (_dirs, state) = build_multi_mode_state(&["alpha", "beta"], Some(policy)).await;
+        let state = state
+            .with_data_token_trust(tokens.trust.clone())
+            .with_boot_witness(
+                omnigraph_server::BootWitness {
+                    applied_graphs: vec![
+                        "alpha".into(),
+                        "beta".into(),
+                        "ghost-allowed".into(),
+                        "ghost-hidden".into(),
+                    ],
+                    ..Default::default()
+                },
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                omnigraph_server::DEFAULT_SHUTDOWN_GRACE,
+            );
         let app = build_app(state);
-        (dirs, app)
+        let token = tokens.token(serde_json::json!([
+            {"graph_id":"alpha","actions":["graph_list"]},
+            {"graph_id":"beta","actions":["read"]},
+            {"graph_id":"ghost-allowed","actions":["graph_list"]}
+        ]));
+        let (status, body) = json_response(&app, get_request("/graphs", &token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["graphs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["graphs"][0]["graph_id"], "alpha");
+        assert_eq!(body["quarantined"], serde_json::json!(["ghost-allowed"]));
+        let read = tokens.token(serde_json::json!([{"graph_id":"alpha","actions":["read"]}]));
+        let (status, _) = json_response(&app, get_request("/graphs", &read)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     /// Cluster route `/graphs/{graph_id}/snapshot` resolves to the right

@@ -194,6 +194,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                 cmd,
                 Command::Cluster {
                     command: ClusterCommand::Apply { .. } | ClusterCommand::Approve { .. },
+                    ..
                 }
             ),
             Direct => matches!(cmd, Command::RebuildFullTextIndexes { .. }),
@@ -274,6 +275,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Embed(_)
         | Command::Login { .. }
         | Command::Logout { .. }
+        | Command::Use { .. }
         | Command::Profile { .. }
         | Command::Version => Plane::Session,
     }
@@ -286,6 +288,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Version => "version",
         Command::Login { .. } => "login",
         Command::Logout { .. } => "logout",
+        Command::Use { .. } => "use",
         Command::Profile { .. } => "profile",
         Command::Embed(_) => "embed",
         Command::Init { .. } => "init",

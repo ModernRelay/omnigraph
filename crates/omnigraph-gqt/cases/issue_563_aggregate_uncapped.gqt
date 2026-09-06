@@ -63,3 +63,6 @@ query recall_count($q: String) {
 
 --- expect unordered
 {"total": 20}
+
+--- expect shape
+total: I64

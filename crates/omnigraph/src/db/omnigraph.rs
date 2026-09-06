@@ -14,7 +14,7 @@ use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
     DropMode, SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep,
-    SchemaShape, SchemaTypeKind, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
+    SchemaShape, SchemaTypeKind, build_catalog_from_ir, compile_schema_source_shape,
     plan_schema_migration,
 };
 
@@ -337,10 +337,21 @@ pub enum OpenMode {
 /// URI. With `force: true`, orphan schema files may be replaced only when no
 /// `__manifest` exists. Force never rebinds an existing graph to a newly
 /// minted schema identity domain and does not purge Lance datasets.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct InitOptions {
     /// Replace orphan schema artifacts at a root with no `__manifest`.
     pub force: bool,
+    /// Provision the protected actor identity table for a new graph.
+    pub actor_provenance: bool,
+}
+
+impl Default for InitOptions {
+    fn default() -> Self {
+        Self {
+            force: false,
+            actor_provenance: true,
+        }
+    }
 }
 
 impl Omnigraph {
@@ -408,8 +419,12 @@ impl Omnigraph {
         preflight_init_target(&root, storage.as_ref(), options).await?;
 
         let schema_shape = read_schema_shape_from_source(schema_source)?;
-        let resolution = initialize_schema_ir(SchemaIdentityDomain::new(), &schema_shape)
-            .map_err(|error| OmniError::manifest(error.to_string()))?;
+        let resolution = omnigraph_compiler::initialize_schema_ir_with_actor_provenance(
+            SchemaIdentityDomain::new(),
+            &schema_shape,
+            options.actor_provenance,
+        )
+        .map_err(|error| OmniError::manifest(error.to_string()))?;
         for diagnostic in &resolution.diagnostics {
             tracing::warn!(
                 target: "omnigraph::schema::identity",
@@ -967,6 +982,38 @@ impl Omnigraph {
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
         Ok(Arc::new(catalog))
+    }
+
+    /// Read customer source and its full accepted schema, including protected
+    /// builtins, from one validated view. This performs no recovery or writes.
+    pub async fn accepted_schema(&self) -> Result<(String, SchemaIR)> {
+        let _schema_guard = self
+            .write_queue()
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let source = self
+            .storage
+            .read_text(&schema_source_uri(self.uri()))
+            .await?;
+        let (schema_ir, _) = load_validated_schema_contract_for_source(
+            self.uri(),
+            Arc::clone(&self.storage),
+            &source,
+        )
+        .await?;
+        let resolved = self
+            .resolve_target_after_schema_validation(ReadTarget::branch("main"))
+            .await?;
+        validate_schema_ir_against_snapshot(&schema_ir, &resolved.snapshot)?;
+        Ok((source, schema_ir))
+    }
+
+    /// Read the current accepted graph setting without creating actors or changing state.
+    pub async fn actor_provenance_enabled(&self) -> Result<bool> {
+        let (_, catalog) = self.capture_read_view(ReadTarget::branch("main")).await?;
+        Ok(catalog
+            .actor_provenance()
+            .is_some_and(|binding| binding.enabled))
     }
 
     pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
@@ -3985,7 +4032,7 @@ fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapsho
 
 fn read_schema_shape_from_source(schema_source: &str) -> Result<SchemaShape> {
     let schema_ast = parse_schema(schema_source)?;
-    compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+    compile_schema_source_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
 }
 
 /// Root-scoped durable ownership for graph initialization.
@@ -4730,8 +4777,14 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         assert_one_init_race_winner(
             dir.path().to_str().unwrap(),
-            InitOptions { force: true },
-            InitOptions { force: true },
+            InitOptions {
+                force: true,
+                ..InitOptions::default()
+            },
+            InitOptions {
+                force: true,
+                ..InitOptions::default()
+            },
         )
         .await;
     }
@@ -4741,7 +4794,10 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         assert_one_init_race_winner(
             dir.path().to_str().unwrap(),
-            InitOptions { force: true },
+            InitOptions {
+                force: true,
+                ..InitOptions::default()
+            },
             InitOptions::default(),
         )
         .await;
@@ -4770,7 +4826,10 @@ edge WorksAt: Person -> Company
             uri,
             TEST_SCHEMA,
             Arc::new(ObjectStorageAdapter::local()),
-            InitOptions { force: true },
+            InitOptions {
+                force: true,
+                ..InitOptions::default()
+            },
         )
         .await
         {

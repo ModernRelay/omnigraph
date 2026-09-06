@@ -22,8 +22,14 @@ repair, cleanup, schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
 --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
+MANAGED FOLDERS: cluster commands use .omnigraph/context; cluster token caches data access.\n\
+query and mutate require --graph and a cached data credential. --direct selects legacy addressing.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
+    /// Explicitly use legacy addressing and credentials, ignoring folder context.
+    #[arg(long, global = true)]
+    pub(crate) direct: bool,
+
     /// Actor id for direct-engine writes and actor-bound cluster operations;
     /// overrides `operator.actor`. No effect on remote writes (the server
     /// resolves the actor from the bearer token). With a policy configured
@@ -41,7 +47,7 @@ pub(crate) struct Cli {
     /// Select a graph within a multi-graph scope: on a `--server` it appends
     /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
     /// graph to maintain. Rejected on a single-graph address (a positional URI /
-    /// `--store`).
+    /// `--store`). Required for managed data queries, mutations, and token issuance.
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 
@@ -284,6 +290,9 @@ pub(crate) enum Command {
         /// overwrites an initialized graph or purges its Lance datasets.
         #[arg(long)]
         force: bool,
+        /// Materialize attributed writers as OmniActor nodes (default: true).
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        actor_provenance: Option<bool>,
     },
     /// Compact small Lance fragments in every backing dataset of the graph
     Optimize {
@@ -364,7 +373,7 @@ pub(crate) enum Command {
     },
 
     // ── Control plane ── manage a cluster directory (--config <dir>).
-    /// Validate and plan read-only cluster configuration.
+    /// Manage cluster configuration or the folder's selected managed cluster.
     Cluster {
         #[command(subcommand)]
         command: ClusterCommand,
@@ -382,7 +391,11 @@ pub(crate) enum Command {
     Login {
         /// Server name (keys the credential; declare its url under
         /// `servers:` in ~/.omnigraph/config.yaml)
-        name: String,
+        #[arg(required_unless_present = "api", conflicts_with = "api")]
+        name: Option<String>,
+        /// Log in to a managed Intent API using browser device authorization.
+        #[arg(long, conflicts_with = "token")]
+        api: Option<String>,
         /// The token. Prefer piping via stdin over this flag (shell
         /// history).
         #[arg(long)]
@@ -392,7 +405,21 @@ pub(crate) enum Command {
     },
     /// Remove a named server's stored credential. Idempotent.
     Logout {
-        name: String,
+        #[arg(required_unless_present = "api", conflicts_with = "api")]
+        name: Option<String>,
+        /// Revoke the managed session and remove its OS keychain entry.
+        #[arg(long)]
+        api: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Select a managed cluster for this config directory.
+    Use {
+        cluster_id: String,
+        #[arg(long)]
+        api: String,
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -497,6 +524,22 @@ pub(crate) enum BlobCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClusterCommand {
+    /// Cache a scoped data credential for this managed cluster, or forget it locally.
+    Token {
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// Comma-separated data actions, such as read,change.
+        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        actions: Option<String>,
+        /// Credential lifetime, 60 seconds to 24 hours (default 1h).
+        #[arg(long, value_parser = crate::managed::data::parse_ttl, conflicts_with = "clear")]
+        ttl: Option<u64>,
+        /// Forget this cluster's cached data credential; does not revoke it at the server.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Validate cluster.yaml and referenced schemas, queries, and policy files.
     Validate {
         /// Cluster config directory containing cluster.yaml.
@@ -518,6 +561,11 @@ pub(crate) enum ClusterCommand {
         /// any lock instead of refusing, and label the output `observed`.
         #[arg(long)]
         observe: bool,
+        /// Managed: select a pushed revision; omission uses the bound head.
+        #[arg(long = "rev", alias = "revision")]
+        revision: Option<String>,
+        #[command(flatten)]
+        managed: ManagedRunArgs,
     },
     /// Converge the cluster to its config: create graphs, apply schema updates
     /// (soft drops), write stored-query/policy catalog resources, and execute
@@ -530,6 +578,11 @@ pub(crate) enum ClusterCommand {
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
+        /// Managed: apply this exact saved plan run. Required in managed mode.
+        #[arg(long)]
+        plan: Option<String>,
+        #[command(flatten)]
+        managed: ManagedRunArgs,
     },
     /// Record a digest-bound approval for a gated (irreversible) change,
     /// e.g. a graph delete. Requires the global --as actor.
@@ -545,10 +598,32 @@ pub(crate) enum ClusterCommand {
     },
     /// Read the local JSON state ledger without scanning live graph resources.
     Status {
+        /// Managed: inspect a run instead of the cluster projections.
+        run_id: Option<String>,
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read managed run history with its provenance and outcomes.
+    History {
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+        /// Include runs since this RFC 3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Cancel a pending managed run, or abandon an unused saved plan.
+    Cancel {
+        run_id: String,
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -592,6 +667,19 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Default, Args)]
+pub(crate) struct ManagedRunArgs {
+    /// Return the accepted managed run without waiting for its outcome.
+    #[arg(long)]
+    pub(crate) no_wait: bool,
+    /// Managed wait deadline in seconds (default 300, maximum 3600).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub(crate) timeout: Option<u64>,
+    /// Reuse this key to safely replay the same managed request.
+    #[arg(long)]
+    pub(crate) idempotency_key: Option<String>,
 }
 
 /// Operations on the graph registry of a multi-graph server (MR-668).
@@ -673,6 +761,9 @@ pub(crate) enum SchemaCommand {
         /// so the plan output reflects the destructive intent.
         #[arg(long, default_value_t = false)]
         allow_data_loss: bool,
+        /// Change automatic actor materialization; omission preserves the accepted setting.
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        actor_provenance: Option<bool>,
     },
     /// Apply a supported schema migration
     Apply {
@@ -693,8 +784,11 @@ pub(crate) enum SchemaCommand {
         /// making the prior data unreachable.
         #[arg(long, default_value_t = false)]
         allow_data_loss: bool,
+        /// Change automatic actor materialization; omission preserves the accepted setting.
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        actor_provenance: Option<bool>,
     },
-    /// Show the current accepted schema source
+    /// Show customer source and effective system types; --json includes the accepted schema
     #[command(alias = "get")]
     Show {
         /// Graph URI

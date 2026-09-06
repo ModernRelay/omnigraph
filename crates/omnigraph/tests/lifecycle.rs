@@ -6,7 +6,7 @@ use omnigraph::db::{InitOptions, Omnigraph, ReadTarget};
 use omnigraph_compiler::schema::parser::{parse_persisted_schema_contract, parse_schema};
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, compile_schema_shape, resolve_schema_ir, schema_ir_hash,
-    schema_ir_pretty_json, schema_shape_hash, schema_shape_hash_from_ir,
+    schema_ir_pretty_json, schema_shape_hash, schema_source_shape_hash_from_ir,
 };
 
 use helpers::*;
@@ -22,7 +22,7 @@ fn compile_persisted_shape(source: &str) -> omnigraph_compiler::SchemaShape {
 fn schema_state_json(ir: &SchemaIR) -> serde_json::Value {
     serde_json::json!({
         "format_version": 2,
-        "schema_shape_hash": schema_shape_hash_from_ir(ir).unwrap(),
+        "schema_shape_hash": schema_source_shape_hash_from_ir(ir).unwrap(),
         "schema_ir_hash": schema_ir_hash(ir).unwrap(),
         "schema_identity_version": 2,
         "schema_identity_domain": ir.schema_identity_domain.as_str(),
@@ -59,7 +59,18 @@ async fn init_creates_graph() {
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join("__schema_state.json")).unwrap())
             .unwrap();
-    assert_eq!(ir.ir_version, 2);
+    let (accepted_source, accepted_ir) = db.accepted_schema().await.unwrap();
+    assert_eq!(accepted_source, TEST_SCHEMA);
+    assert_eq!(accepted_ir, ir);
+    assert!(
+        accepted_ir
+            .nodes
+            .iter()
+            .any(|node| node.name == "OmniActor")
+    );
+    assert_eq!(ir.ir_version, 3);
+
+    assert!(ir.actor_provenance.as_ref().unwrap().enabled);
     assert!(ir.next_identity_id > 1);
     assert!(SchemaIdentityDomain::parse(ir.schema_identity_domain.as_str()).is_ok());
     assert_eq!(state["format_version"].as_u64(), Some(2));
@@ -97,11 +108,19 @@ async fn init_creates_graph() {
         6,
         "fresh graphs must use the restored pre-WAL v6 manifest format"
     );
+    assert!(snap.dataset("node:OmniActor").is_some());
+    assert_eq!(snap.dataset("node:OmniActor").unwrap().entity_count, 0);
     assert!(snap.dataset("node:Person").is_some());
     assert!(snap.dataset("node:Company").is_some());
     assert!(snap.dataset("edge:Knows").is_some());
     assert!(snap.dataset("edge:WorksAt").is_some());
-    for table_key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+    for table_key in [
+        "node:OmniActor",
+        "node:Person",
+        "node:Company",
+        "edge:Knows",
+        "edge:WorksAt",
+    ] {
         let dataset = snap.open_dataset(table_key).await.unwrap();
         let primary_key = dataset
             .schema()
@@ -141,7 +160,7 @@ async fn init_creates_graph() {
         }
     }
 
-    assert_eq!(db.catalog().node_types.len(), 2);
+    assert_eq!(db.catalog().node_types.len(), 3);
     assert_eq!(db.catalog().edge_types.len(), 2);
     assert_eq!(
         db.catalog().node_types["Person"].key_property(),
@@ -225,7 +244,7 @@ async fn open_reads_existing_graph() {
     drop(created);
 
     let db = Omnigraph::open(uri).await.unwrap();
-    assert_eq!(db.catalog().node_types.len(), 2);
+    assert_eq!(db.catalog().node_types.len(), 3);
     assert_eq!(db.catalog().edge_types.len(), 2);
     let snap = snapshot_main(&db).await.unwrap();
     assert!(snap.dataset("node:Person").is_some());
@@ -693,7 +712,10 @@ async fn force_init_refuses_existing_manifest_and_preserves_identity_contract() 
     let err = match Omnigraph::init_with_options(
         uri,
         "node Replacement { key: String @key }\n",
-        InitOptions { force: true },
+        InitOptions {
+            force: true,
+            ..InitOptions::default()
+        },
     )
     .await
     {
@@ -707,7 +729,7 @@ async fn force_init_refuses_existing_manifest_and_preserves_identity_contract() 
 }
 
 /// Happy-path sibling to the strict re-init regression above:
-/// `InitOptions { force: true }` may replace orphan schema artifacts when the
+/// `InitOptions { force: true, ..InitOptions::default() }` may replace orphan schema artifacts when the
 /// operator deliberately recovers from a failed prior init.
 ///
 /// Force does not purge Lance state and refuses any existing `__manifest`.
@@ -738,9 +760,16 @@ async fn init_with_force_recovers_from_orphan_schema_files() {
 
     // Force init succeeds after proving no manifest exists, overwrites the
     // orphan file, and proceeds to initialize Lance state.
-    let db = Omnigraph::init_with_options(uri, TEST_SCHEMA, InitOptions { force: true })
-        .await
-        .expect("force init must succeed when only orphan schema files block strict init");
+    let db = Omnigraph::init_with_options(
+        uri,
+        TEST_SCHEMA,
+        InitOptions {
+            force: true,
+            ..InitOptions::default()
+        },
+    )
+    .await
+    .expect("force init must succeed when only orphan schema files block strict init");
 
     // Confirm the catalog is populated as expected — proves the
     // graph is functional after force-recovery, not just that the
@@ -1090,4 +1119,48 @@ mod local_create_if_absent_probe {
             "capability probe must clean up after itself"
         );
     }
+}
+
+// Rust owner: accepted IR/version and on-disk initialization authority are not
+// expressible as a query-row assertion.
+#[tokio::test]
+async fn actor_provenance_legacy_opt_out_and_collision_issue_661() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("legacy");
+    let uri = root.to_str().unwrap();
+    let db = Omnigraph::init_with_options(
+        uri,
+        TEST_SCHEMA,
+        InitOptions {
+            actor_provenance: false,
+            ..InitOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!db.actor_provenance_enabled().await.unwrap());
+    assert!(!db.catalog().node_types.contains_key("OmniActor"));
+    let before = fs::read(root.join("_schema.ir.json")).unwrap();
+    let ir: SchemaIR = serde_json::from_slice(&before).unwrap();
+    assert_eq!(ir.ir_version, 2);
+    assert!(ir.actor_provenance.is_none());
+    assert!(
+        !String::from_utf8(before.clone())
+            .unwrap()
+            .contains("actor_provenance")
+    );
+    drop(db);
+    let reopened = Omnigraph::open_read_only(uri).await.unwrap();
+    assert!(!reopened.actor_provenance_enabled().await.unwrap());
+    assert_eq!(fs::read(root.join("_schema.ir.json")).unwrap(), before);
+
+    let collision_root = dir.path().join("collision");
+    let collision = Omnigraph::init(
+        collision_root.to_str().unwrap(),
+        "node OmniActor { actorId: String @key }",
+    )
+    .await;
+    assert!(collision.is_err());
+    assert!(!collision_root.join("__manifest").exists());
+    assert!(!collision_root.join("_schema.pg").exists());
 }

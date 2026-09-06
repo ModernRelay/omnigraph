@@ -566,11 +566,6 @@ fn aggregate_return(
         }
     }
 
-    // Handle empty input: return a single row with count=0, others=null
-    if num_rows == 0 && group_keys.is_empty() {
-        return build_empty_aggregate_result(projections);
-    }
-
     // Build group assignments
     let mut group_map: HashMap<String, usize> = HashMap::new();
     let mut group_indices: Vec<Vec<usize>> = Vec::new();
@@ -800,6 +795,9 @@ fn compute_min_max(
         DataType::UInt64 => minmax_typed!(UInt64Array, UInt64Builder, arg, is_min),
         DataType::Float32 => minmax_typed!(Float32Array, Float32Builder, arg, is_min),
         DataType::Float64 => minmax_typed!(Float64Array, Float64Builder, arg, is_min),
+        DataType::Boolean => minmax_typed!(BooleanArray, BooleanBuilder, arg, is_min),
+        DataType::Date32 => minmax_typed!(Date32Array, Date32Builder, arg, is_min),
+        DataType::Date64 => minmax_typed!(Date64Array, Date64Builder, arg, is_min),
         DataType::Utf8 => {
             let arr = arg.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
                 OmniError::manifest(format!("min/max: expected Utf8, got {:?}", arg.data_type()))
@@ -834,34 +832,4 @@ fn compute_min_max(
             dt
         ))),
     }
-}
-
-/// Build a single-row result for an aggregate query with zero input rows and no group keys.
-fn build_empty_aggregate_result(projections: &[IRProjection]) -> Result<RecordBatch> {
-    let mut fields = Vec::with_capacity(projections.len());
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projections.len());
-
-    for proj in projections {
-        let name = proj.alias.as_deref().unwrap_or("?");
-        match &proj.expr {
-            IRExpr::Aggregate { func, .. } => match func {
-                AggFunc::Count => {
-                    fields.push(Field::new(name, DataType::Int64, true));
-                    columns.push(Arc::new(Int64Array::from(vec![0i64])) as ArrayRef);
-                }
-                _ => {
-                    fields.push(Field::new(name, DataType::Float64, true));
-                    columns
-                        .push(Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef);
-                }
-            },
-            _ => {
-                fields.push(Field::new(name, DataType::Utf8, true));
-                columns.push(Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef);
-            }
-        }
-    }
-
-    let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }

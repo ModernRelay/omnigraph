@@ -117,3 +117,13 @@ Policy is enforced for graph writes inside the engine as well as at the HTTP
 boundary. This keeps direct and embedded writers subject to the same action
 checks when a policy engine is installed. Per-entity and per-property
 authorization is not currently supported; authorization is graph/branch scoped.
+
+New graphs also make the attributed actor queryable as an `OmniActor` node
+after its first successful content write. This node is provenance, not a
+policy principal or grant: policies continue to use the verified server actor,
+and creating or querying a node cannot enroll an identity. Managed tokens for
+the same principal resolve to the same `principal:<sub>` actor. Direct embedded
+attribution remains self-asserted, and an actor node alone proves neither human
+identity nor authentication assurance. See
+[actor provenance](../schema/index.md#actor-provenance) for configuration and
+migration behavior.

@@ -28,6 +28,18 @@ tokio = { workspace = true, features = ["fs", "io-std", "io-util"] }
 reqwest = { workspace = true, features = ["blocking", "stream"] }
 futures = { workspace = true }
 tempfile = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true, features = ["parsing"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+keyring = { version = "3.6.3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", features = ["windows-native"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
 
 [dev-dependencies]
 assert_cmd = "2"

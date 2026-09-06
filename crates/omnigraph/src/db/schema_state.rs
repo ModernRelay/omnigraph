@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use omnigraph_compiler::schema::parser::parse_persisted_schema_contract;
 use omnigraph_compiler::{
-    SchemaIR, SchemaIdentityDomain, SchemaShape, compile_schema_shape, schema_ir_hash,
-    schema_ir_pretty_json, schema_shape_hash, schema_shape_hash_from_ir, validate_schema_ir,
+    SchemaIR, SchemaIdentityDomain, SchemaShape, compile_schema_source_shape, schema_ir_hash,
+    schema_ir_pretty_json, schema_shape_hash, schema_source_shape_hash_from_ir, validate_schema_ir,
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -41,7 +41,7 @@ impl SchemaState {
         validate_schema_ir(schema_ir).map_err(|error| schema_lock_conflict(error.to_string()))?;
         Ok(Self {
             format_version: SCHEMA_STATE_FORMAT_VERSION,
-            schema_shape_hash: schema_shape_hash_from_ir(schema_ir)
+            schema_shape_hash: schema_source_shape_hash_from_ir(schema_ir)
                 .map_err(|error| schema_lock_conflict(error.to_string()))?,
             schema_ir_hash: schema_ir_hash(schema_ir)
                 .map_err(|error| schema_lock_conflict(error.to_string()))?,
@@ -84,7 +84,7 @@ pub(crate) async fn load_validated_schema_contract_for_source(
 ) -> Result<(SchemaIR, SchemaState)> {
     let current_source_shape = compile_schema_source(source)?;
     let (persisted_ir, state) = match read_schema_contract(root_uri, storage.as_ref()).await? {
-        SchemaContractRead::Present { ir, state } => (ir, state),
+        SchemaContractRead::Present { ir, state } => (*ir, state),
         SchemaContractRead::MissingAll => {
             return Err(schema_lock_conflict(
                 "graph is missing the mandatory identity-bearing schema contract (_schema.ir.json and __schema_state.json); automatic bootstrap is not supported",
@@ -178,7 +178,7 @@ pub(crate) async fn read_accepted_schema_ir(
     match read_schema_contract(root_uri, storage.as_ref()).await? {
         SchemaContractRead::Present { ir, state } => {
             validate_persisted_schema_contract(&ir, &state)?;
-            Ok(ir)
+            Ok(*ir)
         }
         SchemaContractRead::MissingAll => Err(schema_lock_conflict(
             "graph is missing the mandatory identity-bearing schema contract; automatic bootstrap is not supported",
@@ -322,7 +322,10 @@ pub(crate) fn schema_state_staging_uri(root_uri: &str) -> String {
 }
 
 enum SchemaContractRead {
-    Present { ir: SchemaIR, state: SchemaState },
+    Present {
+        ir: Box<SchemaIR>,
+        state: SchemaState,
+    },
     MissingAll,
     PartialMissing,
 }
@@ -353,7 +356,10 @@ async fn read_schema_contract(
                     SCHEMA_STATE_FILENAME, err
                 ))
             })?;
-            Ok(SchemaContractRead::Present { ir, state })
+            Ok(SchemaContractRead::Present {
+                ir: Box::new(ir),
+                state,
+            })
         }
         _ => Ok(SchemaContractRead::PartialMissing),
     }
@@ -390,8 +396,8 @@ fn validate_persisted_schema_contract(ir: &SchemaIR, state: &SchemaState) -> Res
         ));
     }
 
-    let projected_shape_hash =
-        schema_shape_hash_from_ir(ir).map_err(|err| schema_lock_conflict(err.to_string()))?;
+    let projected_shape_hash = schema_source_shape_hash_from_ir(ir)
+        .map_err(|err| schema_lock_conflict(err.to_string()))?;
     if projected_shape_hash != state.schema_shape_hash {
         return Err(schema_lock_conflict(
             "accepted compiled schema's semantic projection does not match the recorded schema shape",
@@ -451,7 +457,7 @@ fn compile_schema_source(source: &str) -> Result<SchemaShape> {
             err
         ))
     })?;
-    compile_schema_shape(&schema).map_err(|err| {
+    compile_schema_source_shape(&schema).map_err(|err| {
         schema_lock_conflict(format!(
             "current _schema.pg could not be compiled into the accepted schema shape: {}",
             err
@@ -857,7 +863,7 @@ async fn validate_present_exact_schema_staging_artifacts(
     } else if let (Some(shape), Some(ir)) = (&source_shape, &staged_ir) {
         let source_hash =
             schema_shape_hash(shape).map_err(|error| schema_lock_conflict(error.to_string()))?;
-        let ir_shape_hash = schema_shape_hash_from_ir(ir)
+        let ir_shape_hash = schema_source_shape_hash_from_ir(ir)
             .map_err(|error| schema_lock_conflict(error.to_string()))?;
         if source_hash != ir_shape_hash {
             return Err(schema_lock_conflict(

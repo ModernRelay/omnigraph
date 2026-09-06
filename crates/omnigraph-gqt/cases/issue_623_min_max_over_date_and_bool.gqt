@@ -1,0 +1,112 @@
+# issue: 623
+# red_on: 2026-09-04, main @ 8ca9b12c: refused at typecheck (min requires numeric or string type, got Date?); the Bool and DateTime columns are refused by the same rule.
+
+--- schema
+node Person {
+    name: String @key
+    birthdate: Date?
+    isStudent: Bool?
+    registered: DateTime?
+    tags: [I32]?
+    emb: Vector(2)?
+    doc: Blob?
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","birthdate":"1900-01-01","isStudent":true,"registered":"2020-05-01T10:00:00.000Z"}}
+{"type":"Person","data":{"name":"bob","birthdate":"1940-06-22","isStudent":false,"registered":"2019-12-31T23:59:59.999Z"}}
+{"type":"Person","data":{"name":"carol"}}
+
+--- query
+query min_max_over_date_and_bool() {
+    match {
+        $p: Person
+    }
+    return { min($p.birthdate) as min_birthdate, max($p.birthdate) as max_birthdate, min($p.isStudent) as min_is_student, max($p.isStudent) as max_is_student, min($p.registered) as first_registered, max($p.registered) as last_registered }
+}
+
+--- expect unordered
+{"min_birthdate": "1900-01-01", "max_birthdate": "1940-06-22", "min_is_student": false, "max_is_student": true, "first_registered": "2019-12-31T23:59:59.999", "last_registered": "2020-05-01T10:00:00"}
+
+--- expect shape
+min_birthdate: Date
+max_birthdate: Date
+min_is_student: Bool
+max_is_student: Bool
+first_registered: DateTime
+last_registered: DateTime
+
+--- query
+query zero_rows_one_null_row() {
+    match {
+        $p: Person
+        $p.name = "nobody"
+    }
+    return { count($p) as n, min($p.birthdate) as min_birthdate, max($p.isStudent) as max_is_student, min($p.registered) as first_registered }
+}
+
+--- expect unordered
+{"n": 0}
+
+--- expect shape
+n: I64
+min_birthdate: Date?
+max_is_student: Bool?
+first_registered: DateTime?
+
+--- query
+query null_only_group_yields_null() {
+    match {
+        $p: Person
+        $p.name = "carol"
+    }
+    return { count($p) as n, max($p.isStudent) as max_is_student, min($p.birthdate) as min_birthdate }
+}
+
+--- expect unordered
+{"n": 1}
+
+--- expect shape
+n: I64
+max_is_student: Bool?
+min_birthdate: Date?
+
+--- query
+query min_over_list_refused() {
+    match {
+        $p: Person
+    }
+    return { min($p.tags) as t }
+}
+
+--- expect error: T8: min requires a numeric, String, Bool, Date, or DateTime scalar, got [I32]
+
+--- query
+query max_over_vector_refused() {
+    match {
+        $p: Person
+    }
+    return { max($p.emb) as e }
+}
+
+--- expect error: T8: max requires a numeric, String, Bool, Date, or DateTime scalar, got Vector(2)
+
+--- query
+query sum_over_date_refused() {
+    match {
+        $p: Person
+    }
+    return { sum($p.birthdate) as s }
+}
+
+--- expect error: T8: sum requires numeric type, got Date?
+
+--- query
+query min_over_blob_refused() {
+    match {
+        $p: Person
+    }
+    return { min($p.doc) as d }
+}
+
+--- expect error: T24: Blob property `$p.doc` is not available as a .gq read value

@@ -139,7 +139,47 @@ plan carefully; it cannot be undone.
 Cluster-managed graphs change schema through `omnigraph cluster apply`. Direct
 schema apply and the server schema-apply endpoint refuse cluster-managed graphs.
 
+## Actor provenance
+
+New graphs include the protected `OmniActor` node with `actorId: String @key`.
+The first successful attributed content write creates its actor alongside the
+customer data in the same graph commit. Unattributed writes, reads, login, and
+zero-effect mutations create no actor. Customer-defined `Actor` types remain
+independent; declaring an unbound `OmniActor` conflicts with enabling this
+feature and must be renamed first.
+
+Use `omnigraph init --actor-provenance false` to create a graph without the
+built-in. Existing graphs keep their accepted setting until an explicit schema
+migration changes it:
+
+```bash
+omnigraph schema plan --schema current.pg --actor-provenance true graph.omni
+omnigraph schema apply --schema current.pg --actor-provenance true graph.omni
+```
+
+Pass `false` to stop automatic creation. Existing actor rows and their stable
+table identity remain queryable and protected; re-enabling reuses them. The
+customer source does not declare the built-in: the accepted schema IR owns its
+binding and setting. A bound graph uses schema IR version 3 and requires a
+compatible reader/writer even after automatic creation is disabled. Existing
+unbound version-2 graphs keep their legacy representation.
+
+Ordinary mutations and loads cannot modify the protected actor table. When
+automatic provenance is enabled, an attributed schema change that rewrites or
+removes existing content requires its actor to exist already. A missing actor
+returns `actor_provenance_unsupported_schema_write` before schema or table effects.
+Metadata changes, enabling/disabling, and empty table creation remain supported.
+Application edges can refer to `OmniActor` under ordinary referential-integrity
+rules; actor nodes do not grant permissions or prove human identity.
+
+Data exports follow their selected types and can include protected `OmniActor`
+rows. Ordinary load refuses those rows instead of recreating or silently dropping
+them. Export/load therefore does not provide a provenance-preserving restore;
+preserving provenance requires the accepted schema binding and actor content
+together with graph state.
+
 ## Diagnostic codes
+
 
 Migration rejections may include a stable `OG-...` code. Match automation on the
 code rather than the message text.

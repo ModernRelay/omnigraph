@@ -1403,7 +1403,7 @@ async fn partial_first_touch_recovery_fails_closed_on_legacy_path_overlap() {
     let main_edge_rows = helpers::count_rows(&db, "edge:Knows").await;
 
     let main_snapshot = db.snapshot_of("main").await.unwrap();
-    let table_pins = ["node:Person", "edge:Knows"]
+    let table_pins = ["node:Person", "edge:Knows", "node:OmniActor"]
         .into_iter()
         .map(|table_key| {
             let entry = main_snapshot.dataset(table_key).unwrap();
@@ -1431,7 +1431,7 @@ async fn partial_first_touch_recovery_fails_closed_on_legacy_path_overlap() {
     let operation_id = {
         let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_TABLE_COMMIT, "return");
         let error = db
-            .mutate(
+            .mutate_as(
                 "feature",
                 MUTATION_QUERIES,
                 "insert_person_and_friend",
@@ -1439,6 +1439,7 @@ async fn partial_first_touch_recovery_fails_closed_on_legacy_path_overlap() {
                     &[("$name", "Ancestor"), ("$friend", "Alice")],
                     &[("$age", 23)],
                 ),
+                Some("partial-first-actor"),
             )
             .await
             .expect_err("the first exact table effect must leave a partial v3 intent");
@@ -1483,8 +1484,8 @@ async fn partial_first_touch_recovery_fails_closed_on_legacy_path_overlap() {
     head_deltas.sort_unstable();
     assert_eq!(
         head_deltas,
-        vec![0, 1],
-        "exactly one table effect must be durable while its sibling remains an untouched fork"
+        vec![0, 0, 1],
+        "exactly one table effect must be durable while its siblings remain untouched forks"
     );
 
     let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
@@ -1572,6 +1573,11 @@ async fn partial_first_touch_recovery_fails_closed_on_legacy_path_overlap() {
         helpers::count_rows_branch(&recovered, "feature", "edge:Knows").await,
         main_edge_rows
     );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:OmniActor").await,
+        0
+    );
+    assert_eq!(helpers::count_rows(&recovered, "node:OmniActor").await, 0);
 }
 
 #[tokio::test]
@@ -3651,23 +3657,25 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
 
     // Setup: trigger the residual.
     {
-        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
         let _failpoint =
             ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
 
         // The mutation's finalize completes (commit_staged advances Lance
-        // HEAD on node:Person AND writes a `__recovery/{ulid}.json`
+        // HEAD on node:Person and node:OmniActor, and writes a `__recovery/{ulid}.json`
         // sidecar). Then the failpoint kicks in before the publisher's
         // manifest commit, so the manifest pin stays at the pre-write
         // version. The sidecar persists for the next-open recovery sweep.
-        let err = mutate_main(
-            &mut db,
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-        )
-        .await
-        .unwrap_err();
+        let err = db
+            .mutate_as(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+                Some("recovery-actor"),
+            )
+            .await
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("injected failpoint triggered: mutation.post_finalize_pre_publisher"),
@@ -3687,6 +3695,9 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
         );
         operation_id = single_sidecar_operation_id(dir.path());
 
+        assert_eq!(helpers::count_rows(&db, "node:Person").await, 0);
+        assert_eq!(helpers::count_rows(&db, "node:OmniActor").await, 0);
+
         // Drop the failpoint scope and the engine handle.
     }
 
@@ -3703,20 +3714,27 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
         person_count, 1,
         "exactly one person (Eve) must be visible after roll-forward"
     );
+    assert_eq!(helpers::count_rows(&db, "node:OmniActor").await, 1);
+    let actors = collect_column_strings(
+        &helpers::read_table_branch(&db, "main", "node:OmniActor").await,
+        "actorId",
+    );
+    assert_eq!(actors, vec!["recovery-actor"]);
     drop(db);
 
     assert_post_recovery_invariants(
         dir.path(),
         &operation_id,
         RecoveryExpectation::RolledForwardOriginalLineage {
-            tables: vec![TableExpectation::main("node:Person").follow_up_mutation(
-                FollowUpMutation::new(
+            tables: vec![
+                TableExpectation::main("node:Person").follow_up_mutation(FollowUpMutation::new(
                     "main",
                     MUTATION_QUERIES,
                     "insert_person",
                     mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
-                ),
-            )],
+                )),
+                TableExpectation::main("node:OmniActor"),
+            ],
         },
     )
     .await
@@ -3728,6 +3746,7 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
         person_count, 2,
         "Frank's insert must land normally after recovery"
     );
+    assert_eq!(helpers::count_rows(&db, "node:OmniActor").await, 1);
 }
 
 /// The same confirmed-effect recovery boundary must hold when both the Lance
@@ -4511,7 +4530,7 @@ async fn ensure_indices_partial_armed_case(full_text_rebuild: bool) {
         let _failpoint = ScopedFailPoint::new(names::ENSURE_INDICES_POST_TABLE_EFFECT, "return");
         let err = run_index_maintenance(&db, "main", full_text_rebuild)
             .await
-            .expect_err("failpoint must stop after the first of two table effects");
+            .expect_err("failpoint must stop after the first planned table effect");
         assert!(matches!(err, OmniError::RecoveryRequired { .. }));
         operation_id = single_sidecar_operation_id(dir.path());
     }
@@ -4526,15 +4545,32 @@ async fn ensure_indices_partial_armed_case(full_text_rebuild: bool) {
         sidecar["protocol_v8"]["effect_phase"], "Armed",
         "a partial table-effect failure must remain rollback-only",
     );
+    let mut planned_tables = sidecar["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|table| table["table_key"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    planned_tables.sort_unstable();
+    // Ordinary reconciliation skips the empty actor table; a forced full-text
+    // rebuild includes its actorId index alongside both populated tables.
+    let expected_tables = if full_text_rebuild {
+        vec!["node:Company", "node:OmniActor", "node:Person"]
+    } else {
+        vec!["node:Company", "node:Person"]
+    };
     assert_eq!(
-        sidecar["tables"].as_array().map(Vec::len),
-        Some(2),
-        "the fixture must pin two planned table effects so one remains to stage",
+        planned_tables, expected_tables,
+        "the fixture must pin the exact index participants with more left to stage",
     );
 
     let snapshot = helpers::snapshot_main(&db).await.unwrap();
     let mut effected_tables = Vec::new();
-    for (table_key, type_name) in [("node:Person", "Person"), ("node:Company", "Company")] {
+    for (table_key, type_name) in [
+        ("node:Person", "Person"),
+        ("node:Company", "Company"),
+        ("node:OmniActor", "OmniActor"),
+    ] {
         let manifest_pin = snapshot
             .dataset(table_key)
             .unwrap()
@@ -5394,7 +5430,7 @@ async fn s3_load_recovers_after_publisher_failure_without_reopen() {
     }
 
     // Same-handle follow-up load: the entry heal LISTs __recovery/ on
-    // S3, rolls the sidecar forward, DELETEs it, and the write lands.
+    // S3, rolls the sidecar forward, issues a DELETE for it, and the write lands.
     load_jsonl(
         &db,
         r#"{"type":"Person","data":{"name":"Bob","age":25}}
@@ -6200,14 +6236,16 @@ async fn interrupted_write_self_heals_effect_free_armed_intent_issue_554() {
     // but before any table transaction commits.
     {
         let _fp = ScopedFailPoint::new(names::MUTATION_POST_ARM_PRE_EFFECT, "return");
-        let err = mutate_main(
-            &mut db,
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "dave")], &[("$age", 40)]),
-        )
-        .await
-        .expect_err("armed-window failure must surface as RecoveryRequired");
+        let err = db
+            .mutate_as(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "dave")], &[("$age", 40)]),
+                Some("interrupted-actor"),
+            )
+            .await
+            .expect_err("armed-window failure must surface as RecoveryRequired");
         let failed_operation_id = match err {
             OmniError::RecoveryRequired { operation_id, .. } => operation_id,
             other => panic!("expected RecoveryRequired from the armed window; got: {other}"),
@@ -6231,15 +6269,24 @@ async fn interrupted_write_self_heals_effect_free_armed_intent_issue_554() {
         person_head, person_entry.published_dataset_version,
         "the stranded sidecar must be effect-free (no Lance drift)"
     );
+    assert_eq!(helpers::count_rows(&db, "node:OmniActor").await, 0);
+    let actor_entry = snapshot.dataset("node:OmniActor").unwrap();
+    let actor_head = Dataset::open(&node_table_uri(&db, "OmniActor").await)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(actor_head, actor_entry.published_dataset_version);
 
     // The next write through the SAME long-lived handle must retire the
     // provably effect-free intent at its entry heal and then succeed — no
     // read-write reopen required.
-    mutate_main(
-        &mut db,
+    db.mutate_as(
+        "main",
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "erin")], &[("$age", 50)]),
+        Some("healed-actor"),
     )
     .await
     .expect("the live handle must self-heal the effect-free intent and write");
@@ -6254,6 +6301,8 @@ async fn interrupted_write_self_heals_effect_free_armed_intent_issue_554() {
         vec!["alice", "bob", "carol", "erin"],
         "seed writes plus the healed write — and no dave from the interrupted write"
     );
+    let actors = collect_column_strings(&read_table(&db, "node:OmniActor").await, "actorId");
+    assert_eq!(actors, vec!["healed-actor"]);
 }
 
 /// The version-gate exclusion of the issue #554 live retirement: a pre-v9
@@ -7497,7 +7546,7 @@ async fn schema_apply_first_touch_foreign_winner_is_preserved_not_adopted() {
 #[tokio::test]
 #[serial]
 async fn schema_apply_phase_b_failure_recovered_on_next_open() {
-    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::loader::LoadMode;
 
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -7506,19 +7555,28 @@ async fn schema_apply_phase_b_failure_recovered_on_next_open() {
     let fixed_commit_id;
     const ACTOR: &str = "schema-v9-recovery-actor";
 
-    // Seed: a Person table with one row so the schema-apply rewritten_tables
-    // loop has actual work to do.
-    {
+    // Seed both the content and its actor through one ordinary data write.
+    // SchemaApply can reuse this actor while exercising its populated rewrite.
+    let actor_version = {
         let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-        load_jsonl(
-            &db,
+        db.load_as(
+            "main",
+            None,
             r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#,
             LoadMode::Append,
+            Some(ACTOR),
         )
         .await
         .unwrap();
-    }
+        assert_eq!(helpers::count_rows(&db, "node:OmniActor").await, 1);
+        db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:OmniActor")
+            .unwrap()
+            .published_dataset_version
+    };
 
     // Capture pre-failure manifest version so we can assert the recovery
     // sweep advances it.
@@ -7622,6 +7680,21 @@ edge WorksAt: Person -> Company
     );
     let recovered_commit = db.get_commit(&fixed_commit_id).await.unwrap();
     assert_eq!(recovered_commit.actor_id.as_deref(), Some(ACTOR));
+    let actors = collect_column_strings(
+        &helpers::read_table_branch(&db, "main", "node:OmniActor").await,
+        "actorId",
+    );
+    assert_eq!(actors, vec![ACTOR]);
+    assert_eq!(
+        db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:OmniActor")
+            .unwrap()
+            .published_dataset_version,
+        actor_version,
+        "schema recovery must retain the existing actor without another table effect"
+    );
     drop(db);
 
     assert_post_recovery_invariants(
@@ -9222,12 +9295,21 @@ async fn branch_merge_recovery_replays_pointer_slots_with_fixed_lineage() {
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(
         delta_keys,
-        std::collections::HashSet::from(["node:Person", "node:Company"])
+        std::collections::HashSet::from(["node:Person", "node:Company", "node:OmniActor"])
     );
     assert_eq!(
         effect_keys,
-        std::collections::HashSet::from(["node:Person"]),
+        std::collections::HashSet::from(["node:Person", "node:OmniActor"]),
         "pointer-only Company must be in the logical delta but not physical pins"
+    );
+    assert_eq!(
+        helpers::read_table_branch(&db, "target", "node:OmniActor")
+            .await
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        0,
+        "unpublished actor must not be visible before recovery"
     );
     drop(db);
 
@@ -9244,6 +9326,12 @@ async fn branch_merge_recovery_replays_pointer_slots_with_fixed_lineage() {
         "name",
     );
     assert!(companies.iter().any(|name| name == "source-main-company"));
+    let actors = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:OmniActor").await,
+        "actorId",
+    );
+    assert_eq!(actors, vec!["merge-author"]);
+    assert_eq!(helpers::count_rows(&recovered, "node:OmniActor").await, 0);
 
     let recovered_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
     assert_eq!(recovered_head, fixed_commit_id);

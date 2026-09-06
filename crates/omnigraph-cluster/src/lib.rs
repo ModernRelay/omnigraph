@@ -35,9 +35,10 @@ use config::{
     validate_cluster_header,
 };
 use diff::{
-    FailedGraphOrigin, ResourceKind, append_embedding_profile_changes,
-    append_policy_binding_changes, approved_resources, classify_changes, compute_approvals,
-    compute_blast_radius, demote_dependents_of_failed_graphs, diff_resources, resource_kind,
+    FailedGraphOrigin, ResourceKind, append_actor_provenance_changes,
+    append_embedding_profile_changes, append_policy_binding_changes, approved_resources,
+    classify_changes, compute_approvals, compute_blast_radius, demote_dependents_of_failed_graphs,
+    diff_resources, resource_kind,
 };
 pub use serve::{
     ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, cluster_graph_ids,
@@ -242,6 +243,23 @@ pub async fn plan_config_dir_with_options(
     if !has_errors(&diagnostics) {
         append_policy_binding_changes(&mut changes, prior_state.as_ref(), &desired);
         append_embedding_profile_changes(&mut changes, prior_state.as_ref(), &desired);
+        Box::pin(append_actor_provenance_changes(
+            &mut changes,
+            prior_state.as_ref(),
+            &desired,
+            &backend,
+            &BTreeSet::new(),
+            &mut diagnostics,
+        ))
+        .await;
+        Box::pin(config::validate_accepted_query_catalogs(
+            &desired,
+            &backend,
+            &changes,
+            &BTreeSet::new(),
+            &mut diagnostics,
+        ))
+        .await;
     }
     // Plan previews dispositions without sweeping; a pending recovery is
     // surfaced as the cluster_recovery_pending warning above instead.
@@ -275,7 +293,18 @@ pub async fn plan_config_dir_with_options(
             .find(|resource| resource.address == change.resource)
             .and_then(|resource| resource.path.clone());
         let preview = match source_path {
-            Some(path) => preview_schema_migration(&graph_uri, &path).await,
+            Some(path) => {
+                preview_schema_migration(
+                    &graph_uri,
+                    &path,
+                    desired
+                        .graphs
+                        .iter()
+                        .find(|graph| graph.id == graph_id)
+                        .and_then(|graph| graph.actor_provenance),
+                )
+                .await
+            }
             None => Err("no schema source recorded".to_string()),
         };
         match preview {
@@ -335,7 +364,13 @@ pub async fn apply_config_dir_with_options(
     config_dir: impl AsRef<Path>,
     options: ApplyOptions,
 ) -> ApplyOutput {
-    let outcome = load_desired(config_dir.as_ref());
+    // Apply embeds graph open/recovery and schema-write futures. Keep that
+    // state out of its public callers' async frames as observations are added.
+    Box::pin(apply_config_dir_inner(config_dir.as_ref(), options)).await
+}
+
+async fn apply_config_dir_inner(config_dir: &Path, options: ApplyOptions) -> ApplyOutput {
+    let outcome = load_desired(config_dir);
     let mut diagnostics = outcome.diagnostics;
     let storage_root = outcome
         .desired
@@ -479,6 +514,36 @@ pub async fn apply_config_dir_with_options(
     let mut changes = diff_resources(&prior_resources, &desired.resource_digests);
     append_policy_binding_changes(&mut changes, Some(&state), &desired);
     append_embedding_profile_changes(&mut changes, Some(&state), &desired);
+    let validation_start = diagnostics.len();
+    // These observations open an engine snapshot. Keep their nested storage
+    // futures out of the apply frame, which also polls graph recovery.
+    Box::pin(append_actor_provenance_changes(
+        &mut changes,
+        Some(&state),
+        &desired,
+        &backend,
+        &sweep.pending_graphs,
+        &mut diagnostics,
+    ))
+    .await;
+    Box::pin(config::validate_accepted_query_catalogs(
+        &desired,
+        &backend,
+        &changes,
+        &sweep.pending_graphs,
+        &mut diagnostics,
+    ))
+    .await;
+    if has_errors(&diagnostics[validation_start..]) {
+        return early_return(
+            display_path(&desired.config_dir),
+            Some(desired.config_digest),
+            observations,
+            changes,
+            state.resource_statuses,
+            diagnostics,
+        );
+    }
     let approval_artifacts = backend.list_approval_artifacts(&mut diagnostics).await;
     let approved = approved_resources(
         &approval_artifacts,
@@ -542,6 +607,7 @@ pub async fn apply_config_dir_with_options(
         .filter_map(|change| change.resource.strip_prefix("graph.").map(str::to_string))
         .collect();
     let mut completed_op_sidecars: Vec<String> = Vec::new();
+    let mut accepted_actor_settings: BTreeMap<String, bool> = BTreeMap::new();
     let mut failed_graphs: BTreeMap<String, FailedGraphOrigin> = BTreeMap::new();
     let mut graph_moving_aborted = false;
     for graph_id in &graph_creates_to_run {
@@ -560,6 +626,8 @@ pub async fn apply_config_dir_with_options(
         };
         let graph_uri = backend.graph_root(graph_id);
         let mut sidecar = RecoverySidecar {
+            observed_actor_provenance: None,
+            desired_actor_provenance: Some(desired_graph.actor_provenance.unwrap_or(true)),
             schema_version: 1,
             operation_id: Ulid::new().to_string(),
             started_at: now_rfc3339(),
@@ -633,7 +701,16 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        match Omnigraph::init(&graph_uri, &schema_source).await {
+        match Omnigraph::init_with_options(
+            &graph_uri,
+            &schema_source,
+            omnigraph::db::InitOptions {
+                actor_provenance: desired_graph.actor_provenance.unwrap_or(true),
+                ..omnigraph::db::InitOptions::default()
+            },
+        )
+        .await
+        {
             Ok(_) => {}
             Err(err) => {
                 diagnostics.push(Diagnostic::error(
@@ -648,6 +725,10 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         }
+        accepted_actor_settings.insert(
+            schema_address(graph_id),
+            desired_graph.actor_provenance.unwrap_or(true),
+        );
         // Record the post-init pin in the sidecar (best effort — a failure
         // here leaves expected = null and the sweep classifies by digest).
         if let Ok(db) = Omnigraph::open_read_only(&graph_uri).await {
@@ -758,8 +839,25 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
+        let observed_actor_provenance = match db.actor_provenance_enabled().await {
+            Ok(enabled) => enabled,
+            Err(err) => {
+                diagnostics.push(Diagnostic::error(
+                    "actor_provenance_observation_failed",
+                    schema_address(graph_id),
+                    format!("could not read accepted actor provenance: {err}"),
+                ));
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
+                graph_moving_aborted = true;
+                continue;
+            }
+        };
+        let schema_options = SchemaApplyOptions {
+            actor_provenance: desired_graph.actor_provenance,
+            ..SchemaApplyOptions::default()
+        };
         if let Err(err) = db
-            .preview_schema_apply_with_options(&schema_source, SchemaApplyOptions::default())
+            .preview_schema_apply_with_options(&schema_source, schema_options.clone())
             .await
         {
             diagnostics.push(Diagnostic::error(
@@ -781,6 +879,12 @@ pub async fn apply_config_dir_with_options(
             .get(&schema_address(graph_id))
             .map(|entry| entry.digest.clone());
         let mut sidecar = RecoverySidecar {
+            observed_actor_provenance: Some(observed_actor_provenance),
+            desired_actor_provenance: Some(
+                desired_graph
+                    .actor_provenance
+                    .unwrap_or(observed_actor_provenance),
+            ),
             schema_version: 1,
             operation_id: Ulid::new().to_string(),
             started_at: now_rfc3339(),
@@ -816,14 +920,16 @@ pub async fn apply_config_dir_with_options(
         // Soft drops only: allow_data_loss stays false until the approval
         // artifacts of stage 4C exist (RFC-004 §D4).
         match db
-            .apply_schema_as(
-                &schema_source,
-                SchemaApplyOptions::default(),
-                options.actor.as_deref(),
-            )
+            .apply_schema_as(&schema_source, schema_options, options.actor.as_deref())
             .await
         {
             Ok(result) => {
+                accepted_actor_settings.insert(
+                    schema_address(graph_id),
+                    desired_graph
+                        .actor_provenance
+                        .unwrap_or(observed_actor_provenance),
+                );
                 sidecar.expected_manifest_version = Some(result.graph_manifest_version);
                 if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar).await {
                     diagnostics.push(diagnostic);
@@ -1024,6 +1130,8 @@ pub async fn apply_config_dir_with_options(
             Err(_) => None, // partial/unopenable roots still get deleted
         };
         let sidecar = RecoverySidecar {
+            observed_actor_provenance: None,
+            desired_actor_provenance: None,
             schema_version: 1,
             operation_id: Ulid::new().to_string(),
             started_at: now_rfc3339(),
@@ -1107,6 +1215,7 @@ pub async fn apply_config_dir_with_options(
                     new_state.applied_revision.resources.insert(
                         change.resource.clone(),
                         StateResource {
+                            actor_provenance: accepted_actor_settings.get(&change.resource).copied(),
                             digest: change
                                 .after_digest
                                 .clone()
@@ -2021,6 +2130,7 @@ fn recompute_state_graph_digests(
         state.applied_revision.resources.insert(
             graph_address,
             StateResource {
+                actor_provenance: None,
                 digest,
                 applies_to: None,
                 embedding_provider: graph.embedding_provider.clone(),

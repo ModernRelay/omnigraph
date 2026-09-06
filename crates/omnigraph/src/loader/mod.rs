@@ -346,6 +346,46 @@ impl Omnigraph {
         if let (Some(target), Some(base_name)) = (requested.as_deref(), base_branch.as_deref()) {
             let exists = self.branch_list().await?.iter().any(|name| name == target);
             if !exists {
+                // An explicitly refused protocol-table import must not leave
+                // an implicit branch behind. The final load attempt repeats
+                // these checks against its own captured schema authority.
+                let (_, catalog) = self
+                    .capture_read_view(crate::db::ReadTarget::branch(base_name))
+                    .await?;
+                if let Some(binding) = catalog.actor_provenance() {
+                    if binding.enabled {
+                        crate::exec::actor_provenance::validate_actor_id(actor_id)?;
+                    }
+                    if input_shape == LoadInputShape::StrictGraphBatch {
+                        // Preserve strict syntax and allocation bounds even in
+                        // this before-fork check; a generic JSON DOM would bypass
+                        // the existing structural budget on malformed input.
+                        let rows = parse_strict_graph_rows(
+                            data.as_bytes(),
+                            &catalog,
+                            matches!(mode, LoadMode::Append | LoadMode::Merge),
+                            &mut HashMap::new(),
+                        )?;
+                        for type_name in rows.nodes.keys() {
+                            crate::exec::actor_provenance::refuse_actor_table_write(
+                                &catalog, type_name,
+                            )?;
+                        }
+                    } else {
+                        for value in
+                            serde_json::Deserializer::from_str(data).into_iter::<JsonValue>()
+                        {
+                            let value = value.map_err(|error| {
+                                OmniError::manifest(format!("invalid load JSON: {error}"))
+                            })?;
+                            if let Some(type_name) = value.get("type").and_then(JsonValue::as_str) {
+                                crate::exec::actor_provenance::refuse_actor_table_write(
+                                    &catalog, type_name,
+                                )?;
+                            }
+                        }
+                    }
+                }
                 // Thread the actor through to the implicit BranchCreate so
                 // policy decisions match what an explicit `branch_create_from_as`
                 // call would see. Calling the no-actor variant here would
@@ -517,6 +557,12 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let txn = db.open_write_txn(branch).await?;
     let catalog = Arc::clone(&txn.catalog);
     let snapshot = txn.base.clone();
+    if catalog
+        .actor_provenance()
+        .is_some_and(|binding| binding.enabled)
+    {
+        crate::exec::actor_provenance::validate_actor_id(actor_id)?;
+    }
 
     // Phase 1: Parse all lines, spool into per-type collections
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
@@ -675,6 +721,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let mut __dst_nr: Vec<_> = node_rows.iter().collect();
     __dst_nr.sort_by(|a, b| a.0.cmp(b.0));
     for (type_name, rows) in __dst_nr {
+        crate::exec::actor_provenance::refuse_actor_table_write(&catalog, type_name)?;
         let node_type = &catalog.node_types[type_name];
         let batch = build_node_batch(node_type, rows, &mut node_id_remap)?;
         // Validation (value/enum/unique) runs end-of-load via the evaluator.
@@ -688,6 +735,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let mut __dst_sn: Vec<_> = strict_nodes.into_iter().collect();
     __dst_sn.sort_by(|a, b| a.0.cmp(&b.0));
     for (type_name, rows) in __dst_sn {
+        crate::exec::actor_provenance::refuse_actor_table_write(&catalog, &type_name)?;
         let table_key = format!("node:{type_name}");
         let _entry = snapshot
             .dataset(&table_key)
@@ -808,6 +856,19 @@ async fn load_jsonl_reader_once<R: BufRead>(
         }
     }
     let committed = crate::validate::CommittedState::load(&snapshot, mode, &changeset);
+    // Capture the customer's overwrite set before adding the protocol row:
+    // creating one actor must preserve all existing actors and edges to them.
+    // Empty loads retain lineage semantics without becoming actor-only writes.
+    if staging.pending_row_count() > 0
+        && let Some(table_key) =
+            Box::pin(db.stage_actor_provenance(&txn, &mut staging, actor_id)).await?
+    {
+        let change = crate::validate::TableChange {
+            changed: staging.pending_batches(&table_key).to_vec(),
+            ..Default::default()
+        };
+        changeset.insert(table_key, change);
+    }
     crate::validate::validate_changeset(&changeset, &committed, &catalog).await?;
 
     // Phase 4: Atomic manifest commit with publisher-level OCC.

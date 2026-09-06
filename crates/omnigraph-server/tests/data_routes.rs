@@ -2631,7 +2631,7 @@ async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() 
         .unwrap();
     let app = build_app(state);
 
-    // Spawn N=8 concurrent UPDATEs on Alice (from test.jsonl, age=30 at V0)
+    // Spawn N=8 concurrent UPDATE mutations on Alice (from test.jsonl, age=30 at V0)
     // writing distinct ages.
     const N: usize = 8;
     let mut handles = Vec::with_capacity(N);
