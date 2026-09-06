@@ -626,6 +626,48 @@ fn resolve_binding_type_name<'a>(pipeline: &'a [IROp], variable: &str) -> Option
     None
 }
 
+/// A value bound through the Rust `ParamMap` API skips the JSON param arm: refuse
+/// a time-bearing `Date` string, and a non-`Date` literal on a `Date` parameter.
+pub(super) fn check_param_date_literals(
+    params: &ParamMap,
+    declared: &[omnigraph_compiler::query::ast::Param],
+) -> Result<()> {
+    fn check(name: &str, lit: &Literal) -> Result<()> {
+        match lit {
+            Literal::Date(value) => omnigraph_compiler::check_date_literal(value)
+                .map_err(|reason| OmniError::manifest(format!("param '{name}': {reason}"))),
+            Literal::List(items) => items.iter().try_for_each(|item| check(name, item)),
+            _ => Ok(()),
+        }
+    }
+    params.iter().try_for_each(|(name, lit)| check(name, lit))?;
+    for param in declared {
+        let Some(lit) = params.get(&param.name) else {
+            continue;
+        };
+        let is_date = |lit: &Literal| match lit {
+            Literal::Date(_) => true,
+            Literal::Null => param.nullable,
+            _ => false,
+        };
+        let well_typed = match param.type_name.as_str() {
+            "Date" => is_date(lit),
+            "[Date]" => match lit {
+                Literal::List(items) => items.iter().all(is_date),
+                other => is_date(other),
+            },
+            _ => true,
+        };
+        if !well_typed {
+            return Err(OmniError::manifest(format!(
+                "param '{}': expected {}, got {lit:?}",
+                param.name, param.type_name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Execute a lowered QueryIR. Pure function — no state, no caches.
 pub async fn execute_query(
     ir: &QueryIR,
@@ -635,6 +677,7 @@ pub async fn execute_query(
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
 ) -> Result<QueryResult> {
+    check_param_date_literals(params, &ir.params)?;
     let mut resolved_params = None;
     for param in &ir.params {
         if !params.contains_key(&param.name) {

@@ -1772,7 +1772,11 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
         Literal::Integer(_) => Ok(PropType::scalar(ScalarType::I64, false)),
         Literal::Float(_) => Ok(PropType::scalar(ScalarType::F64, false)),
         Literal::Bool(_) => Ok(PropType::scalar(ScalarType::Bool, false)),
-        Literal::Date(_) => Ok(PropType::scalar(ScalarType::Date, false)),
+        Literal::Date(value) => {
+            crate::types::check_date_literal(value)
+                .map_err(|reason| CompilerError::Type(format!("T3: {reason}")))?;
+            Ok(PropType::scalar(ScalarType::Date, false))
+        }
         Literal::DateTime(_) => Ok(PropType::scalar(ScalarType::DateTime, false)),
         Literal::List(items) => {
             if items.is_empty() {
