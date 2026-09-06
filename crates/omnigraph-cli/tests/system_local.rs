@@ -1893,7 +1893,8 @@ fn local_applied_empty_cluster_serves_exact_witness_and_empty_inventory() {
             .json()
             .unwrap();
         assert_eq!(listed["graphs"], serde_json::json!([]));
-        assert_eq!(listed["quarantined"], serde_json::json!([]));
+        // The existing wire format omits the optional empty quarantine list.
+        assert!(listed.get("quarantined").is_none(), "{listed}");
         let absent = client
             .post(format!("{}/graphs/future/query", server.base_url))
             .bearer_auth("admin-token")
