@@ -673,7 +673,7 @@ struct CursorRow {
     batch: RecordBatch,
     row_index: usize,
     // Rows and typed views can outlive the cursor's current hydration chunk.
-    _preparation_charge: Arc<preparation::PreparationLease>,
+    _preparation_charge: Option<Arc<preparation::PreparationLease>>,
 }
 
 impl CursorRow {
@@ -747,7 +747,7 @@ const HYDRATION_SCAN_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 struct HydratedChunk {
     batches: Vec<RecordBatch>,
     order: Vec<(usize, usize)>,
-    charge: Arc<preparation::PreparationLease>,
+    charge: Option<Arc<preparation::PreparationLease>>,
 }
 
 /// Outcome of one bounded chunk-scan attempt.
@@ -1102,7 +1102,7 @@ impl OrderedTableCursor {
                         dataset,
                         batch,
                         row_index,
-                        _preparation_charge: Arc::clone(&chunk.charge),
+                        _preparation_charge: chunk.charge.clone(),
                     }));
                 }
                 self.hydrated = None;
@@ -1438,7 +1438,7 @@ impl OrderedTableCursor {
             chunk: HydratedChunk {
                 batches,
                 order,
-                charge: Arc::new(batch_charge),
+                charge: batch_charge.into_shared(),
             },
             bytes: retained_bytes,
         })
@@ -1491,8 +1491,11 @@ impl StagedTableWriter {
         external_preflight: &crate::table_store::ExternalBlobPreflight,
     ) -> Result<()> {
         preparation::checkpoint()?;
-        let _copy_charge =
-            preparation::reserve((row.batch.get_array_memory_size() as u64).saturating_add(256))?;
+        let _copy_charge = if preparation::parallel_context_active() {
+            preparation::reserve((row.batch.get_array_memory_size() as u64).saturating_add(256))?
+        } else {
+            preparation::PreparationLease::default()
+        };
         // `RecordBatch::slice` would retain the complete scanner buffers.
         // Copy exactly one row before sizing or buffering it.
         let indices = UInt64Array::from(vec![row.row_index as u64]);

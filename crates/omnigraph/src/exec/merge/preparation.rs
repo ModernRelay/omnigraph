@@ -206,6 +206,11 @@ impl ScratchAccounting {
 /// leases; it is never held across an await or used to wait for memory permits.
 #[derive(Debug)]
 pub(super) struct PreparationContext {
+    // Immutable construction flag: serial windows contain one worker, so they
+    // have neither parallel-budget pressure nor a sibling failure to observe.
+    // Scratch accounting remains active. For parallel-born contexts, the
+    // mutable account still governs ownership transfer to the collector.
+    parallel_accounting: bool,
     accounting: Mutex<WorkerAccounting>,
     ordered_failure: Option<(Arc<PreparationFailureFrontier>, usize)>,
 }
@@ -248,6 +253,7 @@ impl PreparationContext {
         ordered_failure: Option<(Arc<PreparationFailureFrontier>, usize)>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            parallel_accounting: budget.is_some(),
             accounting: Mutex::new(WorkerAccounting {
                 budget,
                 retained_bytes: 0,
@@ -267,6 +273,12 @@ impl PreparationContext {
     }
 
     fn reserve(self: &Arc<Self>, bytes: u64) -> Result<PreparationLease> {
+        if !self.parallel_accounting {
+            return Ok(PreparationLease {
+                context: None,
+                bytes,
+            });
+        }
         self.resize(0, bytes)?;
         Ok(PreparationLease {
             context: Some(Arc::clone(self)),
@@ -275,6 +287,9 @@ impl PreparationContext {
     }
 
     fn resize(&self, previous: u64, bytes: u64) -> Result<()> {
+        if !self.parallel_accounting {
+            return Ok(());
+        }
         let mut accounting = self.accounting();
         // Releasing an allocation must stay infallible after a sibling fails.
         // New controlled growth stops before allocating another chunk. Once
@@ -307,6 +322,9 @@ impl PreparationContext {
     }
 
     fn checkpoint(&self) -> Result<()> {
+        if !self.parallel_accounting {
+            return Ok(());
+        }
         let accounting = self.accounting();
         if accounting.scratch.is_some() {
             self.check_ordered_failure()?;
@@ -325,6 +343,9 @@ impl PreparationContext {
     }
 
     fn require_serial(&self) -> Result<()> {
+        if !self.parallel_accounting {
+            return Ok(());
+        }
         let mut accounting = self.accounting();
         let Some(budget) = accounting.budget.as_ref() else {
             return Ok(());
@@ -430,7 +451,7 @@ pub(super) fn checkpoint() -> Result<()> {
 
 pub(super) fn parallel_context_active() -> bool {
     PREPARATION_CONTEXT
-        .try_with(|context| context.accounting().budget.is_some())
+        .try_with(|context| context.parallel_accounting && context.accounting().budget.is_some())
         .unwrap_or(false)
 }
 
@@ -463,6 +484,11 @@ pub(super) struct PreparationLease {
 }
 
 impl PreparationLease {
+    /// Untracked serial batches need no shared lease allocation or row clones.
+    pub(super) fn into_shared(self) -> Option<Arc<Self>> {
+        self.context.is_some().then(|| Arc::new(self))
+    }
+
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
         if let Some(context) = &self.context {
             context.resize(self.bytes, bytes)?;
