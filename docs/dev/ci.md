@@ -145,19 +145,19 @@ every cache key, so the pin is what keeps caches warm across Rust releases.
 The release and publish workflows still build on the floating `stable`
 action and save their caches from the tag ref; they are outside this rule.
 
-The remaining post-merge/tag/manual jobs own contracts that need special infrastructure:
+The remaining jobs own contracts that need special infrastructure. They run after merge, on tags, and by manual dispatch; two of them, the format fence and the AWS feature build, also run on pull requests:
 
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps currently
   disabled; see above).
-- **V5 ↔ V6 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild.
+- **V5 ↔ V6 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every non-documentation pull request, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it as for `Test Workspace`. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
 - **RustFS S3 integration** runs configured engine, server, cluster, CLI, recovery, and deterministic operation-count owners. A configured test that skips is a failure.
 - **Azurite Azure integration** runs only after merge, on tags, or by manual
   dispatch. It exercises configured storage, admission-lease, recovery,
   cluster, server, and CLI owners against a digest-pinned Azurite image, then
   verifies that control objects, Lance data, and the admission object use the
   declared container.
-- **AWS feature** builds and tests `omnigraph-server` with `--features aws`; unlike the others it also runs on every pull request, as a required context.
+- **AWS feature** builds and tests `omnigraph-server` with `--features aws`; it also runs on every pull request, as a required context.
 
 Azure remains a qualification preview. Emulator coverage and the completed
 managed-identity smoke proof do not replace the pending adversarial live-Azure
