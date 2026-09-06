@@ -186,6 +186,76 @@ query seen_eq() { match { $m: Metric { seen: datetime("2024-06-01T12:00:00Z") } 
     assert_eq!(sorted_metric_names(&mut db, q, "seen_eq").await, vec!["m1"]);
 }
 
+#[tokio::test]
+async fn date_param_with_a_time_of_day_is_refused_from_a_rust_param_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let mut params = ParamMap::new();
+    params.insert(
+        "d".to_string(),
+        omnigraph_compiler::Literal::Date("2024-06-01T02:00:00+05:00".to_string()),
+    );
+    let q = r#"
+query born_eq_param($d: Date) { match { $m: Metric  $m.born = $d } return { $m.name } }
+"#;
+    let err = query_main(&mut db, q, "born_eq_param", &params)
+        .await
+        .expect_err("a Date param with a time of day is refused on read");
+    assert!(
+        err.to_string().contains(
+            "param 'd': invalid Date literal '2024-06-01T02:00:00+05:00': a Date is a calendar day (YYYY-MM-DD)"
+        ),
+        "{err}"
+    );
+
+    let m = r#"
+query touch_born($d: Date) { update Metric set { active: false } where born = $d }
+"#;
+    let err = db
+        .mutate("main", m, "touch_born", &params)
+        .await
+        .expect_err("a Date param with a time of day is refused in a mutation predicate");
+    assert!(
+        err.to_string()
+            .contains("param 'd': invalid Date literal '2024-06-01T02:00:00+05:00'"),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "d".to_string(),
+        omnigraph_compiler::Literal::String("2024-06-01T02:00:00+05:00".to_string()),
+    );
+    let err = query_main(&mut db, q, "born_eq_param", &params)
+        .await
+        .expect_err("a String literal bound to a Date parameter is refused");
+    assert!(
+        err.to_string()
+            .contains("param 'd': expected Date, got String(\"2024-06-01T02:00:00+05:00\")"),
+        "{err}"
+    );
+    let err = db
+        .mutate("main", m, "touch_born", &params)
+        .await
+        .expect_err("the same String literal is refused on the mutation route");
+    assert!(
+        err.to_string()
+            .contains("param 'd': expected Date, got String("),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert("d".to_string(), omnigraph_compiler::Literal::Null);
+    let err = query_main(&mut db, q, "born_eq_param", &params)
+        .await
+        .expect_err("Null on a non-nullable Date parameter is refused");
+    assert!(
+        err.to_string()
+            .contains("param 'd': expected Date, got Null"),
+        "{err}"
+    );
+}
+
 // Exact string predicates: `starts_with` and the String overload of
 // `contains`. Standalone filters on a scanned variable are hoisted into the
 // NodeScan (the pushdown arm — Lance probes a covering BTREE/NGRAM index when
