@@ -27,12 +27,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow_schema::{DataType, Schema};
+use arrow_array::{RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
 use futures::FutureExt as _;
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::query::ast::{Clause, Expr, Literal, Param, QueryDecl};
+use omnigraph_compiler::query::ast::{
+    BranchStmt, BranchWrite, Clause, Expr, Literal, Param, QueryDecl, QueryFile,
+};
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::{
     executed_column_name, infer_query_result_schema, typecheck_query,
@@ -79,7 +82,29 @@ enum Item {
 enum Step {
     Query(QueryStep),
     Mutate(MutateStep),
+    Control(ControlStep),
+    List(ListStep),
     Restart { ordinal: usize },
+}
+
+impl Step {
+    /// The rows-or-error expect of a read step (`--- query`), which is the
+    /// one kind that carries a shape section.
+    fn read_expect(&self) -> Option<&QueryExpect> {
+        match self {
+            Step::Query(step) => Some(&step.expect),
+            Step::List(step) => Some(&step.expect),
+            Step::Mutate(_) | Step::Control(_) | Step::Restart { .. } => None,
+        }
+    }
+
+    fn read_expect_mut(&mut self) -> Option<&mut QueryExpect> {
+        match self {
+            Step::Query(step) => Some(&mut step.expect),
+            Step::List(step) => Some(&mut step.expect),
+            Step::Mutate(_) | Step::Control(_) | Step::Restart { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -87,6 +112,8 @@ struct QueryStep {
     ordinal: usize,
     source: String,
     name: String,
+    /// The `branch: <name>` header argument; `main` when unspelled.
+    branch: String,
     decl: Box<QueryDecl>,
     params_raw: Option<String>,
     expect: QueryExpect,
@@ -100,9 +127,93 @@ struct MutateStep {
     ordinal: usize,
     source: String,
     name: String,
+    /// The `branch: <name>` header argument, as `QueryStep::branch`.
+    branch: String,
     ast_params: Vec<Param>,
     params_raw: Option<String>,
     expect: MutateExpect,
+}
+
+/// A `--- mutate` step holding a control write. The expect lives inside
+/// the write so `outcome:` is spellable on a merge and on nothing else.
+#[derive(Debug)]
+struct ControlStep {
+    ordinal: usize,
+    /// The statement's two words, from `BranchWrite::statement_name`.
+    name: &'static str,
+    write: ControlWrite,
+}
+
+#[derive(Debug)]
+enum ControlWrite {
+    Create {
+        name: String,
+        from: Option<String>,
+        expect: WriteExpect,
+    },
+    Delete {
+        name: String,
+        expect: WriteExpect,
+    },
+    Merge {
+        source: String,
+        into: Option<String>,
+        expect: MergeExpect,
+    },
+}
+
+#[derive(Debug)]
+enum WriteExpect {
+    Ok,
+    Error { needle: String },
+}
+
+/// A `branch merge`'s expect: what any control write takes, plus the
+/// `outcome:` word only a merge has an answer for.
+#[derive(Debug)]
+enum MergeExpect {
+    Write(WriteExpect),
+    Outcome(MergeOutcome),
+}
+
+/// A `--- query` step holding `branch list`: one `name` column, rows in
+/// byte order, so its expect is a read expect like a declaration's.
+#[derive(Debug)]
+struct ListStep {
+    ordinal: usize,
+    expect: QueryExpect,
+}
+
+/// `main`, the default wherever a branch is unspelled.
+const MAIN_BRANCH: &str = "main";
+
+/// The `outcome:` word of each `MergeOutcome`, the spelling
+/// `BranchMergeOutcome` carries on the wire (`omnigraph-api-types`).
+fn merge_outcome_word(outcome: MergeOutcome) -> &'static str {
+    match outcome {
+        MergeOutcome::AlreadyUpToDate => "already_up_to_date",
+        MergeOutcome::FastForward => "fast_forward",
+        MergeOutcome::Merged => "merged",
+    }
+}
+
+const MERGE_OUTCOMES: [MergeOutcome; 3] = [
+    MergeOutcome::AlreadyUpToDate,
+    MergeOutcome::FastForward,
+    MergeOutcome::Merged,
+];
+
+/// The `outcome:` words as a refusal spells them, off `MERGE_OUTCOMES`, so a
+/// fourth variant widens every message with the match.
+fn merge_outcome_words() -> String {
+    let words = MERGE_OUTCOMES.map(|o| format!("`{}`", merge_outcome_word(o)));
+    let (last, head) = words
+        .split_last()
+        .expect("invariant: MERGE_OUTCOMES names every MergeOutcome");
+    if head.is_empty() {
+        return last.clone();
+    }
+    format!("{}, or {last}", head.join(", "))
 }
 
 #[derive(Debug)]
@@ -333,12 +444,52 @@ enum ExpectHeader {
     Ok,
     Error(String),
     Affected { nodes: usize, edges: usize },
+    Outcome(MergeOutcome),
+}
+
+/// The one argument a `--- query` or `--- mutate` header takes,
+/// `branch: <name>` (a word, a colon, the trimmed remainder, as
+/// `--- expect error: <substring>`); `None` when the header is bare.
+fn parse_step_branch(kind: &str, rest: &str) -> Result<Option<String>, String> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let Some(name) = rest.strip_prefix("branch:") else {
+        return Err(format!(
+            "`--- {kind}` takes no arguments but `branch: <name>`, got `{rest}`"
+        ));
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("`--- {kind} branch:` needs a branch name"));
+    }
+    Ok(Some(name.to_string()))
 }
 
 fn parse_expect_header(rest: &str) -> Result<ExpectHeader, String> {
     let rest = rest.trim();
     if rest.is_empty() {
         return Err("a bare `--- expect` is refused; give a mode word".into());
+    }
+    if let Some(word) = rest.strip_prefix("outcome:") {
+        let word = word.trim();
+        if word.is_empty() {
+            return Err(format!(
+                "`expect outcome:` needs a word: {}",
+                merge_outcome_words()
+            ));
+        }
+        let Some(outcome) = MERGE_OUTCOMES
+            .into_iter()
+            .find(|o| merge_outcome_word(*o) == word)
+        else {
+            return Err(format!(
+                "`expect outcome:` takes {}, got `{word}`",
+                merge_outcome_words()
+            ));
+        };
+        return Ok(ExpectHeader::Outcome(outcome));
     }
     if rest == "unordered" {
         return Ok(ExpectHeader::Unordered);
@@ -678,15 +829,252 @@ fn refuse_embed_schema(schema: &str, start_line: usize) -> Result<(), String> {
 }
 
 /// A query or mutate section parsed and classified, awaiting its expect.
+enum Pending {
+    Decl(PendingStep),
+    List { ordinal: usize },
+    Control { ordinal: usize, write: BranchWrite },
+}
+
 struct PendingStep {
     is_mutation: bool,
     ordinal: usize,
     source: String,
     name: String,
+    branch: String,
     decl: Box<QueryDecl>,
     ordered_refusal: Option<String>,
     expects_expand: bool,
     params_raw: Option<String>,
+}
+
+/// The rows expect of a read step: the body under its substitution rule,
+/// with the empty shape the mandatory `--- expect shape` section fills in.
+fn rows_expect(
+    ordered: bool,
+    section: &Section<'_>,
+    loop_var: Option<&str>,
+) -> Result<QueryExpect, String> {
+    refuse_comment_lines(&section.body, "expect")?;
+    let body: String = section
+        .body
+        .iter()
+        .map(|(_, l)| *l)
+        .collect::<Vec<_>>()
+        .join("\n");
+    validate_subst_tokens(&body, loop_var)?;
+    Ok(QueryExpect::Rows {
+        ordered,
+        body_raw: body,
+        span: BodySpan {
+            start_line: section.header_line + 1,
+            len: section.body.len(),
+        },
+        shape: ShapeExpect {
+            lines: Vec::new(),
+            span: BodySpan {
+                start_line: 0,
+                len: 0,
+            },
+        },
+    })
+}
+
+/// The step a `branch list` section becomes under `mode`. A rows expect
+/// needs a shape section next, as for a declaration.
+fn complete_list_step(
+    ordinal: usize,
+    mode: &ExpectHeader,
+    section: &Section<'_>,
+    loop_var: Option<&str>,
+) -> Result<ListStep, String> {
+    let expect = match mode {
+        ExpectHeader::Unordered | ExpectHeader::Ordered => {
+            rows_expect(matches!(mode, ExpectHeader::Ordered), section, loop_var)?
+        }
+        ExpectHeader::Error(needle) => {
+            refuse_nonempty_body(&section.body, "an `expect error:` section")?;
+            QueryExpect::Error {
+                needle: needle.clone(),
+            }
+        }
+        ExpectHeader::Ok | ExpectHeader::Affected { .. } | ExpectHeader::Outcome(_) => {
+            return Err("`branch list` takes `unordered`, `ordered`, or `error:`".into());
+        }
+    };
+    Ok(ListStep { ordinal, expect })
+}
+
+fn affected_refusal(name: &str) -> String {
+    format!("`expect affected:` is refused on a control write; `{name}` carries no counts")
+}
+
+fn rows_refusal(name: &str) -> String {
+    format!("a control write takes `ok` or `error:`; `{name}` returns no rows")
+}
+
+/// The expect of a `branch create` or `branch delete` step under `mode`,
+/// or why the mode is refused for it.
+fn complete_write_expect(
+    name: &str,
+    mode: &ExpectHeader,
+    section: &Section<'_>,
+) -> Result<WriteExpect, String> {
+    match mode {
+        ExpectHeader::Ok => {
+            refuse_nonempty_body(&section.body, "an `expect ok` section")?;
+            Ok(WriteExpect::Ok)
+        }
+        ExpectHeader::Error(needle) => {
+            refuse_nonempty_body(&section.body, "an `expect error:` section")?;
+            Ok(WriteExpect::Error {
+                needle: needle.clone(),
+            })
+        }
+        ExpectHeader::Outcome(_) => {
+            Err("`expect outcome:` is accepted on a `branch merge` step only".into())
+        }
+        ExpectHeader::Affected { .. } => Err(affected_refusal(name)),
+        ExpectHeader::Unordered | ExpectHeader::Ordered => Err(rows_refusal(name)),
+    }
+}
+
+/// The expect of a `branch merge` step: `complete_write_expect`'s modes,
+/// plus the `outcome:` word only a merge has an answer for.
+fn complete_merge_expect(
+    mode: &ExpectHeader,
+    section: &Section<'_>,
+) -> Result<MergeExpect, String> {
+    if let ExpectHeader::Outcome(outcome) = mode {
+        refuse_nonempty_body(&section.body, "an `expect outcome:` section")?;
+        return Ok(MergeExpect::Outcome(*outcome));
+    }
+    Ok(MergeExpect::Write(complete_write_expect(
+        "branch merge",
+        mode,
+        section,
+    )?))
+}
+
+/// The step a control write becomes under `mode`.
+fn complete_control_step(
+    ordinal: usize,
+    write: BranchWrite,
+    mode: &ExpectHeader,
+    section: &Section<'_>,
+) -> Result<ControlStep, String> {
+    let name = write.statement_name();
+    let write = match write {
+        BranchWrite::Create { name: branch, from } => ControlWrite::Create {
+            name: branch,
+            from,
+            expect: complete_write_expect(name, mode, section)?,
+        },
+        BranchWrite::Delete { name: branch } => ControlWrite::Delete {
+            name: branch,
+            expect: complete_write_expect(name, mode, section)?,
+        },
+        BranchWrite::Merge { source, into } => ControlWrite::Merge {
+            source,
+            into,
+            expect: complete_merge_expect(mode, section)?,
+        },
+    };
+    Ok(ControlStep {
+        ordinal,
+        name,
+        write,
+    })
+}
+
+/// The step a declaration section becomes under `mode`, or why the mode is
+/// refused for it.
+fn complete_decl_step(
+    step: PendingStep,
+    mode: &ExpectHeader,
+    section: &Section<'_>,
+    loop_var: Option<&str>,
+) -> Result<Step, String> {
+    match (mode, step.is_mutation) {
+        (ExpectHeader::Outcome(_), _) => {
+            Err("`expect outcome:` is accepted on a `branch merge` step only".into())
+        }
+        (ExpectHeader::Unordered | ExpectHeader::Ordered, true) => Err(
+            "a mutate step takes `ok`, `affected:`, or `error:`; mutation results carry no rows"
+                .into(),
+        ),
+        (ExpectHeader::Ok | ExpectHeader::Affected { .. }, false) => {
+            Err("a query step takes `unordered`, `ordered`, or `error:`".into())
+        }
+        (ExpectHeader::Unordered | ExpectHeader::Ordered, false) => {
+            let ordered = matches!(mode, ExpectHeader::Ordered);
+            if ordered && let Some(reason) = step.ordered_refusal {
+                return Err(reason);
+            }
+            Ok(Step::Query(QueryStep {
+                ordinal: step.ordinal,
+                source: step.source,
+                name: step.name,
+                branch: step.branch,
+                decl: step.decl,
+                params_raw: step.params_raw,
+                expects_expand: step.expects_expand,
+                expect: rows_expect(ordered, section, loop_var)?,
+            }))
+        }
+        (ExpectHeader::Error(needle), is_mutation) => {
+            refuse_nonempty_body(&section.body, "an `expect error:` section")?;
+            let needle = needle.clone();
+            Ok(if is_mutation {
+                Step::Mutate(MutateStep {
+                    ordinal: step.ordinal,
+                    source: step.source,
+                    name: step.name,
+                    branch: step.branch,
+                    ast_params: step.decl.params,
+                    params_raw: step.params_raw,
+                    expect: MutateExpect::Error { needle },
+                })
+            } else {
+                Step::Query(QueryStep {
+                    ordinal: step.ordinal,
+                    source: step.source,
+                    name: step.name,
+                    branch: step.branch,
+                    decl: step.decl,
+                    params_raw: step.params_raw,
+                    expects_expand: step.expects_expand,
+                    expect: QueryExpect::Error { needle },
+                })
+            })
+        }
+        (ExpectHeader::Ok, true) => {
+            refuse_nonempty_body(&section.body, "an `expect ok` section")?;
+            Ok(Step::Mutate(MutateStep {
+                ordinal: step.ordinal,
+                source: step.source,
+                name: step.name,
+                branch: step.branch,
+                ast_params: step.decl.params,
+                params_raw: step.params_raw,
+                expect: MutateExpect::Ok,
+            }))
+        }
+        (ExpectHeader::Affected { nodes, edges }, true) => {
+            refuse_nonempty_body(&section.body, "an `expect affected:` section")?;
+            Ok(Step::Mutate(MutateStep {
+                ordinal: step.ordinal,
+                source: step.source,
+                name: step.name,
+                branch: step.branch,
+                ast_params: step.decl.params,
+                params_raw: step.params_raw,
+                expect: MutateExpect::Affected {
+                    nodes: *nodes,
+                    edges: *edges,
+                },
+            }))
+        }
+    }
 }
 
 fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
@@ -725,18 +1113,18 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut needs_indices = header.traversal.is_some();
     let mut items: Vec<Item> = Vec::new();
     let mut open_loop: Option<(String, Vec<String>, Vec<Step>)> = None;
-    let mut pending: Option<PendingStep> = None;
-    let mut awaiting_shape: Option<QueryStep> = None;
+    let mut pending: Option<Pending> = None;
+    let mut awaiting_shape: Option<Step> = None;
     let mut ordinal = 0usize;
     let mut qm_steps = 0usize;
     let mut substitutable_lines: HashSet<usize> = HashSet::new();
 
     /// The refusal for a rows step whose `--- expect shape` did not arrive
     /// next: any other section, or the end of the file, ends the case here.
-    fn missing_shape(step: &QueryStep) -> String {
-        let line = match &step.expect {
-            QueryExpect::Rows { span, .. } => span.start_line,
-            QueryExpect::Error { .. } => 0,
+    fn missing_shape(step: &Step) -> String {
+        let line = match step.read_expect() {
+            Some(QueryExpect::Rows { span, .. }) => span.start_line,
+            Some(QueryExpect::Error { .. }) | None => 0,
         };
         format!(
             "line {line}: the rows expect needs an `--- expect shape` section directly after it; write it from the .pg schema, or fill it with OMNIGRAPH_GQ_BLESS=1 and review the diff"
@@ -755,7 +1143,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     }
 
     for section in &sections[2..] {
-        let (kind, rest) = match section.name.split_once(' ') {
+        let (kind, rest) = match section.name.split_once([' ', '\t']) {
             Some((k, rest)) => (k, rest),
             None => (section.name.as_str(), ""),
         };
@@ -772,9 +1160,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 ));
             }
             "query" | "mutate" => {
-                if !rest.is_empty() {
-                    return Err(format!("`--- {kind}` takes no arguments"));
-                }
+                let branch = parse_step_branch(kind, rest)?;
                 if pending.is_some() {
                     return Err(format!(
                         "line {}: the previous step is missing its `--- expect`",
@@ -793,10 +1179,40 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         section.header_line + 1
                     )
                 })?;
-                let [decl] = file.queries.as_slice() else {
+                let decls = match file {
+                    QueryFile::Queries(decls) => decls,
+                    QueryFile::Branch(stmt) => {
+                        if kind == "query" && stmt.is_write() {
+                            return Err(
+                                "a control write under `--- query` is refused; use `--- mutate`"
+                                    .into(),
+                            );
+                        }
+                        if kind == "mutate" && !stmt.is_write() {
+                            return Err(
+                                "`branch list` under `--- mutate` is refused; use `--- query`"
+                                    .into(),
+                            );
+                        }
+                        if branch.is_some() {
+                            return Err(
+                                "a branch statement names its branches itself; drop the `branch:` argument"
+                                    .into(),
+                            );
+                        }
+                        ordinal += 1;
+                        qm_steps += 1;
+                        pending = Some(match stmt {
+                            BranchStmt::List => Pending::List { ordinal },
+                            BranchStmt::Write(write) => Pending::Control { ordinal, write },
+                        });
+                        continue;
+                    }
+                };
+                let [decl] = decls.as_slice() else {
                     return Err(format!(
                         "a `--- {kind}` section must hold exactly one declaration, got {}",
-                        file.queries.len()
+                        decls.len()
                     ));
                 };
                 let is_mutation = !decl.mutations.is_empty();
@@ -814,26 +1230,33 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 inspect_decl(decl, &mut needs_indices)?;
                 ordinal += 1;
                 qm_steps += 1;
-                pending = Some(PendingStep {
+                pending = Some(Pending::Decl(PendingStep {
                     is_mutation,
                     ordinal,
                     source: source.clone(),
                     name: decl.name.clone(),
+                    branch: branch.unwrap_or_else(|| MAIN_BRANCH.to_string()),
                     decl: Box::new(decl.clone()),
                     ordered_refusal: ordered_refusal(decl),
                     expects_expand: expects_expand(&decl.match_clause),
                     params_raw: None,
-                });
+                }));
             }
             "params" => {
                 if !rest.is_empty() {
                     return Err(format!("unknown section `--- {}`", section.name));
                 }
-                let Some(step) = pending.as_mut() else {
-                    return Err(format!(
-                        "line {}: `--- params` must directly follow a query or mutate section",
-                        section.header_line + 1
-                    ));
+                let step = match pending.as_mut() {
+                    Some(Pending::Decl(step)) => step,
+                    Some(Pending::List { .. } | Pending::Control { .. }) => {
+                        return Err("a branch statement takes no params".into());
+                    }
+                    None => {
+                        return Err(format!(
+                            "line {}: `--- params` must directly follow a query or mutate section",
+                            section.header_line + 1
+                        ));
+                    }
                 };
                 if step.params_raw.is_some() {
                     return Err(format!(
@@ -860,147 +1283,46 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     };
                     let lines = parse_shape_body(&section.body)?;
-                    match &mut step.expect {
-                        QueryExpect::Rows { shape, .. } => {
-                            *shape = ShapeExpect {
-                                lines,
-                                span: BodySpan {
-                                    start_line: section.header_line + 1,
-                                    len: section.body.len(),
-                                },
-                            };
-                        }
-                        QueryExpect::Error { .. } => {
-                            return Err(format!(
-                                "line {}: internal: the step awaiting a shape section carries no rows expect",
-                                section.header_line + 1
-                            ));
-                        }
-                    }
-                    push_step(&mut items, &mut open_loop, Step::Query(step));
+                    let Some(QueryExpect::Rows { shape, .. }) = step.read_expect_mut() else {
+                        return Err(format!(
+                            "line {}: internal: the step awaiting a shape section carries no rows expect",
+                            section.header_line + 1
+                        ));
+                    };
+                    *shape = ShapeExpect {
+                        lines,
+                        span: BodySpan {
+                            start_line: section.header_line + 1,
+                            len: section.body.len(),
+                        },
+                    };
+                    push_step(&mut items, &mut open_loop, step);
                     continue;
                 }
                 let mode = parse_expect_header(rest)?;
-                let Some(step) = pending.take() else {
-                    return Err(format!(
-                        "line {}: `--- expect` has no query or mutate step to bind to",
-                        section.header_line + 1
-                    ));
-                };
-                let completed = match (&mode, step.is_mutation) {
-                    (ExpectHeader::Unordered | ExpectHeader::Ordered, true) => {
-                        return Err(
-                            "a mutate step takes `ok`, `affected:`, or `error:`; mutation results carry no rows"
-                                .into(),
-                        );
+                let loop_var = open_loop.as_ref().map(|(v, _, _)| v.as_str());
+                let completed = match pending.take() {
+                    Some(Pending::Decl(step)) => {
+                        complete_decl_step(step, &mode, section, loop_var)?
                     }
-                    (ExpectHeader::Ok | ExpectHeader::Affected { .. }, false) => {
-                        return Err("a query step takes `unordered`, `ordered`, or `error:`".into());
+                    Some(Pending::List { ordinal }) => {
+                        Step::List(complete_list_step(ordinal, &mode, section, loop_var)?)
                     }
-                    (ExpectHeader::Unordered | ExpectHeader::Ordered, false) => {
-                        let ordered = matches!(mode, ExpectHeader::Ordered);
-                        if ordered {
-                            if let Some(reason) = step.ordered_refusal {
-                                return Err(reason);
-                            }
-                        }
-                        refuse_comment_lines(&section.body, "expect")?;
-                        let body: String = section
-                            .body
-                            .iter()
-                            .map(|(_, l)| *l)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        validate_subst_tokens(
-                            &body,
-                            open_loop.as_ref().map(|(v, _, _)| v.as_str()),
-                        )?;
-                        substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
-                        Step::Query(QueryStep {
-                            ordinal: step.ordinal,
-                            source: step.source,
-                            name: step.name,
-                            decl: step.decl,
-                            params_raw: step.params_raw,
-                            expects_expand: step.expects_expand,
-                            expect: QueryExpect::Rows {
-                                ordered,
-                                body_raw: body,
-                                span: BodySpan {
-                                    start_line: section.header_line + 1,
-                                    len: section.body.len(),
-                                },
-                                shape: ShapeExpect {
-                                    lines: Vec::new(),
-                                    span: BodySpan {
-                                        start_line: 0,
-                                        len: 0,
-                                    },
-                                },
-                            },
-                        })
+                    Some(Pending::Control { ordinal, write }) => {
+                        Step::Control(complete_control_step(ordinal, write, &mode, section)?)
                     }
-                    (ExpectHeader::Error(needle), is_mutation) => {
-                        refuse_nonempty_body(&section.body, "an `expect error:` section")?;
-                        if is_mutation {
-                            Step::Mutate(MutateStep {
-                                ordinal: step.ordinal,
-                                source: step.source,
-                                name: step.name,
-                                ast_params: step.decl.params,
-                                params_raw: step.params_raw,
-                                expect: MutateExpect::Error {
-                                    needle: needle.clone(),
-                                },
-                            })
-                        } else {
-                            Step::Query(QueryStep {
-                                ordinal: step.ordinal,
-                                source: step.source,
-                                name: step.name,
-                                decl: step.decl,
-                                params_raw: step.params_raw,
-                                expects_expand: step.expects_expand,
-                                expect: QueryExpect::Error {
-                                    needle: needle.clone(),
-                                },
-                            })
-                        }
-                    }
-                    (ExpectHeader::Ok, true) => {
-                        refuse_nonempty_body(&section.body, "an `expect ok` section")?;
-                        Step::Mutate(MutateStep {
-                            ordinal: step.ordinal,
-                            source: step.source,
-                            name: step.name,
-                            ast_params: step.decl.params,
-                            params_raw: step.params_raw,
-                            expect: MutateExpect::Ok,
-                        })
-                    }
-                    (ExpectHeader::Affected { nodes, edges }, true) => {
-                        refuse_nonempty_body(&section.body, "an `expect affected:` section")?;
-                        Step::Mutate(MutateStep {
-                            ordinal: step.ordinal,
-                            source: step.source,
-                            name: step.name,
-                            ast_params: step.decl.params,
-                            params_raw: step.params_raw,
-                            expect: MutateExpect::Affected {
-                                nodes: *nodes,
-                                edges: *edges,
-                            },
-                        })
+                    None => {
+                        return Err(format!(
+                            "line {}: `--- expect` has no query or mutate step to bind to",
+                            section.header_line + 1
+                        ));
                     }
                 };
-                match completed {
-                    Step::Query(
-                        step @ QueryStep {
-                            expect: QueryExpect::Rows { .. },
-                            ..
-                        },
-                    ) => awaiting_shape = Some(step),
-                    other => push_step(&mut items, &mut open_loop, other),
+                if matches!(completed.read_expect(), Some(QueryExpect::Rows { .. })) {
+                    substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+                    awaiting_shape = Some(completed);
+                } else {
+                    push_step(&mut items, &mut open_loop, completed);
                 }
             }
             "restart" => {
@@ -1409,7 +1731,7 @@ async fn run_query_step(
     let (outcome, counts) = under_traversal(
         mode,
         db.query(
-            ReadTarget::branch("main"),
+            ReadTarget::branch(&step.branch),
             &step.source,
             &step.name,
             &params,
@@ -1434,8 +1756,8 @@ async fn run_query_step(
                 .and_then(|ctx| infer_query_result_schema(&catalog, &step.decl, &ctx))
                 .map_err(|e| fail(format!("result schema inference failed: {e}")))?;
             let drift = schema_drift(&step.decl, &inferred, &result);
-            if let Some(mismatch) = shape_mismatch(&shape.lines, &result, &inferred) {
-                let (message, bless_lines) = match (&drift, bless_shape_lines(&result)) {
+            if let Some(mismatch) = shape_mismatch(&shape.lines, &result, &inferred, &catalog) {
+                let (message, bless_lines) = match (&drift, bless_shape_lines(&result, &catalog)) {
                     (Some(drift), _) => (
                         format!(
                             "{mismatch}\nthe executor disagrees with the compiler's schema, so bless does not rewrite the shape: {drift}"
@@ -1454,32 +1776,192 @@ async fn run_query_step(
             if let Some(drift) = drift {
                 return Err(fail(drift));
             }
-            let rows = result
-                .to_rust_json()
-                .map_err(|e| fail(format!("query rows failed to render as JSON: {e}")))?;
-            let Value::Array(actual) = rows else {
-                return Err(fail("engine returned a non-array row set".into()));
-            };
-            let expected = parse_expect_rows(&substitute(body_raw, binding)).map_err(&fail)?;
-            compare_rows(&expected, &actual, *ordered).map_err(|(message, rows)| StepFail {
-                label: label.clone(),
-                message,
-                bless_lines: Some((*span, rows)),
-            })
+            check_rows(&label, &result, *ordered, body_raw, *span, binding)
         }
-        QueryExpect::Error { needle } => match outcome {
-            Ok(_) => Err(fail(format!(
-                "expected an error containing \"{needle}\", but the query succeeded"
-            ))),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains(needle) {
-                    Ok(())
-                } else {
-                    Err(fail(format!("error does not contain \"{needle}\": {msg}")))
-                }
+        QueryExpect::Error { needle } => {
+            check_error_expect(needle, outcome, "the query succeeded").map_err(fail)
+        }
+    }
+}
+
+/// Compares the executed rows with the expect body; a mismatch carries the
+/// actual rows as the bless target.
+fn check_rows(
+    label: &str,
+    result: &QueryResult,
+    ordered: bool,
+    body_raw: &str,
+    span: BodySpan,
+    binding: Option<(&str, &str)>,
+) -> Result<(), StepFail> {
+    let fail = |message: String| StepFail {
+        label: label.to_string(),
+        message,
+        bless_lines: None,
+    };
+    let rows = result
+        .to_rust_json()
+        .map_err(|e| fail(format!("query rows failed to render as JSON: {e}")))?;
+    let Value::Array(actual) = rows else {
+        return Err(fail("engine returned a non-array row set".into()));
+    };
+    let expected = parse_expect_rows(&substitute(body_raw, binding)).map_err(&fail)?;
+    compare_rows(&expected, &actual, ordered).map_err(|(message, rows)| StepFail {
+        label: label.to_string(),
+        message,
+        bless_lines: Some((span, rows)),
+    })
+}
+
+/// Holds an `error: <needle>` expect against the step's outcome: the step
+/// must fail, and the rendered error must contain the needle.
+fn check_error_expect<T, E: std::fmt::Display>(
+    needle: &str,
+    outcome: Result<T, E>,
+    succeeded: &str,
+) -> Result<(), String> {
+    match outcome {
+        Ok(_) => Err(format!(
+            "expected an error containing \"{needle}\", but {succeeded}"
+        )),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains(needle) {
+                Ok(())
+            } else {
+                Err(format!("error does not contain \"{needle}\": {msg}"))
             }
-        },
+        }
+    }
+}
+
+/// `branch list`'s answer as a result: one non-null `Utf8` column `name`,
+/// rows in byte order, the shape a `--- expect shape` holds against.
+fn list_result(mut names: Vec<String>) -> Result<QueryResult, String> {
+    names.sort();
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from(names))],
+    )
+    .map_err(|e| format!("`branch list` rows failed to build: {e}"))?;
+    Ok(QueryResult::new(schema, vec![batch]))
+}
+
+async fn run_list_step(
+    db: &Omnigraph,
+    step: &ListStep,
+    binding: Option<(&str, &str)>,
+) -> Result<(), StepFail> {
+    let label = step_label(step.ordinal, "branch list", binding);
+    let fail = |message: String| StepFail {
+        label: label.clone(),
+        message,
+        bless_lines: None,
+    };
+    let outcome = db.branch_list().await;
+    match &step.expect {
+        QueryExpect::Rows {
+            ordered,
+            body_raw,
+            span,
+            shape,
+        } => {
+            let names = outcome.map_err(|e| fail(format!("`branch list` failed: {e}")))?;
+            let result = list_result(names).map_err(&fail)?;
+            let catalog = db.catalog();
+            if let Some(mismatch) = shape_mismatch(&shape.lines, &result, result.schema(), &catalog)
+            {
+                let (message, bless_lines) = match bless_shape_lines(&result, &catalog) {
+                    Ok(lines) => (mismatch, Some((shape.span, lines))),
+                    Err(unspellable) => (format!("{mismatch}\n{unspellable}"), None),
+                };
+                return Err(StepFail {
+                    label: label.clone(),
+                    message,
+                    bless_lines,
+                });
+            }
+            check_rows(&label, &result, *ordered, body_raw, *span, binding)
+        }
+        QueryExpect::Error { needle } => {
+            check_error_expect(needle, outcome, "`branch list` succeeded").map_err(fail)
+        }
+    }
+}
+
+fn check_write_expect<T, E: std::fmt::Display>(
+    name: &str,
+    expect: &WriteExpect,
+    outcome: Result<T, E>,
+) -> Result<(), String> {
+    match expect {
+        WriteExpect::Ok => outcome
+            .map(|_| ())
+            .map_err(|e| format!("`{name}` failed: {e}")),
+        WriteExpect::Error { needle } => {
+            check_error_expect(needle, outcome, &format!("`{name}` succeeded"))
+        }
+    }
+}
+
+/// Runs a control write against the handle. A `branch delete` returns at
+/// the manifest flip and reclaims the branch's forks in a background task,
+/// so the step joins those before the next step runs.
+async fn run_control_step(
+    db: &Omnigraph,
+    step: &ControlStep,
+    binding: Option<(&str, &str)>,
+) -> Result<(), StepFail> {
+    let name = step.name;
+    let label = step_label(step.ordinal, name, binding);
+    let fail = |message: String| StepFail {
+        label: label.clone(),
+        message,
+        bless_lines: None,
+    };
+    match &step.write {
+        ControlWrite::Create {
+            name: branch,
+            from,
+            expect,
+        } => {
+            let parent = from.as_deref().unwrap_or(MAIN_BRANCH);
+            let outcome = db
+                .branch_create_from_as(ReadTarget::branch(parent), branch, None)
+                .await;
+            check_write_expect(name, expect, outcome).map_err(fail)
+        }
+        ControlWrite::Delete {
+            name: branch,
+            expect,
+        } => {
+            let outcome = db.branch_delete_as(branch, None).await;
+            db.wait_for_fork_reclaims().await;
+            check_write_expect(name, expect, outcome).map_err(fail)
+        }
+        ControlWrite::Merge {
+            source,
+            into,
+            expect,
+        } => {
+            let target = into.as_deref().unwrap_or(MAIN_BRANCH);
+            let outcome = db.branch_merge_as(source, target, None).await;
+            match expect {
+                MergeExpect::Write(expect) => {
+                    check_write_expect(name, expect, outcome).map_err(fail)
+                }
+                MergeExpect::Outcome(want) => match outcome {
+                    Ok(got) if got == *want => Ok(()),
+                    Ok(got) => Err(fail(format!(
+                        "merge outcome mismatch: expected `{}`, got `{}`",
+                        merge_outcome_word(*want),
+                        merge_outcome_word(got)
+                    ))),
+                    Err(e) => Err(fail(format!("`{name}` failed: {e}"))),
+                },
+            }
+        }
     }
 }
 
@@ -1507,8 +1989,11 @@ async fn run_mutate_step(
             };
         }
     };
-    let (outcome, counts) =
-        under_traversal(mode, db.mutate("main", &step.source, &step.name, &params)).await;
+    let (outcome, counts) = under_traversal(
+        mode,
+        db.mutate(&step.branch, &step.source, &step.name, &params),
+    )
+    .await;
     if let Some(violation) = check_pin(mode, &counts, false) {
         return Err(fail(violation));
     }
@@ -1527,19 +2012,9 @@ async fn run_mutate_step(
                 )))
             }
         }
-        MutateExpect::Error { needle } => match outcome {
-            Ok(_) => Err(fail(format!(
-                "expected an error containing \"{needle}\", but the mutation succeeded"
-            ))),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains(needle) {
-                    Ok(())
-                } else {
-                    Err(fail(format!("error does not contain \"{needle}\": {msg}")))
-                }
-            }
-        },
+        MutateExpect::Error { needle } => {
+            check_error_expect(needle, outcome, "the mutation succeeded").map_err(fail)
+        }
     }
 }
 
@@ -1588,6 +2063,8 @@ async fn execute_case(case: &Case, path: &Path, bless: bool) -> Result<(), Strin
                 let outcome = match step {
                     Step::Query(q) => run_query_step(&db, case.traversal, q, binding).await,
                     Step::Mutate(m) => run_mutate_step(&db, case.traversal, m, binding).await,
+                    Step::Control(c) => run_control_step(&db, c, binding).await,
+                    Step::List(l) => run_list_step(&db, l, binding).await,
                     Step::Restart { ordinal } => {
                         drop(db);
                         db = Omnigraph::open(&uri).await.map_err(|e| {

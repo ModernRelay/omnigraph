@@ -166,7 +166,7 @@ fn scope(cli: &Cli) -> Result<()> {
     {
         return Err(Failure::refused(
             "managed_scope_conflict",
-            "managed data uses folder context and its cached credential; --server, --profile, --store, --cluster, and --as require explicit --direct",
+            "this managed operation uses its selected context; ordinary target selectors and an explicit --as are not applicable",
         ));
     }
     Ok(())
@@ -317,18 +317,48 @@ fn load(
 
 fn skips_context(cli: &Cli) -> bool {
     cli.direct
-        || matches!(cli.command, Command::Cluster { .. })
-        || (crate::planes::command_plane(&cli.command) == crate::planes::Plane::Session
-            && !matches!(cli.command, Command::Alias { .. }))
+        || !matches!(cli.command, Command::Query { .. } | Command::Mutate { .. })
+        || cli.server.is_some()
+        || cli.profile.is_some()
+        || cli.store.is_some()
+        || cli.cluster.is_some()
 }
 
-fn resolve(cli: &Cli, config: &std::path::Path, store: &impl Store) -> Result<Option<GraphClient>> {
+/// This check never resolves a competing target or consults credentials. Even
+/// an unknown profile or matching-looking server URL is ambiguous beside a
+/// managed binding. Call it only after selecting a valid exact-directory
+/// context, so ordinary commands retain their own operator-config behavior.
+fn has_ambient_target() -> Result<bool> {
+    if std::env::var_os(crate::scope::PROFILE_ENV).is_some_and(|value| !value.is_empty()) {
+        return Ok(true);
+    }
+    let operator = crate::operator::load_operator_config().map_err(|_| {
+        Failure::refused(
+            "operator_config_invalid",
+            "cannot read valid operator configuration to exclude a competing data target",
+        )
+    })?;
+    Ok(operator.default_server().is_some() || operator.default_store().is_some())
+}
+
+fn resolve(
+    cli: &Cli,
+    config: &std::path::Path,
+    store: &impl Store,
+    ambient_target: impl FnOnce() -> Result<bool>,
+) -> Result<Option<GraphClient>> {
     if skips_context(cli) {
         return Ok(None);
     }
     let Some(context) = super::read_context(config)? else {
         return Ok(None);
     };
+    if ambient_target()? {
+        return Err(Failure::refused(
+            "managed_target_ambiguous",
+            "folder context competes with OMNIGRAPH_PROFILE or an operator default target; select the intended ordinary target explicitly, use --direct for ordinary ambient resolution, or clear the competing ambient target to use this managed folder",
+        ));
+    }
     let (action, named) = match &cli.command {
         Command::Query {
             query,
@@ -340,12 +370,7 @@ fn resolve(cli: &Cli, config: &std::path::Path, store: &impl Store) -> Result<Op
             query_string,
             ..
         } => ("change", query.is_none() && query_string.is_none()),
-        _ => {
-            return Err(Failure::refused(
-                "managed_command_unsupported",
-                "managed data currently supports query and mutate; use --direct only when legacy addressing is intended",
-            ));
-        }
+        _ => unreachable!("only implicit query/mutate consult data context"),
     };
     scope(cli)?;
     let graph = cli
@@ -374,7 +399,7 @@ pub(crate) fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>, Outp
     };
     let result = std::env::current_dir()
         .map_err(|_| Failure::refused("context_invalid", "cannot resolve the current directory"))
-        .and_then(|cwd| resolve(cli, &cwd, &auth::DATA_STORE));
+        .and_then(|cwd| resolve(cli, &cwd, &auth::DATA_STORE, has_ambient_target));
     result.map_err(|e| Output::from_result(Err(e), json, 2))
 }
 

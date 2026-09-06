@@ -1,0 +1,90 @@
+# issue: none
+# notes: 5 docs indexed, then 2 docs inserted beside each other at 100 and 101,
+# notes: far from the indexed rows. Step 1, nearest from 100.3 limit 4: the two
+# notes: unindexed rows rank first, then the indexed tail d004, d003, so one
+# notes: ranking spans indexed and unindexed fragments. Then `--- restart` and
+# notes: the same query: the committed rows survive the reopen, same answer.
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64 @index
+    name: String @index
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","n":2,"name":"doc-002","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","n":3,"name":"doc-003","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","n":4,"name":"doc-004","embedding":[4.0,0.0,0.0,0.0]}}
+
+--- mutate
+query ins($s: String, $n: I64, $nm: String, $e: Vector(4)) {
+    insert Doc { slug: $s, n: $n, name: $nm, embedding: $e }
+}
+
+--- params
+{"s": "d100", "n": 100, "nm": "doc-100", "e": [100.0, 0.0, 0.0, 0.0]}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query ins($s: String, $n: I64, $nm: String, $e: Vector(4)) {
+    insert Doc { slug: $s, n: $n, name: $nm, embedding: $e }
+}
+
+--- params
+{"s": "d101", "n": 101, "nm": "doc-101", "e": [101.0, 0.0, 0.0, 0.0]}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query scenario($q: Vector(4)) {
+    match {
+        $d: Doc
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+
+--- params
+{"q": [100.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d100"}
+{"d.slug":"d101"}
+{"d.slug":"d004"}
+{"d.slug":"d003"}
+
+--- expect shape
+d.slug: String
+
+--- restart
+
+--- query
+query scenario($q: Vector(4)) {
+    match {
+        $d: Doc
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+
+--- params
+{"q": [100.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d100"}
+{"d.slug":"d101"}
+{"d.slug":"d004"}
+{"d.slug":"d003"}
+
+--- expect shape
+d.slug: String

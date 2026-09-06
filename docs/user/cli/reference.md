@@ -33,16 +33,16 @@ Common global flags:
 | `--yes` | Non-interactive consent for destructive writes to non-local storage |
 | `--quiet` | Suppress the resolved write target printed to stderr |
 
-Served writes ignore `--as`: the server derives the actor from the bearer
-token.
+A served write refuses `--as` ("`--as` is not allowed on a served write"): the
+server resolves the actor from the bearer token. Drop it, or use `--store <uri>`.
 
 ## Commands
 
 | Command | Purpose | Scope |
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
-| `query` | Run a read query | direct or served |
-| `mutate` | Run an insert/update/delete query | direct or served |
+| `query` | Run a read query, or the `branch list` statement | direct or served |
+| `mutate` | Run an insert/update/delete query, or a `branch create`, `branch delete`, or `branch merge` statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
 | `branch create/list/delete/merge` | Manage graph branches | direct or served |
@@ -50,7 +50,7 @@ token.
 | `commit list/show/changes` | Inspect history or one commit's entity changes | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
-| `schema show` | Read customer source and discover accepted system types | direct or served |
+| `schema show` | Read the accepted schema | direct or served |
 | `schema apply` | Apply a schema to a standalone graph | direct |
 | `schema plan` | Preview a schema migration | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
@@ -75,43 +75,18 @@ covered in [Maintenance](../operations/maintenance.md).
 `--as` for actor attribution. Direct maintenance does not load server policy;
 see the [rebuild procedure](../operations/maintenance.md#rebuild-full-text-indexes).
 
-## Schema and actor provenance
-
-`init`, `schema plan`, and `schema apply` accept
-`--actor-provenance true|false`. New graphs default to `true`; plan and apply
-preserve an existing graph's accepted setting when the flag is omitted.
-Changing only the flag still produces a schema migration:
-
-```bash
-omnigraph init graph.omni --schema graph.pg --actor-provenance false
-omnigraph schema plan graph.omni --schema graph.pg --actor-provenance true
-omnigraph schema apply graph.omni --schema graph.pg --actor-provenance true
-omnigraph schema show graph.omni --json
-```
-
-Disabling retains an established `OmniActor` type, rows, and history. See
-[Actor provenance](../schema/index.md) for identity and write rules.
-
-`schema show --json` and `GET /schema` return unchanged customer `.pg` text
-in `schema_source`, and accepted structured types and binding in
-`accepted_schema` (absent on older servers). Write only `schema_source` back
-to desired `.pg` files. Human output labels source and system types separately.
-
-Use `lint --store graph.omni --query actors.gq` for accepted types;
-`lint --schema current.pg` validates only customer source.
-
 ## Query inputs and output
 
 For ad-hoc source, pass `--query <FILE>` or `-e/--query-string <GQ>`. When the
 source contains multiple declarations, the positional name selects one. For a
-stored server query, omit the source and pass its registry name.
+stored server query, omit the source and pass its registry name. Parameters
+come inline, `--params '{"name":"Ada"}'`, or from a file, `--params-file
+params.json`.
 
-Parameters can be supplied inline or from a file:
-
-```bash
---params '{"name":"Ada"}'
---params-file params.json
-```
+The source may instead be one branch statement, `mutate -e 'branch create b0'`
+or `query -e 'branch list'` (control writes through `mutate`, the listing
+through `query`), which takes no `--branch`, `--snapshot`, `--if-commit`, name,
+or params; see [Work with branches](index.md#work-with-branches).
 
 Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
@@ -254,8 +229,8 @@ cluster: CLUSTER_ID
 api: https://control.example
 ```
 
-The context contains no secret and is read only from the selected `--config`
-directory, which defaults to `.`. Parent directories are not searched.
+The context contains no secret. Cluster commands read it only from the selected
+`--config` directory, which defaults to `.`. Parent directories are not searched.
 Unknown fields, versions, malformed files, symbolic links, and files over
 16 KiB are refused. API addresses must be origins without credentials, path,
 query, or fragment. HTTPS is required except for exact localhost,
@@ -337,7 +312,7 @@ for permissions, offline behavior, expiry, and local credential clearing.
 `cleanup` changes nothing until `--confirm` is present. Destructive operations
 against non-local storage also require interactive confirmation or `--yes`; in
 non-interactive and JSON modes they fail closed. The same non-local consent
-rule applies to overwrite loads and branch deletion.
+rule applies to overwrite loads and branch deletion, verb or statement.
 
 ## Compatibility aliases
 

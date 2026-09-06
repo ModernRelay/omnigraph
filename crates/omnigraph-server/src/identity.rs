@@ -157,25 +157,16 @@ pub enum AuthSource {
     SignedData,
 }
 
-/// Server-resolved actor identity. Replaces the previous
-/// `AuthenticatedActor(Arc<str>)` from `lib.rs`.
-///
-/// The fields are populated by `authenticate_bearer_token` after a successful
-/// static hash match or signed credential verification.
-/// **Clients cannot set any of these fields directly**
-/// — this is the MR-731 invariant. See `authorize_request` in `lib.rs` for the
-/// chokepoint that overwrites any client-supplied actor identity.
-///
-/// The static constructor uses `Scope::Full`; the data-token verifier attaches
-/// validated claims and uses `Scope::DataToken`.
+/// Public identity projection for embedders. Its legacy fields remain
+/// constructible; this record alone is never authenticated request authority.
+/// The server uses [`AuthenticatedActor`] internally, populated only after a
+/// static credential match or signed credential verification.
 #[derive(Debug, Clone)]
 pub struct ResolvedActor {
     pub actor_id: Arc<str>,
     pub tenant_id: Option<TenantId>,
     pub scopes: Vec<Scope>,
     pub source: AuthSource,
-    pub(crate) data_token: Option<Arc<crate::data_tokens::DataTokenClaims>>,
-    pub(crate) selected_graph: Option<GraphId>,
 }
 
 impl ResolvedActor {
@@ -187,8 +178,6 @@ impl ResolvedActor {
             tenant_id: None,
             scopes: vec![Scope::Full],
             source: AuthSource::Static,
-            data_token: None,
-            selected_graph: None,
         }
     }
 
@@ -196,6 +185,54 @@ impl ResolvedActor {
     /// boundary — Cedar always sees this value as the principal.
     pub fn actor_id_str(&self) -> &str {
         &self.actor_id
+    }
+}
+
+/// Verified request identity and its immutable signed grant ceiling.
+///
+/// Public identity fields are exposed only through a shared projection. There
+/// is no public constructor or mutable projection: a caller-created
+/// [`ResolvedActor`] cannot manufacture or widen request authority.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedActor {
+    actor: ResolvedActor,
+    data_token: Option<Arc<crate::data_tokens::DataTokenClaims>>,
+    selected_graph: Option<GraphId>,
+}
+
+impl std::ops::Deref for AuthenticatedActor {
+    type Target = ResolvedActor;
+
+    fn deref(&self) -> &Self::Target {
+        self.actor()
+    }
+}
+
+impl AuthenticatedActor {
+    pub(crate) fn cluster_static(actor_id: Arc<str>) -> Self {
+        Self {
+            actor: ResolvedActor::cluster_static(actor_id),
+            data_token: None,
+            selected_graph: None,
+        }
+    }
+
+    pub(crate) fn signed(claims: crate::data_tokens::DataTokenClaims) -> Self {
+        Self {
+            actor: ResolvedActor {
+                actor_id: Arc::from(format!("principal:{}", claims.sub)),
+                tenant_id: None,
+                scopes: vec![Scope::DataToken],
+                source: AuthSource::SignedData,
+            },
+            data_token: Some(Arc::new(claims)),
+            selected_graph: None,
+        }
+    }
+
+    /// Identity metadata, without mutable access to the authenticated state.
+    pub fn actor(&self) -> &ResolvedActor {
+        &self.actor
     }
 
     /// Authenticated signed claims, excluding the original bearer plaintext.

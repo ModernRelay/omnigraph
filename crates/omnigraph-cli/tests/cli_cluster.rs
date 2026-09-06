@@ -733,7 +733,7 @@ fn managed_lifecycle_capture_and_retry_records_refuse_symlinks_without_reading_t
 }
 
 #[test]
-fn managed_data_process_refuses_unsupported_and_conflicting_scope_before_keychain() {
+fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain() {
     let temp = tempdir().unwrap();
     let api = IntentApiFixture::new(vec![]);
     write_managed_context(temp.path(), &api.origin);
@@ -748,15 +748,6 @@ fn managed_data_process_refuses_unsupported_and_conflicting_scope_before_keychai
             "forged",
             "--json",
         ],
-        vec![
-            "query",
-            "q",
-            "--graph",
-            "knowledge",
-            "--server",
-            "https://foreign.example",
-            "--json",
-        ],
         vec!["cluster", "token", "--actions", "read", "--json"],
         vec![
             "cluster",
@@ -767,7 +758,12 @@ fn managed_data_process_refuses_unsupported_and_conflicting_scope_before_keychai
             "--json",
         ],
     ] {
-        let output = cli().current_dir(temp.path()).args(&args).output().unwrap();
+        let output = cli()
+            .current_dir(temp.path())
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(&args)
+            .output()
+            .unwrap();
         assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
         let problem = parse_stdout_json(&output);
         assert!(
@@ -778,15 +774,6 @@ fn managed_data_process_refuses_unsupported_and_conflicting_scope_before_keychai
             "{problem}"
         );
         assert_no_core_effects(temp.path());
-    }
-    for args in [
-        vec!["graphs", "list"],
-        vec!["alias", "legacy-alias"],
-        vec!["snapshot", "--store", "/tmp/managed-must-not-open"],
-    ] {
-        let output = cli().current_dir(temp.path()).args(&args).output().unwrap();
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("managed_command_unsupported"));
     }
     assert!(api.requests().is_empty());
     assert_no_core_effects(temp.path());
@@ -828,6 +815,270 @@ fn managed_data_direct_override_uses_only_explicit_legacy_transport() {
     assert!(api.requests().is_empty());
     data.assert_complete();
     assert_no_core_effects(temp.path());
+}
+
+#[test]
+fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
+    for malformed in [false, true] {
+        for selector in ["--server", "--profile"] {
+            for verb in ["query", "mutate"] {
+                let temp = tempdir().unwrap();
+                let api = IntentApiFixture::new(vec![]);
+                write_managed_context(temp.path(), &api.origin);
+                if malformed {
+                    fs::write(temp.path().join(".omnigraph/context"), "malformed").unwrap();
+                }
+                let reply = if verb == "query" {
+                    serde_json::json!({
+                        "query_name":"q", "target":{"branch":"main"}, "row_count":1,
+                        "columns":["value"], "rows":[{"value":42}], "graph_commit_id":"head-a"
+                    })
+                } else {
+                    serde_json::json!({
+                        "branch":"main", "query_name":"q", "affected_nodes":1,
+                        "affected_edges":0, "actor_id":"legacy-actor", "commit":null
+                    })
+                };
+                let data = IntentApiFixture::new(vec![IntentReply::json(200, reply)]);
+                let home = temp.path().join("operator");
+                fs::create_dir(&home).unwrap();
+                fs::write(
+                    home.join("config.yaml"),
+                    format!(
+                        "servers:\n  staging:\n    url: {}\nprofiles:\n  staging:\n    server: staging\n    default_graph: knowledge\n",
+                        data.origin
+                    ),
+                )
+                .unwrap();
+                let mut command = cli();
+                command
+                    .current_dir(temp.path())
+                    .env("OMNIGRAPH_HOME", &home)
+                    .env("OMNIGRAPH_PROFILE", "unused-unknown-profile")
+                    .env("OMNIGRAPH_TOKEN_STAGING", "explicit-legacy-token")
+                    .env("OMNIGRAPH_BEARER_TOKEN", "unused-legacy-fallback")
+                    .env("OMNIGRAPH_CONTROL_API", &api.origin)
+                    .env("OMNIGRAPH_CONTROL_TOKEN", "never-data")
+                    .args([verb, "q", selector, "staging", "--json"])
+                    .timeout(std::time::Duration::from_secs(15));
+                if selector == "--server" {
+                    command.args(["--graph", "knowledge"]);
+                }
+                let output = output_success(&mut command);
+                let payload = parse_stdout_json(&output);
+                if verb == "query" {
+                    assert_eq!(payload["rows"], serde_json::json!([{"value":42}]));
+                } else {
+                    assert_eq!(payload["affected_nodes"], 1);
+                }
+                let requests = data.requests();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].path, "/graphs/knowledge/queries/q");
+                assert_eq!(
+                    requests[0].headers["authorization"],
+                    "Bearer explicit-legacy-token"
+                );
+                assert!(api.requests().is_empty());
+                data.assert_complete();
+                assert_no_core_effects(temp.path());
+            }
+        }
+    }
+}
+
+#[test]
+fn managed_data_issue_633_ambient_targets_refuse_without_selecting_either() {
+    for (config, profile) in [
+        ("{}", Some("unknown-profile")),
+        ("defaults:\n  server: staging\n", None),
+        ("defaults:\n  store: file:///must-not-open\n", None),
+    ] {
+        let temp = tempdir().unwrap();
+        let api = IntentApiFixture::new(vec![]);
+        write_managed_context(temp.path(), &api.origin);
+        let home = temp.path().join("operator");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("config.yaml"), config).unwrap();
+        for verb in ["query", "mutate"] {
+            let mut command = cli();
+            command
+                .current_dir(temp.path())
+                .env("OMNIGRAPH_HOME", &home)
+                .env_remove("OMNIGRAPH_PROFILE")
+                .env("OMNIGRAPH_BEARER_TOKEN", "must-not-be-used")
+                .args([verb, "q", "--json"])
+                .timeout(std::time::Duration::from_secs(15));
+            if let Some(profile) = profile {
+                command.env("OMNIGRAPH_PROFILE", profile);
+            }
+            // No graph means the old dispatcher fails without touching a real
+            // keychain too; the regression is which target decision occurs first.
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert_eq!(
+                parse_stdout_json(&output)["type"],
+                "managed_target_ambiguous"
+            );
+            assert!(api.requests().is_empty());
+            assert_no_core_effects(temp.path());
+        }
+    }
+}
+
+#[test]
+fn managed_data_issue_633_folder_context_does_not_gate_local_graph_work() {
+    let temp = tempdir().unwrap();
+    let api = IntentApiFixture::new(vec![]);
+    write_managed_context(temp.path(), &api.origin);
+    fs::write(temp.path().join(".omnigraph/context"), "malformed").unwrap();
+    let graph = graph_path(temp.path());
+    let schema = fixture("test.pg");
+    let queries = fixture("test.gq");
+    let command = || {
+        let mut command = cli();
+        command
+            .current_dir(temp.path())
+            .env_remove("OMNIGRAPH_PROFILE")
+            .env_remove("OMNIGRAPH_BEARER_TOKEN")
+            .timeout(std::time::Duration::from_secs(30));
+        command
+    };
+    output_success(
+        command()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg(&graph),
+    );
+    assert!(graph.exists());
+    output_success(
+        command()
+            .args(["load", "--mode", "append", "--data"])
+            .arg(fixture("test.jsonl"))
+            .arg("--store")
+            .arg(&graph)
+            .arg("--json"),
+    );
+    output_success(
+        command()
+            .args(["lint", "--schema"])
+            .arg(&schema)
+            .arg("--query")
+            .arg(&queries)
+            .arg("--json"),
+    );
+    let query = output_success(
+        command()
+            .args(["query", "get_person", "--query"])
+            .arg(&queries)
+            .arg("--store")
+            .arg(&graph)
+            .args(["--params", r#"{"name":"Alice"}"#, "--json"]),
+    );
+    assert_eq!(parse_stdout_json(&query)["rows"][0]["p.name"], "Alice");
+    output_success(
+        command()
+            .args(["schema", "plan", "--schema"])
+            .arg(&schema)
+            .arg("--store")
+            .arg(&graph)
+            .arg("--json"),
+    );
+    output_success(
+        command()
+            .args(["commit", "list", "--store"])
+            .arg(&graph)
+            .arg("--json"),
+    );
+    assert!(api.requests().is_empty());
+    assert_no_core_effects(temp.path());
+}
+
+#[test]
+fn managed_data_issue_633_operator_preferences_do_not_select_a_target() {
+    let temp = tempdir().unwrap();
+    let api = IntentApiFixture::new(vec![]);
+    write_managed_context(temp.path(), &api.origin);
+    let home = temp.path().join("operator");
+    fs::create_dir(&home).unwrap();
+    fs::write(
+        home.join("config.yaml"),
+        "operator:\n  actor: preferred-actor\ndefaults:\n  output: json\n  default_graph: knowledge\nprofiles:\n  unused:\n    server: staging\n",
+    )
+    .unwrap();
+    for profile in [None, Some("")] {
+        let mut command = cli();
+        command
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_HOME", &home)
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["query", "q", "--json"]);
+        if let Some(profile) = profile {
+            command.env("OMNIGRAPH_PROFILE", profile);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(parse_stdout_json(&output)["type"], "graph_required");
+        assert!(api.requests().is_empty());
+    }
+    fs::write(home.join("config.yaml"), "defaults: [invalid]").unwrap();
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_HOME", &home)
+        .env_remove("OMNIGRAPH_PROFILE")
+        .args(["query", "q", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "operator_config_invalid"
+    );
+    assert!(api.requests().is_empty());
+    assert_no_core_effects(temp.path());
+}
+
+#[test]
+fn managed_data_issue_633_direct_preserves_ambient_legacy_resolution() {
+    for use_profile in [false, true] {
+        let temp = tempdir().unwrap();
+        let api = IntentApiFixture::new(vec![]);
+        write_managed_context(temp.path(), &api.origin);
+        let data = IntentApiFixture::new(vec![IntentReply::json(
+            200,
+            serde_json::json!({
+                "query_name":"q", "target":{"branch":"main"}, "row_count":1,
+                "columns":["value"], "rows":[{"value":42}], "graph_commit_id":"head-a"
+            }),
+        )]);
+        let home = temp.path().join("operator");
+        fs::create_dir(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            format!(
+                "servers:\n  staging:\n    url: {}\nprofiles:\n  staging:\n    server: staging\ndefaults:\n  server: staging\n",
+                data.origin
+            ),
+        )
+        .unwrap();
+        let mut command = cli();
+        command
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_HOME", &home)
+            .env_remove("OMNIGRAPH_PROFILE")
+            .env("OMNIGRAPH_TOKEN_STAGING", "legacy-ambient-token")
+            .args(["query", "q", "--graph", "knowledge", "--json", "--direct"]);
+        if use_profile {
+            command.env("OMNIGRAPH_PROFILE", "staging");
+        }
+        let output = output_success(&mut command);
+        assert_eq!(parse_stdout_json(&output)["rows"][0]["value"], 42);
+        assert_eq!(
+            data.requests()[0].headers["authorization"],
+            "Bearer legacy-ambient-token"
+        );
+        assert!(api.requests().is_empty());
+        data.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
 }
 
 #[test]

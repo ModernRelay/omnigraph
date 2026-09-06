@@ -1,4 +1,4 @@
-//! Service-owned lifecycle operations and managed source preparation (RFC 0055).
+//! Service-owned lifecycle operations and managed source preparation (RFC 0061).
 use super::*;
 
 mod capture;

@@ -187,6 +187,268 @@ fn refuses_mutation_declaration_under_query() {
     assert!(refusal("x", &text).contains("use `--- mutate`"));
 }
 
+const CREATE: &str = "--- mutate\nbranch create b0\n--- expect ok\n";
+const LIST: &str = "--- query\nbranch list\n--- expect unordered\n{\"name\": \"b0\"}\n{\"name\": \"main\"}\n--- expect shape\nname: String\n";
+
+/// The four refusals a statement step carries: the wrong section word for a
+/// control write and for `branch list`, the `branch:` argument, `--- params`.
+/// One input per arm; `branch_statement_lifecycle.gqt` runs the accepted ones.
+#[test]
+fn statement_step_refusals() {
+    for (step, want) in [
+        (
+            format!("--- query\nbranch create b0\n{EXPECT}"),
+            "a control write under `--- query` is refused; use `--- mutate`",
+        ),
+        (
+            format!("--- mutate\nbranch list\n{EXPECT_OK}"),
+            "`branch list` under `--- mutate` is refused; use `--- query`",
+        ),
+        (
+            format!("--- mutate branch: main\nbranch create b0\n{EXPECT_OK}"),
+            "a branch statement names its branches itself; drop the `branch:` argument",
+        ),
+        (
+            format!("--- mutate\nbranch create b0\n{PARAMS}{EXPECT_OK}"),
+            "a branch statement takes no params",
+        ),
+    ] {
+        let text = format!("{HDR}{SCHEMA}{SEED}{step}");
+        assert_eq!(refusal("x", &text), want, "{step}");
+    }
+}
+
+/// The section word ends at the first space or tab, so a tab-separated
+/// argument parses as the space-separated one does.
+#[test]
+fn step_header_word_ends_at_a_space_or_a_tab() {
+    for sep in [' ', '\t'] {
+        let text = format!(
+            "{HDR}{SCHEMA}{SEED}--- query{sep}branch: main\n{}{EXPECT}",
+            QUERY.trim_start_matches("--- query\n")
+        );
+        let case = parse_case("x", &text).unwrap_or_else(|e| panic!("{sep:?}: {e}"));
+        match &case.items[0] {
+            Item::Step(Step::Query(step)) => assert_eq!(step.branch, "main", "{sep:?}"),
+            other => panic!("{sep:?}: {other:?}"),
+        }
+    }
+}
+
+/// The header argument's grammar: bare, or exactly `branch: <name>` with
+/// `rest` trimmed and the trimmed remainder as the name; any other `rest`
+/// is refused with the grammar, and a `branch:` with nothing after it too.
+#[test]
+fn step_header_takes_only_a_branch_argument() {
+    for (rest, want) in [
+        ("", None),
+        ("branch: b0", Some("b0")),
+        ("branch:b0", Some("b0")),
+        (" branch: b0", Some("b0")),
+        ("branch:   review/x  ", Some("review/x")),
+    ] {
+        assert_eq!(
+            parse_step_branch("query", rest).unwrap().as_deref(),
+            want,
+            "{rest:?}"
+        );
+    }
+    assert_eq!(
+        parse_step_branch("mutate", "branches: b0").unwrap_err(),
+        "`--- mutate` takes no arguments but `branch: <name>`, got `branches: b0`"
+    );
+    assert_eq!(
+        parse_step_branch("query", "branch:").unwrap_err(),
+        "`--- query branch:` needs a branch name"
+    );
+}
+
+#[test]
+fn refuses_outcome_on_any_step_but_a_merge() {
+    let outcome = "--- expect outcome: merged\n";
+    for (step, want) in [
+        (
+            "--- query\nbranch list\n",
+            "`branch list` takes `unordered`, `ordered`, or `error:`",
+        ),
+        (
+            "--- mutate\nbranch create b0\n",
+            "`expect outcome:` is accepted on a `branch merge` step only",
+        ),
+        (
+            QUERY,
+            "`expect outcome:` is accepted on a `branch merge` step only",
+        ),
+    ] {
+        let text = format!("{HDR}{SCHEMA}{SEED}{step}{outcome}");
+        assert_eq!(refusal("x", &text), want, "{step}");
+    }
+}
+
+#[test]
+fn outcome_takes_the_three_merge_words() {
+    for (word, want) in [
+        ("already_up_to_date", MergeOutcome::AlreadyUpToDate),
+        ("fast_forward", MergeOutcome::FastForward),
+        ("merged", MergeOutcome::Merged),
+    ] {
+        let text = format!(
+            "{HDR}{SCHEMA}{SEED}--- mutate\nbranch merge b0 into main\n--- expect outcome: {word}\n"
+        );
+        let case = parse_case("x", &text).unwrap();
+        let [Item::Step(Step::Control(step))] = case.items.as_slice() else {
+            panic!("expected one control step, got {:?}", case.items);
+        };
+        let ControlWrite::Merge {
+            source,
+            into,
+            expect: MergeExpect::Outcome(got),
+        } = &step.write
+        else {
+            panic!(
+                "expected a merge with an outcome expect, got {:?}",
+                step.write
+            );
+        };
+        assert_eq!(
+            (source.as_str(), into.as_deref(), *got),
+            ("b0", Some("main"), want)
+        );
+    }
+    let text =
+        format!("{HDR}{SCHEMA}{SEED}--- mutate\nbranch merge b0\n--- expect outcome: conflicted\n");
+    assert_eq!(
+        refusal("x", &text),
+        "`expect outcome:` takes `already_up_to_date`, `fast_forward`, or `merged`, got `conflicted`"
+    );
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}--- mutate\nbranch merge b0\n--- expect outcome: merged\nbody\n"
+    );
+    assert!(refusal("x", &text).contains("carries no body"));
+    let text = format!("{HDR}{SCHEMA}{SEED}--- mutate\nbranch merge b0\n--- expect outcome:\n");
+    assert_eq!(
+        refusal("x", &text),
+        "`expect outcome:` needs a word: `already_up_to_date`, `fast_forward`, or `merged`"
+    );
+}
+
+#[test]
+fn refuses_affected_and_rows_on_a_control_write() {
+    for (stmt, name) in [
+        ("branch create b0", "branch create"),
+        ("branch merge b0", "branch merge"),
+    ] {
+        let text = format!(
+            "{HDR}{SCHEMA}{SEED}--- mutate\n{stmt}\n--- expect affected: nodes=0 edges=0\n"
+        );
+        assert_eq!(
+            refusal("x", &text),
+            format!("`expect affected:` is refused on a control write; `{name}` carries no counts")
+        );
+        let text = format!("{HDR}{SCHEMA}{SEED}--- mutate\n{stmt}\n--- expect unordered\n");
+        assert_eq!(
+            refusal("x", &text),
+            format!("a control write takes `ok` or `error:`; `{name}` returns no rows")
+        );
+    }
+}
+
+#[test]
+fn branch_list_takes_rows_or_error_and_needs_a_shape() {
+    for mode in ["--- expect ok\n", "--- expect affected: nodes=0 edges=0\n"] {
+        let text = format!("{HDR}{SCHEMA}{SEED}--- query\nbranch list\n{mode}");
+        assert_eq!(
+            refusal("x", &text),
+            "`branch list` takes `unordered`, `ordered`, or `error:`",
+            "{mode}"
+        );
+    }
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}--- query\nbranch list\n--- expect ordered\n{{\"name\": \"main\"}}\n"
+    );
+    assert!(refusal("x", &text).contains("needs an `--- expect shape` section"));
+    let text = format!("{HDR}{SCHEMA}{SEED}--- query\nbranch list\n--- expect error: boom\n");
+    let case = parse_case("x", &text).unwrap();
+    assert!(matches!(
+        case.items.as_slice(),
+        [Item::Step(Step::List(ListStep {
+            expect: QueryExpect::Error { .. },
+            ..
+        }))]
+    ));
+    let text = format!("{HDR}{SCHEMA}{SEED}{CREATE}{LIST}");
+    let case = parse_case("x", &text).unwrap();
+    assert_eq!(case.items.len(), 2);
+}
+
+/// A quoted statement name carries `${` past the compiler (`string_char`
+/// admits everything but `"` and `\`), so the runner's own `${` fence is
+/// what refuses it, naming the line.
+#[test]
+fn refuses_substitution_marker_in_a_statement_body() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}--- foreach $i a b\n--- mutate\nbranch create \"${{i}}\"\n{EXPECT_OK}--- endloop\n"
+    );
+    assert_eq!(
+        refusal("x", &text),
+        "line 10: `${` may appear only inside a params or expect body"
+    );
+}
+
+/// The `branch:` argument routes a declaration step to its branch and a
+/// `branch list` rows step is compared and shape-checked as a read step;
+/// what this pins is the `outcome:` mismatch, which names both words.
+#[tokio::test]
+async fn statement_steps_run_against_the_embedded_handle() {
+    let on_b0 = QUERY.replace("--- query", "--- query branch: b0");
+    let ins_b0 = MUTATE.replace("--- mutate", "--- mutate branch: b0");
+    let both = "--- expect unordered\n{\"p.name\": \"alice\"}\n{\"p.name\": \"bob\"}\n--- expect shape\np.name: String\n";
+    let list_ordered = LIST.replace("unordered", "ordered");
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{CREATE}{ins_b0}{PARAMS}--- expect affected: nodes=1 edges=0\n{on_b0}{both}{QUERY}{EXPECT}{list_ordered}\
+         --- mutate\nbranch merge b0\n--- expect outcome: already_up_to_date\n"
+    );
+    let case = parse_case("x", &text).unwrap();
+    let err = execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        "step 6 (branch merge): merge outcome mismatch: expected `already_up_to_date`, got `fast_forward`"
+    );
+}
+
+#[tokio::test]
+async fn branch_list_shape_and_rows_are_blessed_like_a_read_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bless_list.gqt");
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{CREATE}--- query\nbranch list\n--- expect unordered\n--- expect shape\n"
+    );
+    std::fs::write(&path, &text).unwrap();
+    let case = parse_case("bless_list", &text).unwrap();
+    let err = execute_case(&case, &path, true).await.unwrap_err();
+    assert!(
+        err.contains("names 0 column(s), the executor returned 1"),
+        "got: {err}"
+    );
+    let blessed = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        blessed.ends_with("--- expect shape\nname: String\n"),
+        "got: {blessed}"
+    );
+    let case = parse_case("bless_list", &blessed).unwrap();
+    let err = execute_case(&case, &path, true).await.unwrap_err();
+    assert!(err.contains("row mismatch"), "got: {err}");
+    let blessed = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        blessed.contains("{\"name\":\"b0\"}\n{\"name\":\"main\"}\n"),
+        "got: {blessed}"
+    );
+    let case = parse_case("bless_list", &blessed).unwrap();
+    execute_case(&case, &path, false).await.unwrap();
+}
+
 #[test]
 fn refuses_read_declaration_under_mutate() {
     let text = format!(
@@ -513,7 +775,7 @@ mod schema_drift {
     const NAME_QUERY: &str = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}";
 
     fn decl(source: &str) -> QueryDecl {
-        parse_query(source).unwrap().queries.remove(0)
+        parse_query(source).unwrap().single_decl().clone()
     }
 
     fn agg_inferred() -> Schema {
@@ -605,11 +867,62 @@ mod shape_section {
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Fields};
 
+    use omnigraph_compiler::catalog::{Catalog, build_catalog};
+
     use super::*;
-    use crate::shape::{ShapeLine, bless_shape_lines, parse_shape_body, shape_mismatch};
+    use crate::shape::{ShapeLine, ShapeType, bless_shape_lines, parse_shape_body, shape_mismatch};
+
+    fn age_catalog() -> Catalog {
+        build_catalog(
+            &parse_schema("node Person {\n    name: String @key\n    age: I32?\n}\n").unwrap(),
+        )
+        .unwrap()
+    }
 
     fn mismatch(shape: &[ShapeLine], result: &QueryResult) -> Option<String> {
-        shape_mismatch(shape, result, &Schema::empty())
+        shape_mismatch(shape, result, &Schema::empty(), &age_catalog())
+    }
+
+    fn person_struct() -> (Field, ArrayRef) {
+        let fields = Fields::from(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, true),
+        ]);
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["alice"])),
+            Arc::new(StringArray::from(vec!["alice"])),
+            Arc::new(Int32Array::from(vec![Some(30)])),
+        ];
+        let array = StructArray::new(fields.clone(), columns, None);
+        (
+            Field::new("p", DataType::Struct(fields), false),
+            Arc::new(array),
+        )
+    }
+
+    #[test]
+    fn a_node_type_name_spells_a_bare_node_projection() {
+        let parsed = lines("p: Person");
+        assert!(matches!(&parsed[0].shape_type, ShapeType::Node(name) if name == "Person"));
+        assert!(shape_refusal("p: Person?").contains("never null"));
+        let (field, column) = person_struct();
+        let executed = result(vec![field], vec![column]);
+        assert_eq!(mismatch(&lines("p: Person"), &executed), None);
+        assert!(
+            mismatch(&lines("p: Company"), &executed)
+                .unwrap()
+                .contains("not a node type")
+        );
+        assert!(
+            mismatch(&lines("p: String"), &executed)
+                .unwrap()
+                .contains("expected String")
+        );
+        assert_eq!(
+            bless_shape_lines(&executed, &age_catalog()).unwrap(),
+            vec!["p: Person".to_string()]
+        );
     }
 
     const AGE_SCHEMA: &str = "--- schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n";
@@ -675,7 +988,10 @@ mod shape_section {
         );
         let spelled: Vec<String> = parsed
             .iter()
-            .map(|l| format!("{}: {}", l.name, l.prop_type.display_name()))
+            .map(|l| match &l.shape_type {
+                ShapeType::Scalar(t) => format!("{}: {}", l.name, t.display_name()),
+                ShapeType::Node(n) => format!("{}: {n}", l.name),
+            })
             .collect();
         assert_eq!(
             spelled,
@@ -705,7 +1021,7 @@ mod shape_section {
             shape_refusal("p.name: String @key")
                 .contains("annotations and body constraints are not allowed")
         );
-        assert!(shape_refusal("p: Person").contains("line 1: unknown type `Person`"));
+        assert!(shape_refusal("p: 123").contains("line 1: unknown type `123`"));
         assert!(shape_refusal("Name: String").contains("`Name` is not a column name"));
         assert!(shape_refusal("p.name: String // note").contains("comments are refused"));
         assert!(shape_refusal("p.name: String /* note */").contains("comments are refused"));
@@ -785,7 +1101,7 @@ mod shape_section {
             ],
         );
         assert_eq!(
-            bless_shape_lines(&executed).unwrap(),
+            bless_shape_lines(&executed, &age_catalog()).unwrap(),
             ["p.name: String?", "p.age: I32"]
         );
     }
@@ -820,10 +1136,11 @@ mod shape_section {
             vec![Arc::new(arrow_array::Float64Array::from(vec![None::<f64>]))],
         );
         let inferred = Schema::new(vec![Field::new("m", DataType::Int32, true)]);
-        let msg = shape_mismatch(&lines("m: I32?"), &executed, &inferred).unwrap();
+        let msg = shape_mismatch(&lines("m: I32?"), &executed, &inferred, &age_catalog()).unwrap();
         assert!(msg.ends_with("expected I32, the executor returned F64; the compiler infers I32 too, so the executor is wrong, not the shape line"), "{msg}");
         let disagreeing = Schema::new(vec![Field::new("m", DataType::Float64, true)]);
-        let msg = shape_mismatch(&lines("m: I32?"), &executed, &disagreeing).unwrap();
+        let msg =
+            shape_mismatch(&lines("m: I32?"), &executed, &disagreeing, &age_catalog()).unwrap();
         assert!(
             msg.ends_with("expected I32, the executor returned F64"),
             "{msg}"
@@ -836,7 +1153,7 @@ mod shape_section {
             vec![Field::new("?", DataType::Int64, true)],
             vec![Arc::new(arrow_array::Int64Array::from(vec![0]))],
         );
-        let err = bless_shape_lines(&executed).unwrap_err();
+        let err = bless_shape_lines(&executed, &age_catalog()).unwrap_err();
         assert!(
             err.contains("column `?` is not a column name the shape section can spell"),
             "{err}"
@@ -855,8 +1172,11 @@ mod shape_section {
             vec![Field::new("p", DataType::Struct(inner), false)],
             vec![column],
         );
-        let err = bless_shape_lines(&executed).unwrap_err();
-        assert!(err.contains("column `p` has Arrow type Struct"), "{err}");
+        let err = bless_shape_lines(&executed, &age_catalog()).unwrap_err();
+        assert!(
+            err.contains("column `p` is a struct that is no node type's object"),
+            "{err}"
+        );
         let msg = mismatch(&lines("p: String"), &executed).unwrap();
         assert!(
             msg.contains("expected String, the executor returned Struct"),
@@ -1107,17 +1427,17 @@ fn pin_violation_names_the_path_that_ran() {
 #[test]
 fn expects_expand_ignores_bound_edges_and_plain_bindings() {
     let unbound = parse_query(TRAVERSAL_QUERY.trim_start_matches("--- query\n")).unwrap();
-    assert!(expects_expand(&unbound.queries[0].match_clause));
+    assert!(expects_expand(&unbound.single_decl().match_clause));
     let bound = "query f($n: String) {\n    match {\n        $a: Person\n        $a.name = $n\n        \
                  $a $k:knows $b\n    }\n    return { $b.name }\n}\n";
     let bound = parse_query(bound).unwrap();
-    assert!(!expects_expand(&bound.queries[0].match_clause));
+    assert!(!expects_expand(&bound.single_decl().match_clause));
     let plain = parse_query(QUERY.trim_start_matches("--- query\n")).unwrap();
-    assert!(!expects_expand(&plain.queries[0].match_clause));
+    assert!(!expects_expand(&plain.single_decl().match_clause));
     let negated = "query f() {\n    match {\n        $a: Person\n        not { $a knows $x }\n    }\n    \
                    return { $a.name }\n}\n";
     let negated = parse_query(negated).unwrap();
-    assert!(!expects_expand(&negated.queries[0].match_clause));
+    assert!(!expects_expand(&negated.single_decl().match_clause));
 }
 
 /// A two-node, one-edge graph with a one-hop traversal, for the pin tests.

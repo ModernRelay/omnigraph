@@ -1,0 +1,52 @@
+# issue: none
+# notes: three docs, one edge d001 -> d002; the source is deleted after the
+# notes: index build (the delete reports its edge), then `$d knows $t` nearest
+# notes: limit 2: no doc has an edge, the eligible set is proven empty and the
+# notes: answer is empty. Rust twin (probes: no scan runs):
+# notes: issue_567_proven_empty_eligible_set_runs_no_scan_and_no_overfetch.
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64 @index
+    name: String @index
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","n":2,"name":"doc-002","embedding":[2.0,0.0,0.0,0.0]}}
+{"edge":"Knows","from":"d001","to":"d002","data":{"id":"e001_0"}}
+
+--- mutate
+query del($s: String) {
+    delete Doc where slug = $s
+}
+
+--- params
+{"s": "d001"}
+
+--- expect affected: nodes=1 edges=1
+
+--- query
+query scenario($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+
+--- expect shape
+d.slug: String

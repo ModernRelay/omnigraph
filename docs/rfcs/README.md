@@ -38,9 +38,10 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0056**; lower gaps are historical and must
+The next available number is **0062**; lower gaps are historical and must
 not be reused (0047 and 0048 are allocated by PR #606; 0050 by the
-`rfc/0050-engine-crate-topology` branch).
+`rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0058 by
+PR #662 for retained merged ancestry; 0059 by PR #675; 0060 by PR #677).
 
 ## Required frontmatter
 
@@ -179,5 +180,7 @@ This table is the human index for the canonical RFC corpus.
 | [0051](0051-json-output-via-arrow.md) | JSON output via Arrow | maintainer | draft | partial |
 | [0052](0052-managed-control-plane-cli.md) | Managed control-plane CLI | maintainer | accepted | complete |
 | [0053](0053-offline-data-token-verification.md) | Offline data-token verification | maintainer | accepted | complete |
-| [0054](0054-default-actor-provenance.md) | Default graph actor provenance | maintainer | accepted | complete |
-| [0055](0055-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |
+| [0054](0054-default-actor-provenance.md) | Default graph actor provenance | maintainer | rejected | removed |
+| [0055](0055-gq-branch-statements.md) | Branch statements in GQ | maintainer | draft | in-progress |
+| [0057](0057-bounded-merge-preparation.md) | Accepted-context reuse and bounded merge preparation | maintainer | accepted | in-progress |
+| [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |

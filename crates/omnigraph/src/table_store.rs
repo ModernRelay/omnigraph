@@ -44,7 +44,8 @@ use lance_core::{
     },
 };
 use lance_datafusion::exec::{
-    ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions, collect_execution_metrics,
+    ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
+    collect_execution_metrics,
 };
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
@@ -112,10 +113,57 @@ const ORDERED_SCAN_MAX_INPUT_BATCH_BYTES: u64 = ORDERED_SCAN_MEMORY_BYTES / 4;
 pub(crate) struct ScanTuning<'a> {
     scanner: &'a mut Scanner,
     full_text_columns: Option<HashSet<String>>,
+    /// FTS-index demand of the typed filters set through this surface, unioned
+    /// over every `filter_expr` call although Lance keeps only the last filter:
+    /// a fail-closed over-approximation.
+    filter_demand: FtsFilterDemand,
+}
+
+/// Which FTS-index columns a filter expression reads through
+/// `contains_tokens(column, ...)`. `all_columns` is the fail-closed verdict
+/// for a call whose first argument is not a plain column.
+#[derive(Debug, Default)]
+pub(crate) struct FtsFilterDemand {
+    all_columns: bool,
+    columns: HashSet<String>,
+}
+
+impl FtsFilterDemand {
+    fn from_filter(filter: &Expr) -> Self {
+        let mut demand = Self::default();
+        filter
+            .apply(|expr| {
+                if let Expr::ScalarFunction(function) = expr
+                    && function.name() == "contains_tokens"
+                {
+                    match function.args.first() {
+                        Some(Expr::Column(column)) => {
+                            demand.columns.insert(column.name.clone());
+                        }
+                        // An unfamiliar expression must not bypass the gate.
+                        _ => demand.all_columns = true,
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("the visitor returns Ok on every node");
+        demand
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.all_columns |= other.all_columns;
+        self.columns.extend(other.columns);
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.all_columns && self.columns.is_empty()
+    }
 }
 
 impl ScanTuning<'_> {
     pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
+        self.filter_demand
+            .merge(FtsFilterDemand::from_filter(&filter));
         self.scanner.filter_expr(filter);
         self
     }
@@ -171,6 +219,27 @@ impl ScanTuning<'_> {
 
     pub(crate) fn maximum_nprobes(&mut self, n: usize) -> &mut Self {
         self.scanner.maximum_nprobes(n);
+        self
+    }
+
+    /// Whether the `nearest` set on this scanner may use a vector index
+    /// (Lance 11 `Scanner::use_index`; `false` runs the flat exact kNN over
+    /// the rows the filter admits). A no-op before `nearest` is set. A
+    /// scan-input decision, not an ordering one.
+    pub(crate) fn use_index(&mut self, use_index: bool) -> &mut Self {
+        self.scanner.use_index(use_index);
+        self
+    }
+
+    /// Lance calls `callback` once with the plan's execution summary after
+    /// the scan completes (partitions ranked/searched, bytes, IOPS). A
+    /// scan-input observation, not an ordering decision.
+    ///
+    /// INPUT CONTRACT: honored on the unordered `scan_stream_with` path
+    /// only; `execute_bounded_ordered_scan` builds its own plan from the
+    /// scanner and drops the callback.
+    pub(crate) fn scan_stats_callback(&mut self, callback: ExecutionStatsCallback) -> &mut Self {
+        self.scanner.scan_stats_callback(callback);
         self
     }
 
@@ -1841,16 +1910,23 @@ impl TableStore {
             let mut tuning = ScanTuning {
                 scanner: &mut scanner,
                 full_text_columns: None,
+                filter_demand: FtsFilterDemand::default(),
             };
             configure(&mut tuning)?;
             let columns = tuning.full_text_columns;
-            Ok((scanner, has_ordering, columns))
+            let filter_demand = tuning.filter_demand;
+            Ok((scanner, has_ordering, columns, filter_demand))
         })();
 
+        let has_sql_filter = filter.is_some();
         let dataset = ds.clone();
         Box::pin(async move {
-            let (scanner, has_ordering, columns) = prepared?;
-            Self::validate_full_text_scan(&dataset, &scanner, columns).await?;
+            let (scanner, has_ordering, columns, filter_demand) = prepared?;
+            if has_sql_filter {
+                Self::validate_full_text_scan(&dataset, &scanner, columns).await?;
+            } else if columns.is_some() || !filter_demand.is_empty() {
+                Self::validate_full_text_demand(&dataset, columns, filter_demand).await?;
+            }
             if has_ordering {
                 Self::execute_bounded_ordered_scan(
                     scanner,
@@ -1876,26 +1952,26 @@ impl TableStore {
         scanner: &Scanner,
         columns: Option<HashSet<String>>,
     ) -> Result<()> {
-        let mut all_columns = columns.as_ref().is_some_and(HashSet::is_empty);
+        let filter_demand = match scanner.get_expr_filter().map_err(OmniError::storage)? {
+            Some(filter) => FtsFilterDemand::from_filter(&filter),
+            None => FtsFilterDemand::default(),
+        };
+        Self::validate_full_text_demand(ds, columns, filter_demand).await
+    }
+
+    /// The validation proper, over an already-derived demand: `columns` is
+    /// the full-text query's column set (`Some(empty)` = every FTS column),
+    /// `filter_demand` what the filters read through `contains_tokens`.
+    async fn validate_full_text_demand(
+        ds: &Dataset,
+        columns: Option<HashSet<String>>,
+        filter_demand: FtsFilterDemand,
+    ) -> Result<()> {
+        crate::instrumentation::record_fts_validation();
+        let all_columns =
+            columns.as_ref().is_some_and(HashSet::is_empty) || filter_demand.all_columns;
         let mut requested = columns.unwrap_or_default();
-        if let Some(filter) = scanner.get_expr_filter().map_err(OmniError::storage)? {
-            filter
-                .apply(|expr| {
-                    if let Expr::ScalarFunction(function) = expr
-                        && function.name() == "contains_tokens"
-                    {
-                        match function.args.first() {
-                            Some(Expr::Column(column)) => {
-                                requested.insert(column.name.clone());
-                            }
-                            // An unfamiliar expression must not bypass the gate.
-                            _ => all_columns = true,
-                        }
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })
-                .map_err(OmniError::datafusion)?;
-        }
+        requested.extend(filter_demand.columns);
         if !all_columns && requested.is_empty() {
             return Ok(());
         }
@@ -3995,7 +4071,9 @@ impl TableStore {
             scanner.filter(f).map_err(OmniError::storage)?;
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
-        Self::validate_full_text_scan(ds, &scanner, None).await?;
+        if filter.is_some() {
+            Self::validate_full_text_scan(ds, &scanner, None).await?;
+        }
         let stream = scanner
             .try_into_stream()
             .await
@@ -4308,11 +4386,13 @@ impl TableStore {
             return self.count_rows(ds, filter).await;
         }
         let mut scanner = ds.scan();
-        if let Some(f) = filter {
-            scanner.filter(&f).map_err(OmniError::storage)?;
+        if let Some(f) = &filter {
+            scanner.filter(f).map_err(OmniError::storage)?;
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
-        Self::validate_full_text_scan(ds, &scanner, None).await?;
+        if filter.is_some() {
+            Self::validate_full_text_scan(ds, &scanner, None).await?;
+        }
         let count = scanner.count_rows().await.map_err(OmniError::storage)?;
         Ok(count as usize)
     }
@@ -5979,6 +6059,54 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let col = Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
         RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    /// `FtsFilterDemand::from_filter` names the columns a typed filter reads
+    /// through `contains_tokens`, at any nesting; a call whose first argument
+    /// is not a plain column fails closed to every column.
+    #[test]
+    fn fts_filter_demand_names_contains_tokens_columns_and_fails_closed() {
+        use datafusion::logical_expr::{Cast, expr::ScalarFunction};
+        use datafusion::prelude::{col, lit};
+        use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
+
+        let contains_tokens = |args: Vec<Expr>| {
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::new(CONTAINS_TOKENS_UDF.clone()),
+                args,
+            ))
+        };
+        let body = || HashSet::from(["body".to_string()]);
+
+        let plain = FtsFilterDemand::from_filter(&contains_tokens(vec![col("body"), lit("x")]));
+        assert!(!plain.all_columns);
+        assert_eq!(plain.columns, body());
+
+        let cast = FtsFilterDemand::from_filter(&contains_tokens(vec![
+            Expr::Cast(Cast::new(Box::new(col("body")), DataType::Utf8)),
+            lit("x"),
+        ]));
+        assert!(cast.all_columns, "a wrapped column fails closed");
+
+        let swapped = FtsFilterDemand::from_filter(&contains_tokens(vec![lit("x"), col("body")]));
+        assert!(
+            swapped.all_columns,
+            "a literal in column position fails closed"
+        );
+
+        let bare = FtsFilterDemand::from_filter(&contains_tokens(vec![]));
+        assert!(bare.all_columns, "a call with no arguments fails closed");
+
+        let nested = FtsFilterDemand::from_filter(
+            &(!contains_tokens(vec![col("body"), lit("x")])).and(col("a").eq(lit(1))),
+        );
+        assert!(!nested.all_columns);
+        assert_eq!(nested.columns, body(), "a call under NOT and AND is found");
+
+        assert!(
+            FtsFilterDemand::from_filter(&col("a").eq(lit(1))).is_empty(),
+            "a filter without the call demands nothing"
+        );
     }
 
     #[tokio::test]

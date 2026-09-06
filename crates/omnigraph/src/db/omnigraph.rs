@@ -14,7 +14,7 @@ use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
     DropMode, SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep,
-    SchemaShape, SchemaTypeKind, build_catalog_from_ir, compile_schema_source_shape,
+    SchemaShape, SchemaTypeKind, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
     plan_schema_migration,
 };
 
@@ -51,11 +51,12 @@ use super::manifest::{
     GenesisManifestAttempt, ManifestChange, Snapshot, TableRegistration, TableTombstone,
 };
 use super::schema_state::{
-    SCHEMA_SOURCE_FILENAME, load_validated_schema_contract,
-    load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_state_identity,
-    recover_schema_state_files, schema_ir_uri, schema_source_staging_uri, schema_source_uri,
-    schema_state_uri, validate_schema_contract, validate_schema_ir_against_snapshot,
-    write_schema_contract, write_schema_contract_staging,
+    SCHEMA_SOURCE_FILENAME, SchemaContractText, load_validated_schema_contract,
+    load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_contract_text,
+    read_schema_contract_text_for_source, read_schema_state_identity, recover_schema_state_files,
+    render_schema_contract, schema_ir_uri, schema_source_staging_uri, schema_source_uri,
+    schema_state_uri, validate_schema_contract, validate_schema_contract_text,
+    validate_schema_ir_against_snapshot, write_schema_contract, write_schema_contract_staging,
 };
 use super::{
     ReadTarget, ResolvedTarget, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId, is_internal_system_branch,
@@ -337,21 +338,10 @@ pub enum OpenMode {
 /// URI. With `force: true`, orphan schema files may be replaced only when no
 /// `__manifest` exists. Force never rebinds an existing graph to a newly
 /// minted schema identity domain and does not purge Lance datasets.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct InitOptions {
     /// Replace orphan schema artifacts at a root with no `__manifest`.
     pub force: bool,
-    /// Provision the protected actor identity table for a new graph.
-    pub actor_provenance: bool,
-}
-
-impl Default for InitOptions {
-    fn default() -> Self {
-        Self {
-            force: false,
-            actor_provenance: true,
-        }
-    }
 }
 
 impl Omnigraph {
@@ -419,10 +409,9 @@ impl Omnigraph {
         preflight_init_target(&root, storage.as_ref(), options).await?;
 
         let schema_shape = read_schema_shape_from_source(schema_source)?;
-        let resolution = omnigraph_compiler::initialize_schema_ir_with_actor_provenance(
-            SchemaIdentityDomain::new(),
+        let resolution = initialize_schema_ir(
+            SchemaIdentityDomain::from_ulid(crate::dst_ids::new_ulid()),
             &schema_shape,
-            options.actor_provenance,
         )
         .map_err(|error| OmniError::manifest(error.to_string()))?;
         for diagnostic in &resolution.diagnostics {
@@ -440,6 +429,12 @@ impl Omnigraph {
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
+        let (_, ir_json, state_json) = render_schema_contract(&schema_ir)?;
+        let contract = SchemaContractText {
+            source: schema_source.to_string(),
+            ir_json,
+            state_json,
+        };
 
         // Every init write needs atomic create-if-absent (the root init claim,
         // the strict-mode `_schema.pg` defence, and each Lance commit), so
@@ -521,8 +516,7 @@ impl Omnigraph {
         // remove the graph directory manually before retrying `init`.
         let coordinator = match init_commit_phase(
             &root,
-            schema_source,
-            &schema_ir,
+            &contract,
             &catalog,
             &storage,
             !schema_pg_claimed,
@@ -586,6 +580,16 @@ impl Omnigraph {
         };
 
         let session = lance_access.data_session();
+        let catalog = Arc::new(catalog);
+        let read_caches = Arc::new(crate::runtime_cache::ReadCaches {
+            session: Arc::clone(&session),
+            handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
+            accepted_catalog: crate::runtime_cache::AcceptedCatalogMemo::default(),
+            compiled_queries: crate::runtime_cache::CompiledQueryCache::default(),
+        });
+        read_caches
+            .accepted_catalog
+            .memoize(contract, Arc::clone(&catalog));
         Ok(Self {
             root_uri: root.clone(),
             storage,
@@ -595,15 +599,12 @@ impl Omnigraph {
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
             // sessions reuse the process-wide object-store registry.
-            table_store: TableStore::new(&root, session.clone()),
+            table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
             feed_cut_cache: tokio::sync::RwLock::new(None),
-            read_caches: Arc::new(crate::runtime_cache::ReadCaches {
-                session,
-                handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
-            }),
+            read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
-                catalog: Arc::new(catalog),
+                catalog,
                 source: Arc::new(schema_source.to_string()),
                 schema_ir_hash: accepted_schema_ir_hash,
                 schema_identity_domain,
@@ -678,6 +679,14 @@ impl Omnigraph {
         // Both open modes refuse: there is no in-place migration, and the check is
         // a stamp read with no object-store writes, so it is safe under ReadOnly.
         crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
+        // Hold the same schema gate through format preflight and contract
+        // capture. A v3 live or staged IR must refuse before the local write
+        // probe, coordinator open, or either recovery sweep can change files.
+        let schema_contract_guard = write_queue
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        crate::db::schema_state::refuse_unsupported_schema_versions(&root, storage.as_ref())
+            .await?;
         // Read-write opens write before the first user mutation (recovery
         // sweeps, schema-stamp migration), and every write needs atomic
         // create-if-absent; read-only opens perform no writes.
@@ -697,12 +706,8 @@ impl Omnigraph {
         // observe a partial promotion, or publish an old catalog after a live
         // apply completed. ReadOnly still performs no recovery writes; this gate
         // only serializes its read with an in-process publisher.
-        let schema_contract_guard = write_queue
-            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
-            .await;
-        // `coordinator` was opened before the await above. A live handle may have
-        // published while this open blocked, so refresh under the continuously
-        // held gate before either recovery or contract capture.
+        // Refresh under the continuously held gate before either recovery or
+        // contract capture, preserving the coherent snapshot boundary.
         coordinator.refresh().await?;
         // Both the schema-state recovery sweep AND the manifest-drift
         // recovery sweep are gated on `OpenMode::ReadWrite`. Read-only
@@ -758,15 +763,26 @@ impl Omnigraph {
                 "graph at '{root}' is missing its schema files: '_schema.pg' was not found although '__manifest' is readable; restore the matching '_schema.pg', '_schema.ir.json', and '__schema_state.json' contract from a backup, or rebuild a fresh graph from an existing export or backup"
             )));
         };
-        let (accepted_ir, accepted_state) =
-            load_validated_schema_contract_for_source(&root, Arc::clone(&storage), &schema_source)
-                .await?;
+        let contract =
+            read_schema_contract_text_for_source(&root, storage.as_ref(), schema_source).await?;
+        let (accepted_ir, accepted_state) = validate_schema_contract_text(&contract)?;
         validate_schema_ir_against_snapshot(&accepted_ir, &coordinator.snapshot())?;
         let schema_identity_domain = accepted_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
         fixup_physical_schemas(&mut catalog)?;
 
         let session = lance_access.data_session();
+        let catalog = Arc::new(catalog);
+        let schema_source = Arc::new(contract.source.clone());
+        let read_caches = Arc::new(crate::runtime_cache::ReadCaches {
+            session: Arc::clone(&session),
+            handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
+            accepted_catalog: crate::runtime_cache::AcceptedCatalogMemo::default(),
+            compiled_queries: crate::runtime_cache::CompiledQueryCache::default(),
+        });
+        read_caches
+            .accepted_catalog
+            .memoize(contract, Arc::clone(&catalog));
         let db = Self {
             root_uri: root.clone(),
             storage,
@@ -776,16 +792,13 @@ impl Omnigraph {
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
             // sessions reuse the process-wide object-store registry.
-            table_store: TableStore::new(&root, session.clone()),
+            table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
             feed_cut_cache: tokio::sync::RwLock::new(None),
-            read_caches: Arc::new(crate::runtime_cache::ReadCaches {
-                session,
-                handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
-            }),
+            read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
-                catalog: Arc::new(catalog),
-                source: Arc::new(schema_source),
+                catalog,
+                source: schema_source,
                 schema_ir_hash: accepted_state.schema_ir_hash,
                 schema_identity_domain,
             })),
@@ -977,43 +990,25 @@ impl Omnigraph {
     /// [`Self::load_accepted_catalog_with_schema_gate_held`] unless they perform
     /// that post-resolution identity join themselves.
     async fn build_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
-        let (schema_ir, _) =
-            load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
+        let text = read_schema_contract_text(self.uri(), self.storage.as_ref()).await?;
+        if let Some(catalog) = self.read_caches.accepted_catalog.get(&text) {
+            return Ok(catalog);
+        }
+        let (schema_ir, _) = validate_schema_contract_text(&text)?;
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
-        Ok(Arc::new(catalog))
+        crate::instrumentation::record_catalog_build();
+        let catalog = Arc::new(catalog);
+        self.read_caches
+            .accepted_catalog
+            .memoize(text, Arc::clone(&catalog));
+        Ok(catalog)
     }
 
-    /// Read customer source and its full accepted schema, including protected
-    /// builtins, from one validated view. This performs no recovery or writes.
-    pub async fn accepted_schema(&self) -> Result<(String, SchemaIR)> {
-        let _schema_guard = self
-            .write_queue()
-            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
-            .await;
-        let source = self
-            .storage
-            .read_text(&schema_source_uri(self.uri()))
-            .await?;
-        let (schema_ir, _) = load_validated_schema_contract_for_source(
-            self.uri(),
-            Arc::clone(&self.storage),
-            &source,
-        )
-        .await?;
-        let resolved = self
-            .resolve_target_after_schema_validation(ReadTarget::branch("main"))
-            .await?;
-        validate_schema_ir_against_snapshot(&schema_ir, &resolved.snapshot)?;
-        Ok((source, schema_ir))
-    }
-
-    /// Read the current accepted graph setting without creating actors or changing state.
-    pub async fn actor_provenance_enabled(&self) -> Result<bool> {
-        let (_, catalog) = self.capture_read_view(ReadTarget::branch("main")).await?;
-        Ok(catalog
-            .actor_provenance()
-            .is_some_and(|binding| binding.enabled))
+    /// The per-graph read caches (`ReadCaches`): table handles, the accepted
+    /// catalog memo, and the compiled-query cache.
+    pub(crate) fn read_caches(&self) -> &Arc<crate::runtime_cache::ReadCaches> {
+        &self.read_caches
     }
 
     pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
@@ -1871,6 +1866,7 @@ impl Omnigraph {
     async fn invalidate_read_caches(&self) {
         self.runtime_cache.invalidate_all().await;
         self.read_caches.handles.invalidate_all().await;
+        // `accepted_catalog` and `compiled_queries` are content-keyed: no invalidation.
         // Hygiene, like the caches above: the incarnation key already makes a
         // stale feed cut miss, but a same-branch refresh clears it so an
         // e_tag-less substrate cannot serve a recreated branch's projection
@@ -4032,7 +4028,7 @@ fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapsho
 
 fn read_schema_shape_from_source(schema_source: &str) -> Result<SchemaShape> {
     let schema_ast = parse_schema(schema_source)?;
-    compile_schema_source_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+    compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
 }
 
 /// Root-scoped durable ownership for graph initialization.
@@ -4190,8 +4186,7 @@ enum InitCommitError {
 
 async fn init_commit_phase(
     root: &str,
-    schema_source: &str,
-    schema_ir: &SchemaIR,
+    contract: &SchemaContractText,
     catalog: &Catalog,
     storage: &Arc<dyn StorageAdapter>,
     write_schema_pg: bool,
@@ -4201,14 +4196,14 @@ async fn init_commit_phase(
     if write_schema_pg {
         let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
         storage
-            .write_text(&schema_path, schema_source)
+            .write_text(&schema_path, &contract.source)
             .await
             .map_err(InitCommitError::BeforePhysicalInit)?;
         crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN)
             .map_err(InitCommitError::BeforePhysicalInit)?;
     }
 
-    write_schema_contract(root, storage.as_ref(), schema_ir)
+    write_schema_contract(root, storage.as_ref(), contract)
         .await
         .map_err(InitCommitError::BeforePhysicalInit)?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)
@@ -4777,14 +4772,8 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         assert_one_init_race_winner(
             dir.path().to_str().unwrap(),
-            InitOptions {
-                force: true,
-                ..InitOptions::default()
-            },
-            InitOptions {
-                force: true,
-                ..InitOptions::default()
-            },
+            InitOptions { force: true },
+            InitOptions { force: true },
         )
         .await;
     }
@@ -4794,10 +4783,7 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         assert_one_init_race_winner(
             dir.path().to_str().unwrap(),
-            InitOptions {
-                force: true,
-                ..InitOptions::default()
-            },
+            InitOptions { force: true },
             InitOptions::default(),
         )
         .await;
@@ -4826,10 +4812,7 @@ edge WorksAt: Person -> Company
             uri,
             TEST_SCHEMA,
             Arc::new(ObjectStorageAdapter::local()),
-            InitOptions {
-                force: true,
-                ..InitOptions::default()
-            },
+            InitOptions { force: true },
         )
         .await
         {

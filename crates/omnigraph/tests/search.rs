@@ -735,37 +735,21 @@ async fn filtered_nearest_clause_spelling_prefilters_like_inline() {
     assert_filtered_nearest_returns_hits("filtered_nearest_clause_range").await;
 }
 
-/// The engine's maximum-only IVF guard must not lower the requested candidate
-/// count. A short standalone scan and each short RRF vector arm retry without
-/// a maximum. The graph-level optimize path creates the multi-partition shape
-/// here, so this covers the real engine scanner rather than only Lance's API.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn issue_567_bounded_nearest_and_rrf_retry_after_optimized_ivf_underfill() {
-    const ROWS: usize = 20_000;
-
-    fn rows() -> String {
-        (0..ROWS)
-            .map(|row| {
-                let keep = row >= 19_000;
-                let drop = (16_000..19_000).contains(&row);
-                format!(
-                    r#"{{"type":"Doc","data":{{"slug":"n{row:05}","keep":{keep},"drop":{drop},"embedding":[{row}.0,0.0,0.0,0.0]}}}}"#
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    let schema = r#"
-node Doc {
-    slug: String @key
-    keep: Bool @index
-    drop: Bool @index
-    embedding: Vector(4) @index
-}
-"#;
-    let queries = r#"
+/// The #567 fixture shared by the `issue_567_*` probe-ladder tests: 20,000
+/// docs on a line, `keep` on the last thousand, the middle 3,000 deleted,
+/// then the optimize that splits one IVF_FLAT partition into several.
+const ISSUE_567_ROWS: usize = 20_000;
+const ISSUE_567_DELETED: usize = 3_000;
+const ISSUE_567_EDGE_DOCS: usize = 5;
+/// Docs that carry a `Far` edge and `far: true`: five, split across the
+/// optimized index's two partitions (four low on the line, one high). See
+/// `ISSUE_567_FAR_QUERY`.
+const ISSUE_567_FAR_DOCS: [usize; 5] = [0, 2_000, 4_000, 6_000, 15_000];
+/// Query point for the far docs: inside the high partition, near its
+/// centroid, so Lance's initial probe reads that partition alone and the
+/// late search emits the four low docs at `_distance = +inf`.
+const ISSUE_567_FAR_QUERY: [f32; 4] = [13_300.0, 0.0, 0.0, 0.0];
+const ISSUE_567_QUERIES: &str = r#"
 query filtered_nearest($q: Vector(4)) {
     match { $d: Doc { keep: true } }
     return { $d.slug }
@@ -779,24 +763,124 @@ query rrf_all($q: Vector(4)) {
     order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $q)) }
     limit 17000
 }
+
+query nearest_friends($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+
+query nearest_all($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+
+query rrf_keep($q: Vector(4)) {
+    match { $d: Doc { keep: true } }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $q)) }
+    limit 10
+}
+
+query nearest_far_friends($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d far $t
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+
+query nearest_far_flag($q: Vector(4)) {
+    match { $d: Doc { far: true } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+
+query nearest_all_17000($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 17000
+}
+"#;
+
+async fn issue_567_optimized_docs(uri: &str) -> Omnigraph {
+    let mut lines = (0..ISSUE_567_ROWS)
+        .map(|row| {
+            let keep = row >= 19_000;
+            let drop = (16_000..19_000).contains(&row);
+            let far = ISSUE_567_FAR_DOCS.contains(&row);
+            format!(
+                r#"{{"type":"Doc","data":{{"slug":"n{row:05}","keep":{keep},"drop":{drop},"far":{far},"embedding":[{row}.0,0.0,0.0,0.0]}}}}"#
+            )
+        })
+        .collect::<Vec<_>>();
+    for row in 0..ISSUE_567_EDGE_DOCS {
+        lines.push(format!(
+            r#"{{"edge":"Knows","from":"n{row:05}","to":"n{next:05}","data":{{"id":"e{row:05}"}}}}"#,
+            next = row + 1
+        ));
+    }
+    for row in ISSUE_567_FAR_DOCS {
+        lines.push(format!(
+            r#"{{"edge":"Far","from":"n{row:05}","to":"n{next:05}","data":{{"id":"f{row:05}"}}}}"#,
+            next = row + 1
+        ));
+    }
+    let seed = lines.join("\n");
+    let schema = r#"
+node Doc {
+    slug: String @key
+    keep: Bool @index
+    drop: Bool @index
+    far: Bool @index
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+edge Far: Doc -> Doc {
+}
 "#;
     let delete_query = r#"
 query delete_middle() {
     delete Doc where drop = true
 }
 "#;
-
-    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, &rows(), LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&db, &seed, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
     let deleted = mutate_main(&mut db, delete_query, "delete_middle", &params(&[]))
         .await
         .unwrap();
-    assert_eq!(deleted.affected_nodes, 3_000);
+    assert_eq!(deleted.affected_nodes, ISSUE_567_DELETED);
     db.optimize().await.unwrap();
+    db
+}
+
+/// The engine's maximum-only IVF guard must not lower the requested candidate
+/// count. Under a pushed prefilter and `OMNIGRAPH_ANN_NPROBES=1` the capped
+/// scan is short of `k` and the scan-site ladder widens it until `limit` fills.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_bounded_nearest_and_rrf_retry_after_optimized_ivf_underfill() {
+    const ROWS: usize = ISSUE_567_ROWS;
+    let queries = ISSUE_567_QUERIES;
+
+    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = issue_567_optimized_docs(uri).await;
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     let probes = QueryIoProbes::default();
@@ -813,19 +897,40 @@ query delete_middle() {
     .unwrap();
 
     assert_eq!(result.num_rows(), 10);
-    assert_eq!(
-        probes
-            .ann_uncapped_retries
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "a short bounded nearest scan must retry without a maximum"
+    let rescans = probes
+        .ann_rescans
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        rescans >= 1,
+        "a prefiltered scan capped at 1 partition is short of k and must climb; got {rescans}"
     );
     assert_eq!(
         probes
-            .ann_max_nprobes
+            .ann_flat_rescans
             .load(std::sync::atomic::Ordering::Relaxed),
         0,
-        "the effective retry plan must record maximum_nprobes=None"
+        "the cap, not a `+inf` row, left the scan short: the widening is the ladder's, not the flat rescan"
+    );
+    let rungs = probes.ann_rung_partitions_searched.lock().unwrap().clone();
+    assert_eq!(
+        rungs.len() as u64,
+        rescans + 1,
+        "one rung per scan: {rungs:?}"
+    );
+    assert_rungs_climb(&rungs, 1, "filtered_nearest");
+    assert_eq!(
+        probes
+            .ann_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        10,
+        "the last rung fills k"
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a full scan that fills limit never enters the overfetch loop"
     );
     assert_eq!(
         result_slugs(&result),
@@ -833,6 +938,44 @@ query delete_middle() {
             .map(|row| format!("n{row:05}"))
             .collect::<Vec<_>>()
     );
+
+    let rrf_keep_probes = QueryIoProbes::default();
+    let rrf_keep = with_query_io_probes(rrf_keep_probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "rrf_keep",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(rrf_keep.num_rows(), 10);
+    assert_eq!(
+        result_slugs(&rrf_keep),
+        (19_000..19_010)
+            .map(|row| format!("n{row:05}"))
+            .collect::<Vec<_>>()
+    );
+    let keep_rescans = rrf_keep_probes
+        .ann_rescans
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        keep_rescans >= 2,
+        "both prefiltered nearest arms are short under cap 1 and must climb independently; got {keep_rescans}"
+    );
+    let keep_rungs = rrf_keep_probes
+        .ann_rung_partitions_searched
+        .lock()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        keep_rungs.len() as u64,
+        keep_rescans + 2,
+        "one rung per scan: {keep_rungs:?}"
+    );
+    assert_rungs_climb(&keep_rungs, 2, "rrf_keep");
 
     let rrf_probes = QueryIoProbes::default();
     let rrf = with_query_io_probes(rrf_probes.clone(), async {
@@ -848,16 +991,1101 @@ query delete_middle() {
     .unwrap();
     assert_eq!(
         rrf.num_rows(),
-        ROWS - 3_000,
+        ROWS - ISSUE_567_DELETED,
         "RRF retries must preserve every available candidate"
     );
-    assert_eq!(
-        rrf_probes
-            .ann_uncapped_retries
-            .load(std::sync::atomic::Ordering::Relaxed),
-        2,
-        "both short nearest arms must retry independently"
+    let arm_rescans = rrf_probes
+        .ann_rescans
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        arm_rescans >= 2,
+        "both short unfiltered nearest arms must rescan independently at the scan site; got {arm_rescans}"
     );
+    let rungs = rrf_probes
+        .ann_rung_partitions_searched
+        .lock()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        rungs.len() as u64,
+        arm_rescans + 2,
+        "one rung per scan: {rungs:?}"
+    );
+    assert_rungs_climb(&rungs, 2, "rrf_all");
+}
+
+/// Asserts `rungs` (the `ann_rung_partitions_searched` probe) forms exactly
+/// `ladders` strictly increasing runs: a new ladder starts wherever the
+/// searched-partition count does not grow.
+fn assert_rungs_climb(rungs: &[u64], ladders: usize, context: &str) {
+    let runs = 1 + rungs.windows(2).filter(|pair| pair[1] <= pair[0]).count();
+    assert_eq!(
+        runs, ladders,
+        "{context}: rungs {rungs:?} must form {ladders} strictly increasing ladder(s)"
+    );
+}
+
+/// Follow-up to #591 (issue #567): a standalone `nearest` whose `limit`
+/// equals the corpus, under `OMNIGRAPH_ANN_NPROBES=1`. The ladder climbs
+/// until every ranked partition is read and the answer is the whole corpus.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_unfiltered_nearest_climbs_the_ladder_to_the_whole_corpus() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+
+    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = issue_567_optimized_docs(uri).await;
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            ISSUE_567_QUERIES,
+            "nearest_all_17000",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.num_rows(),
+        ISSUE_567_ROWS - ISSUE_567_DELETED,
+        "the ladder must end with every row of the corpus"
+    );
+    let rescans = probes
+        .ann_rescans
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let rungs = probes.ann_rung_partitions_searched.lock().unwrap().clone();
+    let ranked = probes
+        .ann_partitions_ranked
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        rescans >= 1,
+        "a cap of one on the multi-partition fixture must climb; rungs {rungs:?}, ranked {ranked}"
+    );
+    assert_eq!(
+        rungs.len() as u64,
+        rescans + 1,
+        "one rung per scan: {rungs:?}"
+    );
+    assert_rungs_climb(&rungs, 1, "nearest_all_17000");
+    assert_eq!(
+        rungs.last().copied(),
+        Some(ranked),
+        "the last rung read every ranked partition: rungs {rungs:?}"
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the last scan was short of k with the corpus exhausted; no overfetch can help"
+    );
+}
+
+/// Follow-up to #591 (issue #567): the probe cap is for the UNFILTERED scan.
+/// A plain `nearest` under `OMNIGRAPH_ANN_NPROBES=1` fills `limit` in one
+/// scan, so the ladder never fires.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_unfiltered_nearest_keeps_the_probe_cap() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+
+    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = issue_567_optimized_docs(uri).await;
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            ISSUE_567_QUERIES,
+            "nearest_all",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result_slugs(&result),
+        (0..10).map(|row| format!("n{row:05}")).collect::<Vec<_>>(),
+        "the ten nearest docs, from the one partition nearest the query"
+    );
+    assert_eq!(
+        probes
+            .ann_max_nprobes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "an unfiltered scan runs under the configured cap"
+    );
+    assert_eq!(
+        probes
+            .ann_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        10,
+        "one partition fills k"
+    );
+    assert_eq!(
+        probes
+            .ann_rescans
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a full capped scan never climbs the ladder"
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+/// Follow-up to #591 (issue #567): the gate's `id IN` list admits fewer rows
+/// than `k`, so the engine answers from ONE flat exact kNN over the admitted
+/// rows (`use_index(false)`) instead of the IVF plan.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k() {
+    use omnigraph::instrumentation::{QueryIoProbes, RrfGatePlan, with_query_io_probes};
+
+    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", None)]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = issue_567_optimized_docs(uri).await;
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            ISSUE_567_QUERIES,
+            "nearest_friends",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    let verdicts = probes.ann_prefilter_verdicts.lock().unwrap().clone();
+    assert_eq!(verdicts.len(), 1, "one standalone nearest, one verdict");
+    assert_eq!(verdicts[0].plan, RrfGatePlan::Prefilter);
+    assert_eq!(verdicts[0].eligible, Some(ISSUE_567_EDGE_DOCS as u64));
+    assert_eq!(
+        result_slugs(&result),
+        (0..ISSUE_567_EDGE_DOCS)
+            .map(|row| format!("n{row:05}"))
+            .collect::<Vec<_>>(),
+        "every edge-bearing doc, nothing else, in distance order"
+    );
+    assert_eq!(
+        probes
+            .ann_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        ISSUE_567_EDGE_DOCS as u64,
+        "the scan returned every admitted row"
+    );
+    assert_eq!(
+        probes
+            .ann_max_nprobes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        20,
+        "the default cap rides along; the flat scan reads no partition, so it never binds"
+    );
+    assert!(
+        probes
+            .ann_rung_partitions_searched
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "an eligible set at most k long is scanned flat: no IVF rung reports partition counters"
+    );
+    assert_eq!(
+        probes
+            .ann_rescans
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the flat scan holds every row the prefilter admits in order; no rescan may run"
+    );
+    assert_eq!(
+        probes
+            .ann_flat_rescans
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the scan ran flat from the start, which is not a rescan"
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the scan was short of k, so asking for more candidates cannot help"
+    );
+}
+
+/// Follow-up to #591 (issue #567), the order defect: a prefilter admitting at
+/// most `k` rows split across partitions. Both routes to the flat exact kNN
+/// return the exact filtered kNN, in order.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_flat_scan_returns_the_admitted_rows_in_nearest_order() {
+    use omnigraph::instrumentation::{QueryIoProbes, RrfGatePlan, with_query_io_probes};
+
+    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", None)]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = issue_567_optimized_docs(uri).await;
+    let q = vector_param("$q", &ISSUE_567_FAR_QUERY);
+    let mut expected = ISSUE_567_FAR_DOCS
+        .iter()
+        .map(|&row| {
+            (
+                (row as f32 - ISSUE_567_FAR_QUERY[0]).powi(2),
+                format!("n{row:05}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let expected = expected
+        .into_iter()
+        .map(|(_, slug)| slug)
+        .collect::<Vec<_>>();
+    assert_ne!(
+        expected,
+        {
+            let mut by_id = expected.clone();
+            by_id.sort();
+            by_id
+        },
+        "the fixture must make distance order differ from id order"
+    );
+
+    let probes = QueryIoProbes::default();
+    let gated = with_query_io_probes(probes.clone(), async {
+        query_main(&mut db, ISSUE_567_QUERIES, "nearest_far_friends", &q).await
+    })
+    .await
+    .unwrap();
+    let verdicts = probes.ann_prefilter_verdicts.lock().unwrap().clone();
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0].plan, RrfGatePlan::Prefilter);
+    assert_eq!(verdicts[0].eligible, Some(ISSUE_567_FAR_DOCS.len() as u64));
+    assert_eq!(
+        result_slugs(&gated),
+        expected,
+        "the gate's admitted rows come back in exact nearest order"
+    );
+    assert_eq!(
+        probes
+            .ann_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        ISSUE_567_FAR_DOCS.len() as u64
+    );
+    assert!(
+        probes
+            .ann_rung_partitions_searched
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "a list at most k long is scanned flat from the start"
+    );
+    assert_eq!(
+        probes
+            .ann_rescans
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        probes
+            .ann_flat_rescans
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an exhausted scan never enters the overfetch loop"
+    );
+
+    let probes = QueryIoProbes::default();
+    let flagged = with_query_io_probes(probes.clone(), async {
+        query_main(&mut db, ISSUE_567_QUERIES, "nearest_far_flag", &q).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        result_slugs(&flagged),
+        expected,
+        "the `where`-admitted rows come back in exact nearest order after the flat rescan"
+    );
+    assert_eq!(
+        probes
+            .ann_rescans
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one rescan: the IVF scan held +inf rows"
+    );
+    assert_eq!(
+        probes
+            .ann_flat_rescans
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "and it was the flat rescan"
+    );
+    assert_eq!(
+        probes.ann_rung_partitions_searched.lock().unwrap().len(),
+        1,
+        "the IVF rung reported its counters; the flat rung has none"
+    );
+    assert_eq!(
+        probes
+            .ann_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        ISSUE_567_FAR_DOCS.len() as u64,
+        "the flat rescan holds every admitted row"
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+/// Follow-up to #591 (issue #567): the maximum-probe guard's uncapped retry
+/// must fire only when the bounded nearest SCAN under-filled `k`, never when
+/// the answer is short for a reason the rerun cannot change.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_ann_retry_stays_silent_after_an_exhaustive_bounded_scan() {
+    const ROWS: usize = 2_000;
+    let rows = (0..ROWS)
+        .map(|row| {
+            format!(
+                r#"{{"type":"Doc","data":{{"slug":"n{row:05}","embedding":[{row}.0,0.0,0.0,0.0]}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let schema = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+}
+"#;
+    let queries = r#"
+query nearest_all($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 5000
+}
+"#;
+    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("100000"))]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, &rows, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "nearest_all",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.num_rows(), ROWS, "every row exists in both passes");
+    assert_eq!(
+        probes
+            .ann_rescans
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the bounded scan returned every existing row; a wider rescan cannot \
+         add any and must not run"
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the scan was short of k, so asking for more candidates cannot help"
+    );
+    assert_eq!(
+        probes
+            .ann_max_nprobes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        100_000,
+        "the only scan must be the bounded one"
+    );
+    assert_eq!(
+        probes
+            .ann_summary_missing
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an indexed scan reports its partition counters; the fail-closed rescan must not fire"
+    );
+}
+
+/// Follow-up to #591 (issue #567): a nearest over a property with NO vector
+/// index is a flat scan, so `rows < k` is exhaustion and the ladder must
+/// neither rescan nor treat the summary as missing.
+#[tokio::test]
+#[serial]
+async fn nearest_over_an_unindexed_vector_scans_flat_without_rescanning() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    const ROWS: usize = 5;
+    let rows = (0..ROWS)
+        .map(|row| {
+            format!(r#"{{"type":"Doc","data":{{"slug":"n{row:02}","embedding":[{row}.0,0.0,0.0,0.0]}}}}"#)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let schema = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(4)
+}
+"#;
+    let queries = r#"
+query nearest_all($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+"#;
+    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", None)]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, &rows, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "nearest_all",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result_slugs(&result),
+        (0..ROWS)
+            .map(|row| format!("n{row:02}"))
+            .collect::<Vec<_>>(),
+        "a flat scan returns every row, in distance order"
+    );
+    assert_eq!(
+        probes
+            .ann_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        ROWS as u64
+    );
+    assert_eq!(
+        probes
+            .ann_max_nprobes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        20,
+        "the one scan ran under the default cap"
+    );
+    assert_eq!(
+        probes
+            .ann_rescans
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a flat scan reads every row; the cap cannot have starved it"
+    );
+    assert_eq!(
+        probes
+            .ann_summary_missing
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the summary fires for a flat plan; its missing partition counters mean \
+         no index was used, not a missing summary"
+    );
+}
+
+/// Docs on a line (`embedding = [row, 0, 0, 0]`, slug `n{row:05}`) with a
+/// `Knows` edge leaving every `edge_every`-th doc (none for `None`): the
+/// fixture of the standalone-nearest gate and overfetch pins below.
+const ISSUE_567_LINE_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+"#;
+
+const ISSUE_567_LINE_QUERIES: &str = r#"
+query nearest_friends($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+
+query nearest_friends_count($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { count($d) as total }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+"#;
+
+async fn issue_567_line_docs(uri: &str, rows: usize, edge_every: Option<usize>) -> Omnigraph {
+    let mut lines: Vec<String> = (0..rows)
+        .map(|row| {
+            format!(
+                r#"{{"type":"Doc","data":{{"slug":"n{row:05}","embedding":[{row}.0,0.0,0.0,0.0]}}}}"#
+            )
+        })
+        .collect();
+    if let Some(edge_every) = edge_every {
+        for row in (0..rows - 1).step_by(edge_every) {
+            lines.push(format!(
+                r#"{{"edge":"Knows","from":"n{row:05}","to":"n{next:05}","data":{{"id":"e{row:05}"}}}}"#,
+                next = row + 1
+            ));
+        }
+    }
+    let db = Omnigraph::init(uri, ISSUE_567_LINE_SCHEMA).await.unwrap();
+    load_jsonl(&db, &lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    db
+}
+
+/// The `total` of a `count($d) as total` result.
+fn count_total(result: &QueryResult) -> i64 {
+    let batch = result.concat_batches().unwrap();
+    batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0)
+}
+
+/// Follow-up to #591 (issue #567), the nearest prefilter gate and the
+/// overfetch loop on one fixture: 2,000 docs on a line, an edge from every
+/// twentieth doc, run under the default plan and a forced unfiltered one.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_nearest_traversal_prefilters_then_overfetches() {
+    use omnigraph::instrumentation::{
+        QueryIoProbes, RrfGateFallback, RrfGatePlan, with_query_io_probes, with_rrf_plan,
+    };
+    const ROWS: usize = 2_000;
+    let queries = ISSUE_567_LINE_QUERIES;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = issue_567_line_docs(uri, ROWS, Some(20)).await;
+    let q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
+
+    let probes = QueryIoProbes::default();
+    let prefiltered = with_query_io_probes(probes.clone(), async {
+        query_main(&mut db, queries, "nearest_friends", &q).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        result_slugs(&prefiltered),
+        (0..10)
+            .map(|i| format!("n{:05}", i * 20))
+            .collect::<Vec<_>>(),
+        "the ten nearest docs WITH an edge, in distance order"
+    );
+    let verdicts = probes.ann_prefilter_verdicts.lock().unwrap().clone();
+    assert_eq!(verdicts.len(), 1, "one standalone nearest, one verdict");
+    assert_eq!(verdicts[0].plan, RrfGatePlan::Prefilter);
+    assert_eq!(verdicts[0].eligible, Some(100));
+    assert_eq!(verdicts[0].corpus, Some(ROWS as u64));
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a prefiltered scan fills limit in one pass"
+    );
+    assert_eq!(
+        probes
+            .ann_exact_passes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a full answer never reports an exhausted overfetch"
+    );
+    assert_eq!(
+        probes
+            .ann_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        10
+    );
+    let q_vec = [0.0_f32, 0.0, 0.0, 0.0];
+    let mut eligible = (0..ROWS - 1)
+        .step_by(20)
+        .map(|row| {
+            let embedding = [row as f32, 0.0, 0.0, 0.0];
+            let distance = embedding
+                .iter()
+                .zip(q_vec)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>();
+            (distance, format!("n{row:05}"))
+        })
+        .collect::<Vec<_>>();
+    eligible.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let expected = eligible
+        .into_iter()
+        .take(10)
+        .map(|(_, slug)| slug)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        result_slugs(&prefiltered),
+        expected,
+        "the prefiltered answer is the exact top-10 among the eligible docs, in order"
+    );
+
+    let probes = QueryIoProbes::default();
+    let unfiltered = with_query_io_probes(
+        probes.clone(),
+        with_rrf_plan("force_postfilter", async {
+            query_main(&mut db, queries, "nearest_friends", &q).await
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result_slugs(&unfiltered),
+        (0..10)
+            .map(|i| format!("n{:05}", i * 20))
+            .collect::<Vec<_>>(),
+        "k = 160 holds eight edge-bearing docs; the exact pass past the ceiling fills the limit"
+    );
+    let verdicts = probes.ann_prefilter_verdicts.lock().unwrap().clone();
+    assert_eq!(verdicts[0].plan, RrfGatePlan::Postfilter);
+    assert_eq!(verdicts[0].fallback, Some(RrfGateFallback::Forced));
+    assert!(
+        verdicts[0].forced,
+        "a forced postfilter records `forced` like the rrf gate does: a force was active"
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "k widened to 40, then 160 (the ceiling), then the exact pass"
+    );
+    assert_eq!(
+        probes
+            .ann_exact_passes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the ceiling passed with the answer still short: the exact pass fires once"
+    );
+    assert_eq!(
+        probes
+            .ann_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        ROWS as u64,
+        "the exact pass asked for the whole type and received every row"
+    );
+    assert_eq!(
+        probes
+            .ann_max_nprobes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the exact pass runs without a probe cap"
+    );
+    assert_eq!(
+        probes.ann_rung_partitions_searched.lock().unwrap().len(),
+        3,
+        "the passes at k = 10, 40 and 160 searched the index once each; the exact pass ran flat and searched no partition"
+    );
+    assert!(
+        prefiltered.num_rows() >= unfiltered.num_rows(),
+        "the prefiltered answer has at least as many rows as the unfiltered one"
+    );
+}
+
+/// Follow-up to #591 (issue #567): a ranked type none of whose nodes has the
+/// Expand's edge. The empty eligible set PROVES the answer empty, so the
+/// ranked scan runs no Lance query and the overfetch loop never starts.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_proven_empty_eligible_set_runs_no_scan_and_no_overfetch() {
+    use omnigraph::instrumentation::{
+        QueryIoProbes, RrfGateFallback, RrfGatePlan, RrfGateVerdict, with_query_io_probes,
+    };
+    const ROWS: usize = 2_000;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = issue_567_line_docs(uri, ROWS, None).await;
+    let q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(&mut db, ISSUE_567_LINE_QUERIES, "nearest_friends", &q).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.num_rows(), 0, "no doc has an edge");
+    let verdicts = probes.ann_prefilter_verdicts.lock().unwrap().clone();
+    assert_eq!(
+        verdicts,
+        vec![RrfGateVerdict {
+            plan: RrfGatePlan::Postfilter,
+            fallback: Some(RrfGateFallback::EmptyEligible),
+            forced: false,
+            eligible: Some(0),
+            corpus: Some(ROWS as u64),
+        }]
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a proven-empty answer never enters the overfetch loop"
+    );
+    assert_eq!(
+        probes
+            .ann_exact_passes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "and never reports an exhausted overfetch"
+    );
+    assert_eq!(
+        probes
+            .ann_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no nearest scan ran"
+    );
+    assert!(
+        probes.node_scan_projections.lock().unwrap().is_empty(),
+        "no projection was handed to a scanner: the ranked scan never built one"
+    );
+    assert_eq!(
+        probes
+            .ann_max_nprobes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no probe budget was recorded: Lance never ran"
+    );
+}
+
+/// Follow-up to #591 (issue #567): an aggregate over a traversal-constrained
+/// nearest. The window (`k = limit`) is part of the answer, so the overfetch
+/// loop is skipped whatever the plan.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_aggregate_over_a_nearest_traversal_counts_the_window() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+    const ROWS: usize = 2_000;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = issue_567_line_docs(uri, ROWS, Some(20)).await;
+    let q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
+
+    let probes = QueryIoProbes::default();
+    let unfiltered = with_query_io_probes(
+        probes.clone(),
+        with_rrf_plan("force_postfilter", async {
+            query_main(&mut db, ISSUE_567_LINE_QUERIES, "nearest_friends_count", &q).await
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        count_total(&unfiltered),
+        1,
+        "the unfiltered window is the ten nearest docs of the table; only n00000 has an edge"
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an aggregate's window is its answer: no overfetch"
+    );
+    assert_eq!(
+        probes
+            .ann_scan_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        10
+    );
+
+    let probes = QueryIoProbes::default();
+    let gated = with_query_io_probes(probes.clone(), async {
+        query_main(&mut db, ISSUE_567_LINE_QUERIES, "nearest_friends_count", &q).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        count_total(&gated),
+        10,
+        "the gated window is the ten nearest eligible docs, every one a survivor"
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+/// Follow-up to #591 (issue #567): the nearest gate's threshold. Half the
+/// docs carry an edge, above the default 10% ratio, so the gate falls back
+/// with `Threshold` and the overfetch loop fills the limit.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_nearest_gate_falls_back_above_the_ratio() {
+    use omnigraph::instrumentation::{
+        QueryIoProbes, RrfGateFallback, RrfGatePlan, RrfGateVerdict, with_query_io_probes,
+    };
+    const ROWS: usize = 2_000;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = issue_567_line_docs(uri, ROWS, Some(2)).await;
+    let q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(&mut db, ISSUE_567_LINE_QUERIES, "nearest_friends", &q).await
+    })
+    .await
+    .unwrap();
+    let verdicts = probes.ann_prefilter_verdicts.lock().unwrap().clone();
+    assert_eq!(
+        verdicts,
+        vec![RrfGateVerdict {
+            plan: RrfGatePlan::Postfilter,
+            fallback: Some(RrfGateFallback::Threshold),
+            forced: false,
+            eligible: Some(1_000),
+            corpus: Some(ROWS as u64),
+        }],
+        "1,000 of 2,000 eligible must fail the natural 10% ratio"
+    );
+    assert_eq!(
+        result_slugs(&result),
+        (0..10)
+            .map(|i| format!("n{:05}", i * 2))
+            .collect::<Vec<_>>(),
+        "the ten nearest edge-bearing docs, filled by the overfetch rerun"
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "k 10 held five survivors; k 40 filled the limit"
+    );
+    assert_eq!(
+        probes
+            .ann_exact_passes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+/// Follow-up to #591 (issue #567): `OMNIGRAPH_RRF_PLAN=force_prefilter` skips
+/// the threshold, so the gate prefilters, records `forced`, and one scan
+/// fills the limit with the answer the overfetch rerun reaches naturally.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn issue_567_forced_prefilter_skips_the_nearest_gate_threshold() {
+    use omnigraph::instrumentation::{
+        QueryIoProbes, RrfGatePlan, RrfGateVerdict, with_query_io_probes, with_rrf_plan,
+    };
+    const ROWS: usize = 2_000;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = issue_567_line_docs(uri, ROWS, Some(2)).await;
+    let q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(
+        probes.clone(),
+        with_rrf_plan("force_prefilter", async {
+            query_main(&mut db, ISSUE_567_LINE_QUERIES, "nearest_friends", &q).await
+        }),
+    )
+    .await
+    .unwrap();
+    let verdicts = probes.ann_prefilter_verdicts.lock().unwrap().clone();
+    assert_eq!(
+        verdicts,
+        vec![RrfGateVerdict {
+            plan: RrfGatePlan::Prefilter,
+            fallback: None,
+            forced: true,
+            eligible: Some(1_000),
+            corpus: Some(ROWS as u64),
+        }],
+        "the force skips the threshold and is recorded"
+    );
+    assert_eq!(
+        result_slugs(&result),
+        (0..10)
+            .map(|i| format!("n{:05}", i * 2))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        probes
+            .ann_overfetches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the prefiltered scan fills the limit in one pass"
+    );
+}
+
+/// Follow-up to #591, the filter translator's coverage: every filter shape
+/// the GQ grammar can express on the ranked binding reaches Lance as a
+/// prefilter, so a `nearest` returns the top-k of MATCHING rows in one scan.
+#[tokio::test]
+#[serial]
+async fn nearest_pushes_every_grammar_filter_shape_into_the_scan() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let rows = (0..50)
+        .map(|row| {
+            format!(
+                r#"{{"type":"Doc","data":{{"slug":"n{row:02}","n":{row},"name":"doc-{row:02}","embedding":[{row}.0,0.0,0.0,0.0]}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let schema = r#"
+node Doc {
+    slug: String @key
+    n: I64 @index
+    name: String @index
+    embedding: Vector(4) @index
+}
+"#;
+    let queries = r#"
+query f_eq($q: Vector(4)) {
+    match { $d: Doc
+        $d.n = 7 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+query f_ne($q: Vector(4)) {
+    match { $d: Doc
+        $d.n != 0 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+query f_gt($q: Vector(4)) {
+    match { $d: Doc
+        $d.n > 10 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+query f_lt($q: Vector(4)) {
+    match { $d: Doc
+        $d.n < 3 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+query f_ge($q: Vector(4)) {
+    match { $d: Doc
+        $d.n >= 10 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+query f_le($q: Vector(4)) {
+    match { $d: Doc
+        $d.n <= 2 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+query f_starts_with($q: Vector(4)) {
+    match { $d: Doc
+        $d.name starts_with "doc-2" }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+query f_contains($q: Vector(4)) {
+    match { $d: Doc
+        $d.name contains "-3" }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+query f_param($q: Vector(4), $n: I64) {
+    match { $d: Doc
+        $d.n = $n }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+query f_flipped($q: Vector(4)) {
+    match { $d: Doc
+        10 < $d.n }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, &rows, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+    let mut q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
+    q.insert("n".to_string(), Literal::Integer(7));
+
+    let table: [(&str, &[&str]); 10] = [
+        ("f_eq", &["n07"]),
+        ("f_ne", &["n01", "n02", "n03"]),
+        ("f_gt", &["n11", "n12", "n13"]),
+        ("f_lt", &["n00", "n01", "n02"]),
+        ("f_ge", &["n10", "n11", "n12"]),
+        ("f_le", &["n00", "n01", "n02"]),
+        ("f_starts_with", &["n20", "n21", "n22"]),
+        ("f_contains", &["n30", "n31", "n32"]),
+        ("f_param", &["n07"]),
+        ("f_flipped", &["n11", "n12", "n13"]),
+    ];
+    for (name, expected) in table {
+        let probes = QueryIoProbes::default();
+        let result = with_query_io_probes(probes.clone(), async {
+            query_main(&mut db, queries, name, &q).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            probes
+                .pushed_filter_exprs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "{name}: the filter must reach Lance as a prefilter"
+        );
+        assert_eq!(
+            result_slugs(&result),
+            expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "{name}: top-k of the MATCHING rows"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2095,6 +3323,56 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
     );
 }
 
+/// A plain `nearest` over a type with full-text-indexed String columns runs no
+/// full-text validation; a full-text query over the same fixture runs one, so
+/// the zero is a skip and not a dead probe.
+#[tokio::test]
+#[serial]
+async fn plain_nearest_skips_the_full_text_validation() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+
+    let probes = QueryIoProbes::default();
+    let nearest = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            SEARCH_QUERIES,
+            "vector_search",
+            &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert!(nearest.num_rows() > 0);
+    assert_eq!(
+        probes.fts_validations.load(Ordering::Relaxed),
+        0,
+        "a scan with no full-text query and no contains_tokens demand skips the validation"
+    );
+
+    let probes = QueryIoProbes::default();
+    let text = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            SEARCH_QUERIES,
+            "text_search",
+            &params(&[("$q", "Learning")]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert!(text.num_rows() > 0);
+    assert!(
+        probes.fts_validations.load(Ordering::Relaxed) > 0,
+        "a full-text query validates its index coverage"
+    );
+}
+
 // ─── RRF hybrid search ─────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2172,5 +3450,145 @@ async fn load_commit_creates_inverted_indices_for_string_annotations() {
         user_indices.len(),
         4,
         "expected id BTree index plus key-property and title/body inverted indices"
+    );
+}
+
+/// A search scan projects exactly its needed columns plus Lance's scoring
+/// column, named explicitly; a bare `$d` keeps the fail-open full projection.
+/// A plain nearest never consults `nearest_prefilter_gate`.
+#[tokio::test]
+#[serial]
+async fn search_scans_project_needed_columns_and_the_scoring_column() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+
+    const ROWS: usize = 60;
+    let seed = (0..ROWS)
+        .map(|row| {
+            let title = if row % 2 == 0 { "alpha" } else { "beta" };
+            format!(
+                r#"{{"type":"Doc","data":{{"slug":"n{row:05}","title":"{title} doc","embedding":[{row}.0,0.0,0.0,0.0]}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let schema = r#"
+node Doc {
+    slug: String @key
+    title: String @index
+    embedding: Vector(4) @index
+}
+"#;
+    let queries = r#"
+query nearest_slug($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+
+query bm25_slug($q: String) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { bm25($d.title, $q) }
+    limit 10
+}
+
+query nearest_whole($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, &seed, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+
+    fn sorted(columns: &Option<Vec<String>>) -> Option<Vec<String>> {
+        columns.as_ref().map(|columns| {
+            let mut columns = columns.clone();
+            columns.sort();
+            columns
+        })
+    }
+    fn strings(columns: &[&str]) -> Option<Vec<String>> {
+        Some(columns.iter().map(|c| c.to_string()).collect())
+    }
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "nearest_slug",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        result_slugs(&result),
+        (0..10).map(|row| format!("n{row:05}")).collect::<Vec<_>>(),
+        "ascending `_distance` order survives the explicit projection"
+    );
+    let projections = probes.node_scan_projections.lock().unwrap().clone();
+    assert_eq!(projections.len(), 1, "one NodeScan, one projection");
+    assert_eq!(
+        sorted(&projections[0]),
+        strings(&["_distance", "id", "slug"]),
+        "a `return {{ $d.slug }}` nearest scan reads id, the key and `_distance` only"
+    );
+    assert!(
+        probes.ann_prefilter_verdicts.lock().unwrap().is_empty(),
+        "a nearest with no Expand leaving the ranked variable records no gate verdict"
+    );
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(&mut db, queries, "bm25_slug", &params(&[("$q", "alpha")])).await
+    })
+    .await
+    .unwrap();
+    let slugs = result_slugs(&result);
+    assert_eq!(
+        slugs.len(),
+        10,
+        "the capped bm25 scan fills limit in one pass"
+    );
+    assert!(
+        slugs
+            .iter()
+            .all(|slug| slug[1..].parse::<usize>().unwrap() % 2 == 0),
+        "alpha docs only: {slugs:?}"
+    );
+    let projections = probes.node_scan_projections.lock().unwrap().clone();
+    assert_eq!(projections.len(), 1, "limit filled: no uncapped retry scan");
+    assert_eq!(
+        sorted(&projections[0]),
+        strings(&["_score", "id", "slug"]),
+        "a `return {{ $d.slug }}` bm25 scan reads id, the key and `_score` only"
+    );
+
+    let probes = QueryIoProbes::default();
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            queries,
+            "nearest_whole",
+            &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.num_rows(), 10);
+    let projections = probes.node_scan_projections.lock().unwrap().clone();
+    assert_eq!(
+        projections,
+        vec![None],
+        "an entity-valued return keeps every non-blob column (the #564 fail-open)"
     );
 }

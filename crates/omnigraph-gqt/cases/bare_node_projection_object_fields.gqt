@@ -1,0 +1,114 @@
+# issue: none
+# notes: the node object keeps `id` and the declared non-Blob, non-Vector properties (the engine rewrites Blob columns before executing, so the exclusion only runs here).
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+    payload: Blob?
+    embedding: Vector(2)?
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30,"embedding":[1.0,2.0]}}
+{"type":"Person","data":{"name":"bob","age":null}}
+{"type":"Person","data":{"name":"carol","age":41}}
+{"edge":"Knows","from":"alice","to":"bob","data":{}}
+{"edge":"Knows","from":"alice","to":"carol","data":{}}
+{"edge":"Knows","from":"bob","to":"carol","data":{}}
+
+--- query
+query object_and_vector() {
+    match { $p: Person }
+    return { $p, $p.embedding }
+}
+
+--- expect unordered
+{"p": {"id": "alice", "name": "alice", "age": 30}, "p.embedding": [1.0, 2.0]}
+{"p": {"id": "bob", "name": "bob"}}
+{"p": {"id": "carol", "name": "carol", "age": 41}}
+
+--- expect shape
+p: Person
+p.embedding: Vector(2)?
+
+--- query
+query zero_rows() {
+    match { $p: Person { name: "nobody" } }
+    return { $p }
+}
+
+--- expect unordered
+
+--- expect shape
+p: Person
+
+--- query
+query count_alone() {
+    match { $p: Person }
+    return { count($p) as n }
+}
+
+--- expect unordered
+{"n": 3}
+
+--- expect shape
+n: I64
+
+--- query
+query friends_per_person() {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return { $p, count($f) as friends }
+}
+
+--- expect unordered
+{"p": {"id": "alice", "name": "alice", "age": 30}, "friends": 2}
+{"p": {"id": "bob", "name": "bob"}, "friends": 1}
+
+--- expect shape
+p: Person
+friends: I64
+
+--- query
+query alias_ordered() {
+    match { $p: Person }
+    return { $p as person }
+    order { person desc }
+}
+
+--- expect ordered
+{"person": {"id": "carol", "name": "carol", "age": 41}}
+{"person": {"id": "bob", "name": "bob"}}
+{"person": {"id": "alice", "name": "alice", "age": 30}}
+
+--- expect shape
+person: Person
+
+--- query
+query min_of_node() {
+    match { $p: Person }
+    return { min($p) as first }
+}
+
+--- expect error: T8: min cannot take node binding `$p` bare
+
+--- query
+query min_of_node_alias() {
+    match { $p: Person }
+    return { $p as person, min(person) as first }
+}
+
+--- expect error: T8: min cannot take node projection `person` bare
+
+--- query
+query count_of_count() {
+    match { $p: Person }
+    return { count(count($p)) as n }
+}
+
+--- expect error: T8: count cannot take an aggregate

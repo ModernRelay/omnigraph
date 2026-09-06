@@ -1,0 +1,39 @@
+# issue: 665
+# red_on: 2026-09-04, main c253f111: returned 0 rows instead of d001.
+# notes: two docs, one edge d001 -> d000. The nearest doc to the query is d000,
+# notes: which has no out-edge; the scan's top-1 is dropped by the traversal and
+# notes: the under-fill retry reruns with the same k, so the answer stays empty.
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","embedding":[1.0,0.0,0.0,0.0]}}
+{"edge":"Knows","from":"d001","to":"d000","data":{"id":"e001"}}
+
+--- query
+query nearest_with_edge($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 1
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "d001"}
+
+--- expect shape
+d.slug: String

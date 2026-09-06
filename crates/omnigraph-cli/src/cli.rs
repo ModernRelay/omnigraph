@@ -23,7 +23,9 @@ control — manage or inspect a cluster (cluster via --config; policy & queries 
 --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
 MANAGED FOLDERS: cluster commands use .omnigraph/context; cluster token caches data access.\n\
-query and mutate require --graph and a cached data credential. --direct selects legacy addressing.\n\
+Implicit query and mutate use folder context and require --graph plus a cached data credential.\n\
+Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
+--direct selects ordinary addressing, including operator profiles and defaults.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
     /// Explicitly use legacy addressing and credentials, ignoring folder context.
@@ -99,21 +101,22 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     // ── Data plane ── run against a graph (embedded or via --server).
-    /// Execute a read query against a branch or snapshot.
+    /// Execute a read query, or `branch list`, against a branch or snapshot.
     ///
-    /// Canonical read endpoint. The previous name `omnigraph read` is
-    /// kept as a visible alias and prints a one-line deprecation warning
-    /// when used. Pairs with `omnigraph mutate` on the write side.
+    /// Canonical read endpoint, paired with `mutate`; `read` is a visible alias that warns.
     #[command(visible_alias = "read")]
     Query {
         /// Query name. With no `--query`/`-e`, the stored query to invoke from
         /// the catalog (served — addressed via --server/--profile). With
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
-        /// Ad-hoc query file (a `.gq` you're authoring / break-glass).
+        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), or one
+        /// `branch list` statement.
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`.
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
+        /// the `branch list` statement, which takes no name, params, --branch
+        /// or --snapshot.
         #[arg(
             short = 'e',
             long = "query-string",
@@ -132,21 +135,22 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "format")]
         json: bool,
     },
-    /// Execute a graph mutation query against a branch.
+    /// Execute a mutation, or one `branch create`/`delete`/`merge` statement.
     ///
-    /// Canonical mutation endpoint. The previous name `omnigraph change`
-    /// is kept as a visible alias and prints a one-line deprecation
-    /// warning when used. Pairs with `omnigraph query` on the read side.
+    /// Canonical mutation endpoint, paired with `query`; `change` is a visible alias that warns.
     #[command(visible_alias = "change")]
     Mutate {
         /// Query name. With no `--query`/`-e`, the stored mutation to invoke
         /// from the catalog (served — addressed via --server/--profile). With
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
-        /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass).
+        /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass), or
+        /// one `branch create`/`branch delete`/`branch merge` statement.
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`.
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
+        /// one `branch create`/`branch delete`/`branch merge` statement, which
+        /// takes no name, params, --branch or --if-commit.
         #[arg(
             short = 'e',
             long = "query-string",
@@ -290,9 +294,6 @@ pub(crate) enum Command {
         /// overwrites an initialized graph or purges its Lance datasets.
         #[arg(long)]
         force: bool,
-        /// Materialize attributed writers as OmniActor nodes (default: true).
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        actor_provenance: Option<bool>,
     },
     /// Compact small Lance fragments in every backing dataset of the graph
     Optimize {
@@ -823,9 +824,6 @@ pub(crate) enum SchemaCommand {
         /// so the plan output reflects the destructive intent.
         #[arg(long, default_value_t = false)]
         allow_data_loss: bool,
-        /// Change automatic actor materialization; omission preserves the accepted setting.
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        actor_provenance: Option<bool>,
     },
     /// Apply a supported schema migration
     Apply {
@@ -846,11 +844,8 @@ pub(crate) enum SchemaCommand {
         /// making the prior data unreachable.
         #[arg(long, default_value_t = false)]
         allow_data_loss: bool,
-        /// Change automatic actor materialization; omission preserves the accepted setting.
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        actor_provenance: Option<bool>,
     },
-    /// Show customer source and effective system types; --json includes the accepted schema
+    /// Show the current accepted schema source
     #[command(alias = "get")]
     Show {
         /// Graph URI

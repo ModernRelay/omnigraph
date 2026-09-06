@@ -1,0 +1,84 @@
+# issue: none
+# notes: `count($d)` over `$d knows $t` under nearest limit 2, 40 docs, edges
+# notes: leaving 10, 20, 30 (3 of 40 = 7.5%, gate prefilters): the nearest window
+# notes: IS the answer, so the count is min(eligible, k) = min(3, 2) = 2, not the
+# notes: 3 eligible docs (the bm25 ordering counts every match, issue 563). An
+# notes: engine ranking the whole table first counts 0: the unfiltered top-2
+# notes: (0, 1) has no edge. Rust twin (probes: no overfetch on an aggregate):
+# notes: issue_567_aggregate_over_a_nearest_traversal_counts_the_window.
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64 @index
+    name: String @index
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","n":2,"name":"doc-002","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","n":3,"name":"doc-003","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","n":4,"name":"doc-004","embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d005","n":5,"name":"doc-005","embedding":[5.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d006","n":6,"name":"doc-006","embedding":[6.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d007","n":7,"name":"doc-007","embedding":[7.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d008","n":8,"name":"doc-008","embedding":[8.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d009","n":9,"name":"doc-009","embedding":[9.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d010","n":10,"name":"doc-010","embedding":[10.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d011","n":11,"name":"doc-011","embedding":[11.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d012","n":12,"name":"doc-012","embedding":[12.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d013","n":13,"name":"doc-013","embedding":[13.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d014","n":14,"name":"doc-014","embedding":[14.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d015","n":15,"name":"doc-015","embedding":[15.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d016","n":16,"name":"doc-016","embedding":[16.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d017","n":17,"name":"doc-017","embedding":[17.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d018","n":18,"name":"doc-018","embedding":[18.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d019","n":19,"name":"doc-019","embedding":[19.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d020","n":20,"name":"doc-020","embedding":[20.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d021","n":21,"name":"doc-021","embedding":[21.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d022","n":22,"name":"doc-022","embedding":[22.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d023","n":23,"name":"doc-023","embedding":[23.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d024","n":24,"name":"doc-024","embedding":[24.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d025","n":25,"name":"doc-025","embedding":[25.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d026","n":26,"name":"doc-026","embedding":[26.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d027","n":27,"name":"doc-027","embedding":[27.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d028","n":28,"name":"doc-028","embedding":[28.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d029","n":29,"name":"doc-029","embedding":[29.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d030","n":30,"name":"doc-030","embedding":[30.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d031","n":31,"name":"doc-031","embedding":[31.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d032","n":32,"name":"doc-032","embedding":[32.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d033","n":33,"name":"doc-033","embedding":[33.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d034","n":34,"name":"doc-034","embedding":[34.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d035","n":35,"name":"doc-035","embedding":[35.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d036","n":36,"name":"doc-036","embedding":[36.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d037","n":37,"name":"doc-037","embedding":[37.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d038","n":38,"name":"doc-038","embedding":[38.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d039","n":39,"name":"doc-039","embedding":[39.0,0.0,0.0,0.0]}}
+{"edge":"Knows","from":"d010","to":"d011","data":{"id":"e010_0"}}
+{"edge":"Knows","from":"d020","to":"d021","data":{"id":"e020_0"}}
+{"edge":"Knows","from":"d030","to":"d031","data":{"id":"e030_0"}}
+
+--- query
+query scenario($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { count($d) as total }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0]}
+
+--- expect unordered
+{"total":2}
+
+--- expect shape
+total: I64

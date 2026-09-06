@@ -78,6 +78,22 @@ impl NodeType {
             .and_then(|v| v.first())
             .map(|s| s.as_str())
     }
+
+    /// The fields `return { $p }` projects: the identity column and the declared
+    /// properties except `Blob` (T24) and `Vector`. Keyed on declared types: the
+    /// engine rewrites Blob columns to their storage field before executing.
+    pub fn node_object_fields(&self) -> impl Iterator<Item = &Arc<Field>> {
+        self.arrow_schema.fields().iter().filter(|field| {
+            let name = field.name().as_str();
+            match self.properties.get(name) {
+                Some(prop) => {
+                    !self.blob_properties.contains(name)
+                        && !matches!(prop.scalar, ScalarType::Vector(_))
+                }
+                None => name == "id",
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -135,17 +151,6 @@ impl Catalog {
             CatalogIdentity::SourceUnbound => None,
             CatalogIdentity::Bound(ir) => Some(ir),
         }
-    }
-
-    /// Resolve actor configuration only from this catalog's accepted schema.
-    pub fn actor_provenance(&self) -> Option<&schema_ir::ActorProvenanceBinding> {
-        self.bound_schema_ir()?.actor_provenance.as_ref()
-    }
-
-    /// A disabled binding remains protected; names alone never confer ownership.
-    pub fn is_protected_actor_type(&self, name: &str) -> bool {
-        self.actor_provenance()
-            .is_some_and(|binding| self.node_type_id(name) == Some(binding.type_id))
     }
 
     pub fn type_id(&self, name: &str) -> Option<schema_ir::StableTypeId> {

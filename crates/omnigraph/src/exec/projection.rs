@@ -1,5 +1,63 @@
 use super::*;
 
+use arrow_array::StructArray;
+use arrow_schema::Fields;
+use omnigraph_compiler::catalog::NodeType;
+
+/// Node type per pipeline binding, for projecting a bare `$p` as one struct.
+pub(super) struct ProjectionContext<'a> {
+    node_bindings: HashMap<String, &'a NodeType>,
+}
+
+impl<'a> ProjectionContext<'a> {
+    pub(super) fn for_query(catalog: &'a Catalog, ir: &QueryIR) -> Self {
+        let mut type_names = HashMap::new();
+        collect_node_bindings(&ir.pipeline, &mut type_names);
+        let node_bindings = type_names
+            .into_iter()
+            .filter_map(|(variable, type_name)| {
+                catalog
+                    .node_types
+                    .get(&type_name)
+                    .map(|node_type| (variable, node_type))
+            })
+            .collect();
+        Self { node_bindings }
+    }
+}
+
+fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String, String>) {
+    for op in pipeline {
+        match op {
+            IROp::NodeScan {
+                variable,
+                type_name,
+                filters: _,
+            } => {
+                out.insert(variable.clone(), type_name.clone());
+            }
+            IROp::Expand {
+                src_var: _,
+                dst_var,
+                edge_type: _,
+                direction: _,
+                dst_type,
+                min_hops: _,
+                max_hops: _,
+                dst_filters: _,
+                edge_binding: _,
+            } => {
+                out.insert(dst_var.clone(), dst_type.clone());
+            }
+            IROp::Filter(_) => {}
+            IROp::AntiJoin {
+                outer_var: _,
+                inner,
+            } => collect_node_bindings(inner, out),
+        }
+    }
+}
+
 pub(super) fn apply_filter(
     batch: &mut RecordBatch,
     filter: &IRFilter,
@@ -355,6 +413,7 @@ pub(super) fn project_return(
     wide_batch: &RecordBatch,
     projections: &[IRProjection],
     params: &ParamMap,
+    ctx: &ProjectionContext<'_>,
 ) -> Result<RecordBatch> {
     if projections.is_empty() {
         return Err(OmniError::manifest(
@@ -364,14 +423,14 @@ pub(super) fn project_return(
 
     // Route to aggregate path if any projection contains an aggregate
     if projections_have_aggregates(projections) {
-        return aggregate_return(wide_batch, projections, params);
+        return aggregate_return(wide_batch, projections, params, ctx);
     }
 
     let mut fields = Vec::with_capacity(projections.len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projections.len());
 
     for proj in projections {
-        let (name, col) = evaluate_projection(wide_batch, &proj.expr, params)?;
+        let (name, col) = evaluate_projection(wide_batch, &proj.expr, params, ctx)?;
         let field_name = proj.alias.as_deref().unwrap_or(&name);
         fields.push(Field::new(
             field_name,
@@ -390,6 +449,7 @@ fn evaluate_projection(
     wide_batch: &RecordBatch,
     expr: &IRExpr,
     params: &ParamMap,
+    ctx: &ProjectionContext<'_>,
 ) -> Result<(String, ArrayRef)> {
     match expr {
         IRExpr::PropAccess { variable, property } => {
@@ -411,11 +471,32 @@ fn evaluate_projection(
             Ok((name.clone(), arr))
         }
         IRExpr::Variable(name) => {
-            let col_name = format!("{}.id", name);
-            let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
-                OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
+            let node_type = ctx.node_bindings.get(name).ok_or_else(|| {
+                OmniError::manifest(format!("variable '{}' is not a node binding", name))
             })?;
-            Ok((name.clone(), col.clone()))
+            let wide_schema = wide_batch.schema();
+            let mut fields: Vec<Field> = Vec::new();
+            let mut columns: Vec<ArrayRef> = Vec::new();
+            for field in node_type.node_object_fields() {
+                let col_name = format!("{}.{}", name, field.name());
+                let (idx, wide_field) =
+                    wide_schema.column_with_name(&col_name).ok_or_else(|| {
+                        OmniError::manifest(format!(
+                            "column '{}' not found in wide batch",
+                            col_name
+                        ))
+                    })?;
+                let col = wide_batch.column(idx).clone();
+                fields.push(Field::new(
+                    field.name(),
+                    col.data_type().clone(),
+                    wide_field.is_nullable(),
+                ));
+                columns.push(col);
+            }
+            let node = StructArray::try_new(Fields::from(fields), columns, None)
+                .map_err(OmniError::arrow_internal)?;
+            Ok((name.clone(), Arc::new(node) as ArrayRef))
         }
         _ => Err(OmniError::manifest(format!(
             "unsupported projection expression: {:?}",
@@ -524,6 +605,7 @@ fn aggregate_return(
     wide: &RecordBatch,
     projections: &[IRProjection],
     params: &ParamMap,
+    ctx: &ProjectionContext<'_>,
 ) -> Result<RecordBatch> {
     let num_rows = wide.num_rows();
 
@@ -545,7 +627,7 @@ fn aggregate_return(
     for (i, proj) in projections.iter().enumerate() {
         match &proj.expr {
             IRExpr::Aggregate { func, arg } => {
-                let (name, col) = evaluate_projection(wide, arg, params)?;
+                let (name, col) = evaluate_projection(wide, arg, params, ctx)?;
                 let alias = proj.alias.as_deref().unwrap_or(&name);
                 agg_projs.push(AggProj {
                     proj_idx: i,
@@ -555,7 +637,7 @@ fn aggregate_return(
                 });
             }
             _ => {
-                let (name, col) = evaluate_projection(wide, &proj.expr, params)?;
+                let (name, col) = evaluate_projection(wide, &proj.expr, params, ctx)?;
                 let alias = proj.alias.as_deref().unwrap_or(&name);
                 group_keys.push(GroupKey {
                     proj_idx: i,

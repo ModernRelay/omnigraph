@@ -1,5 +1,5 @@
 ---
-rfc: "0055"
+rfc: "0061"
 title: "Managed cluster lifecycle and config preparation"
 track: maintainer
 status: accepted
@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on: []
 ---
 
-# RFC 0055: Managed cluster lifecycle and config preparation
+# RFC 0061: Managed cluster lifecycle and config preparation
 
 ## Summary
 

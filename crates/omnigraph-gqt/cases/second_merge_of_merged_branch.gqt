@@ -1,0 +1,52 @@
+# issue: none
+# notes: fork b0, write on b0, merge b0, merge b0 again, read main. The engine's
+# notes: answer to the re-merge is the pin: the second merge changes nothing and
+# notes: main holds the one write once.
+# notes: The scenario comes from issue 600, where the DST milestone driver
+# notes: re-merged a merged branch and reported the engine's
+# notes: `already_up_to_date` as a failure. The engine answered the re-merge
+# notes: correctly then as now, so no build was ever red on it: this is a
+# notes: feature case that pins the answer.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate branch: b0
+query insert_on_b0() {
+    insert Person { name: "bob" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b0
+
+--- expect outcome: fast_forward
+
+--- mutate
+branch merge b0
+
+--- expect outcome: already_up_to_date
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String

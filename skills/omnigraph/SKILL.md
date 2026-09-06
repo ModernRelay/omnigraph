@@ -83,7 +83,7 @@ omnigraph load --data delta.jsonl --from main --branch review --mode merge $GRAP
 ```
 
 - `--mode`: `merge` (upsert by logical entity ID; keyed node IDs derive from their `@key` tuple) · `append` (fails on ID collision) · `overwrite` (destructive, staged). `--from <base>` forks a missing `--branch`; bare `load` needs an existing branch. Works local **and** remote.
-- **Date values**: `mutate --params` takes ISO strings. `load` accepts ISO `Date` strings (recommended) or integer epoch days, and ISO `DateTime` strings.
+- **Date values**: `mutate --params` takes a calendar day (`YYYY-MM-DD`) for `Date` and ISO 8601 for `DateTime`. `load` accepts calendar-day `Date` strings (`YYYY-MM-DD`, recommended) or integer epoch days, and ISO `DateTime` strings or integer epoch milliseconds; a `Date` string carrying a time of day (`2026-04-29T10:00:00Z`) is refused on every path, and any other JSON type for a date fails the load naming the property.
 
 ### Dispatching
 
@@ -92,8 +92,12 @@ omnigraph alias  signal sig-foo                  # operator alias → its bound 
 omnigraph query  get_signal --params '{"slug":"sig-foo"}'   # served stored query by name (verb asserts read vs write)
 omnigraph query  -e 'query q() { match { $s: Signal } return { $s.slug } limit 5 }'   # ad-hoc/inline (or: --query f.gq <name>)
 omnigraph mutate add_signal --query mutations.gq --params '{"slug":"sig-foo","name":"Foo","brief":"Example","createdAt":"2026-04-14T00:00:00Z"}'   # name positional; ad-hoc file source
+omnigraph mutate -e 'branch create b0'           # branch statement: control writes (create/delete/merge) go through mutate
+omnigraph query  -e 'branch list' --format table # branch statement: the listing is a read and goes through query
 omnigraph lint   --schema schema.pg --query queries/foo.gq    # after EVERY .gq/.pg edit (no server needed)
 ```
+
+A branch statement (`branch create <name> [from <parent>]`, `branch delete <name>`, `branch merge <source> [into <target>]`, `branch list`) names its branches itself: no `--branch`, `--snapshot`, `--if-commit`, positional name, or `--params` beside it. The wrong door refuses it (`statement 'branch merge' is a control write; use POST /mutate` (`mutate` from the CLI), `statement 'branch list' is a read; use POST /query` (`query` from the CLI)). Same effect and same policy check as the `branch` verbs.
 
 ### `.gq` grammar
 
@@ -125,13 +129,13 @@ Notation: `<x>` required · `[x]` optional · `<a|b>` choice · `…` repeatable
 **Global addressing flags**: `--as <actor>` (direct-engine writes and actor-bound cluster operations; remote writes derive the actor from the bearer token), `--server <name|url>`, `--cluster <dir|uri>` (cluster-managed storage, primarily for maintenance), `--graph <id>` (selects within a `--server` or `--cluster` scope), `--profile <name>` (`$OMNIGRAPH_PROFILE`), `--store <uri>`. Commands with an open positional slot also accept `file://`, `s3://`, or preview `az://` directly. `--config <dir>` belongs only to `cluster` subcommands. Output: `--json`, or read queries take `--format <json|jsonl|csv|kv|table>`. **Write guards:** `--yes` skips non-local confirmation for destructive writes; `--quiet` suppresses the resolved-target echo.
 
 **Data plane** — `any` (served via `--server`/`--profile`, or direct via `--store`/URI):
-- `query` (alias `read`) `<name>` — a **served stored query** by name (via `--server`/`--profile`); or ad-hoc `[<name>] (--query <f.gq> | -e '<GQ>')` where `<name>` picks which query in the source. `[--params <json> | --params-file <p>] [--branch <b> | --snapshot <id>] [--format <fmt> | --json]`. No positional URI — address via `--server`/`--store`/`--profile`.
-- `mutate` (alias `change`) — same shape (served stored mutation by `<name>`, or ad-hoc `--query`/`-e`); `[--params …] [--branch <b>] [--if-commit <graph_commit_id>] [--json]`. The verb asserts kind; a failed precondition has no effect and exits 4.
+- `query` (alias `read`) `<name>` — a **served stored query** by name (via `--server`/`--profile`); or ad-hoc `[<name>] (--query <f.gq> | -e '<GQ>')` where `<name>` picks which query in the source. `[--params <json> | --params-file <p>] [--branch <b> | --snapshot <id>] [--format <fmt> | --json]`. No positional URI — address via `--server`/`--store`/`--profile`. The source may be the `branch list` statement (`-e 'branch list'`), which takes no name, params, `--branch`, or `--snapshot`.
+- `mutate` (alias `change`) — same shape (served stored mutation by `<name>`, or ad-hoc `--query`/`-e`); `[--params …] [--branch <b>] [--if-commit <graph_commit_id>] [--json]`. The verb asserts kind; a failed precondition has no effect and exits 4. The source may be one control-write statement (`-e 'branch create b0'`, `'branch delete b0'`, `'branch merge b0 into main'`), which takes no name, params, `--branch`, or `--if-commit`; `branch delete` against a non-local target needs `--yes` or a TTY answer.
 - `load --data <f.jsonl> --mode <overwrite|append|merge> [--branch <b>] [--from <base>] [--json]` — `--mode` required; `--from` forks a missing `--branch`; overwrite replaces only represented types
 - `blob <get|stat> <node|edge> <TYPE> <ID> <PROPERTY>` — dedicated Blob-cell reads; `get` supports ranges/`--out`, `stat` returns metadata
 - `snapshot [--branch <b>] [--json]`
 - `export [--branch <b>] [--type <T>…]` (streams JSONL)
-- `branch <create <name> [--from <base>] | list | delete <name> | merge <source> --into <target> [--delete-branch]> [--json]`
+- `branch <create <name> [--from <base>] | list | delete <name> | merge <source> --into <target> [--delete-branch]> [--json]`; or as GQ statements: `mutate -e 'branch create|delete|merge …'`, `query -e 'branch list'`
 - `commit <list [--branch <b>] | show <commit_id> | changes <commit_id> [filters…]> [--json]`
 - `changes <poll [--start now|beginning|after:<id> | --cursor <c>] | baseline --out <snapshot.jsonl>> [filters…] [--json]`
 - `schema apply --schema <f.pg> [--allow-data-loss] [--json]` · `schema show` (alias `get`) — `apply` **refuses a cluster-managed graph** (evolve those via `cluster apply`)

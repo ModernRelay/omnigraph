@@ -56,7 +56,7 @@ async fn plan_schema_reports_supported_additive_change() {
         .preview_schema_apply_with_options(&desired, omnigraph::db::SchemaApplyOptions::default())
         .await
         .unwrap();
-    assert_eq!(preview.catalog.node_types.len(), 3);
+    assert_eq!(preview.catalog.node_types.len(), 2);
 }
 
 #[tokio::test]
@@ -158,7 +158,7 @@ async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
     );
     schema_owner.apply_schema(&desired).await.unwrap();
     let reopened_after_apply = Omnigraph::open(uri).await.unwrap();
-    assert_eq!(reopened_after_apply.catalog().node_types.len(), 4);
+    assert_eq!(reopened_after_apply.catalog().node_types.len(), 3);
     // The same apply exercises both physical schema shapes: Person is rebuilt
     // through a staged overwrite for the added property, while Project is a
     // newly created table incarnation. Neither may drop the immutable v6 PK.
@@ -1375,7 +1375,6 @@ edge WorksAt: Human -> Company
             desired,
             omnigraph::db::SchemaApplyOptions {
                 allow_data_loss: true,
-                ..Default::default()
             },
         )
         .await
@@ -1726,7 +1725,6 @@ async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
             &desired,
             omnigraph::db::SchemaApplyOptions {
                 allow_data_loss: true,
-                ..Default::default()
             },
         )
         .await
@@ -1763,7 +1761,6 @@ async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
             &desired,
             omnigraph::db::SchemaApplyOptions {
                 allow_data_loss: true,
-                ..Default::default()
             },
         )
         .await
@@ -1791,7 +1788,6 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
             &desired,
             omnigraph::db::SchemaApplyOptions {
                 allow_data_loss: true,
-                ..Default::default()
             },
         )
         .await
@@ -1855,7 +1851,6 @@ edge Knows: Person -> Person {
             desired,
             omnigraph::db::SchemaApplyOptions {
                 allow_data_loss: true,
-                ..Default::default()
             },
         )
         .await
@@ -1889,7 +1884,6 @@ edge Knows: Person -> Person {
             desired,
             omnigraph::db::SchemaApplyOptions {
                 allow_data_loss: true,
-                ..Default::default()
             },
         )
         .await
@@ -2128,292 +2122,4 @@ async fn enum_narrowing_apply_is_refused() {
     )
     .await
     .expect("graph must remain writable after a refused narrowing");
-}
-
-// Rust owner: migration planning, stable identities, retained physical versions,
-// and durable configuration are mechanism assertions beyond the logic-test DSL.
-#[tokio::test]
-#[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn actor_provenance_enable_disable_retains_authority_issue_661() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init_with_options(
-        uri,
-        TEST_SCHEMA,
-        omnigraph::db::InitOptions {
-            actor_provenance: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert!(!db.apply_schema(TEST_SCHEMA).await.unwrap().applied);
-    assert!(!db.actor_provenance_enabled().await.unwrap());
-    let enable = omnigraph::db::SchemaApplyOptions {
-        actor_provenance: Some(true),
-        ..Default::default()
-    };
-    let preview = db
-        .preview_schema_apply_with_options(TEST_SCHEMA, enable.clone())
-        .await
-        .unwrap();
-    assert!(preview.plan.steps.iter().any(|step| matches!(
-        step,
-        SchemaMigrationStep::SetActorProvenance { enabled: true }
-    )));
-    assert!(preview.catalog.is_protected_actor_type("OmniActor"));
-    assert!(
-        db.apply_schema_with_options(TEST_SCHEMA, enable.clone())
-            .await
-            .unwrap()
-            .applied
-    );
-    assert!(db.actor_provenance_enabled().await.unwrap());
-    assert_eq!(
-        fs::read_to_string(dir.path().join("_schema.pg")).unwrap(),
-        TEST_SCHEMA
-    );
-    db.load_as(
-        "main",
-        None,
-        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}\n",
-        LoadMode::Merge,
-        Some("actor:alice"),
-    )
-    .await
-    .unwrap();
-    let before = snapshot_main(&db).await.unwrap();
-    let actor_before = before.dataset("node:OmniActor").unwrap().clone();
-    assert_eq!(actor_before.entity_count, 1);
-    let binding_before = db.catalog().actor_provenance().unwrap().clone();
-    let disable = omnigraph::db::SchemaApplyOptions {
-        actor_provenance: Some(false),
-        ..Default::default()
-    };
-    let plan = db
-        .plan_schema_with_options(TEST_SCHEMA, disable.clone())
-        .await
-        .unwrap();
-    assert_eq!(
-        plan.steps,
-        [SchemaMigrationStep::SetActorProvenance { enabled: false }]
-    );
-    assert!(
-        db.apply_schema_with_options(TEST_SCHEMA, disable)
-            .await
-            .unwrap()
-            .applied
-    );
-    assert!(!db.actor_provenance_enabled().await.unwrap());
-    assert!(!db.apply_schema(TEST_SCHEMA).await.unwrap().applied);
-    let retained = snapshot_main(&db).await.unwrap();
-    let actor_retained = retained.dataset("node:OmniActor").unwrap();
-    assert_eq!(actor_retained.dataset_path, actor_before.dataset_path);
-    assert_eq!(
-        actor_retained.published_dataset_version,
-        actor_before.published_dataset_version
-    );
-    assert_eq!(actor_retained.entity_count, 1);
-    assert!(db.catalog().is_protected_actor_type("OmniActor"));
-    assert!(
-        db.apply_schema_with_options(TEST_SCHEMA, enable)
-            .await
-            .unwrap()
-            .applied
-    );
-    assert_eq!(db.catalog().actor_provenance(), Some(&binding_before));
-    drop(db);
-    let reopened = Omnigraph::open_read_only(uri).await.unwrap();
-    assert!(reopened.actor_provenance_enabled().await.unwrap());
-    assert_eq!(
-        snapshot_main(&reopened)
-            .await
-            .unwrap()
-            .dataset("node:OmniActor")
-            .unwrap()
-            .entity_count,
-        1
-    );
-}
-
-#[tokio::test]
-#[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn first_actor_schema_content_write_refuses_before_effects_issue_661() {
-    for initially_enabled in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init_with_options(
-            uri,
-            TEST_SCHEMA,
-            omnigraph::db::InitOptions {
-                actor_provenance: initially_enabled,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        load_jsonl(
-            &db,
-            "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}\n",
-            LoadMode::Merge,
-        )
-        .await
-        .unwrap();
-        let before = snapshot_main(&db).await.unwrap();
-        let source_before = fs::read(dir.path().join("_schema.pg")).unwrap();
-        let ir_before = fs::read(dir.path().join("_schema.ir.json")).unwrap();
-        let desired = TEST_SCHEMA.replace(
-            "    age: I32?\n}",
-            "    age: I32?\n    nickname: String?\n}",
-        );
-        let err = db
-            .apply_schema_as(
-                &desired,
-                omnigraph::db::SchemaApplyOptions {
-                    actor_provenance: Some(true),
-                    ..Default::default()
-                },
-                Some("new-actor"),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("actor_provenance_unsupported_schema_write")
-        );
-        let after = snapshot_main(&db).await.unwrap();
-        assert_eq!(
-            after.graph_manifest_version(),
-            before.graph_manifest_version()
-        );
-        assert_eq!(
-            after
-                .dataset("node:Person")
-                .unwrap()
-                .published_dataset_version,
-            before
-                .dataset("node:Person")
-                .unwrap()
-                .published_dataset_version
-        );
-        assert_eq!(
-            after
-                .dataset("node:OmniActor")
-                .map(|entry| entry.entity_count),
-            initially_enabled.then_some(0)
-        );
-        assert_eq!(
-            fs::read(dir.path().join("_schema.pg")).unwrap(),
-            source_before
-        );
-        assert_eq!(
-            fs::read(dir.path().join("_schema.ir.json")).unwrap(),
-            ir_before
-        );
-
-        // Metadata-only enablement remains possible. A subsequent productive
-        // data write supplies the missing actor through the ordinary protocol,
-        // after which the exact same schema rewrite succeeds without another row.
-        db.apply_schema_with_options(
-            TEST_SCHEMA,
-            omnigraph::db::SchemaApplyOptions {
-                actor_provenance: Some(true),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        db.load_as(
-            "main",
-            None,
-            "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\"}}\n",
-            LoadMode::Merge,
-            Some("new-actor"),
-        )
-        .await
-        .unwrap();
-        let actor_before = snapshot_main(&db)
-            .await
-            .unwrap()
-            .dataset("node:OmniActor")
-            .unwrap()
-            .clone();
-        assert!(
-            db.apply_schema_as(
-                &desired,
-                omnigraph::db::SchemaApplyOptions::default(),
-                Some("new-actor"),
-            )
-            .await
-            .unwrap()
-            .applied
-        );
-        let rewritten = snapshot_main(&db).await.unwrap();
-        let actor_after = rewritten.dataset("node:OmniActor").unwrap();
-        assert_eq!(actor_after.entity_count, 1);
-        assert_eq!(actor_after.dataset_path, actor_before.dataset_path);
-        assert_eq!(
-            actor_after.published_dataset_version,
-            actor_before.published_dataset_version
-        );
-    }
-}
-
-#[tokio::test]
-#[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn actor_builtin_customer_edges_preserve_source_and_reapply_issue_661() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let source = "node Document { key: String @key } edge AuthoredBy: Document -> OmniActor {}";
-    let db = Omnigraph::init(uri, source).await.unwrap();
-    assert_eq!(db.catalog().edge_types["AuthoredBy"].to_type, "OmniActor");
-    let before = snapshot_main(&db).await.unwrap();
-    assert!(!db.apply_schema(source).await.unwrap().applied);
-    let (accepted_source, ir) = db.accepted_schema().await.unwrap();
-    assert_eq!(accepted_source, source);
-    assert!(ir.actor_provenance.as_ref().unwrap().enabled);
-    assert_eq!(
-        fs::read_to_string(dir.path().join("_schema.pg")).unwrap(),
-        source
-    );
-    assert_eq!(
-        snapshot_main(&db).await.unwrap().graph_manifest_version(),
-        before.graph_manifest_version()
-    );
-    drop(db);
-    let reopened = Omnigraph::open_read_only(uri).await.unwrap();
-    assert_eq!(
-        reopened.catalog().edge_types["AuthoredBy"].to_type,
-        "OmniActor"
-    );
-}
-
-#[tokio::test]
-#[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn legacy_schema_write_preserves_opaque_actor_semantics_issue_661() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init_with_options(
-        uri,
-        TEST_SCHEMA,
-        omnigraph::db::InitOptions {
-            actor_provenance: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    load_jsonl(&db, TEST_DATA, LoadMode::Merge).await.unwrap();
-    let desired = TEST_SCHEMA.replace(
-        "    age: I32?\n}",
-        "    age: I32?\n    nickname: String?\n}",
-    );
-    assert!(
-        db.apply_schema_as(&desired, Default::default(), Some(""))
-            .await
-            .unwrap()
-            .applied
-    );
-    assert!(!db.actor_provenance_enabled().await.unwrap());
-    assert!(!db.catalog().node_types.contains_key("OmniActor"));
 }

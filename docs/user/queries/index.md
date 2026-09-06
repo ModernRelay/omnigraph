@@ -2,7 +2,10 @@
 
 A `.gq` file contains named, typed queries. Read queries match graph patterns
 and return columns; mutation queries use the same declaration form and are
-covered in [Mutations](../mutations/index.md).
+covered in [Mutations](../mutations/index.md). A file may instead hold exactly
+one branch statement (`branch create`, `branch delete`, `branch merge`, or
+`branch list`), never beside a query declaration; see
+[Branches, Commits, and History](../branching/index.md).
 
 ```gq
 query engineers($title: String) @description("People with a title") {
@@ -99,8 +102,13 @@ column and return the column's own type; `Bool` orders `false` before `true`,
 dates and datetimes chronologically. When no row matches, a query whose
 projections are all aggregates returns one row: `count` is 0 and every other
 aggregate is null; a query that also projects a group value returns no rows.
-Each projection produces one result column, named by its alias or, without
-one, by its expression (`$p.name` gives `p.name`). Two projections that would
+A bare node variable returns the node as one object: its `id` and every
+property except `Blob` and `Vector` ones, so `return { $p }` gives a column
+`p` holding `{"id": "alice", "name": "alice", "age": 30}`; project a property
+(`$p.name`, `$p.embedding`) for a single field. `count($p)` counts rows; the
+other aggregates take a property, not a bare node binding (`T8`). Each
+projection produces one result column, named by its alias or, without one,
+by its expression (`$p.name` gives `p.name`). Two projections that would
 produce the same column name are refused at compile time (`T25`); give each
 its own alias.
 Search expressions are documented in [Search](../search/index.md).
@@ -163,6 +171,11 @@ its own. The spellings a consumer sees:
   (`1.0e20`, `1.0e-7`); a non-finite computed value is `null`.
 - `Vector(N)` and list properties are JSON arrays.
 
+On input, a `Date` string is a calendar day, `"2024-01-01"`; a string that
+carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is refused as a
+load value, a param, or a `date(...)` literal, and an instant belongs in a
+`DateTime` property.
+
 A `Date` or `DateTime` count outside the range the writer can format is refused
 on load. A read that meets one fails with status 500; the error names the
 column, the result row, and the count, and an `update` of that row repairs it.
@@ -175,10 +188,12 @@ Validate queries without running them:
 omnigraph lint --query queries.gq --schema schema.pg --json
 ```
 
-`Q000` identifies parse errors. `L201` warns when a nullable property is never
-set by any update query in the inspected set. Type errors report the affected
-query and source location. The command exits nonzero when the overall status is
-an error.
+`Q000` identifies parse errors. A file that holds a [branch
+statement](../branching/index.md) where query declarations were expected also
+reports `Q000`. `L201` warns when a nullable
+property is never set by any update query in the inspected set. Type errors
+report the affected query and source location. The command exits nonzero when
+the overall status is an error.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

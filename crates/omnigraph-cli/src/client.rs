@@ -29,16 +29,19 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent};
 use omnigraph_api_types::{
     BlobReadQuery, BlobStatOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
-    BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeBaselineOutput,
-    ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOpOutput, ChangeOutput,
-    ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, EntityKindOutput,
-    ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse, IngestOutput,
-    IngestRequest, InvokeStoredQueryRequest, QueryRequest, ReadOutput, SchemaApplyOutput,
-    SchemaApplyRequest, SchemaOutput, SnapshotOutput, change_baseline_output, change_feed_output,
-    change_scope, commit_changes_output, commit_output, ingest_receipt_output, read_output,
-    schema_apply_output, snapshot_payload,
+    BranchListOutput, BranchMergeOutcome, BranchMergeOutput, BranchMergeRequest,
+    BranchOutcomeOutput, ChangeBaselineOutput, ChangeBaselineRecord, ChangeBaselineRequest,
+    ChangeFeedOutput, ChangeOpOutput, ChangeOutput, ChangeRequest, CommitChangesOutput,
+    CommitListOutput, CommitOutput, EntityKindOutput, ErrorOutput, ExportRequest,
+    GraphBatchLoadOutput, GraphListResponse, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
+    QueryRequest, ReadOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
+    branch_list_read_output, change_baseline_output, change_feed_output, change_scope,
+    commit_changes_output, commit_output, ingest_receipt_output, read_output, schema_apply_output,
+    snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
+use omnigraph_compiler::query::ast::BranchWrite;
+use omnigraph_compiler::query::parser::parse_query;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
@@ -49,9 +52,10 @@ use crate::blob_cli::{
 };
 use crate::cli::CliLoadMode;
 use crate::helpers::{
-    apply_bearer_token, apply_server_flag, build_blob_http_client, build_http_client,
-    is_remote_uri, legacy_change_request_body, precondition_failed_cli, query_params_from_json,
-    remote_json, remote_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
+    apply_bearer_token, apply_server_flag, branch_statement_change_request,
+    branch_statement_query_request, build_blob_http_client, build_http_client, is_remote_uri,
+    legacy_change_request_body, precondition_failed_cli, query_params_from_json, remote_json,
+    remote_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
     resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
@@ -395,11 +399,9 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open_read_only(uri).await?;
-                let (schema_source, accepted_schema) = db.accepted_schema().await?;
+                let db = Omnigraph::open(uri).await?;
                 Ok(SchemaOutput {
-                    schema_source,
-                    accepted_schema: Some(accepted_schema),
+                    schema_source: db.schema_source().to_string(),
                 })
             }
         }
@@ -838,7 +840,8 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, actor } => {
-                let (selected_name, query_params) = select_named_query(query_source, query_name)?;
+                let (selected_name, query_params) =
+                    select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
                 let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
@@ -870,8 +873,126 @@ impl GraphClient {
                     affected_edges: receipt.result.affected_edges,
                     actor_id: actor.map(String::from),
                     commit: receipt.commit.as_ref().map(commit_output),
+                    outcome: None,
                 })
             }
+        }
+    }
+
+    /// A control write statement (`branch create`, `branch delete`, `branch
+    /// merge`) from `-e`/`--query`: `POST /mutate` with the source alone, or
+    /// the engine call the matching `branch` verb makes, answered as the
+    /// server answers it (`branch` received the effect, both counts `0`,
+    /// `commit` the target's head after a publishing merge).
+    pub(crate) async fn branch_write_statement(
+        &self,
+        query_source: &str,
+        write: BranchWrite,
+    ) -> Result<ChangeOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                remote_json_bounded(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["mutate"], &[])?,
+                    Some(serde_json::to_value(branch_statement_change_request(
+                        query_source,
+                    ))?),
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, actor } => {
+                let query_name = write.statement_name().to_string();
+                let (branch, commit, outcome) = match write {
+                    BranchWrite::Create { name, from } => {
+                        let from = from.unwrap_or_else(|| "main".to_string());
+                        self.branch_create_from(&from, &name).await?;
+                        (
+                            name.clone(),
+                            None,
+                            BranchOutcomeOutput::Created { from, name },
+                        )
+                    }
+                    BranchWrite::Delete { name } => {
+                        self.branch_delete(&name).await?;
+                        (name.clone(), None, BranchOutcomeOutput::Deleted { name })
+                    }
+                    BranchWrite::Merge { source, into } => {
+                        let target = into.unwrap_or_else(|| "main".to_string());
+                        let merge: BranchMergeOutcome =
+                            self.branch_merge(&source, &target, false).await?.outcome;
+                        let commit = match merge {
+                            BranchMergeOutcome::AlreadyUpToDate => None,
+                            BranchMergeOutcome::FastForward | BranchMergeOutcome::Merged => {
+                                match Self::open_embedded(uri).await {
+                                    Ok(db) => db
+                                        .list_commits(Some(&target))
+                                        .await
+                                        .ok()
+                                        .and_then(|commits| commits.first().map(commit_output)),
+                                    Err(_) => None,
+                                }
+                            }
+                        };
+                        (
+                            target.clone(),
+                            commit,
+                            BranchOutcomeOutput::Merged {
+                                source,
+                                target,
+                                merge,
+                            },
+                        )
+                    }
+                };
+                Ok(ChangeOutput {
+                    branch,
+                    query_name,
+                    affected_nodes: 0,
+                    affected_edges: 0,
+                    actor_id: actor.clone(),
+                    commit,
+                    outcome: Some(outcome),
+                })
+            }
+        }
+    }
+
+    /// The `branch list` statement from `-e`/`--query`: `POST /query` with
+    /// the source alone, or the engine's ref list in byte order, both as the
+    /// one `ReadOutput` shape (`branch_list_read_output`).
+    pub(crate) async fn branch_list_statement(&self, query_source: &str) -> Result<ReadOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                remote_json_bounded(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["query"], &[])?,
+                    Some(serde_json::to_value(branch_statement_query_request(
+                        query_source,
+                    ))?),
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => Ok(branch_list_read_output(
+                &self.branch_list().await?.branches,
+            )?),
         }
     }
 
@@ -914,7 +1035,8 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let (selected_name, query_params) = select_named_query(query_source, query_name)?;
+                let (selected_name, query_params) =
+                    select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
                 let db = Self::open_embedded(uri).await?;
                 let (result, graph_commit_id) = db
@@ -1122,7 +1244,6 @@ impl GraphClient {
         &self,
         schema_source: &str,
         allow_data_loss: bool,
-        actor_provenance: Option<bool>,
         validate: F,
     ) -> Result<SchemaApplyOutput>
     where
@@ -1146,7 +1267,6 @@ impl GraphClient {
                     Some(serde_json::to_value(SchemaApplyRequest {
                         schema_source: schema_source.to_string(),
                         allow_data_loss,
-                        actor_provenance,
                     })?),
                     token.as_deref(),
                 )
@@ -1157,10 +1277,7 @@ impl GraphClient {
                 let result = db
                     .apply_schema_as_with_catalog_check(
                         schema_source,
-                        omnigraph::db::SchemaApplyOptions {
-                            allow_data_loss,
-                            actor_provenance,
-                        },
+                        omnigraph::db::SchemaApplyOptions { allow_data_loss },
                         actor.as_deref(),
                         validate,
                     )

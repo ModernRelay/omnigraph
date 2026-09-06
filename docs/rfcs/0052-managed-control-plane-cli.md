@@ -182,7 +182,7 @@ HTTP tests must pass before recommending the managed client. Data-plane
 tokens, managed-store editing, provisioning, console, SSE, and persistent
 refresh tokens remain out of scope for this increment. Managed-store editing
 and service provisioning are extended by
-[RFC 0055](0055-managed-cluster-lifecycle.md).
+[RFC 0061](0061-managed-cluster-lifecycle.md).
 
 ## Unresolved questions
 
@@ -202,5 +202,5 @@ separate increment; this decision authorizes control-plane operations only.
 
 2026-09-06: The Rollout scope sentence now explicitly limits its deferral of
 managed-store editing and provisioning to this original increment, and links
-RFC 0055 as the owner of those additional client commands. Its authentication,
+RFC 0061 as the owner of those additional client commands. Its authentication,
 folder context, direct routing and exact-plan execution contract is unchanged.

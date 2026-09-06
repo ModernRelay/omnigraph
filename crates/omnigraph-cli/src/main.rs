@@ -5,9 +5,9 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
-    BlobContentKindOutput, BlobStatOutput, ChangeOutput, CommitOutput, ErrorOutput,
-    GraphBatchDeclarationOutput, GraphBatchLoadOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotDatasetOutput,
+    BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitOutput,
+    ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, IngestOutput, ReadOutput,
+    SchemaApplyOutput, SnapshotDatasetOutput,
 };
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOptions,
@@ -15,6 +15,7 @@ use omnigraph_cluster::{
     approve_config_dir, force_unlock_config_dir, import_config_dir, observe_config_dir,
     plan_config_dir_with_options, refresh_config_dir, status_config_dir, validate_config_dir,
 };
+use omnigraph_compiler::query::ast::{BranchStmt, BranchWrite, QueryFile};
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
@@ -331,12 +332,7 @@ async fn main() -> Result<()> {
                 print_embed_human(&output);
             }
         }
-        Command::Init {
-            schema,
-            uri,
-            force,
-            actor_provenance,
-        } => {
+        Command::Init { schema, uri, force } => {
             // RFC-010 Slice 3: graphs inside an established cluster are created
             // by `cluster apply` (which records ledger/recovery/approvals), not
             // by hand-running `init` into the cluster's storage layout.
@@ -361,10 +357,7 @@ async fn main() -> Result<()> {
             Omnigraph::init_with_options(
                 &uri,
                 &schema_source,
-                omnigraph::db::InitOptions {
-                    force,
-                    actor_provenance: actor_provenance.unwrap_or(true),
-                },
+                omnigraph::db::InitOptions { force },
             )
             .await?;
             println!("initialized {}", uri);
@@ -865,7 +858,6 @@ async fn main() -> Result<()> {
                 schema,
                 json,
                 allow_data_loss,
-                actor_provenance,
             } => {
                 let uri = resolve_maintenance_uri(
                     cli.profile.as_deref(),
@@ -877,14 +869,11 @@ async fn main() -> Result<()> {
                 )
                 .await?;
                 let schema_source = fs::read_to_string(&schema)?;
-                let db = Omnigraph::open_read_only(&uri).await?;
+                let db = Omnigraph::open(&uri).await?;
                 let plan = db
                     .plan_schema_with_options(
                         &schema_source,
-                        omnigraph::db::SchemaApplyOptions {
-                            allow_data_loss,
-                            actor_provenance,
-                        },
+                        omnigraph::db::SchemaApplyOptions { allow_data_loss },
                     )
                     .await?;
                 let output = SchemaPlanOutput {
@@ -904,7 +893,6 @@ async fn main() -> Result<()> {
                 schema,
                 json,
                 allow_data_loss,
-                actor_provenance,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
                     capability,
@@ -949,12 +937,7 @@ async fn main() -> Result<()> {
                 // no-op here on both arms.
                 echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
                 let output = client
-                    .apply_schema(
-                        &schema_source,
-                        allow_data_loss,
-                        actor_provenance,
-                        |_catalog| Ok(()),
-                    )
+                    .apply_schema(&schema_source, allow_data_loss, |_catalog| Ok(()))
                     .await?;
                 if json {
                     print_json(&output)?;
@@ -976,27 +959,7 @@ async fn main() -> Result<()> {
                 if json {
                     print_json(&output)?;
                 } else {
-                    println!("Customer schema source (.pg):");
                     println!("{}", output.schema_source);
-                    match output.accepted_schema.as_ref() {
-                        Some(schema) => match schema.actor_provenance.as_ref() {
-                            Some(binding) => {
-                                println!(
-                                    "Accepted actor provenance: {}",
-                                    if binding.enabled {
-                                        "enabled"
-                                    } else {
-                                        "disabled"
-                                    }
-                                );
-                                println!("System type: OmniActor {{ actorId: String @key }}");
-                            }
-                            None => {
-                                println!("Accepted actor provenance: disabled (no system binding)")
-                            }
-                        },
-                        None => println!("Accepted schema details: unavailable from this server"),
-                    }
                 }
             }
         },
@@ -1177,15 +1140,30 @@ async fn main() -> Result<()> {
                 .await?
             };
             let params_json = load_params_json(&params)?;
+            let has_target = branch.is_some() || snapshot.is_some();
             let target = resolve_read_target(branch, snapshot, None)?;
             let output: ReadOutput = if query.is_some() || query_string.is_some() {
                 // Ad-hoc lane: run the source; the positional `name` selects
                 // within it when it holds more than one query.
                 let query_source =
                     resolve_query_source(query.as_ref(), query_string.as_deref(), None)?;
-                client
-                    .query(target, &query_source, name.as_deref(), params_json.as_ref())
-                    .await?
+                match parse_query(&query_source) {
+                    Ok(QueryFile::Branch(stmt)) => {
+                        run_branch_list_statement_cli(
+                            &client,
+                            &query_source,
+                            stmt,
+                            has_target,
+                            name.is_some() || params_json.is_some(),
+                        )
+                        .await?
+                    }
+                    Ok(QueryFile::Queries(_)) | Err(_) => {
+                        client
+                            .query(target, &query_source, name.as_deref(), params_json.as_ref())
+                            .await?
+                    }
+                }
             } else {
                 // Catalog lane (served-only): invoke the stored query by name.
                 let Some(name) = name else {
@@ -1229,20 +1207,38 @@ async fn main() -> Result<()> {
                 .await?
             };
             let params_json = load_params_json(&params)?;
+            let has_target = branch.is_some();
             let branch = resolve_branch(branch, None, "main");
             let result: Result<ChangeOutput> = if query.is_some() || query_string.is_some() {
                 // Ad-hoc lane: run the source; positional `name` selects within it.
                 let query_source =
                     resolve_query_source(query.as_ref(), query_string.as_deref(), None)?;
-                client
-                    .mutate(
-                        &branch,
-                        &query_source,
-                        name.as_deref(),
-                        params_json.as_ref(),
-                        if_commit.as_deref(),
-                    )
-                    .await
+                match parse_query(&query_source) {
+                    Ok(QueryFile::Branch(stmt)) => {
+                        run_branch_statement_cli(
+                            &client,
+                            &query_source,
+                            stmt,
+                            has_target,
+                            name.is_some() || params_json.is_some(),
+                            if_commit.is_some(),
+                            cli.yes,
+                            json,
+                        )
+                        .await
+                    }
+                    Ok(QueryFile::Queries(_)) | Err(_) => {
+                        client
+                            .mutate(
+                                &branch,
+                                &query_source,
+                                name.as_deref(),
+                                params_json.as_ref(),
+                                if_commit.as_deref(),
+                            )
+                            .await
+                    }
+                }
             } else {
                 // Catalog lane (served-only): invoke the stored mutation by name.
                 let Some(name) = name else {
@@ -1746,6 +1742,47 @@ async fn main() -> Result<()> {
         },
     }
     Ok(())
+}
+
+/// The `query` door's branch-statement path: the door check, then the
+/// envelope refusals, then the round trip. The door rule itself is documented
+/// on `refuse_wrong_door` in `crates/omnigraph-server/src/handlers/dispatch.rs`.
+async fn run_branch_list_statement_cli(
+    client: &client::GraphClient,
+    query_source: &str,
+    stmt: BranchStmt,
+    has_target: bool,
+    has_name_or_params: bool,
+) -> Result<ReadOutput> {
+    if let BranchStmt::Write(write) = &stmt {
+        bail!("{}", control_write_at_read_door(write));
+    }
+    refuse_statement_envelope(has_target, has_name_or_params, false)?;
+    client.branch_list_statement(query_source).await
+}
+
+/// The `mutate` door's branch-statement path: door, envelope, delete consent,
+/// then the round trip, in the order `run_branch_statement` uses on the
+/// server (`crates/omnigraph-server/src/handlers/dispatch.rs`).
+#[allow(clippy::too_many_arguments)]
+async fn run_branch_statement_cli(
+    client: &client::GraphClient,
+    query_source: &str,
+    stmt: BranchStmt,
+    has_target: bool,
+    has_name_or_params: bool,
+    has_expected_head: bool,
+    yes: bool,
+    json: bool,
+) -> Result<ChangeOutput> {
+    let BranchStmt::Write(write) = stmt else {
+        bail!("{}", read_at_write_door());
+    };
+    refuse_statement_envelope(has_target, has_name_or_params, has_expected_head)?;
+    if let BranchWrite::Delete { .. } = &write {
+        confirm_destructive("branch delete", client.uri(), yes, json)?;
+    }
+    client.branch_write_statement(query_source, write).await
 }
 
 #[cfg(test)]

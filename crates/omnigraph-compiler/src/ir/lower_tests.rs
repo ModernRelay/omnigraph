@@ -32,8 +32,8 @@ return { $f.name, $f.age }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     assert_eq!(ir.pipeline.len(), 2); // NodeScan + Expand
     assert_eq!(ir.return_exprs.len(), 2);
@@ -41,8 +41,8 @@ return { $f.name, $f.age }
 
 fn lower(catalog: &Catalog, text: &str) -> QueryIR {
     let qf = parse_query(text).unwrap();
-    let tc = typecheck_query(catalog, &qf.queries[0]).unwrap();
-    lower_query(catalog, &qf.queries[0], &tc).unwrap()
+    let tc = typecheck_query(catalog, qf.single_decl()).unwrap();
+    lower_query(catalog, qf.single_decl(), &tc).unwrap()
 }
 
 fn expand_dsts(ir: &QueryIR) -> Vec<&str> {
@@ -196,7 +196,7 @@ fn test_typecheck_refuses_reserved_variable_prefix() {
         "query q() { match { $p: Person  $p $__w:knows $q } return { $q.name } }",
     ] {
         let qf = parse_query(text).unwrap();
-        let err = typecheck_query(&catalog, &qf.queries[0])
+        let err = typecheck_query(&catalog, qf.single_decl())
             .expect_err("reserved prefix must be refused")
             .to_string();
         assert!(err.contains("reserved for the compiler"), "{err}");
@@ -223,8 +223,8 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     let filter_ops: Vec<CompOp> = ir
         .pipeline
@@ -266,8 +266,8 @@ return { $b.text }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     let filter_ops: Vec<CompOp> = ir
         .pipeline
@@ -316,8 +316,8 @@ return { $f.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
     match &ir.pipeline[1] {
         IROp::Expand { direction, .. } => assert_eq!(*direction, Direction::Both),
         op => panic!("expected Expand, got {op:?}"),
@@ -343,8 +343,8 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
     let IROp::AntiJoin { inner, .. } = &ir.pipeline[1] else {
         panic!("expected AntiJoin, got {:?}", ir.pipeline[1]);
     };
@@ -373,8 +373,8 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     assert_eq!(ir.pipeline.len(), 2); // NodeScan + AntiJoin
     assert!(matches!(&ir.pipeline[1], IROp::AntiJoin { .. }));
@@ -391,10 +391,10 @@ update Person set { age: $age } where name = $name
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     assert!(matches!(checked, CheckedQuery::Mutation(_)));
 
-    let ir = lower_mutation_query(&qf.queries[0]).unwrap();
+    let ir = lower_mutation_query(qf.single_decl()).unwrap();
     match &ir.ops[0] {
         MutationOpIR::Update {
             type_name,
@@ -425,8 +425,8 @@ return { $f.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
     let expand = ir
         .pipeline
         .iter()
@@ -453,8 +453,8 @@ return { now() as ts }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     assert!(matches!(
         ir.return_exprs[0].expr,
@@ -484,10 +484,10 @@ update Event set { updated_at: now() } where updated_at = now()
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     assert!(matches!(checked, CheckedQuery::Mutation(_)));
 
-    let ir = lower_mutation_query(&qf.queries[0]).unwrap();
+    let ir = lower_mutation_query(qf.single_decl()).unwrap();
     match &ir.ops[0] {
         MutationOpIR::Update {
             assignments,
@@ -519,10 +519,10 @@ insert Knows { from: $name, to: $friend }
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     assert!(matches!(checked, CheckedQuery::Mutation(_)));
 
-    let ir = lower_mutation_query(&qf.queries[0]).unwrap();
+    let ir = lower_mutation_query(qf.single_decl()).unwrap();
     assert_eq!(ir.ops.len(), 2);
     assert!(matches!(&ir.ops[0], MutationOpIR::Insert { type_name, .. } if type_name == "Person"));
     assert!(matches!(&ir.ops[1], MutationOpIR::Insert { type_name, .. } if type_name == "Knows"));
@@ -545,8 +545,8 @@ return { $p.name, $c.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // Should be: NodeScan($p) → Expand($p→$c, dst_filters=[name=="Acme"])
     // NOT:       NodeScan($p) → NodeScan($c) → cross-join → cycle-close
@@ -578,8 +578,8 @@ return { $c.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // Should be: NodeScan($p,[name=Alice]) → Expand($p→$f, [name==Bob])
     //            → Expand($f→$c, [name==Acme])
@@ -614,8 +614,8 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // $c is root (first declared). $p is deferred (connected via traversal).
     // Traversal $p worksAt $c: $c is bound, $p is not → reverse expand.
@@ -645,8 +645,8 @@ return { $p.name, $c.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // No traversal connecting them → both get NodeScans (cross-join at runtime)
     assert_eq!(ir.pipeline.len(), 2);
@@ -671,8 +671,8 @@ return { $p.name, $c.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // $c binding is deferred (no filters) → just NodeScan + Expand
     assert_eq!(ir.pipeline.len(), 2);
@@ -703,8 +703,8 @@ return { $c.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // Even though "$f worksAt $c" is declared before "$p knows $f",
     // the iterative lowering processes "$p knows $f" first (because $p
@@ -742,8 +742,8 @@ return { $p.name, $c.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // $p and $c are in separate components (connected only through $_).
     // Both must get their own NodeScan — $c must NOT be deferred.
@@ -778,8 +778,8 @@ return { $f.name, $c.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // Root: $p. Deferred: $f, $c (both reachable from $p).
     assert_eq!(ir.pipeline.len(), 3);
@@ -816,8 +816,8 @@ return { $a.name, $b.name, $c.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // Root: $a (first in component {a,b,c}). Deferred: $b, $c.
     // $a knows $c: expand(a→c). $b knows $c: reverse expand(c→b).
@@ -854,8 +854,8 @@ return { $a.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // $b is deferred, introduced by first expand.
     // Second traversal ($b knows $a) is genuine cycle-closing.
@@ -893,8 +893,8 @@ return { $f.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // Two prop_matches → two dst_filters on the Expand.
     assert_eq!(ir.pipeline.len(), 2);
@@ -922,8 +922,8 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     assert_eq!(ir.pipeline.len(), 2);
     assert!(matches!(
@@ -959,8 +959,8 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
-    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
 
     // Outer: NodeScan($p) + AntiJoin
     assert_eq!(ir.pipeline.len(), 2);
