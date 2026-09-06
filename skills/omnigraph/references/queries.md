@@ -76,6 +76,12 @@ query recent_signals() {
 }
 ```
 
+A bare node variable projects the node as one object (`id` plus every
+property except `Blob` and `Vector` ones): `return { $s }` gives
+`{"id": "sig-1", "slug": "sig-1", "name": "…"}` under the column `s`;
+`sum`/`avg`/`min`/`max` refuse a bare node binding (`T8`), `count($s)` counts
+rows.
+
 ### Edge traversal (lowerCamelCase)
 
 Schema edges are PascalCase; traversal uses lowerCamelCase:
