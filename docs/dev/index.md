@@ -24,6 +24,7 @@ change boundaries, and test ownership. Design history and proposals belong in
 | Three-way branch integration | [Merge](merge.md) |
 | Managed and external Blob boundaries | [Blob internals](blob.md) |
 | Cluster apply, serving snapshots, and writer ownership | [Control plane](control-plane.md) |
+| Configuration authority, CLI operations, and coherence review | [Configuration and CLI framework](config-cli-framework.md) |
 | Bounded graph-batch ingestion | [Ingestion](ingestion.md) |
 | Release, wire, storage, and dependency compatibility | [Versioning](versioning.md) |
 
