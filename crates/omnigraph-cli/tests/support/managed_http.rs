@@ -13,6 +13,7 @@ pub struct IntentApiFixture {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     reply_count: usize,
+    session: Option<std::sync::Arc<std::sync::Mutex<Value>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,14 @@ impl IntentReply {
 
 impl IntentApiFixture {
     pub fn new(replies: Vec<IntentReply>) -> Self {
+        Self::start(replies, None)
+    }
+
+    pub fn with_session(replies: Vec<IntentReply>, session: Value) -> Self {
+        Self::start(replies, Some(session))
+    }
+
+    fn start(replies: Vec<IntentReply>, session: Option<Value>) -> Self {
         use std::io::Write;
         use std::sync::atomic::Ordering;
         use std::sync::{Arc, Mutex};
@@ -53,6 +62,8 @@ impl IntentApiFixture {
         let received = requests.clone();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped = stop.clone();
+        let session = session.map(|s| Arc::new(Mutex::new(s)));
+        let session_response = session.clone();
         let thread = std::thread::spawn(move || {
             let mut replies = std::collections::VecDeque::from(replies);
             while !stopped.load(Ordering::SeqCst) {
@@ -105,9 +116,16 @@ impl IntentApiFixture {
                         serde_json::from_slice(&body).unwrap()
                     },
                 });
-                let reply = replies.pop_front().unwrap_or_else(|| {
-                    IntentReply::json(500, serde_json::json!({"type":"unexpected_request"}))
-                });
+                let reply = if request_line[0] == "GET"
+                    && request_line[1] == "/v1/auth/session"
+                    && let Some(session) = &session_response
+                {
+                    IntentReply::json(200, session.lock().unwrap().clone())
+                } else {
+                    replies.pop_front().unwrap_or_else(|| {
+                        IntentReply::json(500, serde_json::json!({"type":"unexpected_request"}))
+                    })
+                };
                 let mut response = format!(
                     "HTTP/1.1 {} Fixture\r\nConnection: close\r\nContent-Type: application/json\r\n",
                     reply.status
@@ -133,6 +151,7 @@ impl IntentApiFixture {
             stop,
             thread: Some(thread),
             reply_count,
+            session,
         }
     }
 
@@ -140,9 +159,24 @@ impl IntentApiFixture {
         self.requests.lock().unwrap().clone()
     }
 
+    pub fn workflow_requests(&self) -> Vec<IntentRequest> {
+        self.requests()
+            .into_iter()
+            .filter(|request| {
+                self.session.is_none()
+                    || request.method != "GET"
+                    || request.path != "/v1/auth/session"
+            })
+            .collect()
+    }
+
+    pub fn set_session(&self, value: Value) {
+        *self.session.as_ref().unwrap().lock().unwrap() = value;
+    }
+
     pub fn assert_complete(&self) {
         assert_eq!(
-            self.requests().len(),
+            self.workflow_requests().len(),
             self.reply_count,
             "HTTP fixture request/reply count"
         );

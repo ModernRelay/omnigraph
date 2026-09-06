@@ -180,4 +180,4 @@ This table is the human index for the canonical RFC corpus.
 | [0052](0052-managed-control-plane-cli.md) | Managed control-plane CLI | maintainer | accepted | complete |
 | [0053](0053-offline-data-token-verification.md) | Offline data-token verification | maintainer | accepted | complete |
 | [0054](0054-default-actor-provenance.md) | Default graph actor provenance | maintainer | accepted | complete |
-| [0055](0055-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | in-progress |
+| [0055](0055-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |

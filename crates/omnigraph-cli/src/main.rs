@@ -1717,7 +1717,11 @@ async fn main() -> Result<()> {
             }
             ClusterCommand::History { .. }
             | ClusterCommand::Cancel { .. }
-            | ClusterCommand::Token { .. } => {
+            | ClusterCommand::Token { .. }
+            | ClusterCommand::Create { .. }
+            | ClusterCommand::Delete { .. }
+            | ClusterCommand::UndoDelete { .. }
+            | ClusterCommand::Push { .. } => {
                 unreachable!("managed dispatch refuses managed-only verbs without context")
             }
         },

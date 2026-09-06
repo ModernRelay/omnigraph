@@ -3,7 +3,7 @@ rfc: "0055"
 title: "Managed cluster lifecycle and config preparation"
 track: maintainer
 status: accepted
-implementation: in-progress
+implementation: complete
 authors:
   - Andrew
 created: 2026-09-06
@@ -137,13 +137,15 @@ local wait.
 
 ## Evidence and tests
 
-Extend the existing bounded HTTP fixture in `omnigraph-cli/tests/cli_cluster.rs`
-to cover exact create/delete/undo requests, operation identity mismatches,
+The existing bounded HTTP fixture in `omnigraph-cli/tests/cli_cluster.rs`
+covers exact create/delete/undo requests, operation identity mismatches,
 uncertain create replay across timeout and gateway responses, principal/account
 changes and session renewal, context preservation, pending-key conflicts,
 bounded waits, managed-file capture and no Core effects on refusal.
-Run the existing CLI unit and cluster process owners before and after changes,
-plus strict CLI Clippy, formatting and documentation checks.
+The clean baseline managed suite passed 15 tests. The completed implementation
+passed all 99 CLI unit and 57 cluster process tests on 2026-09-06, including ten
+lifecycle process tests, plus strict CLI Clippy, formatting and documentation
+checks. The host linker emits the same unwind-size warning as the baseline.
 The companion control-plane repository owns authorization, lifecycle storage,
 operator cleanup and the real local cell proof; HTTP fixtures do not qualify
 cloud provisioning or isolation.
@@ -164,3 +166,7 @@ None for this bounded client increment.
 its explicit service authority boundary before code. The control-plane
 DEC-08-28 owns the companion service workflow; this RFC owns only its public
 CLI contract and compatibility.
+
+2026-09-06: Completed the bounded client implementation and owned local
+regressions. Managed upload is qualified on Unix; other platforms refuse it.
+The companion service owns cell qualification and cloud rollout separately.

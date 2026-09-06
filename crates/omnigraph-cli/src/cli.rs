@@ -524,6 +524,55 @@ pub(crate) enum BlobCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClusterCommand {
+    /// Create an empty managed cluster and bind an unbound folder to its identity.
+    Create {
+        name: String,
+        #[arg(long)]
+        api: String,
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        managed: ManagedRunArgs,
+    },
+    /// Upload only referenced configuration files to the managed repository.
+    Push {
+        #[arg(long)]
+        expected_revision: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete this exact managed incarnation; nonzero retention waits to tombstone.
+    Delete {
+        #[arg(long)]
+        incarnation: String,
+        #[arg(long, default_value_t = 86400, value_parser = clap::value_parser!(u32).range(0..=2592000))]
+        retention_seconds: u32,
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        managed: ManagedRunArgs,
+    },
+    /// Undo an exact retained deletion through the ordinary managed bootstrap.
+    UndoDelete {
+        #[arg(long)]
+        incarnation: String,
+        #[arg(long)]
+        deletion_id: String,
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        managed: ManagedRunArgs,
+    },
     /// Cache a scoped data credential for this managed cluster, or forget it locally.
     Token {
         #[arg(long, default_value = ".")]
@@ -599,7 +648,20 @@ pub(crate) enum ClusterCommand {
     /// Read the local JSON state ledger without scanning live graph resources.
     Status {
         /// Managed: inspect a run instead of the cluster projections.
+        #[arg(conflicts_with = "operation")]
         run_id: Option<String>,
+        /// Managed: inspect a service lifecycle operation instead of a run.
+        #[arg(long)]
+        operation: Option<String>,
+        /// Managed operation recovery before a folder context exists.
+        #[arg(long, requires = "operation")]
+        api: Option<String>,
+        /// Poll a lifecycle operation to its canonical outcome.
+        #[arg(long, requires = "operation")]
+        wait: bool,
+        /// Managed operation wait deadline (default 300, maximum 3600 seconds).
+        #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: Option<u64>,
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
