@@ -427,7 +427,11 @@ fn json_value_to_literal_typed(
             Ok(Literal::Bool(value))
         }
         "Date" => match value {
-            Value::String(value) => Ok(Literal::Date(value.clone())),
+            Value::String(value) => {
+                crate::types::check_date_literal(value)
+                    .map_err(|reason| RunInputError::message(format!("param '{key}': {reason}")))?;
+                Ok(Literal::Date(value.clone()))
+            }
             other => Err(match mode {
                 JsonParamMode::Standard => {
                     RunInputError::message(format!("param '{}': expected date string", key))

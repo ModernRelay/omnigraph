@@ -2688,7 +2688,9 @@ fn parse_date32_json_value(property: &str, value: &JsonValue) -> Result<Option<i
         return Ok(Some(checked_date32(days)?));
     }
     if let Some(value) = value.as_str() {
-        return Ok(Some(parse_date32_literal(value)?));
+        return parse_date32_literal(value)
+            .map(Some)
+            .map_err(|e| OmniError::manifest(format!("property '{property}': {e}")));
     }
     Err(OmniError::manifest(format!(
         "invalid Date value {value} for property '{property}': expected an integer day count or a date string"
@@ -2711,7 +2713,9 @@ fn parse_date64_json_value(property: &str, value: &JsonValue) -> Result<Option<i
         return Ok(Some(checked_date64(ms)?));
     }
     if let Some(value) = value.as_str() {
-        return Ok(Some(parse_date64_literal(value)?));
+        return parse_date64_literal(value)
+            .map(Some)
+            .map_err(|e| OmniError::manifest(format!("property '{property}': {e}")));
     }
     Err(OmniError::manifest(format!(
         "invalid DateTime value {value} for property '{property}': expected an integer millisecond count or a datetime string"
@@ -2741,6 +2745,14 @@ fn generate_id() -> String {
 }
 
 pub(crate) fn parse_date32_literal(value: &str) -> Result<i32> {
+    omnigraph_compiler::check_date_literal(value).map_err(OmniError::manifest)?;
+    cast_date32_literal(value)
+}
+
+/// The bare arrow `Utf8 -> Date32` cast, time-bearing strings read as their UTC day.
+/// `parse_date32_literal` fronts it with the check; the legacy explicit-id compare
+/// calls it bare, since old writers derived those ids through this very cast.
+fn cast_date32_literal(value: &str) -> Result<i32> {
     let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(value)]));
     let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date32)
         .map_err(|e| OmniError::manifest(format!("invalid Date literal '{}': {}", value, e)))?;
@@ -3124,7 +3136,7 @@ fn explicit_id_matches_scalar_key(array: &ArrayRef, row: usize, explicit: &str) 
         let parsed = explicit
             .parse::<i32>()
             .ok()
-            .or_else(|| parse_date32_literal(explicit).ok());
+            .or_else(|| cast_date32_literal(explicit).ok());
         return Ok(parsed == Some(a.value(row)));
     }
     if let Some(a) = array.as_any().downcast_ref::<Date64Array>() {
@@ -3369,6 +3381,51 @@ edge WorksAt: Person -> Company
                 .timestamp_millis()
         );
         assert!(parse_date64_literal("+10000-13-01T00:00:00").is_err());
+    }
+
+    /// The load surface refuses a `Date` string with a time of day; a Rust test
+    /// because a `.gqt` seed refusal is a harness failure, not an expectation.
+    /// The param and literal surfaces: `cases/issue_671_date_string_with_time_of_day_refused.gqt`.
+    #[tokio::test]
+    async fn load_refuses_date_string_with_a_time_of_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let version_before = db.version().await;
+
+        let rows = r#"{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Person", "data": {"name": "Bob"}}
+{"edge": "Knows", "from": "Alice", "to": "Bob", "data": {"since": "2024-01-01T02:00:00+05:00"}}
+"#;
+        let err = load_jsonl(&db, rows, LoadMode::Overwrite)
+            .await
+            .expect_err("a datetime string in a Date? property fails the load");
+        assert!(
+            err.to_string().contains(
+                "invalid Date literal '2024-01-01T02:00:00+05:00': a Date is a calendar day (YYYY-MM-DD); a string with a time of day belongs in a DateTime"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            db.version().await,
+            version_before,
+            "a refused load leaves no commit behind"
+        );
+    }
+
+    /// Pins the premise the refusal rests on: arrow's `Utf8 -> Date32` cast
+    /// routes an unsigned string over 10 bytes through its instant parser.
+    #[test]
+    fn date_string_with_a_time_of_day_takes_arrows_instant_route() {
+        let raw: Arc<dyn Array> =
+            Arc::new(StringArray::from(vec![Some("2024-01-01T02:00:00+05:00")]));
+        let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date32).unwrap();
+        let days = casted.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(days.value(0), 19_722, "arrow keeps the UTC day, 2023-12-31");
+
+        assert!(parse_date32_literal("2024-01-01T02:00:00+05:00").is_err());
+        assert!(parse_date32_literal("+2024-01-01T02:00:00+05:00").is_err());
+        assert_eq!(parse_date32_literal("+2024-01-01").unwrap(), 19_723);
     }
 
     #[test]
@@ -4265,6 +4322,10 @@ node Doc {
                 "1.23456789",
             ),
             (Arc::new(Date32Array::from(vec![19_723])), "2024-01-01"),
+            (
+                Arc::new(Date32Array::from(vec![19_722])),
+                "2024-01-01T02:00:00+05:00",
+            ),
             (
                 Arc::new(Date64Array::from(vec![1_704_067_200_000])),
                 "2024-01-01T00:00:00Z",

@@ -3,6 +3,19 @@ use serde::{Deserialize, Serialize};
 
 const MAX_VECTOR_DIM: u32 = i32::MAX as u32;
 
+/// Refuse a `Date` string that carries a time of day. Arrow's `Utf8 -> Date32`
+/// cast parses any unsigned string longer than 10 bytes as an instant and keeps
+/// its UTC calendar day, so `2024-01-01T02:00:00+05:00` would store 2023-12-31.
+pub fn check_date_literal(value: &str) -> Result<(), String> {
+    let signed_extended_year = value.starts_with(['+', '-']);
+    if signed_extended_year || value.len() <= 10 {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid Date literal '{value}': a Date is a calendar day (YYYY-MM-DD); a string with a time of day belongs in a DateTime"
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScalarType {
     String,

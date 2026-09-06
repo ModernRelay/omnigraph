@@ -77,7 +77,10 @@ A `Date` value is an integer day count since 1970-01-01 or a `YYYY-MM-DD`
 string; a `DateTime` value is an integer millisecond count since the Unix epoch
 or an ISO 8601 string. Any other JSON type (a float such as `19723.0`, a
 boolean, an object) fails the load with `invalid Date value` or `invalid
-DateTime value` naming the property.
+DateTime value` naming the property. A `Date` string carries no time of day:
+`"2024-01-01T02:00:00+05:00"` fails the load with `invalid Date literal`, as it
+does in a mutation param, a `date(...)` literal, or a read filter; an instant
+belongs in a `DateTime` property.
 
 Choose the mode explicitly:
 

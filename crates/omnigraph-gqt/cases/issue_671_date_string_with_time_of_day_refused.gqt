@@ -1,0 +1,88 @@
+# issue: 671
+# red_on: 2026-09-06, pre-fix build at 54afa755: the +05:00 insert succeeded and stored 2023-12-31, the date() literal and the Z param matched no rows, and a seed of the same string read back as 2023-12-31 (the filed case).
+# notes: A Date string with a time of day is refused on every user-facing entry;
+# notes: loader entry: loader/mod.rs load_refuses_date_string_with_a_time_of_day.
+
+--- schema
+node Event {
+    name: String @key
+    day: Date?
+}
+
+--- seed
+{"type":"Event","data":{"name":"west","day":"2024-01-01"}}
+
+--- mutate
+query insert_event($name: String, $day: Date) {
+    insert Event { name: $name, day: $day }
+}
+
+--- params
+{"name": "east", "day": "2024-01-01T02:00:00+05:00"}
+
+--- expect error: param 'day': invalid Date literal '2024-01-01T02:00:00+05:00': a Date is a calendar day (YYYY-MM-DD); a string with a time of day belongs in a DateTime
+
+--- mutate
+query touch_on_datetime_literal() {
+    update Event set { name: "moved" } where day = date("2024-01-01T02:00:00+05:00")
+}
+
+--- expect error: invalid Date literal '2024-01-01T02:00:00+05:00'
+
+--- query
+query filter_on_datetime_literal() {
+    match {
+        $e: Event
+        $e.day = date("2024-01-01T02:00:00+05:00")
+    }
+    return { $e.name }
+}
+
+--- expect error: invalid Date literal '2024-01-01T02:00:00+05:00': a Date is a calendar day (YYYY-MM-DD); a string with a time of day belongs in a DateTime
+
+--- query
+query filter_on_datetime_param($day: Date) {
+    match {
+        $e: Event
+        $e.day = $day
+    }
+    return { $e.name }
+}
+
+--- params
+{"day": "2024-01-01T00:00:00Z"}
+
+--- expect error: param 'day': invalid Date literal '2024-01-01T00:00:00Z'
+
+--- query
+query read_back() {
+    match {
+        $e: Event
+    }
+    return { $e.name, $e.day }
+}
+
+--- expect unordered
+{"e.name": "west", "e.day": "2024-01-01"}
+
+--- expect shape
+e.name: String
+e.day: Date?
+
+--- query
+query filter_on_callers_day($day: Date) {
+    match {
+        $e: Event
+        $e.day = $day
+    }
+    return { $e.name }
+}
+
+--- params
+{"day": "2024-01-01"}
+
+--- expect unordered
+{"e.name": "west"}
+
+--- expect shape
+e.name: String
