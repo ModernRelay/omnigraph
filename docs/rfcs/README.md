@@ -38,10 +38,10 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0059**; lower gaps are historical and must
+The next available number is **0061**; lower gaps are historical and must
 not be reused (0047 and 0048 are allocated by PR #606; 0050 by the
 `rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0058 by
-PR #662 for retained merged ancestry).
+PR #662 for retained merged ancestry; 0059 by PR #675).
 
 ## Required frontmatter
 
@@ -183,3 +183,4 @@ This table is the human index for the canonical RFC corpus.
 | [0054](0054-default-actor-provenance.md) | Default graph actor provenance | maintainer | accepted | complete |
 | [0055](0055-gq-branch-statements.md) | Branch statements in GQ | maintainer | draft | not-started |
 | [0057](0057-bounded-merge-preparation.md) | Accepted-context reuse and bounded merge preparation | maintainer | accepted | in-progress |
+| [0060](0060-branch-ops-v2.md) | Branch operations v2 | maintainer | draft | not-started |
