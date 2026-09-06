@@ -41,7 +41,18 @@ def source_identity():
 
 
 def matrix(smoke, extended, selected, history_only=False,
-           cache_state="cold", manifest_layout="uncompacted"):
+           cache_state="cold", manifest_layout="uncompacted", merge_tables=None,
+           io_delay_ms=0):
+    if merge_tables is not None:
+        return [{"name": f"tables{tables}-history{history}-delay{io_delay_ms}-general-merge-updates",
+                 "scenario": "general-merge-updates",
+                 "params": {"rows": 4, "dims": 4, "seed": 42, "tables": tables,
+                            "delta_rows": 2, "target_delta_rows": 2, "source_mode": "update",
+                            "io_delay_ms": io_delay_ms, "history_commits": history,
+                            "retired_branches": 0, "cache_state": cache_state,
+                            "manifest_layout": manifest_layout}}
+                for history in ([0, 16, 64] if history_only else [0])
+                for tables in merge_tables]
     shapes = [("smoke", 2, 1, 2, 2)] if smoke else [
         ("fresh", 0, 0, 2, 2), ("history16", 16, 0, 2, 2),
         ("history64", 64, 0, 2, 2), ("retired8", 0, 8, 2, 2),
@@ -59,7 +70,7 @@ def matrix(smoke, extended, selected, history_only=False,
                       "history_commits": history, "retired_branches": retired,
                       "cache_state": cache_state, "manifest_layout": manifest_layout}
             if scenario == "general-merge-updates":
-                params.update(delta_rows=2, source_mode="update")
+                params.update(delta_rows=2, target_delta_rows=8, source_mode="update", tables=1, io_delay_ms=0)
             else:
                 params.update(branches=branches, tables=tables)
             points.append({"name": f"{shape}-{scenario}", "scenario": scenario, "params": params})
@@ -106,7 +117,7 @@ def admit(records, point, runs, identity, binary_hash):
         require(metrics.get("prewarm_wall_us", -1) >= 0, "Missing prewarm timing")
         require(metrics.get("prewarm_branch_views") == (expected_branches if cache_state == "warm" else 0),
                 "Prewarm did not capture the requested branch views")
-        expected_tables = 1 if point["scenario"] == "general-merge-updates" else point["params"]["tables"]
+        expected_tables = point["params"]["tables"]
         require(metrics.get("prewarm_table_views") == (expected_branches * expected_tables if cache_state == "warm" else 0),
                 "Prewarm did not capture the requested table views")
         layout = point["params"]["manifest_layout"]
@@ -141,11 +152,26 @@ def admit(records, point, runs, identity, binary_hash):
                     "Missing non-vacuous fork first-read proof")
             require(isinstance(metrics.get("first_read_io_manifest_reads"), int), "Missing first-read accounting")
         if point["scenario"] == "general-merge-updates":
-            require(metrics.get("merge_outcome") == "merged" and metrics.get("final_rows") == 16,
+            rows = point["params"]["rows"]
+            require(metrics.get("merge_outcome") == "merged" and metrics.get("final_rows") == rows,
                     "Merge did not verify the expected route and row count")
-            require(metrics.get("verified_complete_main_rows") == 16
-                    and metrics.get("verified_complete_source_rows") == 16,
+            require(metrics.get("verified_complete_main_rows") == rows * expected_tables
+                    and metrics.get("verified_complete_source_rows") == rows * expected_tables,
                     "Merge did not verify every target and source row")
+            require(metrics.get("setup_table_count") == metrics.get("verified_table_count") == expected_tables,
+                    "Table count was ignored or not verified")
+            require(metrics.get("setup_total_main_rows") == metrics.get("setup_total_source_rows")
+                    == rows * expected_tables, "Fixture is not the requested tiny merge shape")
+            tables = metrics.get("setup_tables", [])
+            require(len(tables) == expected_tables
+                    and len({table["type_key"] for table in tables}) == expected_tables
+                    and all(table["main_rows"] == table["source_rows"] == rows for table in tables),
+                    "Missing unique per-table setup receipts")
+            require(metrics.get("verified_source_head_and_pins_unchanged") is True,
+                    "Source head and exact table versions were not verified")
+            require(metrics.get("io_delay_ms") == point["params"]["io_delay_ms"]
+                    and metrics.get("io_delay_calls", 0) > 0,
+                    "Requested physical store delay was not exercised")
         else:
             require(metrics.get("verification_passed") is True, "Missing branch verification")
 
@@ -185,6 +211,12 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="one tiny aged/churned fixture per operation")
     parser.add_argument("--extended", action="store_true", help="also vary sibling count and table count separately")
     parser.add_argument("--history-only", action="store_true", help="only H0/H16/H64; omit retired-branch churn")
+    parser.add_argument("--merge-tables", action="store_true",
+                        help="four rows per table, two source/target edits; one/eight/29 table merges only")
+    parser.add_argument("--table-count", choices=(1, 4, 8, 29), type=int, action="append",
+                        help="select fewer tiny merge table counts; requires --merge-tables")
+    parser.add_argument("--io-delay-ms", choices=(0, 17), type=int, default=0,
+                        help="synthetic asynchronous ObjectStore-call delay, merge-table mode only")
     parser.add_argument("--cache-state", choices=("cold", "warm"), default="cold",
                         help="fresh handle, or separately recorded metadata prewarm on that handle")
     parser.add_argument("--manifest-layout", choices=("uncompacted", "compacted"), default="uncompacted",
@@ -196,8 +228,15 @@ def main():
     require(1 <= args.timeout_seconds <= 600, "--timeout-seconds must be between 1 and 600")
     require(not (args.smoke and args.extended), "Choose smoke or extended")
     require(not (args.history_only and (args.smoke or args.extended)), "--history-only is separate from smoke/extended")
+    require(not args.merge_tables or not (args.smoke or args.extended or args.scenario),
+            "--merge-tables selects its own merge-only matrix")
+    require(args.merge_tables or not (args.table_count or args.io_delay_ms),
+            "--table-count and --io-delay-ms require --merge-tables")
+    merge_tables = list(dict.fromkeys(args.table_count or [1, 8, 29])) if args.merge_tables else None
+    require(not merge_tables or (args.cache_state == "cold" and args.manifest_layout == "uncompacted")
+            or max(merge_tables) <= 8, "Warm/compacted controls support at most eight tables")
     points = matrix(args.smoke, args.extended, list(dict.fromkeys(args.scenario or SCENARIOS)),
-                    args.history_only, args.cache_state, args.manifest_layout)
+                    args.history_only, args.cache_state, args.manifest_layout, merge_tables, args.io_delay_ms)
     if args.plan:
         print(json.dumps(points, indent=2))
         return

@@ -41,6 +41,43 @@ Hold the delta fixed while changing `--rows` to measure scaling, and run
 classification paths. Verify mode executes both paths and is not comparable
 to a single-path throughput sample.
 
+### Tiny multi-table merge fixtures
+
+The same `general-merge-updates` scenario accepts `--tables 1..29` (default
+one) and `--target-delta-rows` (default eight). Each table has the same vector
+schema, base row count and disjoint source/target edits. Multi-table fixtures
+are limited to 256 rows per table and 16 vector dimensions. For example,
+`--tables 8 --rows 4 --dims 4 --delta-rows 2 --target-delta-rows 2` has 32
+logical rows, with two edits on each side in every table. Setup publishes all
+tables together, so the graph commit count is independent of table count.
+Verification checks every target/source row and the unchanged source head and
+exact table pins outside the measured process.
+
+`--io-delay-ms 0..100` adds asynchronous delay to wrapped graph ObjectStore
+calls during the merge only. The same controller reaches Lance child tasks.
+It covers get/head, put, multipart begin/part/complete/abort, copy and one delay
+per list/delete stream. It excludes private local scratch, wire retries,
+individual list pages and body transfer. These are synthetic API-call latency
+diagnostics; they do not establish S3 performance. Records include the applied
+delay and the number of wrapped calls that observed it, including the zero-delay
+control.
+
+The existing sequential driver selects small table-width points explicitly:
+
+```bash
+python3 scripts/bench-branch-age.py --plan --merge-tables --io-delay-ms 17
+python3 scripts/bench-branch-age.py --plan --merge-tables --table-count 4
+python3 scripts/bench-branch-age.py --plan --merge-tables --table-count 8 --history-only
+```
+
+Default table counts are one/eight/29, four rows per table, two disjoint edits
+on each side and no history. Select zero and 17 ms in separate invocations;
+`--history-only` explicitly adds H0/H16/H64. The saved release binary/build
+receipt, process isolation, source checks and resource settings below apply.
+No compilation or large fixtures are selected implicitly. Compare the exact
+same fixture code on the pre-change and refactored source revisions; a forced
+serial run of refactored code is only an additional differential control.
+
 ### Small graph-age fixtures
 
 `--history-commits N` adds paired, real updates of one existing row before

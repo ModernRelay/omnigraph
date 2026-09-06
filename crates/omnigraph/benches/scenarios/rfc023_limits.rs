@@ -9,6 +9,31 @@ pub(crate) const RECOVERY_MAX_TRANSACTIONS: usize = 1024;
 /// Maximum source-version interval eligible for the pure-insert proof walk.
 pub(crate) const PURE_INSERT_HISTORY_MAX_VERSIONS: usize = 1024;
 
+/// Multi-table latency diagnostics must stay small even when a caller changes
+/// the large, single-table scenario's ordinary row/vector defaults.
+pub(crate) fn validate_merge_table_shape(
+    tables: usize,
+    rows: usize,
+    dims: usize,
+    source_delta: usize,
+    target_delta: usize,
+    io_delay_ms: u64,
+) -> Result<(), String> {
+    if !(1..=29).contains(&tables) {
+        return Err("general merge requires --tables between 1 and 29".into());
+    }
+    if tables > 1 && (rows > 256 || dims > 16) {
+        return Err("multi-table merge fixtures require rows <= 256 and dims <= 16".into());
+    }
+    if source_delta == 0 || target_delta == 0 || source_delta.saturating_add(target_delta) > rows {
+        return Err("nonzero source and target deltas must fit disjointly inside --rows".into());
+    }
+    if io_delay_ms > 100 {
+        return Err("--io-delay-ms must be at most 100".into());
+    }
+    Ok(())
+}
+
 /// Explicit controls are diagnostic setup choices, never silent fallbacks.
 pub(crate) fn validate_view_controls(
     cache_state: &str,
@@ -185,6 +210,31 @@ pub(crate) fn require_single_batch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tiny_merge_shapes_are_bounded_and_diverged() {
+        for tables in [1, 4, 8, 29] {
+            for delay in [0, 17] {
+                assert!(super::validate_merge_table_shape(tables, 4, 4, 2, 2, delay).is_ok());
+            }
+        }
+        for shape in [
+            (0, 4, 4, 2, 2, 0),
+            (30, 4, 4, 2, 2, 0),
+            (8, 257, 4, 2, 2, 0),
+            (8, 4, 17, 2, 2, 0),
+            (1, 4, 4, 2, 3, 0),
+            (1, 4, 4, 2, 0, 0),
+            (1, 4, 4, 2, 2, 101),
+        ] {
+            assert!(
+                super::validate_merge_table_shape(
+                    shape.0, shape.1, shape.2, shape.3, shape.4, shape.5
+                )
+                .is_err()
+            );
+        }
+        assert!(super::validate_merge_table_shape(1, 20_000, 256, 50, 8, 0).is_ok());
+    }
     #[test]
     fn derives_against_rows_and_bytes() {
         let ordinary = super::derive_strict_chunk_plan(256, "adopt-new", 100_000).unwrap();
