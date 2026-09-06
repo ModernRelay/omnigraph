@@ -64,6 +64,22 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     );
     let (_, after) = json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
     assert_eq!(after, before, "denial must not publish a commit");
+    let actor_request = |token: &str| {
+        Request::builder().uri(g("/read")).method(Method::POST)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({
+                "query_source": "query actors() { match { $a: OmniActor } return { $a.actorId } }",
+                "branch": "main"
+            }).to_string())).unwrap()
+    };
+    let (status, actors) = json_response(&app, actor_request(&read)).await;
+    assert_eq!(status, StatusCode::OK, "{actors}");
+    assert_eq!(
+        actors["rows"],
+        json!([]),
+        "reads and denied writes create no actor"
+    );
     let (status, _) = json_response(
         &app,
         get_request("/graphs/hidden/snapshot?branch=main", &read),
@@ -95,6 +111,38 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     let (_, commits) = json_response(&app, get_request(&g("/commits?branch=main"), &write)).await;
     assert_eq!(commits["commits"][0]["actor_id"], tokens.actor);
     assert_ne!(commits, before);
+    let (status, actors) = json_response(&app, actor_request(&write)).await;
+    assert_eq!(status, StatusCode::OK, "{actors}");
+    assert_eq!(
+        actors["rows"],
+        json!([{"a.actorId": tokens.actor}]),
+        "the verified principal, never x-actor-id, becomes the graph actor"
+    );
+
+    let renewed = tokens.token(json!([
+        {"graph_id":"default","actions":["read","change"]},
+        {"graph_id":"reports","actions":["read"]}
+    ]));
+    assert_ne!(renewed, write);
+    let request = Request::builder()
+        .uri(g("/mutate"))
+        .method(Method::POST)
+        .header("authorization", format!("Bearer {renewed}"))
+        .header("x-actor-id", "breakglass")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"query":MUTATION_QUERIES,"name":"set_age",
+            "params":{"name":"Signed","age":29},"branch":"main"})
+            .to_string(),
+        ))
+        .unwrap();
+    let (status, body) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, renewed_actors) = json_response(&app, actor_request(&renewed)).await;
+    assert_eq!(
+        renewed_actors["rows"], actors["rows"],
+        "a new credential for the same principal reuses its actor node"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

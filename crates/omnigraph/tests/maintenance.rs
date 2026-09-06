@@ -117,14 +117,15 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
 
     let stats = db.optimize().await.unwrap();
 
-    // Schema declares 2 nodes + 2 edges = 4 data tables, plus the one internal
-    // system table optimize compacts (`__manifest`, RFC-013 step 2) = 5. Graph
+    // Schema declares 2 nodes + 2 edges, with the default actor node = 5 data
+    // tables, plus the internal `__manifest` table (RFC-013 step 2) = 6. Graph
     // lineage lives in `__manifest` (Phase B retired the commit-graph datasets),
     // so there is no separate lineage table to compact. Compaction runs on each
     // but finds nothing to merge: the genesis graph commit rides the SINGLE init
     // `__manifest` write (RFC-013 Phase 7), so a fresh graph has one fragment per
     // table — nothing to compact anywhere.
-    assert_eq!(stats.len(), 5);
+    assert_eq!(stats.len(), 6);
+    assert!(stats.iter().any(|stat| stat.type_key == "node:OmniActor"));
     for s in &stats {
         assert_eq!(s.fragments_removed, 0, "{} should not remove", s.type_key);
         assert_eq!(s.fragments_added, 0, "{} should not add", s.type_key);
@@ -497,8 +498,10 @@ node Doc {
     }
     assert_eq!(db.list_commits(None).await.unwrap().len(), commits_before);
     let rebuilt = db.rebuild_full_text_indices_on("main").await.unwrap();
-    assert_eq!(rebuilt.rebuilt_indexes.len(), 1);
+    assert_eq!(rebuilt.rebuilt_indexes.len(), 2);
     assert_eq!(rebuilt.rebuilt_indexes[0].property, "slug");
+    assert_eq!(rebuilt.rebuilt_indexes[1].type_key, "node:OmniActor");
+    assert_eq!(rebuilt.rebuilt_indexes[1].property, "actorId");
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("node:Doc").await.unwrap();
     assert!(
@@ -1211,6 +1214,10 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
             property: "name".to_string(),
         },
         RebuiltFullTextIndex {
+            type_key: "node:OmniActor".to_string(),
+            property: "actorId".to_string(),
+        },
+        RebuiltFullTextIndex {
             type_key: "node:Person".to_string(),
             property: "biography".to_string(),
         },
@@ -1242,7 +1249,12 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
         before.graph_manifest_version() + 1
     );
 
-    for (table_key, expected_fts) in [("edge:Knows", 1), ("node:Company", 1), ("node:Person", 2)] {
+    for (table_key, expected_fts) in [
+        ("edge:Knows", 1),
+        ("node:Company", 1),
+        ("node:OmniActor", 1),
+        ("node:Person", 2),
+    ] {
         let old = before.open_dataset(table_key).await.unwrap();
         let new = after.open_dataset(table_key).await.unwrap();
         assert_eq!(
@@ -1329,7 +1341,7 @@ async fn full_text_rebuild_first_touches_inherited_main_without_changing_main() 
 
     let result = db.rebuild_full_text_indices_on("feature").await.unwrap();
     assert_eq!(result.branch, "feature");
-    assert_eq!(result.rebuilt_indexes.len(), 2);
+    assert_eq!(result.rebuilt_indexes.len(), 3);
     let feature = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
     let main_after = snapshot_main(&db).await.unwrap();
     for table_key in ["node:Person", "node:Company"] {
@@ -1364,6 +1376,21 @@ async fn full_text_rebuild_first_touches_inherited_main_without_changing_main() 
             "first touch must publish new full-text artifacts"
         );
     }
+    let actor = feature.dataset("node:OmniActor").unwrap();
+    helpers::assert_native_branch_of(actor.native_dataset_branch.as_deref(), "feature");
+    assert!(
+        feature
+            .open_dataset("node:OmniActor")
+            .await
+            .unwrap()
+            .has_fts_index("actorId")
+            .await
+            .unwrap()
+    );
+    assert_same_dataset_entry(
+        main_before.dataset("node:OmniActor").unwrap(),
+        main_after.dataset("node:OmniActor").unwrap(),
+    );
     for table_key in ["edge:Knows", "edge:WorksAt"] {
         assert_same_dataset_entry(
             inherited.dataset(table_key).unwrap(),
@@ -1392,9 +1419,15 @@ async fn full_text_rebuild_first_touches_inherited_main_without_changing_main() 
 #[tokio::test]
 async fn full_text_rebuild_reports_empty_builds_but_not_no_work() {
     let no_fts = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(
+    // The no-work fixture intentionally has no node String index, including
+    // the builtin actor key. The default-on empty-build fixture follows below.
+    let db = Omnigraph::init_with_options(
         no_fts.path().to_str().unwrap(),
         "node Doc { n: I64 @key }\nedge Link: Doc -> Doc { note: String @index }",
+        omnigraph::db::InitOptions {
+            actor_provenance: false,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -1415,17 +1448,21 @@ async fn full_text_rebuild_reports_empty_builds_but_not_no_work() {
         .unwrap();
     let before = snapshot_main(&db).await.unwrap();
     let result = db.rebuild_full_text_indices_on("main").await.unwrap();
-    assert_eq!(result.rebuilt_indexes.len(), 2);
+    assert_eq!(result.rebuilt_indexes.len(), 3);
     assert!(result.graph_commit_id.is_some());
     let after = snapshot_main(&db).await.unwrap();
     assert_eq!(
         after.graph_manifest_version(),
         before.graph_manifest_version() + 1
     );
-    for table_key in ["node:Person", "node:Company"] {
+    for (table_key, property) in [
+        ("node:Person", "name"),
+        ("node:Company", "name"),
+        ("node:OmniActor", "actorId"),
+    ] {
         let table = after.open_dataset(table_key).await.unwrap();
         assert_eq!(table.count_rows(None).await.unwrap(), 0);
-        assert!(table.has_fts_index("name").await.unwrap());
+        assert!(table.has_fts_index(property).await.unwrap());
         assert_eq!(
             after.dataset(table_key).unwrap().published_dataset_version,
             before.dataset(table_key).unwrap().published_dataset_version + 1

@@ -10,20 +10,23 @@ pub mod schema;
 pub mod types;
 
 pub use catalog::schema_ir::{
-    ConstraintIR, EdgeIR, EmbedSourceIR, FieldRefIR, InterfaceIR, NodeIR, PropertyIR,
+    ACTOR_ID_PROPERTY_NAME, ACTOR_TYPE_NAME, ActorProvenanceBinding, ConstraintIR, EdgeIR,
+    EmbedSourceIR, FieldRefIR, InterfaceIR, LEGACY_SCHEMA_IR_VERSION, NodeIR, PropertyIR,
     PropertyRefIR, SCHEMA_IR_VERSION, SchemaIR, SchemaIdentityDiagnostic,
     SchemaIdentityDiagnosticKind, SchemaIdentityDomain, SchemaResolution, StablePropertyId,
     StableTypeId, SystemFieldRefIR, SystemFieldRole, TableIncarnationId, TypeRefIR,
-    initialize_schema_ir, resolve_schema_ir, schema_ir_hash, schema_ir_json, schema_ir_pretty_json,
-    schema_shape_from_ir, schema_shape_hash_from_ir, validate_schema_ir,
+    initialize_schema_ir, initialize_schema_ir_with_actor_provenance, resolve_schema_ir,
+    resolve_schema_ir_with_actor_provenance, schema_ir_hash, schema_ir_json, schema_ir_pretty_json,
+    schema_shape_from_ir, schema_shape_hash_from_ir, schema_source_shape_hash_from_ir,
+    validate_schema_ir,
 };
 pub use catalog::schema_plan::{
     DropMode, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
 };
 pub use catalog::schema_shape::{
     EdgeShape, EmbedSourceShape, InterfaceShape, NodeShape, PropertyConstraintShape, PropertyShape,
-    SchemaShape, ShapePropertyRef, compile_schema_shape, schema_shape_hash, schema_shape_json,
-    schema_shape_pretty_json,
+    SchemaShape, ShapePropertyRef, compile_schema_shape, compile_schema_source_shape,
+    schema_shape_hash, schema_shape_json, schema_shape_pretty_json,
 };
 pub use catalog::{CatalogIdentity, build_catalog, build_catalog_from_ir};
 pub use ir::ParamMap;

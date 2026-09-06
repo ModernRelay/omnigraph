@@ -20,6 +20,78 @@ mod support;
 use support::*;
 
 #[tokio::test]
+async fn schema_actor_provenance_http_matches_embedded_options() {
+    let source = fs::read_to_string(fixture("test.pg")).unwrap();
+    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
+        &source,
+        &[("act-ragnor", "admin-token")],
+        STORED_QUERY_SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+    let direct = init_graph_with_schema(&source).await;
+    let direct_db = Omnigraph::open(graph_path(direct.path()).to_str().unwrap())
+        .await
+        .unwrap();
+    for enabled in [Some(false), None, Some(true)] {
+        let expected = direct_db
+            .apply_schema_as(
+                &source,
+                omnigraph::db::SchemaApplyOptions {
+                    actor_provenance: enabled,
+                    ..Default::default()
+                },
+                Some("act-ragnor"),
+            )
+            .await
+            .unwrap();
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .method(Method::POST)
+                .uri(g("/schema/apply"))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer admin-token")
+                .body(Body::from(
+                    serde_json::to_vec(&SchemaApplyRequest {
+                        schema_source: source.clone(),
+                        actor_provenance: enabled,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], expected.applied);
+        assert_eq!(body["steps"], serde_json::to_value(expected.steps).unwrap());
+        let remote_db = Omnigraph::open_read_only(graph_path(temp.path()).to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            remote_db.actor_provenance_enabled().await.unwrap(),
+            direct_db.actor_provenance_enabled().await.unwrap()
+        );
+        assert!(remote_db.catalog().node_types.contains_key("OmniActor"));
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(g("/schema"))
+                .header("authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let output: SchemaOutput = serde_json::from_value(body).unwrap();
+        assert_eq!(output.schema_source, source);
+        let (_, accepted) = remote_db.accepted_schema().await.unwrap();
+        assert_eq!(output.accepted_schema, Some(accepted));
+    }
+}
+
+#[tokio::test]
 async fn schema_apply_route_updates_graph_for_authorized_admin() {
     let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
@@ -607,6 +679,24 @@ async fn schema_route_returns_current_source() {
     assert_eq!(status, StatusCode::OK);
     let output: SchemaOutput = serde_json::from_value(body).unwrap();
     assert!(output.schema_source.contains("node Person"));
+    assert!(!output.schema_source.contains("OmniActor"));
+    let accepted = output.accepted_schema.unwrap();
+    let binding = accepted.actor_provenance.unwrap();
+    assert!(binding.enabled);
+    let actor = accepted
+        .nodes
+        .iter()
+        .find(|node| node.name == "OmniActor")
+        .unwrap();
+    assert_eq!(actor.type_id, binding.type_id);
+    assert_eq!(actor.table_incarnation_id, binding.table_incarnation_id);
+    assert!(
+        actor
+            .properties
+            .iter()
+            .any(|property| property.name == "actorId"
+                && property.property_id == binding.actor_id_property_id)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -690,10 +780,12 @@ async fn schema_apply_route_soft_drops_property_via_http() {
     let graph = graph_path(temp.path());
     {
         let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-        db.load(
+        db.load_as(
             "main",
+            None,
             r#"{"type":"Person","data":{"name":"PreDrop","age":42}}"#,
             LoadMode::Append,
+            Some("act-ragnor"),
         )
         .await
         .unwrap();
@@ -802,10 +894,12 @@ async fn schema_apply_route_hard_drops_property_with_allow_data_loss() {
     let graph = graph_path(temp.path());
     {
         let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-        db.load(
+        db.load_as(
             "main",
+            None,
             r#"{"type":"Person","data":{"name":"PreDropHard","age":50}}"#,
             LoadMode::Append,
+            Some("act-ragnor"),
         )
         .await
         .unwrap();
@@ -823,6 +917,7 @@ async fn schema_apply_route_hard_drops_property_with_allow_data_loss() {
                 serde_json::to_vec(&SchemaApplyRequest {
                     schema_source: schema_without_age(),
                     allow_data_loss: true,
+                    ..Default::default()
                 })
                 .unwrap(),
             ))
@@ -878,6 +973,7 @@ async fn schema_apply_route_keeps_drops_soft_without_flag() {
                 serde_json::to_vec(&SchemaApplyRequest {
                     schema_source: schema_without_age(),
                     allow_data_loss: false,
+                    ..Default::default()
                 })
                 .unwrap(),
             ))
@@ -903,9 +999,10 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
     // AddProperty wasn't pinned with a row-count check anywhere.
     // Load N rows, apply schema adding nullable property, verify
     // every row is still readable and the new column is null.
-    let (temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+    let (temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy_as(
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
+        Some("act-ragnor"),
     )
     .await;
     let graph = graph_path(temp.path());

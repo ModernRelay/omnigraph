@@ -1002,6 +1002,11 @@ pub struct SchemaApplyRequest {
     /// Defaults to `false` (drops remain reversible via time travel).
     #[serde(default)]
     pub allow_data_loss: bool,
+    /// Desired automatic actor materialization. Omission preserves the accepted
+    /// graph setting; disabling preserves existing actor nodes and attribution
+    /// history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_provenance: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1017,7 +1022,14 @@ pub struct SchemaApplyOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchemaOutput {
+    /// Original customer-authored `.pg` source, suitable for a later apply.
+    /// System-owned types are described by `accepted_schema`, not appended here.
     pub schema_source: String,
+    /// Accepted identity-bearing schema, including effective system types and
+    /// their actor-provenance binding. Absent only on older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Value>)]
+    pub accepted_schema: Option<omnigraph_compiler::SchemaIR>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

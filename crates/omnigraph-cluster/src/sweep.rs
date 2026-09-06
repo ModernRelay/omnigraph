@@ -82,21 +82,43 @@ pub(crate) async fn sweep_graph_create_sidecar(
 
     match Omnigraph::open_read_only(&sidecar.graph_uri).await {
         Ok(db) => {
-            let live_digest = sha256_hex(db.schema_source().as_bytes());
+            let (live_source, live_schema) = match db.accepted_schema().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    diagnostics.push(Diagnostic::error(
+                        "cluster_recovery_pending",
+                        &graph_address,
+                        format!("could not verify accepted actor provenance: {error}"),
+                    ));
+                    outcome.pending_graphs.insert(sidecar.graph_id);
+                    return;
+                }
+            };
+            let live_digest = sha256_hex(live_source.as_bytes());
+            let live_actor_provenance = live_schema
+                .actor_provenance
+                .is_some_and(|binding| binding.enabled);
             let recorded = state
                 .applied_revision
                 .resources
                 .get(&schema_addr)
                 .map(|resource| resource.digest.clone());
-            if recorded.as_deref() == Some(live_digest.as_str()) {
+            if recorded.as_deref() == Some(live_digest.as_str())
+                && recorded_actor_matches(state, &schema_addr, &sidecar, live_actor_provenance)
+            {
                 // Row 2: crash fell between the state CAS and sidecar delete.
                 outcome.completed_sidecars.push(path);
-            } else if live_digest == sidecar.desired_schema_digest {
+            } else if live_digest == sidecar.desired_schema_digest
+                && sidecar
+                    .desired_actor_provenance
+                    .is_none_or(|enabled| enabled == live_actor_provenance)
+            {
                 // Row 4: the create completed on the graph; roll the cluster
                 // state forward to observable reality.
                 state.applied_revision.resources.insert(
                     schema_addr.clone(),
                     StateResource {
+                        actor_provenance: Some(live_actor_provenance),
                         digest: live_digest.clone(),
                         applies_to: None,
                         embedding_provider: None,
@@ -121,6 +143,7 @@ pub(crate) async fn sweep_graph_create_sidecar(
                 state.applied_revision.resources.insert(
                     graph_address.clone(),
                     StateResource {
+                        actor_provenance: None,
                         digest: composite,
                         applies_to: None,
                         embedding_provider,
@@ -214,8 +237,19 @@ pub(crate) async fn sweep_schema_apply_sidecar(
 
     // Digest-based classification: robust to unrelated manifest movement;
     // the sidecar's version pins stay forensic.
-    let live_digest = match Omnigraph::open_read_only(&sidecar.graph_uri).await {
-        Ok(db) => sha256_hex(db.schema_source().as_bytes()),
+    let live: omnigraph::error::Result<(String, bool)> = async {
+        let db = Omnigraph::open_read_only(&sidecar.graph_uri).await?;
+        let (source, schema) = db.accepted_schema().await?;
+        Ok((
+            sha256_hex(source.as_bytes()),
+            schema
+                .actor_provenance
+                .is_some_and(|binding| binding.enabled),
+        ))
+    }
+    .await;
+    let (live_digest, live_actor_provenance) = match live {
+        Ok(observed) => observed,
         Err(err) => {
             // Cannot verify the interrupted operation — refuse to guess.
             diagnostics.push(Diagnostic::warning(
@@ -236,16 +270,23 @@ pub(crate) async fn sweep_schema_apply_sidecar(
         .resources
         .get(&schema_addr)
         .map(|resource| resource.digest.clone());
-    if recorded.as_deref() == Some(live_digest.as_str()) {
+    if recorded.as_deref() == Some(live_digest.as_str())
+        && recorded_actor_matches(state, &schema_addr, &sidecar, live_actor_provenance)
+    {
         // Ledger consistent with the live graph (the apply never landed, or
         // landed and was recorded): the sidecar is stale intent — retire it.
         outcome.completed_sidecars.push(path);
-    } else if live_digest == sidecar.desired_schema_digest {
+    } else if live_digest == sidecar.desired_schema_digest
+        && sidecar
+            .desired_actor_provenance
+            .is_none_or(|enabled| enabled == live_actor_provenance)
+    {
         // RFC-004 §D3 row 3: the schema apply completed on the graph; roll
         // the cluster state forward to observable reality.
         state.applied_revision.resources.insert(
             schema_addr.clone(),
             StateResource {
+                actor_provenance: Some(live_actor_provenance),
                 digest: live_digest.clone(),
                 applies_to: None,
                 embedding_provider: None,
@@ -269,6 +310,7 @@ pub(crate) async fn sweep_schema_apply_sidecar(
         state.applied_revision.resources.insert(
             graph_address.clone(),
             StateResource {
+                actor_provenance: None,
                 digest: composite,
                 applies_to: None,
                 embedding_provider,
@@ -316,6 +358,26 @@ pub(crate) async fn sweep_schema_apply_sidecar(
             "an interrupted schema apply left unexpected graph state; graph-moving work is blocked until repaired",
         ));
         outcome.pending_graphs.insert(sidecar.graph_id.clone());
+    }
+}
+
+fn recorded_actor_matches(
+    state: &ClusterState,
+    schema_address: &str,
+    sidecar: &RecoverySidecar,
+    live: bool,
+) -> bool {
+    match state
+        .applied_revision
+        .resources
+        .get(schema_address)
+        .and_then(|resource| resource.actor_provenance)
+        .or(sidecar.observed_actor_provenance)
+    {
+        Some(recorded) => recorded == live,
+        // Old records predate the option. Their source-only classification is
+        // retained, but cannot retire a new explicit toggle by its bytes alone.
+        None => sidecar.desired_actor_provenance.is_none(),
     }
 }
 

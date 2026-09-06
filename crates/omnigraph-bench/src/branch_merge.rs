@@ -808,9 +808,18 @@ pub async fn initialize_local_fixture(
         ));
     }
     let schema = schema_source(plan.tables);
-    let db = Omnigraph::init(root_uri, &schema)
-        .await
-        .map_err(|error| fixture_error(format!("initialize fixture at {root_uri}: {error}")))?;
+    // Builder-v2 freezes the historical schema and table-count cost contract;
+    // default system tables belong in a separately versioned fixture recipe.
+    let db = Omnigraph::init_with_options(
+        root_uri,
+        &schema,
+        omnigraph::db::InitOptions {
+            actor_provenance: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|error| fixture_error(format!("initialize fixture at {root_uri}: {error}")))?;
     let base_load_commits = load_base(&db, plan).await?;
     if u64::try_from(base_load_commits).ok() != Some(preflight.base_load_commits) {
         return Err(fixture_error(format!(

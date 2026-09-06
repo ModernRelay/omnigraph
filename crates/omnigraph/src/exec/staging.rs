@@ -20,8 +20,10 @@
 //! `record_delete`) and stage through the same `stage_* → commit_staged`
 //! path as writes — `stage_delete` produces a deletion-vector transaction
 //! that advances no Lance HEAD until the end-of-query commit. The parse-time
-//! D₂ rule keeps inserts/updates and deletes from mixing in one query, so
-//! `pending` and `delete_predicates` never overlap on a table.
+//! D₂ rule keeps inserts/updates and deletes from mixing in the caller's query.
+//! RFC 0054 may add one actor insert as a protocol-owned participant on its
+//! protected table; user mutations cannot target that table. Thus `pending`
+//! and `delete_predicates` still never overlap on a table.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

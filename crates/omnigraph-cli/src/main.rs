@@ -331,7 +331,12 @@ async fn main() -> Result<()> {
                 print_embed_human(&output);
             }
         }
-        Command::Init { schema, uri, force } => {
+        Command::Init {
+            schema,
+            uri,
+            force,
+            actor_provenance,
+        } => {
             // RFC-010 Slice 3: graphs inside an established cluster are created
             // by `cluster apply` (which records ledger/recovery/approvals), not
             // by hand-running `init` into the cluster's storage layout.
@@ -356,7 +361,10 @@ async fn main() -> Result<()> {
             Omnigraph::init_with_options(
                 &uri,
                 &schema_source,
-                omnigraph::db::InitOptions { force },
+                omnigraph::db::InitOptions {
+                    force,
+                    actor_provenance: actor_provenance.unwrap_or(true),
+                },
             )
             .await?;
             println!("initialized {}", uri);
@@ -857,6 +865,7 @@ async fn main() -> Result<()> {
                 schema,
                 json,
                 allow_data_loss,
+                actor_provenance,
             } => {
                 let uri = resolve_maintenance_uri(
                     cli.profile.as_deref(),
@@ -868,11 +877,14 @@ async fn main() -> Result<()> {
                 )
                 .await?;
                 let schema_source = fs::read_to_string(&schema)?;
-                let db = Omnigraph::open(&uri).await?;
+                let db = Omnigraph::open_read_only(&uri).await?;
                 let plan = db
                     .plan_schema_with_options(
                         &schema_source,
-                        omnigraph::db::SchemaApplyOptions { allow_data_loss },
+                        omnigraph::db::SchemaApplyOptions {
+                            allow_data_loss,
+                            actor_provenance,
+                        },
                     )
                     .await?;
                 let output = SchemaPlanOutput {
@@ -892,6 +904,7 @@ async fn main() -> Result<()> {
                 schema,
                 json,
                 allow_data_loss,
+                actor_provenance,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
                     capability,
@@ -936,7 +949,12 @@ async fn main() -> Result<()> {
                 // no-op here on both arms.
                 echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
                 let output = client
-                    .apply_schema(&schema_source, allow_data_loss, |_catalog| Ok(()))
+                    .apply_schema(
+                        &schema_source,
+                        allow_data_loss,
+                        actor_provenance,
+                        |_catalog| Ok(()),
+                    )
                     .await?;
                 if json {
                     print_json(&output)?;
@@ -958,7 +976,27 @@ async fn main() -> Result<()> {
                 if json {
                     print_json(&output)?;
                 } else {
+                    println!("Customer schema source (.pg):");
                     println!("{}", output.schema_source);
+                    match output.accepted_schema.as_ref() {
+                        Some(schema) => match schema.actor_provenance.as_ref() {
+                            Some(binding) => {
+                                println!(
+                                    "Accepted actor provenance: {}",
+                                    if binding.enabled {
+                                        "enabled"
+                                    } else {
+                                        "disabled"
+                                    }
+                                );
+                                println!("System type: OmniActor {{ actorId: String @key }}");
+                            }
+                            None => {
+                                println!("Accepted actor provenance: disabled (no system binding)")
+                            }
+                        },
+                        None => println!("Accepted schema details: unavailable from this server"),
+                    }
                 }
             }
         },

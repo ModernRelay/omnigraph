@@ -3,7 +3,7 @@ rfc: "0054"
 title: "Default graph actor provenance"
 track: maintainer
 status: accepted
-implementation: not-started
+implementation: complete
 authors:
   - Codex
 created: 2026-09-06
@@ -40,8 +40,10 @@ and stable schema identity rules apply. The managed server derives
 reuses the same actor. A served caller cannot select a different trusted actor
 through a query parameter or header.
 
-An actor identifier is 1–1024 UTF-8 bytes and contains no ASCII control
-characters. Invalid attributed identities refuse before graph effects. The
+When automatic actor provenance is enabled, an actor identifier is 1–1024
+UTF-8 bytes and contains no ASCII control characters. Invalid attributed
+identities refuse before graph effects; legacy and opted-out graphs retain
+their existing opaque commit-attribution strings. The
 engine does not trim, case-fold, hash into a different public identity, or
 infer an identity from an email or display name. Unattributed operations retain
 `actor_id: None` and create no actor node. Direct writers remain self-asserted;
@@ -62,6 +64,12 @@ shared by initialization, schema evolution, source/IR validation, catalog
 construction and schema inspection. The source schema remains customer-owned;
 the accepted schema and catalog include the built-in. No separate mutable
 registry or configuration sidefile duplicates this authority.
+
+Graph inspection exposes unchanged customer source separately from the full
+accepted schema and binding. Query lint against a graph uses that accepted
+catalog. Generic source-only compilation and offline `lint --schema` remain
+unbound; use a graph target to validate queries or customer edges that refer
+to the built-in. The source file alone cannot establish accepted ownership.
 
 `Actor` remains available for any customer-defined domain type. The engine
 does not adopt an unbound `OmniActor` declaration by its spelling: a collision
@@ -161,9 +169,11 @@ to untracked writes. Unsupported behavior is never evidence of full coverage.
 
 Existing graph schemas, actor strings and version-2 stores remain readable.
 Graphs with a version-3 binding require a compatible writer even when
-materialization is disabled. Opt-out is not a downgrade operation. Restoring
-or exporting graph state preserves the accepted schema binding and actor
-content; a raw data import cannot forge protected actor identities.
+materialization is disabled. Opt-out is not a downgrade operation. A complete
+graph-state restore preserves the accepted schema binding and actor content.
+Ordinary data exports include actor rows under their normal selection rules,
+but are not a provenance-preserving restore format: replaying protected rows
+through raw data import refuses, and must not silently drop them.
 
 Rollout order is engine contract and tests, transport/config plumbing, then a
 coordinated managed dependency/image update and explicit pilot migration.

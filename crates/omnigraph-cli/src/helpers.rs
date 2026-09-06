@@ -902,9 +902,11 @@ pub(crate) async fn execute_query_lint(
     }
 
     let uri = resolve_local_uri(cli_uri, "lint")?;
-    let db = Omnigraph::open(&uri).await?;
+    let db = Omnigraph::open_read_only(&uri).await?;
+    let (_, accepted_schema) = db.accepted_schema().await?;
+    let catalog = omnigraph_compiler::build_catalog_from_ir(&accepted_schema)?;
     Ok(lint_query_file(
-        &db.catalog(),
+        &catalog,
         &query_source,
         query_path,
         QueryLintSchemaSource::graph(uri),
