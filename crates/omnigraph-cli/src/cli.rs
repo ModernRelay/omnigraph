@@ -22,8 +22,14 @@ repair, cleanup, schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
 --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
+MANAGED FOLDERS: cluster commands use .omnigraph/context; cluster token caches data access.\n\
+query and mutate require --graph and a cached data credential. --direct selects legacy addressing.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
+    /// Explicitly use legacy addressing and credentials, ignoring folder context.
+    #[arg(long, global = true)]
+    pub(crate) direct: bool,
+
     /// Actor id for direct-engine writes and actor-bound cluster operations;
     /// overrides `operator.actor`. No effect on remote writes (the server
     /// resolves the actor from the bearer token). With a policy configured
@@ -41,7 +47,7 @@ pub(crate) struct Cli {
     /// Select a graph within a multi-graph scope: on a `--server` it appends
     /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
     /// graph to maintain. Rejected on a single-graph address (a positional URI /
-    /// `--store`).
+    /// `--store`). Required for managed data queries, mutations, and token issuance.
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 
@@ -284,6 +290,9 @@ pub(crate) enum Command {
         /// overwrites an initialized graph or purges its Lance datasets.
         #[arg(long)]
         force: bool,
+        /// Materialize attributed writers as OmniActor nodes (default: true).
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        actor_provenance: Option<bool>,
     },
     /// Compact small Lance fragments in every backing dataset of the graph
     Optimize {
@@ -364,11 +373,8 @@ pub(crate) enum Command {
     },
 
     // ── Control plane ── manage a cluster directory (--config <dir>).
-    /// Validate and plan read-only cluster configuration.
+    /// Manage cluster configuration or the folder's selected managed cluster.
     Cluster {
-        /// Explicitly use the direct Core path, ignoring folder context.
-        #[arg(long, global = true)]
-        direct: bool,
         #[command(subcommand)]
         command: ClusterCommand,
     },
@@ -518,6 +524,22 @@ pub(crate) enum BlobCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClusterCommand {
+    /// Cache a scoped data credential for this managed cluster, or forget it locally.
+    Token {
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// Comma-separated data actions, such as read,change.
+        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        actions: Option<String>,
+        /// Credential lifetime, 60 seconds to 24 hours (default 1h).
+        #[arg(long, value_parser = crate::managed::data::parse_ttl, conflicts_with = "clear")]
+        ttl: Option<u64>,
+        /// Forget this cluster's cached data credential; does not revoke it at the server.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Validate cluster.yaml and referenced schemas, queries, and policy files.
     Validate {
         /// Cluster config directory containing cluster.yaml.
@@ -739,6 +761,9 @@ pub(crate) enum SchemaCommand {
         /// so the plan output reflects the destructive intent.
         #[arg(long, default_value_t = false)]
         allow_data_loss: bool,
+        /// Change automatic actor materialization; omission preserves the accepted setting.
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        actor_provenance: Option<bool>,
     },
     /// Apply a supported schema migration
     Apply {
@@ -759,8 +784,11 @@ pub(crate) enum SchemaCommand {
         /// making the prior data unreachable.
         #[arg(long, default_value_t = false)]
         allow_data_loss: bool,
+        /// Change automatic actor materialization; omission preserves the accepted setting.
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        actor_provenance: Option<bool>,
     },
-    /// Show the current accepted schema source
+    /// Show customer source and effective system types; --json includes the accepted schema
     #[command(alias = "get")]
     Show {
         /// Graph URI

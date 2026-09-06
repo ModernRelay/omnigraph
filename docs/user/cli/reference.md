@@ -50,7 +50,7 @@ token.
 | `commit list/show/changes` | Inspect history or one commit's entity changes | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
-| `schema show` | Read the accepted schema | direct or served |
+| `schema show` | Read customer source and discover accepted system types | direct or served |
 | `schema apply` | Apply a schema to a standalone graph | direct |
 | `schema plan` | Preview a schema migration | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
@@ -74,6 +74,31 @@ covered in [Maintenance](../operations/maintenance.md).
 `rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
 `--as` for actor attribution. Direct maintenance does not load server policy;
 see the [rebuild procedure](../operations/maintenance.md#rebuild-full-text-indexes).
+
+## Schema and actor provenance
+
+`init`, `schema plan`, and `schema apply` accept
+`--actor-provenance true|false`. New graphs default to `true`; plan and apply
+preserve an existing graph's accepted setting when the flag is omitted.
+Changing only the flag still produces a schema migration:
+
+```bash
+omnigraph init graph.omni --schema graph.pg --actor-provenance false
+omnigraph schema plan graph.omni --schema graph.pg --actor-provenance true
+omnigraph schema apply graph.omni --schema graph.pg --actor-provenance true
+omnigraph schema show graph.omni --json
+```
+
+Disabling retains an established `OmniActor` type, rows, and history. See
+[Actor provenance](../schema/index.md) for identity and write rules.
+
+`schema show --json` and `GET /schema` return unchanged customer `.pg` text
+in `schema_source`, and accepted structured types and binding in
+`accepted_schema` (absent on older servers). Write only `schema_source` back
+to desired `.pg` files. Human output labels source and system types separately.
+
+Use `lint --store graph.omni --query actors.gq` for accepted types;
+`lint --schema current.pg` validates only customer source.
 
 ## Query inputs and output
 
@@ -277,7 +302,7 @@ Status and history reads exit 0 when retrieved successfully. Abandoning a
 saved plan preserves its converged result and exits 0. Managed apply does not
 prompt for an additional approval: the API checks the authenticated caller's
 permissions. `--as`, `--server`, `--profile`, `--graph`, `--store`, and the
-global `--cluster` selector do not apply to managed commands.
+global `--cluster` selector do not apply to these managed cluster operations.
 
 For unattended execution, provide an explicitly scoped automation token and
 its API origin together:
@@ -298,6 +323,12 @@ Without a context, existing direct cluster commands behave as before.
 `--direct` or without a context refuse. Other cluster verbs, including
 `approve`, `observe`, `refresh`, and `force-unlock`, refuse when a managed
 context is present. API failures never trigger direct execution.
+
+## Managed data access
+
+Use `cluster token` to cache scoped data authority, then `query` or `mutate`
+with `--graph` from the managed folder. See [managed data access](managed-data.md)
+for permissions, offline behavior, expiry, and local credential clearing.
 
 ## Confirmation rules
 

@@ -587,7 +587,9 @@ jobs:
   v5_v6_format_fence:
     name: V5 ↔ V6 Format Fence
     needs: classify_changes
-    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    # Pull requests too, as a reporting context like `Test Workspace`: a
+    # fence red reports on the pull request instead of first appearing on `main`.
+    if: needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # This job owns the immutable predecessor build in parallel with the
     # current-tree workspace job. The 2026-07-28 cold measurement was 25m40s
@@ -618,6 +620,7 @@ jobs:
             . -> target
           key: crossversion-v5-v6
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       # CI pins only the immediate predecessor. Older seams remain env-gated
       # and on-demand, per docs/dev/testing.md.

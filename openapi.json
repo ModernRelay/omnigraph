@@ -3284,8 +3284,8 @@
         "tags": [
           "schema"
         ],
-        "summary": "Read the current schema source.",
-        "description": "Returns the project's schema as a single string in `.pg` source form.\nUseful for clients that want to introspect available types and properties\nbefore constructing GQ queries. Read-only.",
+        "summary": "Read the customer source and accepted effective schema.",
+        "description": "`schema_source` preserves the project's `.pg` source. `accepted_schema`\ndescribes all queryable types, including the system-owned OmniActor type\nand its stable provenance binding. Both come from one coherent, read-only\naccepted schema view; the system type is never appended to customer source.",
         "operationId": "cluster_getSchema",
         "parameters": [
           {
@@ -3300,7 +3300,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Current schema source",
+            "description": "Customer source and accepted effective schema",
             "content": {
               "application/json": {
                 "schema": {
@@ -5347,6 +5347,13 @@
           "schema_source"
         ],
         "properties": {
+          "actor_provenance": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Desired automatic actor materialization. Omission preserves the accepted\ngraph setting; disabling preserves existing actor nodes and attribution\nhistory."
+          },
           "allow_data_loss": {
             "type": "boolean",
             "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, making the prior property data unreachable\nafter the apply. Matches the CLI's `--allow-data-loss` flag.\nDefaults to `false` (drops remain reversible via time travel)."
@@ -5364,8 +5371,12 @@
           "schema_source"
         ],
         "properties": {
+          "accepted_schema": {
+            "description": "Accepted identity-bearing schema, including effective system types and\ntheir actor-provenance binding. Absent only on older servers."
+          },
           "schema_source": {
-            "type": "string"
+            "type": "string",
+            "description": "Original customer-authored `.pg` source, suitable for a later apply.\nSystem-owned types are described by `accepted_schema`, not appended here."
           }
         }
       },

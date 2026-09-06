@@ -197,6 +197,7 @@ pub struct PlanChange {
 pub enum PlanMetadataChange {
     PolicyBindings,
     EmbeddingProfile,
+    ActorProvenance,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -382,6 +383,7 @@ pub(crate) struct DesiredCluster {
 pub(crate) struct DesiredGraph {
     pub(crate) id: String,
     pub(crate) schema_digest: String,
+    pub(crate) actor_provenance: Option<bool>,
     pub(crate) embedding_provider: Option<String>,
     pub(crate) external_blob_policy: omnigraph::ExternalBlobPolicy,
 }
@@ -455,6 +457,10 @@ pub(crate) struct ProvidersConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GraphConfig {
     pub(crate) schema: PathBuf,
+    /// Desired provenance setting. Omission preserves an existing graph and
+    /// uses the engine initialization default for a new graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) actor_provenance: Option<bool>,
     #[serde(default)]
     pub(crate) queries: QueriesDecl,
     /// Optional reference to a top-level `providers.embedding.<name>` profile.
@@ -658,6 +664,10 @@ pub(crate) struct AppliedRevisionState {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StateResource {
     pub(crate) digest: String,
+    /// Schema resources only: last accepted setting observed during apply or
+    /// refresh. Serving never reads this projection as graph authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) actor_provenance: Option<bool>,
     /// Policy resources only: the applied `applies_to` bindings, normalized
     /// to typed refs (`cluster` | `graph.<id>`). Recorded so the state
     /// ledger is serving-sufficient for the Phase-5 server boot (RFC-005
@@ -702,6 +712,10 @@ pub(crate) struct RecoverySidecar {
     #[serde(default)]
     pub(crate) expected_manifest_version: Option<u64>,
     pub(crate) desired_schema_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observed_actor_provenance: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) desired_actor_provenance: Option<bool>,
     #[serde(default)]
     pub(crate) state_cas_base: Option<String>,
     /// For graph_delete: the approval this operation consumes; lets a sweep

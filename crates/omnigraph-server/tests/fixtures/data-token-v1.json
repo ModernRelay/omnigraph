@@ -1,0 +1,42 @@
+{
+  "description": "Test-only P-256 fixture generated from scalar 0x07 repeated32; no production key or credential.",
+  "verification_time": 1788610060,
+  "header": {
+    "typ": "JWT",
+    "alg": "ES256",
+    "kid": "ce97ec20d43661a19b215cb2e376a698d0b4aa2aa5b4c7854e916bd05082fcee"
+  },
+  "claims": {
+    "version": 1,
+    "iss": "https://api.example.test",
+    "aud": "urn:omnigraph:data:01M00000000000000000000001",
+    "sub": "01M00000000000000000000002",
+    "account_id": "org_fixture",
+    "cluster_id": "01M00000000000000000000001",
+    "cluster_incarnation": "01M00000000000000000000003",
+    "principal_kind": "human",
+    "assurance": "verified_human",
+    "iat": 1788610000,
+    "exp": 1788613600,
+    "jti": "01M00000000000000000000004",
+    "grants": [
+      {
+        "graph_id": "graph-a",
+        "actions": [
+          "change",
+          "invoke_query",
+          "read"
+        ]
+      },
+      {
+        "graph_id": "reports",
+        "actions": [
+          "read"
+        ]
+      }
+    ]
+  },
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIsImtpZCI6ImNlOTdlYzIwZDQzNjYxYTE5YjIxNWNiMmUzNzZhNjk4ZDBiNGFhMmFhNWI0Yzc4NTRlOTE2YmQwNTA4MmZjZWUifQ.eyJ2ZXJzaW9uIjoxLCJpc3MiOiJodHRwczovL2FwaS5leGFtcGxlLnRlc3QiLCJhdWQiOiJ1cm46b21uaWdyYXBoOmRhdGE6MDFNMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDEiLCJzdWIiOiIwMU0wMDAwMDAwMDAwMDAwMDAwMDAwMDAwMiIsImFjY291bnRfaWQiOiJvcmdfZml4dHVyZSIsImNsdXN0ZXJfaWQiOiIwMU0wMDAwMDAwMDAwMDAwMDAwMDAwMDAwMSIsImNsdXN0ZXJfaW5jYXJuYXRpb24iOiIwMU0wMDAwMDAwMDAwMDAwMDAwMDAwMDAwMyIsInByaW5jaXBhbF9raW5kIjoiaHVtYW4iLCJhc3N1cmFuY2UiOiJ2ZXJpZmllZF9odW1hbiIsImlhdCI6MTc4ODYxMDAwMCwiZXhwIjoxNzg4NjEzNjAwLCJqdGkiOiIwMU0wMDAwMDAwMDAwMDAwMDAwMDAwMDAwNCIsImdyYW50cyI6W3siZ3JhcGhfaWQiOiJncmFwaC1hIiwiYWN0aW9ucyI6WyJjaGFuZ2UiLCJpbnZva2VfcXVlcnkiLCJyZWFkIl19LHsiZ3JhcGhfaWQiOiJyZXBvcnRzIiwiYWN0aW9ucyI6WyJyZWFkIl19XX0.dk9Qip2xaddAxio2TKQ7-oxpyc2cWAv8Ob7gMlst7Z8YymtupTMQ83P911VPHYJBnxKIY1Ct5RFIyTZuBPwAnA",
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHhhTL9R1TALzBB2cdc6zO4P/2BrH\nzk/ogsyxyYvFiW6kbDEcTi/0DdlqNlPm5FRF0y3+SG7O11x6kMahiIHAow==\n-----END PUBLIC KEY-----\n",
+  "public_key_sha256": "ce97ec20d43661a19b215cb2e376a698d0b4aa2aa5b4c7854e916bd05082fcee"
+}

@@ -3,16 +3,25 @@
 //! syntax, held against the executed batch before the rows are compared.
 
 use arrow_schema::{DataType, Schema};
+use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::schema::ast::SchemaDecl;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{PropType, QueryResult, ScalarType};
 
 use crate::BodySpan;
 
+/// A shape line's type: a `.pg` property type, or a node type name for a
+/// bare node projection (`p: Person`), whose column is the node object.
+#[derive(Debug, Clone)]
+pub(crate) enum ShapeType {
+    Scalar(PropType),
+    Node(String),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ShapeLine {
     pub(crate) name: String,
-    pub(crate) prop_type: PropType,
+    pub(crate) shape_type: ShapeType,
 }
 
 #[derive(Debug, Clone)]
@@ -56,24 +65,60 @@ pub(crate) fn parse_shape_body(body: &[(usize, &str)]) -> Result<Vec<ShapeLine>,
                 "line {line_no}: annotations and body constraints are not allowed in a shape line"
             ));
         }
-        let prop_type = parse_type(type_text)
-            .ok_or_else(|| format!("line {line_no}: unknown type `{type_text}`"))?;
-        if prop_type.enum_values.is_some() {
-            return Err(format!(
-                "line {line_no}: `enum(...)` is refused; the column's Arrow type is `Utf8`, write `String`"
-            ));
-        }
-        if prop_type.scalar == ScalarType::Blob {
-            return Err(format!(
-                "line {line_no}: `Blob` is refused; a Blob is not a read value (T24)"
-            ));
-        }
+        let shape_type = match parse_type(type_text) {
+            Some(prop_type) => {
+                if prop_type.enum_values.is_some() {
+                    return Err(format!(
+                        "line {line_no}: `enum(...)` is refused; the column's Arrow type is `Utf8`, write `String`"
+                    ));
+                }
+                if prop_type.scalar == ScalarType::Blob {
+                    return Err(format!(
+                        "line {line_no}: `Blob` is refused; a Blob is not a read value (T24)"
+                    ));
+                }
+                ShapeType::Scalar(prop_type)
+            }
+            None if is_type_name(type_text) => ShapeType::Node(type_text.to_string()),
+            None if type_text.ends_with('?') && is_type_name(&type_text[..type_text.len() - 1]) => {
+                return Err(format!(
+                    "line {line_no}: `{type_text}` is refused; a node object is never null, write `{}`",
+                    &type_text[..type_text.len() - 1]
+                ));
+            }
+            None => return Err(format!("line {line_no}: unknown type `{type_text}`")),
+        };
         lines.push(ShapeLine {
             name: name.to_string(),
-            prop_type,
+            shape_type,
         });
     }
     Ok(lines)
+}
+
+fn is_type_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The field names of `type_name`'s node object, or why the catalog has none.
+fn node_object_names(catalog: &Catalog, type_name: &str) -> Result<Vec<String>, String> {
+    let node_type = catalog
+        .node_types
+        .get(type_name)
+        .ok_or_else(|| format!("`{type_name}` is not a node type of this schema"))?;
+    Ok(node_type
+        .node_object_fields()
+        .map(|field| field.name().clone())
+        .collect())
+}
+
+fn struct_field_names(data_type: &DataType) -> Option<Vec<String>> {
+    match data_type {
+        DataType::Struct(fields) => Some(fields.iter().map(|f| f.name().clone()).collect()),
+        _ => None,
+    }
 }
 
 fn is_ident(s: &str) -> bool {
@@ -112,6 +157,7 @@ pub(crate) fn shape_mismatch(
     shape: &[ShapeLine],
     result: &QueryResult,
     inferred: &Schema,
+    catalog: &Catalog,
 ) -> Option<String> {
     let executed = result.schema();
     if executed.fields().len() != shape.len() {
@@ -134,9 +180,32 @@ pub(crate) fn shape_mismatch(
                 got.name()
             ));
         }
-        let want_arrow = want.prop_type.to_arrow();
+        let prop_type = match &want.shape_type {
+            ShapeType::Scalar(prop_type) => prop_type,
+            ShapeType::Node(type_name) => {
+                let names = match node_object_names(catalog, type_name) {
+                    Ok(names) => names,
+                    Err(why) => {
+                        return Some(format!(
+                            "result shape mismatch at column {i} `{}`: {why}",
+                            want.name
+                        ));
+                    }
+                };
+                if struct_field_names(got.data_type()).as_ref() != Some(&names) {
+                    return Some(format!(
+                        "result shape mismatch at column {i} `{}`: expected the `{type_name}` node object ({}), the executor returned {}",
+                        want.name,
+                        names.join(", "),
+                        spell_arrow(got.data_type())
+                    ));
+                }
+                continue;
+            }
+        };
+        let want_arrow = prop_type.to_arrow();
         if got.data_type() != &want_arrow {
-            let expected = spell_pg(&want.prop_type.scalar, want.prop_type.list);
+            let expected = spell_pg(&prop_type.scalar, prop_type.list);
             let verdict = if inferred
                 .fields()
                 .get(i)
@@ -154,7 +223,7 @@ pub(crate) fn shape_mismatch(
                 spell_arrow(got.data_type())
             ));
         }
-        if !want.prop_type.nullable {
+        if !prop_type.nullable {
             let nulls = null_cells(result, i);
             if nulls > 0 {
                 return Some(format!(
@@ -179,7 +248,10 @@ pub(crate) fn null_cells(result: &QueryResult, column: usize) -> usize {
 /// executed, the `.pg` spelling of the Arrow type, `?` exactly when the
 /// column holds a null cell. `Err` names a column the shape grammar cannot
 /// spell, so the section is not rewritten.
-pub(crate) fn bless_shape_lines(result: &QueryResult) -> Result<Vec<String>, String> {
+pub(crate) fn bless_shape_lines(
+    result: &QueryResult,
+    catalog: &Catalog,
+) -> Result<Vec<String>, String> {
     let mut lines = Vec::with_capacity(result.schema().fields().len());
     for (i, field) in result.schema().fields().iter().enumerate() {
         if !is_column_name(field.name()) {
@@ -187,6 +259,29 @@ pub(crate) fn bless_shape_lines(result: &QueryResult) -> Result<Vec<String>, Str
                 "column `{}` is not a column name the shape section can spell; the shape is not rewritten",
                 field.name()
             ));
+        }
+        if let Some(names) = struct_field_names(field.data_type()) {
+            let mut type_names: Vec<&String> = catalog
+                .node_types
+                .iter()
+                .filter(|(_, node_type)| {
+                    node_type
+                        .node_object_fields()
+                        .map(|f| f.name().clone())
+                        .collect::<Vec<_>>()
+                        == names
+                })
+                .map(|(name, _)| name)
+                .collect();
+            type_names.sort();
+            let Some(type_name) = type_names.first() else {
+                return Err(format!(
+                    "column `{}` is a struct that is no node type's object; the shape is not rewritten",
+                    field.name()
+                ));
+            };
+            lines.push(format!("{}: {type_name}", field.name()));
+            continue;
         }
         let Some(mut prop_type) = PropType::from_arrow(field.data_type()) else {
             return Err(format!(

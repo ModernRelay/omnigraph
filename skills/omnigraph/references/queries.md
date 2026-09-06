@@ -76,6 +76,12 @@ query recent_signals() {
 }
 ```
 
+A bare node variable projects the node as one object (`id` plus every
+property except `Blob` and `Vector` ones): `return { $s }` gives
+`{"id": "sig-1", "slug": "sig-1", "name": "…"}` under the column `s`;
+`sum`/`avg`/`min`/`max` refuse a bare node binding (`T8`), `count($s)` counts
+rows.
+
 ### Edge traversal (lowerCamelCase)
 
 Schema edges are PascalCase; traversal uses lowerCamelCase:
@@ -349,7 +355,7 @@ Prefer ISO strings on both paths:
 | Path | Date | DateTime |
 |---|---|---|
 | `mutate --params` | ISO string `"2026-04-29"` | ISO string `"2026-04-29T10:00:00Z"` |
-| `load` JSONL | ISO string `"2026-04-29"` (integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` |
+| `load` JSONL | ISO string `"2026-04-29"` (integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` (integer epoch milliseconds also accepted) |
 
 Integer epoch days remain useful for generated Arrow-oriented input, but are
 not required for hand-authored JSONL.

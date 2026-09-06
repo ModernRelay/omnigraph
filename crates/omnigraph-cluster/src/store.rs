@@ -108,6 +108,19 @@ impl ClusterStore {
         self.storage.kind()
     }
 
+    /// Canonical identity of the same store used for the serving snapshot.
+    /// This is metadata only; it does not reread the config or ledger.
+    pub(crate) fn canonical_root(&self) -> Result<String, Diagnostic> {
+        if self.kind() == StorageKind::Local {
+            let path = std::fs::canonicalize(&self.display_root).map_err(|err| {
+                Diagnostic::error("storage_root_invalid", "storage", err.to_string())
+            })?;
+            Ok(format!("file://{}", path.to_string_lossy()))
+        } else {
+            Ok(self.root.clone())
+        }
+    }
+
     fn uri(&self, relative: &str) -> String {
         format!("{}/{}", self.root, relative)
     }
