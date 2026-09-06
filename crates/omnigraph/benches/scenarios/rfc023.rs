@@ -42,6 +42,20 @@ const SMALL_UPSERT_ROWS: usize = 32;
 
 /// Age is setup work for these two existing fixture families only.
 pub(super) fn validate_fixture_age(args: &Args) -> Result<(), String> {
+    if args.populated_tables.is_some() && args.scenario != "general-merge-updates" {
+        return Err("--populated-tables requires general-merge-updates".into());
+    }
+    if args.scenario != "general-merge-updates" && args.io_delay_ms != 0 {
+        return Err("--io-delay-ms requires general-merge-updates".into());
+    }
+    if args.merge_preparation_width.is_some()
+        && (args.scenario != "general-merge-updates"
+            || !matches!(args.merge_preparation_width, Some(1 | 2 | 4)))
+    {
+        return Err(
+            "--merge-preparation-width requires general-merge-updates and width 1, 2 or 4".into(),
+        );
+    }
     let supported = super::branch_control::is_scenario(&args.scenario)
         || args.scenario == "general-merge-updates";
     if args.age_options_supplied && !supported {
@@ -57,7 +71,7 @@ pub(super) fn validate_fixture_age(args: &Args) -> Result<(), String> {
     }
     rfc023_limits::validate_view_controls(&args.cache_state, &args.manifest_layout)?;
     if (args.cache_state == "warm" || args.manifest_layout == "compacted")
-        && (args.rows > 256 || args.dims > 16 || args.branches > 8 || args.tables > 8)
+        && (args.rows > 256 || args.dims > 16 || args.branches > 8 || args.populated_tables() > 8)
     {
         return Err(
             "warm/compacted controls require rows <= 256, dims <= 16, branches/tables <= 8".into(),
@@ -94,6 +108,15 @@ pub(super) fn validate_args(args: &Args) -> Result<(), String> {
         }
         "general-merge-updates" => {
             rfc023_limits::derive_chunk_plan(args.dims, "base", args.rows)?;
+            rfc023_limits::validate_merge_table_shape(
+                args.tables,
+                args.populated_tables(),
+                args.rows,
+                args.dims,
+                args.delta_rows,
+                args.target_delta_rows,
+                args.io_delay_ms,
+            )?;
             if args.delta_rows == 0 {
                 return Err("--delta-rows must be greater than zero".to_string());
             }
@@ -101,20 +124,6 @@ pub(super) fn validate_args(args: &Args) -> Result<(), String> {
                 return Err(format!(
                     "--source-mode must be 'update' or 'insert', got '{}'",
                     args.source_mode
-                ));
-            }
-            // The branch's updates and main's divergence must address disjoint
-            // key ranges, or the merge reports a row conflict instead of
-            // measuring the general reconciliation route.
-            if args
-                .delta_rows
-                .saturating_add(GENERAL_MERGE_TARGET_DELTA_ROWS)
-                > args.rows
-            {
-                return Err(format!(
-                    "--delta-rows {} plus the {GENERAL_MERGE_TARGET_DELTA_ROWS}-row target \
-                     divergence must fit inside --rows {}",
-                    args.delta_rows, args.rows
                 ));
             }
             rfc023_limits::derive_chunk_plan(args.dims, "base", args.delta_rows)?;
@@ -478,6 +487,16 @@ pub(super) fn vector_json_patterns(dims: usize, seed: u64) -> Vec<String> {
 }
 
 fn graph_jsonl_chunk(prefix: &str, start: usize, end: usize, vector_patterns: &[String]) -> String {
+    named_graph_jsonl_chunk("Chunk", prefix, start, end, vector_patterns)
+}
+
+fn named_graph_jsonl_chunk(
+    node: &str,
+    prefix: &str,
+    start: usize,
+    end: usize,
+    vector_patterns: &[String],
+) -> String {
     let approximate_row_bytes = vector_patterns
         .first()
         .map_or(128, |vector| vector.len().saturating_add(128));
@@ -486,7 +505,7 @@ fn graph_jsonl_chunk(prefix: &str, start: usize, end: usize, vector_patterns: &[
         let vector = &vector_patterns[row % vector_patterns.len()];
         writeln!(
             &mut jsonl,
-            "{{\"type\":\"Chunk\",\"data\":{{\"slug\":\"{prefix}-{row:010}\",\"embedding\":[{vector}]}}}}"
+            "{{\"type\":\"{node}\",\"data\":{{\"slug\":\"{prefix}-{row:010}\",\"embedding\":[{vector}]}}}}"
         )
         .expect("write graph benchmark JSONL");
     }
@@ -1019,6 +1038,7 @@ async fn direct_lance_append_baseline(
 fn merge_phase_metrics(probes: &MergeWriteProbes) -> serde_json::Value {
     serde_json::json!({
         "outer_prepare": probes.outer_prepare_us(),
+        "candidate_preparation": probes.candidate_preparation_us(),
         "proven_insert_history": probes.proven_insert_history_us(),
         "proven_insert_plan_scan": probes.proven_insert_plan_scan_us(),
         "candidate_validation": probes.candidate_validation_us(),
@@ -1632,12 +1652,61 @@ pub(super) async fn fenced_adopt_verify(args: &Args) -> serde_json::Value {
 // two-way fast-forward diff. That matches the reported production shape, where
 // other writers land on main while a branch is open.
 
-/// Rows rewritten on `main` after the branch forks, to force divergence.
-/// Small and fixed: this is the "someone else wrote to main" trigger, not a
-/// variable under study.
-const GENERAL_MERGE_TARGET_DELTA_ROWS: usize = 8;
-
 const GENERAL_MERGE_SOURCE_BRANCH: &str = "update-source";
+
+fn general_merge_node(table: usize) -> String {
+    if table == 0 {
+        "Chunk".into()
+    } else {
+        format!("Chunk{table:02}")
+    }
+}
+
+fn general_merge_schema(args: &Args) -> String {
+    (0..args.populated_tables())
+        .map(|table| {
+            let node = general_merge_node(table);
+            format!(
+                "node {node} {{\n  slug: String @key\n  embedding: Vector({})\n}}\n",
+                args.dims
+            )
+        })
+        .collect()
+}
+
+fn general_merge_jsonl_chunk(
+    tables: usize,
+    prefix: &str,
+    start: usize,
+    end: usize,
+    patterns: &[String],
+) -> String {
+    (0..tables)
+        .map(|table| {
+            named_graph_jsonl_chunk(&general_merge_node(table), prefix, start, end, patterns)
+        })
+        .collect()
+}
+
+async fn general_merge_source_receipt(db: &Omnigraph, snapshot: &Snapshot) -> serde_json::Value {
+    let tables: std::collections::BTreeMap<_, _> = snapshot
+        .datasets()
+        .map(|entry| {
+            (
+                entry.type_key.clone(),
+                serde_json::json!({
+                    "path": entry.dataset_path,
+                    "version": entry.published_dataset_version,
+                    "native_ref": entry.native_dataset_branch,
+                }),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "head": db.resolve_snapshot(GENERAL_MERGE_SOURCE_BRANCH).await.unwrap().to_string(),
+        "tables": tables,
+    })
+}
 
 /// Rows per fixture `load()` call, sized against the loader's ACTUAL keyed
 /// byte accounting rather than the shared benchmark estimator.
@@ -1698,23 +1767,38 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let uri = root.to_str().expect("UTF-8 benchmark fixture root");
 
     let init_start = Instant::now();
-    let db = Omnigraph::init(uri, &graph_schema(args.dims))
+    let db = Omnigraph::init(uri, &general_merge_schema(args))
         .await
         .expect("initialize general-merge benchmark graph");
     let init_ms = init_start.elapsed().as_millis() as u64;
 
     // The committed target image.
     let target_vectors = vector_json_patterns(args.dims, args.seed);
-    let (target_load_ms, max_target_json_chunk_bytes) = load_graph_rows(
-        &db,
-        "main",
-        "base",
-        args.rows,
-        batch_rows,
-        &target_vectors,
-        LoadMode::Overwrite,
-    )
-    .await;
+    let target_start = Instant::now();
+    let mut max_target_json_chunk_bytes = 0_u64;
+    for start in (0..args.rows).step_by(batch_rows) {
+        let end = (start + batch_rows).min(args.rows);
+        let jsonl =
+            general_merge_jsonl_chunk(args.populated_tables(), "base", start, end, &target_vectors);
+        max_target_json_chunk_bytes = max_target_json_chunk_bytes.max(jsonl.len() as u64);
+        let loaded = db
+            .load(
+                "main",
+                &jsonl,
+                if start == 0 {
+                    LoadMode::Overwrite
+                } else {
+                    LoadMode::Append
+                },
+            )
+            .await
+            .expect("load general merge base tables");
+        assert_eq!(
+            loaded.nodes_loaded.values().sum::<usize>(),
+            (end - start) * args.populated_tables()
+        );
+    }
+    let target_load_ms = target_start.elapsed().as_millis() as u64;
 
     let age = age_fixture(&db, args).await;
 
@@ -1737,7 +1821,8 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let mut max_source_json_chunk_bytes = 0_u64;
     while cursor < args.delta_rows {
         let end = cursor.saturating_add(batch_rows).min(args.delta_rows);
-        let jsonl = graph_jsonl_chunk(source_prefix, cursor, end, &source_vectors);
+        let jsonl =
+            general_merge_jsonl_chunk(args.tables, source_prefix, cursor, end, &source_vectors);
         max_source_json_chunk_bytes = max_source_json_chunk_bytes.max(jsonl.len() as u64);
         let mode = if inserting {
             LoadMode::Append
@@ -1758,14 +1843,17 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     };
 
     // Advance main on a disjoint key range so the merge is genuinely diverged.
-    let target_divergence_start = args.rows - GENERAL_MERGE_TARGET_DELTA_ROWS;
+    let target_divergence_start = args.rows - args.target_delta_rows;
     let diverge_vectors = vector_json_patterns(args.dims, args.seed ^ 0x0230_0385);
     let diverge_start = Instant::now();
-    let diverge_jsonl =
-        graph_jsonl_chunk("base", target_divergence_start, args.rows, &diverge_vectors);
-    db.load("main", &diverge_jsonl, LoadMode::Merge)
-        .await
-        .expect("advance main after the branch forked");
+    for start in (target_divergence_start..args.rows).step_by(batch_rows) {
+        let end = start.saturating_add(batch_rows).min(args.rows);
+        let diverge_jsonl =
+            general_merge_jsonl_chunk(args.tables, "base", start, end, &diverge_vectors);
+        db.load("main", &diverge_jsonl, LoadMode::Merge)
+            .await
+            .expect("advance main after the branch forked");
+    }
     let target_diverge_ms = diverge_start.elapsed().as_millis() as u64;
     let layout = super::fixture_controls::prepare_layout(uri, args).await;
 
@@ -1805,15 +1893,52 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         "prepared source branch row count drift"
     );
     let setup_source_dataset_version = source_table.published_dataset_version();
+    assert_eq!(
+        main_snapshot.datasets().count(),
+        args.populated_tables(),
+        "unexpected main table catalog"
+    );
+    assert_eq!(
+        source_snapshot.datasets().count(),
+        args.populated_tables(),
+        "unexpected source table catalog"
+    );
+    let mut setup_tables = Vec::with_capacity(args.populated_tables());
+    for index in 0..args.populated_tables() {
+        let type_key = format!("node:{}", general_merge_node(index));
+        let main = main_snapshot.open_dataset(&type_key).await.unwrap();
+        let source = source_snapshot.open_dataset(&type_key).await.unwrap();
+        assert_eq!(main.count_rows(None).await.unwrap(), args.rows);
+        let source_rows = if index < args.tables {
+            expected_source_rows
+        } else {
+            args.rows
+        };
+        assert_eq!(source.count_rows(None).await.unwrap(), source_rows);
+        setup_tables.push(serde_json::json!({
+            "type_key": type_key,
+            "main_version": main.published_dataset_version(),
+            "source_version": source.published_dataset_version(),
+            "main_rows": args.rows,
+            "source_rows": source_rows,
+            "touched": index < args.tables,
+        }));
+    }
+    let source_receipt = general_merge_source_receipt(&db, &source_snapshot).await;
+    std::fs::write(
+        root.join("general-merge-source.json"),
+        serde_json::to_vec(&source_receipt).unwrap(),
+    )
+    .expect("save exact source head and table pins outside measurement");
     let setup_verify_ms = verify_start.elapsed().as_millis() as u64;
 
     let setup_fingerprint = format!(
-        "general-merge-updates-v3:mode={}:rows={}:delta={}:target_delta={}:dims={}:seed={}:\
-         main-v{}-rows{}:source-v{}-rows{}:history={}:retired={}",
+        "general-merge-updates-v5:mode={}:rows={}:delta={}:target_delta={}:dims={}:seed={}:\
+         main-v{}-rows{}:source-v{}-rows{}:history={}:retired={}:tables={}:populated={}",
         args.source_mode,
         args.rows,
         args.delta_rows,
-        GENERAL_MERGE_TARGET_DELTA_ROWS,
+        args.target_delta_rows,
         args.dims,
         args.seed,
         setup_main_dataset_version,
@@ -1822,13 +1947,20 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         setup_source_rows,
         args.history_commits,
         args.retired_branches,
+        args.tables,
+        args.populated_tables(),
     );
 
     let mut metrics = serde_json::json!({
         "rows": args.rows,
         "dims": args.dims,
         "delta_rows": args.delta_rows,
-        "target_delta_rows": GENERAL_MERGE_TARGET_DELTA_ROWS,
+        "target_delta_rows": args.target_delta_rows,
+        "setup_table_count": args.populated_tables(),
+        "setup_touched_table_count": args.tables,
+        "setup_total_main_rows": args.rows * args.populated_tables(),
+        "setup_total_source_rows": args.rows * args.populated_tables() + if inserting { args.delta_rows * args.tables } else { 0 },
+        "setup_tables": setup_tables,
         "source_mode": args.source_mode,
         "source_transaction_count": source_transaction_count,
         "pure_insert_history_limit": rfc023_limits::PURE_INSERT_HISTORY_MAX_VERSIONS,
@@ -1862,7 +1994,10 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
 /// production `branch_merge`, then records wall time plus this process's peak
 /// RSS. The parent's `wait4` peak for this child is the memory number.
 pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
-    super::helpers::cost::cost_harness(async {
+    use super::helpers::cost::request_delay::{RequestDelay, with_request_delay};
+    use omnigraph::instrumentation::{MergePreparationOptions, with_merge_preparation_options};
+    let delay = RequestDelay::default();
+    with_request_delay(delay.clone(), super::helpers::cost::cost_harness(async {
     let root = general_merge_fixture_root(args);
     let uri = root.to_str().expect("UTF-8 benchmark fixture root");
     let ((db, operation_open_elapsed), open_io) = super::helpers::cost::measure(async {
@@ -1881,10 +2016,21 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
     let probes = MergeWriteProbes::default();
     let ((outcome, operation_elapsed, operation_post_peak_rss_bytes), io) =
         super::helpers::cost::measure(async {
+    let _active_delay = delay.activate(args.io_delay_ms);
     let operation_start = Instant::now();
     let outcome = with_merge_write_probes(
         probes.clone(),
-        db.branch_merge(GENERAL_MERGE_SOURCE_BRANCH, "main"),
+        async {
+            let merge = db.branch_merge(GENERAL_MERGE_SOURCE_BRANCH, "main");
+            if let Some(width) = args.merge_preparation_width {
+                with_merge_preparation_options(MergePreparationOptions {
+                    width,
+                    additional_bytes: 4 * rfc023_limits::KEYED_WRITE_MAX_BYTES as usize,
+                }, merge).await
+            } else {
+                merge.await
+            }
+        },
     )
     .await
     .expect("run production branch merge");
@@ -1928,7 +2074,7 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
         assert_eq!(fenced_insert_calls, 0, "update-only workload inserted rows");
         assert_eq!(
             probes.stage_merge_insert_rows() + probes.stage_known_present_update_rows(),
-            args.delta_rows as u64,
+            args.delta_rows as u64 * args.tables as u64,
             "every selected source update must be written once"
         );
         assert_eq!(
@@ -1940,8 +2086,36 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
     let took_proven_shortcut =
         fenced_insert_calls > 0 && full_walk_classifications == 0 && lineage_classifications == 0;
 
+    let preparation = probes.merge_preparation_snapshot();
+
     let mut metrics = serde_json::json!({
         "routing": "production-omnigraph-branch-merge-diverged-target",
+        "io_delay_ms": args.io_delay_ms,
+        "io_delay_calls": delay.calls(),
+        "io_wrapped_api_active": delay.active_calls(),
+        "io_wrapped_api_peak_active": delay.peak_active_calls(),
+        "io_wrapped_api_concurrency_boundary": "observed wrapped graph ObjectStore API futures and list/delete streams, including injected delay and underlying await; starts on first poll, ends at API return or stream EOF/drop; GET body transfer, wire requests/retries, RSS and unwrapped local I/O excluded",
+        "merge_preparation_width": args.merge_preparation_width,
+        "probe_merge_preparation": {
+            "admitted": preparation.admitted,
+            "active": preparation.active,
+            "ready": preparation.ready,
+            "completed": preparation.completed,
+            "collected": preparation.collected,
+            "discarded": preparation.discarded,
+            "peak_active": preparation.peak_active,
+            "peak_ready": preparation.peak_ready,
+            "uncollected": preparation.uncollected,
+            "peak_uncollected": preparation.peak_uncollected,
+            "accounted_bytes": preparation.accounted_bytes,
+            "peak_accounted_bytes": preparation.peak_accounted_bytes,
+            "budget_fallbacks": preparation.budget_fallbacks,
+            "scratch_owners": preparation.scratch_owners,
+            "peak_scratch_owners": preparation.peak_scratch_owners,
+            "scratch_bytes": preparation.scratch_bytes,
+            "peak_scratch_bytes": preparation.peak_scratch_bytes,
+        },
+        "io_delay_boundary": "wrapped graph ObjectStore API calls only during merge: get/head, put, multipart begin/part/complete/abort, copy and one delay per list/delete stream; excludes private local scratch, wire retries, list pages and body transfer; asynchronous delay, not measured S3 latency",
         "source_mode": args.source_mode,
         "classifier_route": classifier_route,
         "probe_completed_full_walk_classifications": full_walk_classifications,
@@ -1985,7 +2159,7 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
     metrics.as_object_mut().unwrap().extend(super::fixture_controls::io_metrics("open", &open_io).as_object().unwrap().clone());
     metrics.as_object_mut().unwrap().extend(prewarm.as_object().unwrap().clone());
     metrics
-    }).await
+    })).await
 }
 
 /// Verify one exact deterministic fixture row through the public snapshot
@@ -2076,8 +2250,13 @@ async fn verify_fixture_row(
 
 /// Age experiments use small fixtures, but verify every row in bounded batches
 /// so a restored representative cannot hide unrelated data loss or source drift.
-async fn verify_general_all_rows(table: &SnapshotDataset, args: &Args, merged_main: bool) -> usize {
-    let inserting = args.source_mode == "insert";
+async fn verify_general_all_rows(
+    table: &SnapshotDataset,
+    args: &Args,
+    merged_main: bool,
+    touched: bool,
+) -> usize {
+    let inserting = touched && args.source_mode == "insert";
     let expected = args.rows + if inserting { args.delta_rows } else { 0 };
     let mut seen = vec![false; expected];
     let mut scanner = table.scan();
@@ -2123,14 +2302,14 @@ async fn verify_general_all_rows(table: &SnapshotDataset, args: &Args, merged_ma
             let (prefix, ordinal, slot, seed) = if let Some(suffix) = id.strip_prefix("base-") {
                 let ordinal = suffix.parse::<usize>().expect("base row ordinal");
                 assert!(ordinal < args.rows, "unexpected base ID {id}");
-                let seed = if merged_main && ordinal >= args.rows - GENERAL_MERGE_TARGET_DELTA_ROWS
-                {
-                    args.seed ^ 0x0230_0385
-                } else if !inserting && ordinal < args.delta_rows {
-                    args.seed ^ 0x0230_0384
-                } else {
-                    args.seed
-                };
+                let seed =
+                    if touched && merged_main && ordinal >= args.rows - args.target_delta_rows {
+                        args.seed ^ 0x0230_0385
+                    } else if touched && !inserting && ordinal < args.delta_rows {
+                        args.seed ^ 0x0230_0384
+                    } else {
+                        args.seed
+                    };
                 ("base", ordinal, ordinal, seed)
             } else {
                 assert!(inserting, "unexpected inserted ID {id}");
@@ -2212,23 +2391,45 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
     let target_delta_row = verify_fixture_row(
         &table,
         "base",
-        args.rows - GENERAL_MERGE_TARGET_DELTA_ROWS,
+        args.rows - args.target_delta_rows,
         args.dims,
         args.seed ^ 0x0230_0385,
     )
     .await;
+    let source_snapshot = db
+        .snapshot_of(ReadTarget::branch(GENERAL_MERGE_SOURCE_BRANCH))
+        .await
+        .expect("capture unchanged merge source");
+    let expected_source_receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("general-merge-source.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        general_merge_source_receipt(&db, &source_snapshot).await,
+        expected_source_receipt,
+        "merge changed the source head or exact table pins"
+    );
+    assert_eq!(
+        snapshot.datasets().count(),
+        args.populated_tables(),
+        "merged main catalog changed"
+    );
+    assert_eq!(
+        source_snapshot.datasets().count(),
+        args.populated_tables(),
+        "merge source catalog changed"
+    );
     let (verified_complete_main_rows, verified_complete_source_rows) =
         if args.rows <= 256 || args.history_commits > 0 || args.retired_branches > 0 {
-            let main_rows = verify_general_all_rows(&table, args, true).await;
-            let source_snapshot = db
-                .snapshot_of(ReadTarget::branch(GENERAL_MERGE_SOURCE_BRANCH))
-                .await
-                .expect("capture unchanged aged source");
-            let source_table = source_snapshot
-                .open_dataset("node:Chunk")
-                .await
-                .expect("open unchanged aged source");
-            let source_rows = verify_general_all_rows(&source_table, args, false).await;
+            let mut main_rows = 0;
+            let mut source_rows = 0;
+            for index in 0..args.populated_tables() {
+                let type_key = format!("node:{}", general_merge_node(index));
+                let table = snapshot.open_dataset(&type_key).await.unwrap();
+                let source_table = source_snapshot.open_dataset(&type_key).await.unwrap();
+                let touched = index < args.tables;
+                main_rows += verify_general_all_rows(&table, args, true, touched).await;
+                source_rows += verify_general_all_rows(&source_table, args, false, touched).await;
+            }
             (Some(main_rows), Some(source_rows))
         } else {
             (None, None)
@@ -2238,6 +2439,9 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
     serde_json::json!({
         "verify_wall_ms": verify_wall_ms,
         "final_rows": final_rows,
+        "verified_table_count": args.populated_tables(),
+        "verified_touched_table_count": args.tables,
+        "verified_source_head_and_pins_unchanged": true,
         "verified_complete_main_rows": verified_complete_main_rows,
         "verified_complete_source_rows": verified_complete_source_rows,
         "verify_main_dataset_version": table.published_dataset_version(),

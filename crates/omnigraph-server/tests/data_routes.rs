@@ -1873,6 +1873,517 @@ async fn branch_merge_statement_conflict_matches_the_route_409() {
     assert!(!error.merge_conflicts.is_empty());
 }
 
+/// Dropping the router request drops the handler's directly awaited engine
+/// future. This deliberately tests that boundary, not whether a particular
+/// HTTP transport drops its request future when a client disconnects. Normal
+/// server graceful shutdown drains requests rather than cancelling this work.
+/// The request-owned entry must cap every requested diagnostic width at one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_merge_request_drop_before_publication_preserves_graph_and_allows_retry() {
+    assert_branch_merge_request_drop(
+        MergeDropTransport::RouterFuture,
+        MergeRequestSurface::BranchRoute,
+    )
+    .await;
+}
+
+/// The GQ dispatch shares the request-owned engine entry with the branch
+/// route, including its hard width-one cap and pre-publication drop behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_merge_statement_drop_preserves_graph_and_enforces_width_one() {
+    assert_branch_merge_request_drop(
+        MergeDropTransport::RouterFuture,
+        MergeRequestSurface::GqStatement,
+    )
+    .await;
+}
+
+/// Exercise the production Axum/Hyper HTTP/1 connection owner. A complete
+/// request body has been consumed before disconnecting at private preparation;
+/// EOF drops this service future with the pinned default half-close policy.
+/// Diagnostic requests for wider windows cannot bypass the server entry cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_merge_http1_disconnect_drops_private_preparation_and_releases_admission() {
+    assert_branch_merge_request_drop(
+        MergeDropTransport::Http1Disconnect,
+        MergeRequestSurface::BranchRoute,
+    )
+    .await;
+}
+
+#[derive(Clone, Copy)]
+enum MergeDropTransport {
+    RouterFuture,
+    Http1Disconnect,
+}
+
+#[derive(Clone, Copy)]
+enum MergeRequestSurface {
+    BranchRoute,
+    GqStatement,
+}
+
+async fn assert_branch_merge_request_drop(
+    transport: MergeDropTransport,
+    surface: MergeRequestSurface,
+) {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicUsize;
+
+    use omnigraph::instrumentation::{
+        MergePreparationCheckpoint, MergePreparationHook, MergePreparationOptions,
+        MergeWriteProbes, with_merge_preparation_hook, with_merge_preparation_options,
+        with_merge_write_probes,
+    };
+    use sha2::{Digest, Sha256};
+
+    struct PreparedWindow {
+        width: usize,
+        finished: AtomicUsize,
+        reached: tokio::sync::Notify,
+    }
+
+    struct ServedRequest {
+        completed: Arc<AtomicBool>,
+        dropped: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for ServedRequest {
+        fn drop(&mut self) {
+            self.dropped.notify_one();
+        }
+    }
+
+    struct HttpServer {
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    impl HttpServer {
+        async fn stop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            tokio::time::timeout(Duration::from_secs(10), &mut self.task)
+                .await
+                .expect("HTTP listener must drain its connection tasks")
+                .expect("HTTP serving task panicked")
+                .expect("HTTP listener failed");
+        }
+    }
+
+    impl Drop for HttpServer {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            // Also contain a failed assertion/timeout without leaving a
+            // listener alive for another test in this runtime.
+            self.task.abort();
+        }
+    }
+
+    async fn send_request(stream: &tokio::net::TcpStream, bytes: &[u8]) {
+        let mut sent = 0;
+        while sent < bytes.len() {
+            stream.writable().await.unwrap();
+            match stream.try_write(&bytes[sent..]) {
+                Ok(0) => panic!("TCP request closed before its complete body was sent"),
+                Ok(count) => sent += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("TCP request write failed: {error}"),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MergePreparationHook for PreparedWindow {
+        async fn checkpoint(&self, _: usize, _: &str, phase: MergePreparationCheckpoint) {
+            if phase == MergePreparationCheckpoint::Finished {
+                if self.finished.fetch_add(1, Ordering::SeqCst) + 1 == self.width {
+                    self.reached.notify_one();
+                }
+                // Each scratch write has settled; its result and directory
+                // still belong to this worker, before recovery can be armed.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    fn merge_input(surface: MergeRequestSurface) -> (&'static str, Value) {
+        match surface {
+            MergeRequestSurface::BranchRoute => (
+                "/branches/merge",
+                json!({"source": "feature", "target": "main", "delete_branch": false}),
+            ),
+            MergeRequestSurface::GqStatement => (
+                "/mutate",
+                json!({"query": "branch merge feature into main"}),
+            ),
+        }
+    }
+
+    fn merge_request(surface: MergeRequestSurface) -> Request<Body> {
+        let (path, body) = merge_input(surface);
+        json_post(path, &body)
+    }
+
+    fn graph_files(root: &Path) -> BTreeMap<PathBuf, [u8; 32]> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    assert!(
+                        kind.is_file(),
+                        "tiny graph fixture must contain ordinary files"
+                    );
+                    files.insert(
+                        entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                        Sha256::digest(fs::read(entry.path()).unwrap()).into(),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    async fn authority(db: &Omnigraph) -> Value {
+        let mut branches = BTreeMap::new();
+        for branch in ["main", "feature"] {
+            let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await.unwrap();
+            let tables: BTreeMap<_, _> = snapshot
+                .datasets()
+                .map(|entry| {
+                    (
+                        entry.type_key.clone(),
+                        json!({
+                            "path": entry.dataset_path,
+                            "native_ref": entry.native_dataset_branch,
+                            "version": entry.published_dataset_version,
+                            "rows": entry.entity_count,
+                        }),
+                    )
+                })
+                .collect();
+            assert_eq!(tables.len(), 4);
+            branches.insert(
+                branch,
+                json!({
+                    "head": db.resolve_snapshot(branch).await.unwrap().to_string(),
+                    "manifest_version": snapshot.graph_manifest_version(),
+                    "tables": tables,
+                }),
+            );
+        }
+        json!(branches)
+    }
+
+    let types = ["A", "B", "C", "D"];
+    let schema = types
+        .iter()
+        .map(|name| format!("node {name} {{ name: String @key value: I32 }}\n"))
+        .collect::<String>();
+    let rows = |start: usize, end: usize, value: i32| {
+        types
+            .iter()
+            .flat_map(|name| {
+                (start..end).map(move |row| {
+                    json!({"type": name, "data": {"name": format!("row-{row}"), "value": value}})
+                        .to_string()
+                        + "\n"
+                })
+            })
+            .collect::<String>()
+    };
+    for requested_width in [1, 2, 4] {
+        let temp = init_graph_with_schema_and_data(&schema, &rows(0, 4, 0)).await;
+        let graph = graph_path(temp.path());
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.load("feature", &rows(0, 2, 10), LoadMode::Merge)
+            .await
+            .unwrap();
+        db.load("main", &rows(2, 4, 20), LoadMode::Merge)
+            .await
+            .unwrap();
+        let expected_authority = authority(&db).await;
+        drop(db);
+        let app = build_app(AppState::new_with_workload(
+            graph.to_string_lossy().to_string(),
+            Omnigraph::open(graph.to_str().unwrap()).await.unwrap(),
+            Vec::new(),
+            omnigraph_server::workload::WorkloadController::new(1, 1_000_000_000),
+        ));
+        let before = graph_files(&graph);
+        let hook = Arc::new(PreparedWindow {
+            width: 1,
+            finished: AtomicUsize::new(0),
+            reached: tokio::sync::Notify::new(),
+        });
+        let options = MergePreparationOptions {
+            width: requested_width,
+            additional_bytes: 128 * 1024 * 1024,
+        };
+        let probes = MergeWriteProbes::default();
+        let completed = Arc::new(AtomicBool::new(false));
+        let service_dropped = Arc::new(tokio::sync::Notify::new());
+        let (mut request, connection, mut server) = match transport {
+            MergeDropTransport::RouterFuture => (
+                Some(Box::pin(with_merge_write_probes(
+                    probes.clone(),
+                    with_merge_preparation_options(
+                        options,
+                        with_merge_preparation_hook(
+                            hook.clone(),
+                            app.clone().oneshot(merge_request(surface)),
+                        ),
+                    ),
+                ))),
+                None,
+                None,
+            ),
+            MergeDropTransport::Http1Disconnect => {
+                let scoped_app = app.clone().layer(axum::middleware::from_fn({
+                    let probes = probes.clone();
+                    let hook = hook.clone();
+                    let completed = Arc::clone(&completed);
+                    let dropped = Arc::clone(&service_dropped);
+                    move |request: Request<Body>, next: axum::middleware::Next| {
+                        let probes = probes.clone();
+                        let hook = hook.clone();
+                        let guard = ServedRequest {
+                            completed: Arc::clone(&completed),
+                            dropped: Arc::clone(&dropped),
+                        };
+                        async move {
+                            // Hyper owns another task. Install controls inside
+                            // that task; parent task-locals are not inherited.
+                            let response = with_merge_write_probes(
+                                probes,
+                                with_merge_preparation_options(
+                                    options,
+                                    with_merge_preparation_hook(hook, Box::pin(next.run(request))),
+                                ),
+                            )
+                            .await;
+                            guard.completed.store(true, Ordering::SeqCst);
+                            drop(guard);
+                            response
+                        }
+                    }
+                }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(async move {
+                    axum::serve(listener, scoped_app)
+                        .with_graceful_shutdown(async move {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
+                });
+                let server = HttpServer {
+                    shutdown: Some(shutdown),
+                    task,
+                };
+                let connection = tokio::net::TcpStream::connect(address).await.unwrap();
+                let (path, body) = merge_input(surface);
+                let body = body.to_string();
+                let wire = format!(
+                    "POST {} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    g(path),
+                    body.len(),
+                );
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    send_request(&connection, wire.as_bytes()),
+                )
+                .await
+                .expect("complete HTTP merge request must reach the listener");
+                (None, Some(connection), Some(server))
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = hook.reached.notified() => {}
+                response = async {
+                    match request.as_mut() {
+                        Some(request) => request.as_mut().await,
+                        None => std::future::pending().await,
+                    }
+                } => panic!("merge returned before preparation stop: {response:?}"),
+            }
+        })
+        .await
+        .expect("merge did not reach the prepared window");
+        let pending = probes.merge_preparation_snapshot();
+        assert_eq!(pending.admitted, 1, "requested width {requested_width}");
+        assert_eq!(pending.peak_active, 1, "requested width {requested_width}");
+        assert_eq!(
+            pending.peak_uncollected, 1,
+            "requested width {requested_width}"
+        );
+        assert_eq!(
+            pending.accounted_bytes, 0,
+            "serial preparation uses existing limits"
+        );
+        assert_eq!(pending.collected, 0);
+        assert!(pending.scratch_owners > 0 && pending.scratch_bytes > 0);
+        let (busy, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            json_response(&app, merge_request(surface)),
+        )
+        .await
+        .expect("second request bypassed admission and waited on the parked writer");
+        assert_eq!(
+            busy,
+            StatusCode::TOO_MANY_REQUESTS,
+            "parked request must own the only admission permit"
+        );
+        drop(request);
+        drop(connection);
+        if let Some(server) = &mut server {
+            tokio::time::timeout(Duration::from_secs(10), service_dropped.notified())
+                .await
+                .expect("pinned Hyper HTTP/1 must drop the parked service after TCP EOF");
+            assert!(
+                !completed.load(Ordering::SeqCst),
+                "disconnect must cancel, not complete, the parked service"
+            );
+            server.stop().await;
+        }
+        let dropped = probes.merge_preparation_snapshot();
+        assert_eq!(
+            (dropped.active, dropped.ready, dropped.uncollected),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            (
+                dropped.accounted_bytes,
+                dropped.scratch_owners,
+                dropped.scratch_bytes
+            ),
+            (0, 0, 0)
+        );
+        // Compare before reopening, so recovery cannot hide a leaked graph
+        // write. This includes native manifests/refs, lineage and any sidecars.
+        assert_eq!(
+            graph_files(&graph),
+            before,
+            "pre-arm request drop changed graph-owned files at requested width {requested_width}"
+        );
+        let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        assert_eq!(authority(&reopened).await, expected_authority);
+        drop(reopened);
+        let retry_probes = MergeWriteProbes::default();
+        let (status, body) = with_merge_write_probes(
+            retry_probes.clone(),
+            with_merge_preparation_options(
+                options,
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    json_response(&app, merge_request(surface)),
+                ),
+            ),
+        )
+        .await
+        .expect("dropped request retained a server admission or writer gate");
+        assert_eq!(status, StatusCode::OK);
+        match surface {
+            MergeRequestSurface::BranchRoute => assert_eq!(body["outcome"], "merged"),
+            MergeRequestSurface::GqStatement => {
+                assert_eq!(body["outcome"]["kind"], "merged");
+                assert_eq!(body["outcome"]["merge"], "merged");
+            }
+        }
+        let retried = retry_probes.merge_preparation_snapshot();
+        assert_eq!(retried.admitted, 4, "{retried:?}");
+        assert_eq!(retried.collected, 4, "{retried:?}");
+        assert_eq!(retried.peak_active, 1, "{retried:?}");
+        assert_eq!(retried.peak_uncollected, 1, "{retried:?}");
+        assert_eq!(retried.budget_fallbacks, 0, "{retried:?}");
+        let verified = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        let after_retry = authority(&verified).await;
+        assert_eq!(
+            after_retry["main"]["manifest_version"].as_u64().unwrap(),
+            expected_authority["main"]["manifest_version"]
+                .as_u64()
+                .unwrap()
+                + 1,
+            "retry must publish one complete graph transition"
+        );
+        assert_eq!(after_retry["feature"], expected_authority["feature"]);
+        drop(verified);
+        drop(app);
+        let app = build_app(AppState::new_with_workload(
+            graph.to_string_lossy().to_string(),
+            Omnigraph::open(graph.to_str().unwrap()).await.unwrap(),
+            Vec::new(),
+            omnigraph_server::workload::WorkloadController::with_defaults(),
+        ));
+        for branch in ["main", "feature"] {
+            for name in types {
+                let read = ReadRequest {
+                    query_source: format!(
+                        "query rows() {{ match {{ $p: {name} }} return {{ $p.name, $p.value }} }}"
+                    ),
+                    query_name: Some("rows".into()),
+                    params: None,
+                    branch: Some(branch.into()),
+                    snapshot: None,
+                };
+                let (status, body) = json_response(
+                    &app,
+                    Request::builder()
+                        .uri(g("/read"))
+                        .method(Method::POST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&read).unwrap()))
+                        .unwrap(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body["row_count"], 4);
+                let actual: BTreeMap<_, _> = body["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["p.name"].as_str().unwrap().to_string(),
+                            row["p.value"].as_i64().unwrap(),
+                        )
+                    })
+                    .collect();
+                let expected: BTreeMap<_, _> = (0..4)
+                    .map(|row| {
+                        (
+                            format!("row-{row}"),
+                            if row < 2 {
+                                10
+                            } else if branch == "main" {
+                                20
+                            } else {
+                                0
+                            },
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "wrong {branch}/{name} after retry at requested width {requested_width}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     let (_temp, app) = app_for_loaded_graph().await;

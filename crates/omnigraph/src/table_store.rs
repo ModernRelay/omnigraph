@@ -23,7 +23,9 @@ use datafusion::prelude::Expr;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
-use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
+use lance::dataset::scanner::{
+    ColumnOrdering, DatasetRecordBatchStream, MaterializationStyle, Scanner,
+};
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder, UpdateMode};
 use lance::dataset::write::merge_insert::inserted_rows::{KeyExistenceFilterBuilder, KeyValue};
 use lance::dataset::write::merge_insert::{
@@ -45,13 +47,13 @@ use lance_core::{
 };
 use lance_datafusion::exec::{
     ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
-    collect_execution_metrics,
+    collect_execution_metrics, execute_plan,
 };
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
-use lance_select::mask::RowAddrTreeMap;
+use lance_select::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use serde::{Deserialize, Serialize};
@@ -117,6 +119,8 @@ pub(crate) struct ScanTuning<'a> {
     /// over every `filter_expr` call although Lance keeps only the last filter:
     /// a fail-closed over-approximation.
     filter_demand: FtsFilterDemand,
+    execution_target_partitions: Option<usize>,
+    execution_batch_rows: Option<usize>,
 }
 
 /// Which FTS-index columns a filter expression reads through
@@ -176,13 +180,45 @@ impl ScanTuning<'_> {
         self
     }
 
+    /// Lance's `RowAddrMask` is keyed by `_rowid`: stable IDs when enabled,
+    /// physical addresses otherwise. Name our wrapper after that input space.
+    pub(crate) fn with_row_id_prefilter(&mut self, mask: RowAddrMask) -> &mut Self {
+        self.scanner.with_row_addr_prefilter(mask);
+        self
+    }
+
     pub(crate) fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.scanner.batch_size(batch_size);
+        self.execution_batch_rows = Some(batch_size);
         self
     }
 
     pub(crate) fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
         self.scanner.batch_size_bytes(batch_size_bytes);
+        self
+    }
+
+    /// Bound native read/decode fan-out when a caller already overlaps scans.
+    /// The I/O allowance excludes returned batches and decoder working memory.
+    pub(crate) fn readahead(
+        &mut self,
+        batches: usize,
+        fragments: usize,
+        io_buffer_bytes: u64,
+    ) -> &mut Self {
+        self.scanner
+            .batch_readahead(batches)
+            .fragment_readahead(fragments)
+            .io_buffer_size(io_buffer_bytes)
+            .target_parallelism(batches)
+            // Keep hydration on the configured scan: late materialization
+            // would add a take whose reader options omit these bounds.
+            .materialization_style(MaterializationStyle::AllEarly);
+        // Both LanceScanExec and FilteredReadExec cap decode concurrency by
+        // the executing task's target_partitions. Scanner::target_parallelism
+        // controls optimization only; try_into_stream does not forward it to
+        // execution. Keep both halves explicit for this opt-in path.
+        self.execution_target_partitions = Some(batches);
         self
     }
 
@@ -1911,17 +1947,30 @@ impl TableStore {
                 scanner: &mut scanner,
                 full_text_columns: None,
                 filter_demand: FtsFilterDemand::default(),
+                execution_target_partitions: None,
+                execution_batch_rows: None,
             };
             configure(&mut tuning)?;
             let columns = tuning.full_text_columns;
             let filter_demand = tuning.filter_demand;
-            Ok((scanner, has_ordering, columns, filter_demand))
+            let execution_options = LanceExecutionOptions {
+                target_partition: tuning.execution_target_partitions,
+                batch_size: tuning.execution_batch_rows,
+                ..Default::default()
+            };
+            Ok((
+                scanner,
+                has_ordering,
+                columns,
+                filter_demand,
+                execution_options,
+            ))
         })();
 
         let has_sql_filter = filter.is_some();
         let dataset = ds.clone();
         Box::pin(async move {
-            let (scanner, has_ordering, columns, filter_demand) = prepared?;
+            let (scanner, has_ordering, columns, filter_demand, execution_options) = prepared?;
             if has_sql_filter {
                 Self::validate_full_text_scan(&dataset, &scanner, columns).await?;
             } else if columns.is_some() || !filter_demand.is_empty() {
@@ -1935,10 +1984,16 @@ impl TableStore {
                         mem_pool_size: Some(ORDERED_SCAN_MEMORY_BYTES),
                         max_temp_directory_size: Some(ORDERED_SCAN_SCRATCH_BYTES),
                         batch_size: Some(ORDERED_SCAN_EXECUTION_BATCH_ROWS),
+                        target_partition: execution_options.target_partition,
                         ..Default::default()
                     },
                 )
                 .await
+            } else if execution_options.target_partition.is_some() {
+                let plan = scanner.create_plan().await.map_err(OmniError::storage)?;
+                execute_plan(plan, execution_options)
+                    .map(DatasetRecordBatchStream::new)
+                    .map_err(OmniError::storage)
             } else {
                 scanner.try_into_stream().await.map_err(OmniError::storage)
             }
@@ -2484,6 +2539,8 @@ impl TableStore {
                     session: Some(control_session),
                     ..Default::default()
                 };
+                #[cfg(test)]
+                let params = scratch_write_test_params(dataset_uri, params);
                 Dataset::write(reader, dataset_uri, Some(params))
                     .await
                     .map_err(OmniError::storage)
@@ -4533,10 +4590,47 @@ impl TableStore {
             session: Some(control_session),
             ..Default::default()
         };
+        #[cfg(test)]
+        let params = scratch_write_test_params(dataset_uri, params);
         Dataset::write(reader, dataset_uri, Some(params))
             .await
             .map_err(OmniError::storage)
     }
+}
+
+// Only the in-source scratch-lifetime regression installs this scoped adapter.
+// It routes real Lance writes through a controlled local object-store boundary
+// without adding an engine option or intercepting graph-owned dataset writes.
+#[cfg(test)]
+tokio::task_local! {
+    static SCRATCH_WRITE_TEST_STORE: Arc<dyn object_store::ObjectStore>;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_scratch_write_test_store<F: std::future::Future>(
+    store: Arc<dyn object_store::ObjectStore>,
+    future: F,
+) -> F::Output {
+    SCRATCH_WRITE_TEST_STORE.scope(store, future).await
+}
+
+#[cfg(test)]
+fn scratch_write_test_params(dataset_uri: &str, mut params: WriteParams) -> WriteParams {
+    if dataset_uri.contains("/omnigraph-merge-")
+        && let Ok(store) = SCRATCH_WRITE_TEST_STORE.try_with(Arc::clone)
+    {
+        // A synthetic provider identity selects Lance's object-store writer;
+        // the supplied store still writes the actual private local files.
+        // Native file:// bypasses ObjectStore::put_opts via LocalWriter.
+        let mut location = url::Url::parse("memory:///").unwrap();
+        location.set_path(dataset_uri);
+        #[allow(deprecated)]
+        {
+            params.store_params.as_mut().unwrap().object_store = Some((store, location));
+        }
+        params.commit_handler = Some(Arc::new(lance_table::io::commit::RenameCommitHandler));
+    }
+    params
 }
 
 /// Translate only the zero-retry exact staged-commit conflict vocabulary into
@@ -6193,6 +6287,43 @@ mod tests {
                 summary.all_counts.get(metric).copied().unwrap_or_default() > 0,
                 "ordered scan must report non-zero {metric}: {summary:?}"
             );
+        }
+
+        // Exercise both execution routes used by overlapping merge scans.
+        // V2's decode cap comes from the executing task context, so the opt-in
+        // route must carry its target partition setting into execution.
+        let expected_ids = (0..ROWS)
+            .map(|row| format!("{row:08}-{row:0248}"))
+            .collect::<Vec<_>>();
+        for ordered in [false, true] {
+            let mut stream = TableStore::scan_stream_with(
+                &dataset,
+                Some(&["id"]),
+                None,
+                ordered.then(|| vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
+                false,
+                |scanner| {
+                    scanner.batch_size(1_024);
+                    scanner.readahead(1, 1, 8 * 1024 * 1024);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            let mut observed_ids = Vec::with_capacity(ROWS);
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                observed_ids.extend(ids.iter().map(|id| id.unwrap().to_owned()));
+            }
+            if !ordered {
+                observed_ids.sort_unstable();
+            }
+            assert_eq!(observed_ids, expected_ids, "ordered={ordered}");
         }
 
         // A fresh per-operation context with an impossible scratch quota must

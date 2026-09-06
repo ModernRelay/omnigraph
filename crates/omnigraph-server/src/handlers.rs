@@ -2426,7 +2426,8 @@ pub(crate) async fn server_branch_merge(
 
 /// Body shared by `POST /branches/merge` and the `branch merge` statement:
 /// the `branch_merge` check on (`source`, `target`), admission, the engine
-/// call. A conflict surfaces as `ApiError::merge_conflict` (409).
+/// request-owned width-one entry. A conflict surfaces as
+/// `ApiError::merge_conflict` (409).
 async fn branch_merge_body(
     state: &AppState,
     handle: &GraphHandle,
@@ -2455,7 +2456,7 @@ async fn branch_merge_body(
         .map_err(ApiError::from_workload_reject)?;
     handle
         .engine
-        .branch_merge_as(source, target, actor.map(|actor| actor.actor_id.as_ref()))
+        .branch_merge_request_owned_as(source, target, actor.map(|actor| actor.actor_id.as_ref()))
         .await
         .map_err(ApiError::from_omni)
 }

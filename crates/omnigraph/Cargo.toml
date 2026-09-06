@@ -34,6 +34,7 @@ omnigraph-policy = { path = "../omnigraph-policy", version = "0.10.0" }
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.10.0" }
 lance = { workspace = true }
 lance-core = { workspace = true }
+lance-io = { workspace = true }
 lance-select = { workspace = true }
 lance-datafusion = { workspace = true }
 datafusion = { workspace = true }

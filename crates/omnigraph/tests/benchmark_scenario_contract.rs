@@ -8,6 +8,105 @@ mod rfc023_limits;
 #[path = "../benches/scenarios/child_protocol.rs"]
 mod child_protocol;
 
+#[path = "helpers/request_delay.rs"]
+mod request_delay;
+
+#[tokio::test]
+async fn request_delay_wraps_real_store_calls_and_survives_child_tasks() {
+    use futures::StreamExt;
+    use lance_io::utils::tracking_store::IOTracker;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    use request_delay::{RequestDelay, with_request_delay};
+    use std::sync::Arc;
+    let delay = RequestDelay::default();
+    let store: Arc<dyn ObjectStore> = with_request_delay(delay.clone(), async {
+        request_delay::wrap_counter(Arc::new(IOTracker::default()))
+            .wrap("memory", Arc::new(object_store::memory::InMemory::new()))
+    })
+    .await;
+    let path = object_store::path::Path::from("fixture");
+    store.put(&path, "payload".into()).await.unwrap();
+    assert_eq!(delay.calls(), 0, "setup must not receive injection");
+    {
+        let _active = delay.activate(17);
+        let child_store = store.clone();
+        let child_path = path.clone();
+        let child = tokio::spawn(async move { child_store.head(&child_path).await.unwrap() });
+        let local = store.get(&path);
+        let (head, get) = tokio::join!(child, local);
+        assert_eq!(head.unwrap().size, 7);
+        assert_eq!(get.unwrap().bytes().await.unwrap().as_ref(), b"payload");
+        assert_eq!(
+            delay.calls(),
+            2,
+            "each wrapped call must observe the retained controller"
+        );
+        assert_eq!(
+            delay.active_calls(),
+            0,
+            "completed API futures must release their guards"
+        );
+        assert_eq!(
+            delay.peak_active_calls(),
+            2,
+            "child and local API futures overlap during the delay"
+        );
+    }
+    store.head(&path).await.unwrap();
+    assert_eq!(delay.calls(), 2, "verification must not receive injection");
+    assert_eq!(delay.active_calls(), 0);
+    {
+        let active = delay.activate(17);
+        let mut pending = Box::pin(store.head(&path));
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert_eq!(delay.active_calls(), 1);
+        drop(active);
+        assert_eq!(
+            delay.active_calls(),
+            1,
+            "leaving the scope must not hide an outstanding future"
+        );
+        drop(pending);
+        assert_eq!(
+            delay.active_calls(),
+            0,
+            "dropping a delayed API future releases its guard"
+        );
+    }
+    {
+        let _active = delay.activate(0);
+        let mut listed = store.list(None);
+        assert!(listed.next().await.unwrap().is_ok());
+        assert_eq!(
+            delay.active_calls(),
+            1,
+            "a list stream retains ownership between items"
+        );
+        assert!(listed.next().await.is_none());
+        assert_eq!(
+            delay.active_calls(),
+            0,
+            "list EOF releases ownership before stream drop"
+        );
+
+        let mut deleting = store.delete_stream(futures::stream::pending().boxed());
+        assert!(futures::poll!(deleting.next()).is_pending());
+        assert_eq!(
+            delay.active_calls(),
+            1,
+            "the underlying delete stream is pending after the delay"
+        );
+        drop(deleting);
+        assert_eq!(
+            delay.active_calls(),
+            0,
+            "stream cancellation releases ownership"
+        );
+        assert_eq!(delay.calls(), 2);
+        assert_eq!(delay.peak_active_calls(), 1);
+    }
+}
+
 fn product_const(source: &str, name: &str) -> u64 {
     let marker = format!("const {name}:");
     let declaration = source
@@ -341,6 +440,11 @@ fn general_update_reports_completed_classifiers_and_keeps_update_semantics() {
     );
     assert!(operation.contains("\"classifier_route\": classifier_route"));
     assert!(operation.contains("args.delta_rows as u64"));
+    assert!(operation.contains("args.delta_rows as u64 * args.tables as u64"));
+    assert!(operation.contains("delay.activate(args.io_delay_ms)"));
+    assert!(operation.contains("\"io_delay_calls\": delay.calls()"));
+    assert!(operation.contains("\"io_wrapped_api_active\": delay.active_calls()"));
+    assert!(operation.contains("\"io_wrapped_api_peak_active\": delay.peak_active_calls()"));
     assert!(!operation.contains("snapshot_of("));
     assert!(source.contains("pub(super) async fn general_merge_verify"));
     let wrapper = operation.find("helpers::cost::cost_harness").unwrap();
@@ -377,8 +481,29 @@ fn general_update_reports_completed_classifiers_and_keeps_update_semantics() {
         verify
             .contains("args.rows <= 256 || args.history_commits > 0 || args.retired_branches > 0")
     );
-    assert!(verify.contains("verify_general_all_rows(&table, args, true)"));
-    assert!(verify.contains("verify_general_all_rows(&source_table, args, false)"));
+    assert!(verify.contains("verify_general_all_rows(&table, args, true, touched)"));
+    assert!(verify.contains("verify_general_all_rows(&source_table, args, false, touched)"));
+    assert!(verify.contains("for index in 0..args.populated_tables()"));
+    assert!(verify.contains("let touched = index < args.tables"));
+    assert!(
+        setup
+            .split_whitespace()
+            .collect::<String>()
+            .contains("general_merge_jsonl_chunk(args.populated_tables(),\"base\",")
+    );
+    assert!(verify.contains("merge changed the source head or exact table pins"));
+    for field in [
+        "setup_table_count",
+        "setup_touched_table_count",
+        "setup_total_main_rows",
+        "setup_total_source_rows",
+        "setup_tables",
+    ] {
+        assert!(
+            setup.contains(field),
+            "missing multi-table fixture receipt {field}"
+        );
+    }
     assert!(source.contains("scanner.batch_size(256)"));
     assert!(source.contains("duplicate aged fixture ID"));
     assert!(source.contains("aged fixture row missing"));
@@ -495,9 +620,9 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     assert!(aging.contains("args.history_commits > 256"));
     assert!(aging.contains("!args.history_commits.is_multiple_of(2)"));
     assert!(aging.contains("args.retired_branches > 32"));
-    assert!(
-        aging.contains("args.rows > 256 || args.dims > 16 || args.branches > 8 || args.tables > 8")
-    );
+    assert!(aging.contains(
+        "args.rows > 256 || args.dims > 16 || args.branches > 8 || args.populated_tables() > 8"
+    ));
     let age = aging
         .split_once("pub(super) async fn age_fixture")
         .unwrap()

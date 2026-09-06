@@ -6,6 +6,220 @@ use crate::storage_layer::{
 use crate::table_store::certified_insert_absence_rows;
 use futures::StreamExt;
 
+mod preparation;
+
+const MERGE_PREPARATION_WIDTH: usize = 1;
+
+struct ScalarPreparation {
+    candidate: Option<CandidateTableState>,
+    conflicts: Vec<MergeConflict>,
+}
+
+struct PreparedScalarSlot {
+    result: Result<ScalarPreparation>,
+    context: Arc<preparation::PreparationContext>,
+    probe: Option<crate::instrumentation::MergePreparationProbeGuard>,
+}
+
+/// Prepare only private candidates. Collection, graph validation, recovery and
+/// graph-owned effects remain in their original operation-level owners.
+async fn prepare_scalar_table(
+    db: &Omnigraph,
+    table_key: &str,
+    catalog: &Catalog,
+    base: &Snapshot,
+    source: &Snapshot,
+    target: &Snapshot,
+    target_native: Option<&str>,
+) -> Result<ScalarPreparation> {
+    preparation::checkpoint()?;
+    ensure_merge_identity_compatible(
+        table_key,
+        base.dataset(table_key).map(|entry| entry.identity),
+        source.dataset(table_key).map(|entry| entry.identity),
+        target.dataset(table_key).map(|entry| entry.identity),
+    )?;
+    let mut conflicts = Vec::new();
+    let preflight = crate::table_store::ExternalBlobPreflight::default();
+    let candidate = if same_manifest_state(base.dataset(table_key), target.dataset(table_key)) {
+        classify_adopt(
+            db,
+            catalog,
+            base,
+            source,
+            target,
+            table_key,
+            target_native,
+            &preflight,
+        )
+        .await?
+    } else {
+        let timing = crate::instrumentation::start_merge_timing(
+            crate::instrumentation::MergeTimingPhase::TableWalk,
+        );
+        let staged = stage_streaming_table_merge(
+            db,
+            table_key,
+            catalog,
+            base,
+            source,
+            target,
+            &mut conflicts,
+            &preflight,
+        )
+        .await?;
+        timing.finish();
+        staged.map(CandidateTableState::RewriteMerged)
+    };
+    Ok(ScalarPreparation {
+        candidate,
+        conflicts,
+    })
+}
+
+/// An explicit bounded window is drained even when one result is an error.
+/// This is deliberately not a try-collect that drops sibling scratch writers.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_scalar_window(
+    db: &Omnigraph,
+    keys: &[(usize, &str)],
+    catalog: &Catalog,
+    base: &Snapshot,
+    source: &Snapshot,
+    target: &Snapshot,
+    target_native: Option<&str>,
+    width: usize,
+    budget: &Arc<preparation::PreparationBudget>,
+    carried_errors: Vec<Option<OmniError>>,
+    candidates: &mut HashMap<String, CandidateTableState>,
+    conflicts: &mut Vec<MergeConflict>,
+) -> Result<()> {
+    use crate::instrumentation::{self, MergePreparationCheckpoint as Checkpoint};
+    debug_assert!(keys.len() <= width && keys.len() == carried_errors.len());
+    let frontier = preparation::PreparationFailureFrontier::new();
+    let futures = keys
+        .iter()
+        .zip(carried_errors)
+        .map(|(&(slot, key), error)| {
+            let frontier = Arc::clone(&frontier);
+            let context = preparation::PreparationContext::for_ordered_window(
+                Arc::clone(budget),
+                width > 1 && keys.len() > 1,
+                Arc::clone(&frontier),
+                slot,
+            );
+            async move {
+                if let Some(error) = error {
+                    frontier.failed(slot);
+                    return PreparedScalarSlot {
+                        result: Err(error),
+                        context,
+                        probe: None,
+                    };
+                }
+                let mut probe = instrumentation::start_merge_preparation_probe();
+                let result = preparation::scope(Arc::clone(&context), async {
+                    instrumentation::merge_preparation_checkpoint(slot, key, Checkpoint::Started)
+                        .await;
+                    let result = Box::pin(prepare_scalar_table(
+                        db,
+                        key,
+                        catalog,
+                        base,
+                        source,
+                        target,
+                        target_native,
+                    ))
+                    .await;
+                    if result.is_err() {
+                        frontier.failed(slot);
+                    }
+                    instrumentation::merge_preparation_checkpoint(slot, key, Checkpoint::Finished)
+                        .await;
+                    result
+                })
+                .await;
+                probe.ready();
+                PreparedScalarSlot {
+                    result,
+                    context,
+                    probe: Some(probe),
+                }
+            }
+        });
+    let results = futures::future::join_all(futures).await;
+    // A later stopped/pressured slot cannot turn an earlier real error into
+    // a retry. Conversely, earlier pressure must replay before a retained
+    // later real error is eligible to become the public result.
+    if width > 1
+        && results
+            .iter()
+            .find_map(|slot| slot.result.as_ref().err())
+            .is_some_and(preparation::is_pressure)
+    {
+        instrumentation::record_merge_preparation_budget_fallback();
+        // Never replay a real storage/identity failure. Earlier pressure-stopped
+        // slots must still run before that failure can be selected in order.
+        let mut retained_errors = Vec::with_capacity(keys.len());
+        for (&(slot, key), prepared) in keys.iter().zip(results) {
+            let PreparedScalarSlot {
+                result,
+                context,
+                probe,
+            } = prepared;
+            let error = match result {
+                Err(error) if !preparation::is_pressure(&error) => Some(error),
+                _ => None,
+            };
+            drop(probe);
+            drop(context);
+            retained_errors.push(error);
+            instrumentation::merge_preparation_checkpoint(slot, key, Checkpoint::Discarded).await;
+        }
+        let next_width = width / 2;
+        let mut errors = retained_errors.into_iter();
+        for chunk in keys.chunks(next_width) {
+            let errors = errors.by_ref().take(chunk.len()).collect();
+            Box::pin(prepare_scalar_window(
+                db,
+                chunk,
+                catalog,
+                base,
+                source,
+                target,
+                target_native,
+                next_width,
+                budget,
+                errors,
+                candidates,
+                conflicts,
+            ))
+            .await?;
+        }
+        return Ok(());
+    }
+    for (&(slot, key), prepared) in keys.iter().zip(results) {
+        let PreparedScalarSlot {
+            result,
+            context,
+            probe,
+        } = prepared;
+        let prepared = result?;
+        // Actual candidate owners may outlive this scope. Their leases become
+        // serial ownership together, rather than on individual worker finish.
+        context.release_to_collector();
+        if let Some(candidate) = prepared.candidate {
+            candidates.insert(key.to_string(), candidate);
+        }
+        conflicts.extend(prepared.conflicts);
+        if let Some(probe) = probe {
+            probe.collected();
+        }
+        instrumentation::merge_preparation_checkpoint(slot, key, Checkpoint::Collected).await;
+    }
+    Ok(())
+}
+
 const MERGE_STAGE_DIR_ENV: &str = "OMNIGRAPH_MERGE_STAGING_DIR";
 const DELETE_FILTER_PREFIX: &str = "id IN (";
 const DELETE_FILTER_SEPARATOR: &str = ", ";
@@ -150,7 +364,8 @@ async fn open_first_touch_merge_target(
 
 #[derive(Debug)]
 struct StagedTable {
-    _dir: TempDir,
+    _dir: preparation::ScratchDirectory,
+    _metadata_charge: preparation::PreparationLease,
     dataset: Dataset,
     row_count: u64,
     /// Exact row boundaries written by `StagedTableWriter`. Recovery planning
@@ -268,6 +483,26 @@ impl DeleteIdChunks {
                 retained_bytes,
             ));
         }
+        // Existing serial limits count logical payloads. The speculative
+        // account also includes spare String capacity and each Vec's initial
+        // four-slot allocation, before its ordinary doubling allowance covers
+        // subsequent growth.
+        let initial_chunk_slots = if self.chunks.capacity() == 0 {
+            2 * std::mem::size_of::<DeleteIdChunk>() as u64
+        } else {
+            0
+        };
+        let initial_id_slots = if starts_new_chunk {
+            2 * std::mem::size_of::<String>() as u64
+        } else {
+            0
+        };
+        preparation::retain(
+            (retained_bytes - self.retained_bytes)
+                .saturating_add((id.capacity() - id.len()) as u64)
+                .saturating_add(initial_chunk_slots)
+                .saturating_add(initial_id_slots),
+        )?;
         if starts_new_chunk {
             self.chunks.push(DeleteIdChunk {
                 ids: Vec::new(),
@@ -437,6 +672,8 @@ struct CursorRow {
     dataset: Dataset,
     batch: RecordBatch,
     row_index: usize,
+    // Rows and typed views can outlive the cursor's current hydration chunk.
+    _preparation_charge: Arc<preparation::PreparationLease>,
 }
 
 impl CursorRow {
@@ -510,6 +747,7 @@ const HYDRATION_SCAN_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 struct HydratedChunk {
     batches: Vec<RecordBatch>,
     order: Vec<(usize, usize)>,
+    charge: Arc<preparation::PreparationLease>,
 }
 
 /// Outcome of one bounded chunk-scan attempt.
@@ -542,6 +780,7 @@ struct OrderedTableCursor {
     table_key: String,
     role: &'static str,
     key_batch: Option<RecordBatch>,
+    key_charge: preparation::PreparationLease,
     key_row: usize,
     hydrated: Option<HydratedChunk>,
     hydrated_pos: usize,
@@ -555,6 +794,128 @@ struct OrderedTableCursor {
     /// common rows. New/deleted rows therefore avoid comparison work, while
     /// general three-way cursors retain their eager typed rows.
     eager_signatures: bool,
+}
+
+const PREPARATION_NATIVE_MAX_FRAGMENTS: usize = 64;
+const PREPARATION_NATIVE_MAX_ROWS: usize = 8_192;
+const PREPARATION_NATIVE_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const PREPARATION_NATIVE_MAX_INLINE_ROW_ID_BYTES: usize = 64 * 1024;
+const PREPARATION_NATIVE_MAX_IO_PARALLELISM: usize = 64;
+
+/// Bound the encoded input and metadata cardinality admitted to one native
+/// snapshot scan. Encoded bytes do not bound decoder RSS; decode concurrency,
+/// row/byte batching and the existing retained-buffer checks apply separately.
+fn preparation_fragments_fit_native_envelope(fragments: &[lance_table::format::Fragment]) -> bool {
+    use lance_table::format::RowIdMeta;
+
+    if fragments.len() > PREPARATION_NATIVE_MAX_FRAGMENTS {
+        return false;
+    }
+    let mut file_bytes = 0_u64;
+    let mut physical_rows = 0_usize;
+    let mut inline_row_id_bytes = 0_usize;
+    for fragment in fragments {
+        if fragment.files.len() != 1 || !fragment.overlays.is_empty() {
+            return false;
+        }
+        let file = &fragment.files[0];
+        if file.file_version().ok() != Some(lance_file::version::ConcreteFileVersion::V2_2) {
+            return false;
+        }
+        let (Some(size), Some(rows)) = (file.file_size_bytes.get(), fragment.physical_rows) else {
+            return false;
+        };
+        let (Some(next_bytes), Some(next_rows)) = (
+            file_bytes.checked_add(size.get()),
+            physical_rows.checked_add(rows),
+        ) else {
+            return false;
+        };
+        file_bytes = next_bytes;
+        physical_rows = next_rows;
+        if file_bytes > PREPARATION_NATIVE_MAX_FILE_BYTES
+            || physical_rows > PREPARATION_NATIVE_MAX_ROWS
+        {
+            return false;
+        }
+        match &fragment.row_id_meta {
+            Some(RowIdMeta::External(_)) => return false,
+            Some(RowIdMeta::Inline(ids)) => {
+                let Some(next_bytes) = inline_row_id_bytes.checked_add(ids.len()) else {
+                    return false;
+                };
+                inline_row_id_bytes = next_bytes;
+                if inline_row_id_bytes > PREPARATION_NATIVE_MAX_INLINE_ROW_ID_BYTES {
+                    return false;
+                }
+            }
+            None => {}
+        }
+        if let Some(deletion) = &fragment.deletion_file {
+            let Some(deleted) = deletion.num_deleted_rows else {
+                return false;
+            };
+            if deleted > rows {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Qualify each opened snapshot before lineage planning reads fragment metadata.
+/// A native branch inherits base_id files whose schedulers ignore the requested
+/// 8 MiB scan buffer. Small known files remain eligible under this separate
+/// encoded-input envelope; no identity/path rewriting or size-discovery I/O is
+/// needed. Serial work retains its existing behavior.
+fn require_bounded_preparation_dataset(
+    dataset: &Dataset,
+) -> futures::future::BoxFuture<'_, Result<()>> {
+    Box::pin(async move {
+        if !preparation::parallel_context_active() {
+            return Ok(());
+        }
+        // Even an empty persisted section stays serial. Loading indexes just
+        // to qualify speculation can read index/fragment-reuse artifacts and
+        // introduce errors or allocations absent from the original read path.
+        if dataset.manifest.index_section.is_some() {
+            return preparation::require_serial();
+        }
+        if !preparation_fragments_fit_native_envelope(&dataset.manifest.fragments) {
+            return preparation::require_serial();
+        }
+        // Check the primary store too: metadata planning uses its I/O
+        // concurrency even when every data file belongs to an inherited base.
+        // Two possible base references per fragment, plus the primary store.
+        let mut bases = [None; 2 * PREPARATION_NATIVE_MAX_FRAGMENTS + 1];
+        let mut base_count = 1;
+        for fragment in dataset.manifest.fragments.iter() {
+            for base_id in [
+                fragment.files[0].base_id,
+                fragment
+                    .deletion_file
+                    .as_ref()
+                    .and_then(|file| file.base_id),
+            ] {
+                if !bases[..base_count].contains(&base_id) {
+                    bases[base_count] = base_id;
+                    base_count += 1;
+                }
+            }
+        }
+        for base_id in &bases[..base_count] {
+            let Ok(store) = dataset.object_store(*base_id).await else {
+                // Speculative qualification must not introduce an earlier
+                // storage error than the established serial read route.
+                preparation::require_serial()?;
+                return Ok(());
+            };
+            if store.io_parallelism() > PREPARATION_NATIVE_MAX_IO_PARALLELISM {
+                preparation::require_serial()?;
+            }
+        }
+        Ok(())
+    })
 }
 
 impl OrderedTableCursor {
@@ -586,6 +947,9 @@ impl OrderedTableCursor {
             Some(_) => Some(snapshot.open_lance_dataset(table_key).await?),
             None => None,
         };
+        if let Some(dataset) = &dataset {
+            require_bounded_preparation_dataset(dataset).await?;
+        }
         Self::from_dataset_with(dataset, eager_signatures, None, table_key, role).await
     }
 
@@ -627,6 +991,9 @@ impl OrderedTableCursor {
                     |scanner| {
                         scanner.batch_size(KEYED_WRITE_MAX_ROWS);
                         scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+                        if preparation::parallel_context_active() {
+                            scanner.readahead(1, 1, HYDRATION_SCAN_BATCH_BYTES);
+                        }
                         // `_rowaddr` addresses the hydration take against the
                         // same pinned version; payload columns (including Blob
                         // descriptors) arrive only through that take.
@@ -646,6 +1013,7 @@ impl OrderedTableCursor {
             table_key: table_key.to_string(),
             role,
             key_batch: None,
+            key_charge: preparation::reserve(0)?,
             key_row: 0,
             hydrated: None,
             hydrated_pos: 0,
@@ -714,6 +1082,7 @@ impl OrderedTableCursor {
 
     async fn next_row(&mut self) -> Result<Option<CursorRow>> {
         loop {
+            preparation::checkpoint()?;
             if let Some(chunk) = &self.hydrated {
                 if self.hydrated_pos < chunk.order.len() {
                     let (batch_index, row_index) = chunk.order[self.hydrated_pos];
@@ -733,6 +1102,7 @@ impl OrderedTableCursor {
                         dataset,
                         batch,
                         row_index,
+                        _preparation_charge: Arc::clone(&chunk.charge),
                     }));
                 }
                 self.hydrated = None;
@@ -745,6 +1115,7 @@ impl OrderedTableCursor {
                     continue;
                 }
                 self.key_batch = None;
+                self.key_charge.resize(0)?;
                 self.key_row = 0;
             }
 
@@ -753,6 +1124,8 @@ impl OrderedTableCursor {
             };
             match stream.try_next().await {
                 Ok(Some(batch)) => {
+                    self.key_charge
+                        .resize(batch.get_array_memory_size() as u64)?;
                     self.key_batch = Some(batch);
                     self.key_row = 0;
                 }
@@ -844,6 +1217,12 @@ impl OrderedTableCursor {
         len: usize,
     ) -> Result<ChunkScan> {
         use datafusion::prelude::{col, lit};
+        use lance_core::deepsize::DeepSizeOf;
+
+        preparation::checkpoint()?;
+        // Address/filter/order/hash-map bookkeeping and temporary copies are
+        // bounded by this chunk's key count. Data buffers are charged separately.
+        let _address_charge = preparation::reserve((len as u64).saturating_mul(512))?;
 
         let addresses_column = keys
             .column_by_name(lance_core::ROW_ADDR)
@@ -861,11 +1240,25 @@ impl OrderedTableCursor {
         let last_id = row_id_at(keys, start + len - 1)?;
 
         let fragment_ids: HashSet<u64> = addresses.iter().map(|address| address >> 32).collect();
+        let fragment_bytes = if preparation::parallel_context_active() {
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .filter(|fragment| fragment_ids.contains(&fragment.id))
+                .fold(0_u64, |bytes, fragment| {
+                    bytes.saturating_add(fragment.deep_size_of() as u64)
+                })
+        } else {
+            0
+        };
+        let _fragment_charge = preparation::reserve(fragment_bytes.saturating_mul(2))?;
         let fragments: Vec<lance_table::format::Fragment> = dataset
-            .get_fragments()
-            .into_iter()
-            .filter(|fragment| fragment_ids.contains(&fragment.metadata().id))
-            .map(|fragment| fragment.metadata().clone())
+            .manifest
+            .fragments
+            .iter()
+            .filter(|fragment| fragment_ids.contains(&fragment.id))
+            .cloned()
             .collect();
         if fragments.len() != fragment_ids.len() {
             return Err(OmniError::manifest_internal(format!(
@@ -887,9 +1280,38 @@ impl OrderedTableCursor {
             true,
             |scanner| {
                 scanner.with_fragments(fragments);
-                scanner.filter_expr(address_filter);
+                if preparation::parallel_context_active() {
+                    // A `_rowaddr IN` expression takes Lance's shortcut that
+                    // omits scanner reader bounds. Its typed mask instead uses
+                    // `_rowid` space, which differs from physical addresses on
+                    // updated/branched stable-row-ID datasets. Both columns
+                    // came from this same pinned dataset's ordered key scan.
+                    let row_ids = keys
+                        .column_by_name(lance_core::ROW_ID)
+                        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal(
+                                "ordered cursor key batch is missing native row ids",
+                            )
+                        })?;
+                    if (start..start + len).any(|row| row_ids.is_null(row)) {
+                        return Err(OmniError::manifest_internal(
+                            "ordered cursor key batch contains a null native row id",
+                        ));
+                    }
+                    scanner.with_row_id_prefilter(lance_select::mask::RowAddrMask::from_allowed(
+                        lance_select::mask::RowAddrTreeMap::from_iter(
+                            (start..start + len).map(|row| row_ids.value(row)),
+                        ),
+                    ));
+                } else {
+                    scanner.filter_expr(address_filter);
+                }
                 scanner.batch_size(HYDRATION_SCAN_BATCH_ROWS);
                 scanner.batch_size_bytes(HYDRATION_SCAN_BATCH_BYTES);
+                if preparation::parallel_context_active() {
+                    scanner.readahead(1, 1, HYDRATION_SCAN_BATCH_BYTES);
+                }
                 // Blob columns must yield DESCRIPTORS (not payloads) for the
                 // shared typed comparator's data-file identity.
                 scanner.blob_handling(lance_core::datatypes::BlobHandling::BlobsDescriptions);
@@ -901,11 +1323,20 @@ impl OrderedTableCursor {
         .map_err(|error| self.with_hydration_context(error, &first_id, &last_id))?;
 
         let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut batch_charge = preparation::reserve(0)?;
         let mut retained_bytes = 0u64;
         let mut retained_rows = 0usize;
         loop {
             match stream.try_next().await {
                 Ok(Some(batch)) => {
+                    let incoming_bytes = batch.get_array_memory_size() as u64;
+                    let _incoming_charge = preparation::reserve(incoming_bytes)?;
+                    // Reserve before take allocates its output and index array.
+                    let _copy_charge = preparation::reserve(
+                        incoming_bytes
+                            .saturating_add((batch.num_rows() as u64).saturating_mul(8))
+                            .saturating_add(256),
+                    )?;
                     // Compact before charging and retaining: scanned arrays
                     // can be slices of larger decode buffers, so an
                     // uncompacted batch both overcounts (shared parents) and
@@ -915,10 +1346,25 @@ impl OrderedTableCursor {
                     let indices = UInt64Array::from_iter_values(0..batch.num_rows() as u64);
                     let batch = arrow_select::take::take_record_batch(&batch, &indices)
                         .map_err(OmniError::arrow_internal)?;
+                    // Cursor peeks and typed row views clone IDs and Arrow
+                    // metadata while sharing the leased data buffers.
+                    let id_bytes = batch
+                        .column_by_name("id")
+                        .map_or(0, |column| column.get_array_memory_size() as u64);
+                    preparation::retain(
+                        id_bytes.saturating_mul(32).saturating_add(
+                            (batch.num_rows() as u64)
+                                .saturating_mul(batch.num_columns() as u64)
+                                .saturating_mul(512),
+                        ),
+                    )?;
                     retained_bytes = retained_bytes.saturating_add(
                         u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX),
                     );
                     retained_rows += batch.num_rows();
+                    batch_charge.resize(
+                        retained_bytes.saturating_add((retained_rows as u64).saturating_mul(32)),
+                    )?;
                     batches.push(batch);
                     // A single key must hydrate whatever its width — that one
                     // indivisible row is the only allowance above the ceiling.
@@ -989,7 +1435,11 @@ impl OrderedTableCursor {
         }
 
         Ok(ChunkScan::Complete {
-            chunk: HydratedChunk { batches, order },
+            chunk: HydratedChunk {
+                batches,
+                order,
+                charge: Arc::new(batch_charge),
+            },
             bytes: retained_bytes,
         })
     }
@@ -999,7 +1449,9 @@ struct StagedTableWriter {
     schema: SchemaRef,
     materialize_blobs: bool,
     dataset_uri: String,
-    dir: TempDir,
+    dir: preparation::ScratchDirectory,
+    buffer_charge: preparation::PreparationLease,
+    metadata_charge: preparation::PreparationLease,
     dataset: Option<Dataset>,
     buffered_rows: usize,
     buffered_bytes: u64,
@@ -1011,7 +1463,8 @@ struct StagedTableWriter {
 
 impl StagedTableWriter {
     fn new(table_key: &str, schema: SchemaRef) -> Result<Self> {
-        let dir = merge_stage_tempdir(table_key)?;
+        preparation::checkpoint()?;
+        let dir = preparation::ScratchDirectory::new(merge_stage_tempdir(table_key)?);
         let dataset_uri = dir.path().join("table.lance").to_string_lossy().to_string();
         let materialize_blobs = schema_has_blob(&schema)?;
         Ok(Self {
@@ -1019,6 +1472,8 @@ impl StagedTableWriter {
             materialize_blobs,
             dataset_uri,
             dir,
+            buffer_charge: preparation::reserve(0)?,
+            metadata_charge: preparation::reserve(0)?,
             dataset: None,
             buffered_rows: 0,
             buffered_bytes: 0,
@@ -1035,6 +1490,9 @@ impl StagedTableWriter {
         materializer: &crate::table_store::TableStore,
         external_preflight: &crate::table_store::ExternalBlobPreflight,
     ) -> Result<()> {
+        preparation::checkpoint()?;
+        let _copy_charge =
+            preparation::reserve((row.batch.get_array_memory_size() as u64).saturating_add(256))?;
         // `RecordBatch::slice` would retain the complete scanner buffers.
         // Copy exactly one row before sizing or buffering it.
         let indices = UInt64Array::from(vec![row.row_index as u64]);
@@ -1092,6 +1550,11 @@ impl StagedTableWriter {
         {
             self.flush().await?;
         }
+        self.buffer_charge.resize(
+            self.buffered_bytes
+                .saturating_add(row_bytes)
+                .saturating_add((self.buffered_rows as u64 + 1) * 256),
+        )?;
         self.row_count = self
             .row_count
             .checked_add(1)
@@ -1144,16 +1607,19 @@ impl StagedTableWriter {
     async fn finish(mut self) -> Result<StagedTable> {
         self.flush().await?;
         if self.dataset.is_none() {
-            self.dataset = Some(
-                crate::table_store::TableStore::create_empty_dataset(
-                    &self.dataset_uri,
-                    &self.schema,
-                )
-                .await?,
-            );
+            preparation::checkpoint()?;
+            self.dir.begin_write();
+            let result = crate::table_store::TableStore::create_empty_dataset(
+                &self.dataset_uri,
+                &self.schema,
+            )
+            .await;
+            self.dir.end_write();
+            self.retain_dataset(result?)?;
         }
         Ok(StagedTable {
             _dir: self.dir,
+            _metadata_charge: self.metadata_charge,
             dataset: self.dataset.unwrap(),
             row_count: self.row_count,
             chunk_rows: self.chunk_rows,
@@ -1164,7 +1630,15 @@ impl StagedTableWriter {
         if self.batches.is_empty() {
             return Ok(());
         }
-
+        preparation::checkpoint()?;
+        // Keep the source batches charged while concat owns its output, and
+        // keep that output charged until the scratch writer has settled.
+        let _concat_charge = preparation::reserve(if self.batches.len() > 1 {
+            self.buffered_bytes.saturating_mul(2).saturating_add(1024)
+        } else {
+            0
+        })?;
+        preparation::retain(32)?;
         let batch = if self.batches.len() == 1 {
             self.batches.pop().unwrap()
         } else {
@@ -1185,14 +1659,34 @@ impl StagedTableWriter {
             ));
         }
 
-        let ds = crate::table_store::TableStore::append_or_create_batch(
+        let staged_bytes = batch.get_array_memory_size() as u64;
+        self.dir.begin_write();
+        let result = crate::table_store::TableStore::append_or_create_batch(
             &self.dataset_uri,
             self.dataset.take(),
             batch,
         )
-        .await?;
-        self.dataset = Some(ds);
+        .await;
+        self.dir.end_write();
+        self.buffer_charge.resize(0)?;
+        let dataset = result?;
+        self.dir.add_bytes(staged_bytes);
+        self.retain_dataset(dataset)?;
         self.external_payloads.clear();
+        Ok(())
+    }
+
+    fn retain_dataset(&mut self, dataset: Dataset) -> Result<()> {
+        use lance_core::deepsize::DeepSizeOf;
+        // The native writer exposes the new manifest after its write settles.
+        // Its retained metadata follows the private candidate until collection.
+        if preparation::parallel_context_active() {
+            self.metadata_charge.resize(
+                (dataset.manifest.deep_size_of() as u64)
+                    .saturating_add(std::mem::size_of::<Dataset>() as u64),
+            )?;
+        }
+        self.dataset = Some(dataset);
         Ok(())
     }
 }
@@ -1269,6 +1763,9 @@ async fn try_proven_pure_insert_history(
         return Ok(None);
     }
 
+    // The history reader retains native transaction records whose internal
+    // allocation footprint has not yet been qualified for parallel accounting.
+    preparation::require_serial()?;
     let history_timing = crate::instrumentation::start_merge_timing(
         crate::instrumentation::MergeTimingPhase::ProvenInsertHistory,
     );
@@ -1569,6 +2066,172 @@ mod pure_insert_certificate_tests {
     }
 
     #[test]
+    fn native_preparation_requires_known_bounded_snapshot_metadata() {
+        use lance_file::version::ConcreteFileVersion;
+        use lance_table::format::{DeletionFile, DeletionFileType, ExternalFile, RowIdMeta};
+        use std::num::NonZeroU64;
+
+        fn fragment(bytes: u64, rows: usize) -> Fragment {
+            Fragment::new(0)
+                .with_file(
+                    "part.lance",
+                    vec![0],
+                    vec![0],
+                    ConcreteFileVersion::V2_2,
+                    NonZeroU64::new(bytes),
+                )
+                .with_physical_rows(rows)
+        }
+        let fits = super::preparation_fragments_fit_native_envelope;
+        let valid = fragment(128, 4);
+        assert!(fits(std::slice::from_ref(&valid)));
+        let mut inherited = valid.clone();
+        inherited.files[0].base_id = Some(0);
+        assert!(fits(std::slice::from_ref(&inherited)));
+
+        assert!(fits(&[fragment(
+            super::PREPARATION_NATIVE_MAX_FILE_BYTES,
+            1
+        )]));
+        assert!(!fits(&[fragment(
+            super::PREPARATION_NATIVE_MAX_FILE_BYTES + 1,
+            1
+        )]));
+        assert!(!fits(&[
+            fragment(super::PREPARATION_NATIVE_MAX_FILE_BYTES, 1),
+            valid.clone()
+        ]));
+        assert!(
+            !fits(&[fragment(0, 1)]),
+            "unknown length must not trigger HEAD discovery"
+        );
+        assert!(fits(&[fragment(1, super::PREPARATION_NATIVE_MAX_ROWS)]));
+        assert!(!fits(&[fragment(
+            1,
+            super::PREPARATION_NATIVE_MAX_ROWS + 1
+        )]));
+        assert!(!fits(&[
+            fragment(1, super::PREPARATION_NATIVE_MAX_ROWS),
+            valid.clone()
+        ]));
+        assert!(fits(&vec![
+            valid.clone();
+            super::PREPARATION_NATIVE_MAX_FRAGMENTS
+        ]));
+        assert!(!fits(&vec![
+            valid.clone();
+            super::PREPARATION_NATIVE_MAX_FRAGMENTS + 1
+        ]));
+
+        let mut unknown_rows = valid.clone();
+        unknown_rows.physical_rows = None;
+        assert!(!fits(&[unknown_rows]));
+        let mut multiple_files = valid.clone();
+        multiple_files.files.push(valid.files[0].clone());
+        assert!(!fits(&[multiple_files]));
+        for version in [
+            ConcreteFileVersion::V1,
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_3,
+        ] {
+            let other = Fragment::new(0)
+                .with_file(
+                    "part.lance",
+                    vec![0],
+                    vec![0],
+                    version,
+                    NonZeroU64::new(128),
+                )
+                .with_physical_rows(4);
+            assert!(!fits(&[other]), "unqualified file version {version:?}");
+        }
+
+        let mut inline = valid.clone();
+        inline.row_id_meta = Some(RowIdMeta::Inline(
+            vec![0; super::PREPARATION_NATIVE_MAX_INLINE_ROW_ID_BYTES].into(),
+        ));
+        assert!(fits(std::slice::from_ref(&inline)));
+        inline.row_id_meta = Some(RowIdMeta::Inline(
+            vec![0; super::PREPARATION_NATIVE_MAX_INLINE_ROW_ID_BYTES + 1].into(),
+        ));
+        assert!(!fits(&[inline]));
+        let mut external = valid.clone();
+        external.row_id_meta = Some(RowIdMeta::External(ExternalFile {
+            path: "ids".into(),
+            offset: 0,
+            size: 1,
+        }));
+        assert!(!fits(&[external]));
+
+        let mut deleted = valid;
+        deleted.deletion_file = Some(DeletionFile {
+            read_version: 1,
+            id: 0,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(4),
+            base_id: Some(1),
+        });
+        assert!(fits(std::slice::from_ref(&deleted)));
+        deleted.deletion_file.as_mut().unwrap().num_deleted_rows = Some(5);
+        assert!(!fits(std::slice::from_ref(&deleted)));
+        deleted.deletion_file.as_mut().unwrap().num_deleted_rows = None;
+        assert!(!fits(&[deleted]));
+    }
+
+    #[tokio::test]
+    async fn native_preparation_accepts_small_inherited_branch_files() {
+        use arrow_array::{ArrayRef, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let directory = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef],
+        )
+        .unwrap();
+        let mut dataset = crate::table_store::TableStore::write_dataset(
+            directory.path().join("small.lance").to_str().unwrap(),
+            batch,
+        )
+        .await
+        .unwrap();
+        let mut branch = dataset
+            .create_branch("inherited", dataset.version().version, None)
+            .await
+            .unwrap();
+        assert!(
+            branch
+                .manifest
+                .fragments
+                .iter()
+                .any(|fragment| fragment.files.iter().any(|file| file.base_id.is_some()))
+        );
+        let context = super::preparation::PreparationContext::new(Some(
+            super::preparation::PreparationBudget::new(128 * 1024 * 1024),
+        ));
+        super::preparation::scope(context, async {
+            super::require_bounded_preparation_dataset(&branch)
+                .await
+                .unwrap();
+        })
+        .await;
+        // Eligibility must not load this uninspected section. In particular,
+        // an index-read error must not replace the original serial outcome.
+        Arc::make_mut(&mut branch.manifest).index_section = Some(usize::MAX);
+        let context = super::preparation::PreparationContext::new(Some(
+            super::preparation::PreparationBudget::new(128 * 1024 * 1024),
+        ));
+        let error = super::preparation::scope(context, async {
+            super::require_bounded_preparation_dataset(&branch).await
+        })
+        .await
+        .unwrap_err();
+        assert!(super::preparation::is_pressure(&error));
+    }
+
+    #[test]
     fn lineage_candidates_check_working_budget_before_copying_keys_or_expanding_offsets() {
         use lance_core::utils::deletion::DeletionVector;
         use std::collections::BTreeSet;
@@ -1639,6 +2302,27 @@ mod pure_insert_certificate_tests {
         let sparse = DeletionVector::from_iter([8, 2, 9, 1]);
         super::fill_candidate_offset_chunk(&mut sparse.iter(), &mut chunk);
         assert_eq!(chunk, [1, 2, 8, 9]);
+
+        // Parallel pressure is distinct from the lineage gate's existing
+        // logical-key miss and must occur before the candidate key is copied.
+        let budget = super::preparation::PreparationBudget::new(key_bytes * 16 - 1);
+        let context = super::preparation::PreparationContext::new(Some(Arc::clone(&budget)));
+        let mut speculative_candidates = BTreeSet::new();
+        let mut speculative_bytes = 0;
+        futures::executor::block_on(super::preparation::scope(context, async {
+            let error = super::retain_candidate_id(
+                "key",
+                &mut speculative_candidates,
+                &mut speculative_bytes,
+                super::LINEAGE_CANDIDATE_MAX_BYTES,
+            )
+            .unwrap_err();
+            assert!(super::preparation::is_pressure(&error));
+        }));
+        assert!(speculative_candidates.is_empty());
+        assert_eq!(speculative_bytes, 0);
+        assert_eq!(budget.snapshot().retained_bytes, 0);
+        assert_eq!(budget.snapshot().reservation_failures, 1);
     }
 }
 
@@ -1657,6 +2341,10 @@ async fn plan_proven_pure_insert_chunks(
     expected_rows: u64,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
 ) -> Result<Option<Vec<usize>>> {
+    // The stream normalizer owns current, pending and accumulated batches in
+    // addition to its returned batch. Keep this route serial until those
+    // internal owners participate in the preparation allowance.
+    preparation::require_serial()?;
     let scan_timing = crate::instrumentation::start_merge_timing(
         crate::instrumentation::MergeTimingPhase::ProvenInsertPlanScan,
     );
@@ -1829,8 +2517,20 @@ async fn compute_adopt_delta(
     let mut needs_update = false;
 
     loop {
+        preparation::checkpoint()?;
         let base_row = base.peek_cloned().await?;
         let source_row = source.peek_cloned().await?;
+
+        let _id_lease = preparation::reserve(
+            [base_row.as_ref(), source_row.as_ref()]
+                .into_iter()
+                .flatten()
+                .fold(0_u64, |bytes, row| {
+                    bytes
+                        .saturating_add(row.id.len() as u64)
+                        .saturating_add(std::mem::size_of::<String>() as u64)
+                }),
+        )?;
 
         let next_id = [base_row.as_ref(), source_row.as_ref()]
             .into_iter()
@@ -1980,6 +2680,20 @@ enum RowOutcomeKind {
     Conflict,
 }
 
+fn retain_merge_outcome(
+    log: &mut Vec<(String, RowOutcomeKind)>,
+    id: &str,
+    kind: RowOutcomeKind,
+) -> Result<()> {
+    let slots = if log.capacity() == 0 { 4 } else { 2 };
+    preparation::retain(
+        (id.len() as u64)
+            .saturating_add(slots * std::mem::size_of::<(String, RowOutcomeKind)>() as u64),
+    )?;
+    log.push((id.to_owned(), kind));
+    Ok(())
+}
+
 /// The three-way classification loop, shared by the full-scan walk (the
 /// verify-mode oracle) and the lineage-delta candidate path so both apply one
 /// decision rule. The candidate path feeds it `id IN (...)`-filtered cursors
@@ -2001,9 +2715,20 @@ async fn run_three_way_classification(
     mut outcome_log: Option<&mut Vec<(String, RowOutcomeKind)>>,
 ) -> Result<()> {
     loop {
+        preparation::checkpoint()?;
         let base_row = base.peek_cloned().await?;
         let source_row = source.peek_cloned().await?;
         let target_row = target.peek_cloned().await?;
+        let _id_lease = preparation::reserve(
+            [base_row.as_ref(), source_row.as_ref(), target_row.as_ref()]
+                .into_iter()
+                .flatten()
+                .fold(0_u64, |bytes, row| {
+                    bytes
+                        .saturating_add(row.id.len() as u64)
+                        .saturating_add(std::mem::size_of::<String>() as u64)
+                }),
+        )?;
         let Some(next_id) = min_cursor_id(&base_row, &source_row, &target_row) else {
             break;
         };
@@ -2043,9 +2768,9 @@ async fn run_three_way_classification(
                 base_row.is_some(),
                 source_row.is_some(),
                 target_row.is_some(),
-            ));
+            )?);
             if let Some(log) = outcome_log.as_deref_mut() {
-                log.push((next_id.clone(), RowOutcomeKind::Conflict));
+                retain_merge_outcome(log, &next_id, RowOutcomeKind::Conflict)?;
             }
             None
         };
@@ -2059,7 +2784,7 @@ async fn run_three_way_classification(
             deleted_ids.push(next_id.clone())?;
             *needs_update = true;
             if let Some(log) = outcome_log.as_deref_mut() {
-                log.push((next_id.clone(), RowOutcomeKind::Deleted));
+                retain_merge_outcome(log, &next_id, RowOutcomeKind::Deleted)?;
             }
             continue;
         }
@@ -2079,7 +2804,7 @@ async fn run_three_way_classification(
                     .await?;
                 *needs_update = true;
                 if let Some(log) = outcome_log.as_deref_mut() {
-                    log.push((next_id.clone(), outcome));
+                    retain_merge_outcome(log, &next_id, outcome)?;
                 }
             }
         }
@@ -2388,6 +3113,10 @@ fn retain_candidate_id(
     if next_bytes > key_limit {
         return Ok(false);
     }
+    // The existing logical-key limit excludes BTree node slack. A conservative
+    // multiple additionally covers partially occupied node slots and links,
+    // including the initial node allocated for a single tiny key.
+    preparation::retain(id_storage.saturating_mul(16))?;
     candidates.insert(id.to_owned());
     *retained_bytes = next_bytes;
     Ok(true)
@@ -2436,11 +3165,15 @@ async fn gather_candidate_ids(
             scanner.with_fragments(full_fragments);
             scanner.batch_size(LINEAGE_FILTER_MAX_IDS);
             scanner.batch_size_bytes(HYDRATION_SCAN_BATCH_BYTES);
+            if preparation::parallel_context_active() {
+                scanner.readahead(1, 1, HYDRATION_SCAN_BATCH_BYTES);
+            }
             Ok(())
         },
     )
     .await?;
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        let _batch_lease = preparation::reserve(batch.get_array_memory_size() as u64)?;
         crate::instrumentation::record_lineage_candidate_scan_rows(batch.num_rows());
         if !retain_candidate_batch(
             &batch,
@@ -2491,6 +3224,8 @@ async fn gather_offset_candidate_ids(
     retained_bytes: &mut u64,
     key_limit: u64,
 ) -> Result<bool> {
+    let _offset_lease =
+        preparation::reserve((4 * LINEAGE_FILTER_MAX_IDS * std::mem::size_of::<u32>()) as u64)?;
     let mut chunk = Vec::with_capacity(LINEAGE_FILTER_MAX_IDS);
     fill_candidate_offset_chunk(&mut offsets, &mut chunk);
     if chunk.is_empty() {
@@ -2500,14 +3235,24 @@ async fn gather_offset_candidate_ids(
         .schema()
         .project(&["id"])
         .map_err(OmniError::storage)?;
+    let mut read_config =
+        lance::dataset::fragment::FragReadConfig::default().with_row_address(true);
+    if preparation::parallel_context_active() {
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        read_config = read_config.with_scan_scheduler(lance_io::scheduler::ScanScheduler::new(
+            store,
+            lance_io::scheduler::SchedulerConfig::new(HYDRATION_SCAN_BATCH_BYTES),
+        ));
+    }
     let reader = fragment
-        .open(
-            &projection,
-            lance::dataset::fragment::FragReadConfig::default().with_row_address(true),
-        )
+        .open(&projection, read_config)
         .await
         .map_err(OmniError::storage)?;
     loop {
+        preparation::checkpoint()?;
         crate::instrumentation::record_lineage_candidate_address_take(chunk.len());
         // FragmentReader::take takes physical offsets (FileFragment::take
         // takes logical offsets). Stream one key per batch rather than
@@ -2519,6 +3264,7 @@ async fn gather_offset_candidate_ids(
             .buffered(1);
         let mut returned = 0;
         while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+            let _batch_lease = preparation::reserve(batch.get_array_memory_size() as u64)?;
             let addresses = batch
                 .column_by_name(lance_core::ROW_ADDR)
                 .ok_or_else(|| {
@@ -2572,6 +3318,30 @@ async fn lineage_side_candidates(
     candidates: &mut std::collections::BTreeSet<String>,
     retained_bytes: &mut u64,
 ) -> Result<bool> {
+    use lance_core::deepsize::DeepSizeOf;
+
+    // get_fragments clones fragment metadata, and the hash tables retain those
+    // wrappers. Reserve before constructing either view; dataset/session
+    // backing remains with the existing immutable storage owners.
+    let fragment_bytes = if preparation::parallel_context_active() {
+        [base, side]
+            .into_iter()
+            .flatten()
+            .fold(0_u64, |bytes, dataset| {
+                let count = dataset.manifest.fragments.len() as u64;
+                let slots = count.max(4).saturating_mul(
+                    4 * std::mem::size_of::<(u64, lance::dataset::fragment::FileFragment)>() as u64,
+                );
+                dataset
+                    .iter_fragments()
+                    .fold(bytes.saturating_add(slots), |bytes, fragment| {
+                        bytes.saturating_add(fragment.deep_size_of() as u64)
+                    })
+            })
+    } else {
+        0
+    };
+    let _fragment_lease = preparation::reserve(fragment_bytes)?;
     let base_fragments: HashMap<u64, lance::dataset::fragment::FileFragment> = base
         .map(|dataset| {
             dataset
@@ -2595,6 +3365,7 @@ async fn lineage_side_candidates(
     let mut side_full: Vec<lance_table::format::Fragment> = Vec::new();
 
     for (fragment_id, side_fragment) in &side_fragments {
+        preparation::checkpoint()?;
         let side_meta = side_fragment.metadata();
         match (base_fragments.get(fragment_id), base, side) {
             (Some(base_fragment), Some(base_dataset), Some(side_dataset)) => {
@@ -2606,7 +3377,9 @@ async fn lineage_side_candidates(
                         continue;
                     }
                     let base_dv = fragment_deletion_vector(base_fragment).await?;
+                    let _base_dv_lease = preparation::reserve(base_dv.deep_size_of() as u64)?;
                     let side_dv = fragment_deletion_vector(side_fragment).await?;
+                    let _side_dv_lease = preparation::reserve(side_dv.deep_size_of() as u64)?;
                     let Some(key_limit) = deletion_candidate_key_limit(
                         &base_dv,
                         &side_dv,
@@ -2653,15 +3426,32 @@ async fn lineage_side_candidates(
                     // Same fragment id backed by different data/overlay files
                     // (field update / compaction shape). All live rows of both
                     // incarnations are candidates.
+                    preparation::retain(
+                        (side_meta.deep_size_of() as u64)
+                            .saturating_add(base_meta.deep_size_of() as u64)
+                            .saturating_add(
+                                6 * std::mem::size_of::<lance_table::format::Fragment>() as u64,
+                            ),
+                    )?;
                     side_full.push(side_meta.clone());
                     base_full.push(base_meta.clone());
                 }
             }
-            _ => side_full.push(side_meta.clone()),
+            _ => {
+                preparation::retain((side_meta.deep_size_of() as u64).saturating_add(
+                    3 * std::mem::size_of::<lance_table::format::Fragment>() as u64,
+                ))?;
+                side_full.push(side_meta.clone());
+            }
         }
     }
     for (fragment_id, base_fragment) in &base_fragments {
         if !side_fragments.contains_key(fragment_id) {
+            preparation::retain(
+                (base_fragment.metadata().deep_size_of() as u64).saturating_add(
+                    3 * std::mem::size_of::<lance_table::format::Fragment>() as u64,
+                ),
+            )?;
             base_full.push(base_fragment.metadata().clone());
         }
     }
@@ -2740,6 +3530,7 @@ async fn plan_lineage_merge(
         let (Some(dataset), Some(entry)) = (dataset, entry) else {
             continue;
         };
+        require_bounded_preparation_dataset(dataset).await?;
         if dataset.version().version != entry.published_dataset_version
             || !dataset.manifest.uses_stable_row_ids()
         {
@@ -2854,6 +3645,9 @@ async fn plan_lineage_merge(
     for id in candidate_ids {
         match candidate_chunks.push_bounded(id, LINEAGE_FILTER_MAX_IDS, KEYED_WRITE_MAX_BYTES) {
             Ok(()) => {}
+            // Parallel accounting is a scheduler retry, not a lineage-gate
+            // miss. Falling through would hide it and allocate the full walk.
+            Err(error) if preparation::is_pressure(&error) => return Err(error),
             // The discovery budget above uses the same per-id accounting, so
             // this arm is belt and braces — but a budget miss must fall back
             // to the walk (the gate's contract), never fail a merge the walk
@@ -2902,6 +3696,8 @@ async fn stage_lineage_table_merge(
     let mut needs_update = false;
 
     for chunk in &plan.candidate_chunks.chunks {
+        preparation::checkpoint()?;
+        let _filter_lease = preparation::reserve(chunk.filter_bytes)?;
         let filter = chunk.filter()?;
         let mut base = OrderedTableCursor::from_dataset_filtered(
             plan.base.clone(),
@@ -2978,6 +3774,17 @@ fn verify_lineage_agreement(
     walk_result: Option<&StagedMergeResult>,
     lineage_result: Option<&StagedMergeResult>,
 ) -> Result<()> {
+    // Both oracle logs stay live while sorting their clones. Include spare
+    // vector/sort storage in addition to every cloned id's owned bytes.
+    let comparison_bytes = walk_log
+        .iter()
+        .chain(lineage_log)
+        .fold(0_u64, |bytes, (id, _)| {
+            bytes
+                .saturating_add(id.len() as u64)
+                .saturating_add(3 * std::mem::size_of::<(String, RowOutcomeKind)>() as u64)
+        });
+    let _comparison_lease = preparation::reserve(comparison_bytes)?;
     let mut walk_sorted = walk_log.to_vec();
     let mut lineage_sorted = lineage_log.to_vec();
     walk_sorted.sort();
@@ -3000,6 +3807,15 @@ fn verify_lineage_agreement(
              {LINEAGE_MERGE_MODE_ENV}=off to run the walk only"
         )));
     }
+    let deleted_count = [walk_result, lineage_result]
+        .into_iter()
+        .flatten()
+        .fold(0_u64, |count, result| {
+            count.saturating_add(result.deleted_ids.iter().count() as u64)
+        });
+    let _deleted_lease = preparation::reserve(
+        deleted_count.saturating_mul(2 * std::mem::size_of::<&String>() as u64),
+    )?;
     let walk_deleted: Vec<&String> = walk_result
         .map(|result| result.deleted_ids.iter().collect())
         .unwrap_or_default();
@@ -3244,7 +4060,7 @@ async fn collect_three_way_blob_selection(
                 base_row.is_some(),
                 source_row.is_some(),
                 target_row.is_some(),
-            ));
+            )?);
             None
         };
 
@@ -3401,7 +4217,17 @@ fn classify_merge_conflict(
     base_present: bool,
     source_present: bool,
     target_present: bool,
-) -> MergeConflict {
+) -> Result<MergeConflict> {
+    // The vector slot and all owned strings must fit before formatting or
+    // cloning. Double the payload allowance for formatting capacity growth.
+    let payload_bytes = (table_key.len() as u64)
+        .saturating_add((row_id.len() as u64).saturating_mul(2))
+        .saturating_add("delete/update conflict for id ''".len() as u64);
+    preparation::retain(
+        payload_bytes
+            .saturating_mul(2)
+            .saturating_add(4 * std::mem::size_of::<MergeConflict>() as u64),
+    )?;
     let (kind, message) = match (base_present, source_present, target_present) {
         (false, true, true) => (
             MergeConflictKind::DivergentInsert,
@@ -3416,12 +4242,12 @@ fn classify_merge_conflict(
             format!("divergent update for id '{}'", row_id),
         ),
     };
-    MergeConflict {
+    Ok(MergeConflict {
         type_key: table_key.to_string(),
         entity_id: Some(row_id.to_string()),
         kind,
         message,
-    }
+    })
 }
 
 /// Operation-wide budget for the scalar delta retained by merge validation.
@@ -5181,11 +6007,41 @@ impl Omnigraph {
         self.branch_merge_as(source, target, None).await
     }
 
+    /// Merge preparation is owned by this future. Forced drop before arming
+    /// can leave private, unreachable scratch; it cannot await scratch cleanup.
+    /// After arming, the existing durable recovery protocol applies.
     pub async fn branch_merge_as(
         &self,
         source: &str,
         target: &str,
         actor_id: Option<&str>,
+    ) -> Result<MergeOutcome> {
+        self.branch_merge_with_preparation_cap(source, target, actor_id, 4)
+            .await
+    }
+
+    /// Server entry for a merge whose future is owned by its HTTP request.
+    /// Request drop cannot own an asynchronous drain, so preparation stays
+    /// serial even under diagnostic width overrides. This does not make a
+    /// forced drop an abort: private scratch may remain before arming, and
+    /// the existing durable recovery protocol still applies after arming.
+    #[doc(hidden)]
+    pub async fn branch_merge_request_owned_as(
+        &self,
+        source: &str,
+        target: &str,
+        actor_id: Option<&str>,
+    ) -> Result<MergeOutcome> {
+        self.branch_merge_with_preparation_cap(source, target, actor_id, 1)
+            .await
+    }
+
+    async fn branch_merge_with_preparation_cap(
+        &self,
+        source: &str,
+        target: &str,
+        actor_id: Option<&str>,
+        preparation_width_cap: usize,
     ) -> Result<MergeOutcome> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `BranchTransition { source, target }` — matches the HTTP-layer
@@ -5206,7 +6062,7 @@ impl Omnigraph {
         // Keep the recovery/planning future out of the public API's callers;
         // deeply composed loads and merges otherwise retain large debug
         // construction frames throughout execution. Poll it in the same task.
-        Box::pin(self.branch_merge_impl(source, target, actor_id)).await
+        Box::pin(self.branch_merge_impl(source, target, actor_id, preparation_width_cap)).await
     }
 
     async fn branch_merge_impl(
@@ -5214,6 +6070,7 @@ impl Omnigraph {
         source: &str,
         target: &str,
         actor_id: Option<&str>,
+        preparation_width_cap: usize,
     ) -> Result<MergeOutcome> {
         let outer_prepare_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
@@ -5325,6 +6182,7 @@ impl Omnigraph {
             &source_head_commit_id,
             is_fast_forward,
             actor_id,
+            preparation_width_cap,
         ))
         .await;
         let outer_restore_timing = crate::instrumentation::start_merge_timing(
@@ -5362,6 +6220,7 @@ impl Omnigraph {
         source_head_commit_id: &str,
         is_fast_forward: bool,
         actor_id: Option<&str>,
+        preparation_width_cap: usize,
     ) -> Result<MergeOutcome> {
         let source_snapshot = &source_txn.base;
         let target_snapshot = &target_txn.base;
@@ -5386,19 +6245,32 @@ impl Omnigraph {
         // the logical branch name.
         let target_active = captured_merge_target_ref(target_txn)?.map(str::to_string);
         let mut candidates: HashMap<String, CandidateTableState> = HashMap::new();
-        let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
         let mut blob_table_keys = HashSet::new();
         let mut blob_selection = crate::table_store::PersistedBlobSelection::default();
         let mut blob_adopt_proof_attempted = HashSet::new();
         let mut blob_pure_insert_histories: HashMap<String, ProvenPureInsertAdopt> = HashMap::new();
         let materializer = self.blob_materializer();
 
-        // Classify scalar tables once before any external source I/O. Blob
-        // tables get a descriptor-only first pass so every row-writing managed
-        // value and exact external range shares one operation budget. Pointer
-        // and fork adoption write no row, so their descriptors require neither
-        // policy approval nor source I/O.
-        for table_key in &ordered_table_keys {
+        let preparation_options = crate::instrumentation::merge_preparation_options_override();
+        // The entry-point ownership ceiling is authoritative even when a
+        // diagnostic scope requests a wider preparation window.
+        let preparation_width = preparation_options
+            .map_or(MERGE_PREPARATION_WIDTH, |options| options.width)
+            .min(preparation_width_cap);
+        let preparation_budget = preparation::PreparationBudget::new(
+            preparation_options.map_or(4 * KEYED_WRITE_MAX_BYTES, |options| {
+                options.additional_bytes as u64
+            }),
+        );
+        let preparation_timing = crate::instrumentation::start_merge_timing(
+            crate::instrumentation::MergeTimingPhase::CandidatePreparation,
+        );
+        let mut scalar_window = Vec::with_capacity(preparation_width);
+
+        // Blob descriptor work remains in canonical order. Drain every preceding
+        // scalar window before a Blob or admission-error barrier, preserving the
+        // old first-pass error and external preflight boundaries.
+        for (slot, table_key) in ordered_table_keys.iter().enumerate() {
             let base_entry = base_snapshot.dataset(table_key);
             let source_entry = source_snapshot.dataset(table_key);
             let target_entry = target_snapshot.dataset(table_key);
@@ -5407,52 +6279,74 @@ impl Omnigraph {
             {
                 continue;
             }
-            ensure_merge_identity_compatible(
+            let eligibility = ensure_merge_identity_compatible(
                 table_key,
                 base_entry.map(|entry| entry.identity),
                 source_entry.map(|entry| entry.identity),
                 target_entry.map(|entry| entry.identity),
-            )?;
-            let has_blob = schema_has_blob(&schema_for_table_key(catalog, table_key)?)?;
-            if !has_blob {
-                if same_manifest_state(base_entry, target_entry) {
-                    if let Some(candidate) = classify_adopt(
+            )
+            .and_then(|()| schema_for_table_key(catalog, table_key))
+            .and_then(|schema| schema_has_blob(&schema));
+            if matches!(eligibility, Ok(false)) && !same_manifest_state(base_entry, target_entry) {
+                scalar_window.push((slot, table_key.as_str()));
+                if scalar_window.len() == preparation_width {
+                    Box::pin(prepare_scalar_window(
                         self,
+                        &scalar_window,
                         catalog,
                         base_snapshot,
                         source_snapshot,
                         target_snapshot,
-                        table_key,
                         target_active.as_deref(),
-                        &empty_external_preflight,
-                    )
-                    .await?
-                    {
-                        candidates.insert(table_key.clone(), candidate);
-                    }
-                } else {
-                    let table_walk_timing = crate::instrumentation::start_merge_timing(
-                        crate::instrumentation::MergeTimingPhase::TableWalk,
-                    );
-                    let staged = stage_streaming_table_merge(
-                        self,
-                        table_key,
-                        catalog,
-                        base_snapshot,
-                        source_snapshot,
-                        target_snapshot,
+                        preparation_width,
+                        &preparation_budget,
+                        (0..scalar_window.len()).map(|_| None).collect(),
+                        &mut candidates,
                         &mut conflicts,
-                        &empty_external_preflight,
-                    )
+                    ))
                     .await?;
-                    table_walk_timing.finish();
-                    if let Some(staged) = staged {
-                        candidates.insert(
-                            table_key.clone(),
-                            CandidateTableState::RewriteMerged(staged),
-                        );
-                    }
+                    scalar_window.clear();
                 }
+                continue;
+            }
+            if !scalar_window.is_empty() {
+                Box::pin(prepare_scalar_window(
+                    self,
+                    &scalar_window,
+                    catalog,
+                    base_snapshot,
+                    source_snapshot,
+                    target_snapshot,
+                    target_active.as_deref(),
+                    preparation_width,
+                    &preparation_budget,
+                    (0..scalar_window.len()).map(|_| None).collect(),
+                    &mut candidates,
+                    &mut conflicts,
+                ))
+                .await?;
+                scalar_window.clear();
+            }
+            if !eligibility? {
+                // Adoption can enter the transaction-history proof and source
+                // normalizer, whose native allocation owners are not yet
+                // qualified for speculation. Use one serial barrier directly
+                // instead of replaying unrelated table work at lower widths.
+                Box::pin(prepare_scalar_window(
+                    self,
+                    &[(slot, table_key.as_str())],
+                    catalog,
+                    base_snapshot,
+                    source_snapshot,
+                    target_snapshot,
+                    target_active.as_deref(),
+                    1,
+                    &preparation_budget,
+                    vec![None],
+                    &mut candidates,
+                    &mut conflicts,
+                ))
+                .await?;
                 continue;
             }
             blob_table_keys.insert(table_key.clone());
@@ -5515,6 +6409,25 @@ impl Omnigraph {
                 .await?;
             }
         }
+        if !scalar_window.is_empty() {
+            Box::pin(prepare_scalar_window(
+                self,
+                &scalar_window,
+                catalog,
+                base_snapshot,
+                source_snapshot,
+                target_snapshot,
+                target_active.as_deref(),
+                preparation_width,
+                &preparation_budget,
+                (0..scalar_window.len()).map(|_| None).collect(),
+                &mut candidates,
+                &mut conflicts,
+            ))
+            .await?;
+        }
+        preparation_timing.finish();
+        debug_assert_eq!(preparation_budget.snapshot().retained_bytes, 0);
         if !conflicts.is_empty() {
             return Err(OmniError::MergeConflicts(conflicts));
         }

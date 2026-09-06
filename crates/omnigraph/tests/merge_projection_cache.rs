@@ -13,6 +13,7 @@ mod helpers;
 use std::future::Future;
 
 use omnigraph::db::{MergeOutcome, Omnigraph};
+use omnigraph::instrumentation::{MergePreparationOptions, with_merge_preparation_options};
 
 use helpers::cost::{cost_harness, measure};
 use helpers::*;
@@ -110,7 +111,21 @@ async fn diverge(db: &mut Omnigraph, round: i64) {
 #[test]
 fn repeated_merge_refreshes_projection_incrementally() {
     on_big_stack(|| async {
-        cost_harness(async {
+        for width in [1, 2, 4] {
+            with_merge_preparation_options(
+                MergePreparationOptions {
+                    width,
+                    additional_bytes: 128 * 1024 * 1024,
+                },
+                assert_repeated_merge_refreshes_projection_incrementally(width),
+            )
+            .await;
+        }
+    });
+}
+
+async fn assert_repeated_merge_refreshes_projection_incrementally(width: usize) {
+    cost_harness(async {
             let dir = tempfile::tempdir().unwrap();
             let mut db = init_and_load(&dir).await;
             db.branch_create("feature").await.unwrap();
@@ -132,7 +147,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
                 io.projection_incremental_refreshes,
                 io.projection_full_refreshes,
             );
-            eprintln!("local publication reuse: {io:?}");
+            eprintln!("width={width} local publication reuse: {io:?}");
             assert_eq!(
                 io.projection_full_refreshes, 0,
                 "acknowledged local publication must retain both exact projections",
@@ -178,7 +193,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
             ).await.unwrap();
             let (outcome, foreign_io) = measure(db.branch_merge("feature", "main")).await;
             assert_eq!(outcome.unwrap(), MergeOutcome::Merged);
-            eprintln!("foreign publication refresh: {foreign_io:?}");
+            eprintln!("width={width} foreign publication refresh: {foreign_io:?}");
             assert!(foreign_io.projection_incremental_refreshes >= 1);
             assert_eq!(foreign_io.projection_full_refreshes, 0);
             assert_eq!(
@@ -204,9 +219,8 @@ fn repeated_merge_refreshes_projection_incrementally() {
                     assert_eq!(actual_age, age, "{branch}/{name}");
                 }
             }
-        })
-        .await;
-    });
+    })
+    .await;
 }
 
 /// The persistent cache has capacity one. Alternating to another non-bound

@@ -55,6 +55,45 @@ drops it. Commit IDs and timestamps are minted for the captured branch without
 reloading manifest history. The existing schema and branch gates still serialize
 conflicting control operations.
 
+Merge candidate preparation owns a bounded ordered window of non-Blob table
+jobs inside the calling operation. Each job returns private candidates and
+conflicts; the collector preserves table order and the existing shared validator
+checks the combined result. Blob descriptor and materialization phases remain
+ordered barriers. Production stays serial until the resource and cancellation
+gates in [RFC 0054](../rfcs/0054-bounded-merge-preparation.md) pass; scoped test
+controls exercise widths two and four.
+
+Parallel attempts share a 128 MiB allowance for controlled speculative buffers
+and metadata, including finished results waiting for collection. This allowance
+is separate from Lance pools and the existing combined validation limit.
+Parallel scans set both scanner and execution concurrency to one, with one
+fragment of read-ahead and an 8 MiB I/O buffer per scan. Hydration uses native
+stable row-ID masks and physical fragment selection to keep reads on that
+configured path. Parallel eligibility
+requires known V2.2 snapshots with at most 64 one-file fragments, 8 MiB of encoded
+data and 8,192 physical rows. Indexed tables, external row-ID metadata, overlays,
+unknown metadata and larger layouts use serial preparation. Referenced stores
+must report I/O parallelism no greater than 64. Inherited branch files keep
+their native base IDs and Lance's separate I/O scheduler; the encoded input
+limit does not bound decoder memory. Native pools and soft I/O buffering remain
+separate from retained candidate accounting. Failed reservations never wait for
+permits: the uncollected window settles and retries
+at lower width, ending with existing serial limits. Source-state adoption uses a
+serial barrier because its pure-insert history proof and normalizer are not yet
+qualified for speculative allocation. Scratch ownership follows the candidate;
+forced drop during a scratch write retains its private directory to
+avoid deleting files while filesystem work may still be running. Such files
+cannot become graph-visible. Final table gates, baseline revalidation, durable
+effects and graph publication retain their existing order.
+
+HTTP merges use the request-owned engine entry, which caps preparation at one
+table even when diagnostic controls request more. Hyper can drop the request
+future on client disconnect; that owner cannot drain outstanding private writes.
+Ordinary errors and memory fallback settle all admitted preparations. Forced
+future drop cannot provide asynchronous drain, including for embedded callers;
+only private, unreachable scratch may remain. Parallel HTTP preparation requires
+an operation owner that survives disconnect and participates in shutdown drain.
+
 Native branch creation uses an operation-local capture of the bound coordinator
 or that same one-entry cache after the control gates and recovery checks. Reuse
 requires a fresh match of the complete manifest incarnation, including the

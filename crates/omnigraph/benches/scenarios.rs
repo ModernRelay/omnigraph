@@ -119,6 +119,12 @@ struct Args {
     /// target size. Holding this small while `--rows` grows is the whole
     /// point of that scenario: it separates delta cost from target cost.
     delta_rows: usize,
+    /// Disjoint target edits per table in `general-merge-updates`.
+    target_delta_rows: usize,
+    /// Synthetic latency at the wrapped graph ObjectStore boundary, merge only.
+    io_delay_ms: u64,
+    /// Scoped differential control; omitted means the production default.
+    merge_preparation_width: Option<usize>,
     /// `general-merge-updates` source shape: "update" rewrites committed rows,
     /// "insert" adds brand-new rows. Both run against a target that advanced
     /// after the fork, which is what distinguishes this from the adopt
@@ -126,8 +132,12 @@ struct Args {
     source_mode: String,
     /// Existing sibling branches (excluding main and a deletion victim).
     branches: usize,
-    /// Populated tables for branch-control scenarios; Chunk plus small scalar tables.
+    /// Branch controls count populated tables with small scalar companions;
+    /// general merge counts touched vector tables and defaults to one.
     tables: usize,
+    /// Optional complete populated catalog for general merge; `tables` counts
+    /// touched types, and omitted means every populated type is touched.
+    populated_tables: Option<usize>,
     /// Extra paired main commits before any scenario branches are created.
     history_commits: usize,
     /// Temporary branches written once, deleted, and fully reclaimed in setup.
@@ -172,9 +182,13 @@ impl Args {
             ann_probes: 20,
             text_bytes: 2048,
             delta_rows: 50,
+            target_delta_rows: 8,
+            io_delay_ms: 0,
+            merge_preparation_width: None,
             source_mode: "update".to_string(),
             branches: 8,
             tables: 4,
+            populated_tables: None,
             history_commits: 0,
             retired_branches: 0,
             cache_state: "cold".into(),
@@ -187,6 +201,7 @@ impl Args {
             phase: None,
             fixture_root: None,
         };
+        let mut tables_supplied = false;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             let mut take = |name: &str| {
@@ -216,9 +231,34 @@ impl Args {
                 "--delta-rows" => {
                     args.delta_rows = take("--delta-rows").parse().expect("--delta-rows")
                 }
+                "--target-delta-rows" => {
+                    args.target_delta_rows = take("--target-delta-rows")
+                        .parse()
+                        .expect("--target-delta-rows")
+                }
+                "--io-delay-ms" => {
+                    args.io_delay_ms = take("--io-delay-ms").parse().expect("--io-delay-ms")
+                }
+                "--merge-preparation-width" => {
+                    args.merge_preparation_width = Some(
+                        take("--merge-preparation-width")
+                            .parse()
+                            .expect("--merge-preparation-width"),
+                    )
+                }
                 "--source-mode" => args.source_mode = take("--source-mode"),
                 "--branches" => args.branches = take("--branches").parse().expect("--branches"),
-                "--tables" => args.tables = take("--tables").parse().expect("--tables"),
+                "--tables" => {
+                    args.tables = take("--tables").parse().expect("--tables");
+                    tables_supplied = true;
+                }
+                "--populated-tables" => {
+                    args.populated_tables = Some(
+                        take("--populated-tables")
+                            .parse()
+                            .expect("--populated-tables"),
+                    );
+                }
                 "--history-commits" => {
                     args.history_commits = take("--history-commits")
                         .parse()
@@ -252,7 +292,14 @@ impl Args {
                 _ => {}
             }
         }
+        if args.scenario == "general-merge-updates" && !tables_supplied {
+            args.tables = 1;
+        }
         args
+    }
+
+    fn populated_tables(&self) -> usize {
+        self.populated_tables.unwrap_or(self.tables)
     }
 
     fn to_child_argv(&self) -> Vec<String> {
@@ -277,6 +324,10 @@ impl Args {
             self.text_bytes.to_string(),
             "--delta-rows".into(),
             self.delta_rows.to_string(),
+            "--target-delta-rows".into(),
+            self.target_delta_rows.to_string(),
+            "--io-delay-ms".into(),
+            self.io_delay_ms.to_string(),
             "--source-mode".into(),
             self.source_mode.clone(),
             "--branches".into(),
@@ -299,6 +350,12 @@ impl Args {
         }
         if self.baseline {
             v.push("--baseline".into());
+        }
+        if let Some(width) = self.merge_preparation_width {
+            v.extend(["--merge-preparation-width".into(), width.to_string()]);
+        }
+        if let Some(populated) = self.populated_tables {
+            v.extend(["--populated-tables".into(), populated.to_string()]);
         }
         if let Some(cap) = self.memory_cap_mb {
             v.push("--memory-cap-mb".into());
@@ -333,8 +390,9 @@ fn main() {
             "usage: --scenario <merge-all-changed|nearest-prefilter|ann-probe-budget|fenced-small-upsert|\
              fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|rrf-gate> [--rows N] [--dims D] \
              [--seed S] [--runs K] [--selectivity F] [--k K] [--ann-partitions N] \
-             [--ann-probes N] [--text-bytes B] [--delta-rows N] \
-             [--source-mode update|insert] [--branches N] [--tables N] [--memory-cap-mb M] \
+             [--ann-probes N] [--text-bytes B] [--delta-rows N] [--target-delta-rows N] [--io-delay-ms N (0..100)] \
+             [--source-mode update|insert] [--branches N] [--tables N] [--populated-tables N (merge, at most 121)] [--memory-cap-mb M] \
+             [--merge-preparation-width 1|2|4 (diagnostic override)] \
              [--history-commits N (even, 0..256)] [--retired-branches N (0..32)]\n\
              [--cache-state cold|warm] [--manifest-layout uncompacted|compacted]\n\
              Age flags apply only to branch controls and general-merge-updates."
@@ -765,9 +823,13 @@ fn run_phased_adopt_once(args: &Args, run: usize) -> serde_json::Value {
             "selectivity": args.selectivity,
             "k": args.k,
             "delta_rows": args.delta_rows,
+            "target_delta_rows": args.target_delta_rows,
+            "io_delay_ms": args.io_delay_ms,
+            "merge_preparation_width": args.merge_preparation_width,
             "source_mode": args.source_mode,
             "branches": args.branches,
             "tables": args.tables,
+            "populated_tables": args.populated_tables(),
             "history_commits": args.history_commits,
             "retired_branches": args.retired_branches,
             "cache_state": args.cache_state,

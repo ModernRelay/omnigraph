@@ -539,6 +539,95 @@ pub(crate) fn stage_write_concurrency_override() -> Option<usize> {
         .flatten()
 }
 
+/// Scoped merge-preparation controls for tests and diagnostic benchmarks.
+///
+/// These values never become an environment variable or a graph option. The
+/// engine owns its production defaults; an installed scope replaces them only
+/// while its future is being polled. Zero bytes is useful for forcing the
+/// scheduler's serial fallback without allocating a large fixture.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergePreparationOptions {
+    pub width: usize,
+    pub additional_bytes: usize,
+}
+
+/// Named boundaries for deterministic preparation interleavings. `Finished`
+/// means a worker has produced its result, including an error; it does not
+/// mean the serial collector accepted that result.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePreparationCheckpoint {
+    Started,
+    Finished,
+    Collected,
+    Discarded,
+}
+
+/// A scoped test rendezvous. Implementations may suspend a selected ordered
+/// table slot; they must release it themselves. Production installs no hook.
+/// Callers must not suspend an issued storage operation inside this hook.
+#[doc(hidden)]
+#[async_trait]
+pub trait MergePreparationHook: Send + Sync {
+    async fn checkpoint(
+        &self,
+        slot: usize,
+        table_name: &str,
+        checkpoint: MergePreparationCheckpoint,
+    );
+}
+
+tokio::task_local! {
+    static MERGE_PREPARATION_OPTIONS: MergePreparationOptions;
+    static MERGE_PREPARATION_HOOK: Arc<dyn MergePreparationHook>;
+}
+
+/// Run a diagnostic future with width one, two, or four and a scoped byte
+/// allowance. Nested scopes restore the previous values, including on drop.
+/// Like the other probes, this context follows futures polled in this task;
+/// detached spawned tasks do not inherit it.
+#[doc(hidden)]
+pub async fn with_merge_preparation_options<F>(
+    options: MergePreparationOptions,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    assert!(
+        matches!(options.width, 1 | 2 | 4),
+        "merge preparation width must be one, two, or four"
+    );
+    MERGE_PREPARATION_OPTIONS.scope(options, fut).await
+}
+
+#[doc(hidden)]
+pub async fn with_merge_preparation_hook<F>(
+    hook: Arc<dyn MergePreparationHook>,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    MERGE_PREPARATION_HOOK.scope(hook, fut).await
+}
+
+pub(crate) fn merge_preparation_options_override() -> Option<MergePreparationOptions> {
+    MERGE_PREPARATION_OPTIONS.try_with(|options| *options).ok()
+}
+
+pub(crate) async fn merge_preparation_checkpoint(
+    slot: usize,
+    table_name: &str,
+    checkpoint: MergePreparationCheckpoint,
+) {
+    let hook = MERGE_PREPARATION_HOOK.try_with(Arc::clone).ok();
+    if let Some(hook) = hook {
+        hook.checkpoint(slot, table_name, checkpoint).await;
+    }
+}
+
 pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.manifest_wrapper.clone()).flatten()
 }
@@ -846,10 +935,13 @@ pub(crate) enum MergeTimingPhase {
     ManifestPublish,
     RecoveryCleanup,
     OuterRestoreRefresh,
+    /// Wall time of the complete ordered candidate-preparation pass, including
+    /// its overlapping table workers, barriers, settlement and fallback.
+    CandidatePreparation,
 }
 
 impl MergeTimingPhase {
-    const COUNT: usize = 14;
+    const COUNT: usize = 15;
 
     const fn index(self) -> usize {
         self as usize
@@ -870,6 +962,7 @@ impl MergeTimingPhase {
         Self::ManifestPublish,
         Self::RecoveryCleanup,
         Self::OuterRestoreRefresh,
+        Self::CandidatePreparation,
     ];
 
     const fn name(self) -> &'static str {
@@ -888,6 +981,7 @@ impl MergeTimingPhase {
             Self::ManifestPublish => "ManifestPublish",
             Self::RecoveryCleanup => "RecoveryCleanup",
             Self::OuterRestoreRefresh => "OuterRestoreRefresh",
+            Self::CandidatePreparation => "CandidatePreparation",
         }
     }
 }
@@ -916,6 +1010,82 @@ struct MergeTimingCounters {
     total_ns: [AtomicU64; MergeTimingPhase::COUNT],
     max_ns: [AtomicU64; MergeTimingPhase::COUNT],
     interval_count: [AtomicU64; MergeTimingPhase::COUNT],
+}
+
+/// Resource and settlement counters for one measured preparation scope.
+/// Read after the scoped future settles; a live snapshot is observational and
+/// its individual relaxed counters need not represent one atomic instant.
+/// Accounted bytes cover the scheduler's additional allowance, not process
+/// RSS. Scratch bytes are successfully staged logical Arrow payload, not
+/// physical file size, heap retention, or abandoned directories after a drop.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergePreparationReading {
+    pub admitted: u64,
+    pub active: u64,
+    pub ready: u64,
+    pub completed: u64,
+    pub collected: u64,
+    pub discarded: u64,
+    pub peak_active: u64,
+    pub peak_ready: u64,
+    /// Active plus completed-but-uncollected workers, including their retained
+    /// result/error and private scratch ownership.
+    pub uncollected: u64,
+    pub peak_uncollected: u64,
+    pub accounted_bytes: u64,
+    pub peak_accounted_bytes: u64,
+    pub budget_fallbacks: u64,
+    pub scratch_owners: u64,
+    pub peak_scratch_owners: u64,
+    pub scratch_bytes: u64,
+    pub peak_scratch_bytes: u64,
+}
+
+#[derive(Default)]
+struct MergePreparationCounters {
+    admitted: AtomicU64,
+    active: AtomicU64,
+    ready: AtomicU64,
+    completed: AtomicU64,
+    collected: AtomicU64,
+    discarded: AtomicU64,
+    peak_active: AtomicU64,
+    peak_ready: AtomicU64,
+    uncollected: AtomicU64,
+    peak_uncollected: AtomicU64,
+    accounted_bytes: AtomicU64,
+    peak_accounted_bytes: AtomicU64,
+    budget_fallbacks: AtomicU64,
+    scratch_owners: AtomicU64,
+    peak_scratch_owners: AtomicU64,
+    scratch_bytes: AtomicU64,
+    peak_scratch_bytes: AtomicU64,
+}
+
+impl MergePreparationCounters {
+    fn snapshot(&self) -> MergePreparationReading {
+        MergePreparationReading {
+            admitted: self.admitted.load(Ordering::Relaxed),
+            active: self.active.load(Ordering::Relaxed),
+            ready: self.ready.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            collected: self.collected.load(Ordering::Relaxed),
+            discarded: self.discarded.load(Ordering::Relaxed),
+            peak_active: self.peak_active.load(Ordering::Relaxed),
+            peak_ready: self.peak_ready.load(Ordering::Relaxed),
+            uncollected: self.uncollected.load(Ordering::Relaxed),
+            peak_uncollected: self.peak_uncollected.load(Ordering::Relaxed),
+            accounted_bytes: self.accounted_bytes.load(Ordering::Relaxed),
+            peak_accounted_bytes: self.peak_accounted_bytes.load(Ordering::Relaxed),
+            budget_fallbacks: self.budget_fallbacks.load(Ordering::Relaxed),
+            scratch_owners: self.scratch_owners.load(Ordering::Relaxed),
+            peak_scratch_owners: self.peak_scratch_owners.load(Ordering::Relaxed),
+            scratch_bytes: self.scratch_bytes.load(Ordering::Relaxed),
+            peak_scratch_bytes: self.peak_scratch_bytes.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Per-operation branch-merge route and timing counters.
@@ -1003,10 +1173,13 @@ pub struct MergeWriteProbes {
     /// normalized writer-chunk cap.
     pub proven_insert_raw_batch_calls: Arc<AtomicU64>,
     pub proven_insert_raw_batch_max_bytes: Arc<AtomicU64>,
-    /// Diagnostic-only elapsed-time buckets. They are non-overlapping at the
-    /// top level; `KeyedStage` and `KeyedCommit` are intentional sub-buckets of
-    /// `PhysicalPublish`. Production pays only the unset task-local probe.
+    /// Diagnostic-only elapsed-time buckets. `CandidatePreparation` measures
+    /// wall time while its `TableWalk` and proven-insert intervals can overlap;
+    /// do not sum worker intervals to report preparation latency. `KeyedStage`
+    /// and `KeyedCommit` are sub-buckets of `PhysicalPublish`. Production pays
+    /// only the unset task-local probe.
     merge_timing: Arc<MergeTimingCounters>,
+    merge_preparation: Arc<MergePreparationCounters>,
 }
 
 impl MergeWriteProbes {
@@ -1187,6 +1360,15 @@ impl MergeWriteProbes {
         self.merge_timing_total_us(MergeTimingPhase::OuterRestoreRefresh)
     }
 
+    pub fn candidate_preparation_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::CandidatePreparation)
+    }
+
+    #[doc(hidden)]
+    pub fn merge_preparation_snapshot(&self) -> MergePreparationReading {
+        self.merge_preparation.snapshot()
+    }
+
     /// Snapshot all completed merge timing intervals in deterministic order.
     ///
     /// Take the snapshot after the [`with_merge_write_probes`] future completes.
@@ -1219,6 +1401,160 @@ where
     F: std::future::Future,
 {
     MERGE_WRITE_PROBES.scope(probes, fut).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergePreparationProbeState {
+    Active,
+    Ready,
+    Settled,
+}
+
+/// Moves with a worker's owned result until the collector takes it. Drop
+/// accounts an abandoned active/ready worker even when the enclosing future
+/// is forcibly dropped; it does not claim asynchronous scratch cleanup.
+#[must_use = "retain the probe until its worker result is collected or discarded"]
+pub(crate) struct MergePreparationProbeGuard {
+    counters: Option<Arc<MergePreparationCounters>>,
+    state: MergePreparationProbeState,
+}
+
+impl MergePreparationProbeGuard {
+    /// The worker completed; retain this guard alongside the result while an
+    /// earlier table is still pending. Errors are completed results too.
+    pub(crate) fn ready(&mut self) {
+        assert!(self.state == MergePreparationProbeState::Active);
+        self.state = MergePreparationProbeState::Ready;
+        if let Some(counters) = &self.counters {
+            counters.active.fetch_sub(1, Ordering::Relaxed);
+            counters.completed.fetch_add(1, Ordering::Relaxed);
+            let ready = counters.ready.fetch_add(1, Ordering::Relaxed) + 1;
+            counters.peak_ready.fetch_max(ready, Ordering::Relaxed);
+        }
+    }
+
+    /// Transfer the result to the serial collector exactly once.
+    pub(crate) fn collected(mut self) {
+        assert!(self.state == MergePreparationProbeState::Ready);
+        self.settle(true);
+    }
+
+    fn settle(&mut self, collected: bool) {
+        if self.state == MergePreparationProbeState::Settled {
+            return;
+        }
+        if let Some(counters) = &self.counters {
+            match self.state {
+                MergePreparationProbeState::Active => &counters.active,
+                MergePreparationProbeState::Ready => &counters.ready,
+                MergePreparationProbeState::Settled => unreachable!(),
+            }
+            .fetch_sub(1, Ordering::Relaxed);
+            counters.uncollected.fetch_sub(1, Ordering::Relaxed);
+            if collected {
+                counters.collected.fetch_add(1, Ordering::Relaxed);
+            } else {
+                counters.discarded.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.state = MergePreparationProbeState::Settled;
+    }
+}
+
+impl Drop for MergePreparationProbeGuard {
+    fn drop(&mut self) {
+        self.settle(false);
+    }
+}
+
+pub(crate) fn start_merge_preparation_probe() -> MergePreparationProbeGuard {
+    let counters = MERGE_WRITE_PROBES
+        .try_with(|probes| Arc::clone(&probes.merge_preparation))
+        .ok();
+    if let Some(counters) = &counters {
+        counters.admitted.fetch_add(1, Ordering::Relaxed);
+        let active = counters.active.fetch_add(1, Ordering::Relaxed) + 1;
+        counters.peak_active.fetch_max(active, Ordering::Relaxed);
+        let uncollected = counters.uncollected.fetch_add(1, Ordering::Relaxed) + 1;
+        counters
+            .peak_uncollected
+            .fetch_max(uncollected, Ordering::Relaxed);
+    }
+    MergePreparationProbeGuard {
+        counters,
+        state: MergePreparationProbeState::Active,
+    }
+}
+
+/// The operation's resource reporter, captured while its scope is active and
+/// retained by the budget/scratch owners. Destructors can update the original
+/// counters even after the task-local future has been dropped or another
+/// operation's scope is active. This is observational, not a budget allocator.
+#[derive(Clone, Default)]
+pub(crate) struct MergePreparationReporter {
+    counters: Option<Arc<MergePreparationCounters>>,
+}
+
+impl std::fmt::Debug for MergePreparationReporter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MergePreparationReporter")
+            .field("enabled", &self.counters.is_some())
+            .finish()
+    }
+}
+
+impl MergePreparationReporter {
+    /// Observe the complete operation-wide reservation. Its owner must report
+    /// zero on release/drop; the reporter does not own those allocations.
+    pub(crate) fn bytes(&self, current: usize) {
+        let Some(counters) = &self.counters else {
+            return;
+        };
+        counters
+            .accounted_bytes
+            .store(current as u64, Ordering::Relaxed);
+        counters
+            .peak_accounted_bytes
+            .fetch_max(current as u64, Ordering::Relaxed);
+    }
+
+    /// Observe private scratch still owned by the uncollected window. The
+    /// scratch owner reports aggregate transfers/releases through its Drop.
+    pub(crate) fn scratch(&self, owners: usize, bytes: usize) {
+        let Some(counters) = &self.counters else {
+            return;
+        };
+        counters
+            .scratch_owners
+            .store(owners as u64, Ordering::Relaxed);
+        counters
+            .peak_scratch_owners
+            .fetch_max(owners as u64, Ordering::Relaxed);
+        counters
+            .scratch_bytes
+            .store(bytes as u64, Ordering::Relaxed);
+        counters
+            .peak_scratch_bytes
+            .fetch_max(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn merge_preparation_reporter() -> MergePreparationReporter {
+    MergePreparationReporter {
+        counters: MERGE_WRITE_PROBES
+            .try_with(|probes| Arc::clone(&probes.merge_preparation))
+            .ok(),
+    }
+}
+
+pub(crate) fn record_merge_preparation_budget_fallback() {
+    let _ = MERGE_WRITE_PROBES.try_with(|probes| {
+        probes
+            .merge_preparation
+            .budget_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    });
 }
 
 /// Record one `stage_append` of `rows` rows against the active probes. No-op in
@@ -1817,5 +2153,97 @@ mod merge_timing_phase_tests {
             .find(|reading| reading.phase == "TableWalk")
             .expect("TableWalk timing reading");
         assert_eq!(table_walk.interval_count, 1);
+    }
+
+    #[tokio::test]
+    async fn preparation_controls_follow_future_scopes_without_cross_task_leaks() {
+        let serial = MergePreparationOptions {
+            width: 1,
+            additional_bytes: 0,
+        };
+        let parallel = MergePreparationOptions {
+            width: 4,
+            additional_bytes: 4096,
+        };
+        assert_eq!(merge_preparation_options_override(), None);
+        tokio::join!(
+            with_merge_preparation_options(serial, async {
+                tokio::task::yield_now().await;
+                assert_eq!(merge_preparation_options_override(), Some(serial));
+                with_merge_preparation_options(parallel, async {
+                    tokio::task::yield_now().await;
+                    assert_eq!(merge_preparation_options_override(), Some(parallel));
+                })
+                .await;
+                assert_eq!(merge_preparation_options_override(), Some(serial));
+            }),
+            with_merge_preparation_options(parallel, async {
+                tokio::task::yield_now().await;
+                assert_eq!(merge_preparation_options_override(), Some(parallel));
+            }),
+        );
+        assert_eq!(merge_preparation_options_override(), None);
+    }
+
+    #[tokio::test]
+    async fn preparation_probe_owns_completed_results_until_collection_or_future_drop() {
+        struct ResourceOwner(MergePreparationReporter);
+
+        impl Drop for ResourceOwner {
+            fn drop(&mut self) {
+                self.0.bytes(0);
+                self.0.scratch(0, 0);
+            }
+        }
+
+        let probes = MergeWriteProbes::default();
+        let mut operation = Box::pin(with_merge_write_probes(probes.clone(), async {
+            let resources = ResourceOwner(merge_preparation_reporter());
+            resources.0.bytes(12);
+            resources.0.scratch(1, 32);
+            let mut collected = start_merge_preparation_probe();
+            collected.ready();
+            collected.collected();
+
+            let mut active = start_merge_preparation_probe();
+            let mut ready = start_merge_preparation_probe();
+            ready.ready();
+            std::future::pending::<()>().await;
+            active.ready();
+            active.collected();
+            ready.collected();
+        }));
+        assert!(futures::poll!(&mut operation).is_pending());
+        let waiting = probes.merge_preparation_snapshot();
+        assert_eq!(waiting.active, 1);
+        assert_eq!(waiting.ready, 1);
+        assert_eq!(waiting.uncollected, 2);
+        assert_eq!(waiting.collected, 1);
+        assert_eq!(waiting.accounted_bytes, 12);
+        assert_eq!(waiting.scratch_bytes, 32);
+
+        // Drop outside the installed task-local scope: the tokens retain the
+        // original counters and settle both the active and buffered result,
+        // even when a different operation's scope is currently installed.
+        let other = MergeWriteProbes::default();
+        with_merge_write_probes(other.clone(), async { drop(operation) }).await;
+        assert_eq!(
+            other.merge_preparation_snapshot(),
+            MergePreparationReading::default()
+        );
+        let dropped = probes.merge_preparation_snapshot();
+        assert_eq!(dropped.admitted, 3);
+        assert_eq!(dropped.completed, 2);
+        assert_eq!(dropped.collected, 1);
+        assert_eq!(dropped.discarded, 2);
+        assert_eq!(dropped.active, 0);
+        assert_eq!(dropped.ready, 0);
+        assert_eq!(dropped.uncollected, 0);
+        assert_eq!(dropped.peak_uncollected, 2);
+        assert_eq!(dropped.accounted_bytes, 0);
+        assert_eq!(dropped.peak_accounted_bytes, 12);
+        assert_eq!(dropped.scratch_owners, 0);
+        assert_eq!(dropped.scratch_bytes, 0);
+        assert_eq!(dropped.peak_scratch_bytes, 32);
     }
 }
