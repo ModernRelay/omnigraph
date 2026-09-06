@@ -10532,6 +10532,9 @@ mod tests {
 
     #[tokio::test]
     async fn exact_preflight_rebase_recovery_preserves_published_winner() {
+        // This unarmed recovery must not consume a neighboring test's fault.
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::failpoints::FailScenario::setup();
         // Lance may preflight-rebase an Append even when CommitBuilder's retry
         // budget is zero. Reproduce the exact availability hazard:
         //
