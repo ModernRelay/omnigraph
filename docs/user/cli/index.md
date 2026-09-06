@@ -75,6 +75,17 @@ omnigraph query inspect --query review.gq \
 omnigraph branch merge review/new-data --into main --store ./graph.omni
 ```
 
+Each branch operation is also a GQ statement, run through the same verbs that
+run any `.gq` source: the control writes through `mutate`, the listing through
+`query`. A statement names its branches itself, so it takes no `--branch`:
+
+```bash
+omnigraph mutate -e 'branch create "review/new-data" from main' --store ./graph.omni
+omnigraph query  -e 'branch list' --format table --store ./graph.omni
+omnigraph mutate -e 'branch merge "review/new-data" into main' --store ./graph.omni
+omnigraph mutate -e 'branch delete "review/new-data"' --store ./graph.omni
+```
+
 See [Branches and commits](../branching/index.md) for isolation, history, and
 merge behavior.
 

@@ -3323,6 +3323,56 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
     );
 }
 
+/// A plain `nearest` over a type with full-text-indexed String columns runs no
+/// full-text validation; a full-text query over the same fixture runs one, so
+/// the zero is a skip and not a dead probe.
+#[tokio::test]
+#[serial]
+async fn plain_nearest_skips_the_full_text_validation() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+
+    let probes = QueryIoProbes::default();
+    let nearest = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            SEARCH_QUERIES,
+            "vector_search",
+            &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert!(nearest.num_rows() > 0);
+    assert_eq!(
+        probes.fts_validations.load(Ordering::Relaxed),
+        0,
+        "a scan with no full-text query and no contains_tokens demand skips the validation"
+    );
+
+    let probes = QueryIoProbes::default();
+    let text = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &mut db,
+            SEARCH_QUERIES,
+            "text_search",
+            &params(&[("$q", "Learning")]),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert!(text.num_rows() > 0);
+    assert!(
+        probes.fts_validations.load(Ordering::Relaxed) > 0,
+        "a full-text query validates its index coverage"
+    );
+}
+
 // ─── RRF hybrid search ─────────────────────────────────────────────────────
 
 #[tokio::test]

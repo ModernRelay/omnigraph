@@ -1060,6 +1060,172 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     assert_eq!(allow_body["actor_id"], "act-ragnor");
 }
 
+const BRANCH_CONTROL_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  readers: [act-bruno]
+  admins: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: readers-read
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+  - id: admins-branch-control
+    allow:
+      actors: { group: admins }
+      actions: [branch_create, branch_delete, branch_merge]
+      target_branch_scope: any
+"#;
+
+fn statement_request(path: &str, token: &str, source: &str) -> Request<Body> {
+    Request::builder()
+        .uri(g(path))
+        .method(Method::POST)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"query": source}).to_string()))
+        .unwrap()
+}
+
+fn assert_forbidden(status: StatusCode, body: Value, what: &str) {
+    assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    assert_eq!(
+        error.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden),
+        "{what}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_statements_take_their_routes_policy_decision() {
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-bruno", "reader-token"), ("act-ragnor", "admin-token")],
+        BRANCH_CONTROL_POLICY_YAML,
+    )
+    .await;
+
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", "reader-token", "branch create feature"),
+    )
+    .await;
+    assert_forbidden(status, body, "branch create by a reader");
+    let create = BranchCreateRequest {
+        from: None,
+        name: "feature".to_string(),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("authorization", "Bearer reader-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_forbidden(status, body, "POST /branches by a reader");
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", "admin-token", "branch create feature"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["actor_id"], "act-ragnor");
+    assert_eq!(body["outcome"]["kind"], "created");
+
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", "reader-token", "branch merge feature into main"),
+    )
+    .await;
+    assert_forbidden(status, body, "branch merge by a reader");
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", "admin-token", "branch merge feature into main"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"]["merge"], "already_up_to_date");
+
+    let (status, body) = json_response(
+        &app,
+        statement_request("/query", "reader-token", "branch list"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"], json!([{"name": "feature"}, {"name": "main"}]));
+    let (status, body) = json_response(
+        &app,
+        statement_request("/query", "admin-token", "branch list"),
+    )
+    .await;
+    assert_forbidden(status, body, "branch list by an actor with no read rule");
+    let (status, body) = json_response(&app, get_request(&g("/branches"), "reader-token")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = json_response(&app, get_request(&g("/branches"), "admin-token")).await;
+    assert_forbidden(status, body, "GET /branches by an actor with no read rule");
+
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", "reader-token", "branch delete feature"),
+    )
+    .await;
+    assert_forbidden(status, body, "branch delete by a reader");
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", "admin-token", "branch delete feature"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["outcome"],
+        json!({"kind": "deleted", "name": "feature"})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_list_is_denied_by_a_branch_scoped_read_rule_as_the_route_is() {
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-bruno", "team-token")],
+        POLICY_PROTECTED_READ_YAML,
+    )
+    .await;
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/query"))
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"query": FIND_PERSON_GQ, "params": {"name": "Alice"}, "branch": "main"})
+                    .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = json_response(
+        &app,
+        statement_request("/query", "team-token", "branch list"),
+    )
+    .await;
+    assert_forbidden(status, body, "branch list under a protected-only read rule");
+    let (status, body) = json_response(&app, get_request(&g("/branches"), "team-token")).await;
+    assert_forbidden(
+        status,
+        body,
+        "GET /branches under a protected-only read rule",
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn authenticated_change_stamps_actor_on_commits() {
     // With the Run state machine removed, actor_id is recorded

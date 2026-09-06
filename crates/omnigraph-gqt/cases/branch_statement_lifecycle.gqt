@@ -1,0 +1,87 @@
+# issue: none
+# notes: one branch lifecycle end to end: create, write on the branch and on
+# notes: main, merge the divergence, then a second branch whose write collides
+# notes: with main's, its merge refused, the branch deleted, and the deletion
+# notes: read back through `branch list` and a read targeting the gone branch.
+# notes: The merge of b0 is a three-way merge (both sides wrote after the
+# notes: fork), so the outcome is `merged` rather than a fast forward.
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate branch: b0
+query insert_on_b0() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_on_main() {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b0
+
+--- expect outcome: merged
+
+--- mutate
+branch create b1
+
+--- expect ok
+
+--- mutate branch: b1
+query bump_on_b1() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query bump_on_main() {
+    update Person set { age: 32 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b1 into main
+
+--- expect error: merge conflicts
+
+--- mutate
+branch delete b1
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "b0"}
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query branch: b1
+query read_on_b1() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: branch 'b1' not found

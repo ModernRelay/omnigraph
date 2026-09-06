@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::catalog::Catalog;
-use crate::query::ast::{Mutation, QueryDecl};
+use crate::query::ast::{Mutation, QueryDecl, QueryFile};
 use crate::query::descriptor::{QueryOperationDescriptor, describe_query_operation};
 use crate::query::parser::parse_query;
 
@@ -120,13 +120,18 @@ pub fn lint_query_file(
     schema_source: QueryLintSchemaSource,
 ) -> QueryLintOutput {
     let query_path = query_path.into();
-    match parse_query(query_source) {
-        Ok(parsed) => {
-            let queries_processed = parsed.queries.len();
+    let parsed = match parse_query(query_source) {
+        Ok(QueryFile::Queries(queries)) => Ok(queries),
+        Ok(QueryFile::Branch(stmt)) => Err(stmt.not_a_declaration_message()),
+        Err(err) => Err(err.to_string()),
+    };
+    match parsed {
+        Ok(queries) => {
+            let queries_processed = queries.len();
             let mut results = Vec::with_capacity(queries_processed);
             let mut coverage = BTreeMap::<String, UpdateCoverage>::new();
 
-            for query in &parsed.queries {
+            for query in &queries {
                 let kind = query_kind(query);
                 let warnings = per_query_warnings(query);
                 match describe_query_operation(catalog, query) {
@@ -194,7 +199,7 @@ pub fn lint_query_file(
                 findings,
             }
         }
-        Err(err) => QueryLintOutput {
+        Err(message) => QueryLintOutput {
             status: QueryLintStatus::Error,
             schema_source,
             query_path,
@@ -206,7 +211,7 @@ pub fn lint_query_file(
             findings: vec![QueryLintFinding {
                 severity: QueryLintSeverity::Error,
                 code: PARSE_ERROR_CODE.to_string(),
-                message: err.to_string(),
+                message,
                 type_name: None,
                 property: None,
                 query_names: Vec::new(),

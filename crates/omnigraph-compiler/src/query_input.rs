@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::error::CompilerError;
 use crate::ir::ParamMap;
-use crate::query::ast::{Literal, Param, QueryDecl};
+use crate::query::ast::{Literal, Param, QueryDecl, QueryFile};
 use crate::query::parser::parse_query;
 
 const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
@@ -260,12 +260,13 @@ macro_rules! params {
 }
 
 pub fn find_named_query(query_source: &str, query_name: &str) -> RunInputResult<QueryDecl> {
-    let queries = parse_query(query_source)?;
-    queries
-        .queries
-        .into_iter()
-        .find(|query| query.name == query_name)
-        .ok_or_else(|| RunInputError::message(format!("query '{}' not found", query_name)))
+    match parse_query(query_source)? {
+        QueryFile::Queries(queries) => queries
+            .into_iter()
+            .find(|query| query.name == query_name)
+            .ok_or_else(|| RunInputError::message(format!("query '{}' not found", query_name))),
+        QueryFile::Branch(stmt) => Err(RunInputError::message(stmt.not_a_declaration_message())),
+    }
 }
 
 pub fn json_params_to_param_map(
@@ -795,6 +796,16 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "param 'id': integer 9007199254740992 exceeds JS safe integer range; pass a decimal string for exact values"
+        );
+    }
+
+    #[test]
+    fn find_named_query_refuses_a_branch_statement() {
+        let error = find_named_query("branch merge b0 into main", "b0")
+            .expect_err("a branch statement has no declaration to return");
+        assert_eq!(
+            error.to_string(),
+            "`branch merge` is a branch statement, not a query declaration"
         );
     }
 

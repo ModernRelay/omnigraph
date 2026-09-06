@@ -1,11 +1,609 @@
 //! Stored-query commands and alias resolution.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
-use tempfile::tempdir;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+use tempfile::{TempDir, tempdir};
 
 mod support;
 
 use support::*;
+
+const STATEMENT_GRAPH_ID: &str = "knowledge";
+
+/// A loaded graph for the embedded (`--store`) arm.
+fn loaded_graph() -> (TempDir, PathBuf) {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    (temp, graph)
+}
+
+/// A loaded graph served unauthenticated for the remote (`--server`) arm.
+fn served_graph() -> (ClusterFixture, TestServer) {
+    let cluster = converged_loaded_cluster(STATEMENT_GRAPH_ID, None);
+    let server = spawn_server_with_cluster(cluster.path());
+    (cluster, server)
+}
+
+fn embedded(verb: &str, graph: &Path) -> assert_cmd::Command {
+    let mut command = cli();
+    command.arg(verb).arg("--store").arg(graph);
+    command
+}
+
+fn served(verb: &str, server: &TestServer) -> assert_cmd::Command {
+    let mut command = cli();
+    command
+        .arg(verb)
+        .arg("--server")
+        .arg(&server.base_url)
+        .arg("--graph")
+        .arg(STATEMENT_GRAPH_ID);
+    command
+}
+
+fn stderr_string(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// `branch list` rows as names, from the statement's `--json` envelope.
+fn listed_names(output: &std::process::Output) -> Vec<String> {
+    parse_stdout_json(output)["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+
+#[test]
+fn branch_statements_embedded_print_the_verb_lines() {
+    let (_temp, graph) = loaded_graph();
+
+    let created = output_success(embedded("mutate", &graph).arg("-e").arg("branch create b0"));
+    assert_eq!(stdout_string(&created), "created branch b0 from main\n");
+
+    let listed = output_success(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg("branch list")
+            .arg("--json"),
+    );
+    assert_eq!(listed_names(&listed), ["b0", "main"]);
+
+    let up_to_date = output_success(
+        embedded("mutate", &graph)
+            .arg("-e")
+            .arg("branch merge b0 into main"),
+    );
+    assert_eq!(
+        stdout_string(&up_to_date),
+        "merged b0 into main: already_up_to_date\n"
+    );
+
+    let defaulted = output_success(embedded("mutate", &graph).arg("-e").arg("branch merge b0"));
+    assert_eq!(
+        stdout_string(&defaulted),
+        "merged b0 into main: already_up_to_date\n",
+        "a merge with no `into` targets main, and the line names it"
+    );
+
+    output_success(
+        embedded("mutate", &graph)
+            .arg("--branch")
+            .arg("b0")
+            .arg("-e")
+            .arg(SET_AGE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice","age":41}"#),
+    );
+    let fast_forward = output_success(
+        embedded("mutate", &graph)
+            .arg("-e")
+            .arg("branch merge b0 into main")
+            .arg("--json"),
+    );
+    let payload = parse_stdout_json(&fast_forward);
+    assert_eq!(payload["outcome"]["kind"], "merged");
+    assert_eq!(payload["outcome"]["source"], "b0");
+    assert_eq!(payload["outcome"]["target"], "main");
+    assert_eq!(payload["outcome"]["merge"], "fast_forward");
+    assert_eq!(payload["branch"], "main");
+    assert_eq!(payload["query_name"], "branch merge");
+    assert_eq!(payload["affected_nodes"], 0);
+    assert_eq!(payload["affected_edges"], 0);
+    assert!(
+        payload["commit"]["graph_commit_id"].as_str().is_some(),
+        "a publishing merge reports the target's head: {payload}"
+    );
+
+    let deleted = output_success(embedded("mutate", &graph).arg("-e").arg("branch delete b0"));
+    assert_eq!(
+        stdout_string(&deleted),
+        "deleted branch b0\n",
+        "a local target needs no --yes for the delete"
+    );
+    let listed = output_success(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg("branch list")
+            .arg("--json"),
+    );
+    assert_eq!(listed_names(&listed), ["main"]);
+
+    let created = output_success(
+        embedded("mutate", &graph)
+            .arg("--as")
+            .arg("act-stmt")
+            .arg("-e")
+            .arg("branch create b1 from main")
+            .arg("--json"),
+    );
+    let payload = parse_stdout_json(&created);
+    assert_eq!(payload["outcome"]["kind"], "created");
+    assert_eq!(payload["outcome"]["from"], "main");
+    assert_eq!(payload["outcome"]["name"], "b1");
+    assert_eq!(payload["branch"], "b1");
+    assert_eq!(payload["query_name"], "branch create");
+    assert_eq!(
+        payload["actor_id"], "act-stmt",
+        "--as attributes the actor as on any embedded write"
+    );
+    assert_eq!(payload["commit"], Value::Null);
+    let deleted = output_success(
+        embedded("mutate", &graph)
+            .arg("--as")
+            .arg("act-stmt")
+            .arg("-e")
+            .arg("branch delete b1"),
+    );
+    assert_eq!(
+        stdout_string(&deleted),
+        "deleted branch b1\nactor_id: act-stmt\n"
+    );
+}
+
+#[test]
+fn branch_list_statement_renders_in_every_text_format() {
+    let (_temp, graph) = loaded_graph();
+    output_success(embedded("mutate", &graph).arg("-e").arg("branch create b0"));
+
+    let render = |format: &str| {
+        stdout_string(&output_success(
+            embedded("query", &graph)
+                .arg("-e")
+                .arg("branch list")
+                .arg("--format")
+                .arg(format),
+        ))
+    };
+
+    let table = render("table");
+    assert!(
+        table.starts_with("2 rows via branch list\n"),
+        "a null-null target drops the `from ...` clause: {table}"
+    );
+    assert!(table.contains("name") && table.contains("b0") && table.contains("main"));
+
+    let kv = render("kv");
+    assert_eq!(
+        kv,
+        "2 rows via branch list\nrow 1\nname: b0\n\nrow 2\nname: main\n"
+    );
+
+    assert_eq!(render("csv"), "name\nb0\nmain\n");
+
+    let jsonl = render("jsonl");
+    let mut lines = jsonl.lines();
+    let metadata: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(metadata["kind"], "metadata");
+    assert_eq!(metadata["query_name"], "branch list");
+    assert_eq!(metadata["target"]["branch"], Value::Null);
+    assert_eq!(metadata["target"]["snapshot"], Value::Null);
+    assert_eq!(metadata["row_count"], 2);
+    let rows: Vec<Value> = lines
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            serde_json::json!({"name": "b0"}),
+            serde_json::json!({"name": "main"})
+        ]
+    );
+
+    let json: Value = serde_json::from_str(&render("json")).unwrap();
+    assert_eq!(json["query_name"], "branch list");
+    assert_eq!(json["target"]["branch"], Value::Null);
+    assert_eq!(json["target"]["snapshot"], Value::Null);
+    assert_eq!(json["columns"], serde_json::json!(["name"]));
+    assert_eq!(json["row_count"], 2);
+    assert_eq!(json["graph_commit_id"], Value::Null);
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([{"name": "b0"}, {"name": "main"}])
+    );
+}
+
+#[test]
+fn branch_statements_remote_round_trip_and_delete_needs_consent() {
+    let (_cluster, server) = served_graph();
+
+    let created = output_success(served("mutate", &server).arg("-e").arg("branch create b0"));
+    assert_eq!(stdout_string(&created), "created branch b0 from main\n");
+
+    let table = stdout_string(&output_success(
+        served("query", &server)
+            .arg("-e")
+            .arg("branch list")
+            .arg("--format")
+            .arg("table"),
+    ));
+    assert!(
+        table.starts_with("2 rows via branch list\n") && table.contains("b0"),
+        "table: {table}"
+    );
+    let listed = output_success(
+        served("query", &server)
+            .arg("-e")
+            .arg("branch list")
+            .arg("--json"),
+    );
+    let payload = parse_stdout_json(&listed);
+    assert_eq!(payload["target"]["branch"], Value::Null);
+    assert_eq!(payload["target"]["snapshot"], Value::Null);
+    assert_eq!(listed_names(&listed), ["b0", "main"]);
+
+    let merged = output_success(
+        served("mutate", &server)
+            .arg("-e")
+            .arg("branch merge b0 into main"),
+    );
+    assert_eq!(
+        stdout_string(&merged),
+        "merged b0 into main: already_up_to_date\n"
+    );
+
+    let refused = output_failure(served("mutate", &server).arg("-e").arg("branch delete b0"));
+    let stderr = stderr_string(&refused);
+    assert!(
+        stderr.contains("refusing destructive `branch delete` against non-local target")
+            && stderr.contains("pass --yes to confirm"),
+        "a served target is non-local: the statement takes the verb's consent step; got: {stderr}"
+    );
+    let refused_json = output_failure(
+        served("mutate", &server)
+            .arg("-e")
+            .arg("branch delete b0")
+            .arg("--json"),
+    );
+    assert!(
+        stderr_string(&refused_json).contains("pass --yes to confirm"),
+        "--json fails closed too"
+    );
+    let listed = output_success(
+        served("query", &server)
+            .arg("-e")
+            .arg("branch list")
+            .arg("--json"),
+    );
+    assert_eq!(
+        listed_names(&listed),
+        ["b0", "main"],
+        "a refused delete changes nothing"
+    );
+
+    let deleted = output_success(
+        served("mutate", &server)
+            .arg("-e")
+            .arg("branch delete b0")
+            .arg("--yes"),
+    );
+    assert_eq!(stdout_string(&deleted), "deleted branch b0\n");
+    let listed = output_success(
+        served("query", &server)
+            .arg("-e")
+            .arg("branch list")
+            .arg("--json"),
+    );
+    assert_eq!(listed_names(&listed), ["main"]);
+
+    let created = output_success(
+        served("mutate", &server)
+            .arg("-e")
+            .arg("branch create b1")
+            .arg("--json"),
+    );
+    let payload = parse_stdout_json(&created);
+    assert_eq!(payload["outcome"]["kind"], "created");
+    assert_eq!(payload["outcome"]["from"], "main");
+    assert_eq!(payload["outcome"]["name"], "b1");
+    assert_eq!(payload["query_name"], "branch create");
+    assert_eq!(payload["affected_nodes"], 0);
+    assert_eq!(payload["commit"], Value::Null);
+
+    diverge_alice(&|| served("mutate", &server));
+    let conflicted = served("mutate", &server)
+        .arg("-e")
+        .arg("branch merge feature into main")
+        .output()
+        .unwrap();
+    assert_eq!(conflicted.status.code(), Some(1));
+    let stderr = stderr_string(&conflicted);
+    assert!(
+        stderr.contains("merge conflicts: ") && stderr.contains("Alice"),
+        "served conflict names the conflicting entity; got: {stderr}"
+    );
+}
+
+#[test]
+fn branch_statement_local_refusals_happen_before_any_round_trip() {
+    let unreachable = "http://127.0.0.1:9";
+    let temp = tempdir().unwrap();
+    let params_file = temp.path().join("params.json");
+    std::fs::write(&params_file, "{}").unwrap();
+    let params_file = params_file.to_str().unwrap();
+
+    let refusal = |args: &[&str]| -> String {
+        let mut command = cli();
+        command
+            .args(args)
+            .arg("--server")
+            .arg(unreachable)
+            .arg("--graph")
+            .arg("g");
+        stderr_string(&output_failure(&mut command))
+    };
+
+    const TARGET: &str = "a branch statement names its branches itself; drop the request target";
+    const NAME_OR_PARAMS: &str = "a branch statement takes no name and no parameters";
+    const PRECONDITION: &str = "a branch statement takes no commit precondition";
+    const CONTROL_WRITE_AT_QUERY: &str =
+        "statement 'branch create' is a control write; use POST /mutate";
+    const READ_AT_MUTATE: &str = "statement 'branch list' is a read; use POST /query";
+
+    const WRONG_DOOR: &str = "wrong door";
+    const DOOR_BEFORE_ENVELOPE: &str = "the door is checked before the envelope, as on the server";
+    const QUERY_ENVELOPE: &str = "`query`: request target, then name or params";
+    const MUTATE_ENVELOPE: &str =
+        "`mutate`: request target, then name or params, then precondition";
+    const ENVELOPE_BEFORE_CONSENT: &str = "the envelope is refused before the delete consent step";
+
+    let cases: &[(&[&str], &str, &str)] = &[
+        (
+            &["query", "-e", "branch create b0"],
+            CONTROL_WRITE_AT_QUERY,
+            WRONG_DOOR,
+        ),
+        (
+            &["query", "-e", "branch delete b0"],
+            "statement 'branch delete' is a control write; use POST /mutate",
+            WRONG_DOOR,
+        ),
+        (
+            &["query", "-e", "branch merge b0 into main"],
+            "statement 'branch merge' is a control write; use POST /mutate",
+            WRONG_DOOR,
+        ),
+        (&["mutate", "-e", "branch list"], READ_AT_MUTATE, WRONG_DOOR),
+        (
+            &["query", "-e", "branch create b0", "--branch", "main"],
+            CONTROL_WRITE_AT_QUERY,
+            DOOR_BEFORE_ENVELOPE,
+        ),
+        (
+            &["mutate", "-e", "branch list", "--branch", "main"],
+            READ_AT_MUTATE,
+            DOOR_BEFORE_ENVELOPE,
+        ),
+        (
+            &["query", "-e", "branch list", "--branch", "main"],
+            TARGET,
+            QUERY_ENVELOPE,
+        ),
+        (
+            &["query", "-e", "branch list", "--snapshot", "s1"],
+            TARGET,
+            QUERY_ENVELOPE,
+        ),
+        (
+            &["query", "which", "-e", "branch list"],
+            NAME_OR_PARAMS,
+            QUERY_ENVELOPE,
+        ),
+        (
+            &["query", "-e", "branch list", "--params", "{}"],
+            NAME_OR_PARAMS,
+            QUERY_ENVELOPE,
+        ),
+        (
+            &["query", "-e", "branch list", "--params-file", params_file],
+            NAME_OR_PARAMS,
+            QUERY_ENVELOPE,
+        ),
+        (
+            &["query", "which", "-e", "branch list", "--branch", "main"],
+            TARGET,
+            QUERY_ENVELOPE,
+        ),
+        (
+            &["mutate", "-e", "branch create b0", "--branch", "main"],
+            TARGET,
+            MUTATE_ENVELOPE,
+        ),
+        (
+            &["mutate", "which", "-e", "branch create b0"],
+            NAME_OR_PARAMS,
+            MUTATE_ENVELOPE,
+        ),
+        (
+            &["mutate", "-e", "branch create b0", "--params", "{}"],
+            NAME_OR_PARAMS,
+            MUTATE_ENVELOPE,
+        ),
+        (
+            &[
+                "mutate",
+                "-e",
+                "branch create b0",
+                "--params-file",
+                params_file,
+            ],
+            NAME_OR_PARAMS,
+            MUTATE_ENVELOPE,
+        ),
+        (
+            &["mutate", "-e", "branch create b0", "--if-commit", "01HEAD"],
+            PRECONDITION,
+            MUTATE_ENVELOPE,
+        ),
+        (
+            &[
+                "mutate",
+                "-e",
+                "branch create b0",
+                "--branch",
+                "main",
+                "--if-commit",
+                "01HEAD",
+            ],
+            TARGET,
+            MUTATE_ENVELOPE,
+        ),
+        (
+            &[
+                "mutate",
+                "which",
+                "-e",
+                "branch create b0",
+                "--if-commit",
+                "01HEAD",
+            ],
+            NAME_OR_PARAMS,
+            MUTATE_ENVELOPE,
+        ),
+        (
+            &["mutate", "-e", "branch delete b0", "--branch", "main"],
+            TARGET,
+            ENVELOPE_BEFORE_CONSENT,
+        ),
+    ];
+    for (args, expected, rule) in cases {
+        let stderr = refusal(args);
+        assert!(
+            stderr.contains(expected),
+            "{args:?} ({rule}): expected {expected:?}; got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("error sending request") && !stderr.contains("Connection refused"),
+            "{args:?}: the refusal must not follow a round trip (nothing listens on \
+             {unreachable}); got: {stderr}"
+        );
+    }
+
+    let absent = temp.path().join("absent.omni");
+    let stderr = stderr_string(&output_failure(
+        embedded("query", &absent)
+            .arg("-e")
+            .arg("branch list")
+            .arg("--branch")
+            .arg("main"),
+    ));
+    assert!(
+        stderr.contains(TARGET),
+        "the embedded arm refuses the same way: {stderr}"
+    );
+    let stderr = stderr_string(&output_failure(
+        embedded("mutate", &absent).arg("-e").arg("branch list"),
+    ));
+    assert!(
+        stderr.contains(READ_AT_MUTATE),
+        "the embedded arm refuses the same way: {stderr}"
+    );
+    assert!(
+        !absent.exists(),
+        "a refusal never opens or creates the store"
+    );
+}
+
+#[test]
+fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
+    let unreachable = "http://127.0.0.1:9";
+    let sent_verbatim = |verb: &str| -> String {
+        let mut command = cli();
+        command
+            .arg(verb)
+            .arg("-e")
+            .arg("not gq at all {")
+            .arg("--server")
+            .arg(unreachable)
+            .arg("--graph")
+            .arg("g");
+        stderr_string(&output_failure(&mut command))
+    };
+    for verb in ["query", "mutate"] {
+        let stderr = sent_verbatim(verb);
+        assert!(
+            stderr.contains("error sending request") || stderr.contains("Connection refused"),
+            "{verb}: a source this CLI's grammar cannot parse is the server's to judge, so it \
+             goes over the wire rather than failing locally (an older CLI never gates a newer \
+             server's grammar); got: {stderr}"
+        );
+    }
+}
+
+/// `main` and `feature` set Alice's age to different values, so merging
+/// `feature` into `main` conflicts.
+fn diverge_alice(mutate: &dyn Fn() -> assert_cmd::Command) {
+    output_success(mutate().arg("-e").arg("branch create feature"));
+    output_success(
+        mutate()
+            .arg("-e")
+            .arg(SET_AGE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice","age":31}"#),
+    );
+    output_success(
+        mutate()
+            .arg("--branch")
+            .arg("feature")
+            .arg("-e")
+            .arg(SET_AGE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice","age":32}"#),
+    );
+}
+
+#[test]
+fn branch_merge_statement_conflict_exits_1_with_the_engine_message() {
+    let (_temp, graph) = loaded_graph();
+    diverge_alice(&|| embedded("mutate", &graph));
+    let conflicted = embedded("mutate", &graph)
+        .arg("-e")
+        .arg("branch merge feature into main")
+        .output()
+        .unwrap();
+    assert_eq!(conflicted.status.code(), Some(1));
+    let stderr = stderr_string(&conflicted);
+    assert!(
+        stderr.contains("merge conflicts: "),
+        "embedded conflict renders as the engine error; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("Alice"),
+        "names the conflicting entity: {stderr}"
+    );
+    assert_eq!(
+        stdout_string(&conflicted),
+        "",
+        "a conflict prints no outcome"
+    );
+}
 
 #[test]
 fn query_check_alias_matches_lint_output() {

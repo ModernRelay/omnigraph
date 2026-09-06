@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
 use omnigraph_compiler::SchemaMigrationPlan;
 use omnigraph_compiler::build_catalog;
+use omnigraph_compiler::query::ast::QueryFile;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query_decl;
 use omnigraph_compiler::schema::parser::parse_schema;

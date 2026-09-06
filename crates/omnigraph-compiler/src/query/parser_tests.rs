@@ -11,8 +11,7 @@ return { $p.name, $p.age }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    assert_eq!(qf.queries.len(), 1);
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.name, "get_person");
     assert_eq!(q.params.len(), 1);
     assert_eq!(q.params[0].name, "name");
@@ -34,7 +33,7 @@ return { $d.slug }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(
         q.description.as_deref(),
         Some("Find semantically similar documents.")
@@ -75,7 +74,7 @@ order { $p.age desc }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.name, "adults");
     assert!(q.params.is_empty());
     assert_eq!(q.match_clause.len(), 2);
@@ -98,7 +97,7 @@ return { $f.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.edge_name, "knows");
@@ -135,7 +134,7 @@ return { $f.name, $f.age }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
@@ -161,7 +160,7 @@ return { $p.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
         Clause::Negation(clauses) => {
@@ -198,7 +197,7 @@ limit 20
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.return_clause.len(), 2);
     match &q.return_clause[1].expr {
         Expr::Aggregate { func, .. } => {
@@ -223,7 +222,7 @@ return { $fof.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 3);
 }
 
@@ -239,7 +238,7 @@ return { $p.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
@@ -265,7 +264,7 @@ return { $b.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.min_hops, 1);
@@ -287,7 +286,7 @@ return { $b.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.min_hops, 1);
@@ -309,8 +308,10 @@ match { $c: Company }
 return { $c.name }
 }
 "#;
-    let qf = parse_query(input).unwrap();
-    assert_eq!(qf.queries.len(), 2);
+    let QueryFile::Queries(queries) = parse_query(input).unwrap() else {
+        panic!("expected query declarations");
+    };
+    assert_eq!(queries.len(), 2);
 }
 
 #[test]
@@ -328,7 +329,7 @@ return { $p.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 5);
 }
 
@@ -344,7 +345,7 @@ return { $p.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Filter(f) => {
             assert_eq!(f.op, CompOp::Ne);
@@ -365,7 +366,7 @@ return { $p.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Filter(f) => match &f.right {
             Expr::Literal(Literal::String(value)) => {
@@ -405,7 +406,7 @@ return { $p.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Filter(f) => match &f.right {
             Expr::Literal(Literal::Bool(value)) => assert!(*value),
@@ -434,7 +435,7 @@ return { $p.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Filter(f) => {
             assert_eq!(f.op, CompOp::Contains);
@@ -470,7 +471,7 @@ return { $p.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Filter(f) => {
             assert_eq!(f.op, CompOp::StartsWith);
@@ -508,7 +509,7 @@ return { $b.name, $c.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 4);
 }
 
@@ -529,7 +530,7 @@ order { headcount desc }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.return_clause.len(), 3);
 }
 
@@ -544,7 +545,7 @@ insert Person {
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match q.mutations.first().expect("expected mutation") {
         Mutation::Insert(ins) => {
             assert_eq!(ins.type_name, "Person");
@@ -564,7 +565,7 @@ update Person set {
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match q.mutations.first().expect("expected mutation") {
         Mutation::Update(upd) => {
             assert_eq!(upd.type_name, "Person");
@@ -584,7 +585,7 @@ delete Person where name = $name
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match q.mutations.first().expect("expected mutation") {
         Mutation::Delete(del) => {
             assert_eq!(del.type_name, "Person");
@@ -608,7 +609,7 @@ return { $e.id }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Filter(f) => match &f.right {
             Expr::Literal(Literal::Date(v)) => assert_eq!(v, "2026-02-14"),
@@ -637,7 +638,7 @@ return { now() as ts }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Filter(f) => assert!(matches!(f.right, Expr::Now)),
         _ => panic!("expected Filter"),
@@ -652,7 +653,7 @@ update Event set { updated_at: now() } where created_at <= now()
 "#,
     )
     .unwrap();
-    match mutation.queries[0].mutations.first().unwrap() {
+    match mutation.single_decl().mutations.first().unwrap() {
         Mutation::Update(update) => {
             assert!(matches!(update.assignments[0].value, MatchValue::Now));
             assert!(matches!(update.predicate.value, MatchValue::Now));
@@ -670,7 +671,7 @@ insert Knows { from: $name, to: $friend }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.mutations.len(), 2);
     assert!(matches!(&q.mutations[0], Mutation::Insert(ins) if ins.type_name == "Person"));
     assert!(matches!(&q.mutations[1], Mutation::Insert(ins) if ins.type_name == "Knows"));
@@ -685,7 +686,7 @@ delete Person where name = $old
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.mutations.len(), 2);
     assert!(matches!(&q.mutations[0], Mutation::Insert(_)));
     assert!(matches!(&q.mutations[1], Mutation::Delete(_)));
@@ -699,7 +700,7 @@ insert Person { name: $name, age: $age }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    assert_eq!(qf.queries[0].mutations.len(), 1);
+    assert_eq!(qf.single_decl().mutations.len(), 1);
 }
 
 #[test]
@@ -711,7 +712,7 @@ return { $p.tags }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     match &q.match_clause[0] {
         Clause::Binding(b) => match &b.prop_matches[0].value {
             MatchValue::Literal(Literal::List(items)) => {
@@ -734,7 +735,7 @@ limit 5
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.params[0].type_name, "Vector(3)");
     assert_eq!(q.order_clause.len(), 1);
     assert!(!q.order_clause[0].descending);
@@ -763,7 +764,7 @@ limit 5
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.params[0].type_name, "Vector(3)");
     assert!(q.params[0].nullable);
 }
@@ -777,7 +778,7 @@ return { $t.slug }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.params[0].type_name, "[String]");
     assert!(!q.params[0].nullable);
     assert_eq!(q.params[1].type_name, "[Date]");
@@ -809,7 +810,7 @@ limit 5
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.return_clause.len(), 2);
     match &q.return_clause[1].expr {
         Expr::Nearest {
@@ -841,7 +842,7 @@ return { $s.slug }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
         Clause::Filter(Filter { left, op, right }) => {
@@ -874,7 +875,7 @@ return { $s.slug }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
         Clause::Filter(Filter { left, op, right }) => {
@@ -915,7 +916,7 @@ return { $s.slug }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
         Clause::Filter(Filter { left, op, right }) => {
@@ -947,7 +948,7 @@ limit 5
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.return_clause.len(), 2);
     match &q.return_clause[1].expr {
         Expr::Bm25 { field, query } => {
@@ -974,7 +975,7 @@ limit 5
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.order_clause.len(), 1);
     assert!(q.order_clause[0].descending);
     match &q.order_clause[0].expr {
@@ -1024,7 +1025,7 @@ return { $f.name }
 }
 "#;
     let qf = parse_query(input).unwrap();
-    let q = &qf.queries[0];
+    let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 4);
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
@@ -1049,4 +1050,171 @@ return { $f.name }
         }
         c => panic!("expected Traversal, got {c:?}"),
     }
+}
+
+fn parse_branch(input: &str) -> BranchStmt {
+    match parse_query(input).unwrap() {
+        QueryFile::Branch(stmt) => stmt,
+        QueryFile::Queries(queries) => panic!(
+            "expected a branch statement, got {} declarations",
+            queries.len()
+        ),
+    }
+}
+
+fn create(name: &str, from: Option<&str>) -> BranchStmt {
+    BranchStmt::Write(BranchWrite::Create {
+        name: name.to_string(),
+        from: from.map(str::to_string),
+    })
+}
+
+fn delete(name: &str) -> BranchStmt {
+    BranchStmt::Write(BranchWrite::Delete {
+        name: name.to_string(),
+    })
+}
+
+fn merge(source: &str, into: Option<&str>) -> BranchStmt {
+    BranchStmt::Write(BranchWrite::Merge {
+        source: source.to_string(),
+        into: into.map(str::to_string),
+    })
+}
+
+#[test]
+fn branch_statements_parse_with_and_without_their_defaults() {
+    let created = parse_branch("branch create b0");
+    assert_eq!(created, create("b0", None));
+    assert!(created.is_write());
+    assert_eq!(created.statement_name(), "branch create");
+    assert_eq!(
+        parse_branch("branch create b0 from main"),
+        create("b0", Some("main"))
+    );
+    let deleted = parse_branch("branch delete b0");
+    assert_eq!(deleted, delete("b0"));
+    assert!(deleted.is_write());
+    assert_eq!(deleted.statement_name(), "branch delete");
+    let merged = parse_branch("branch merge b0");
+    assert_eq!(merged, merge("b0", None));
+    assert!(merged.is_write());
+    assert_eq!(merged.statement_name(), "branch merge");
+    assert_eq!(
+        parse_branch("branch merge b0 into main"),
+        merge("b0", Some("main"))
+    );
+    let listed = parse_branch("branch list");
+    assert_eq!(listed, BranchStmt::List);
+    assert!(!listed.is_write());
+    assert_eq!(listed.statement_name(), "branch list");
+    assert_eq!(
+        parse_branch("  branch\n  list // trailing comment\n"),
+        BranchStmt::List
+    );
+}
+
+#[test]
+fn branch_names_outside_the_identifier_alphabet_are_quoted() {
+    assert_eq!(
+        parse_branch(r#"branch create "review/add-benchmark""#),
+        create("review/add-benchmark", None)
+    );
+    assert_eq!(
+        parse_branch(r#"branch merge "release.1.2" into "Main""#),
+        merge("release.1.2", Some("Main"))
+    );
+    assert_eq!(parse_branch(r#"branch delete "a\"b""#), delete("a\"b"));
+    assert_eq!(parse_branch(r#"branch create "b 0""#), create("b 0", None));
+    assert!(parse_query("branch create B0").is_err());
+    assert!(parse_query("branch create 0b").is_err());
+    assert!(parse_query("branch create review/add-benchmark").is_err());
+    assert_eq!(parse_branch("branch create list"), create("list", None));
+    assert_eq!(parse_branch("branch delete from"), delete("from"));
+    assert_eq!(parse_branch("branch merge into"), merge("into", None));
+    assert_eq!(
+        parse_branch(r#"branch create "from" from main"#),
+        create("from", Some("main"))
+    );
+    assert!(parse_query("branch create from main").is_err());
+    assert!(parse_query("branch create b0 from").is_err());
+    assert!(parse_query("branch merge b0 into").is_err());
+    assert!(parse_query("branch list all").is_err());
+}
+
+#[test]
+fn branch_keywords_end_at_a_word_boundary() {
+    assert!(parse_query("branch create b0").is_ok());
+    for input in [
+        "branch createb0",
+        "branchcreate b0",
+        "branch merge b0 intomain",
+        "branch listing",
+        "branch_list",
+        "branch",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+}
+
+#[test]
+fn branch_name_refusals_keep_the_spelled_and_acted_on_name_identical() {
+    let err = parse_query(r#"branch create """#).unwrap_err();
+    assert!(err.to_string().contains("cannot be empty"), "{err}");
+    let err = parse_query(r#"branch create " ""#).unwrap_err();
+    assert!(
+        err.to_string().contains("leading or trailing whitespace"),
+        "{err}"
+    );
+    let err = parse_query(r#"branch merge b0 into "main ""#).unwrap_err();
+    assert!(
+        err.to_string().contains("leading or trailing whitespace"),
+        "{err}"
+    );
+    let err = parse_query(r#"branch create "b\n0""#).unwrap_err();
+    assert!(err.to_string().contains("control character"), "{err}");
+}
+
+#[test]
+fn branch_statement_never_shares_a_file_with_a_declaration() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    assert!(parse_query(decl).is_ok());
+    let err = parse_query(&format!("branch create b0\n{decl}")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a branch statement stands alone in its file"),
+        "{err}"
+    );
+    let err = parse_query("branch create b0\nbranch create b1\n").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a branch statement stands alone in its file"),
+        "{err}"
+    );
+    assert!(parse_query(&format!("{decl}branch create b0\n")).is_err());
+    assert!(
+        parse_query("query m() {\n    insert Person { name: \"a\" }\n    branch create b0\n}\n")
+            .is_err()
+    );
+    let err = parse_query("mutation { insert Person { name: \"a\" } }").unwrap_err();
+    assert!(err.to_string().contains("expected query_file"), "{err}");
+}
+
+#[test]
+fn branch_keywords_stay_identifiers_inside_bodies() {
+    let input = r#"
+query q($b: String) {
+match {
+    $p: Person { branch: $b }
+    $p merge $q
+    $q.list = "x"
+}
+return { $p.branch, $q.into as create }
+}
+"#;
+    let qf = parse_query(input).unwrap();
+    assert_eq!(qf.single_decl().name, "q");
+    let insert =
+        parse_query("query m() {\n    insert Knows { from: \"a\", to: \"b\" }\n}\n").unwrap();
+    assert_eq!(insert.single_decl().mutations.len(), 1);
 }

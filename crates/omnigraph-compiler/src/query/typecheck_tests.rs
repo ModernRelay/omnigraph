@@ -90,7 +90,7 @@ insert Shared { label: "node" }
     )
     .unwrap();
 
-    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => assert_eq!(
             ctx.targets,
@@ -158,7 +158,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("p"));
 }
 
@@ -174,7 +174,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T1"));
 }
 
@@ -190,7 +190,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T2"));
 }
 
@@ -206,7 +206,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T3"));
 }
 
@@ -252,7 +252,7 @@ return { $p.name }
         ),
     ] {
         let qf = parse_query(query).unwrap();
-        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
         assert!(
             err.to_string().contains(&format!(
                 "match variable `${variable}` must be a declared query parameter"
@@ -274,7 +274,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("p"));
 }
 
@@ -290,7 +290,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("p"));
 }
 
@@ -306,7 +306,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("list equality is not supported"));
     assert!(msg.contains("membership"));
@@ -327,7 +327,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("p"));
 }
 
@@ -346,7 +346,7 @@ return { $p.tags, $tags, $days }
 "#,
     )
     .unwrap();
-    assert!(typecheck_query(&catalog, &qf.queries[0]).is_ok());
+    assert!(typecheck_query(&catalog, qf.single_decl()).is_ok());
 }
 
 #[test]
@@ -366,7 +366,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    assert!(typecheck_query(&catalog, &qf.queries[0]).is_ok());
+    assert!(typecheck_query(&catalog, qf.single_decl()).is_ok());
 }
 
 #[test]
@@ -384,7 +384,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(
         err.to_string()
             .contains("string contains requires a String right operand")
@@ -406,7 +406,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains(
         "contains requires a list property (membership) or a String property (substring)"
     ));
@@ -427,7 +427,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    assert!(typecheck_query(&catalog, &qf.queries[0]).is_ok());
+    assert!(typecheck_query(&catalog, qf.single_decl()).is_ok());
 }
 
 #[test]
@@ -445,7 +445,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(
         err.to_string()
             .contains("starts_with requires a String property on the left")
@@ -467,7 +467,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(
         err.to_string()
             .contains("starts_with requires a String right operand")
@@ -489,7 +489,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(
         err.to_string()
             .contains("contains requires a scalar right operand")
@@ -511,7 +511,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T4"));
 }
 
@@ -530,7 +530,7 @@ return { $c.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T5"));
 }
 
@@ -549,7 +549,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T6"));
 }
 
@@ -568,7 +568,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T7"));
 }
 
@@ -587,7 +587,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("scalar operands"));
 }
 
@@ -604,7 +604,7 @@ order { nearest($d.embedding, $q) }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T17"));
 }
 
@@ -622,7 +622,7 @@ limit 3
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T15"));
 }
 
@@ -640,7 +640,7 @@ limit 3
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("d"));
 }
 
@@ -658,7 +658,7 @@ limit 3
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("d"));
 }
 
@@ -677,7 +677,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("p"));
 }
 
@@ -696,7 +696,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("p"));
 }
 
@@ -715,7 +715,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T19"));
 }
 
@@ -734,7 +734,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("p"));
 }
 
@@ -751,7 +751,7 @@ order { bm25($p.name, $q) desc }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("p"));
 }
 
@@ -767,7 +767,7 @@ return { bm25($p.name, $q) as score }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T20"));
 }
 
@@ -784,7 +784,7 @@ order { rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) desc }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T21"));
 }
 
@@ -802,7 +802,7 @@ limit 5
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("d"));
 }
 
@@ -820,7 +820,7 @@ limit 5
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("d"));
 }
 
@@ -844,7 +844,7 @@ limit 5
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("d"));
 }
 
@@ -864,7 +864,7 @@ order { score desc }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T21"));
 }
 
@@ -885,7 +885,7 @@ limit 5
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("d"));
 }
 
@@ -908,7 +908,7 @@ limit 5
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T18"));
 }
 
@@ -941,7 +941,7 @@ limit 5
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T21"));
 }
 
@@ -957,7 +957,7 @@ return { sum($p.name) as s }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T8"));
 }
 
@@ -976,7 +976,7 @@ return { $f.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert_eq!(ctx.traversals[0].direction, Direction::Both);
     assert_eq!(node_type_of(&ctx.bindings["f"]), "Person");
 }
@@ -996,7 +996,7 @@ return { $c.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("T22"), "expected T22, got: {msg}");
     assert!(msg.contains("WorksAt"), "names the edge type: {msg}");
@@ -1017,7 +1017,7 @@ return { $f.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert_eq!(ctx.traversals[0].direction, Direction::Out);
     assert_eq!(node_type_of(&ctx.bindings["f"]), "Person");
 }
@@ -1037,7 +1037,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     // $c is Company (to_type), $p is src — direction should be Out
     // because $p (Person=from_type) worksAt $c (Company=to_type) is forward
     assert_eq!(ctx.traversals[0].direction, Direction::Out);
@@ -1058,7 +1058,7 @@ return { $f.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert_eq!(ctx.traversals[0].min_hops, 1);
     assert_eq!(ctx.traversals[0].max_hops, Some(3));
 }
@@ -1078,7 +1078,7 @@ return { $f.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T15"));
 }
 
@@ -1097,7 +1097,7 @@ return { $f.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("unbounded traversal is disabled"));
 }
 
@@ -1116,7 +1116,7 @@ return { $p.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("p"));
 }
 
@@ -1138,7 +1138,7 @@ return {
 "#,
     )
     .unwrap();
-    typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    typecheck_query(&catalog, qf.single_decl()).unwrap();
 }
 
 #[test]
@@ -1157,7 +1157,7 @@ return { $fof.name }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.bindings.contains_key("mid"));
     assert!(ctx.bindings.contains_key("fof"));
 }
@@ -1176,7 +1176,7 @@ insert Person {
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => assert_eq!(
             ctx.targets[0],
@@ -1199,7 +1199,7 @@ insert Person { age: $age }
 "#,
     )
     .unwrap();
-    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T12"));
 }
 
@@ -1217,7 +1217,7 @@ insert Doc {
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => assert_eq!(
             ctx.targets[0],
@@ -1242,7 +1242,7 @@ insert Doc {
 "#,
     )
     .unwrap();
-    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("T12"));
     assert!(msg.contains("embedding"));
@@ -1260,7 +1260,7 @@ update Person set { salary: 100 } where name = $name
 "#,
     )
     .unwrap();
-    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T11"));
 }
 
@@ -1275,7 +1275,7 @@ delete Unknown where name = $name
 "#,
     )
     .unwrap();
-    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T10"));
 }
 
@@ -1293,7 +1293,7 @@ insert Knows {
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => assert_eq!(
             ctx.targets[0],
@@ -1318,7 +1318,7 @@ insert Knows {
 "#,
     )
     .unwrap();
-    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T12"));
 }
 
@@ -1333,7 +1333,7 @@ delete Knows where from = $from
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => assert_eq!(
             ctx.targets[0],
@@ -1356,7 +1356,7 @@ update Knows set { since: 2000 } where from = $from
 "#,
     )
     .unwrap();
-    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T16"));
 }
 
@@ -1372,7 +1372,7 @@ insert Knows { from: $name, to: $friend }
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => {
             assert_eq!(
@@ -1403,7 +1403,7 @@ insert Unknown { foo: $name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T10"));
 }
 
@@ -1432,7 +1432,7 @@ return { now() as ts }
     )
     .unwrap();
 
-    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     assert!(matches!(checked, CheckedQuery::Read(_)));
 }
 
@@ -1457,7 +1457,7 @@ update Event set { on: now() } where slug = "launch"
     )
     .unwrap();
 
-    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("DateTime"));
     assert!(err.to_string().contains("property `on`"));
 }
@@ -1478,7 +1478,7 @@ return { $f.name, $w.since }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert_eq!(edge_type_of(&ctx.bindings["w"]), "Knows");
     assert_eq!(
         ctx.traversals[0].edge_binding.as_deref(),
@@ -1502,7 +1502,7 @@ return { $w.nonsense }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("Knows"), "names the edge type: {msg}");
     assert!(
@@ -1526,7 +1526,7 @@ return { $f.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("T23"), "dedicated code: {msg}");
     assert!(msg.contains("multi-hop"), "explains the restriction: {msg}");
@@ -1548,7 +1548,7 @@ return { $f.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("T23"), "{err}");
 }
 
@@ -1566,7 +1566,7 @@ return {{ $w.label }}
 "#
         );
         let qf = parse_query(&source).unwrap();
-        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
         assert!(
@@ -1593,7 +1593,7 @@ return { $w.label }
     )
     .unwrap();
 
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
     assert!(
@@ -1620,7 +1620,7 @@ return {{ $c.label }}
 "#
         );
         let qf = parse_query(&source).unwrap();
-        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
         assert!(
@@ -1657,7 +1657,7 @@ fn test_blob_read_values_are_rejected_for_nodes_and_edges() {
             let qf = parse_query(&source).unwrap_or_else(|error| {
                 panic!("{binding_kind} {operation} query must parse: {error}\n{source}")
             });
-            let error = typecheck_query(&catalog, &qf.queries[0])
+            let error = typecheck_query(&catalog, qf.single_decl())
                 .expect_err(&format!("{binding_kind} {operation}"));
             assert_eq!(
                 error.to_string(),
@@ -1683,7 +1683,7 @@ return { $e.label }
 "#,
     )
     .unwrap();
-    assert!(typecheck_query(&catalog, &scalar_edge.queries[0]).is_ok());
+    assert!(typecheck_query(&catalog, scalar_edge.single_decl()).is_ok());
 }
 
 #[test]
@@ -1708,7 +1708,7 @@ return { count($d.payload) }
         aliases: HashMap::new(),
         traversals: Vec::new(),
     };
-    let error = infer_query_result_schema(&catalog, &qf.queries[0], &ctx).unwrap_err();
+    let error = infer_query_result_schema(&catalog, qf.single_decl(), &ctx).unwrap_err();
     assert_eq!(
         error.to_string(),
         "type error: T24: Blob property `$d.payload` is not available as a .gq read value; Blob values require a dedicated API"
@@ -1729,7 +1729,7 @@ fn test_blob_parameters_are_rejected_as_read_values() {
         let source = format!("query q($payload: Blob) {{\nmatch {{ $d: Document }}\n{tail}\n}}");
         let qf = parse_query(&source)
             .unwrap_or_else(|error| panic!("{operation} query must parse: {error}\n{source}"));
-        let error = typecheck_query(&catalog, &qf.queries[0]).expect_err(operation);
+        let error = typecheck_query(&catalog, qf.single_decl()).expect_err(operation);
         assert_eq!(
             error.to_string(),
             "type error: T24: Blob parameter `$payload` is not available as a .gq read value; Blob values require a dedicated API",
@@ -1751,7 +1751,7 @@ return { $d.name }
 "#,
     )
     .unwrap();
-    let error = typecheck_query(&catalog, &matched.queries[0]).unwrap_err();
+    let error = typecheck_query(&catalog, matched.single_decl()).unwrap_err();
     assert_eq!(
         error.to_string(),
         "type error: T3: blob property `Document.payload` cannot be used in match patterns"
@@ -1769,7 +1769,7 @@ return { $d.name }
 "#,
     )
     .unwrap();
-    let error = typecheck_query(&catalog, &parameter_comparison.queries[0]).unwrap_err();
+    let error = typecheck_query(&catalog, parameter_comparison.single_decl()).unwrap_err();
     assert_eq!(
         error.to_string(),
         "type error: T7: blob comparisons in filters are not supported"
@@ -1823,7 +1823,7 @@ return { $d.name }
         );
         let qf = parse_query(&source)
             .unwrap_or_else(|error| panic!("{kind} comparison must parse: {error}\n{source}"));
-        let error = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let error = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
         assert_eq!(
             error.to_string(),
             format!(
@@ -1843,7 +1843,7 @@ fn test_blob_mutation_predicates_are_rejected_for_nodes_and_edges() {
                 "query delete_target($payload: {param_type}) {{\ndelete {target} where payload = $payload\n}}"
             );
             let qf = parse_query(&source).unwrap();
-            let error = typecheck_query_decl(&catalog, &qf.queries[0])
+            let error = typecheck_query_decl(&catalog, qf.single_decl())
                 .expect_err("Blob predicates must never use assignment coercions");
             assert_eq!(
                 error.to_string(),
@@ -1868,7 +1868,7 @@ update Document set {{ payload: $payload }} where name = "doc"
         let qf = parse_query(&source).unwrap();
         assert!(
             matches!(
-                typecheck_query_decl(&catalog, &qf.queries[0]),
+                typecheck_query_decl(&catalog, qf.single_decl()),
                 Ok(CheckedQuery::Mutation(_))
             ),
             "{param_type} assignment must remain available"
@@ -1893,7 +1893,7 @@ return { $f.name, count($w.since) }
 "#,
     )
     .unwrap();
-    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(matches!(&ctx.bindings["w"], BoundVariable::Edge { .. }));
 }
 
@@ -1916,7 +1916,7 @@ return { $c.name }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("T23"), "{msg}");
     assert!(msg.contains("search"), "{msg}");
@@ -1940,7 +1940,7 @@ limit 5
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("T23"),
@@ -1964,7 +1964,7 @@ return { $w }
 "#,
     )
     .unwrap();
-    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("T23"), "{msg}");
     assert!(msg.contains("propert"), "points at property access: {msg}");
