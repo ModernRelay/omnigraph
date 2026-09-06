@@ -15,7 +15,8 @@ or `--workspace` reaches it.
   temporary store, the `--- expect shape` check of each rows step's result
   columns, the result-schema check against the compiler's inferred schema,
   row comparison, bless); `src/shape.rs` parses and compares the shape
-  section. Format self-tests and the corpus layout check are its unit
+  section (a `.pg` type per column, or a node type name such as `p: Person`
+  for a bare node projection). Format self-tests and the corpus layout check are its unit
   tests (`src/tests.rs`).
 - `tests/gq_logic_tests.rs`: one libtest test per case, named
   `case::<file>.gqt`, registered at run time by `datatest-stable`

@@ -1,0 +1,60 @@
+# issue: 631
+# red_on: 2026-09-05, stock main at 8ca9b12c: `return { $p }` gave `{"p": "alice"}`, the id string, instead of the node object.
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":null}}
+{"edge":"Knows","from":"alice","to":"bob","data":{}}
+
+--- query
+query bare_person() {
+    match { $p: Person }
+    return { $p }
+}
+
+--- expect unordered
+{"p": {"id": "alice", "name": "alice", "age": 30}}
+{"p": {"id": "bob", "name": "bob"}}
+
+--- expect shape
+p: Person
+
+--- query
+query friend_of_alice() {
+    match {
+        $p: Person { name: "alice" }
+        $p knows $f
+    }
+    return { $p.name, $f }
+}
+
+--- expect unordered
+{"p.name": "alice", "f": {"id": "bob", "name": "bob"}}
+
+--- expect shape
+p.name: String
+f: Person
+
+--- query
+query friends_per_person() {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return { $p, count($f) as friends }
+}
+
+--- expect unordered
+{"p": {"id": "alice", "name": "alice", "age": 30}, "friends": 1}
+
+--- expect shape
+p: Person
+friends: I64
