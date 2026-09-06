@@ -168,6 +168,11 @@ its own. The spellings a consumer sees:
   (`1.0e20`, `1.0e-7`); a non-finite computed value is `null`.
 - `Vector(N)` and list properties are JSON arrays.
 
+On input, a `Date` string is a calendar day, `"2024-01-01"`; a string that
+carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is refused as a
+load value, a param, or a `date(...)` literal, and an instant belongs in a
+`DateTime` property.
+
 A `Date` or `DateTime` count outside the range the writer can format is refused
 on load. A read that meets one fails with status 500; the error names the
 column, the result row, and the count, and an `update` of that row repairs it.

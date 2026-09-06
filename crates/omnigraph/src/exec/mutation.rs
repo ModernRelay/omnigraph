@@ -930,6 +930,7 @@ impl Omnigraph {
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
         let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
+        super::query::check_param_date_literals(params, &ir.params)?;
         if txn
             .catalog
             .actor_provenance()
