@@ -42,11 +42,13 @@ def source_identity():
 
 def matrix(smoke, extended, selected, history_only=False,
            cache_state="cold", manifest_layout="uncompacted", merge_tables=None,
-           io_delay_ms=0):
+           io_delay_ms=0, populated_tables=None):
     if merge_tables is not None:
-        return [{"name": f"tables{tables}-history{history}-delay{io_delay_ms}-general-merge-updates",
+        return [{"name": f"tables{tables}" + (f"-catalog{populated_tables}" if populated_tables is not None else "")
+                        + f"-history{history}-delay{io_delay_ms}-general-merge-updates",
                  "scenario": "general-merge-updates",
                  "params": {"rows": 4, "dims": 4, "seed": 42, "tables": tables,
+                            "populated_tables": populated_tables if populated_tables is not None else tables,
                             "delta_rows": 2, "target_delta_rows": 2, "source_mode": "update",
                             "io_delay_ms": io_delay_ms, "history_commits": history,
                             "retired_branches": 0, "cache_state": cache_state,
@@ -70,7 +72,7 @@ def matrix(smoke, extended, selected, history_only=False,
                       "history_commits": history, "retired_branches": retired,
                       "cache_state": cache_state, "manifest_layout": manifest_layout}
             if scenario == "general-merge-updates":
-                params.update(delta_rows=2, target_delta_rows=8, source_mode="update", tables=1, io_delay_ms=0)
+                params.update(delta_rows=2, target_delta_rows=8, source_mode="update", tables=1, populated_tables=1, io_delay_ms=0)
             else:
                 params.update(branches=branches, tables=tables)
             points.append({"name": f"{shape}-{scenario}", "scenario": scenario, "params": params})
@@ -117,7 +119,7 @@ def admit(records, point, runs, identity, binary_hash):
         require(metrics.get("prewarm_wall_us", -1) >= 0, "Missing prewarm timing")
         require(metrics.get("prewarm_branch_views") == (expected_branches if cache_state == "warm" else 0),
                 "Prewarm did not capture the requested branch views")
-        expected_tables = point["params"]["tables"]
+        expected_tables = point["params"].get("populated_tables", point["params"]["tables"])
         require(metrics.get("prewarm_table_views") == (expected_branches * expected_tables if cache_state == "warm" else 0),
                 "Prewarm did not capture the requested table views")
         layout = point["params"]["manifest_layout"]
@@ -160,12 +162,16 @@ def admit(records, point, runs, identity, binary_hash):
                     "Merge did not verify every target and source row")
             require(metrics.get("setup_table_count") == metrics.get("verified_table_count") == expected_tables,
                     "Table count was ignored or not verified")
+            touched = point["params"]["tables"]
+            require(metrics.get("setup_touched_table_count") == metrics.get("verified_touched_table_count") == touched,
+                    "Touched table count was ignored or not verified")
             require(metrics.get("setup_total_main_rows") == metrics.get("setup_total_source_rows")
                     == rows * expected_tables, "Fixture is not the requested tiny merge shape")
             tables = metrics.get("setup_tables", [])
             require(len(tables) == expected_tables
                     and len({table["type_key"] for table in tables}) == expected_tables
-                    and all(table["main_rows"] == table["source_rows"] == rows for table in tables),
+                    and all(table["main_rows"] == table["source_rows"] == rows for table in tables)
+                    and sum(table.get("touched") is True for table in tables) == touched,
                     "Missing unique per-table setup receipts")
             require(metrics.get("verified_source_head_and_pins_unchanged") is True,
                     "Source head and exact table versions were not verified")
@@ -215,6 +221,8 @@ def main():
                         help="four rows per table, two source/target edits; one/eight/29 table merges only")
     parser.add_argument("--table-count", choices=(1, 4, 8, 29), type=int, action="append",
                         help="select fewer tiny merge table counts; requires --merge-tables")
+    parser.add_argument("--populated-tables", type=int,
+                        help="fixed full catalog, touched counts stay selected by --table-count; at most121")
     parser.add_argument("--io-delay-ms", choices=(0, 17), type=int, default=0,
                         help="synthetic asynchronous ObjectStore-call delay, merge-table mode only")
     parser.add_argument("--cache-state", choices=("cold", "warm"), default="cold",
@@ -230,13 +238,15 @@ def main():
     require(not (args.history_only and (args.smoke or args.extended)), "--history-only is separate from smoke/extended")
     require(not args.merge_tables or not (args.smoke or args.extended or args.scenario),
             "--merge-tables selects its own merge-only matrix")
-    require(args.merge_tables or not (args.table_count or args.io_delay_ms),
-            "--table-count and --io-delay-ms require --merge-tables")
+    require(args.merge_tables or not (args.table_count or args.io_delay_ms or args.populated_tables is not None),
+            "--table-count, --populated-tables and --io-delay-ms require --merge-tables")
     merge_tables = list(dict.fromkeys(args.table_count or [1, 8, 29])) if args.merge_tables else None
+    require(args.populated_tables is None or max(merge_tables) <= args.populated_tables <= 121,
+            "--populated-tables must cover every touched count and be at most121")
     require(not merge_tables or (args.cache_state == "cold" and args.manifest_layout == "uncompacted")
-            or max(merge_tables) <= 8, "Warm/compacted controls support at most eight tables")
+            or (args.populated_tables or max(merge_tables)) <= 8, "Warm/compacted controls support at most eight populated tables")
     points = matrix(args.smoke, args.extended, list(dict.fromkeys(args.scenario or SCENARIOS)),
-                    args.history_only, args.cache_state, args.manifest_layout, merge_tables, args.io_delay_ms)
+                    args.history_only, args.cache_state, args.manifest_layout, merge_tables, args.io_delay_ms, args.populated_tables)
     if args.plan:
         print(json.dumps(points, indent=2))
         return

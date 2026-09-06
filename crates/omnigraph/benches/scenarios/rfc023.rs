@@ -42,6 +42,9 @@ const SMALL_UPSERT_ROWS: usize = 32;
 
 /// Age is setup work for these two existing fixture families only.
 pub(super) fn validate_fixture_age(args: &Args) -> Result<(), String> {
+    if args.populated_tables.is_some() && args.scenario != "general-merge-updates" {
+        return Err("--populated-tables requires general-merge-updates".into());
+    }
     if args.scenario != "general-merge-updates" && args.io_delay_ms != 0 {
         return Err("--io-delay-ms requires general-merge-updates".into());
     }
@@ -60,7 +63,7 @@ pub(super) fn validate_fixture_age(args: &Args) -> Result<(), String> {
     }
     rfc023_limits::validate_view_controls(&args.cache_state, &args.manifest_layout)?;
     if (args.cache_state == "warm" || args.manifest_layout == "compacted")
-        && (args.rows > 256 || args.dims > 16 || args.branches > 8 || args.tables > 8)
+        && (args.rows > 256 || args.dims > 16 || args.branches > 8 || args.populated_tables() > 8)
     {
         return Err(
             "warm/compacted controls require rows <= 256, dims <= 16, branches/tables <= 8".into(),
@@ -99,6 +102,7 @@ pub(super) fn validate_args(args: &Args) -> Result<(), String> {
             rfc023_limits::derive_chunk_plan(args.dims, "base", args.rows)?;
             rfc023_limits::validate_merge_table_shape(
                 args.tables,
+                args.populated_tables(),
                 args.rows,
                 args.dims,
                 args.delta_rows,
@@ -1650,7 +1654,7 @@ fn general_merge_node(table: usize) -> String {
 }
 
 fn general_merge_schema(args: &Args) -> String {
-    (0..args.tables)
+    (0..args.populated_tables())
         .map(|table| {
             let node = general_merge_node(table);
             format!(
@@ -1662,13 +1666,13 @@ fn general_merge_schema(args: &Args) -> String {
 }
 
 fn general_merge_jsonl_chunk(
-    args: &Args,
+    tables: usize,
     prefix: &str,
     start: usize,
     end: usize,
     patterns: &[String],
 ) -> String {
-    (0..args.tables)
+    (0..tables)
         .map(|table| {
             named_graph_jsonl_chunk(&general_merge_node(table), prefix, start, end, patterns)
         })
@@ -1765,7 +1769,8 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let mut max_target_json_chunk_bytes = 0_u64;
     for start in (0..args.rows).step_by(batch_rows) {
         let end = (start + batch_rows).min(args.rows);
-        let jsonl = general_merge_jsonl_chunk(args, "base", start, end, &target_vectors);
+        let jsonl =
+            general_merge_jsonl_chunk(args.populated_tables(), "base", start, end, &target_vectors);
         max_target_json_chunk_bytes = max_target_json_chunk_bytes.max(jsonl.len() as u64);
         let loaded = db
             .load(
@@ -1781,7 +1786,7 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
             .expect("load general merge base tables");
         assert_eq!(
             loaded.nodes_loaded.values().sum::<usize>(),
-            (end - start) * args.tables
+            (end - start) * args.populated_tables()
         );
     }
     let target_load_ms = target_start.elapsed().as_millis() as u64;
@@ -1807,7 +1812,8 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let mut max_source_json_chunk_bytes = 0_u64;
     while cursor < args.delta_rows {
         let end = cursor.saturating_add(batch_rows).min(args.delta_rows);
-        let jsonl = general_merge_jsonl_chunk(args, source_prefix, cursor, end, &source_vectors);
+        let jsonl =
+            general_merge_jsonl_chunk(args.tables, source_prefix, cursor, end, &source_vectors);
         max_source_json_chunk_bytes = max_source_json_chunk_bytes.max(jsonl.len() as u64);
         let mode = if inserting {
             LoadMode::Append
@@ -1833,7 +1839,8 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let diverge_start = Instant::now();
     for start in (target_divergence_start..args.rows).step_by(batch_rows) {
         let end = start.saturating_add(batch_rows).min(args.rows);
-        let diverge_jsonl = general_merge_jsonl_chunk(args, "base", start, end, &diverge_vectors);
+        let diverge_jsonl =
+            general_merge_jsonl_chunk(args.tables, "base", start, end, &diverge_vectors);
         db.load("main", &diverge_jsonl, LoadMode::Merge)
             .await
             .expect("advance main after the branch forked");
@@ -1879,27 +1886,33 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let setup_source_dataset_version = source_table.published_dataset_version();
     assert_eq!(
         main_snapshot.datasets().count(),
-        args.tables,
+        args.populated_tables(),
         "unexpected main table catalog"
     );
     assert_eq!(
         source_snapshot.datasets().count(),
-        args.tables,
+        args.populated_tables(),
         "unexpected source table catalog"
     );
-    let mut setup_tables = Vec::with_capacity(args.tables);
-    for index in 0..args.tables {
+    let mut setup_tables = Vec::with_capacity(args.populated_tables());
+    for index in 0..args.populated_tables() {
         let type_key = format!("node:{}", general_merge_node(index));
         let main = main_snapshot.open_dataset(&type_key).await.unwrap();
         let source = source_snapshot.open_dataset(&type_key).await.unwrap();
         assert_eq!(main.count_rows(None).await.unwrap(), args.rows);
-        assert_eq!(source.count_rows(None).await.unwrap(), expected_source_rows);
+        let source_rows = if index < args.tables {
+            expected_source_rows
+        } else {
+            args.rows
+        };
+        assert_eq!(source.count_rows(None).await.unwrap(), source_rows);
         setup_tables.push(serde_json::json!({
             "type_key": type_key,
             "main_version": main.published_dataset_version(),
             "source_version": source.published_dataset_version(),
             "main_rows": args.rows,
-            "source_rows": expected_source_rows,
+            "source_rows": source_rows,
+            "touched": index < args.tables,
         }));
     }
     let source_receipt = general_merge_source_receipt(&db, &source_snapshot).await;
@@ -1911,8 +1924,8 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let setup_verify_ms = verify_start.elapsed().as_millis() as u64;
 
     let setup_fingerprint = format!(
-        "general-merge-updates-v4:mode={}:rows={}:delta={}:target_delta={}:dims={}:seed={}:\
-         main-v{}-rows{}:source-v{}-rows{}:history={}:retired={}:tables={}",
+        "general-merge-updates-v5:mode={}:rows={}:delta={}:target_delta={}:dims={}:seed={}:\
+         main-v{}-rows{}:source-v{}-rows{}:history={}:retired={}:tables={}:populated={}",
         args.source_mode,
         args.rows,
         args.delta_rows,
@@ -1926,6 +1939,7 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         args.history_commits,
         args.retired_branches,
         args.tables,
+        args.populated_tables(),
     );
 
     let mut metrics = serde_json::json!({
@@ -1933,9 +1947,10 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         "dims": args.dims,
         "delta_rows": args.delta_rows,
         "target_delta_rows": args.target_delta_rows,
-        "setup_table_count": args.tables,
-        "setup_total_main_rows": args.rows * args.tables,
-        "setup_total_source_rows": expected_source_rows * args.tables,
+        "setup_table_count": args.populated_tables(),
+        "setup_touched_table_count": args.tables,
+        "setup_total_main_rows": args.rows * args.populated_tables(),
+        "setup_total_source_rows": args.rows * args.populated_tables() + if inserting { args.delta_rows * args.tables } else { 0 },
         "setup_tables": setup_tables,
         "source_mode": args.source_mode,
         "source_transaction_count": source_transaction_count,
@@ -2190,8 +2205,13 @@ async fn verify_fixture_row(
 
 /// Age experiments use small fixtures, but verify every row in bounded batches
 /// so a restored representative cannot hide unrelated data loss or source drift.
-async fn verify_general_all_rows(table: &SnapshotDataset, args: &Args, merged_main: bool) -> usize {
-    let inserting = args.source_mode == "insert";
+async fn verify_general_all_rows(
+    table: &SnapshotDataset,
+    args: &Args,
+    merged_main: bool,
+    touched: bool,
+) -> usize {
+    let inserting = touched && args.source_mode == "insert";
     let expected = args.rows + if inserting { args.delta_rows } else { 0 };
     let mut seen = vec![false; expected];
     let mut scanner = table.scan();
@@ -2237,13 +2257,14 @@ async fn verify_general_all_rows(table: &SnapshotDataset, args: &Args, merged_ma
             let (prefix, ordinal, slot, seed) = if let Some(suffix) = id.strip_prefix("base-") {
                 let ordinal = suffix.parse::<usize>().expect("base row ordinal");
                 assert!(ordinal < args.rows, "unexpected base ID {id}");
-                let seed = if merged_main && ordinal >= args.rows - args.target_delta_rows {
-                    args.seed ^ 0x0230_0385
-                } else if !inserting && ordinal < args.delta_rows {
-                    args.seed ^ 0x0230_0384
-                } else {
-                    args.seed
-                };
+                let seed =
+                    if touched && merged_main && ordinal >= args.rows - args.target_delta_rows {
+                        args.seed ^ 0x0230_0385
+                    } else if touched && !inserting && ordinal < args.delta_rows {
+                        args.seed ^ 0x0230_0384
+                    } else {
+                        args.seed
+                    };
                 ("base", ordinal, ordinal, seed)
             } else {
                 assert!(inserting, "unexpected inserted ID {id}");
@@ -2344,24 +2365,25 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
     );
     assert_eq!(
         snapshot.datasets().count(),
-        args.tables,
+        args.populated_tables(),
         "merged main catalog changed"
     );
     assert_eq!(
         source_snapshot.datasets().count(),
-        args.tables,
+        args.populated_tables(),
         "merge source catalog changed"
     );
     let (verified_complete_main_rows, verified_complete_source_rows) =
         if args.rows <= 256 || args.history_commits > 0 || args.retired_branches > 0 {
             let mut main_rows = 0;
             let mut source_rows = 0;
-            for index in 0..args.tables {
+            for index in 0..args.populated_tables() {
                 let type_key = format!("node:{}", general_merge_node(index));
                 let table = snapshot.open_dataset(&type_key).await.unwrap();
                 let source_table = source_snapshot.open_dataset(&type_key).await.unwrap();
-                main_rows += verify_general_all_rows(&table, args, true).await;
-                source_rows += verify_general_all_rows(&source_table, args, false).await;
+                let touched = index < args.tables;
+                main_rows += verify_general_all_rows(&table, args, true, touched).await;
+                source_rows += verify_general_all_rows(&source_table, args, false, touched).await;
             }
             (Some(main_rows), Some(source_rows))
         } else {
@@ -2372,7 +2394,8 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
     serde_json::json!({
         "verify_wall_ms": verify_wall_ms,
         "final_rows": final_rows,
-        "verified_table_count": args.tables,
+        "verified_table_count": args.populated_tables(),
+        "verified_touched_table_count": args.tables,
         "verified_source_head_and_pins_unchanged": true,
         "verified_complete_main_rows": verified_complete_main_rows,
         "verified_complete_source_rows": verified_complete_source_rows,

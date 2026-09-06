@@ -417,12 +417,20 @@ fn general_update_reports_completed_classifiers_and_keeps_update_semantics() {
         verify
             .contains("args.rows <= 256 || args.history_commits > 0 || args.retired_branches > 0")
     );
-    assert!(verify.contains("verify_general_all_rows(&table, args, true)"));
-    assert!(verify.contains("verify_general_all_rows(&source_table, args, false)"));
-    assert!(verify.contains("for index in 0..args.tables"));
+    assert!(verify.contains("verify_general_all_rows(&table, args, true, touched)"));
+    assert!(verify.contains("verify_general_all_rows(&source_table, args, false, touched)"));
+    assert!(verify.contains("for index in 0..args.populated_tables()"));
+    assert!(verify.contains("let touched = index < args.tables"));
+    assert!(
+        setup
+            .split_whitespace()
+            .collect::<String>()
+            .contains("general_merge_jsonl_chunk(args.populated_tables(),\"base\",")
+    );
     assert!(verify.contains("merge changed the source head or exact table pins"));
     for field in [
         "setup_table_count",
+        "setup_touched_table_count",
         "setup_total_main_rows",
         "setup_total_source_rows",
         "setup_tables",
@@ -548,9 +556,9 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     assert!(aging.contains("args.history_commits > 256"));
     assert!(aging.contains("!args.history_commits.is_multiple_of(2)"));
     assert!(aging.contains("args.retired_branches > 32"));
-    assert!(
-        aging.contains("args.rows > 256 || args.dims > 16 || args.branches > 8 || args.tables > 8")
-    );
+    assert!(aging.contains(
+        "args.rows > 256 || args.dims > 16 || args.branches > 8 || args.populated_tables() > 8"
+    ));
     let age = aging
         .split_once("pub(super) async fn age_fixture")
         .unwrap()

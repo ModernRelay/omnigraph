@@ -130,9 +130,12 @@ struct Args {
     source_mode: String,
     /// Existing sibling branches (excluding main and a deletion victim).
     branches: usize,
-    /// Populated tables: branch controls use small scalar companions; general
-    /// merge uses equally sized vector tables and defaults to one.
+    /// Branch controls count populated tables with small scalar companions;
+    /// general merge counts touched vector tables and defaults to one.
     tables: usize,
+    /// Optional complete populated catalog for general merge; `tables` counts
+    /// touched types, and omitted means every populated type is touched.
+    populated_tables: Option<usize>,
     /// Extra paired main commits before any scenario branches are created.
     history_commits: usize,
     /// Temporary branches written once, deleted, and fully reclaimed in setup.
@@ -182,6 +185,7 @@ impl Args {
             source_mode: "update".to_string(),
             branches: 8,
             tables: 4,
+            populated_tables: None,
             history_commits: 0,
             retired_branches: 0,
             cache_state: "cold".into(),
@@ -238,6 +242,13 @@ impl Args {
                     args.tables = take("--tables").parse().expect("--tables");
                     tables_supplied = true;
                 }
+                "--populated-tables" => {
+                    args.populated_tables = Some(
+                        take("--populated-tables")
+                            .parse()
+                            .expect("--populated-tables"),
+                    );
+                }
                 "--history-commits" => {
                     args.history_commits = take("--history-commits")
                         .parse()
@@ -275,6 +286,10 @@ impl Args {
             args.tables = 1;
         }
         args
+    }
+
+    fn populated_tables(&self) -> usize {
+        self.populated_tables.unwrap_or(self.tables)
     }
 
     fn to_child_argv(&self) -> Vec<String> {
@@ -326,6 +341,9 @@ impl Args {
         if self.baseline {
             v.push("--baseline".into());
         }
+        if let Some(populated) = self.populated_tables {
+            v.extend(["--populated-tables".into(), populated.to_string()]);
+        }
         if let Some(cap) = self.memory_cap_mb {
             v.push("--memory-cap-mb".into());
             v.push(cap.to_string());
@@ -360,7 +378,7 @@ fn main() {
              fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|rrf-gate> [--rows N] [--dims D] \
              [--seed S] [--runs K] [--selectivity F] [--k K] [--ann-partitions N] \
              [--ann-probes N] [--text-bytes B] [--delta-rows N] [--target-delta-rows N] [--io-delay-ms N (0..100)] \
-             [--source-mode update|insert] [--branches N] [--tables N] [--memory-cap-mb M] \
+             [--source-mode update|insert] [--branches N] [--tables N] [--populated-tables N (merge, at most 121)] [--memory-cap-mb M] \
              [--history-commits N (even, 0..256)] [--retired-branches N (0..32)]\n\
              [--cache-state cold|warm] [--manifest-layout uncompacted|compacted]\n\
              Age flags apply only to branch controls and general-merge-updates."
@@ -796,6 +814,7 @@ fn run_phased_adopt_once(args: &Args, run: usize) -> serde_json::Value {
             "source_mode": args.source_mode,
             "branches": args.branches,
             "tables": args.tables,
+            "populated_tables": args.populated_tables(),
             "history_commits": args.history_commits,
             "retired_branches": args.retired_branches,
             "cache_state": args.cache_state,
