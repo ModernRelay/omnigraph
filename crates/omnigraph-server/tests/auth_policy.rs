@@ -113,6 +113,63 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     let (_, commits) = json_response(&app, get_request(&g("/commits?branch=main"), &write)).await;
     assert_eq!(commits["commits"][0]["actor_id"], tokens.actor);
     assert_ne!(commits, before);
+    let (_, before_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
+    let other_graph_create = tokens.token(json!([
+        {"graph_id":"default","actions":["read"]},
+        {"graph_id":"reports","actions":["branch_create"]}
+    ]));
+    for token in [&read, &wider, &other_graph_create] {
+        let (status, body) = json_response(
+            &app,
+            statement_request("/mutate", token, "branch create signed_branch"),
+        )
+        .await;
+        assert_forbidden(
+            status,
+            body,
+            "branch statements retain the selected graph's action ceiling",
+        );
+    }
+    let (_, after_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
+    assert_eq!(
+        after_branches, before_branches,
+        "denied branch statements have no effect"
+    );
+
+    let create = tokens.token(json!([{"graph_id":"default","actions":["branch_create"]}]));
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", &create, "branch create signed_branch"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["actor_id"], tokens.actor);
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", &create, "branch delete signed_branch"),
+    )
+    .await;
+    assert_forbidden(
+        status,
+        body,
+        "branch creation authority cannot delete a branch",
+    );
+    let (status, body) =
+        json_response(&app, statement_request("/query", &read, "branch list")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"],
+        json!([{"name":"main"},{"name":"signed_branch"}])
+    );
+
+    let mut hidden = statement_request("/query", &read, "branch list");
+    *hidden.uri_mut() = "/graphs/hidden/query".parse().unwrap();
+    let (status, body) = json_response(&app, hidden).await;
+    assert_forbidden(
+        status,
+        body,
+        "branch list cannot probe a graph outside the signed grant",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
