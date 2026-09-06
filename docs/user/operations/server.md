@@ -129,6 +129,10 @@ seconds after its final issuance before removing it with another restart.
 | `/graphs/{id}/schema` | Show the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
 
+`POST /query` and `POST /mutate` also serve the GQ branch statements:
+`branch list` on `/query`, and `branch create`, `branch delete`, and
+`branch merge` on `/mutate`. See [Branching](../branching/index.md).
+
 `/read`, `/change`, and `/ingest` are deprecated compatibility routes. New
 clients should use `/query`, `/mutate`, and `/load`.
 

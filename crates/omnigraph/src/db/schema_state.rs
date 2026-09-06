@@ -60,6 +60,11 @@ pub(crate) async fn refuse_unsupported_schema_versions(
     Ok(())
 }
 
+const MISSING_SCHEMA_CONTRACT_MESSAGE: &str = "graph is missing the mandatory identity-bearing schema contract (_schema.ir.json and __schema_state.json); automatic bootstrap is not supported";
+const INCOMPLETE_SCHEMA_CONTRACT_MESSAGE: &str = "graph schema contract is incomplete: _schema.ir.json and __schema_state.json must both be present";
+const INVALID_SCHEMA_IR_SUBJECT: &str = "accepted compiled schema contract";
+const INVALID_SCHEMA_STATE_SUBJECT: &str = "graph schema state";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SchemaState {
     pub(crate) format_version: u32,
@@ -102,8 +107,8 @@ pub(crate) async fn load_validated_schema_contract(
     root_uri: &str,
     storage: Arc<dyn StorageAdapter>,
 ) -> Result<(SchemaIR, SchemaState)> {
-    let source = storage.read_text(&schema_source_uri(root_uri)).await?;
-    load_validated_schema_contract_for_source(root_uri, storage, &source).await
+    let text = read_schema_contract_text(root_uri, storage.as_ref()).await?;
+    validate_schema_contract_text(&text)
 }
 
 /// Validate the complete durable schema contract against source bytes already
@@ -115,24 +120,83 @@ pub(crate) async fn load_validated_schema_contract_for_source(
     storage: Arc<dyn StorageAdapter>,
     source: &str,
 ) -> Result<(SchemaIR, SchemaState)> {
-    let current_source_shape = compile_schema_source(source)?;
-    let (persisted_ir, state) = match read_schema_contract(root_uri, storage.as_ref()).await? {
-        SchemaContractRead::Present { ir, state } => (ir, state),
+    let text = read_schema_contract_text_for_source(root_uri, storage.as_ref(), source.to_string())
+        .await?;
+    validate_schema_contract_text(&text)
+}
+
+/// The three durable schema-contract files as read, byte-exact. Memo key of
+/// `ReadCaches::accepted_catalog` (see `AcceptedCatalogMemo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchemaContractText {
+    pub(crate) source: String,
+    pub(crate) ir_json: String,
+    pub(crate) state_json: String,
+}
+
+/// Read the schema contract's bytes: three `read_text` and two `exists` calls
+/// (the per-query drift detection the lifecycle tests pin). A missing or
+/// incomplete contract reports an unparseable source first; a storage error
+/// from the existence probes is reported before a parse error, and so is a
+/// failing IR or state read on the present-contract path.
+pub(crate) async fn read_schema_contract_text(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<SchemaContractText> {
+    let source = storage.read_text(&schema_source_uri(root_uri)).await?;
+    read_schema_contract_text_for_source(root_uri, storage, source).await
+}
+
+/// [`read_schema_contract_text`] over a source already read under the root
+/// schema gate.
+pub(crate) async fn read_schema_contract_text_for_source(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    source: String,
+) -> Result<SchemaContractText> {
+    match read_schema_contract(root_uri, storage).await? {
+        SchemaContractRead::Present {
+            ir_json,
+            state_json,
+        } => Ok(SchemaContractText {
+            source,
+            ir_json,
+            state_json,
+        }),
         SchemaContractRead::MissingAll => {
-            return Err(schema_lock_conflict(
-                "graph is missing the mandatory identity-bearing schema contract (_schema.ir.json and __schema_state.json); automatic bootstrap is not supported",
-            ));
+            compile_schema_source(&source)?;
+            Err(schema_lock_conflict(MISSING_SCHEMA_CONTRACT_MESSAGE))
         }
         SchemaContractRead::PartialMissing => {
-            return Err(schema_lock_conflict(
-                "graph schema contract is incomplete: _schema.ir.json and __schema_state.json must both be present",
-            ));
+            compile_schema_source(&source)?;
+            Err(schema_lock_conflict(INCOMPLETE_SCHEMA_CONTRACT_MESSAGE))
         }
-    };
+    }
+}
 
-    validate_persisted_schema_contract(&persisted_ir, &state)?;
+/// Validate contract bytes: source compiled, IR and state parsed, IR checked
+/// against the state, source shape checked against the state.
+pub(crate) fn validate_schema_contract_text(
+    text: &SchemaContractText,
+) -> Result<(SchemaIR, SchemaState)> {
+    let current_source_shape = compile_schema_source(&text.source)?;
+    let (ir, state) = parse_schema_contract(&text.ir_json, &text.state_json)?;
+    validate_persisted_schema_contract(&ir, &state)?;
     validate_current_source_matches(&state, &current_source_shape)?;
-    Ok((persisted_ir, state))
+    Ok((ir, state))
+}
+
+fn parse_schema_contract(ir_json: &str, state_json: &str) -> Result<(SchemaIR, SchemaState)> {
+    let ir = serde_json::from_str::<SchemaIR>(ir_json)
+        .map_err(|err| invalid_contract_file(INVALID_SCHEMA_IR_SUBJECT, SCHEMA_IR_FILENAME, err))?;
+    let state = serde_json::from_str::<SchemaState>(state_json).map_err(|err| {
+        invalid_contract_file(INVALID_SCHEMA_STATE_SUBJECT, SCHEMA_STATE_FILENAME, err)
+    })?;
+    Ok((ir, state))
+}
+
+fn invalid_contract_file(subject: &str, file: &str, err: impl std::fmt::Display) -> OmniError {
+    schema_lock_conflict(format!("{subject} in {file} is invalid: {err}"))
 }
 
 /// Read only the durable schema-identity marker. Schema apply promotes this
@@ -146,25 +210,39 @@ pub(crate) async fn read_schema_state_identity(
 ) -> Result<SchemaState> {
     let text = storage.read_text(&schema_state_uri(root_uri)).await?;
     let state = serde_json::from_str::<SchemaState>(&text).map_err(|err| {
-        schema_lock_conflict(format!(
-            "graph schema state in {} is invalid: {}",
-            SCHEMA_STATE_FILENAME, err
-        ))
+        invalid_contract_file(INVALID_SCHEMA_STATE_SUBJECT, SCHEMA_STATE_FILENAME, err)
     })?;
     validate_schema_state_envelope(&state)?;
     Ok(state)
 }
 
+/// The IR and state JSON of `schema_ir` as the contract writers put them on
+/// the object store, with the state they encode.
+pub(crate) fn render_schema_contract(
+    schema_ir: &SchemaIR,
+) -> Result<(SchemaState, String, String)> {
+    let ir_json = schema_ir_pretty_json(schema_ir)
+        .map_err(|err| OmniError::manifest_internal(err.to_string()))?;
+    let state = SchemaState::from_ir(schema_ir)?;
+    let state_json = serde_json::to_string_pretty(&state).map_err(|err| {
+        OmniError::manifest_internal(format!("serialize schema state error: {}", err))
+    })?;
+    Ok((state, ir_json, state_json))
+}
+
+/// Write the IR and state of an already-rendered contract to their final
+/// filenames; init keeps the same text to seed its accepted-catalog memo.
 pub(crate) async fn write_schema_contract(
     root_uri: &str,
     storage: &dyn StorageAdapter,
-    schema_ir: &SchemaIR,
-) -> Result<SchemaState> {
+    contract: &SchemaContractText,
+) -> Result<()> {
     write_schema_contract_to(
         storage,
         &schema_ir_uri(root_uri),
         &schema_state_uri(root_uri),
-        schema_ir,
+        &contract.ir_json,
+        &contract.state_json,
     )
     .await
 }
@@ -177,31 +255,27 @@ pub(crate) async fn write_schema_contract_staging(
     storage: &dyn StorageAdapter,
     schema_ir: &SchemaIR,
 ) -> Result<SchemaState> {
+    let (state, ir_json, state_json) = render_schema_contract(schema_ir)?;
     write_schema_contract_to(
         storage,
         &schema_ir_staging_uri(root_uri),
         &schema_state_staging_uri(root_uri),
-        schema_ir,
+        &ir_json,
+        &state_json,
     )
-    .await
+    .await?;
+    Ok(state)
 }
 
 async fn write_schema_contract_to(
     storage: &dyn StorageAdapter,
     ir_uri: &str,
     state_uri: &str,
-    schema_ir: &SchemaIR,
-) -> Result<SchemaState> {
-    let ir_json = schema_ir_pretty_json(schema_ir)
-        .map_err(|err| OmniError::manifest_internal(err.to_string()))?;
-    let state = SchemaState::from_ir(schema_ir)?;
-    let state_json = serde_json::to_string_pretty(&state).map_err(|err| {
-        OmniError::manifest_internal(format!("serialize schema state error: {}", err))
-    })?;
-
-    storage.write_text(ir_uri, &ir_json).await?;
-    storage.write_text(state_uri, &state_json).await?;
-    Ok(state)
+    ir_json: &str,
+    state_json: &str,
+) -> Result<()> {
+    storage.write_text(ir_uri, ir_json).await?;
+    storage.write_text(state_uri, state_json).await
 }
 
 pub(crate) async fn read_accepted_schema_ir(
@@ -209,7 +283,11 @@ pub(crate) async fn read_accepted_schema_ir(
     storage: Arc<dyn StorageAdapter>,
 ) -> Result<SchemaIR> {
     match read_schema_contract(root_uri, storage.as_ref()).await? {
-        SchemaContractRead::Present { ir, state } => {
+        SchemaContractRead::Present {
+            ir_json,
+            state_json,
+        } => {
+            let (ir, state) = parse_schema_contract(&ir_json, &state_json)?;
             validate_persisted_schema_contract(&ir, &state)?;
             Ok(ir)
         }
@@ -355,7 +433,7 @@ pub(crate) fn schema_state_staging_uri(root_uri: &str) -> String {
 }
 
 enum SchemaContractRead {
-    Present { ir: SchemaIR, state: SchemaState },
+    Present { ir_json: String, state_json: String },
     MissingAll,
     PartialMissing,
 }
@@ -374,19 +452,10 @@ async fn read_schema_contract(
         (true, true) => {
             let ir_json = storage.read_text(&ir_uri).await?;
             let state_json = storage.read_text(&state_uri).await?;
-            let ir = serde_json::from_str::<SchemaIR>(&ir_json).map_err(|err| {
-                schema_lock_conflict(format!(
-                    "accepted compiled schema contract in {} is invalid: {}",
-                    SCHEMA_IR_FILENAME, err
-                ))
-            })?;
-            let state = serde_json::from_str::<SchemaState>(&state_json).map_err(|err| {
-                schema_lock_conflict(format!(
-                    "graph schema state in {} is invalid: {}",
-                    SCHEMA_STATE_FILENAME, err
-                ))
-            })?;
-            Ok(SchemaContractRead::Present { ir, state })
+            Ok(SchemaContractRead::Present {
+                ir_json,
+                state_json,
+            })
         }
         _ => Ok(SchemaContractRead::PartialMissing),
     }

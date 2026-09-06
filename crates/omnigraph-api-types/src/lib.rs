@@ -33,6 +33,40 @@ pub const SNAPSHOT_ID_HEADER: &str = "omnigraph-snapshot-id";
 /// Response header carrying `ReadOutput.graph_commit_id` beside an Arrow IPC body.
 pub const GRAPH_COMMIT_ID_HEADER: &str = "omnigraph-graph-commit-id";
 
+/// The refusal texts a branch statement can answer with, shared by the server
+/// handlers and the CLI so the two fronts cannot drift apart. The server's HTTP
+/// tests and the CLI's tests keep literal copies as the pins.
+pub mod branch_statement_refusals {
+    /// A control write sent to a read door. `{statement}` is the statement's
+    /// two keywords.
+    pub const CONTROL_WRITE_AT_READ_DOOR: &str =
+        "statement '{statement}' is a control write; use POST /mutate";
+    /// A read sent to a write door. `{statement}` is the statement's two
+    /// keywords.
+    pub const READ_AT_WRITE_DOOR: &str = "statement '{statement}' is a read; use POST /query";
+    /// A request target (branch or snapshot) beside a statement.
+    pub const REQUEST_TARGET: &str =
+        "a branch statement names its branches itself; drop the request target";
+    /// A query name or parameters beside a statement.
+    pub const NAME_OR_PARAMS: &str = "a branch statement takes no name and no parameters";
+    /// An expected head beside a statement.
+    pub const COMMIT_PRECONDITION: &str = "a branch statement takes no commit precondition";
+    /// Any statement sent to a deprecated route.
+    pub const DEPRECATED_ROUTE: &str =
+        "branch statements are not served on deprecated routes; use POST /mutate or POST /query";
+
+    /// Fill the `{statement}` placeholder of the two door refusals.
+    pub fn with_statement(template: &str, statement: &str) -> String {
+        template.replace("{statement}", statement)
+    }
+}
+
+/// The refusal both fronts answer for a source that holds no declaration.
+pub mod query_file_refusals {
+    /// An empty or declaration-less source, from which no query can be picked.
+    pub const NO_QUERY: &str = "query file contains no query";
+}
+
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
 #[derive(ToSchema)]
 #[schema(as = LoadMode)]
@@ -325,14 +359,49 @@ impl From<ReadOutput> for LegacyReadOutput {
     }
 }
 
+/// The effect of a branch statement sent to `POST /mutate`, tagged by `kind`.
+/// A merge conflict has no kind: it is the 409 `POST /branches/merge` answers.
+/// The statement grammar is `BranchStmt` in `omnigraph-compiler`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BranchOutcomeOutput {
+    /// `name` was forked off `from`.
+    Created { from: String, name: String },
+    /// `name` was removed.
+    Deleted { name: String },
+    /// `source` was merged into `target`; `merge` is the three-way result,
+    /// one of `already_up_to_date`, `fast_forward`, `merged`.
+    Merged {
+        source: String,
+        target: String,
+        merge: BranchMergeOutcome,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeOutput {
+    /// The branch that received the effect. For a branch statement: the
+    /// created branch, the deleted branch (gone by the time this is read),
+    /// or the merge target.
     pub branch: String,
+    /// The declared mutation's name, or a branch statement's two keywords
+    /// (`branch create`, `branch delete`, `branch merge`).
     pub query_name: String,
+    /// Nodes the mutation touched. Not reported for a branch statement,
+    /// which moves refs, not nodes or edges: `0` whenever `outcome` is present.
     pub affected_nodes: usize,
+    /// Edges the mutation touched, under the `affected_nodes` rule.
     pub affected_edges: usize,
     pub actor_id: Option<String>,
+    /// The commit this write published, if any. For a branch statement: the
+    /// target's head, read after the merge released its gates, so under a
+    /// concurrent writer it may name a later commit than the merge published.
+    /// `null` for `created`, `deleted`, and `already_up_to_date`, which publish
+    /// nothing, and `null` when that head read fails.
     pub commit: Option<CommitOutput>,
+    /// Present only when the request was a branch statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<BranchOutcomeOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -666,7 +735,9 @@ pub struct QueryRequest {
     /// GQ read-query source. May declare one or more named queries; pick one
     /// with `name` when more than one is declared. Mutations
     /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
-    /// deprecated alias `POST /change`) instead.
+    /// deprecated alias `POST /change`) instead. May instead be the branch
+    /// statement `branch list`, sent with no `name`, `params`, `branch`, or
+    /// `snapshot`.
     #[schema(
         example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
     )]
@@ -817,7 +888,9 @@ impl BlobStatOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeRequest {
     /// GQ mutation source containing `insert`, `update`, or `delete` statements.
-    /// May declare multiple named mutations; pick one with `name`.
+    /// May declare multiple named mutations; pick one with `name`. May instead
+    /// be one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),
+    /// sent with no `name`, `params`, or `branch`.
     ///
     /// Accepts the legacy field name `query_source` as a deserialization alias.
     #[schema(
@@ -1532,6 +1605,28 @@ pub fn read_output(
         columns,
         rows,
         graph_commit_id,
+    })
+}
+
+/// The `branch list` answer: one `{"name": ..}` row per branch in the order
+/// given, column `name`, no target and no graph commit (the statement reads
+/// the ref list, not a branch).
+pub fn branch_list_read_output(branches: &[String]) -> Result<ReadOutput, serde_json::Error> {
+    #[derive(Serialize)]
+    struct Row<'a> {
+        name: &'a str,
+    }
+    let rows = branches.iter().map(|name| Row { name }).collect::<Vec<_>>();
+    Ok(ReadOutput {
+        query_name: "branch list".to_string(),
+        target: ReadTargetOutput {
+            branch: None,
+            snapshot: None,
+        },
+        row_count: branches.len(),
+        columns: vec!["name".to_string()],
+        rows: serde_json::value::to_raw_value(&rows)?,
+        graph_commit_id: None,
     })
 }
 

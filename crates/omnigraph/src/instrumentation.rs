@@ -261,6 +261,16 @@ pub struct QueryIoProbes {
     /// scan. Lets a test pin that a pruned search scan reads only its needed
     /// columns and names Lance's scoring column explicitly.
     pub node_scan_projections: Arc<Mutex<Vec<Option<Vec<String>>>>>,
+    /// Misses of `ReadCaches::accepted_catalog`, counted in
+    /// `Omnigraph::build_accepted_catalog_with_schema_gate_held`.
+    pub catalog_builds: Arc<AtomicU64>,
+    /// Misses of `ReadCaches::compiled_queries`, counted in
+    /// `Omnigraph::compile_named_query`.
+    pub query_compiles: Arc<AtomicU64>,
+    /// Full-text validations entered (`TableStore::validate_full_text_demand`):
+    /// scans with a full-text query, a SQL-string filter, or a `contains_tokens`
+    /// demand in a typed filter; other scans record nothing.
+    pub fts_validations: Arc<AtomicU64>,
 }
 
 /// The two candidate plans of the rrf prefilter gate. Over FTS-index-covered
@@ -757,6 +767,21 @@ pub(crate) fn record_ann_prefilter_verdict(verdict: RrfGateVerdict) {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(verdict);
     });
+}
+
+/// Probe-only: one accepted-catalog build (a memo miss).
+pub(crate) fn record_catalog_build() {
+    let _ = current(|p| p.catalog_builds.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Probe-only: one named-query compilation (a compiled-query cache miss).
+pub(crate) fn record_query_compile() {
+    let _ = current(|p| p.query_compiles.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Probe-only: one full-text validation entered by a scan.
+pub(crate) fn record_fts_validation() {
+    let _ = current(|p| p.fts_validations.fetch_add(1, Ordering::Relaxed));
 }
 
 /// Record `commits` walked into a change-feed poll's first-parent chain. No-op

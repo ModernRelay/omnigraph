@@ -2293,6 +2293,29 @@ fn read_requires_name_for_multi_query_files() {
     assert!(stderr.contains("multiple queries"));
 }
 
+/// A `--query` file holding no declaration is refused by count; an empty
+/// `-e` is caught earlier by `--query-string must not be empty`.
+#[test]
+fn read_refuses_an_empty_source_as_no_query() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let empty_query = temp.path().join("empty.gq");
+    fs::write(&empty_query, b"").unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("read")
+            .arg("--store")
+            .arg(&graph)
+            .arg("--query")
+            .arg(&empty_query),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("query file contains no query"), "{stderr}");
+    assert!(!stderr.contains("multiple queries"), "{stderr}");
+}
+
 #[test]
 fn read_supports_inline_query_string() {
     let temp = tempdir().unwrap();

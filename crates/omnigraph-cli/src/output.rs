@@ -876,11 +876,24 @@ pub(crate) fn print_read_output(output: &ReadOutput, format: ReadOutputFormat) -
     Ok(())
 }
 
+/// A branch statement's `ChangeOutput` prints the line its `branch` verb
+/// prints; a mutation's prints the affected counts.
 pub(crate) fn print_change_human(output: &ChangeOutput) {
-    println!(
-        "changed {} via {}: {} nodes, {} edges",
-        output.branch, output.query_name, output.affected_nodes, output.affected_edges
-    );
+    match &output.outcome {
+        Some(BranchOutcomeOutput::Created { from, name }) => {
+            println!("created branch {name} from {from}");
+        }
+        Some(BranchOutcomeOutput::Deleted { name }) => println!("deleted branch {name}"),
+        Some(BranchOutcomeOutput::Merged {
+            source,
+            target,
+            merge,
+        }) => println!("merged {source} into {target}: {}", merge.as_str()),
+        None => println!(
+            "changed {} via {}: {} nodes, {} edges",
+            output.branch, output.query_name, output.affected_nodes, output.affected_edges
+        ),
+    }
     if let Some(actor_id) = &output.actor_id {
         println!("actor_id: {}", actor_id);
     }

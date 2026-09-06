@@ -1,8 +1,94 @@
 pub const NOW_PARAM_NAME: &str = "__nanograph_now";
 
+/// A parsed `.gq` source: a list of `query` declarations, or one branch
+/// statement.
 #[derive(Debug, Clone)]
-pub struct QueryFile {
-    pub queries: Vec<QueryDecl>,
+pub enum QueryFile {
+    Queries(Vec<QueryDecl>),
+    Branch(BranchStmt),
+}
+
+impl QueryFile {
+    /// The one declaration of a single-query file. Test support: production
+    /// code matches `QueryFile` instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the file holds exactly one `query` declaration.
+    #[doc(hidden)]
+    #[track_caller]
+    pub fn single_decl(&self) -> &QueryDecl {
+        match self {
+            QueryFile::Queries(queries) => match queries.as_slice() {
+                [decl] => decl,
+                other => panic!(
+                    "expected exactly one query declaration, got {}",
+                    other.len()
+                ),
+            },
+            QueryFile::Branch(stmt) => panic!("{}", stmt.not_a_declaration_message()),
+        }
+    }
+}
+
+/// A top-level branch statement: a control write, or `branch list`, the
+/// one statement that changes no branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchStmt {
+    Write(BranchWrite),
+    List,
+}
+
+/// A control write: `branch create <name> [from <parent>]`,
+/// `branch delete <name>`, or `branch merge <source> [into <target>]`.
+/// `from` and `into` are `None` when unspelled; no default is filled here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchWrite {
+    Create {
+        name: String,
+        from: Option<String>,
+    },
+    Delete {
+        name: String,
+    },
+    Merge {
+        source: String,
+        into: Option<String>,
+    },
+}
+
+impl BranchWrite {
+    /// The write's two keywords, `branch create` through `branch merge`.
+    pub fn statement_name(&self) -> &'static str {
+        match self {
+            BranchWrite::Create { .. } => "branch create",
+            BranchWrite::Delete { .. } => "branch delete",
+            BranchWrite::Merge { .. } => "branch merge",
+        }
+    }
+}
+
+impl BranchStmt {
+    /// `false` only for `branch list`.
+    pub fn is_write(&self) -> bool {
+        matches!(self, BranchStmt::Write(_))
+    }
+
+    /// The statement's two keywords, `branch create` through `branch list`.
+    pub fn statement_name(&self) -> &'static str {
+        match self {
+            BranchStmt::Write(write) => write.statement_name(),
+            BranchStmt::List => "branch list",
+        }
+    }
+
+    /// Refusal text for a consumer that expected `query` declarations.
+    pub fn not_a_declaration_message(&self) -> String {
+        format!(
+            "`{}` is a branch statement, not a query declaration",
+            self.statement_name()
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
