@@ -199,6 +199,58 @@ async fn managed_settings_bind_the_applied_store_not_the_config_directory() {
     );
 }
 
+#[tokio::test]
+async fn applied_empty_cluster_still_requires_exact_data_trust_root() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs: {}\n").unwrap();
+    assert!(omnigraph_cluster::import_config_dir(temp.path()).await.ok);
+    let applied = omnigraph_cluster::apply_config_dir(temp.path()).await;
+    assert!(applied.ok && applied.converged, "{applied:?}");
+    let mut tokens = data_tokens::DataTokens::new();
+    let trust = temp.path().join("trust.json");
+    fs::write(&trust, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+    let source = temp.path().to_path_buf();
+    assert!(
+        omnigraph_server::load_server_settings_with_data_token_trust(
+            Some(&source),
+            None,
+            false,
+            true,
+            &trust,
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("serving-root binding")
+    );
+    let root = format!(
+        "file://{}",
+        fs::canonicalize(temp.path()).unwrap().display()
+    );
+    tokens.document["canonical_root"] = serde_json::json!(root);
+    fs::write(&trust, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+    let settings = omnigraph_server::load_server_settings_with_data_token_trust(
+        Some(&source),
+        None,
+        false,
+        true,
+        &trust,
+    )
+    .await
+    .unwrap();
+    assert_eq!(settings.canonical_root(), root);
+    assert!(settings.config().require_all_graphs);
+    assert!(!settings.config().allow_unauthenticated);
+    assert_eq!(
+        settings.config().witness.booted_serving_digest,
+        applied.desired_revision.config_digest
+    );
+    assert!(settings.config().witness.applied_graphs.is_empty());
+    let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &settings.config().mode;
+    assert!(graphs.is_empty());
+    assert!(!temp.path().join("graphs").exists());
+}
+
 mod multi_graph_startup {
     use super::*;
     use omnigraph::storage::normalize_root_uri;

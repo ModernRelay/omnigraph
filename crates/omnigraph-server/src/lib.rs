@@ -336,7 +336,8 @@ pub struct GraphStartupConfig {
 
 /// Runtime routing for the server (RFC-011 cluster-only). Every
 /// deployment serves cluster routes (`/graphs/{graph_id}/...`) backed by
-/// a registry of N graphs (N ≥ 1). The single-graph convenience
+/// a registry of N graphs (N ≥ 0). An applied empty cluster has no default
+/// graph. The single-graph convenience
 /// constructors build a one-graph registry keyed by `default`; the
 /// cluster boot path builds an N-graph registry. There is no longer a
 /// flat-route mode.
@@ -2131,8 +2132,9 @@ fn load_graph_policy(source: &PolicySource, graph_id: &str) -> Result<PolicyEngi
 
 /// Parallel open of every graph in the startup config, with bounded
 /// concurrency (`buffer_unordered(4)`). Graph-specific open failures
-/// quarantine that graph; startup succeeds as long as at least one graph
-/// opens.
+/// quarantine that graph; a nonempty configuration succeeds only if at least
+/// one graph opens. An empty configuration opens none; the cluster settings
+/// loader verifies its applied revision before calling this function.
 ///
 /// The bound 4 is a rule-of-thumb for I/O-bound work. At N ≤ 10 this
 /// trades startup latency for a small amount of concurrent S3 / Lance
@@ -2145,10 +2147,6 @@ pub async fn open_multi_graph_state(
     require_all_graphs: bool,
 ) -> Result<AppState> {
     use futures::StreamExt;
-
-    if graphs.is_empty() {
-        bail!("multi-graph mode requires at least one graph in the `graphs:` map");
-    }
 
     // Server-level policy (loaded once, applies to management endpoints).
     // The placeholder graph_id `"server"` is the sentinel the Cedar
@@ -2193,7 +2191,7 @@ pub async fn open_multi_graph_state(
             failed
         );
     }
-    if handles.is_empty() {
+    if handles.is_empty() && configured_graphs > 0 {
         bail!(
             "no healthy graphs opened from multi-graph startup config ({} configured, {} failed)",
             configured_graphs,

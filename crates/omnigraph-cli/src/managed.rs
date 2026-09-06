@@ -13,6 +13,7 @@ use url::Url;
 
 mod auth;
 pub(crate) mod data;
+mod lifecycle;
 
 /// Managed transports must not render an endpoint's reflected credential.
 pub(crate) fn scrub_response_error(text: String, secret: &str) -> String {
@@ -470,7 +471,11 @@ fn managed_flags(command: &ClusterCommand) -> bool {
         ClusterCommand::Status { run_id, .. } => run_id.is_some(),
         ClusterCommand::History { .. }
         | ClusterCommand::Cancel { .. }
-        | ClusterCommand::Token { .. } => true,
+        | ClusterCommand::Token { .. }
+        | ClusterCommand::Create { .. }
+        | ClusterCommand::Delete { .. }
+        | ClusterCommand::UndoDelete { .. }
+        | ClusterCommand::Push { .. } => true,
         _ => false,
     }
 }
@@ -488,7 +493,11 @@ fn config_and_json(command: &ClusterCommand) -> (&Path, bool) {
         | ClusterCommand::ForceUnlock { config, json, .. }
         | ClusterCommand::History { config, json, .. }
         | ClusterCommand::Cancel { config, json, .. }
-        | ClusterCommand::Token { config, json, .. } => (config, *json),
+        | ClusterCommand::Token { config, json, .. }
+        | ClusterCommand::Create { config, json, .. }
+        | ClusterCommand::Delete { config, json, .. }
+        | ClusterCommand::UndoDelete { config, json, .. }
+        | ClusterCommand::Push { config, json, .. } => (config, *json),
     }
 }
 
@@ -729,6 +738,12 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
         }
         Command::Cluster { command } => {
             let (config, json) = config_and_json(command);
+            if lifecycle::handles(command) {
+                return Some(match lifecycle::dispatch(cli, command).await {
+                    Ok((body, exit)) => Output::from_result(Ok(body), json, exit),
+                    Err(err) => Output::from_result(Err(err), json, 1),
+                });
+            }
             let context = if cli.direct {
                 Ok(None)
             } else {

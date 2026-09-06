@@ -244,14 +244,16 @@ query, or fragment. HTTPS is required except for exact localhost,
 | `cluster history [--limit N] [--since RFC3339]` | Read up to N runs, default 100, maximum 1000 |
 | `cluster cancel RUN_ID` | Cancel a pending run; abandon a converged unused plan and release its lease |
 
+See [managed lifecycle](managed-lifecycle.md) for creation, upload, deletion, undo and operation status.
+
 All accept `--config DIR` and `--json`. Managed plan and apply accept
 `--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. Without a
-supplied key, plan or apply generates one
-and prints it to stderr before submission. Reuse that key with the same body
+supplied key, plan or apply generates one and prints it to stderr before
+submission. Reuse that key with the same body
 to recover from an uncertain response; changing the body under a key is
 refused by the API. Retry cancellation or abandonment using the same run id.
-The CLI does not upload local files or infer a revision
-from uncommitted changes. A saved plan retains the service's change lease
+Plan and apply do not upload local files or infer a revision from uncommitted
+changes; `cluster push` explicitly prepares managed source. A saved plan retains the service's change lease
 until it is applied, abandoned, or expires under the API's rules.
 
 Plan and apply normally poll every two seconds for up to 300 seconds.
@@ -320,6 +322,3 @@ rule applies to overwrite loads and branch deletion, verb or statement.
 | `change` | `mutate` |
 | `check` and `query lint` | `lint` |
 | `ingest` | `load` |
-
-These aliases are compatibility-only. Use the canonical names in new
-automation.

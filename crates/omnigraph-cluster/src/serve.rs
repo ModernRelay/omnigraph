@@ -511,18 +511,30 @@ async fn read_snapshot_with_store(
     }
 
     if graphs.is_empty() {
-        if saw_applied_graph && !quarantined_graphs.is_empty() {
+        if saw_applied_graph {
             diagnostics.push(Diagnostic::error(
                 "cluster_no_healthy_graphs",
                 CLUSTER_RECOVERIES_DIR,
                 "all applied graphs are quarantined by startup safety checks; resolve the graph-specific diagnostics, then retry",
             ));
-        } else {
+        } else if boot_state_revision == 0
+            || boot_state_cas.is_none()
+            || !boot_config_digest.as_deref().is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
             diagnostics.push(Diagnostic::error(
                 "cluster_empty",
                 CLUSTER_STATE_FILE,
-                "the applied revision records no graphs; apply a cluster with at least one graph before serving from it",
+                "an empty cluster requires an applied configuration digest, a positive state revision and an observed ledger CAS; run `cluster apply` before serving",
             ));
+        } else if let Err(diagnostic) = backend.canonical_root() {
+            // Empty serving still needs an actual storage root. Unlike a
+            // nonempty revision, it will not open a graph to check one later.
+            diagnostics.push(diagnostic);
         }
     }
     if has_errors(&diagnostics) {

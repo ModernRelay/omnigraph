@@ -199,7 +199,7 @@ fn settings_from_snapshot(
             queries: registry,
         });
     }
-    if graphs.is_empty() {
+    if graphs.is_empty() && !snapshot.applied_graphs.is_empty() {
         let skipped = skipped_graphs.join(", ");
         bail!(
             "the cluster at '{}' has no healthy graphs to serve{}",

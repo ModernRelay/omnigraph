@@ -4543,16 +4543,82 @@ async fn serving_snapshot_refuses_tampered_blob_and_stripped_bindings() {
 }
 
 #[tokio::test]
-async fn serving_snapshot_refuses_empty_cluster() {
+async fn serving_snapshot_refuses_unapplied_or_invalid_empty_cluster() {
     let dir = fixture();
     write_state_resources(dir.path(), &[]); // state exists, no graphs
+    let state_path = dir.path().join(CLUSTER_STATE_FILE);
+    let original: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    for (revision, digest) in [
+        (1, serde_json::Value::Null),
+        (0, json!("a".repeat(64))),
+        (1, json!("a".repeat(63))),
+        (1, json!("A".repeat(64))),
+        (1, json!("g".repeat(64))),
+    ] {
+        let mut state = original.clone();
+        state["state_revision"] = json!(revision);
+        state["applied_revision"]["config_digest"] = digest;
+        let bytes = serde_json::to_vec(&state).unwrap();
+        fs::write(&state_path, &bytes).unwrap();
+        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.code == "cluster_empty"),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), bytes);
+    }
+}
 
-    let err = read_serving_snapshot(dir.path()).await.unwrap_err();
-    assert!(
-        err.iter()
-            .any(|diagnostic| diagnostic.code == "cluster_empty"),
-        "{err:?}"
+#[tokio::test]
+async fn serving_snapshot_reads_applied_empty_cluster() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs: {}\n",
+    )
+    .unwrap();
+    let imported = import_config_dir(dir.path()).await;
+    assert!(imported.ok, "{imported:?}");
+    let applied = apply_config_dir(dir.path()).await;
+    assert!(applied.ok && applied.converged, "{applied:?}");
+    let digest = desired_revision_digest(&applied);
+    let bytes = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let canonical_root = format!("file://{}", fs::canonicalize(dir.path()).unwrap().display());
+    // Only the root locator comes from desired config at boot. An unapplied
+    // graph addition must not change this valid empty applied revision.
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs:\n  future:\n    schema: ./missing.pg\n",
+    )
+    .unwrap();
+    let from_directory = read_serving_snapshot(dir.path()).await.unwrap();
+    let from_root = read_root_bound_serving_snapshot_from_storage(&canonical_root)
+        .await
+        .unwrap();
+    assert_eq!(from_root.canonical_root(), canonical_root);
+    for snapshot in [&from_directory, from_root.snapshot()] {
+        assert!(snapshot.graphs.is_empty());
+        assert!(snapshot.applied_graphs.is_empty());
+        assert!(snapshot.quarantined_graphs.is_empty());
+        assert_eq!(snapshot.config_digest.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            snapshot.state_revision,
+            state["state_revision"].as_u64().unwrap()
+        );
+        assert!(snapshot.state_revision > 0);
+        assert_eq!(
+            snapshot.state_cas,
+            Some(format!("sha256:{}", sha256_hex(&bytes)))
+        );
+    }
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        bytes
     );
+    assert!(!dir.path().join("graphs").exists());
 }
 
 // ---- query discovery (Terraform-style declaration) ----

@@ -38,10 +38,10 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0059**; lower gaps are historical and must
+The next available number is **0062**; lower gaps are historical and must
 not be reused (0047 and 0048 are allocated by PR #606; 0050 by the
 `rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0058 by
-PR #662 for retained merged ancestry).
+PR #662 for retained merged ancestry; 0059 by PR #675; 0060 by PR #677).
 
 ## Required frontmatter
 
@@ -139,7 +139,7 @@ This table is the human index for the canonical RFC corpus.
 | [0002](0002-config-cli-architecture.md) | Config and CLI architecture | maintainer | superseded | partial |
 | [0003](0003-mcp-server-surface.md) | MCP server surface | maintainer | draft | not-started |
 | [0004](0004-cluster-graph-schema-apply.md) | Cluster graph and schema apply | maintainer | accepted | complete |
-| [0005](0005-server-cluster-boot.md) | Server boot from cluster state | maintainer | accepted | complete |
+| [0005](0005-server-cluster-boot.md) | Server boot from cluster state | maintainer | accepted | partial |
 | [0006](0006-object-storage-cluster-roots.md) | Object-storage cluster roots | maintainer | accepted | complete |
 | [0007](0007-operator-config.md) | Per-operator configuration | maintainer | accepted | complete |
 | [0008](0008-retire-omnigraph-yaml.md) | Retire `omnigraph.yaml` | maintainer | accepted | complete |
@@ -176,10 +176,11 @@ This table is the human index for the canonical RFC corpus.
 | [0044](0044-edge-keys.md) | Edge keys: derived edge identity | maintainer | draft | in-progress |
 | [0045](0045-gq-logic-tests.md) | GQ logic tests | maintainer | draft | partial |
 | [0046](0046-index-status.md) | Read-only index status | maintainer | draft | not-started |
-| [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | complete |
+| [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | partial |
 | [0051](0051-json-output-via-arrow.md) | JSON output via Arrow | maintainer | draft | partial |
 | [0052](0052-managed-control-plane-cli.md) | Managed control-plane CLI | maintainer | accepted | complete |
 | [0053](0053-offline-data-token-verification.md) | Offline data-token verification | maintainer | accepted | complete |
 | [0054](0054-default-actor-provenance.md) | Default graph actor provenance | maintainer | rejected | removed |
 | [0055](0055-gq-branch-statements.md) | Branch statements in GQ | maintainer | draft | in-progress |
 | [0057](0057-bounded-merge-preparation.md) | Accepted-context reuse and bounded merge preparation | maintainer | accepted | in-progress |
+| [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |

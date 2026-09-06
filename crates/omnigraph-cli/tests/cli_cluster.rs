@@ -56,6 +56,682 @@ fn assert_no_core_effects(root: &std::path::Path) {
     );
 }
 
+fn lifecycle_envelope(kind: &str, state: &str, phase: &str) -> serde_json::Value {
+    serde_json::json!({"data":{"cluster_id":"managed-test","incarnation":"inc-one","operation_id":"operation-one","kind":kind,"state":state,"canonical_root":"s3://tenant/clusters/managed-test-inc-one","lifecycle":{"phase":phase,"purgeAfter":"2026-09-07T12:00:00Z"}},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db","assurance":"verified_workload"}})
+}
+
+fn lifecycle_session(principal: &str, account: &str) -> serde_json::Value {
+    serde_json::json!({"data":{"principal_id":principal,"account_id":account},"meta":{"provenance":"service_db","assurance":"verified_workload"}})
+}
+
+fn lifecycle_fixture(replies: Vec<IntentReply>) -> IntentApiFixture {
+    IntentApiFixture::with_session(replies, lifecycle_session("principal-one", "account-one"))
+}
+
+#[test]
+fn managed_lifecycle_uncertain_create_reuses_durable_key_and_preserves_context() {
+    for (status, body) in [
+        (503, serde_json::json!({"type":"response_uncertain"})),
+        (
+            408,
+            serde_json::json!({"type":"gateway_timeout","status":408,"title":"gateway timeout","detail":"upstream timed out"}),
+        ),
+        (
+            400,
+            serde_json::json!({"type":"unknown_proxy_error","status":400,"title":"proxy error","detail":"unknown upstream outcome"}),
+        ),
+        (403, serde_json::json!({"type":"scope_missing"})),
+    ] {
+        let temp = tempdir().unwrap();
+        let accepted = lifecycle_envelope("create", "proposed", "provisioning");
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(status, body),
+            IntentReply::json(
+                403,
+                serde_json::json!({"type":"scope_missing","status":403,"title":"scope missing","detail":"grant revoked since first attempt"}),
+            ),
+            IntentReply::json(202, accepted.clone()),
+        ]);
+        let invoke = |name: &str, key: Option<&str>| {
+            let mut command = cli();
+            command
+                .current_dir(temp.path())
+                .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+                .env("OMNIGRAPH_CONTROL_API", &api.origin)
+                .args([
+                    "cluster",
+                    "create",
+                    name,
+                    "--api",
+                    &api.origin,
+                    "--no-wait",
+                    "--json",
+                ]);
+            if let Some(key) = key {
+                command.args(["--idempotency-key", key]);
+            }
+            command.output().unwrap()
+        };
+        let uncertain = invoke("new-cluster", None);
+        assert_eq!(
+            uncertain.status.code(),
+            Some(if status < 500 { 2 } else { 1 })
+        );
+        let pending_path = temp.path().join(".omnigraph/pending-lifecycle.json");
+        let pending: serde_json::Value =
+            serde_json::from_slice(&fs::read(&pending_path).unwrap()).unwrap();
+        assert_eq!(pending["request_digest"].as_str().unwrap().len(), 64);
+        assert!(!pending.to_string().contains("og_fixture_control"));
+        assert!(!temp.path().join(".omnigraph/context").exists());
+        for output in [
+            invoke("different-cluster", None),
+            invoke("new-cluster", Some("different-key")),
+        ] {
+            assert_eq!(output.status.code(), Some(2));
+            assert_eq!(
+                parse_stdout_json(&output)["type"],
+                "pending_lifecycle_conflict"
+            );
+        }
+        // Current authorization can change after the first request was accepted.
+        // A later permission refusal must not erase that unresolved identity.
+        assert_eq!(invoke("new-cluster", None).status.code(), Some(2));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&pending_path).unwrap()).unwrap(),
+            pending
+        );
+        let retried = invoke("new-cluster", None);
+        assert!(retried.status.success(), "{retried:?}");
+        assert_eq!(parse_stdout_json(&retried), accepted);
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[0].headers["idempotency-key"],
+            requests[1].headers["idempotency-key"]
+        );
+        assert_eq!(
+            requests[0].headers["idempotency-key"],
+            requests[2].headers["idempotency-key"]
+        );
+        assert_control_request(
+            &requests[1],
+            "POST",
+            "/v1/clusters",
+            serde_json::json!({"name":"new-cluster"}),
+            pending["idempotency_key"].as_str(),
+        );
+        assert!(!pending_path.exists());
+        let saved: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.path().join(".omnigraph/last-lifecycle.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["operation_id"], "operation-one");
+        let context = fs::read(temp.path().join(".omnigraph/context")).unwrap();
+        assert_eq!(invoke("another-cluster", None).status.code(), Some(2));
+        assert_eq!(
+            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+            context
+        );
+        assert_eq!(api.workflow_requests().len(), 3);
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+fn managed_lifecycle_pending_is_principal_bound_across_session_renewal() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(503, serde_json::json!({"type":"response_uncertain"})),
+        IntentReply::json(
+            202,
+            lifecycle_envelope("create", "proposed", "provisioning"),
+        ),
+    ]);
+    let invoke = |token: &str| {
+        cli()
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_CONTROL_TOKEN", token)
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args([
+                "cluster",
+                "create",
+                "new-name",
+                "--api",
+                &api.origin,
+                "--no-wait",
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    assert_eq!(invoke("og_fixture_control").status.code(), Some(1));
+    let path = temp.path().join(".omnigraph/pending-lifecycle.json");
+    let pending = fs::read(&path).unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&pending).unwrap();
+    assert_eq!(record["principal_id"], "principal-one");
+    assert_eq!(record["account_id"], "account-one");
+    for (principal, account) in [
+        ("principal-two", "account-one"),
+        ("principal-one", "account-two"),
+    ] {
+        api.set_session(lifecycle_session(principal, account));
+        let output = invoke("og_fixture_another_actor");
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            parse_stdout_json(&output)["type"],
+            "pending_lifecycle_conflict"
+        );
+        assert_eq!(fs::read(&path).unwrap(), pending);
+        assert_eq!(api.workflow_requests().len(), 1);
+        assert!(!temp.path().join(".omnigraph/context").exists());
+    }
+    api.set_session(lifecycle_session("principal-one", "account-one"));
+    assert!(invoke("og_fixture_renewed_session").status.success());
+    let requests = api.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.path == "/v1/auth/session")
+            .count(),
+        4
+    );
+    for token in ["og_fixture_control", "og_fixture_renewed_session"] {
+        let matching: Vec<_> = requests
+            .iter()
+            .filter(|r| r.headers["authorization"] == format!("Bearer {token}"))
+            .collect();
+        assert_eq!(matching.len(), 2);
+        assert_eq!(
+            (matching[0].method.as_str(), matching[0].path.as_str()),
+            ("GET", "/v1/auth/session")
+        );
+        assert_eq!(matching[1].method, "POST");
+    }
+    let mutations = api.workflow_requests();
+    assert_eq!(
+        mutations[0].headers["idempotency-key"],
+        mutations[1].headers["idempotency-key"]
+    );
+    assert!(!path.exists());
+    api.assert_complete();
+}
+
+#[test]
+fn managed_lifecycle_definitive_first_refusal_releases_pending_intent() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(
+            409,
+            serde_json::json!({"type":"name_taken","status":409,"title":"name taken","detail":"name already exists"}),
+        ),
+        IntentReply::json(
+            202,
+            lifecycle_envelope("create", "proposed", "provisioning"),
+        ),
+    ]);
+    let invoke = |name: &str| {
+        cli()
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args([
+                "cluster",
+                "create",
+                name,
+                "--api",
+                &api.origin,
+                "--no-wait",
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    assert_eq!(invoke("taken-name").status.code(), Some(2));
+    assert!(
+        !temp
+            .path()
+            .join(".omnigraph/pending-lifecycle.json")
+            .exists()
+    );
+    assert!(!temp.path().join(".omnigraph/context").exists());
+    assert!(invoke("new-name").status.success());
+    let requests = api.workflow_requests();
+    assert_eq!(requests.len(), 2);
+    assert_ne!(
+        requests[0].headers["idempotency-key"],
+        requests[1].headers["idempotency-key"]
+    );
+    api.assert_complete();
+}
+
+#[test]
+fn managed_lifecycle_delete_and_undo_send_exact_authority_targets() {
+    for (kind, args, expected) in [
+        (
+            "delete",
+            vec![
+                "delete",
+                "--incarnation",
+                "inc-one",
+                "--retention-seconds",
+                "0",
+            ],
+            serde_json::json!({"incarnation":"inc-one","retention_seconds":0}),
+        ),
+        (
+            "undo",
+            vec![
+                "undo-delete",
+                "--incarnation",
+                "inc-one",
+                "--deletion-id",
+                "delete-one",
+            ],
+            serde_json::json!({"incarnation":"inc-one","deletion_id":"delete-one"}),
+        ),
+    ] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![IntentReply::json(
+            202,
+            lifecycle_envelope(kind, "proposed", "requested"),
+        )]);
+        write_managed_context(temp.path(), &api.origin);
+        let before = fs::read(temp.path().join(".omnigraph/context")).unwrap();
+        let output = output_success(
+            cli()
+                .current_dir(temp.path())
+                .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+                .env("OMNIGRAPH_CONTROL_API", &api.origin)
+                .arg("cluster")
+                .args(args)
+                .args(["--no-wait", "--idempotency-key", "exact-intent", "--json"]),
+        );
+        assert_eq!(parse_stdout_json(&output)["data"]["kind"], kind);
+        assert_control_request(
+            &api.workflow_requests()[0],
+            "POST",
+            &format!("/v1/clusters/managed-test:{kind}"),
+            expected,
+            Some("exact-intent"),
+        );
+        assert_eq!(
+            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+            before
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
+    let temp = tempdir().unwrap();
+    let tombstone = lifecycle_envelope("delete", "running", "tombstoned");
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(202, lifecycle_envelope("delete", "proposed", "requested")),
+        IntentReply::json(200, tombstone.clone()),
+    ]);
+    write_managed_context(temp.path(), &api.origin);
+    let output = output_success(
+        cli()
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args([
+                "cluster",
+                "delete",
+                "--incarnation",
+                "inc-one",
+                "--timeout",
+                "10",
+                "--json",
+            ]),
+    );
+    assert_eq!(parse_stdout_json(&output), tombstone);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("undo deadline:"));
+    assert_eq!(api.workflow_requests()[0].body["retention_seconds"], 86400);
+    assert_eq!(
+        api.workflow_requests()[1].path,
+        "/v1/operations/operation-one"
+    );
+    api.assert_complete();
+
+    let temp = tempdir().unwrap();
+    let mut mismatched = lifecycle_envelope("create", "converged", "ready");
+    mismatched["data"]["incarnation"] = serde_json::json!("other-incarnation");
+    mismatched["meta"]["incarnation"] = serde_json::json!("other-incarnation");
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(
+            200,
+            lifecycle_envelope("create", "running", "bootstrapping"),
+        ),
+        IntentReply::json(200, mismatched),
+    ]);
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .env("OMNIGRAPH_CONTROL_API", &api.origin)
+        .args([
+            "cluster",
+            "status",
+            "--operation",
+            "operation-one",
+            "--api",
+            &api.origin,
+            "--wait",
+            "--timeout",
+            "10",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
+    assert!(!temp.path().join(".omnigraph/context").exists());
+    api.assert_complete();
+}
+
+#[test]
+fn managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity() {
+    let temp = tempdir().unwrap();
+    let mut bad = lifecycle_envelope("create", "proposed", "provisioning");
+    bad["meta"]["cluster_id"] = serde_json::json!("foreign");
+    let api = lifecycle_fixture(vec![IntentReply::json(202, bad)]);
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .env("OMNIGRAPH_CONTROL_API", &api.origin)
+        .args([
+            "cluster",
+            "create",
+            "new",
+            "--api",
+            &api.origin,
+            "--no-wait",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        temp.path()
+            .join(".omnigraph/pending-lifecycle.json")
+            .exists()
+    );
+    assert!(!temp.path().join(".omnigraph/context").exists());
+    api.assert_complete();
+
+    let temp = tempdir().unwrap();
+    let accepted = lifecycle_envelope("create", "proposed", "provisioning");
+    let api = lifecycle_fixture(vec![IntentReply::json(202, accepted.clone())]);
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .env("OMNIGRAPH_CONTROL_API", &api.origin)
+        .args([
+            "cluster",
+            "create",
+            "new",
+            "--api",
+            &api.origin,
+            "--timeout",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(parse_stdout_json(&output), accepted);
+    assert!(temp.path().join(".omnigraph/last-lifecycle.json").exists());
+    assert_eq!(api.workflow_requests().len(), 1);
+    api.assert_complete();
+    assert_no_core_effects(temp.path());
+}
+
+#[test]
+#[cfg(unix)]
+fn managed_lifecycle_push_sends_only_complete_referenced_files() {
+    let temp = tempdir().unwrap();
+    let response = serde_json::json!({"data":{"cluster_id":"managed-test","revision":"a".repeat(40)},"meta":{"cluster_id":"managed-test","incarnation":"inc-one"}});
+    let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
+    write_managed_context(temp.path(), &api.origin);
+    fs::create_dir(temp.path().join("queries")).unwrap();
+    let files = [
+        (
+            "cluster.yaml",
+            "version: 1\ngraphs:\n  sample:\n    schema: ./schema.pg\n    queries: queries/\npolicies:\n  access:\n    file: policy.yaml\n",
+        ),
+        ("schema.pg", "node Person { name: String @key }\n"),
+        (
+            "queries/names.gq",
+            "query names() { match { $p: Person } return { $p.name } }\n",
+        ),
+        ("policy.yaml", "policies: []\n"),
+    ];
+    for (path, text) in files {
+        fs::write(temp.path().join(path), text).unwrap();
+    }
+    fs::write(temp.path().join("private.key"), "NEVER_UPLOAD_ME").unwrap();
+    fs::write(temp.path().join("queries/ignored.txt"), "NEVER_UPLOAD_ME").unwrap();
+    let output = output_success(
+        cli()
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args([
+                "cluster",
+                "push",
+                "--expected-revision",
+                &"b".repeat(40),
+                "--message",
+                "prepare",
+                "--json",
+            ]),
+    );
+    assert_eq!(parse_stdout_json(&output), response);
+    let requests = api.workflow_requests();
+    assert_eq!(requests[0].body["files"].as_object().unwrap().len(), 4);
+    for (path, text) in files {
+        assert_eq!(requests[0].body["files"][path], text);
+    }
+    assert!(!requests[0].body.to_string().contains("NEVER_UPLOAD_ME"));
+    assert_eq!(requests[0].path, "/v1/clusters/managed-test/config");
+    assert!(!requests[0].headers.contains_key("idempotency-key"));
+    api.assert_complete();
+    assert_no_core_effects(temp.path());
+}
+
+#[test]
+fn managed_lifecycle_push_refuses_unsafe_paths_and_oversized_files_before_http() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    write_managed_context(temp.path(), &api.origin);
+    fs::write(
+        temp.path().join("large.pg"),
+        vec![b'x'; 2 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+    fs::write(temp.path().join("binary.pg"), [0xff, 0xfe]).unwrap();
+    for path in [
+        "../escape.pg",
+        "/absolute.pg",
+        ".omnigraph/context",
+        "large.pg",
+        "binary.pg",
+        "missing.pg",
+    ] {
+        fs::write(
+            temp.path().join("cluster.yaml"),
+            format!("version: 1\ngraphs:\n  sample:\n    schema: {path}\n"),
+        )
+        .unwrap();
+        let output = cli()
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args([
+                "cluster",
+                "push",
+                "--expected-revision",
+                &"b".repeat(40),
+                "--message",
+                "prepare",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{path}: {output:?}");
+        assert_eq!(parse_stdout_json(&output)["type"], "config_capture_failed");
+    }
+    assert!(api.workflow_requests().is_empty());
+    assert_no_core_effects(temp.path());
+}
+
+#[test]
+fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    fs::create_dir(temp.path().join(".omnigraph")).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(temp.path().join(".omnigraph/lifecycle.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .env("OMNIGRAPH_CONTROL_API", &api.origin)
+        .args([
+            "cluster",
+            "create",
+            "locked",
+            "--api",
+            &api.origin,
+            "--no-wait",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "lifecycle_submission_busy"
+    );
+    assert!(
+        !temp
+            .path()
+            .join(".omnigraph/pending-lifecycle.json")
+            .exists()
+    );
+    drop(lock);
+    for args in [
+        vec![
+            "cluster",
+            "create",
+            "direct",
+            "--api",
+            &api.origin,
+            "--direct",
+        ],
+        vec!["cluster", "delete", "--incarnation", "inc-one", "--direct"],
+        vec![
+            "cluster",
+            "undo-delete",
+            "--incarnation",
+            "inc-one",
+            "--deletion-id",
+            "op",
+            "--direct",
+        ],
+        vec![
+            "cluster",
+            "status",
+            "--operation",
+            "op",
+            "--api",
+            &api.origin,
+            "--direct",
+        ],
+    ] {
+        let output = cli()
+            .current_dir(temp.path())
+            .args(args)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            parse_stdout_json(&output)["type"],
+            "managed_context_required"
+        );
+    }
+    assert!(api.workflow_requests().is_empty());
+    assert_no_core_effects(temp.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_lifecycle_capture_and_retry_records_refuse_symlinks_without_reading_targets() {
+    let temp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    write_managed_context(temp.path(), &api.origin);
+    fs::write(outside.path().join("private.pg"), "DO_NOT_SEND").unwrap();
+    std::os::unix::fs::symlink(outside.path(), temp.path().join("linked")).unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  sample:\n    schema: linked/private.pg\n",
+    )
+    .unwrap();
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .env("OMNIGRAPH_CONTROL_API", &api.origin)
+        .args([
+            "cluster",
+            "push",
+            "--expected-revision",
+            &"b".repeat(40),
+            "--message",
+            "prepare",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(parse_stdout_json(&output)["type"], "config_capture_failed");
+    std::os::unix::fs::symlink(
+        outside.path().join("private.pg"),
+        temp.path().join(".omnigraph/pending-lifecycle.json"),
+    )
+    .unwrap();
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .env("OMNIGRAPH_CONTROL_API", &api.origin)
+        .args([
+            "cluster",
+            "delete",
+            "--incarnation",
+            "inc-one",
+            "--no-wait",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(outside.path().join("private.pg")).unwrap(),
+        "DO_NOT_SEND"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("DO_NOT_SEND"));
+    assert!(api.workflow_requests().is_empty());
+}
+
 #[test]
 fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain() {
     let temp = tempdir().unwrap();

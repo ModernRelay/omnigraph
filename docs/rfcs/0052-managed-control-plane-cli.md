@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-06
 discussion: https://github.com/ModernRelay/omnigraph/pull/629
 supersedes: []
 superseded_by: []
@@ -180,7 +180,9 @@ release notes. The companion API adds device sessions and plan abandonment
 without changing executor or engine gates. Existing CLI/direct and managed
 HTTP tests must pass before recommending the managed client. Data-plane
 tokens, managed-store editing, provisioning, console, SSE, and persistent
-refresh tokens remain out of scope.
+refresh tokens remain out of scope for this increment. Managed-store editing
+and service provisioning are extended by
+[RFC 0061](0061-managed-cluster-lifecycle.md).
 
 ## Unresolved questions
 
@@ -197,3 +199,8 @@ compatibility, bounded HTTP and credential handling, focused regression
 suites, the full native CLI kind proof, and the separate live WorkOS pilot.
 No engine or storage contract changes are required. Data access remains a
 separate increment; this decision authorizes control-plane operations only.
+
+2026-09-06: The Rollout scope sentence now explicitly limits its deferral of
+managed-store editing and provisioning to this original increment, and links
+RFC 0061 as the owner of those additional client commands. Its authentication,
+folder context, direct routing and exact-plan execution contract is unchanged.
