@@ -144,8 +144,20 @@ pub(crate) fn resolve_query_decls(
                 continue;
             }
         };
-        let parsed = match parse_query(&source) {
-            Ok(parsed) => parsed,
+        let queries = match parse_query(&source) {
+            Ok(QueryFile::Queries(queries)) => queries,
+            Ok(QueryFile::Branch(stmt)) => {
+                diagnostics.push(Diagnostic::error(
+                    "query_parse_error",
+                    format!("graphs.{graph_id}.queries"),
+                    format!(
+                        "'{}' is not a stored-query file: {}",
+                        resolved.display(),
+                        stmt.not_a_declaration_message()
+                    ),
+                ));
+                continue;
+            }
             Err(err) => {
                 diagnostics.push(Diagnostic::error(
                     "query_parse_error",
@@ -155,7 +167,7 @@ pub(crate) fn resolve_query_decls(
                 continue;
             }
         };
-        for query_decl in &parsed.queries {
+        for query_decl in &queries {
             let name = query_decl.name.clone();
             if let Some(previous) = origin.get(&name) {
                 diagnostics.push(Diagnostic::error(
@@ -1289,8 +1301,13 @@ pub(crate) fn validate_query_source(
 ) {
     let path = format!("graphs.{graph_id}.queries.{query_name}");
     match parse_query(source) {
-        Ok(query_file) => {
-            let Some(query_decl) = query_file.queries.iter().find(|q| q.name == query_name) else {
+        Ok(QueryFile::Branch(stmt)) => diagnostics.push(Diagnostic::error(
+            "query_parse_error",
+            path,
+            stmt.not_a_declaration_message(),
+        )),
+        Ok(QueryFile::Queries(queries)) => {
+            let Some(query_decl) = queries.iter().find(|q| q.name == query_name) else {
                 diagnostics.push(Diagnostic::error(
                     "query_key_mismatch",
                     path,

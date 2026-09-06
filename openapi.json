@@ -690,7 +690,7 @@
           "branches"
         ],
         "summary": "List all branches.",
-        "description": "Returns branch names sorted alphabetically. Read-only.",
+        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.",
         "operationId": "cluster_listBranches",
         "parameters": [
           {
@@ -746,7 +746,7 @@
           "branches"
         ],
         "summary": "Create a new branch.",
-        "description": "Forks `name` off of `from` (defaults to `main`). The new branch shares\nbacking dataset data with its parent until it is mutated. Returns 409 if `name`\nalready exists.",
+        "description": "Forks `name` off of `from` (defaults to `main`). The new branch shares\nbacking dataset data with its parent until it is mutated. Returns 409 if `name`\nalready exists. The GQ statement `branch create` on `POST /mutate` runs\nthe same body.",
         "operationId": "cluster_createBranch",
         "parameters": [
           {
@@ -854,7 +854,7 @@
           "branches"
         ],
         "summary": "Merge one branch into another.",
-        "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success.\n\nWith `delete_branch: true` the source branch is deleted after a successful\nmerge, under its own `branch_delete` policy check. The merge is durable by\nthen, so a deletion refusal or failure never fails the request; it is\nreported via `branch_deleted: false` + `branch_delete_error`.",
+        "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success.\n\nWith `delete_branch: true` the source branch is deleted after a successful\nmerge, under its own `branch_delete` policy check. The merge is durable by\nthen, so a deletion refusal or failure never fails the request; it is\nreported via `branch_deleted: false` + `branch_delete_error`.\n\nThe GQ statement `branch merge` on `POST /mutate` runs the same body\n(without the deletion composition) and answers the same 409 on conflict.",
         "operationId": "cluster_mergeBranches",
         "parameters": [
           {
@@ -982,7 +982,7 @@
           "branches"
         ],
         "summary": "Delete a branch.",
-        "description": "**Irreversible.** Removes the branch pointer; commits remain reachable\nonly if referenced by another branch. Returns 404 if the branch does not\nexist.",
+        "description": "**Irreversible.** Removes the branch pointer; commits remain reachable\nonly if referenced by another branch. Returns 404 if the branch does not\nexist. The GQ statement `branch delete` on `POST /mutate` runs the same\nbody.",
         "operationId": "cluster_deleteBranch",
         "parameters": [
           {
@@ -2430,7 +2430,7 @@
           "mutations"
         ],
         "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
-        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nConditional callers use `POST /mutate/if-graph-commit`. Keeping that\ncapability on a distinct path makes rolling upgrades fail closed: an older\nserver returns 404 instead of ignoring an unknown optional header and\nmutating unconditionally.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nConditional callers use `POST /mutate/if-graph-commit`. Keeping that\ncapability on a distinct path makes rolling upgrades fail closed: an older\nserver returns 404 instead of ignoring an unknown optional header and\nmutating unconditionally.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.\n\nThe GQ statements `branch create`, `branch delete`, and `branch merge`\n(grammar: `BranchStmt` in `omnigraph-compiler`) are also served\nhere, with no `branch`, `name`, or `params`: each runs the handler body\nof its `/branches` route (same Cedar action, admission check, and errors,\nincluding the 409 of a conflicting merge) and answers a `ChangeOutput`\nwhose `outcome` names the effect. `branch list` is rejected with 400;\nsend it to `POST /query`.",
         "operationId": "cluster_mutate",
         "parameters": [
           {
@@ -2465,7 +2465,7 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "Bad request - also returned when `branch list` arrives here instead of POST /query, when a request target accompanies a branch statement, when a name or parameters accompany a branch statement, and when a commit precondition accompanies a branch statement",
             "content": {
               "application/json": {
                 "schema": {
@@ -2494,8 +2494,18 @@
               }
             }
           },
+          "404": {
+            "description": "`branch delete` of a branch that does not exist, as DELETE /branches/{branch} answers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
-            "description": "Write-authority conflict",
+            "description": "Write-authority conflict; also `branch create` of a branch that already exists, and a conflicting `branch merge`, whose body carries `merge_conflicts`",
             "content": {
               "application/json": {
                 "schema": {
@@ -3108,7 +3118,7 @@
           "queries"
         ],
         "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
-        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. It shares `POST /read` target semantics (branch xor\nsnapshot) and the same Cedar action (Read), while its canonical response\nadditionally carries the pinned graph-commit token.",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. It shares `POST /read` target semantics (branch xor\nsnapshot) and the same Cedar action (Read), while its canonical response\nadditionally carries the pinned graph-commit token.\n\nThe GQ statement `branch list` is also served here, with no `branch`,\n`snapshot`, `name`, or `params`: it answers one row per branch (column\n`name`, byte order) under the same `read` check as `GET /branches`.\n`branch create`, `branch delete`, and `branch merge` are rejected with\n400; send them to `POST /mutate`.",
         "operationId": "cluster_query",
         "parameters": [
           {
@@ -3143,7 +3153,7 @@
             }
           },
           "400": {
-            "description": "Bad request - also returned when the query body contains mutations; use POST /mutate (or its deprecated alias POST /change) for write queries",
+            "description": "Bad request - also returned when the query body contains mutations (use POST /mutate, or its deprecated alias POST /change, for write queries), when a control write statement (`branch create`, `branch delete`, `branch merge`) arrives here instead of POST /mutate, when a request target accompanies a branch statement, and when a name or parameters accompany a branch statement",
             "content": {
               "application/json": {
                 "schema": {
@@ -3744,6 +3754,80 @@
           }
         }
       },
+      "BranchOutcomeOutput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "`name` was forked off `from`.",
+            "required": [
+              "from",
+              "name",
+              "kind"
+            ],
+            "properties": {
+              "from": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "created"
+                ]
+              },
+              "name": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`name` was removed.",
+            "required": [
+              "name",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "deleted"
+                ]
+              },
+              "name": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`source` was merged into `target`; `merge` is the three-way result,\none of `already_up_to_date`, `fast_forward`, `merged`.",
+            "required": [
+              "source",
+              "target",
+              "merge",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "merged"
+                ]
+              },
+              "merge": {
+                "$ref": "#/components/schemas/BranchMergeOutcome"
+              },
+              "source": {
+                "type": "string"
+              },
+              "target": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "description": "The effect of a branch statement sent to `POST /mutate`, tagged by `kind`.\nA merge conflict has no kind: it is the 409 `POST /branches/merge` answers.\nThe statement grammar is `BranchStmt` in `omnigraph-compiler`."
+      },
       "ChangeBaselineOutput": {
         "type": "object",
         "description": "Terminal payload of a baseline stream: the captured snapshot commit and\nthe cursor that resumes the feed immediately after it.",
@@ -4082,14 +4166,17 @@
           },
           "affected_edges": {
             "type": "integer",
+            "description": "Edges the mutation touched, under the `affected_nodes` rule.",
             "minimum": 0
           },
           "affected_nodes": {
             "type": "integer",
+            "description": "Nodes the mutation touched. Not reported for a branch statement,\nwhich moves refs, not nodes or edges: `0` whenever `outcome` is present.",
             "minimum": 0
           },
           "branch": {
-            "type": "string"
+            "type": "string",
+            "description": "The branch that received the effect. For a branch statement: the\ncreated branch, the deleted branch (gone by the time this is read),\nor the merge target."
           },
           "commit": {
             "oneOf": [
@@ -4097,12 +4184,25 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/CommitOutput"
+                "$ref": "#/components/schemas/CommitOutput",
+                "description": "The commit this write published, if any. For a branch statement: the\ntarget's head, read after the merge released its gates, so under a\nconcurrent writer it may name a later commit than the merge published.\n`null` for `created`, `deleted`, and `already_up_to_date`, which publish\nnothing, and `null` when that head read fails."
+              }
+            ]
+          },
+          "outcome": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BranchOutcomeOutput",
+                "description": "Present only when the request was a branch statement."
               }
             ]
           },
           "query_name": {
-            "type": "string"
+            "type": "string",
+            "description": "The declared mutation's name, or a branch statement's two keywords\n(`branch create`, `branch delete`, `branch merge`)."
           }
         }
       },
@@ -4131,7 +4231,7 @@
           },
           "query": {
             "type": "string",
-            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `name`.\n\nAccepts the legacy field name `query_source` as a deserialization alias.",
+            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `name`. May instead\nbe one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),\nsent with no `name`, `params`, or `branch`.\n\nAccepts the legacy field name `query_source` as a deserialization alias.",
             "example": "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
           }
         }
@@ -5088,7 +5188,7 @@
           },
           "query": {
             "type": "string",
-            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its\ndeprecated alias `POST /change`) instead.",
+            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its\ndeprecated alias `POST /change`) instead. May instead be the branch\nstatement `branch list`, sent with no `name`, `params`, `branch`, or\n`snapshot`.",
             "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
           },
           "snapshot": {

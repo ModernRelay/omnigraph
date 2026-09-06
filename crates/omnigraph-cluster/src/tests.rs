@@ -4966,6 +4966,59 @@ fn query_discovery_rejects_duplicates_and_parse_errors() {
     );
 }
 
+#[test]
+fn query_discovery_rejects_a_discovered_branch_statement_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("branch.gq"), "branch create b0\n").unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./branch.gq\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "query_parse_error"
+                && diagnostic.message.contains("branch statement")
+        }),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
+#[test]
+fn query_discovery_rejects_a_named_branch_statement_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("branch.gq"), "branch create b0\n").unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      b0:\n        file: ./branch.gq\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "query_parse_error"
+                && diagnostic.path == "graphs.knowledge.queries.b0"
+                && diagnostic.message.contains("branch statement")
+        }),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
 #[tokio::test]
 async fn status_warns_on_pending_recovery_sidecar() {
     let dir = fixture();

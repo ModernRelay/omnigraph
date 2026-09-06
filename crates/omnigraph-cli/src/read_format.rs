@@ -187,23 +187,22 @@ fn render_table_line(columns: &[String], widths: &[usize]) -> String {
 }
 
 fn header_line(output: &ReadOutput) -> String {
+    let from = output
+        .target
+        .snapshot
+        .as_deref()
+        .map(|id| format!(" from snapshot {}", id))
+        .or_else(|| {
+            output
+                .target
+                .branch
+                .as_deref()
+                .map(|branch| format!(" from branch {}", branch))
+        })
+        .unwrap_or_default();
     format!(
-        "{} rows from {} via {}",
-        output.row_count,
-        output
-            .target
-            .snapshot
-            .as_deref()
-            .map(|id| format!("snapshot {}", id))
-            .or_else(|| {
-                output
-                    .target
-                    .branch
-                    .as_deref()
-                    .map(|branch| format!("branch {}", branch))
-            })
-            .unwrap_or_else(|| "target".to_string()),
-        output.query_name
+        "{} rows{} via {}",
+        output.row_count, from, output.query_name
     )
 }
 

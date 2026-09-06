@@ -99,21 +99,22 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     // ── Data plane ── run against a graph (embedded or via --server).
-    /// Execute a read query against a branch or snapshot.
+    /// Execute a read query, or `branch list`, against a branch or snapshot.
     ///
-    /// Canonical read endpoint. The previous name `omnigraph read` is
-    /// kept as a visible alias and prints a one-line deprecation warning
-    /// when used. Pairs with `omnigraph mutate` on the write side.
+    /// Canonical read endpoint, paired with `mutate`; `read` is a visible alias that warns.
     #[command(visible_alias = "read")]
     Query {
         /// Query name. With no `--query`/`-e`, the stored query to invoke from
         /// the catalog (served — addressed via --server/--profile). With
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
-        /// Ad-hoc query file (a `.gq` you're authoring / break-glass).
+        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), or one
+        /// `branch list` statement.
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`.
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
+        /// the `branch list` statement, which takes no name, params, --branch
+        /// or --snapshot.
         #[arg(
             short = 'e',
             long = "query-string",
@@ -132,21 +133,22 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "format")]
         json: bool,
     },
-    /// Execute a graph mutation query against a branch.
+    /// Execute a mutation, or one `branch create`/`delete`/`merge` statement.
     ///
-    /// Canonical mutation endpoint. The previous name `omnigraph change`
-    /// is kept as a visible alias and prints a one-line deprecation
-    /// warning when used. Pairs with `omnigraph query` on the read side.
+    /// Canonical mutation endpoint, paired with `query`; `change` is a visible alias that warns.
     #[command(visible_alias = "change")]
     Mutate {
         /// Query name. With no `--query`/`-e`, the stored mutation to invoke
         /// from the catalog (served — addressed via --server/--profile). With
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
-        /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass).
+        /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass), or
+        /// one `branch create`/`branch delete`/`branch merge` statement.
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`.
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
+        /// one `branch create`/`branch delete`/`branch merge` statement, which
+        /// takes no name, params, --branch or --if-commit.
         #[arg(
             short = 'e',
             long = "query-string",

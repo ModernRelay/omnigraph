@@ -2,7 +2,10 @@
 
 A `.gq` file contains named, typed queries. Read queries match graph patterns
 and return columns; mutation queries use the same declaration form and are
-covered in [Mutations](../mutations/index.md).
+covered in [Mutations](../mutations/index.md). A file may instead hold exactly
+one branch statement (`branch create`, `branch delete`, `branch merge`, or
+`branch list`), never beside a query declaration; see
+[Branches, Commits, and History](../branching/index.md).
 
 ```gq
 query engineers($title: String) @description("People with a title") {
@@ -185,10 +188,12 @@ Validate queries without running them:
 omnigraph lint --query queries.gq --schema schema.pg --json
 ```
 
-`Q000` identifies parse errors. `L201` warns when a nullable property is never
-set by any update query in the inspected set. Type errors report the affected
-query and source location. The command exits nonzero when the overall status is
-an error.
+`Q000` identifies parse errors. A file that holds a [branch
+statement](../branching/index.md) where query declarations were expected also
+reports `Q000`. `L201` warns when a nullable
+property is never set by any update query in the inspected set. Type errors
+report the affected query and source location. The command exits nonzero when
+the overall status is an error.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

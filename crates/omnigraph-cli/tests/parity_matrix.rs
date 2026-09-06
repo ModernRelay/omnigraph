@@ -344,6 +344,132 @@ fn parity_branch_merge() {
     assert_parity("branch list (post delete-branch)", &l, &r);
 }
 
+fn listed_statement_names(output: &std::process::Output) -> Vec<String> {
+    parse_stdout_json(output)["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn parity_branch_statements() {
+    let p = parity();
+    let (l, r) = p.run(&["mutate", "-e", "branch create stmt", "--json"]);
+    assert_parity("branch create statement", &l, &r);
+    assert_eq!(parse_stdout_json(&l)["outcome"]["kind"], "created");
+
+    let (l, r) = p.run(&["query", "-e", "branch list", "--json"]);
+    assert_parity("branch list statement", &l, &r);
+    assert_eq!(listed_statement_names(&l), ["main", "stmt"]);
+
+    let (l, r) = p.run(&["mutate", "-e", "branch merge stmt into main", "--json"]);
+    assert_parity("branch merge statement (already up to date)", &l, &r);
+    assert_eq!(
+        parse_stdout_json(&l)["outcome"]["merge"],
+        "already_up_to_date"
+    );
+
+    let (l, r) = p.run(&[
+        "mutate",
+        "--branch",
+        "stmt",
+        "-e",
+        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+        "--params",
+        r#"{"name":"Stmt","age":1}"#,
+        "--json",
+    ]);
+    assert_write_parity("mutate on the statement branch", &l, &r);
+    let (l, r) = p.run(&["mutate", "-e", "branch merge stmt into main", "--json"]);
+    assert_write_parity(
+        "branch merge statement (fast_forward: both arms report the target's new head)",
+        &l,
+        &r,
+    );
+    assert_eq!(parse_stdout_json(&l)["outcome"]["merge"], "fast_forward");
+
+    let (l, r) = p.run(&["mutate", "-e", "branch delete stmt", "--yes", "--json"]);
+    assert_parity(
+        "branch delete statement (--yes: the served arm is non-local)",
+        &l,
+        &r,
+    );
+    assert_eq!(parse_stdout_json(&l)["outcome"]["kind"], "deleted");
+}
+
+#[test]
+fn parity_verb_and_statement_agree() {
+    let p = parity();
+    let (verb_l, verb_r) = p.run(&["branch", "create", "--from", "main", "via-verb", "--json"]);
+    let (stmt_l, stmt_r) = p.run(&["mutate", "-e", "branch create via_stmt from main", "--json"]);
+    for (arm, verb, stmt) in [("local", &verb_l, &stmt_l), ("remote", &verb_r, &stmt_r)] {
+        let verb = parse_stdout_json(verb);
+        let stmt = parse_stdout_json(stmt);
+        assert_eq!(verb["from"], stmt["outcome"]["from"], "{arm}: create from");
+        assert_eq!(verb["name"], "via-verb", "{arm}: verb name");
+        assert_eq!(stmt["outcome"]["name"], "via_stmt", "{arm}: statement name");
+        assert_eq!(verb["actor_id"], stmt["actor_id"], "{arm}: create actor");
+    }
+
+    let (verb_l, verb_r) = p.run(&["branch", "list", "--json"]);
+    let (stmt_l, stmt_r) = p.run(&["query", "-e", "branch list", "--json"]);
+    for (arm, verb, stmt) in [("local", &verb_l, &stmt_l), ("remote", &verb_r, &stmt_r)] {
+        let verb: Vec<String> = parse_stdout_json(verb)["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(verb, listed_statement_names(stmt), "{arm}: branch list");
+        assert_eq!(
+            verb,
+            ["main", "via-verb", "via_stmt"],
+            "{arm}: both branches listed"
+        );
+    }
+
+    let (verb_l, verb_r) = p.run(&["branch", "merge", "via-verb", "--into", "main", "--json"]);
+    let (stmt_l, stmt_r) = p.run(&["mutate", "-e", "branch merge via_stmt into main", "--json"]);
+    for (arm, verb, stmt) in [("local", &verb_l, &stmt_l), ("remote", &verb_r, &stmt_r)] {
+        let verb = parse_stdout_json(verb);
+        let stmt = parse_stdout_json(stmt);
+        assert_eq!(
+            verb["target"], stmt["outcome"]["target"],
+            "{arm}: merge target"
+        );
+        assert_eq!(
+            verb["outcome"], stmt["outcome"]["merge"],
+            "{arm}: merge result"
+        );
+        assert_eq!(
+            verb["outcome"], "already_up_to_date",
+            "{arm}: nothing to merge"
+        );
+        assert_eq!(verb["actor_id"], stmt["actor_id"], "{arm}: merge actor");
+    }
+
+    let (verb_l, verb_r) = p.run(&["branch", "delete", "via-verb", "--yes", "--json"]);
+    let (stmt_l, stmt_r) = p.run(&["mutate", "-e", "branch delete via_stmt", "--yes", "--json"]);
+    for (arm, verb, stmt) in [("local", &verb_l, &stmt_l), ("remote", &verb_r, &stmt_r)] {
+        let verb = parse_stdout_json(verb);
+        let stmt = parse_stdout_json(stmt);
+        assert_eq!(verb["name"], "via-verb", "{arm}: verb delete");
+        assert_eq!(
+            stmt["outcome"]["name"], "via_stmt",
+            "{arm}: statement delete"
+        );
+        assert_eq!(verb["actor_id"], stmt["actor_id"], "{arm}: delete actor");
+    }
+    let (verb_l, _) = p.run(&["branch", "list", "--json"]);
+    assert_eq!(
+        parse_stdout_json(&verb_l)["branches"],
+        serde_json::json!(["main"]),
+        "both deletions took effect"
+    );
+}
+
 #[test]
 fn parity_load() {
     let p = parity();

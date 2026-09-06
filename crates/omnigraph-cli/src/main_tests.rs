@@ -2,8 +2,9 @@
 //! main.rs; `use super::*` resolves through the #[path] declaration).
 
 use super::{
-    DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, legacy_change_request_body,
-    normalize_bearer_token, resolve_remote_bearer_token, sync_dir,
+    DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, branch_statement_change_request,
+    branch_statement_query_request, legacy_change_request_body, normalize_bearer_token,
+    resolve_remote_bearer_token, sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -66,6 +67,29 @@ fn legacy_change_request_body_omits_optional_fields_when_unset() {
     assert_eq!(body["branch"].as_str(), Some("main"));
     assert!(body.get("query_name").is_none());
     assert!(body.get("params").is_none());
+}
+
+#[test]
+fn branch_statement_requests_carry_the_source_alone() {
+    assert_eq!(
+        serde_json::to_value(branch_statement_query_request("branch list")).unwrap(),
+        json!({
+            "query": "branch list",
+            "name": null,
+            "params": null,
+            "branch": null,
+            "snapshot": null,
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(branch_statement_change_request("branch merge b0 into main")).unwrap(),
+        json!({
+            "query": "branch merge b0 into main",
+            "name": null,
+            "params": null,
+            "branch": null,
+        })
+    );
 }
 
 #[test]

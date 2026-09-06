@@ -5,7 +5,28 @@ COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
 LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
-query_file = { SOI ~ query_decl* ~ EOI }
+query_file = { SOI ~ (branch_stmt ~ statement_trailer? | query_decl*) ~ EOI }
+
+// Branch statements: one per file, never beside a query declaration. Each
+// keyword is atomic and closed by a word boundary: an identifier character
+// may not follow it (`branch createb0` is a parse error), a quoted name may.
+branch_stmt   = { kw_branch ~ (branch_create | branch_delete | branch_merge | branch_list) }
+// Anything the file holds after its branch statement, matched so the parser
+// refuses it by name instead of leaving `EOI` to report the expected tokens.
+statement_trailer = { (branch_stmt | query_decl)+ }
+branch_create = { kw_create ~ branch_name ~ (kw_from ~ branch_name)? }
+branch_delete = { kw_delete ~ branch_name }
+branch_merge  = { kw_merge ~ branch_name ~ (kw_into ~ branch_name)? }
+branch_list   = { kw_list }
+branch_name   = { ident | string_lit }
+
+kw_branch = @{ "branch" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_create = @{ "create" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_delete = @{ "delete" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_merge  = @{ "merge" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_list   = @{ "list" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_from   = @{ "from" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_into   = @{ "into" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 query_decl = {
     "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ "{"

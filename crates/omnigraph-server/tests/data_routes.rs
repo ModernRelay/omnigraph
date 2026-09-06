@@ -1291,8 +1291,9 @@ async fn ingest_rejects_payloads_over_32_mib() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn branch_merge_conflict_response_includes_structured_conflicts() {
+/// A loaded graph whose `main` and `feature` branches set Alice's age to
+/// different values, so merging `feature` into `main` conflicts.
+async fn divergent_alice_graph() -> tempfile::TempDir {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
@@ -1330,6 +1331,13 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
     .await
     .unwrap();
     drop(db);
+    temp
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_merge_conflict_response_includes_structured_conflicts() {
+    let temp = divergent_alice_graph().await;
+    let graph = graph_path(temp.path());
 
     let state = AppState::open(graph.to_string_lossy().to_string())
         .await
@@ -1361,6 +1369,508 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
             && conflict.entity_id.as_deref() == Some("Alice")
             && conflict.kind == omnigraph_server::api::MergeConflictKindOutput::DivergentUpdate
     }));
+}
+
+fn json_post(path: &str, body: &Value) -> Request<Body> {
+    Request::builder()
+        .uri(g(path))
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_statements_dispatch_to_their_route_bodies() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "branch create feature", "name": null, "params": null, "branch": null}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "branch": "feature",
+            "query_name": "branch create",
+            "affected_nodes": 0,
+            "affected_edges": 0,
+            "actor_id": null,
+            "commit": null,
+            "outcome": {"kind": "created", "from": "main", "name": "feature"}
+        })
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": "branch list", "name": null, "params": null, "branch": null, "snapshot": null}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "query_name": "branch list",
+            "target": {"branch": null, "snapshot": null},
+            "row_count": 2,
+            "columns": ["name"],
+            "rows": [{"name": "feature"}, {"name": "main"}]
+        })
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "branch create \"review/x\" from feature"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["outcome"],
+        json!({"kind": "created", "from": "feature", "name": "review/x"})
+    );
+    let (_, body) =
+        json_response(&app, json_post("/query", &json!({"query": "branch list"}))).await;
+    assert_eq!(
+        body["rows"],
+        json!([{"name": "feature"}, {"name": "main"}, {"name": "review/x"}])
+    );
+    let alice_on = |branch: &str| {
+        json_post(
+            "/query",
+            &json!({"query": FIND_PERSON_GQ, "params": {"name": "Alice"}, "branch": branch}),
+        )
+    };
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "branch merge feature into main"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "main");
+    assert_eq!(body["query_name"], "branch merge");
+    assert_eq!(body["commit"], Value::Null);
+    assert_eq!(
+        body["outcome"],
+        json!({"kind": "merged", "source": "feature", "target": "main", "merge": "already_up_to_date"})
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "insert_person",
+                "params": {"name": "Fay", "age": 40},
+                "branch": "feature"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("outcome").is_none(), "{body}");
+    let (status, body) = json_response(
+        &app,
+        json_post("/mutate", &json!({"query": "branch merge feature"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "main");
+    assert_eq!(body["affected_nodes"], 0);
+    assert_eq!(body["affected_edges"], 0);
+    assert_eq!(
+        body["outcome"],
+        json!({"kind": "merged", "source": "feature", "target": "main", "merge": "fast_forward"})
+    );
+    assert!(
+        body["commit"]["graph_commit_id"].is_string(),
+        "a fast-forward moves main to the commit authored on feature: {body}"
+    );
+    assert_receipt_commit_matches_get(&app, &body).await;
+    let (_, commits) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/commits?branch=main"))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(commits["commits"][0], body["commit"]);
+
+    for (branch, name) in [("main", "Mo"), ("review/x", "Ro")] {
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/mutate",
+                &json!({
+                    "query": MUTATION_QUERIES,
+                    "name": "insert_person",
+                    "params": {"name": name, "age": 50},
+                    "branch": branch
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "branch merge \"review/x\" into main"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["outcome"],
+        json!({"kind": "merged", "source": "review/x", "target": "main", "merge": "merged"})
+    );
+    assert!(
+        body["commit"]["merged_parent_commit_id"].is_string(),
+        "{body}"
+    );
+    assert_receipt_commit_matches_get(&app, &body).await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post("/mutate", &json!({"query": "branch delete \"review/x\""})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "branch": "review/x",
+            "query_name": "branch delete",
+            "affected_nodes": 0,
+            "affected_edges": 0,
+            "actor_id": null,
+            "commit": null,
+            "outcome": {"kind": "deleted", "name": "review/x"}
+        })
+    );
+    let (_, body) =
+        json_response(&app, json_post("/query", &json!({"query": "branch list"}))).await;
+    assert_eq!(body["rows"], json!([{"name": "feature"}, {"name": "main"}]));
+    let (status, body) = json_response(&app, alice_on("review/x")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "branch 'review/x' not found");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_statement_refusals_name_the_door_and_the_envelope() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let target_refusal = "a branch statement names its branches itself; drop the request target";
+    let name_refusal = "a branch statement takes no name and no parameters";
+    let deprecated_refusal =
+        "branch statements are not served on deprecated routes; use POST /mutate or POST /query";
+    let cases = [
+        (
+            "/query",
+            json!({"query": "branch create b0"}),
+            "statement 'branch create' is a control write; use POST /mutate",
+        ),
+        (
+            "/query",
+            json!({"query": "branch delete b0"}),
+            "statement 'branch delete' is a control write; use POST /mutate",
+        ),
+        (
+            "/query",
+            json!({"query": "branch merge b0 into main"}),
+            "statement 'branch merge' is a control write; use POST /mutate",
+        ),
+        (
+            "/query",
+            json!({"query": "branch merge b0", "branch": "main"}),
+            "statement 'branch merge' is a control write; use POST /mutate",
+        ),
+        (
+            "/mutate",
+            json!({"query": "branch list"}),
+            "statement 'branch list' is a read; use POST /query",
+        ),
+        (
+            "/mutate",
+            json!({"query": "branch list", "branch": "main"}),
+            "statement 'branch list' is a read; use POST /query",
+        ),
+        (
+            "/query",
+            json!({"query": "branch list", "branch": "main"}),
+            target_refusal,
+        ),
+        (
+            "/query",
+            json!({"query": "branch list", "snapshot": "0123456789abcdef"}),
+            target_refusal,
+        ),
+        (
+            "/query",
+            json!({"query": "branch list", "name": "branch list"}),
+            name_refusal,
+        ),
+        (
+            "/query",
+            json!({"query": "branch list", "params": {}}),
+            name_refusal,
+        ),
+        (
+            "/mutate",
+            json!({"query": "branch create b0", "branch": "main"}),
+            target_refusal,
+        ),
+        (
+            "/mutate",
+            json!({"query": "branch merge b0 into main", "branch": "other"}),
+            target_refusal,
+        ),
+        (
+            "/mutate",
+            json!({"query": "branch create b0", "name": "x"}),
+            name_refusal,
+        ),
+        (
+            "/mutate",
+            json!({"query": "branch delete b0", "params": {"a": 1}}),
+            name_refusal,
+        ),
+        (
+            "/mutate",
+            json!({"query": "branch create b0", "branch": "main", "name": "x"}),
+            target_refusal,
+        ),
+        (
+            "/read",
+            json!({"query_source": "branch list"}),
+            deprecated_refusal,
+        ),
+        (
+            "/read",
+            json!({"query_source": "branch create b0"}),
+            deprecated_refusal,
+        ),
+        (
+            "/read",
+            json!({"query_source": "branch delete b0"}),
+            deprecated_refusal,
+        ),
+        (
+            "/change",
+            json!({"query": "branch create b0"}),
+            deprecated_refusal,
+        ),
+        (
+            "/change",
+            json!({"query": "branch delete b0"}),
+            deprecated_refusal,
+        ),
+        (
+            "/change",
+            json!({"query": "branch list"}),
+            deprecated_refusal,
+        ),
+        (
+            "/change",
+            json!({"query": "branch merge b0", "branch": "main"}),
+            deprecated_refusal,
+        ),
+    ];
+    for (path, request, expected) in cases {
+        let (status, body) = json_response(&app, json_post(path, &request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {request}: {body}");
+        assert_eq!(body["error"], expected, "{path} {request}");
+    }
+
+    let conditional = [
+        (
+            json!({"query": "branch create b0"}),
+            "a branch statement takes no commit precondition",
+        ),
+        (
+            json!({"query": "branch create b0", "name": "x"}),
+            name_refusal,
+        ),
+    ];
+    for (request, expected) in conditional {
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .uri(g("/mutate/if-graph-commit"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .header("omnigraph-if-graph-commit", "0123456789abcdef")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {body}");
+        assert_eq!(body["error"], expected, "{request}");
+    }
+
+    let (route_status, route_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches/nope"))
+            .method(Method::DELETE)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let (status, body) = json_response(
+        &app,
+        json_post("/mutate", &json!({"query": "branch delete nope"})),
+    )
+    .await;
+    assert_eq!(route_status, StatusCode::NOT_FOUND, "{route_body}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body, route_body);
+
+    let (status, body) =
+        json_response(&app, json_post("/query", &json!({"query": "branch list"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"],
+        json!([{"name": "main"}]),
+        "a refused statement must create nothing"
+    );
+
+    let create = BranchCreateRequest {
+        from: Some("main".to_string()),
+        name: "b0".to_string(),
+    };
+    let post_create = || {
+        Request::builder()
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create).unwrap()))
+            .unwrap()
+    };
+    let (status, body) = json_response(&app, post_create()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (route_status, route_body) = json_response(&app, post_create()).await;
+    let (status, body) = json_response(
+        &app,
+        json_post("/mutate", &json!({"query": "branch create b0"})),
+    )
+    .await;
+    assert_eq!(route_status, StatusCode::CONFLICT, "{route_body}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body, route_body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parse_error_precedes_policy_denial_on_every_door() {
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-bruno", "team-token"), ("act-nobody", "nobody-token")],
+        POLICY_YAML,
+    )
+    .await;
+    let send = |path: &str, token: &str, body: Value, expected_head: bool| {
+        let mut builder = Request::builder()
+            .uri(g(path))
+            .method(Method::POST)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json");
+        if expected_head {
+            builder = builder.header("omnigraph-if-graph-commit", "0123456789abcdef");
+        }
+        builder
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let read = json!({"query": FIND_PERSON_GQ, "params": {"name": "Alice"}});
+    let legacy_read = json!({"query_source": FIND_PERSON_GQ, "params": {"name": "Alice"}});
+    let write = json!({
+        "query": MUTATION_QUERIES,
+        "name": "insert_person",
+        "params": {"name": "Nia", "age": 20},
+        "branch": "main"
+    });
+    let denied = [
+        ("/query", "nobody-token", read.clone(), false),
+        ("/read", "nobody-token", legacy_read, false),
+        ("/mutate", "team-token", write.clone(), false),
+        ("/change", "team-token", write.clone(), false),
+        ("/mutate/if-graph-commit", "team-token", write, true),
+    ];
+    for (path, token, body, expected_head) in denied {
+        let (status, out) = json_response(&app, send(path, token, body, expected_head)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {out}");
+
+        let mut unparseable = json!({"query": "not gq at all", "branch": "main"});
+        if path == "/read" {
+            unparseable = json!({"query_source": "not gq at all", "branch": "main"});
+        }
+        let (status, out) =
+            json_response(&app, send(path, token, unparseable, expected_head)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
+        let error: ErrorOutput = serde_json::from_value(out).unwrap();
+        assert_ne!(error.code, Some(ErrorCode::Forbidden), "{path}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_merge_statement_conflict_matches_the_route_409() {
+    let temp = divergent_alice_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let app = build_app(state);
+
+    let merge = BranchMergeRequest {
+        source: "feature".to_string(),
+        target: Some("main".to_string()),
+        delete_branch: false,
+    };
+    let (route_status, route_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches/merge"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(route_status, StatusCode::CONFLICT, "{route_body}");
+
+    let (statement_status, statement_body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "branch merge feature into main"}),
+        ),
+    )
+    .await;
+    assert_eq!(statement_status, StatusCode::CONFLICT, "{statement_body}");
+    assert_eq!(statement_body, route_body);
+    let error: ErrorOutput = serde_json::from_value(statement_body).unwrap();
+    assert_eq!(error.code, Some(ErrorCode::Conflict));
+    assert!(
+        error.error.starts_with("merge conflicts: "),
+        "{}",
+        error.error
+    );
+    assert!(!error.merge_conflicts.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1462,6 +1972,32 @@ async fn query_endpoint_rejects_mutation_with_400() {
         err.contains("contains mutations") && err.contains("POST /mutate"),
         "expected mutation-rejection message pointing at canonical /mutate, got: {err}"
     );
+}
+
+/// An empty source parses to zero declarations; the refusal names that
+/// count, not "multiple queries", and names no CLI flag.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_source_is_refused_as_no_query_on_both_doors() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    for path in ["/query", "/mutate"] {
+        let request = json!({ "query": "" });
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .uri(g(path))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(
+            body["error"], "query file contains no query",
+            "{path}: {body}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

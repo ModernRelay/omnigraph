@@ -10,6 +10,22 @@ omnigraph branch merge review/2026-04-25 --into main \
 
 The source is positional. `--into` defaults to `main`.
 
+The same merge as a GQ statement, sent to `POST /mutate` with no request
+target, name, or parameters:
+
+```text
+branch merge "review/2026-04-25" into main
+```
+
+`into` defaults to `main`; a name with `/`, `-`, or `.` is quoted, a bare
+identifier such as `main` is not. The answer is a `ChangeOutput` with
+`outcome.kind = "merged"` and `outcome.merge` one of `already_up_to_date`,
+`fast_forward`, or `merged`; after a `fast_forward` or `merged` result,
+`commit` is the target's newest commit. The statement has no `--delete-branch`
+composition: follow it with `branch delete <source>`. A merge statement takes
+no commit precondition -- `POST /mutate/if-graph-commit` and `--if-commit`
+refuse one beside it -- and no front offers a conditional merge today.
+
 ## Outcomes
 
 - **Already up to date**: the target already contains the source changes.
@@ -49,8 +65,9 @@ structured conflict list and publishes nothing.
 | `value_constraint_violation` | The result would violate an enum, range, or other value constraint. |
 
 Each conflict identifies the affected type and, when applicable, entity id. The
-HTTP server returns conflicts with status `409`. Reconcile the data on one or
-both branches, then run the merge again.
+HTTP server returns conflicts with status `409`, the same answer for
+`POST /branches/merge` and for a `branch merge` statement on `POST /mutate`.
+Reconcile the data on one or both branches, then run the merge again.
 
 ## Merge classification mode
 

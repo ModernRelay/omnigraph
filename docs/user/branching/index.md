@@ -31,6 +31,30 @@ omnigraph branch delete review/abandoned --store graph.omni
 Creating a branch defaults to `main` when `--from` is omitted. A load can create
 a missing target branch by combining `--branch <name>` with `--from <base>`.
 
+Each branch operation is also a GQ statement, so a client that already sends
+`.gq` source needs no second transport. The three control writes go to
+`POST /mutate` and the listing to `POST /query`, each with no request target,
+name, or parameters:
+
+```text
+branch create "review/add-benchmark" from main
+branch merge "review/add-benchmark" into main
+branch delete "review/abandoned"
+branch list
+```
+
+`from` defaults to `main` and `into` defaults to `main`. A name outside the
+identifier alphabet (a lowercase letter or `_`, then letters, digits, or `_`),
+such as one containing `/`, `-`, or `.`, is quoted, as above; `main`, `b0`,
+and `_x` are bare. A control write answers a
+`ChangeOutput` whose `outcome.kind` is `created`, `deleted`, or `merged`
+(`outcome.merge` holds the merge result), with zero affected counts; a merge
+that publishes a commit reports it in `commit`. `branch list` answers one row
+per branch in column `name`, sorted by name. Each statement runs under the same
+policy check as its HTTP route (`POST /branches`, `DELETE /branches/{branch}`,
+`POST /branches/merge`, `GET /branches`), and `branch list` is a read, so it is
+refused on `POST /mutate` as a control write is refused on `POST /query`.
+
 Branches are cheap until written: unchanged data remains shared with the source.
 A branch remains after a normal merge, so prefer `--delete-branch` or delete it
 when review is complete. Live branches retain the history they depend on and can

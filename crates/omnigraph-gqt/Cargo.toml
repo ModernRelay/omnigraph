@@ -13,6 +13,7 @@ publish = false
 doctest = false
 
 [dependencies]
+arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 futures = { workspace = true }
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.10.0" }
@@ -22,7 +23,6 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-arrow-array = { workspace = true }
 datatest-stable = "0.3"
 
 # One libtest test per `cases/*.gqt`; mechanism and flags: tests/gq_logic_tests.rs.
