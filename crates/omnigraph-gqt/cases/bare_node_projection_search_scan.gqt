@@ -1,0 +1,54 @@
+# issue: none
+# notes: the node object from a search scan and from an rrf-fused batch carries no `_score`, `_distance` or vector column.
+
+--- schema
+node Chunk {
+    slug: String @key
+    text: String @index
+    embedding: Vector(2)
+}
+
+--- seed
+{"type":"Chunk","data":{"slug":"chunk-00","text":"needle needle needle filler","embedding":[1.0,0.0]}}
+{"type":"Chunk","data":{"slug":"chunk-01","text":"needle needle filler","embedding":[0.0,1.0]}}
+{"type":"Chunk","data":{"slug":"chunk-02","text":"needle filler","embedding":[0.7,0.7]}}
+
+--- query
+query top_chunks($q: String) {
+    match {
+        $c: Chunk
+        search($c.text, $q)
+    }
+    return { $c }
+    order { bm25($c.text, $q) }
+    limit 2
+}
+
+--- params
+{"q": "needle"}
+
+--- expect ordered
+{"c": {"id": "chunk-00", "slug": "chunk-00", "text": "needle needle needle filler"}}
+{"c": {"id": "chunk-01", "slug": "chunk-01", "text": "needle needle filler"}}
+
+--- expect shape
+c: Chunk
+
+--- query
+query hybrid_chunks($q: String, $v: Vector(2)) {
+    match { $c: Chunk }
+    return { $c }
+    order { rrf(nearest($c.embedding, $v), bm25($c.text, $q)) }
+    limit 3
+}
+
+--- params
+{"q": "needle", "v": [1.0, 0.0]}
+
+--- expect unordered
+{"c": {"id": "chunk-00", "slug": "chunk-00", "text": "needle needle needle filler"}}
+{"c": {"id": "chunk-01", "slug": "chunk-01", "text": "needle needle filler"}}
+{"c": {"id": "chunk-02", "slug": "chunk-02", "text": "needle filler"}}
+
+--- expect shape
+c: Chunk

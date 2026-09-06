@@ -605,11 +605,62 @@ mod shape_section {
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Fields};
 
+    use omnigraph_compiler::catalog::{Catalog, build_catalog};
+
     use super::*;
-    use crate::shape::{ShapeLine, bless_shape_lines, parse_shape_body, shape_mismatch};
+    use crate::shape::{ShapeLine, ShapeType, bless_shape_lines, parse_shape_body, shape_mismatch};
+
+    fn age_catalog() -> Catalog {
+        build_catalog(
+            &parse_schema("node Person {\n    name: String @key\n    age: I32?\n}\n").unwrap(),
+        )
+        .unwrap()
+    }
 
     fn mismatch(shape: &[ShapeLine], result: &QueryResult) -> Option<String> {
-        shape_mismatch(shape, result, &Schema::empty())
+        shape_mismatch(shape, result, &Schema::empty(), &age_catalog())
+    }
+
+    fn person_struct() -> (Field, ArrayRef) {
+        let fields = Fields::from(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, true),
+        ]);
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["alice"])),
+            Arc::new(StringArray::from(vec!["alice"])),
+            Arc::new(Int32Array::from(vec![Some(30)])),
+        ];
+        let array = StructArray::new(fields.clone(), columns, None);
+        (
+            Field::new("p", DataType::Struct(fields), false),
+            Arc::new(array),
+        )
+    }
+
+    #[test]
+    fn a_node_type_name_spells_a_bare_node_projection() {
+        let parsed = lines("p: Person");
+        assert!(matches!(&parsed[0].shape_type, ShapeType::Node(name) if name == "Person"));
+        assert!(shape_refusal("p: Person?").contains("never null"));
+        let (field, column) = person_struct();
+        let executed = result(vec![field], vec![column]);
+        assert_eq!(mismatch(&lines("p: Person"), &executed), None);
+        assert!(
+            mismatch(&lines("p: Company"), &executed)
+                .unwrap()
+                .contains("not a node type")
+        );
+        assert!(
+            mismatch(&lines("p: String"), &executed)
+                .unwrap()
+                .contains("expected String")
+        );
+        assert_eq!(
+            bless_shape_lines(&executed, &age_catalog()).unwrap(),
+            vec!["p: Person".to_string()]
+        );
     }
 
     const AGE_SCHEMA: &str = "--- schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n";
@@ -675,7 +726,10 @@ mod shape_section {
         );
         let spelled: Vec<String> = parsed
             .iter()
-            .map(|l| format!("{}: {}", l.name, l.prop_type.display_name()))
+            .map(|l| match &l.shape_type {
+                ShapeType::Scalar(t) => format!("{}: {}", l.name, t.display_name()),
+                ShapeType::Node(n) => format!("{}: {n}", l.name),
+            })
             .collect();
         assert_eq!(
             spelled,
@@ -705,7 +759,7 @@ mod shape_section {
             shape_refusal("p.name: String @key")
                 .contains("annotations and body constraints are not allowed")
         );
-        assert!(shape_refusal("p: Person").contains("line 1: unknown type `Person`"));
+        assert!(shape_refusal("p: 123").contains("line 1: unknown type `123`"));
         assert!(shape_refusal("Name: String").contains("`Name` is not a column name"));
         assert!(shape_refusal("p.name: String // note").contains("comments are refused"));
         assert!(shape_refusal("p.name: String /* note */").contains("comments are refused"));
@@ -785,7 +839,7 @@ mod shape_section {
             ],
         );
         assert_eq!(
-            bless_shape_lines(&executed).unwrap(),
+            bless_shape_lines(&executed, &age_catalog()).unwrap(),
             ["p.name: String?", "p.age: I32"]
         );
     }
@@ -820,10 +874,11 @@ mod shape_section {
             vec![Arc::new(arrow_array::Float64Array::from(vec![None::<f64>]))],
         );
         let inferred = Schema::new(vec![Field::new("m", DataType::Int32, true)]);
-        let msg = shape_mismatch(&lines("m: I32?"), &executed, &inferred).unwrap();
+        let msg = shape_mismatch(&lines("m: I32?"), &executed, &inferred, &age_catalog()).unwrap();
         assert!(msg.ends_with("expected I32, the executor returned F64; the compiler infers I32 too, so the executor is wrong, not the shape line"), "{msg}");
         let disagreeing = Schema::new(vec![Field::new("m", DataType::Float64, true)]);
-        let msg = shape_mismatch(&lines("m: I32?"), &executed, &disagreeing).unwrap();
+        let msg =
+            shape_mismatch(&lines("m: I32?"), &executed, &disagreeing, &age_catalog()).unwrap();
         assert!(
             msg.ends_with("expected I32, the executor returned F64"),
             "{msg}"
@@ -836,7 +891,7 @@ mod shape_section {
             vec![Field::new("?", DataType::Int64, true)],
             vec![Arc::new(arrow_array::Int64Array::from(vec![0]))],
         );
-        let err = bless_shape_lines(&executed).unwrap_err();
+        let err = bless_shape_lines(&executed, &age_catalog()).unwrap_err();
         assert!(
             err.contains("column `?` is not a column name the shape section can spell"),
             "{err}"
@@ -855,8 +910,11 @@ mod shape_section {
             vec![Field::new("p", DataType::Struct(inner), false)],
             vec![column],
         );
-        let err = bless_shape_lines(&executed).unwrap_err();
-        assert!(err.contains("column `p` has Arrow type Struct"), "{err}");
+        let err = bless_shape_lines(&executed, &age_catalog()).unwrap_err();
+        assert!(
+            err.contains("column `p` is a struct that is no node type's object"),
+            "{err}"
+        );
         let msg = mismatch(&lines("p: String"), &executed).unwrap();
         assert!(
             msg.contains("expected String, the executor returned Struct"),

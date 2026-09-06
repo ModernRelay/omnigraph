@@ -1585,32 +1585,7 @@ fn resolve_expr_type(
         Expr::Aggregate { func, arg } => {
             let arg_type = resolve_expr_type(catalog, arg, ctx, params)?;
             reject_blob_read_value(&arg_type, arg)?;
-
-            match func {
-                AggFunc::Sum | AggFunc::Avg => {
-                    if let ResolvedType::Scalar(s) = &arg_type
-                        && (s.list || !s.scalar.is_numeric())
-                    {
-                        return Err(CompilerError::Type(format!(
-                            "T8: {} requires numeric type, got {}",
-                            func,
-                            s.display_name()
-                        )));
-                    }
-                }
-                AggFunc::Min | AggFunc::Max => {
-                    if let ResolvedType::Scalar(s) = &arg_type
-                        && (s.list || !s.scalar.is_orderable())
-                    {
-                        return Err(CompilerError::Type(format!(
-                            "T8: {} requires a numeric, String, Bool, Date, or DateTime scalar, got {}",
-                            func,
-                            s.display_name()
-                        )));
-                    }
-                }
-                _ => {} // count works on any type
-            }
+            check_aggregate_argument(func, arg, &arg_type)?;
 
             Ok(ResolvedType::Aggregate)
         }
@@ -1662,6 +1637,7 @@ fn infer_projection_field(
             // unsupported Blob value.
             let resolved_arg = resolve_expr_type(catalog, arg, ctx, params)?;
             reject_blob_read_value(&resolved_arg, arg)?;
+            check_aggregate_argument(func, arg, &resolved_arg)?;
             let (data_type, nullable) = match func {
                 AggFunc::Count => (DataType::Int64, true),
                 AggFunc::Avg | AggFunc::Sum => (DataType::Float64, true),
@@ -1726,6 +1702,46 @@ fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
     }
 }
 
+/// T8: `count` takes a scalar or a node, `sum`/`avg` a numeric, `min`/`max` an
+/// orderable scalar; none takes an aggregate.
+fn check_aggregate_argument(func: &AggFunc, arg: &Expr, arg_type: &ResolvedType) -> Result<()> {
+    match (func, arg_type) {
+        (_, ResolvedType::Aggregate) => Err(CompilerError::Type(format!(
+            "T8: {func} cannot take an aggregate or a forward alias reference as its argument"
+        ))),
+        (AggFunc::Count, _) => Ok(()),
+        (_, ResolvedType::Node(_)) => {
+            let subject = match arg {
+                Expr::Variable(name) => format!("node binding `${name}`"),
+                Expr::AliasRef(alias) => format!("node projection `{alias}`"),
+                other => format!("node value `{other:?}`"),
+            };
+            Err(CompilerError::Type(format!(
+                "T8: {func} cannot take {subject} bare; access one of the node's properties (`$var.{{prop}}`)"
+            )))
+        }
+        (AggFunc::Sum | AggFunc::Avg, ResolvedType::Scalar(s))
+            if s.list || !s.scalar.is_numeric() =>
+        {
+            Err(CompilerError::Type(format!(
+                "T8: {} requires numeric type, got {}",
+                func,
+                s.display_name()
+            )))
+        }
+        (AggFunc::Min | AggFunc::Max, ResolvedType::Scalar(s))
+            if s.list || !s.scalar.is_orderable() =>
+        {
+            Err(CompilerError::Type(format!(
+                "T8: {} requires a numeric, String, Bool, Date, or DateTime scalar, got {}",
+                func,
+                s.display_name()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn resolved_type_to_field_shape(
     catalog: &Catalog,
     resolved: &ResolvedType,
@@ -1737,10 +1753,10 @@ fn resolved_type_to_field_shape(
                 CompilerError::Type(format!("type `{}` not found in catalog", type_name))
             })?;
             let fields: Vec<Field> = node_type
-                .arrow_schema
-                .fields()
-                .iter()
-                .map(|field| field.as_ref().clone())
+                .node_object_fields()
+                .map(|field| {
+                    Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                })
                 .collect();
             Ok((DataType::Struct(fields.into()), false))
         }

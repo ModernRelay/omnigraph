@@ -78,6 +78,22 @@ impl NodeType {
             .and_then(|v| v.first())
             .map(|s| s.as_str())
     }
+
+    /// The fields `return { $p }` projects: the identity column and the declared
+    /// properties except `Blob` (T24) and `Vector`. Keyed on declared types: the
+    /// engine rewrites Blob columns to their storage field before executing.
+    pub fn node_object_fields(&self) -> impl Iterator<Item = &Arc<Field>> {
+        self.arrow_schema.fields().iter().filter(|field| {
+            let name = field.name().as_str();
+            match self.properties.get(name) {
+                Some(prop) => {
+                    !self.blob_properties.contains(name)
+                        && !matches!(prop.scalar, ScalarType::Vector(_))
+                }
+                None => name == "id",
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

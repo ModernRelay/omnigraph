@@ -409,11 +409,12 @@ included) is refused. A step is one of:
   an unaliased property or an aggregate over one, `p` for an aggregate over
   a bare variable (`count($p)`), the alias for `expr as alias`, `literal`
   for an unaliased literal, `x` for a bare `$x`, `__nanograph_now` for
-  `now()`. A bare node projection (`return { $p }`) has no green shape
-  today: the executor returns the node's id column while the compiler infers
-  the node object, so the computed check refuses the step whatever the shape
-  line says; no corpus case carries one until the engine returns the node
-  object. `x` for a bare `$x` therefore names a bare parameter. The type is
+  `now()`. A bare node projection (`return { $p }`) is spelled with its node
+  type name, `p: Person`: the column must be that type's node object, a struct
+  whose fields are the identity column and the declared properties minus
+  `Blob` and `Vector`, in the catalog's order; it takes no `?` (the object is
+  never null), and bless spells a struct column back as the one node type
+  whose object it is. Otherwise the type is
   a `.pg` `type_ref` (`schema.pest`) parsed by the product schema parser as
   the one property of a `node Shape { }` declaration the runner wraps around
   it; annotations, body constraints, `enum(...)` (its Arrow type is `Utf8`,
@@ -1335,3 +1336,16 @@ listed in Compatibility and reversibility.
     sqllogictest mistakes, for the three-letter form only; and this
     entry's earlier "No new section, no opt-out", which described the
     computed check alone.
+- 2026-09-06, amendment from the PR that makes a bare node projection
+  return the node object (#631). Trigger: the shape line's type was a `.pg`
+  `type_ref`, which has no spelling for a struct column, so the three cases
+  that pin the object could not carry the mandatory shape section.
+  - File format, the shape section: a node type name (`p: Person`) spells a
+    bare node projection; the runner checks that the executed column is a
+    struct whose field names are that type's node object (the identity
+    column and the declared properties minus `Blob` and `Vector`, in the
+    catalog's order); `Person?` is refused (the object is never null);
+    bless spells a struct column as the one node type whose object it is,
+    and refuses a struct that is no type's object. Superseded: File format
+    "A bare node projection (`return { $p }`) has no green shape today ...
+    no corpus case carries one until the engine returns the node object".
