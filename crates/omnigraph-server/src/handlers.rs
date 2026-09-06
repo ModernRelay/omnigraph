@@ -1710,18 +1710,17 @@ pub(crate) async fn server_list_queries(
     tag = "schema",
     operation_id = "getSchema",
     responses(
-        (status = 200, description = "Customer source and accepted effective schema", body = SchemaOutput),
+        (status = 200, description = "Current schema source", body = SchemaOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
-/// Read the customer source and accepted effective schema.
+/// Read the current schema source.
 ///
-/// `schema_source` preserves the project's `.pg` source. `accepted_schema`
-/// describes all queryable types, including the system-owned OmniActor type
-/// and its stable provenance binding. Both come from one coherent, read-only
-/// accepted schema view; the system type is never appended to customer source.
+/// Returns the project's schema as a single string in `.pg` source form.
+/// Useful for clients that want to introspect available types and properties
+/// before constructing GQ queries. Read-only.
 pub(crate) async fn server_schema_get(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1735,15 +1734,11 @@ pub(crate) async fn server_schema_get(
             target_branch: None,
         },
     )?;
-    let (schema_source, accepted_schema) = handle
-        .engine
-        .accepted_schema()
-        .await
-        .map_err(ApiError::from_omni)?;
-    Ok(Json(SchemaOutput {
-        schema_source,
-        accepted_schema: Some(accepted_schema),
-    }))
+    let schema_source = {
+        let db = &handle.engine;
+        db.schema_source().to_string()
+    };
+    Ok(Json(SchemaOutput { schema_source }))
 }
 
 #[utoipa::path(
@@ -1823,7 +1818,6 @@ pub(crate) async fn server_schema_apply(
             &request.schema_source,
             omnigraph::db::SchemaApplyOptions {
                 allow_data_loss: request.allow_data_loss,
-                actor_provenance: request.actor_provenance,
             },
             actor_id,
             |catalog| {

@@ -65,7 +65,7 @@ use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 use omnigraph_compiler::schema::parser::parse_schema;
 
-use helpers::{open_dataset_head, snapshot_main};
+use helpers::{init_and_load, open_dataset_head, snapshot_main};
 
 #[test]
 fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
@@ -1814,18 +1814,7 @@ async fn dataset_delta_historical_images_require_the_exact_end_handle() {
 #[tokio::test]
 async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
     let dir = tempfile::tempdir().unwrap();
-    let db = omnigraph::db::Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
-        .await
-        .unwrap();
-    db.load_as(
-        "main",
-        None,
-        helpers::TEST_DATA,
-        omnigraph::loader::LoadMode::Overwrite,
-        Some("lance-surface-guard"),
-    )
-    .await
-    .unwrap();
+    let db = init_and_load(&dir).await;
     let snapshot = snapshot_main(&db).await.unwrap();
     let entries = snapshot
         .datasets()
@@ -1840,8 +1829,8 @@ async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
         .collect::<Vec<_>>();
     assert_eq!(
         entries.len(),
-        5,
-        "the fixture must exercise every declared node and edge table plus the actor table"
+        4,
+        "the shared fixture must exercise every declared node and edge table"
     );
 
     for (table_key, table_path, table_version, table_branch) in entries {

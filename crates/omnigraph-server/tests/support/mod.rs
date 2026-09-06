@@ -15,7 +15,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
-use omnigraph::loader::LoadMode;
+use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
 use omnigraph_server::api::{BranchCreateRequest, BranchMergeRequest, ChangeRequest, ReadRequest};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
@@ -116,14 +116,6 @@ pub async fn init_loaded_graph() -> tempfile::TempDir {
 }
 
 pub async fn init_graph_with_schema_and_data(schema: &str, data: &str) -> tempfile::TempDir {
-    init_graph_with_schema_and_data_as(schema, data, None).await
-}
-
-pub async fn init_graph_with_schema_and_data_as(
-    schema: &str,
-    data: &str,
-    actor: Option<&str>,
-) -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     let graph = graph_path(temp.path());
     fs::create_dir_all(&graph).unwrap();
@@ -131,9 +123,7 @@ pub async fn init_graph_with_schema_and_data_as(
         .await
         .unwrap();
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-    db.load_as("main", None, data, LoadMode::Overwrite, actor)
-        .await
-        .unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
     temp
 }
 
@@ -416,20 +406,7 @@ pub async fn app_for_loaded_graph_with_auth_tokens_and_policy(
     tokens: &[(&str, &str)],
     policy: &str,
 ) -> (tempfile::TempDir, Router) {
-    app_for_loaded_graph_with_auth_tokens_and_policy_as(tokens, policy, None).await
-}
-
-pub async fn app_for_loaded_graph_with_auth_tokens_and_policy_as(
-    tokens: &[(&str, &str)],
-    policy: &str,
-    actor: Option<&str>,
-) -> (tempfile::TempDir, Router) {
-    let temp = init_graph_with_schema_and_data_as(
-        &fs::read_to_string(fixture("test.pg")).unwrap(),
-        &fs::read_to_string(fixture("test.jsonl")).unwrap(),
-        actor,
-    )
-    .await;
+    let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, policy).unwrap();

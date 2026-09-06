@@ -766,7 +766,6 @@ fn optimize_json_succeeds_on_local_graph() {
         rebuilt["rebuilt_indexes"],
         serde_json::json!([
             {"type_key": "node:Company", "property": "name"},
-            {"type_key": "node:OmniActor", "property": "actorId"},
             {"type_key": "node:Person", "property": "name"},
         ])
     );
@@ -797,7 +796,7 @@ fn optimize_json_succeeds_on_local_graph() {
         "{stderr}"
     );
     assert!(
-        human.contains("branch search-upgrade, 3 indexes rebuilt"),
+        human.contains("branch search-upgrade, 2 indexes rebuilt"),
         "{human}"
     );
     assert!(
@@ -807,10 +806,6 @@ fn optimize_json_succeeds_on_local_graph() {
     assert!(human.contains("graph commit:"), "{human}");
     assert!(
         human.contains("node type 'Company', property 'name'"),
-        "{human}"
-    );
-    assert!(
-        human.contains("node type 'OmniActor', property 'actorId'"),
         "{human}"
     );
     assert!(!human.contains("node:Person"), "{human}");
@@ -964,18 +959,13 @@ fn repair_json_reports_noop_on_clean_graph() {
     assert!(payload.get("manifest_version").is_none());
     assert!(payload.get("tables").is_none());
     let datasets = payload["datasets"].as_array().unwrap();
-    assert_eq!(datasets.len(), 5);
-    assert!(
-        datasets
-            .iter()
-            .any(|dataset| dataset["type_key"] == "node:OmniActor")
-    );
+    assert_eq!(datasets.len(), 4);
     assert!(datasets.iter().all(|dataset| {
         dataset["classification"] == "no_drift" && dataset["action"] == "no_op"
     }));
 
     let human = stdout_string(&output_success(cli().arg("repair").arg(&graph)));
-    assert!(human.contains("preview mode, 5 datasets"), "{human}");
+    assert!(human.contains("preview mode, 4 datasets"), "{human}");
     assert!(human.contains("node type 'Person'"), "{human}");
     assert!(!human.contains("node:Person"), "{human}");
 }
@@ -986,18 +976,9 @@ fn rebuild_full_text_indexes_json_noops_without_full_text_properties() {
     let graph = graph_path(temp.path());
     let schema = temp.path().join("scalar.pg");
     // The ordinary Person fixture has FTS even without @index because its
-    // String @key participates in index intent. A numeric key does not. Opt
-    // out of the builtin's String key so this fixture has no FTS properties.
+    // String @key participates in index intent. A numeric key does not.
     write_file(&schema, "node Metric { key: I64 @key }");
-    output_success(
-        cli()
-            .arg("init")
-            .arg("--actor-provenance")
-            .arg("false")
-            .arg("--schema")
-            .arg(&schema)
-            .arg(&graph),
-    );
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
     let version_before = manifest_dataset_version(&graph);
     let rebuilt = parse_stdout_json(&output_success(
         cli()
@@ -2756,12 +2737,7 @@ fn cleanup_against_local_scope_executes_with_confirm() {
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(payload.get("tables").is_none());
     let datasets = payload["datasets"].as_array().unwrap();
-    assert_eq!(datasets.len(), 5, "{payload}");
-    assert!(
-        datasets
-            .iter()
-            .any(|dataset| dataset["type_key"] == "node:OmniActor")
-    );
+    assert_eq!(datasets.len(), 4, "{payload}");
     assert!(
         datasets
             .iter()
@@ -2778,7 +2754,7 @@ fn cleanup_against_local_scope_executes_with_confirm() {
             .arg("--confirm")
             .arg(&graph),
     ));
-    assert!(human.contains("across 5 datasets"), "{human}");
+    assert!(human.contains("across 4 datasets"), "{human}");
 }
 
 #[test]

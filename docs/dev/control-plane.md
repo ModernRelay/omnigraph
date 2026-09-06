@@ -12,15 +12,6 @@ There are three distinct views:
 
 The desired bundle is input, not runtime authority. A server reads the applied revision; editing `cluster.yaml` changes nothing until a successful apply and server restart.
 
-Per-graph `actor_provenance` is optional desired intent (RFC 0054): omission
-defaults to enabled at creation and preserves accepted state on an existing
-graph. The engine's accepted `SchemaIR` binding is the sole authority for the
-effective setting and protected actor identities. A schema resource in the
-cluster ledger may record the observed boolean for reconciliation; serving
-never installs that projection as an override. Source digests remain hashes
-of customer `.pg` bytes. Explicit setting changes are schema update plan
-items even when those bytes are unchanged.
-
 The storage root defaults to the configuration directory and may instead be a local path, `file://`, `s3://`, or `az://` root. Graph roots are derived as `graphs/<graph_id>.omni` beneath it.
 
 ## Durable layout
@@ -37,12 +28,6 @@ The storage root defaults to the configuration directory and may instead be a lo
 All stored control objects use the shared storage adapter. Filesystem replacement and object-store PUT/CAS details stay below that boundary; higher layers deal in versioned reads, conditional writes, and normalized roots.
 
 The cluster sidecars are separate from each graph's ordinary recovery-v9 sidecar. A control-plane operation may need both: the outer cluster record describes desired/applied resource progress, while the engine record owns graph-table publication.
-
-Actor-setting schema sidecars record observed and desired booleans alongside
-the source digest. Sweep compares the accepted setting as well as source
-bytes, so a same-source toggle cannot be mistaken for an already recorded
-schema. The graph's ordinary schema publication and recovery own the effect;
-the cluster only reconciles its existing ledger and sidecar.
 
 ## Lifecycle operations
 

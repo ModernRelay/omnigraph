@@ -399,11 +399,9 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open_read_only(uri).await?;
-                let (schema_source, accepted_schema) = db.accepted_schema().await?;
+                let db = Omnigraph::open(uri).await?;
                 Ok(SchemaOutput {
-                    schema_source,
-                    accepted_schema: Some(accepted_schema),
+                    schema_source: db.schema_source().to_string(),
                 })
             }
         }
@@ -1246,7 +1244,6 @@ impl GraphClient {
         &self,
         schema_source: &str,
         allow_data_loss: bool,
-        actor_provenance: Option<bool>,
         validate: F,
     ) -> Result<SchemaApplyOutput>
     where
@@ -1270,7 +1267,6 @@ impl GraphClient {
                     Some(serde_json::to_value(SchemaApplyRequest {
                         schema_source: schema_source.to_string(),
                         allow_data_loss,
-                        actor_provenance,
                     })?),
                     token.as_deref(),
                 )
@@ -1281,10 +1277,7 @@ impl GraphClient {
                 let result = db
                     .apply_schema_as_with_catalog_check(
                         schema_source,
-                        omnigraph::db::SchemaApplyOptions {
-                            allow_data_loss,
-                            actor_provenance,
-                        },
+                        omnigraph::db::SchemaApplyOptions { allow_data_loss },
                         actor.as_deref(),
                         validate,
                     )

@@ -1284,6 +1284,7 @@ async fn refresh_records_live_schema_digest_and_graph_manifest_version() {
         sha256_hex(SCHEMA.as_bytes())
     );
     assert!(out.observations["graph.knowledge"]["graph_manifest_version"].is_u64());
+    assert_legacy_state_resource_fields(dir.path());
 }
 
 #[tokio::test]
@@ -1590,6 +1591,30 @@ fn historical_graph_digest(
 
 fn read_state_json(config_dir: &Path) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(config_dir.join(CLUSTER_STATE_FILE)).unwrap()).unwrap()
+}
+
+fn assert_legacy_state_resource_fields(config_dir: &Path) {
+    let state = read_state_json(config_dir);
+    assert_eq!(state["version"], 1);
+    let resources = state["applied_revision"]["resources"].as_object().unwrap();
+    assert!(resources.contains_key("schema.knowledge"));
+    for resource in resources.values() {
+        // These are the complete pre-#663 StateResource keys, whose decoder
+        // denies unknown fields. Pin the serialized contract independently.
+        for key in resource.as_object().unwrap().keys() {
+            assert!(
+                matches!(
+                    key.as_str(),
+                    "digest"
+                        | "applies_to"
+                        | "embedding_provider"
+                        | "embedding_profile"
+                        | "external_blob_policy"
+                ),
+                "unexpected ledger field: {key}"
+            );
+        }
+    }
 }
 
 fn recovery_sidecars(config_dir: &Path) -> Vec<std::path::PathBuf> {
@@ -2062,6 +2087,7 @@ async fn apply_schema_update_and_dependent_query_in_one_run() {
         desired.resource_digests["schema.knowledge"]
     );
     let state = read_state_json(dir.path());
+    assert_legacy_state_resource_fields(dir.path());
     assert_eq!(
         state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
         desired.resource_digests["schema.knowledge"]
@@ -2073,238 +2099,6 @@ async fn apply_schema_update_and_dependent_query_in_one_run() {
                 .unwrap()
                 .next()
                 .is_none()
-    );
-}
-
-#[tokio::test]
-async fn actor_provenance_cluster_toggle_and_omission_follow_accepted_schema() {
-    let dir = fixture();
-    let graph_uri = derived_graph_uri(dir.path(), "knowledge");
-    Omnigraph::init_with_options(
-        &graph_uri,
-        SCHEMA,
-        omnigraph::db::InitOptions {
-            actor_provenance: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    write_applyable_state(dir.path());
-    let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
-    let original = fs::read_to_string(&config_path).unwrap();
-    let initial = apply_config_dir(dir.path()).await;
-    assert!(initial.ok, "{:?}", initial.diagnostics);
-    assert!(
-        !Omnigraph::open_read_only(&graph_uri)
-            .await
-            .unwrap()
-            .actor_provenance_enabled()
-            .await
-            .unwrap()
-    );
-    for enabled in [true, false, true] {
-        fs::write(
-            &config_path,
-            original.replace(
-                "    schema:",
-                &format!("    actor_provenance: {enabled}\n    schema:"),
-            ),
-        )
-        .unwrap();
-        let plan = plan_config_dir(dir.path()).await;
-        assert!(plan.ok, "{:?}", plan.diagnostics);
-        let schema_change = plan
-            .changes
-            .iter()
-            .find(|change| change.resource == "schema.knowledge")
-            .unwrap();
-        assert_eq!(schema_change.before_digest, schema_change.after_digest);
-        assert_eq!(
-            schema_change.metadata_change,
-            Some(PlanMetadataChange::ActorProvenance)
-        );
-        assert!(schema_change.migration.as_ref().unwrap().steps.iter().any(|step|
-            matches!(step, omnigraph_compiler::SchemaMigrationStep::SetActorProvenance { enabled: actual } if *actual == enabled)));
-        let applied = apply_config_dir(dir.path()).await;
-        assert!(applied.ok && applied.converged, "{applied:?}");
-        let db = Omnigraph::open_read_only(&graph_uri).await.unwrap();
-        assert_eq!(db.actor_provenance_enabled().await.unwrap(), enabled);
-        assert!(db.catalog().node_types.contains_key("OmniActor"));
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["schema.knowledge"]["actor_provenance"],
-            enabled
-        );
-        let repeated = apply_config_dir(dir.path()).await;
-        assert!(
-            repeated.ok && repeated.converged && !repeated.state_written,
-            "{repeated:?}"
-        );
-        fs::write(&config_path, &original).unwrap();
-        let omitted = apply_config_dir(dir.path()).await;
-        assert!(omitted.ok && omitted.converged, "{omitted:?}");
-        assert_eq!(db.actor_provenance_enabled().await.unwrap(), enabled);
-    }
-}
-
-#[tokio::test]
-async fn actor_provenance_cluster_query_validation_uses_actual_binding() {
-    for (enabled, disable_existing, missing_root) in [
-        (false, false, false),
-        (true, false, false),
-        (true, true, false),
-        (true, false, true),
-    ] {
-        let dir = fixture();
-        let graph_uri = derived_graph_uri(dir.path(), "knowledge");
-        Omnigraph::init_with_options(
-            &graph_uri,
-            SCHEMA,
-            omnigraph::db::InitOptions {
-                actor_provenance: enabled,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        if disable_existing {
-            Omnigraph::open(&graph_uri)
-                .await
-                .unwrap()
-                .apply_schema_as(
-                    SCHEMA,
-                    SchemaApplyOptions {
-                        actor_provenance: Some(false),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await
-                .unwrap();
-        }
-        write_applyable_state(dir.path());
-        if missing_root {
-            fs::remove_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni")).unwrap();
-        }
-        fs::write(
-            dir.path().join("people.gq"),
-            "query find_person() { match { $a: OmniActor } return { $a.actorId } }",
-        )
-        .unwrap();
-        assert!(
-            validate_config_dir(dir.path()).ok,
-            "static catalog is provisional"
-        );
-        let before = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
-        let has_accepted_binding = enabled && !missing_root;
-        let plan = plan_config_dir(dir.path()).await;
-        assert_eq!(plan.ok, has_accepted_binding, "{:?}", plan.diagnostics);
-        let apply = apply_config_dir(dir.path()).await;
-        assert_eq!(apply.ok, has_accepted_binding, "{:?}", apply.diagnostics);
-        if !has_accepted_binding {
-            assert_eq!(
-                fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
-                before
-            );
-            assert!(
-                apply
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.code == "query_typecheck_error")
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn actor_provenance_cluster_never_adopts_customer_type() {
-    let dir = fixture();
-    let source = format!("{SCHEMA}\nnode OmniActor {{ label: String @key }}\n");
-    fs::write(dir.path().join("people.pg"), &source).unwrap();
-    let graph_uri = derived_graph_uri(dir.path(), "knowledge");
-    Omnigraph::init_with_options(
-        &graph_uri,
-        &source,
-        omnigraph::db::InitOptions {
-            actor_provenance: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    write_applyable_state(dir.path());
-    assert!(validate_config_dir(dir.path()).ok);
-    let preserved = apply_config_dir(dir.path()).await;
-    assert!(preserved.ok && preserved.converged, "{preserved:?}");
-    let db = Omnigraph::open_read_only(&graph_uri).await.unwrap();
-    let before = db.accepted_schema().await.unwrap();
-    assert!(before.1.actor_provenance.is_none());
-
-    let config = dir.path().join(CLUSTER_CONFIG_FILE);
-    let original = fs::read_to_string(&config).unwrap();
-    fs::write(
-        &config,
-        original.replace("    schema:", "    actor_provenance: true\n    schema:"),
-    )
-    .unwrap();
-    let refused = apply_config_dir(dir.path()).await;
-    assert!(!refused.ok, "{refused:?}");
-    assert!(
-        refused
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "schema_apply_failed"
-                && diagnostic.message.contains("OmniActor")),
-        "{refused:?}"
-    );
-    assert_eq!(db.accepted_schema().await.unwrap(), before);
-
-    // A customer-owned collision can be renamed through the existing schema
-    // lifecycle, then enabled separately. Static validation must not mistake
-    // this explicit legacy rename for a rename of the protected built-in.
-    fs::write(&config, &original).unwrap();
-    fs::write(
-        dir.path().join("people.pg"),
-        source.replace(
-            "node OmniActor",
-            "node HumanActor @rename_from(\"OmniActor\")",
-        ),
-    )
-    .unwrap();
-    let renamed = apply_config_dir(dir.path()).await;
-    assert!(renamed.ok && renamed.converged, "{renamed:?}");
-    let (_, unbound) = db.accepted_schema().await.unwrap();
-    assert!(unbound.actor_provenance.is_none());
-    let customer_id = unbound
-        .nodes
-        .iter()
-        .find(|node| node.name == "HumanActor")
-        .unwrap()
-        .type_id;
-    // The now-stale rename hint stays inert when enabling afterward.
-    fs::write(
-        dir.path().join("people.gq"),
-        "query find_person() { match { $a: OmniActor } return { $a.actorId } }",
-    )
-    .unwrap();
-    fs::write(
-        &config,
-        original.replace("    schema:", "    actor_provenance: true\n    schema:"),
-    )
-    .unwrap();
-    let enabled = apply_config_dir(dir.path()).await;
-    assert!(enabled.ok && enabled.converged, "{enabled:?}");
-    let (_, accepted) = db.accepted_schema().await.unwrap();
-    assert!(accepted.actor_provenance.as_ref().unwrap().enabled);
-    assert_eq!(
-        accepted
-            .nodes
-            .iter()
-            .find(|node| node.name == "HumanActor")
-            .unwrap()
-            .type_id,
-        customer_id
     );
 }
 
@@ -2507,88 +2301,59 @@ async fn apply_blocks_schema_update_while_recovery_pending() {
 
 #[tokio::test]
 async fn apply_creates_graph_and_unblocks_dependents() {
-    for actor_provenance in [None, Some(false)] {
-        let dir = fixture();
-        if actor_provenance.is_none() {
-            fs::write(
-                dir.path().join("people.pg"),
-                format!("{SCHEMA}\nedge AuthoredBy: Person -> OmniActor\n"),
-            )
-            .unwrap();
-        }
-        if let Some(enabled) = actor_provenance {
-            let path = dir.path().join(CLUSTER_CONFIG_FILE);
-            let source = fs::read_to_string(&path).unwrap();
-            fs::write(
-                path,
-                source.replace(
-                    "    schema:",
-                    &format!("    actor_provenance: {enabled}\n    schema:"),
-                ),
-            )
-            .unwrap();
-        }
-        write_state_resources(dir.path(), &[]);
+    let dir = fixture();
+    write_state_resources(dir.path(), &[]);
 
-        let out = apply_config_dir(dir.path()).await;
-        assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(out.converged, "{out:?}");
-        let by_resource: BTreeMap<&str, &PlanChange> = out
-            .changes
-            .iter()
-            .map(|change| (change.resource.as_str(), change))
-            .collect();
-        // Stage 4A: the create executes, and its dependents apply in-run.
-        assert_eq!(
-            by_resource["graph.knowledge"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["schema.knowledge"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["query.knowledge.find_person"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert_eq!(
-            by_resource["policy.base"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        // The graph exists on disk and opens; state records everything.
-        let graph_uri = derived_graph_uri(dir.path(), "knowledge");
-        let db = Omnigraph::open_read_only(&graph_uri).await.unwrap();
-        assert_eq!(
-            db.actor_provenance_enabled().await.unwrap(),
-            actor_provenance.unwrap_or(true)
-        );
-        assert_eq!(
-            db.catalog().edge_types.contains_key("AuthoredBy"),
-            actor_provenance.is_none()
-        );
-        let desired = validate_config_dir(dir.path());
-        assert_eq!(
-            sha256_hex(db.schema_source().as_bytes()),
-            desired.resource_digests["schema.knowledge"]
-        );
-        let state = read_state_json(dir.path());
-        assert_eq!(
-            state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
-            desired.resource_digests["schema.knowledge"]
-        );
-        assert_eq!(
-            state["resource_statuses"]["graph.knowledge"]["status"],
-            "applied"
-        );
-        // The create's sidecar was retired after the state CAS landed.
-        assert!(
-            !dir.path().join(CLUSTER_RECOVERIES_DIR).exists()
-                || fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
-                    .unwrap()
-                    .next()
-                    .is_none()
-        );
-    }
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.converged, "{out:?}");
+    let by_resource: BTreeMap<&str, &PlanChange> = out
+        .changes
+        .iter()
+        .map(|change| (change.resource.as_str(), change))
+        .collect();
+    // Stage 4A: the create executes, and its dependents apply in-run.
+    assert_eq!(
+        by_resource["graph.knowledge"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["schema.knowledge"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["query.knowledge.find_person"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    assert_eq!(
+        by_resource["policy.base"].disposition,
+        Some(ApplyDisposition::Applied)
+    );
+    // The graph exists on disk and opens; state records everything.
+    let graph_uri = derived_graph_uri(dir.path(), "knowledge");
+    let db = Omnigraph::open_read_only(&graph_uri).await.unwrap();
+    let desired = validate_config_dir(dir.path());
+    assert_eq!(
+        sha256_hex(db.schema_source().as_bytes()),
+        desired.resource_digests["schema.knowledge"]
+    );
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        desired.resource_digests["schema.knowledge"]
+    );
+    assert_eq!(
+        state["resource_statuses"]["graph.knowledge"]["status"],
+        "applied"
+    );
+    // The create's sidecar was retired after the state CAS landed.
+    assert!(
+        !dir.path().join(CLUSTER_RECOVERIES_DIR).exists()
+            || fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
+                .unwrap()
+                .next()
+                .is_none()
+    );
 }
 
 #[tokio::test]
@@ -3643,66 +3408,6 @@ async fn sweep_rolls_forward_completed_schema_apply() {
                     && record["outcome"] == "rolled_forward")
         );
     assert!(out.converged, "{out:?}");
-}
-
-#[tokio::test]
-async fn actor_provenance_recovery_distinguishes_same_source_toggle_effect() {
-    for effect_landed in [false, true] {
-        let dir = fixture();
-        let root = derived_graph_uri(dir.path(), "knowledge");
-        let db = Omnigraph::init_with_options(
-            &root,
-            SCHEMA,
-            omnigraph::db::InitOptions {
-                actor_provenance: false,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        write_applyable_state(dir.path());
-        let sidecar = write_schema_apply_sidecar(
-            dir.path(),
-            "knowledge",
-            &sha256_hex(SCHEMA.as_bytes()),
-            "01ACTOR",
-        );
-        let mut intent: serde_json::Value =
-            serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
-        intent["observed_actor_provenance"] = json!(false);
-        intent["desired_actor_provenance"] = json!(true);
-        fs::write(&sidecar, serde_json::to_vec(&intent).unwrap()).unwrap();
-        if effect_landed {
-            db.apply_schema_as(
-                SCHEMA,
-                SchemaApplyOptions {
-                    actor_provenance: Some(true),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        }
-        // Desired omission must preserve whichever accepted setting exists.
-        let apply = apply_config_dir(dir.path()).await;
-        assert!(apply.ok && apply.converged, "{apply:?}");
-        assert_eq!(db.actor_provenance_enabled().await.unwrap(), effect_landed);
-        assert!(!sidecar.exists());
-        assert_eq!(
-            apply
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward"),
-            effect_landed
-        );
-        if effect_landed {
-            assert_eq!(
-                read_state_json(dir.path())["applied_revision"]["resources"]["schema.knowledge"]["actor_provenance"],
-                true
-            );
-        }
-    }
 }
 
 #[tokio::test]

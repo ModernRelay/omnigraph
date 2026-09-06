@@ -47,30 +47,6 @@ enum CandidateTableState {
     RewriteMerged(StagedMergeResult),
 }
 
-impl CandidateTableState {
-    fn changes_content(&self) -> bool {
-        let has_rows =
-            |table: &Option<StagedTable>| table.as_ref().is_some_and(|table| table.row_count > 0);
-        match self {
-            Self::AdoptSourceState {
-                validation_delta: None,
-            } => false,
-            Self::AdoptSourceState {
-                validation_delta: Some(delta),
-            }
-            | Self::AdoptWithDelta(delta) => {
-                has_rows(&delta.inserts)
-                    || has_rows(&delta.upserts)
-                    || !delta.deleted_ids.chunks.is_empty()
-            }
-            Self::AdoptPureInserts(proof) => proof.inserted_rows > 0,
-            Self::RewriteMerged(staged) => {
-                has_rows(&staged.delta_staged) || !staged.deleted_ids.chunks.is_empty()
-            }
-        }
-    }
-}
-
 /// An existing target ref opened and verified against the target manifest pin
 /// under branch merge's final schema -> branch -> table gate envelope.
 ///
@@ -107,50 +83,6 @@ struct StagedTable {
 struct StagedMergeResult {
     delta_staged: Option<StagedTable>,
     deleted_ids: DeleteIdChunks,
-}
-
-/// Extend only the private merge-delta dataset. The resulting actor row will
-/// join the normal exact transaction chain and one graph publication.
-async fn append_protocol_actor(
-    table_key: &str,
-    existing: Option<StagedTable>,
-    batch: RecordBatch,
-) -> Result<StagedTable> {
-    if batch.num_rows() != 1 || schema_has_blob(&batch.schema())? {
-        return Err(OmniError::manifest_internal("invalid protocol actor batch"));
-    }
-    let mut staged = match existing {
-        Some(staged) => staged,
-        None => {
-            StagedTableWriter::new(table_key, batch.schema())?
-                .finish()
-                .await?
-        }
-    };
-    let chunks = staged.chunk_rows.len().saturating_add(1) as u64;
-    if chunks > crate::db::manifest::MAX_BRANCH_MERGE_DATA_TRANSACTIONS {
-        return Err(OmniError::resource_limit(
-            "branch-merge recovery transaction chain",
-            crate::db::manifest::MAX_BRANCH_MERGE_DATA_TRANSACTIONS,
-            chunks,
-        ));
-    }
-    let row_count = staged
-        .row_count
-        .checked_add(1)
-        .ok_or_else(|| OmniError::manifest_internal("actor merge row count overflow"))?;
-    let uri = staged
-        ._dir
-        .path()
-        .join("table.lance")
-        .to_string_lossy()
-        .into_owned();
-    staged.dataset =
-        crate::table_store::TableStore::append_or_create_batch(&uri, Some(staged.dataset), batch)
-            .await?;
-    staged.row_count = row_count;
-    staged.chunk_rows.push(1);
-    Ok(staged)
 }
 
 /// Exact delete-filter chunks retained from the ordered merge walk.
@@ -5100,12 +5032,6 @@ impl Omnigraph {
         let source_snapshot = &source_txn.base;
         let target_snapshot = &target_txn.base;
         let catalog = target_txn.catalog.as_ref();
-        if catalog
-            .actor_provenance()
-            .is_some_and(|binding| binding.enabled)
-        {
-            super::actor_provenance::validate_actor_id(actor_id)?;
-        }
         let mut table_keys = HashSet::new();
         for entry in base_snapshot.datasets() {
             table_keys.insert(entry.type_key.clone());
@@ -5406,72 +5332,6 @@ impl Omnigraph {
 
         if !conflicts.is_empty() {
             return Err(OmniError::MergeConflicts(conflicts));
-        }
-
-        // A lineage-only merge must not become an actor-only content write.
-        // If the source already carries the initiating actor, the ordinary
-        // protected-table merge carries that row. Otherwise append one row to
-        // the actor table's normal merge delta, never to the live graph.
-        if candidates
-            .values()
-            .any(CandidateTableState::changes_content)
-            && let Some((table_key, batch)) = Box::pin(
-                super::actor_provenance::prepare_actor_batch(target_snapshot, catalog, actor_id),
-            )
-            .await?
-            && Box::pin(super::actor_provenance::prepare_actor_batch(
-                source_snapshot,
-                catalog,
-                actor_id,
-            ))
-            .await?
-            .is_some()
-        {
-            // Reuse classification: an absent actor candidate has no incoming
-            // delta, and an existing rewrite already owns its staged rows. Only
-            // pointer/insert-chain adoption needs a materialized delta before
-            // adding the initiating actor. Unchanged actors never require a
-            // three-way full-table walk for this one-row participant.
-            let merged = match candidates.remove(&table_key) {
-                None => None,
-                Some(CandidateTableState::RewriteMerged(staged)) => Some(staged),
-                Some(_) => {
-                    // Keep additional Lance preparation futures off the
-                    // already large branch-merge state machine's stack.
-                    Box::pin(stage_streaming_table_merge(
-                        self,
-                        &table_key,
-                        catalog,
-                        base_snapshot,
-                        source_snapshot,
-                        target_snapshot,
-                        &mut conflicts,
-                        &empty_external_preflight,
-                    ))
-                    .await?
-                }
-            };
-            let mut merged = merged.unwrap_or_else(|| StagedMergeResult {
-                delta_staged: None,
-                deleted_ids: DeleteIdChunks::default(),
-            });
-            if !conflicts.is_empty() {
-                return Err(OmniError::MergeConflicts(conflicts));
-            }
-            if !merged.deleted_ids.chunks.is_empty() {
-                return Err(OmniError::manifest(
-                    "actor_provenance_protected: merge cannot remove actor identities",
-                ));
-            }
-            merged.delta_staged = Some(
-                Box::pin(append_protocol_actor(
-                    &table_key,
-                    merged.delta_staged.take(),
-                    batch,
-                ))
-                .await?,
-            );
-            candidates.insert(table_key, CandidateTableState::RewriteMerged(merged));
         }
 
         // A narrow pure-insert fast-forward can avoid reconstructing the same

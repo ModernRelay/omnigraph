@@ -245,8 +245,6 @@ write_surfaces! {
 // name-independent: a newly named `transact`, `publish`, or `vacuum` method
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
-    ("db/omnigraph.rs", "accepted_schema"),
-    ("db/omnigraph.rs", "actor_provenance_enabled"),
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "open_read_only_with_storage"),
     ("db/omnigraph.rs", "manifest_has_external_base_paths"),
@@ -843,8 +841,7 @@ durable_calls! {
     ("db/manifest/recovery.rs", "promote_exact_schema_staging(", 2, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "discard_exact_schema_staging(", 2, WriteProtocol::RecoveryExecutor),
     ("exec/merge.rs", "TableStore::create_empty_dataset(", 1, WriteProtocol::EphemeralScratch),
-    // The protocol actor row joins the private delta before the same MergeV9 publication.
-    ("exec/merge.rs", "TableStore::append_or_create_batch(", 2, WriteProtocol::EphemeralScratch),
+    ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
