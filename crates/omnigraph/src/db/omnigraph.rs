@@ -421,7 +421,7 @@ impl Omnigraph {
 
         let schema_shape = read_schema_shape_from_source(schema_source)?;
         let resolution = omnigraph_compiler::initialize_schema_ir_with_actor_provenance(
-            SchemaIdentityDomain::new(),
+            SchemaIdentityDomain::from_ulid(crate::dst_ids::new_ulid()),
             &schema_shape,
             options.actor_provenance,
         )

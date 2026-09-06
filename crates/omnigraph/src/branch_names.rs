@@ -20,7 +20,7 @@ pub(crate) const INCARNATION_LEN: usize = 26;
 
 /// Mint a fresh branch incarnation.
 pub(crate) fn mint_incarnation() -> String {
-    ulid::Ulid::new().to_string()
+    crate::dst_ids::new_ulid().to_string()
 }
 
 /// The native Lance ref name for one incarnation of a logical branch.
