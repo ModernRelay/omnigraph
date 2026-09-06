@@ -38,7 +38,7 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0054**; lower gaps are historical and must
+The next available number is **0055**; lower gaps are historical and must
 not be reused (0047 and 0048 are allocated by PR #606; 0050 by the
 `rfc/0050-engine-crate-topology` branch).
 
@@ -179,3 +179,4 @@ This table is the human index for the canonical RFC corpus.
 | [0051](0051-json-output-via-arrow.md) | JSON output via Arrow | maintainer | draft | partial |
 | [0052](0052-managed-control-plane-cli.md) | Managed control-plane CLI | maintainer | accepted | complete |
 | [0053](0053-offline-data-token-verification.md) | Offline data-token verification | maintainer | accepted | complete |
+| [0054](0054-default-actor-provenance.md) | Default graph actor provenance | maintainer | accepted | complete |

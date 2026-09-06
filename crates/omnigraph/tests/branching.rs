@@ -2118,11 +2118,24 @@ async fn branch_merge_records_actor_on_latest_commit() {
     .await
     .unwrap();
 
+    let before = version_main(&main).await.unwrap();
+    assert_eq!(count_rows(&main, "node:OmniActor").await, 0);
+
     let outcome = main
         .branch_merge_as("feature", "main", Some("act-ragnor"))
         .await
         .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(version_main(&main).await.unwrap(), before + 1);
+    assert_eq!(count_rows(&main, "node:OmniActor").await, 1);
+    let source_actors = read_table_branch(&main, "feature", "node:OmniActor").await;
+    assert_eq!(
+        source_actors
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        0
+    );
 
     let head = CommitGraph::open(uri)
         .await
@@ -2172,6 +2185,139 @@ async fn already_up_to_date_branch_merge_returns_without_new_commit() {
     );
     assert_eq!(head.graph_commit_id, target_head_before.graph_commit_id);
     assert_eq!(head.graph_commit_id, source_head_before.graph_commit_id);
+}
+
+/// Actor content follows the same branch and merge publication as customer
+/// rows. Exercise pointer/insert adoption and an already-staged three-way delta.
+#[tokio::test]
+async fn actor_provenance_is_inherited_isolated_and_merged_once() {
+    for (divergent, actor_in_source, shared_actor) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+        (true, false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        db.mutate_as(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Ancestor")], &[("$age", 40)]),
+            Some("ancestor"),
+        )
+        .await
+        .unwrap();
+        db.branch_create("feature").await.unwrap();
+        assert_eq!(count_rows_branch(&db, "feature", "node:OmniActor").await, 1);
+        db.mutate_as(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Source")], &[("$age", 41)]),
+            Some("source"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count_rows(&db, "node:OmniActor").await,
+            1,
+            "first-use actor on feature must not leak to main"
+        );
+        if divergent {
+            db.mutate_as(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Target")], &[("$age", 42)]),
+                Some(if shared_actor { "source" } else { "target" }),
+            )
+            .await
+            .unwrap();
+        }
+        let actor = if actor_in_source { "source" } else { "merger" };
+        let before = version_main(&db).await.unwrap();
+        let outcome = db
+            .branch_merge_as("feature", "main", Some(actor))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            if divergent {
+                MergeOutcome::Merged
+            } else {
+                MergeOutcome::FastForward
+            }
+        );
+        assert_eq!(version_main(&db).await.unwrap(), before + 1);
+        let query = "query actors() { match { $a: OmniActor } return { $a.actorId } }";
+        let actors = db
+            .query(
+                ReadTarget::branch("main"),
+                query,
+                "actors",
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let mut expected = vec!["ancestor", "source"];
+        if divergent && !shared_actor {
+            expected.push("target");
+        }
+        if !actor_in_source {
+            expected.push("merger");
+        }
+        expected.sort();
+        assert_eq!(first_column_sorted(&actors), expected);
+        assert_eq!(count_rows_branch(&db, "feature", "node:OmniActor").await, 2);
+        let commit = CommitGraph::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap()
+            .head_commit()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(commit.actor_id.as_deref(), Some(actor));
+
+        assert_eq!(
+            db.branch_merge_as("feature", "main", Some("no-op-merger"))
+                .await
+                .unwrap(),
+            MergeOutcome::AlreadyUpToDate
+        );
+        assert_eq!(version_main(&db).await.unwrap(), before + 1);
+        assert_eq!(count_rows(&db, "node:OmniActor").await, expected.len());
+    }
+}
+
+#[tokio::test]
+async fn actor_provenance_metadata_only_merge_does_not_materialize() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let before = version_main(&db).await.unwrap();
+    db.rebuild_full_text_indices_on("main").await.unwrap();
+    assert!(
+        version_main(&db).await.unwrap() > before,
+        "fixture must advance physical metadata without changing logical rows"
+    );
+    assert_eq!(
+        db.branch_merge_as("main", "feature", Some("metadata-merger"))
+            .await
+            .unwrap(),
+        MergeOutcome::FastForward
+    );
+    assert_eq!(count_rows(&db, "node:OmniActor").await, 0);
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:OmniActor").await,
+        0,
+        "same-content pointer adoption must not become actor-only content"
+    );
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Person").await,
+        count_rows(&db, "node:Person").await
+    );
 }
 
 #[tokio::test]

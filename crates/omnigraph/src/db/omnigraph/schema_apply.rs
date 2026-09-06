@@ -6,7 +6,7 @@ const SCHEMA_BLOB_DESCRIPTOR_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Operator-supplied options that gate schema-apply behavior.
 ///
-/// Today the only knob is `allow_data_loss`, which promotes
+/// `allow_data_loss` promotes
 /// `DropMode::Soft` steps to `DropMode::Hard` (per chassis v1
 /// commit #5). Soft is the default — drops are reversible via Lance
 /// time travel until cleanup runs. Hard runs `cleanup_old_versions`
@@ -19,6 +19,8 @@ pub struct SchemaApplyOptions {
     /// `DropMode::Hard`, and the apply path runs
     /// `cleanup_old_versions` on affected datasets after the publish.
     pub allow_data_loss: bool,
+    /// Set automatic actor materialization; omission preserves the accepted setting.
+    pub actor_provenance: Option<bool>,
 }
 
 /// Promote every `Soft` drop variant in the plan to `Hard` when
@@ -50,10 +52,15 @@ fn pre_minted_schema_transaction(
 fn resolve_desired_schema_ir(
     accepted_ir: &SchemaIR,
     desired_schema_source: &str,
+    actor_provenance: Option<bool>,
 ) -> Result<SchemaIR> {
     let desired_shape = read_schema_shape_from_source(desired_schema_source)?;
-    let resolution = omnigraph_compiler::resolve_schema_ir(accepted_ir, &desired_shape)
-        .map_err(|error| OmniError::manifest(error.to_string()))?;
+    let resolution = omnigraph_compiler::resolve_schema_ir_with_actor_provenance(
+        accepted_ir,
+        &desired_shape,
+        actor_provenance,
+    )
+    .map_err(|error| OmniError::manifest(error.to_string()))?;
     for diagnostic in &resolution.diagnostics {
         tracing::warn!(
             target: "omnigraph::schema::identity",
@@ -107,7 +114,11 @@ pub(super) async fn plan_schema(
 ) -> Result<SchemaMigrationPlan> {
     db.ensure_schema_state_valid().await?;
     let accepted_ir = read_accepted_schema_ir(db.uri(), Arc::clone(&db.storage)).await?;
-    let desired_ir = resolve_desired_schema_ir(&accepted_ir, desired_schema_source)?;
+    let desired_ir = resolve_desired_schema_ir(
+        &accepted_ir,
+        desired_schema_source,
+        options.actor_provenance,
+    )?;
     let mut plan = plan_schema_migration(&accepted_ir, &desired_ir)
         .map_err(|err| OmniError::manifest(err.to_string()))?;
     promote_drops_to_hard(&mut plan, options.allow_data_loss);
@@ -153,7 +164,8 @@ async fn plan_schema_for_apply_from_accepted(
         )));
     }
 
-    let desired_ir = resolve_desired_schema_ir(accepted_ir, desired_schema_source)?;
+    let desired_ir =
+        resolve_desired_schema_ir(accepted_ir, desired_schema_source, options.actor_provenance)?;
     let mut plan = plan_schema_migration(accepted_ir, &desired_ir)
         .map_err(|err| OmniError::manifest(err.to_string()))?;
     promote_drops_to_hard(&mut plan, options.allow_data_loss);
@@ -279,6 +291,13 @@ where
         desired_ir,
         desired_catalog,
     } = planned;
+    let actor_enabled = desired_ir
+        .actor_provenance
+        .as_ref()
+        .is_some_and(|binding| binding.enabled);
+    if actor_enabled {
+        crate::exec::actor_provenance::validate_actor_id(actor)?;
+    }
     if plan.steps.is_empty() {
         return Ok(SchemaApplyResult {
             supported: true,
@@ -398,7 +417,8 @@ where
             // committed row is valid under the wider set, so no table data is
             // touched — the accepted catalog update alone makes the unified
             // validator accept the new variants on all three write surfaces.
-            SchemaMigrationStep::AddConstraint { .. }
+            SchemaMigrationStep::SetActorProvenance { .. }
+            | SchemaMigrationStep::AddConstraint { .. }
             | SchemaMigrationStep::ExtendEnum { .. }
             | SchemaMigrationStep::UpdateTypeMetadata { .. }
             | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
@@ -488,6 +508,43 @@ where
                         .unwrap_or_else(|| "unsupported schema migration step".to_string()),
                 ));
             }
+        }
+    }
+
+    // SchemaApply currently owns exact Overwrite participants, not an additional
+    // keyed actor insertion. Refuse before staging/recovery/effects if this
+    // authored content rewrite would need such a participant (RFC 0054).
+    // Empty table creation and metadata/configuration changes do not invent
+    // actor content; existing actor rows continue through the normal protocol.
+    let rewrites_content = rewritten_tables
+        .iter()
+        .chain(dropped_tables.iter())
+        .any(|key| {
+            let source_key = renamed_tables.get(key).unwrap_or(key);
+            snapshot
+                .dataset(source_key)
+                .is_some_and(|entry| entry.entity_count > 0)
+        });
+    if rewrites_content && actor_enabled && actor.is_some() {
+        // A newly enabled table is absent from the accepted snapshot. A retained
+        // disabled table has the same protected identities in desired_catalog;
+        // use the resolved setting with the accepted physical snapshot for its
+        // exact-key lookup, so re-enabling cannot bypass first-use attribution.
+        let actor_missing = if accepted_ir.actor_provenance.is_none() {
+            true
+        } else {
+            Box::pin(crate::exec::actor_provenance::prepare_actor_batch(
+                &snapshot,
+                &desired_catalog,
+                actor,
+            ))
+            .await?
+            .is_some()
+        };
+        if actor_missing {
+            return Err(OmniError::manifest(
+                "actor_provenance_unsupported_schema_write: schema content changes require an actor already present in the accepted graph; first-use attribution is supported by mutation and load",
+            ));
         }
     }
 

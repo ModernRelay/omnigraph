@@ -147,6 +147,18 @@ async fn apply_schema_as_allows_when_policy_permits_actor() {
     let dir = tempfile::tempdir().unwrap();
     let (db, _engine) = init_with_policy(&dir).await;
 
+    // A populated schema rewrite reuses an actor from an authorized content
+    // write; it does not invent a separate actor-only publication.
+    db.load_as(
+        "main",
+        None,
+        ONE_PERSON_JSONL,
+        LoadMode::Append,
+        Some("act-allowed"),
+    )
+    .await
+    .unwrap();
+
     let desired = additive_schema();
     let result = db
         .apply_schema_as(&desired, SchemaApplyOptions::default(), Some("act-allowed"))
@@ -505,7 +517,7 @@ async fn full_text_rebuild_enforces_selected_branch_before_effects_and_records_a
         .await
         .expect("Change on the selected unprotected branch must permit a real rebuild");
     assert_eq!(result.branch, "feature");
-    assert_eq!(result.rebuilt_indexes.len(), 2);
+    assert_eq!(result.rebuilt_indexes.len(), 3);
     let feature_after = db.list_commits(Some("feature")).await.unwrap();
     assert_eq!(feature_after.len(), feature_before.len() + 1);
     assert_eq!(

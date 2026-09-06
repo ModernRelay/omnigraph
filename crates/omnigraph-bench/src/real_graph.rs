@@ -911,10 +911,16 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(
             observed.node_tables,
-            vec![GraphTableCountV1 {
-                name: "Person".to_string(),
-                rows: 2,
-            }]
+            vec![
+                GraphTableCountV1 {
+                    name: "OmniActor".to_string(),
+                    rows: 0,
+                },
+                GraphTableCountV1 {
+                    name: "Person".to_string(),
+                    rows: 2,
+                },
+            ]
         );
         assert_eq!(
             observed.edge_tables,

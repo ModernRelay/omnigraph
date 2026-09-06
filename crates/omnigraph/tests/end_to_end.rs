@@ -36,7 +36,8 @@ async fn init_creates_schema_file_and_manifest() {
 
     assert!(dir.path().join("_schema.pg").exists());
     assert!(dir.path().join("__manifest").exists());
-    assert_eq!(db.catalog().node_types.len(), 2);
+    assert_eq!(db.catalog().node_types.len(), 3);
+    assert!(db.catalog().node_types.contains_key("OmniActor"));
     assert_eq!(db.catalog().edge_types.len(), 2);
 }
 
@@ -50,7 +51,8 @@ async fn open_restores_full_state() {
     drop(original);
 
     let reopened = Omnigraph::open(uri).await.unwrap();
-    assert_eq!(reopened.catalog().node_types.len(), 2);
+    assert_eq!(reopened.catalog().node_types.len(), 3);
+    assert!(reopened.catalog().node_types.contains_key("OmniActor"));
     assert_eq!(reopened.catalog().edge_types.len(), 2);
     // Version should be what we left it at
     // (manifest was committed during load)

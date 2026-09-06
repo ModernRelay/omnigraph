@@ -110,6 +110,13 @@ Roll-forward publishes the sidecar's pre-minted lineage and complete manifest
 delta; it does not create a new semantic commit. Compensation restores the
 previous accepted graph view and never acknowledges the failed operation.
 
+Automatic actor materialization is another table participant in that same
+outcome. An attributed mutation, load, or merge stages its missing `OmniActor`
+row before arming the existing writer sidecar. Recovery classifies its exact
+effect with every customer table; it cannot publish an actor-only prefix or
+mint a replacement identity during recovery. The actor table uses the same
+stable table/incarnation and native-branch identities as other graph tables.
+
 ## Initialization ownership
 
 Fresh-graph initialization uses a separate root-scoped
