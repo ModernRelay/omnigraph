@@ -1,5 +1,5 @@
 ---
-rfc: "0052"
+rfc: "0055"
 title: "Branch statements in GQ"
 track: maintainer
 status: draft
@@ -7,22 +7,22 @@ implementation: not-started
 authors:
   - azimafroozeh
 created: 2026-09-04
-updated: 2026-09-04
-discussion: null
+updated: 2026-09-06
+discussion: https://github.com/ModernRelay/omnigraph/pull/626
 supersedes: []
 superseded_by: []
 blocked_on: []
 ---
 
-# RFC 0052: Branch statements in GQ
+# RFC 0055: Branch statements in GQ
 
 > A term set in ***bold italics*** is being defined at that exact spot; it is
 > used plain everywhere after.
 
-> The number is provisional: `0052` is the next available number at the
+> The number is provisional: `0055` is the next available number at the
 > upstream commit this document is anchored to, and the file, the heading,
-> the frontmatter, and the registry row are renumbered together when the PR
-> opens if another RFC has taken it by then.
+> the frontmatter, and the registry row are renumbered together before the
+> PR merges if another RFC has taken it by then.
 
 ## Summary
 
@@ -60,27 +60,33 @@ keep their handlers and response types; the engine crate is untouched;
 current branch, or checkout, since every request keeps naming its target;
 a mutation body still publishes as one commit on one branch; the
 `omnigraph branch` verb tree stays on its routes and shares only its
-output text and its delete confirmation with the statement path. Whether
-every statement kind should share one door is deferred to a follow-up RFC
-(Alternatives 3).
+output text and its delete confirmation with the statement path. This RFC
+is the branch family of a wider direction under which every operation a
+graph exposes becomes a GQ statement (Motivation): the one-language RFC
+makes the rules set here for a control read and a control write its
+general contract, applies them to load, schema, snapshot, commit history,
+the change feed, blob inspection, and maintenance, one statement family
+each, through the same two doors, and delegates the branch family to this
+document; neither document waits on the other. The one-door question
+stays deferred (Alternatives 3).
 
 ## Motivation
 
-Branch create, delete, merge, and list exist, at upstream commit `8ca9b12c`
+Branch create, delete, merge, and list exist, at upstream commit `d520d2bb`
 (every `file:line` anchor in this document is at that commit), as four
 HTTP routes, `GET` and `POST /branches`, `DELETE /branches/{branch}`,
-`POST /branches/merge` (`crates/omnigraph-server/src/lib.rs:1895-1900`),
+`POST /branches/merge` (`crates/omnigraph-server/src/lib.rs:1919-1924`),
 and as the CLI verbs wrapping them
-(`crates/omnigraph-cli/src/main.rs:410-531`). GQ, the
+(`crates/omnigraph-cli/src/main.rs:440-561`). GQ, the
 language every read and every mutation is written in, has no statement for
 any of them: the grammar's only top-level form is `query_decl`
 (`crates/omnigraph-compiler/src/query/query.pest:8`). Three costs follow.
 
 First, no logic test can pin a merge bug. RFC 0045's runner knows three
-step kinds, `Query`, `Mutate`, `Restart` (`crates/omnigraph-gqt/src/lib.rs:72-76`),
-grouped by `Item::Loop` (`lib.rs:62-69`),
+step kinds, `Query`, `Mutate`, `Restart` (`crates/omnigraph-gqt/src/lib.rs:79-83`),
+grouped by `Item::Loop` (`lib.rs:69-76`),
 and runs every query and mutate step against `main`
-(`lib.rs:1295, 1365`). The merge family found by the deterministic
+(`lib.rs:1412, 1511`). The merge family found by the deterministic
 simulation harness therefore has Rust-only regressions or none:
 [#583](https://github.com/ModernRelay/omnigraph/issues/583) (an edge
 inserted on both sides of a fork is duplicated by the merge),
@@ -97,7 +103,7 @@ twice: GQ for rows, HTTP for refs, GQ again. Third, the CLI's ad-hoc
 source flags, `--query <file>` and `-e`/`--query-string`, cannot carry a
 branch operation; those live only in the verb tree
 `BranchCommand::{Create, List, Delete, Merge}`
-(`crates/omnigraph-cli/src/cli.rs:613-659`), so a script
+(`crates/omnigraph-cli/src/cli.rs:701-747`), so a script
 that mixes rows and refs mixes verbs too. The verb tree itself stays (User
 and operational behavior).
 
@@ -113,6 +119,24 @@ not pre-empt a holistic review of the language. A local fix is
 not enough because the gap is a contract: a new query statement kind, a
 wire-visible answer shape, and a test-format amendment, each named in the
 registry's RFC-required list (`docs/rfcs/README.md:18`).
+
+The branch family is one family of a wider direction, not the whole of it.
+The direction is one language for every operation a graph exposes: load,
+schema, snapshot, commit history, the change feed, blob inspection, and
+maintenance are today each an HTTP route and a CLI verb, or a CLI verb
+alone (`optimize`, `rebuild-full-text-indexes`, `repair`, and `cleanup`
+are direct-storage verbs with no route,
+`crates/omnigraph-cli/src/cli.rs:20-21`), so an agent leaves GQ for every
+one of them and cannot reach the maintenance four at all. The one-language
+RFC applies the rules this RFC sets for a control read and a control write
+to those operations, one statement family each, and delegates the branch
+family to this document, adding nothing to it; neither document waits on
+the other. Branches have a document of their own because they are the only
+operations an agent performs in the middle of its work, between its reads
+and its writes, and because they carry the test gap above. SQL took the same
+route: `VACUUM`, `REINDEX`, and `CREATE TABLE` are statements in the
+language, and Dolt mirrors every CLI command as a `dolt_*` procedure,
+`DOLT_GC()` included (per its documentation; not verified against source).
 
 ## User and operational behavior
 
@@ -142,12 +166,15 @@ answers `merged`, the target holds the merged state as
 source state becomes visible on the target in one atomic commit." A
 conflicting merge publishes nothing: the
 engine returns `OmniError::MergeConflicts` before any table state is
-published (`crates/omnigraph/src/exec/merge.rs:5190-5192, 5333-5335`), so
+published (`crates/omnigraph/src/exec/merge.rs:5264-5266, 5407-5409`), so
 the target's head and the source are unchanged.
 
 Guarantee: a statement and its route produce the same engine effect, the
 same Cedar decision, the same admission check, and the same error mapping
-for every input, because they run one handler body (Design). They differ
+for every input the compiler accepts, because they run one handler body
+(Design); a padded or control-character name is refused at the statement
+and trimmed, or passed, by the route (Grammar), the one input class where
+the fronts differ. They differ
 only in envelope; a merge conflict is the same 409 on both fronts.
 
 Guarantee: `branch list` is authorized as `GET /branches` is, `read` with
@@ -163,7 +190,7 @@ branch-scoped listing is a tightening this RFC does not make
 
 From the CLI, the statements arrive through the existing verbs and their
 existing source flags (`--query <file>`, `-e`/`--query-string`,
-`cli.rs:107-117, 140-150`):
+`cli.rs:113-123, 146-156`):
 
 ```
 omnigraph mutate -e 'branch create b0'
@@ -172,36 +199,39 @@ omnigraph mutate -e 'branch merge b0 into main'
 omnigraph query  -e 'branch list' --format table
 ```
 
-A name outside the identifier alphabet, which includes every name with a
-`/`, a `-`, a `.`, an uppercase letter, or a leading digit
-(`review/add-benchmark`, `release.1.2`), is quoted; `b0` and `main` are
-bare (Design, Grammar). Both verbs classify
+A name outside the identifier alphabet (a lowercase letter or `_`, then
+letters, digits, or `_`), which includes every name with a `/`, a `-`, a
+`.`, a leading uppercase letter, or a leading digit
+(`review/add-benchmark`, `release.1.2`, `B0`), is quoted; `b0`, `bX`,
+`_x`, and `main` are bare (Design, Grammar). Both verbs classify
 the source before sending: a statement is posted with no request target,
 and `--branch`, `--snapshot`, `--if-commit`, a positional `name`,
 `--params`, or `--params-file` beside one fails locally
 with the server's message (Design, CLI). `omnigraph query` renders the list
-in all five of its formats unchanged (`read_format.rs:13-17`), since the
+in every text format unchanged (five of its six, `read_format.rs:13-19`;
+`--format arrow` is RFC 0051's IPC path), since the
 answer is an ordinary `ReadOutput`. Without `--json`, `omnigraph mutate`
 prints one line per control write: `created branch b0 from main`, `deleted
 branch b0`, `merged b0 into main: fast_forward`; a merge conflict is the
 409 the client already turns into an error, exit code 1 with the server's
-`error` text (`helpers.rs:523-528`), as every non-2xx answer is today. The
+`error` text (`helpers.rs:562-573`), as every non-2xx answer is today. The
 `omnigraph branch create|list|delete|merge` verbs stay on their routes
 (`GraphClient::branch_create_from`, `branch_delete`, `branch_merge`,
 `branch_list`) and keep their output text (`created branch <name> from
 <parent>`, `deleted branch <name>`, `merged <source> into <target>:
-<outcome>`, `main.rs:433, 472, 520-525`), their `--delete-branch`
+<outcome>`, `main.rs:463, 502, 550-555`), their `--delete-branch`
 composition (`POST /branches/merge` with `delete_branch: true`; the
 statement path has no composition), and their `confirm_destructive` prompt
-on delete (`main.rs:466`); the statement path shares their text renderer
+on delete (`main.rs:496`); the statement path shares their text renderer
 and the delete confirmation. Deprecating the verb tree is not part of this
 RFC.
 
 Refusals. Each is an HTTP 400 on the server and a non-zero exit with the
-same message in the CLI, naming the statement and the door to use, in the
+same message in the CLI; the first six name the statement and the door to
+use, in the
 shape of the existing `query '{}' contains mutations (insert/update/delete);
 use POST /mutate for write queries`
-(`crates/omnigraph-server/src/handlers.rs:1126-1131`):
+(`crates/omnigraph-server/src/handlers.rs:1156-1161`):
 
 | Rule | Refusal |
 |---|---|
@@ -209,7 +239,7 @@ use POST /mutate for write queries`
 | `branch list` at the write door | `statement 'branch list' is a read; use POST /query` |
 | `QueryRequest.branch` or `.snapshot`, or `ChangeRequest.branch`, set alongside a branch statement | `a branch statement names its branches itself; drop the request target` |
 | `QueryRequest.name` or `.params`, or `ChangeRequest.name` or `.params`, set alongside a branch statement | `a branch statement takes no name and no parameters` |
-| the `Omnigraph-If-Graph-Commit` header on `POST /mutate/if-graph-commit` (CLI `--if-commit`) alongside a branch statement (on `POST /mutate` the header is refused before any parse, `handlers.rs:1280`) | `a branch statement takes no commit precondition` |
+| the `Omnigraph-If-Graph-Commit` header on `POST /mutate/if-graph-commit` (CLI `--if-commit`) alongside a branch statement (on `POST /mutate` the header is refused before any parse, `handlers.rs:1310`) | `a branch statement takes no commit precondition` |
 | a branch statement on the deprecated `POST /read` or `POST /change` | `branch statements are not served on deprecated routes; use POST /mutate or POST /query` |
 | a branch statement beside any `query` declaration, or inside a mutation body | a parse error from the compiler (Design, Grammar) |
 
@@ -223,10 +253,10 @@ follow.
 | Evasion | What stops it |
 |---|---|
 | wrap `branch merge` in `query m() { … }` to ride the mutation door as a mutation | the grammar: `branch_stmt` is a top-level alternative, not a `mutation_stmt`; the file does not parse |
-| send a control write to `POST /read`, which does not reject mutations (`handlers.rs:587`) | deprecated routes refuse every branch statement before authorization |
-| steer a merge's target, or make it conditional, through the request envelope (`ChangeRequest.branch`, `Omnigraph-If-Graph-Commit`) | the request-target and precondition refusals above: two sources for one fact are never reconciled (on `POST /mutate` the header is refused before any parse, `handlers.rs:1280`) |
+| send a control write to `POST /read`, which does not reject mutations (`handlers.rs:614`) | deprecated routes refuse every branch statement before authorization |
+| steer a merge's target, or make it conditional, through the request envelope (`ChangeRequest.branch`, `Omnigraph-If-Graph-Commit`) | the request-target and precondition refusals above: two sources for one fact are never reconciled (on `POST /mutate` the header is refused before any parse, `handlers.rs:1310`) |
 | store a statement in the stored-query catalog and invoke it through `POST /queries/{name}` or `omnigraph mutate <name>` | refused at `cluster validate` and at server boot: a catalog file is a list of `query` declarations, so the cluster loader refuses a `QueryFile::Branch` with a diagnostic in the `query_parse_error` family (`omnigraph-cluster/src/config.rs:150`) and `QueryRegistry::from_specs` refuses it at load (Design, AST) |
-| run the statement through the embedded CLI (`--store`) to skip server Cedar | nothing new to skip: in embedded mode no Cedar runs for any statement kind today. Every embedded arm opens the handle bare, `Omnigraph::open(uri)` (directly or through `open_embedded`, `client.rs:303-305`), and `Omnigraph::open` installs no policy (`crates/omnigraph/src/db/omnigraph.rs:785`; only `with_policy`, `:854`, does, and the CLI never calls it), so `enforce` returns `Ok` when no policy is configured (`:918-920`); the verbs' embedded arms (`client.rs:966-1050`) have the same property. `--store` is the operator's own machine and credentials; a statement there carries exactly the policy a verb carries, none. This RFC records the existing embedded rule and does not change it |
+| run the statement through the embedded CLI (`--store`) to skip server Cedar | nothing new to skip: in embedded mode no Cedar runs for any statement kind today. Every embedded arm opens the handle bare, `Omnigraph::open(uri)` (directly or through `open_embedded`, `client.rs:321-323`), and `Omnigraph::open` installs no policy (`crates/omnigraph/src/db/omnigraph.rs:796`; only `with_policy`, `:865`, does, and the CLI never calls it), so `enforce` returns `Ok` when no policy is configured (`:929-931`); the verbs' embedded arms (`client.rs:1009-1095`) have the same property. `--store` is the operator's own machine and credentials; a statement there carries exactly the policy a verb carries, none. This RFC records the existing embedded rule and does not change it |
 | put two statements in one request to get two forks in one call | the grammar: one statement per file; two statements are two requests, as they are two routes today |
 
 | Honest route | Accepted |
@@ -238,7 +268,7 @@ follow.
 
 Operationally nothing is new: a control write is admission-gated per actor
 exactly as its route is (`state.workload.try_admit(&actor_arc, 256)` after
-Cedar, `handlers.rs:2148, 2230, 2303`), `branch list` is not, and no
+Cedar, `handlers.rs:2181, 2263, 2336`), `branch list` is not, and no
 route, Cedar action, or configuration is added.
 
 ## Design
@@ -266,8 +296,9 @@ createb0`, `branchcreate b0`, and `branch merge b0 intomain` are parse
 errors rather than statements acting on a misread name; pest's implicit
 whitespace between non-atomic tokens would otherwise make the space
 optional. The grammar has no reserved-word list: every keyword is a string
-literal inside a rule, `ident` is any lowercase-start word
-(`query.pest:111`), and the only exclusion anywhere is `edge_ident`'s
+literal inside a rule, `ident` is a lowercase letter or `_` followed by
+letters, digits, or `_` (`query.pest:111`), and the only exclusion
+anywhere is `edge_ident`'s
 `!"not"` (`:108`). Nothing is reserved here either. The leading keyword
 `branch` disambiguates at the one position where it can appear: a file
 today must begin with `query` (`query.pest:8, 11`), so no file that parses
@@ -289,13 +320,14 @@ quoted name is the decoded content of the literal (`\"`, `\\`, `\n`,
 `\r`, `\t`; any other escape is a parse error, `decode_string_literal`,
 `crates/omnigraph-compiler/src/error.rs:60-90`); the compiler refuses an
 empty name, a name with leading or trailing whitespace, and a name
-carrying a control character, so that the
+carrying a control character (Unicode category Cc, `char::is_control`), so
+that the
 spelled name and the name the engine acts on are one string; every other
 rule is the engine's (`normalize_branch_name` trims and refuses empty,
 `ensure_logical_branch_name` refuses an incarnation-shaped segment, and
 `ensure_branch_create_namespace_safe` refuses an existing name and an
-ancestor or descendant of a live name, `crates/omnigraph/src/db/omnigraph.rs:3744-3756,
-2939-2960`, `crates/omnigraph/src/branch_names.rs:65-75`), and
+ancestor or descendant of a live name, `crates/omnigraph/src/db/omnigraph.rs:3787-3799,
+2982-3003`, `crates/omnigraph/src/branch_names.rs:65-75`), and
 `ChangeOutput.branch` carries the spelled name. A statement binds no
 `$vars`: `param_list` belongs to `query_decl` (`query.pest:11, 35-36`).
 
@@ -319,7 +351,7 @@ pub enum QueryFile {
     Branch(BranchStmt),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchStmt {
     Create { name: String, from: Option<String> },
     Delete { name: String },
@@ -329,40 +361,51 @@ pub enum BranchStmt {
 
 impl BranchStmt {
     pub fn is_write(&self) -> bool  // false only for List
+    pub fn statement_name(&self) -> &'static str  // "branch create" through "branch list"
+    pub fn not_a_declaration_message(&self) -> String
+    // "`branch create` is a branch statement, not a query declaration"
 }
 ```
+
+`not_a_declaration_message` is the one refusal text every consumer whose
+arm is a refusal prints, so it is wire-visible wherever that arm is
+reached; `statement_name` is the two words it names.
 
 A file-level enum rather than an added `Option<BranchStmt>` field, because
 a consumer can ignore an `Option` and cannot ignore a variant: every
 `.queries` consumer becomes a `match` and the compiler enumerates them. At
 that commit they are `find_named_query`
-(`omnigraph-compiler/src/query_input.rs:256`), the one seam through which
+(`omnigraph-compiler/src/query_input.rs:262`), the one seam through which
 the engine parses (`crates/omnigraph/src/exec/query.rs:66, 118`,
-`exec/mutation.rs:1082`); `select_named_query_decl` (`handlers.rs:2479`);
-the CLI's `select_named_query` (`omnigraph-cli/src/helpers.rs:795`); the
-runner's `file.queries.as_slice()` (`omnigraph-gqt/src/lib.rs:770`); the
+`exec/mutation.rs:1095`); `select_named_query_decl` (`handlers.rs:2512`);
+the CLI's `select_named_query` (`omnigraph-cli/src/helpers.rs:846`); the
+runner's `file.queries.as_slice()` (`omnigraph-gqt/src/lib.rs:796`); the
 cluster stored-query loader (`omnigraph-cluster/src/config.rs:158`) and
-its per-query check `validate_query_source` (`config.rs:1081`);
+its per-query check `validate_query_source` (`config.rs:1293`);
 `lint_query_file` (`query/lint.rs:129`); the stored-query registry's
-parse site `QueryRegistry::from_specs` (`omnigraph-server/src/queries.rs:103`);
-`typecheck_query_decl` and `typecheck_query` (`typecheck.rs:98-113`); and
-`lower_query` (`ir/lower.rs:34`). For the typechecker, linter, lowerer,
-registry, and cluster loader the new arm is a refusal (a branch statement
-has no plan and is never stored); for `find_named_query` it is a refusal
+parse site `QueryRegistry::from_specs` (`omnigraph-server/src/queries.rs:103`).
+For the linter, the registry, and the cluster loader the new arm is a
+refusal (a branch statement has no plan and is never stored), lint's under
+its parse code `Q000` and the cluster loader's as `query_parse_error`;
+`typecheck_query_decl`, `typecheck_query` (`typecheck.rs:98, 110`) and
+`lower_query` (`ir/lower.rs:34`) take a `QueryDecl`, never see the file,
+and need none. For `find_named_query` it is a refusal
 too, which is why the engine crate stays untouched: the engine reaches a
 declaration only through `find_named_query`, and a `Branch` file has none
 to return. For the runner, the CLI, and the server the arm is the dispatch
 below. Test files reach declarations through a `QueryFile::single_decl()`
 helper, so the `.queries[0]` sites in `parser_tests.rs`,
 `typecheck_tests.rs`, `lower_tests.rs`, and `omnigraph-gqt/src/tests.rs`
-are one edit. `parse_query_decl`
+are one edit. `single_decl` is test support: it is `#[track_caller]` and
+panics unless the file holds exactly one declaration, and no production
+code calls it. `parse_query_decl`
 (`parser.rs:47`) is untouched; a sibling `parse_branch_stmt` fills
 `BranchStmt`.
 
 The compiler classifies and never refuses a door: the read door's refusal
-of a mutation is the server's (`run_query`, `handlers.rs:1126-1131`), and
-the same holds here. Beside the three name refusals in Grammar, the
-compiler owns two refusals, both parse
+of a mutation is the server's (`run_query`, `handlers.rs:1156-1161`), and
+the same holds here. Beside the three name refusals and the escape refusal
+in Grammar, the compiler owns two structural refusals, both parse
 errors: a branch statement beside a `query` declaration, and a branch
 statement inside a mutation body (no `mutation_stmt` alternative exists).
 
@@ -370,17 +413,17 @@ statement inside a mutation body (no `mutation_stmt` alternative exists).
 
 Both doors parse, classify, refuse the wrong kind, then authorize per kind:
 
-1. `run_query` (`handlers.rs:1105`) and `run_mutate` (`handlers.rs:1032`)
+1. `run_query` (`handlers.rs:1135`) and `run_mutate` (`handlers.rs:1062`)
    gain a first step, `classify(query) -> QueryFile`, which is
    `parse_query`, before any target resolution. Today `run_query`
    resolves and Cedar-authorizes the read target
    (`resolve_authorized_read_target`, action `Read` on the request's
-   branch, default `main`) before parsing (`handlers.rs:1123` then
-   `:1124`), and today `run_mutate` authorizes `Change` and admits before
-   parsing (`handlers.rs:1046, 1061, 1066`); after this RFC the parse
+   branch, default `main`) before parsing (`handlers.rs:1153` then
+   `:1154`), and today `run_mutate` authorizes `Change` and admits before
+   parsing (`handlers.rs:1076, 1091, 1096`); after this RFC the parse
    comes first at both doors, so a branch statement never pays a `Read`
    check on `main` on top of its own action. Likewise `run_mutate`'s own
-   `Change` check and `try_admit` (`handlers.rs:1046-1064`) are skipped
+   `Change` check and `try_admit` (`handlers.rs:1076-1094`) are skipped
    for a `Branch` file; the handler body's are the only ones. For
    `QueryFile::Queries` the remaining steps keep today's order, with one
    visible consequence owned in Compatibility: a parse error (400) now
@@ -394,22 +437,22 @@ Both doors parse, classify, refuse the wrong kind, then authorize per kind:
    expected head present alongside a branch statement is a 400. To make
    these checks possible inside the shared functions rather than in each
    axum shell: `run_mutate` takes `branch: Option<String>` (today every
-   caller defaults it to `main` before the call, `handlers.rs:1221, 1281,
-   1333, 1538`),
+   caller defaults it to `main` before the call, `handlers.rs:1251, 1311,
+   1336, 1541`),
    `run_query` returns `ReadDispatch::{Rows(String, ReadTarget,
    QueryResult, Option<String>), BranchList(Vec<String>)}` in place of
-   today's tuple (`handlers.rs:1114-1121`), and the `reject_mutations:
-   bool` parameter (`/read` passes the literal `false`, `handlers.rs:587`)
+   today's tuple (`handlers.rs:1144-1151`), and the `reject_mutations:
+   bool` parameter (`/read` passes the literal `false`, `handlers.rs:614`)
    becomes `door: Door::{Query, Read, Mutate, Change}`, on which the
    refusal table keys: `Read` and `Change` refuse every branch statement,
    `Query` refuses a control write, `Mutate` refuses `branch list`
    (`/mutate/if-graph-commit` is `Mutate` with an expected head,
-   `handlers.rs:1335`). `/queries/{name}` (`handlers.rs:1539, 1557`)
+   `handlers.rs:1365`). `/queries/{name}` (`handlers.rs:1569, 1587`)
    passes `Mutate` and `Query`; its source is registry-owned and never a
    `Branch` file (AST), so neither refusal fires there. The
    request types do not change: `QueryRequest { query, name, params,
-   branch, snapshot }` (`crates/omnigraph-api-types/src/lib.rs:648-666`)
-   and `ChangeRequest` (`:801`) already carry any GQ source string.
+   branch, snapshot }` (`crates/omnigraph-api-types/src/lib.rs:665-683`)
+   and `ChangeRequest` (`:818`) already carry any GQ source string.
 3. Each `server_branch_*` handler splits into its axum shell (extractors)
    and a body function that both the route and the statement path call,
    so the `PolicyRequest`, the admission check, the engine call, and the
@@ -417,33 +460,40 @@ Both doors parse, classify, refuse the wrong kind, then authorize per kind:
 
 | Statement | Handler body | Cedar `PolicyRequest` (`handlers.rs`) | Engine call |
 |---|---|---|---|
-| `branch create` | `server_branch_create` | `BranchCreate`, `branch: Some(from)`, `target_branch: Some(name)` (`:2138-2140`) | `db.branch_create_from_as(ReadTarget::branch(&from), &name, actor)` (`:2152`; `db/omnigraph.rs:3344`) |
-| `branch delete` | `server_branch_delete` | `BranchDelete`, `branch: None`, `target_branch: Some(name)` (`:2222-2224`) | `db.branch_delete_as(&name, actor_id)` (`:2234`; `db/omnigraph.rs:3458`) |
-| `branch merge` | `server_branch_merge` | `BranchMerge`, `branch: Some(source)`, `target_branch: Some(target)` (`:2293-2295`) | `db.branch_merge_as(&source, &target, actor_id)` (`:2307`; `crates/omnigraph/src/exec/merge.rs:4825-4851`) |
-| `branch list` | `server_branch_list` | `Read`, `branch: None`, `target_branch: None` (`:2088-2090`) | `db.branch_list()` (`:2095`; `db/omnigraph.rs:3438`), then `sort()` (`:2097`) |
+| `branch create` | `server_branch_create` | `BranchCreate`, `branch: Some(from)`, `target_branch: Some(name)` (`:2171-2173`) | `db.branch_create_from_as(ReadTarget::branch(&from), &name, actor)` (`:2185`; `db/omnigraph.rs:3387`) |
+| `branch delete` | `server_branch_delete` | `BranchDelete`, `branch: None`, `target_branch: Some(name)` (`:2255-2257`) | `db.branch_delete_as(&name, actor_id)` (`:2267`; `db/omnigraph.rs:3501`) |
+| `branch merge` | `server_branch_merge` | `BranchMerge`, `branch: Some(source)`, `target_branch: Some(target)` (`:2326-2328`) | `db.branch_merge_as(&source, &target, actor_id)` (`:2340`; `crates/omnigraph/src/exec/merge.rs:4893-4919`) |
+| `branch list` | `server_branch_list` | `Read`, `branch: None`, `target_branch: None` (`:2121-2123`) | `db.branch_list()` (`:2128`; `db/omnigraph.rs:3481`), then `sort()` (`:2130`) |
 
 The three write actions are the only branch actions Cedar has
 (`PolicyAction`, `crates/omnigraph-policy/src/lib.rs:18-74`; schema lines
 `:849-851`); `branch list` is authorized as `read` with no scope, exactly
-as its route is, not as a branch action. The `delete_branch` composition
-of `POST /branches/merge` (a second `BranchDelete` check, `:2349`) has no
+as its route is, not as a branch action. Since RFC 0053, `authorize`
+applies the credential's own action ceiling, and for a signed data
+credential the applied-policy requirement, before Cedar
+(`handlers.rs:407-418`), and `resolve_graph_handle` refuses a graph the
+credential does not select (`:335-339`); a statement reaches both through
+the same `PolicyRequest` and the same extractor as its route, so a
+credential that cannot reach a route cannot reach its statement. The
+`delete_branch` composition
+of `POST /branches/merge` (a second `BranchDelete` check, `:2382`) has no
 statement clause: an author writes `branch merge b0` then `branch delete
 b0`, two statements, two checks, which is what the route does internally.
 
 4. The answer. `branch list` fills `ReadOutput { query_name, target,
    row_count, columns, rows, graph_commit_id }`
-   (`api-types lib.rs:271-285`) with `query_name: "branch list"`,
+   (`api-types lib.rs:285-300`) with `query_name: "branch list"`,
    `target: { branch: null, snapshot: null }` (the statement reads the
    ref list, not a branch, matching its scope-free Cedar request; no
    route emits this value today, since `read_target_from_request` always
-   fills one of the two, `handlers.rs:2468-2477`, so Compatibility names
+   fills one of the two, `handlers.rs:2501-2510`, so Compatibility names
    it), `columns: ["name"]`, `rows` = one `{"name": "<branch>"}` per
    branch sorted by `name` in byte order (`Vec<String>::sort`,
-   `handlers.rs:2097`), `row_count = rows.len()`, and `graph_commit_id`
-   absent (`skip_serializing_if`, `api-types lib.rs:283`). The three
+   `handlers.rs:2130`), `row_count = rows.len()`, and `graph_commit_id`
+   absent (`skip_serializing_if`, `api-types lib.rs:298`). The three
    control writes fill `ChangeOutput { branch,
    query_name, affected_nodes, affected_edges, actor_id, commit }`
-   (`api-types lib.rs:313-320`) with `branch` = the branch that received
+   (`api-types lib.rs:329-336`) with `branch` = the branch that received
    the effect (the new branch; for `branch delete` the deleted branch,
    which no longer exists when the answer is read; the merge target),
    `query_name` = the statement's two words, both counts `0` (a control
@@ -458,16 +508,16 @@ outcome: Option<BranchOutcomeOutput>    // serde: skip when None
 `commit` is `null` for `created`, `deleted`, and a merge whose `merge` is
 `already_up_to_date`, none of which publishes a commit (a fresh branch's
 inherited head is read back with any read on it, `api-types
-lib.rs:278-282`). For `fast_forward`
+lib.rs:293-297`). For `fast_forward`
 and `merged` it is the target's head after the merge, filled by the
 handler body: the engine's `MergeOutcome` carries no commit id
-(`AlreadyUpToDate | FastForward | Merged`, `db/omnigraph.rs:69-74`), so
+(`AlreadyUpToDate | FastForward | Merged`, `db/omnigraph.rs:65-70`), so
 the body reads `db.list_commits(Some(target))`, whose first entry is the
-newest by that function's contract (`db/omnigraph.rs:3556-3563`), and
+newest by that function's contract (`db/omnigraph.rs:3599-3606`), and
 renders it through `api::commit_output` as the `CommitOutput` a mutation
-body's answer already carries (`api-types lib.rs:371-381, 1342`). The
+body's answer already carries (`api-types lib.rs:387-397, 1359`). The
 merge holds both branch gates through publication
-(`exec/merge.rs:4889-4892`) and the head read runs after they are
+(`exec/merge.rs:4957-4960`) and the head read runs after they are
 released, so under a concurrent writer on the target the id can name a
 later commit; the exact merge commit id is an engine follow-up
 (`MergeOutcome` carrying it), not this RFC. The engine crate stays
@@ -476,29 +526,29 @@ untouched.
 `BranchOutcomeOutput` is a tagged object, `kind` in `snake_case`, its
 fields taken from the route outputs that exist today
 (`BranchCreateOutput`, `BranchDeleteOutput`, `BranchMergeOutput`,
-`api-types lib.rs:123-140, 185-200`):
+`api-types lib.rs:137-154, 199-214`):
 
 | `kind` | Fields | Source of each field |
 |---|---|---|
 | `created` | `from`, `name` | `BranchCreateOutput` minus `actor_id`, which `ChangeOutput` already carries, and minus `uri`, the graph URI the caller already addressed |
 | `deleted` | `name` | `BranchDeleteOutput` minus `actor_id` and `uri` |
-| `merged` | `source`, `target`, `merge` | `BranchMergeOutput`; `merge` is `BranchMergeOutcome`, wire strings `already_up_to_date`, `fast_forward`, `merged` (`api-types lib.rs:174-181`), under the key `merge` so that `merged` the kind (a merge that completed) and `merged` the three-way result never share a key |
+| `merged` | `source`, `target`, `merge` | `BranchMergeOutput`; `merge` is `BranchMergeOutcome`, wire strings `already_up_to_date`, `fast_forward`, `merged` (`api-types lib.rs:188-195`), under the key `merge` so that `merged` the kind (a merge that completed) and `merged` the three-way result never share a key |
 
 A merge conflict has no `kind`: it is the route's error. `branch_merge_as`
 returns `Err(OmniError::MergeConflicts)` (`crates/omnigraph/src/error.rs:172-173`),
 the shared body maps it through `ApiError::from_omni` to
-`ApiError::merge_conflict` (`omnigraph-server/src/lib.rs:1081-1089,
+`ApiError::merge_conflict` (`omnigraph-server/src/lib.rs:1105-1113,
 930-937`), status 409, `ErrorOutput { error, code: "conflict",
-merge_conflicts: [MergeConflictOutput] }` (`api-types lib.rs:1244-1249`),
+merge_conflicts: [MergeConflictOutput] }` (`api-types lib.rs:1273-1278`),
 with `error` beginning `merge conflicts: ` (`summarize_merge_conflicts`,
-`lib.rs:1260`). `MergeConflictOutput { entity_kind, type_name, entity_id,
-kind, message }` (`api-types lib.rs:243-249`) and its seven kinds
-(`:204-226`) are untouched.
+`lib.rs:1272`). `MergeConflictOutput { entity_kind, type_name, entity_id,
+kind, message }` (`api-types lib.rs:257-263`) and its seven kinds
+(`:218-240`) are untouched.
 
 Guarantee: a mutation body's `ChangeOutput` is byte-identical before and
 after this RFC, because `outcome` is skipped when absent; a `branch list`
 answer is a well-formed `ReadOutput` for every existing consumer of that
-type, including the five CLI renderers; a conflicting `branch merge` and a
+type, including the five text renderers; a conflicting `branch merge` and a
 conflicting `POST /branches/merge` answer the same status, the same
 `ErrorOutput`, and the same `merge_conflicts` list for the same input.
 
@@ -508,7 +558,7 @@ the four routes that exist today (Alternatives 1) or a fifth route for the
 statement family (Alternatives 8), or one door accepts every kind
 unclassified, which puts a write behind the read door's `Read` check.
 Classification is already how the read door keeps writes out
-(`handlers.rs:1126`); this RFC makes that rule file-level and applies it
+(`handlers.rs:1156`); this RFC makes that rule file-level and applies it
 symmetrically at the write door.
 
 ### CLI
@@ -516,29 +566,29 @@ symmetrically at the write door.
 The remote arms of both verbs change, because today both always send a
 request target and `mutate` posts to a deprecated route. `Command::Query`
 builds a `ReadTarget` from `--branch`/`--snapshot`, default `main`
-(`resolve_read_target`, `main.rs:1116`), and `GraphClient::query`
+(`resolve_read_target`, `main.rs:1180`), and `GraphClient::query`
 serializes it as `branch` or `snapshot` on every `QueryRequest`
-(`client.rs:862-876`). `Command::Mutate` resolves `branch` to `main`
-(`resolve_branch(branch, None, "main")`, `main.rs:1164`;
+(`client.rs:895-909`). `Command::Mutate` resolves `branch` to `main`
+(`resolve_branch(branch, None, "main")`, `main.rs:1232`;
 `main_tests.rs:59-69` pins that the legacy body always carries `branch`),
 and `GraphClient::mutate`
 posts to `POST /mutate/if-graph-commit` when `--if-commit` is given and
 otherwise to the deprecated `POST /change` with
-`legacy_change_request_body` (`client.rs:782-797`, `helpers.rs:1061-1077`).
+`legacy_change_request_body` (`client.rs:813-828`, `helpers.rs:1114-1130`).
 The wire cannot tell a defaulted target from an explicit one, and the
 refusal table refuses both the target and the deprecated route, so without
 a CLI change every statement the CLI sends is refused. Both verbs therefore
 classify before sending: the remote arm parses the source (the embedded
-arm already does, `select_named_query`, `helpers.rs:795-813`) and, for
+arm already does, `select_named_query`, `helpers.rs:846-864`) and, for
 `QueryFile::Branch`, `GraphClient::query` posts `QueryRequest` with
 `branch: None, snapshot: None, name: None, params: None`, and
 `GraphClient::mutate` posts `ChangeRequest` with `branch: None` to `POST
 /mutate`, never to `/change`. An explicit `--branch`, `--snapshot`,
 `--if-commit`, a positional query `name`, `--params`, or `--params-file`
-(`ParamsArgs`, `cli.rs:897-900`) beside a statement fails locally with the
+(`ParamsArgs`, `cli.rs:991-994`) beside a statement fails locally with the
 server's message, before any round trip. A `BranchStmt::Delete` runs
 `confirm_destructive("branch delete", …)` on both arms
-(`main.rs:466`; `helpers.rs:52-61` refuses a non-local target without
+(`main.rs:496`; `helpers.rs:52-61` refuses a non-local target without
 `--yes` or a TTY answer), the same consent step the `omnigraph branch
 delete` verb takes,
 so the statement path cannot delete on a remote server without it.
@@ -550,24 +600,24 @@ exact request shape for each statement is pinned in `data_routes.rs`
 The embedded arm (`--store`) must classify locally, because it never meets
 the server. After `parse_query`, a `QueryFile::Branch` dispatches to the
 engine calls the embedded `BranchCommand` arms make today:
-`branch_create_from_as` (`client.rs:969`), `branch_delete_as` then
-`wait_for_fork_reclaims` (`:1000-1003`), `branch_merge_as` (`:1041`),
-`branch_list` (`:325`). No Cedar runs in this arm for any statement kind,
+`branch_create_from_as` (`client.rs:1012`), `branch_delete_as` then
+`wait_for_fork_reclaims` (`:1044-1047`), `branch_merge_as` (`:1086`),
+`branch_list` (`:344`). No Cedar runs in this arm for any statement kind,
 because none runs there for anything today: every embedded arm opens the
 handle bare, `Omnigraph::open(uri)` (directly or through `open_embedded`,
-`client.rs:303-305`), and `Omnigraph::open` installs no policy
-(`db/omnigraph.rs:785`; only `with_policy`, `:854`, does, and the CLI
+`client.rs:321-323`), and `Omnigraph::open` installs no policy
+(`db/omnigraph.rs:796`; only `with_policy`, `:865`, does, and the CLI
 never calls it), so `enforce` returns `Ok` with no policy configured
-(`db/omnigraph.rs:918-920`). The existing embedded rule holds unchanged. A
+(`db/omnigraph.rs:929-931`). The existing embedded rule holds unchanged. A
 conflicting merge in this arm is `Err(OmniError::MergeConflicts)` from the
 engine, rendered as the CLI renders any engine error, message beginning
 `merge conflicts: ` (`error.rs:172`), exit code 1.
 
 The text renderer is shared. A `ChangeOutput` carrying `outcome` prints
 the verb tree's line for that kind (`created branch b0 from main`,
-`deleted branch b0`, `merged b0 into main: fast_forward`, `main.rs:433,
-472, 520-525`) instead of `print_change_human`'s `changed main via branch
-merge: 0 nodes, 0 edges` (`output.rs:879-887`), which would hide the
+`deleted branch b0`, `merged b0 into main: fast_forward`, `main.rs:463,
+502, 550-555`) instead of `print_change_human`'s `changed main via branch
+merge: 0 nodes, 0 edges` (`output.rs:882-890`), which would hide the
 outcome word. The `omnigraph branch …` verbs keep calling
 `GraphClient::branch_create_from`, `branch_delete`, `branch_merge`, and
 `branch_list`, that is, the routes and the embedded engine calls they use
@@ -575,41 +625,42 @@ today; they build no GQ source, since a verb that rendered its arguments
 into a statement string would be the shape of ad-hoc string generation
 the deny-list rejects where a structured form exists
 (`docs/dev/invariants.md:108-109`). `read` and `change` stay the visible aliases
-of `query` and `mutate` (`cli.rs:101, 134`).
+of `query` and `mutate` (`cli.rs:107, 140`).
 
 ### Logic tests (RFC 0045 amendment)
 
 Two amendments to RFC 0045's File format, both fail-closed under its own
-evolution rule (`0045-gq-logic-tests.md:739-742`: "Format evolution is
+evolution rule (`0045-gq-logic-tests.md:821-824`: "Format evolution is
 fail-closed: unknown sections, unknown header keys, and missing required
 headers are refusals, never silent skips, so an older harness refuses a
 newer logic test rather than mis-running it"). That rule names sections
 and header keys, not step arguments or expect modes, so the fail-closed
 claim for these two amendments rests on the runner's own refusals: the
-`takes no arguments` check (`lib.rs:749-751`) and `parse_expect_header`'s
-unknown-mode refusal (`lib.rs:330-369`), and the `does not parse` refusal
-on a statement body (`lib.rs:764-769`).
+`takes no arguments` check (`lib.rs:775-777`) and `parse_expect_header`'s
+unknown-mode refusal (`lib.rs:338-377`), and the refusal of a statement
+body, `does not parse` before phase 1 and `the runner executes query
+declarations only` between phases 1 and 3 (`lib.rs:790-803`).
 
 1. `--- query` and `--- mutate` accept one optional argument, `branch:
    <name>`, the branch the step runs against; absent, `main`, as today
-   (`lib.rs:1295, 1365`). The seam is the `rest` of the header line, split
-   off at the first space (`lib.rs:737-740`) and refused today with
-   `` `--- {kind}` takes no arguments `` (`lib.rs:749-751`). A fifth
-   `HEADER_KEYS` entry (`lib.rs:140`: `issue, red_on, notes, traversal`)
+   (`lib.rs:1412, 1511`). The seam is the `rest` of the header line, split
+   off at the first space (`lib.rs:758-761`) and refused today with
+   `` `--- {kind}` takes no arguments `` (`lib.rs:775-777`). A fifth
+   `HEADER_KEYS` entry (`lib.rs:148`: `issue, red_on, notes, traversal`)
    is not the seam: a case header is per case, a branch target is per
    step. The argument follows the shape of `--- expect error:
    <substring>` (a word, a colon, the trimmed remainder); anything else in
    `rest` is refused with the grammar.
 2. A `--- mutate` step may hold a control write and a `--- query` step may
    hold `branch list`, classified by the compiler. The wrong kind is
-   refused beside the existing read/mutation refusals (`lib.rs:777-786`)
+   refused beside the existing read/mutation refusals (`lib.rs:803-812`)
    with two new exact strings, since a statement is not a declaration:
    `` a control write under `--- query` is refused; use `--- mutate` `` and
    `` `branch list` under `--- mutate` is refused; use `--- query` ``. A
    step holding a statement refuses `branch: <name>` on its header (`a
    branch statement names its branches itself`) and a following `---
    params` (`a branch statement takes no params`; today `--- params`
-   attaches to any pending step, `lib.rs:802-827`); the step's name, used
+   attaches to any pending step, `lib.rs:828-853`); the step's name, used
    in labels, is the statement's two words. `branch create` and `branch
    delete` take `ok` or `error: <substring>`. `branch merge` takes `ok`,
    `error: <substring>`, or the new mode `outcome: <word>`, body empty,
@@ -623,30 +674,38 @@ on a statement body (`lib.rs:764-769`).
    `unordered`, `ordered`, or `error:` over rows `{"name": "…"}`; its rows
    are sorted by `name` in byte order, a total order, so `ordered` is
    accepted and the `order`-clause refusal for declarations
-   (`ordered_refusal`, `lib.rs:606-609`) does not apply to it. An
+   (`ordered_refusal`, `lib.rs:614-617`) does not apply to it. A
+   `branch list` rows expect carries the shape section RFC 0045 makes
+   mandatory directly after every rows expect (`0045:398-430`;
+   `missing_shape`, `lib.rs:736-744`), one line, `name: String`: the
+   runner presents the statement's answer as one non-null `Utf8` column
+   `name`, so the shape check (`0045:645-663`) holds against it as against
+   any rows step, while the computed check against the compiler's
+   inferred schema (`0045:664-678`) is skipped for a statement step, which
+   has no declaration to infer from. An
    `outcome:` word or `affected:` counts in a new case are blessed from a
    run, never copied from a design document.
 
-The runner executes against the embedded handle (`lib.rs:31`), opened by
-`Omnigraph::init` (`lib.rs:1410`) and reopened by `Omnigraph::open` on
-`--- restart` (`lib.rs:1447`), neither with a policy, so a statement there
+The runner executes against the embedded handle (`lib.rs:32`), opened by
+`Omnigraph::init` (`lib.rs:1556`) and reopened by `Omnigraph::open` on
+`--- restart` (`lib.rs:1593`), neither with a policy, so a statement there
 exercises compiler and engine, never the server's Cedar dispatch; the actor
-is `None` and `enforce` is a no-op (`db/omnigraph.rs:918-920`). After a
+is `None` and `enforce` is a no-op (`db/omnigraph.rs:929-931`). After a
 `branch delete` step the runner awaits `wait_for_fork_reclaims` before the
-next step, as the CLI does before exit (`client.rs:1000-1003`), because
+next step, as the CLI does before exit (`client.rs:1044-1047`), because
 `branch_delete_as` returns at the manifest flip and reclaims forks in a
-background task (`db/omnigraph.rs:3455-3458`) and `--- restart` drops the
-handle (`lib.rs:1445-1446`). Loops do not reach a statement: `${i}`
+background task (`db/omnigraph.rs:3498-3501`) and `--- restart` drops the
+handle (`lib.rs:1591-1592`). Loops do not reach a statement: `${i}`
 substitutes only in params and expect bodies and query and mutate bodies
-stay literal (`0045:419-423`); a statement step has no params, and `${`
+stay literal (`0045:467-471`); a statement step has no params, and `${`
 in a statement body is refused as in any other step body
-(`lib.rs:1003-1005`). `--- restart` (`0045:391`) remains the one step
+(`lib.rs:1075-1077`). `--- restart` (`0045:438`) remains the one step
 that is not GQ; this
 amendment adds no directive, since the statements are GQ.
 
-The two format pieces in one fragment (the outcome word is illustrative
-and is blessed from a run when a case is written, per the blessing rule
-above):
+The two format pieces in one fragment, with the shape section every rows
+step carries (the outcome word is illustrative and is blessed from a run
+when a case is written, per the blessing rule above):
 
 ```
 --- mutate
@@ -660,12 +719,16 @@ branch list
 --- expect unordered
 {"name": "b0"}
 {"name": "main"}
+
+--- expect shape
+name: String
 ```
 
 Guarantee: an older harness refuses a case using either amendment (the
 argument with `takes no arguments`, the expect mode as an unknown mode, a
-statement body as `does not parse`, `lib.rs:764-769`) and never mis-runs
-it.
+statement body as `does not parse` today, `lib.rs:790-795`, and as `the
+runner executes query declarations only` between phases 1 and 3) and
+never mis-runs it.
 
 ## Invariants
 
@@ -697,15 +760,15 @@ Wire. `ChangeOutput` gains one optional, skip-when-absent field; every
 existing mutation response is byte-identical. `ReadOutput` gains no field
 here, and its value space gains one value: `target: { branch: null,
 snapshot: null }`, which only a `branch list` answer carries and no route
-emits today. `branch list` fills `ReadOutput` whatever `rows`' Rust type
-is, so RFC 0051 (JSON output via Arrow) may change that type without
-touching this RFC, and `branch list` inherits the `Accept` negotiation
-RFC 0051 adds to `POST /query`: under its Arrow `Accept` it answers a
-one-column `name` IPC stream. The four `/branches` routes and their
-output types,
+emits today. `branch list` fills `ReadOutput.rows`, JSON text since
+RFC 0051 (`Box<RawValue>`, `api-types lib.rs:292`), as any read does, and
+inherits the `Accept` negotiation RFC 0051 schedules for `POST /query`:
+under its Arrow `Accept` it answers a one-column `name` IPC stream. The
+four `/branches` routes and their output types,
 `QueryRequest`, and `ChangeRequest` are unchanged. The deprecated `POST
-/read` and `POST /change`, whose envelopes are frozen (`LegacyReadOutput`,
-`api-types lib.rs:291`), refuse branch statements. A statement and its
+/read` and `POST /change`, whose envelopes are byte-stable
+(`LegacyReadOutput`, `api-types lib.rs:306`), refuse branch statements. A
+statement and its
 route never diverge in behavior: a merge conflict is the same 409 on both
 (Design, step 4).
 
@@ -714,19 +777,19 @@ Error precedence on `/query`, `/read`, `/mutate`, `/change`, and
 statements (`/queries/{name}` shares the functions, but its source is
 parsed at load, `queries.rs:108`, so no order change is observable
 there): today an actor denied `Read` gets 403 before any
-parse (`handlers.rs:1123` then `:1124`); after this RFC a parse error, 400
+parse (`handlers.rs:1153` then `:1154`); after this RFC a parse error, 400
 with the parser's diagnostics, precedes the denial, so an authenticated
 actor denied `read` spends parser time on a route with no admission gate
-(`run_query` doc, `handlers.rs:1100-1104`); on the write routes the parse
-now runs before `try_admit` (`handlers.rs:1061`), so an unparseable body
+(`run_query` doc, `handlers.rs:1130-1134`); on the write routes the parse
+now runs before `try_admit` (`handlers.rs:1091`), so an unparseable body
 no longer consumes an admission slot and the parse itself is no longer
 admission-bounded. A caller with no credentials never reaches the handler
-when a policy is configured (`require_bearer_auth`, `handlers.rs:259-286`,
+when a policy is configured (`require_bearer_auth`, `handlers.rs:269-296`,
 answers 401 first). Accepted, because the parse reads nothing beyond the
 request body, and `/mutate` takes the same reorder: the door's Cedar
 action is known only after classification, so both doors parse, classify,
 then authorize (today `/mutate` authorizes and admits first,
-`handlers.rs:1046-1066`); the alternative, parsing first only when
+`handlers.rs:1076-1096`); the alternative, parsing first only when
 the source begins with `branch`, would make the door's behavior depend on
 a string compare on the request, which Invariants 9 forbids.
 
@@ -746,8 +809,9 @@ exposing a `mutate` entry point must now classify the source it sends or
 accept the change.
 
 Storage: none. Policy: no new action and no policy-file change; a policy
-that grants `branch_merge` today grants `branch merge` tomorrow, and one
-that denies it denies both fronts. Logic tests: fail-closed per RFC 0045.
+that grants `branch_merge` today grants `branch merge` tomorrow, one
+that denies it denies both fronts, and a data credential's action ceiling
+(RFC 0053) bounds both fronts alike. Logic tests: fail-closed per RFC 0045.
 
 Reverting: remove the grammar alternative and the `Branch` variant (the
 compiler then enumerates every arm to delete), the `outcome` field, and
@@ -774,9 +838,9 @@ stay readable as behavior records.
 3. **One door for every statement kind** (deferred). The language is
    already one; the split is transport, kept for four code-visible
    reasons and one routing constraint: separate Cedar actions (`Read`
-   versus `Change`, `handlers.rs:1175, 1050`), different targets (reads
+   versus `Change`, `handlers.rs:1205, 1080`), different targets (reads
    take branch or snapshot, writes branch only), a write-only CAS
-   precondition (`/mutate/if-graph-commit`, `lib.rs:1868`), different
+   precondition (`/mutate/if-graph-commit`, `lib.rs:1892`), different
    answers (rows versus two counts), and the routing constraint: a proxy
    that dispatches by route path, without reading bodies, must be able to
    send every write to the writer, so write statements keep a mutation
@@ -786,15 +850,16 @@ stay readable as behavior records.
    a mutation route path. The cost is a deprecation window for two routes
    and two verbs and a wider RFC. This
    RFC is written for two doors and survives one: every rule above holds
-   after the doors merge, and the `outcome` object becomes a row. A
-   follow-up RFC may adopt it, citing this one.
+   after the doors merge, and the `outcome` object becomes a row. An RFC
+   of its own may adopt it, citing this one; the one-language RFC
+   (Motivation) keeps the two doors and inherits the routing constraint.
 4. **A session "current branch" or `checkout` statement.** Dolt's
    `DOLT_CHECKOUT` sets a per-session branch. Rejected: the HTTP API is
    stateless, every route names its branch per request
    (`QueryRequest.branch`, `ChangeRequest.branch`, default `main`), and
    no server, compiler, or user-doc surface has a session or
    working-branch notion; the engine's coordinator-open branch used by
-   `branch_create` (`db/omnigraph.rs:3291`) is exposed by no route.
+   `branch_create` (`db/omnigraph.rs:3334`) is exposed by no route.
 5. **Branch operations inside a mutation body.** Rejected: one mutation
    query publishes as one commit on one branch and a merge is its own
    atomic commit (`docs/user/branching/index.md:65, 68`); a body holding
@@ -835,12 +900,21 @@ stay readable as behavior records.
     `docs/user/branching/merge.md:38-53`), so an agent reads it as data
     today; a 200 for a write that published nothing would split the
     shared error mapping (`OmniError::MergeConflicts` to 409 in one place,
-    `omnigraph-server/src/lib.rs:1081`) into two, against the guarantee
+    `omnigraph-server/src/lib.rs:1105`) into two, against the guarantee
     that a statement and its route map errors identically; and every
     `/mutate` consumer treats 200 as applied.
+11. **Every operation in this RFC**, the seven families Motivation names
+    beside the branch family, so the direction lands as one document.
+    Rejected: each family carries its own answer shape, payload form, and
+    permission (the maintenance verbs have no route today, so no policy
+    check meets them), so one RFC would own seven contracts and the
+    smallest of them, the one with the live test gap, would wait on the
+    largest. The branch rules are written to be inherited (Summary), and
+    the one-language RFC delegates the branch family to this document
+    instead of reopening it.
 
 Precedent audit. In-repo: the read door's classification-by-body refusal
-(`handlers.rs:1126-1131`) is the nearest pattern, extended here to the
+(`handlers.rs:1156-1161`) is the nearest pattern, extended here to the
 file level and both doors; the one divergence, parsing before target
 resolution, is justified in Server dispatch and owned in Compatibility.
 RFC 0041's inline queries put any GQ source in `QueryRequest.query`, so
@@ -867,8 +941,8 @@ Existing owners to extend:
 - Compiler: a parser test beside `parse_query` (the crate has no `tests/`
   directory at that commit) for each statement, each default, the quoted
   name, the keyword boundary (`branch createb0` refused), the empty,
-  whitespace-padded, and control-character name refusals, the two
-  compiler refusals, and a
+  whitespace-padded, and control-character name refusals, the escape
+  refusal, the two structural refusals, and a
   property named `branch` still parsing inside a body.
 - Server: `crates/omnigraph-server/tests/data_routes.rs` for dispatch,
   the refusal table, the 400-before-403 precedence, the CLI's exact
@@ -878,7 +952,7 @@ Existing owners to extend:
   list` under `read`); `openapi.rs` for the `outcome` field and the
   null-null `target` value.
 - CLI: `crates/omnigraph-cli/tests/cli_queries.rs` for `-e` statements in
-  remote and embedded mode, rendering `branch list` in all five formats
+  remote and embedded mode, rendering `branch list` in all text formats
   with the null-null target, the three text lines for control writes, and
   the delete confirmation on a non-local target;
   `parity_matrix.rs` for verb-versus-statement output parity.
@@ -890,9 +964,9 @@ Existing owners to extend:
 Engine tests are not extended; merge semantics keep their owners.
 
 First cases: the three merge-family findings, in the first `.gqt` files
-that can hold them. Ten cases are committed at that commit
-(`git ls-tree 8ca9b12c crates/omnigraph-gqt/cases/`); these are the
-eleventh through thirteenth.
+that can hold them. Sixteen cases are committed at that commit
+(`git ls-tree d520d2bb crates/omnigraph-gqt/cases/`); these are the
+seventeenth through nineteenth.
 
 1. `issue_583_merge_duplicates_edge_inserted_on_both_sides.gqt`
    ([#583](https://github.com/ModernRelay/omnigraph/issues/583)): fork
@@ -947,6 +1021,9 @@ branch list
 {"name": "b0"}
 {"name": "b1"}
 {"name": "main"}
+
+--- expect shape
+name: String
 
 --- mutate branch: b0
 query duplicate_add() {
@@ -1006,23 +1083,37 @@ existing walker.
 
 ## Rollout
 
-1. **Compiler** (`omnigraph-compiler`, `omnigraph-cluster`): grammar,
-   `BranchStmt`, the `QueryFile` enum, the two parse refusals, the three
-   name refusals, the refusing `Branch` arms in typecheck, lint, lower,
-   and the registry, and the cluster loader's two `.queries` sites
+1. **Compiler** (`omnigraph-compiler`, `omnigraph-cluster`; refusing
+   `Branch` arms in `omnigraph-server`, `omnigraph-cli`, and
+   `omnigraph-gqt` where the enum forces a match, replaced by dispatch in
+   phases 2 to 4): grammar,
+   `BranchStmt`, the `QueryFile` enum, the two structural refusals, the
+   three name refusals, the refusing `Branch` arms in lint, the registry,
+   the server's and CLI's named-query selectors, and the runner, and the
+   cluster loader's two `.queries` sites
    (`config.rs:158` and `validate_query_source`), whose `Branch` arm is a
    diagnostic in the `query_parse_error` family, so `omnigraph cluster
-   validate` refuses a catalog the server would refuse at boot. Ships
-   alone: nothing accepts
-   a statement yet, every existing `.gq` file parses as before.
-   `implementation` advances to `in-progress`.
+   validate` refuses a catalog the server would refuse at boot. Same
+   change: `docs/user/queries/index.md`'s `Q000` line gains that a file
+   holding a branch statement where declarations were expected is also a
+   `Q000`. Ships
+   alone: every existing `.gq` file parses as before. Until its door
+   ships, a statement at `POST /query`, `POST /mutate`, the CLI verbs, or
+   a runner step is refused with the compiler's one text,
+   `` `<statement>` is a branch statement, not a query declaration ``
+   (HTTP 400 on the server, exit 1 in the CLI); phases 2 to 4 replace that
+   refusal with dispatch at the two handlers, the runner, and the verbs.
+   The cluster-loader and registry refusals are permanent. Phase 1 merges
+   after this RFC is `accepted`, and the phase 1 PR sets
+   `implementation: in-progress` and `updated` in this file
+   (`docs/rfcs/README.md` §Process 6).
 2. **Server and wire** (`omnigraph-server`, `omnigraph-api-types`):
    parse-first ordering in `run_query` and `run_mutate` (`classify`,
    `ReadDispatch`, `Door`), the wrong-door, request-target, name-and-params,
    precondition, and deprecated-route refusals, the handler-body split,
    `BranchOutcomeOutput` and the `outcome` field, the `commit` fill for a
    merge. Same change: `openapi.json` regenerated, `docs/user/branching/index.md`
-   and `merge.md` amended with the statement spellings (`AGENTS.md:146,
+   and `merge.md` amended with the statement spellings (`AGENTS.md:147,
    169` require both in the change that adds the endpoint or format).
    Ships alone: statements work over HTTP; the CLI's `-e` verbs reach them
    in phase 4.
@@ -1044,11 +1135,17 @@ existing walker.
    spelling beside the verb spelling with the wrong-door rule. The
    `omnigraph branch` verbs are
    untouched.
-   Ships alone. `implementation` advances to `complete`.
+   Ships alone; the phase 4 PR sets `implementation: complete` and
+   `updated` in this file (`docs/rfcs/README.md` §Process 6).
 
-The RFC PR adds this file as `docs/rfcs/0052-gq-branch-statements.md`, its
-registry row, and the next-number bump to `0053` in the same PR, with
-`scripts/check-docs.py` green.
+The RFC PR adds this file as `docs/rfcs/0055-gq-branch-statements.md`, its
+registry row, and the next-number bump to `0056` in the same PR, with
+`scripts/check-docs.py` green. The one-language RFC's families land as
+their own PR sets, citing this RFC for the rules they inherit; neither its
+phase 1 nor this one waits on the other: whichever lands first introduces
+the `QueryFile` enum, and the other extends it (that RFC's Rollout names
+the variant it adds and the general spelling it gives the refusal strings
+in User and operational behavior).
 
 ## Unresolved questions
 
@@ -1059,3 +1156,26 @@ None.
 - 2026-09-04: initial draft.
 - 2026-09-04: a `branch merge` conflict stays the route's HTTP 409, not a
   200 `outcome` (Alternatives 10).
+- 2026-09-06: §AST and §Rollout 1 no longer name a typechecker or lowerer
+  arm, because `typecheck_query_decl`, `typecheck_query`, and `lower_query`
+  take a `QueryDecl` and never see the file; §Rollout 1 names every crate
+  the enum forces an arm in and states the interim refusal between phase 1
+  and each door; `implementation` is set by each phase PR after this RFC is
+  `accepted`. This supersedes §AST's consumer list and its refusing-arm
+  sentence, §Rollout 1's crate list and its claim that no surface accepts
+  a statement yet, and the two `implementation` sentences in §Rollout 1
+  and 4.
+- 2026-09-06: this RFC is the first family of a roadmap under which every
+  operation a graph exposes becomes a GQ statement; the remaining families
+  go to a follow-up RFC that inherits the control-read and control-write
+  rules set here (Summary, Motivation, Alternatives 3 and 11, Rollout).
+- 2026-09-06, later the same day: the one-language RFC is the umbrella
+  and delegates the branch family to this document; neither waits on the
+  other, and no landing order holds between the two phase 1s. This
+  supersedes the "first step of a roadmap", "follow-up RFC", and
+  "land once phase 1 has shipped the `QueryFile` enum" wording of the
+  entry above in Summary, Motivation, Alternatives 3 and 11, and Rollout.
+  Same entry: every `branch list` rows expect carries the shape section
+  RFC 0045 made mandatory (Design, Logic tests), and the RFC 0053
+  credential ceiling is named as bounding a statement as it bounds its
+  route (Design, Server dispatch; Compatibility, Policy).
