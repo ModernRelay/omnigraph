@@ -23,57 +23,62 @@ struct PreparedScalarSlot {
 
 /// Prepare only private candidates. Collection, graph validation, recovery and
 /// graph-owned effects remain in their original operation-level owners.
-async fn prepare_scalar_table(
-    db: &Omnigraph,
-    table_key: &str,
-    catalog: &Catalog,
-    base: &Snapshot,
-    source: &Snapshot,
-    target: &Snapshot,
-    target_native: Option<&str>,
-) -> Result<ScalarPreparation> {
-    preparation::checkpoint()?;
-    ensure_merge_identity_compatible(
-        table_key,
-        base.dataset(table_key).map(|entry| entry.identity),
-        source.dataset(table_key).map(|entry| entry.identity),
-        target.dataset(table_key).map(|entry| entry.identity),
-    )?;
-    let mut conflicts = Vec::new();
-    let preflight = crate::table_store::ExternalBlobPreflight::default();
-    let candidate = if same_manifest_state(base.dataset(table_key), target.dataset(table_key)) {
-        classify_adopt(
-            db,
-            catalog,
-            base,
-            source,
-            target,
+// Separate future construction from the scheduler's poll frame. Adoption
+// embeds deep Lance work even when this particular table takes the walk path.
+#[inline(never)]
+fn prepare_scalar_table<'a>(
+    db: &'a Omnigraph,
+    table_key: &'a str,
+    catalog: &'a Catalog,
+    base: &'a Snapshot,
+    source: &'a Snapshot,
+    target: &'a Snapshot,
+    target_native: Option<&'a str>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ScalarPreparation>> + Send + 'a>> {
+    Box::pin(async move {
+        preparation::checkpoint()?;
+        ensure_merge_identity_compatible(
             table_key,
-            target_native,
-            &preflight,
-        )
-        .await?
-    } else {
-        let timing = crate::instrumentation::start_merge_timing(
-            crate::instrumentation::MergeTimingPhase::TableWalk,
-        );
-        let staged = stage_streaming_table_merge(
-            db,
-            table_key,
-            catalog,
-            base,
-            source,
-            target,
-            &mut conflicts,
-            &preflight,
-        )
-        .await?;
-        timing.finish();
-        staged.map(CandidateTableState::RewriteMerged)
-    };
-    Ok(ScalarPreparation {
-        candidate,
-        conflicts,
+            base.dataset(table_key).map(|entry| entry.identity),
+            source.dataset(table_key).map(|entry| entry.identity),
+            target.dataset(table_key).map(|entry| entry.identity),
+        )?;
+        let mut conflicts = Vec::new();
+        let preflight = crate::table_store::ExternalBlobPreflight::default();
+        let candidate = if same_manifest_state(base.dataset(table_key), target.dataset(table_key)) {
+            classify_adopt(
+                db,
+                catalog,
+                base,
+                source,
+                target,
+                table_key,
+                target_native,
+                &preflight,
+            )
+            .await?
+        } else {
+            let timing = crate::instrumentation::start_merge_timing(
+                crate::instrumentation::MergeTimingPhase::TableWalk,
+            );
+            let staged = stage_streaming_table_merge(
+                db,
+                table_key,
+                catalog,
+                base,
+                source,
+                target,
+                &mut conflicts,
+                &preflight,
+            )
+            .await?;
+            timing.finish();
+            staged.map(CandidateTableState::RewriteMerged)
+        };
+        Ok(ScalarPreparation {
+            candidate,
+            conflicts,
+        })
     })
 }
 
@@ -121,16 +126,9 @@ async fn prepare_scalar_window(
                 let result = preparation::scope(Arc::clone(&context), async {
                     instrumentation::merge_preparation_checkpoint(slot, key, Checkpoint::Started)
                         .await;
-                    let result = Box::pin(prepare_scalar_table(
-                        db,
-                        key,
-                        catalog,
-                        base,
-                        source,
-                        target,
-                        target_native,
-                    ))
-                    .await;
+                    let result =
+                        prepare_scalar_table(db, key, catalog, base, source, target, target_native)
+                            .await;
                     if result.is_err() {
                         frontier.failed(slot);
                     }
@@ -2816,71 +2814,78 @@ async fn run_three_way_classification(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn stage_streaming_table_merge_walk(
-    target_db: &Omnigraph,
-    table_key: &str,
-    catalog: &Catalog,
-    base_snapshot: &Snapshot,
-    source_snapshot: &Snapshot,
-    target_snapshot: &Snapshot,
-    conflicts: &mut Vec<MergeConflict>,
-    external_preflight: &crate::table_store::ExternalBlobPreflight,
-    outcome_log: Option<&mut Vec<(String, RowOutcomeKind)>>,
-) -> Result<Option<StagedMergeResult>> {
-    let schema = schema_for_table_key(catalog, table_key)?;
-    let prior_conflict_count = conflicts.len();
-    let materializer = target_db.blob_materializer();
-    let mut insert_writer =
-        StagedTableWriter::new(&format!("{}_inserts", table_key), schema.clone())?;
-    let mut update_writer = StagedTableWriter::new(&format!("{}_updates", table_key), schema)?;
-    let mut deleted_ids = DeleteIdChunks::default();
-    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key, "base").await?;
-    let mut source =
-        OrderedTableCursor::from_snapshot(source_snapshot, table_key, "source").await?;
-    let mut target =
-        OrderedTableCursor::from_snapshot(target_snapshot, table_key, "target").await?;
+// The outer staging future also holds lineage/verification branches. Keep
+// this walk's future construction in its own frame before the writer is polled.
+#[inline(never)]
+fn stage_streaming_table_merge_walk<'a>(
+    target_db: &'a Omnigraph,
+    table_key: &'a str,
+    catalog: &'a Catalog,
+    base_snapshot: &'a Snapshot,
+    source_snapshot: &'a Snapshot,
+    target_snapshot: &'a Snapshot,
+    conflicts: &'a mut Vec<MergeConflict>,
+    external_preflight: &'a crate::table_store::ExternalBlobPreflight,
+    outcome_log: Option<&'a mut Vec<(String, RowOutcomeKind)>>,
+) -> std::pin::Pin<
+    Box<impl std::future::Future<Output = Result<Option<StagedMergeResult>>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        let schema = schema_for_table_key(catalog, table_key)?;
+        let prior_conflict_count = conflicts.len();
+        let materializer = target_db.blob_materializer();
+        let mut insert_writer =
+            StagedTableWriter::new(&format!("{}_inserts", table_key), schema.clone())?;
+        let mut update_writer = StagedTableWriter::new(&format!("{}_updates", table_key), schema)?;
+        let mut deleted_ids = DeleteIdChunks::default();
+        let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key, "base").await?;
+        let mut source =
+            OrderedTableCursor::from_snapshot(source_snapshot, table_key, "source").await?;
+        let mut target =
+            OrderedTableCursor::from_snapshot(target_snapshot, table_key, "target").await?;
 
-    let mut needs_update = false;
-    run_three_way_classification(
-        &mut base,
-        &mut source,
-        &mut target,
-        &mut insert_writer,
-        &mut update_writer,
-        &mut deleted_ids,
-        conflicts,
-        prior_conflict_count,
-        &mut needs_update,
-        table_key,
-        &materializer,
-        external_preflight,
-        outcome_log,
-    )
-    .await?;
+        let mut needs_update = false;
+        run_three_way_classification(
+            &mut base,
+            &mut source,
+            &mut target,
+            &mut insert_writer,
+            &mut update_writer,
+            &mut deleted_ids,
+            conflicts,
+            prior_conflict_count,
+            &mut needs_update,
+            table_key,
+            &materializer,
+            external_preflight,
+            outcome_log,
+        )
+        .await?;
 
-    if conflicts.len() > prior_conflict_count {
-        return Ok(None);
-    }
-    if !needs_update {
-        return Ok(None);
-    }
+        if conflicts.len() > prior_conflict_count {
+            return Ok(None);
+        }
+        if !needs_update {
+            return Ok(None);
+        }
 
-    let inserts = if insert_writer.row_count > 0 {
-        Some(insert_writer.finish().await?)
-    } else {
-        None
-    };
-    let updates = if update_writer.row_count > 0 {
-        Some(update_writer.finish().await?)
-    } else {
-        None
-    };
+        let inserts = if insert_writer.row_count > 0 {
+            Some(insert_writer.finish().await?)
+        } else {
+            None
+        };
+        let updates = if update_writer.row_count > 0 {
+            Some(update_writer.finish().await?)
+        } else {
+            None
+        };
 
-    Ok(Some(StagedMergeResult {
-        inserts,
-        updates,
-        deleted_ids,
-    }))
+        Ok(Some(StagedMergeResult {
+            inserts,
+            updates,
+            deleted_ids,
+        }))
+    })
 }
 
 // ---------------------------------------------------------------------------
