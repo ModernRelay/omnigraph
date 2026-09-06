@@ -1,5 +1,5 @@
 ---
-rfc: "0053"
+rfc: "0058"
 title: "Retained merged ancestry"
 track: maintainer
 status: draft
@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-06
 discussion: null
 supersedes: []
 superseded_by: []
@@ -18,7 +18,7 @@ blocked_on:
   - Strict-format activation and compatibility evidence
 ---
 
-# RFC 0053: Retained merged ancestry
+# RFC 0058: Retained merged ancestry
 
 ## Summary
 
@@ -430,3 +430,8 @@ on older RFC substrate claims.
   the preferred contract. Indefinite reachable-history retention moved to an
   opt-in alternative; optional current-pair base pinning is bounded but does
   not promise availability for future branch heads.
+
+- 2026-09-06: Reallocated the draft to 0058 after checking main and open
+  RFC reservations. Main owns 0053–0055, PR #670 reserves 0056, and bounded
+  merge preparation is the separate accepted RFC 0057 in PR #638. This
+  numbering correction does not accept or activate retained ancestry.
