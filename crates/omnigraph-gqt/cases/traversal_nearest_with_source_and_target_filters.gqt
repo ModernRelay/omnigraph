@@ -1,0 +1,172 @@
+# issue: none
+# notes: one 60-doc fixture, two edge types, three filter positions beside a hop.
+# notes: Knows leaves 10, 20, 30, 40, 50 (5 of 60 = 8.3%, gate prefilters); Likes
+# notes: leaves every 5th doc from 5 (11 of 60 = 18%, Threshold fallback).
+# notes: Step 1 `$d.n > 15  $d knows $t`, limit 2: the pushed filter AND the
+# notes: gate's id list on one scan; 20, 30, 40, 50 survive both (4 > 2): d020,
+# notes: d030. Step 2 `$d knows $t  $t.n > 25`, limit 2: the target filter cannot
+# notes: be pushed, the gate's ids over-admit (10 and 20 have targets 11, 21),
+# notes: the first prefiltered pass holds 10, 20 and loses both; the overfetch
+# notes: rerun under the same id list reaches 30, 40, 50 (3 > 2): d030, d040.
+# notes: Step 3 `$d.n > 15  $d likes $t`, limit 2: above the fence, so the
+# notes: filter is pushed and the traversal drops rows above an unfiltered scan;
+# notes: k 2 (16, 17) and 8 (16..23: one source, 20) are short, k 32 fills:
+# notes: d020, d025. Three different answers, one per path.
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64 @index
+    name: String @index
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+edge Likes: Doc -> Doc {
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","n":2,"name":"doc-002","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","n":3,"name":"doc-003","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","n":4,"name":"doc-004","embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d005","n":5,"name":"doc-005","embedding":[5.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d006","n":6,"name":"doc-006","embedding":[6.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d007","n":7,"name":"doc-007","embedding":[7.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d008","n":8,"name":"doc-008","embedding":[8.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d009","n":9,"name":"doc-009","embedding":[9.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d010","n":10,"name":"doc-010","embedding":[10.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d011","n":11,"name":"doc-011","embedding":[11.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d012","n":12,"name":"doc-012","embedding":[12.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d013","n":13,"name":"doc-013","embedding":[13.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d014","n":14,"name":"doc-014","embedding":[14.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d015","n":15,"name":"doc-015","embedding":[15.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d016","n":16,"name":"doc-016","embedding":[16.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d017","n":17,"name":"doc-017","embedding":[17.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d018","n":18,"name":"doc-018","embedding":[18.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d019","n":19,"name":"doc-019","embedding":[19.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d020","n":20,"name":"doc-020","embedding":[20.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d021","n":21,"name":"doc-021","embedding":[21.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d022","n":22,"name":"doc-022","embedding":[22.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d023","n":23,"name":"doc-023","embedding":[23.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d024","n":24,"name":"doc-024","embedding":[24.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d025","n":25,"name":"doc-025","embedding":[25.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d026","n":26,"name":"doc-026","embedding":[26.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d027","n":27,"name":"doc-027","embedding":[27.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d028","n":28,"name":"doc-028","embedding":[28.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d029","n":29,"name":"doc-029","embedding":[29.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d030","n":30,"name":"doc-030","embedding":[30.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d031","n":31,"name":"doc-031","embedding":[31.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d032","n":32,"name":"doc-032","embedding":[32.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d033","n":33,"name":"doc-033","embedding":[33.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d034","n":34,"name":"doc-034","embedding":[34.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d035","n":35,"name":"doc-035","embedding":[35.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d036","n":36,"name":"doc-036","embedding":[36.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d037","n":37,"name":"doc-037","embedding":[37.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d038","n":38,"name":"doc-038","embedding":[38.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d039","n":39,"name":"doc-039","embedding":[39.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d040","n":40,"name":"doc-040","embedding":[40.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d041","n":41,"name":"doc-041","embedding":[41.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d042","n":42,"name":"doc-042","embedding":[42.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d043","n":43,"name":"doc-043","embedding":[43.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d044","n":44,"name":"doc-044","embedding":[44.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d045","n":45,"name":"doc-045","embedding":[45.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d046","n":46,"name":"doc-046","embedding":[46.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d047","n":47,"name":"doc-047","embedding":[47.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d048","n":48,"name":"doc-048","embedding":[48.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d049","n":49,"name":"doc-049","embedding":[49.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d050","n":50,"name":"doc-050","embedding":[50.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d051","n":51,"name":"doc-051","embedding":[51.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d052","n":52,"name":"doc-052","embedding":[52.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d053","n":53,"name":"doc-053","embedding":[53.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d054","n":54,"name":"doc-054","embedding":[54.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d055","n":55,"name":"doc-055","embedding":[55.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d056","n":56,"name":"doc-056","embedding":[56.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d057","n":57,"name":"doc-057","embedding":[57.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d058","n":58,"name":"doc-058","embedding":[58.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d059","n":59,"name":"doc-059","embedding":[59.0,0.0,0.0,0.0]}}
+{"edge":"Knows","from":"d010","to":"d011","data":{"id":"e010_0"}}
+{"edge":"Knows","from":"d020","to":"d021","data":{"id":"e020_0"}}
+{"edge":"Knows","from":"d030","to":"d031","data":{"id":"e030_0"}}
+{"edge":"Knows","from":"d040","to":"d041","data":{"id":"e040_0"}}
+{"edge":"Knows","from":"d050","to":"d051","data":{"id":"e050_0"}}
+{"edge":"Likes","from":"d005","to":"d006","data":{"id":"l005"}}
+{"edge":"Likes","from":"d010","to":"d011","data":{"id":"l010"}}
+{"edge":"Likes","from":"d015","to":"d016","data":{"id":"l015"}}
+{"edge":"Likes","from":"d020","to":"d021","data":{"id":"l020"}}
+{"edge":"Likes","from":"d025","to":"d026","data":{"id":"l025"}}
+{"edge":"Likes","from":"d030","to":"d031","data":{"id":"l030"}}
+{"edge":"Likes","from":"d035","to":"d036","data":{"id":"l035"}}
+{"edge":"Likes","from":"d040","to":"d041","data":{"id":"l040"}}
+{"edge":"Likes","from":"d045","to":"d046","data":{"id":"l045"}}
+{"edge":"Likes","from":"d050","to":"d051","data":{"id":"l050"}}
+{"edge":"Likes","from":"d055","to":"d056","data":{"id":"l055"}}
+
+--- query
+query scenario($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d.n > 15
+        $d knows $t
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d020"}
+{"d.slug":"d030"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query scenario($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d knows $t
+        $t.n > 25
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d030"}
+{"d.slug":"d040"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query scenario($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d.n > 15
+        $d likes $t
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d020"}
+{"d.slug":"d025"}
+
+--- expect shape
+d.slug: String

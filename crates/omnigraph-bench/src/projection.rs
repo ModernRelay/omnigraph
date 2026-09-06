@@ -1355,7 +1355,14 @@ fn page_from_query_result(
     exclusive_after: &str,
     query: &ProjectionQuery,
 ) -> Result<ProjectionPageV1, ProjectionError> {
-    let mut rows = match result.to_rust_json() {
+    let rendered = result.to_rust_json().map_err(|err| {
+        ProjectionError::new(
+            "projection_page_result_invalid",
+            None,
+            format!("projection page query did not render as JSON: {err}"),
+        )
+    })?;
+    let mut rows = match rendered {
         serde_json::Value::Array(rows) => rows,
         _ => {
             return Err(ProjectionError::new(
@@ -2019,7 +2026,13 @@ fn parse_inventory_page(
     result: &QueryResult,
     exclusive_after: &str,
 ) -> Result<Vec<InventoryEntry>, ProjectionError> {
-    let rows = result.to_rust_json();
+    let rows = result.to_rust_json().map_err(|err| {
+        ProjectionError::new(
+            "projection_inventory_result_invalid",
+            None,
+            format!("inventory query did not render as JSON: {err}"),
+        )
+    })?;
     let rows = rows.as_array().ok_or_else(|| {
         ProjectionError::new(
             "projection_inventory_result_invalid",
@@ -2305,7 +2318,14 @@ fn bounded_verification_rows(
     result: QueryResult,
     noun: &str,
 ) -> Result<Vec<serde_json::Value>, ProjectionError> {
-    let rows = match result.to_rust_json() {
+    let rendered = result.to_rust_json().map_err(|err| {
+        ProjectionError::new(
+            "projection_verification_result_invalid",
+            None,
+            format!("{noun} verification query did not render as JSON: {err}"),
+        )
+    })?;
+    let rows = match rendered {
         serde_json::Value::Array(rows) => rows,
         _ => {
             return Err(ProjectionError::new(

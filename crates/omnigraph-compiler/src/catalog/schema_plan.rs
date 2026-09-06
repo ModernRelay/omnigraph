@@ -7,8 +7,9 @@ use crate::schema::ast::{Annotation, Constraint};
 use crate::types::PropType;
 
 use super::schema_ir::{
-    ConstraintIR, EdgeIR, EmbedSourceIR, InterfaceIR, NodeIR, PropertyIR, PropertyRefIR, SchemaIR,
-    StablePropertyId, StableTypeId, TableIncarnationId, constraint_from_ir, validate_schema_ir,
+    ACTOR_TYPE_NAME, ConstraintIR, EdgeIR, EmbedSourceIR, InterfaceIR, NodeIR, PropertyIR,
+    PropertyRefIR, SchemaIR, StablePropertyId, StableTypeId, TableIncarnationId,
+    constraint_from_ir, validate_schema_ir,
 };
 use super::schema_shape::PropertyConstraintShape;
 
@@ -52,6 +53,8 @@ pub struct SchemaMigrationPlan {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SchemaMigrationStep {
+    /// Change automatic materialization while retaining the protected table.
+    SetActorProvenance { enabled: bool },
     AddType {
         type_kind: SchemaTypeKind,
         name: String,
@@ -197,6 +200,13 @@ pub fn plan_schema_migration(
     }
     validate_evolution_identity(accepted, desired)?;
     let mut steps = Vec::new();
+    if accepted.actor_provenance != desired.actor_provenance
+        && let Some(binding) = &desired.actor_provenance
+    {
+        steps.push(SchemaMigrationStep::SetActorProvenance {
+            enabled: binding.enabled,
+        });
+    }
     plan_interfaces(&accepted.interfaces, &desired.interfaces, &mut steps);
     plan_nodes(&accepted.nodes, &desired.nodes, &mut steps);
     plan_edges(&accepted.edges, &desired.edges, &mut steps);
@@ -220,6 +230,38 @@ pub fn plan_schema_migration(
 fn validate_evolution_identity(accepted: &SchemaIR, desired: &SchemaIR) -> Result<()> {
     use crate::error::SchemaIdentityError;
 
+    if let Some(previous) = &accepted.actor_provenance {
+        let Some(next) = &desired.actor_provenance else {
+            return Err(SchemaIdentityError::Resolution(
+                "protected actor binding cannot be removed".to_string(),
+            )
+            .into());
+        };
+        if previous.type_id != next.type_id
+            || previous.table_incarnation_id != next.table_incarnation_id
+            || previous.actor_id_property_id != next.actor_id_property_id
+        {
+            return Err(SchemaIdentityError::Resolution(
+                "protected actor binding cannot change identity".to_string(),
+            )
+            .into());
+        }
+    } else if let Some(binding) = &desired.actor_provenance
+        && (binding.type_id.get() < accepted.next_identity_id
+            || accepted
+                .interfaces
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .chain(accepted.nodes.iter().map(|entry| entry.name.as_str()))
+                .chain(accepted.edges.iter().map(|entry| entry.name.as_str()))
+                .any(|name| name == ACTOR_TYPE_NAME))
+    {
+        return Err(SchemaIdentityError::Resolution(
+            "a new actor binding cannot adopt an existing identity or unbound OmniActor declaration"
+                .to_string(),
+        )
+        .into());
+    }
     if desired.next_identity_id < accepted.next_identity_id {
         return Err(SchemaIdentityError::Resolution(format!(
             "desired next_identity_id {} regresses accepted high-water mark {}",

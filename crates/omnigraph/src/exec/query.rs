@@ -4,6 +4,11 @@ use super::projection::{
     apply_filter, apply_ordering, project_return, projections_have_aggregates,
 };
 
+use crate::instrumentation::{
+    RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_ann_prefilter_verdict,
+    record_rrf_gate_verdict,
+};
+
 /// Bundles the per-handle embedding client cell with the optional injected
 /// config (RFC-012 Phase 5) so the lazy init uses the injected config when
 /// present, else `EmbeddingClient::from_env()`. Threaded through the query path
@@ -155,10 +160,17 @@ impl Omnigraph {
 struct SearchMode {
     /// Vector ANN search: (variable, property, query_vector, k).
     nearest: Option<(String, String, Vec<f32>, usize)>,
-    /// Maximum number of IVF payload partitions a nearest scan may search.
-    /// Lance retains its adaptive minimum (one by default); `maximum = None`
-    /// is used by the completeness retry.
-    ann_probe_budget: Option<AnnProbeBudget>,
+    /// Maximum number of IVF payload partitions a nearest scan may search,
+    /// per index delta; `None` is uncapped. The scan-site ladder in
+    /// `execute_node_scan` widens a maximum that starves the scan.
+    ann_probe_budget: Option<usize>,
+    /// The nearest scan runs flat (`use_index(false)`, every row scored): the
+    /// overfetch loop's exact pass.
+    nearest_exact: bool,
+    /// The nearest prefilter gate proved the answer empty: no node of the
+    /// ranked type satisfies an Expand's first hop. Set only by
+    /// `nearest_prefilter_gate`, never on an RRF arm.
+    answer_proven_empty: bool,
     /// BM25 full-text search: (variable, property, query_text).
     bm25: Option<(String, String, String)>,
     /// Row cap for the BM25 scan, the counterpart of `nearest`'s `k`; see
@@ -166,15 +178,9 @@ struct SearchMode {
     bm25_scan_limit: Option<usize>,
     /// RRF fusion: (primary, secondary, k_constant, limit).
     rrf: Option<RrfMode>,
-    /// The rrf prefilter gate's eligible-id set for this arm's BM25 scan
-    /// (`execute_rrf_fusion` sets it on an arm iff that arm carries an
-    /// uncapped `bm25` target on the ranked variable — never on a `nearest`
-    /// arm, whose constitutive `k` truncation would make a prefiltered run
-    /// answer-DIFFERENT, not just cheaper). The set over-approximates the
-    /// traversal's survivors (single owner of that invariant:
-    /// `rrf_prefilter_gate`'s doc), so ANDing it into the scan is a cost
-    /// change only. Not a cap: `to_uncapped` must NOT clear it.
-    bm25_eligible_ids: Option<EligibleIds>,
+    /// The set a gate ANDs into the ranked scan as `id IN (...)`. Never set
+    /// on an RRF nearest arm. Not a cap: `to_uncapped` must NOT clear it.
+    eligible_ids: Option<EligibleIds>,
 }
 
 /// Shared eligible-id set, `Debug`-opaque so a logged `SearchMode` prints the
@@ -188,42 +194,115 @@ impl std::fmt::Debug for EligibleIds {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AnnProbeBudget {
-    maximum: Option<usize>,
+/// What the nearest scan reported back to the query level: the LAST scan of
+/// the ranked variable in a pass. `rows == k` means the scan was full, so a
+/// shortfall above it can only be recovered by asking for more candidates.
+#[derive(Debug, Default, Clone, Copy)]
+struct ScanReport {
+    nearest_scan: Option<NearestScanReport>,
 }
 
-impl AnnProbeBudget {
-    fn bounded(maximum: usize) -> Self {
-        Self {
-            maximum: Some(maximum),
-        }
+/// One nearest scan as `execute_node_scan`'s ladder left it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NearestScanReport {
+    /// Rows the scan returned.
+    rows: usize,
+    /// Candidates the scan asked for.
+    k: usize,
+    /// The probe cap the scan ran under; `None` is uncapped.
+    maximum_nprobes: Option<usize>,
+    /// The scan holds every row Lance could return for this query: it ran
+    /// as the flat exact kNN (every admitted row scored), or it returned
+    /// every row the gate's `id IN` list admits (`rows >= known_matches`).
+    exhausted: bool,
+    /// Live rows in the ranked type (`count_rows`, deletions excluded): the
+    /// `k` of the overfetch loop's exact pass.
+    dataset_rows: u64,
+}
+
+/// The next pass of `execute_query`'s overfetch loop after `factor` × `k0`
+/// candidates left the answer short above a full scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverfetchRung {
+    /// Ask for `k` candidates under the cap that filled the previous pass.
+    Wider {
+        factor: usize,
+        k: usize,
+        maximum: Option<usize>,
+    },
+    /// The exact pass: every live row of the type, scored flat, no probe cap.
+    Exact { k: usize },
+}
+
+/// ×4 up to `ANN_OVERFETCH_MAX_FACTOR`, then one exact pass, taken early once
+/// the next rung would cover the whole type anyway; `None` when the previous
+/// full scan already asked for every live row (`k == dataset_rows`).
+fn next_overfetch_rung(factor: usize, k0: usize, scan: NearestScanReport) -> Option<OverfetchRung> {
+    let whole = usize::try_from(scan.dataset_rows).unwrap_or(usize::MAX);
+    let next = factor.saturating_mul(ANN_OVERFETCH_STEP);
+    let k = k0.saturating_mul(next);
+    if next <= ANN_OVERFETCH_MAX_FACTOR && k < whole {
+        return Some(OverfetchRung::Wider {
+            factor: next,
+            k,
+            maximum: scan.maximum_nprobes,
+        });
     }
+    (whole > scan.k).then_some(OverfetchRung::Exact { k: whole })
 }
 
 impl SearchMode {
-    /// This mode with the BM25 scan cap cleared (only a standalone `bm25()`
-    /// ordering ever carries one — `rrf()` arms are never capped, see
-    /// `extract_sub_search_mode`). Any future scan cap must be cleared here
-    /// too. (`bm25_eligible_ids` is not a cap — a superset prefilter is
-    /// answer-preserving — so it survives.)
+    /// This mode with the BM25 scan cap cleared. Not a row cap, so not
+    /// cleared: `ann_probe_budget` (the nearest scan widens its own probes)
+    /// and `eligible_ids` (a superset prefilter is answer-preserving).
     fn to_uncapped(&self) -> Self {
         Self {
             bm25_scan_limit: None,
-            ann_probe_budget: self
-                .ann_probe_budget
-                .map(|_| AnnProbeBudget { maximum: None }),
             ..self.clone()
         }
     }
 
-    /// The eligible-id set to AND into `variable`'s scan, if this mode is a
-    /// bm25 arm targeting `variable` and the gate chose the prefilter plan.
-    fn bm25_eligible_ids_for(&self, variable: &str) -> Option<&[String]> {
-        match (&self.bm25, &self.bm25_eligible_ids) {
-            (Some((var, ..)), Some(ids)) if var == variable => Some(ids.0.as_slice()),
-            _ => None,
+    /// This mode asking the nearest scan for `k` candidates under the probe
+    /// cap `maximum` (`None` = uncapped). The cap is the rung that filled the
+    /// previous pass's scan, so the rerun does not re-climb from the base cap.
+    fn with_nearest_k(&self, k: usize, maximum: Option<usize>) -> Self {
+        let mut mode = self.clone();
+        if let Some((_, _, _, current)) = mode.nearest.as_mut() {
+            *current = k;
         }
+        mode.ann_probe_budget = maximum;
+        mode
+    }
+
+    /// This mode running the nearest scan flat over `k` = every live row of
+    /// the type: the overfetch loop's exact pass.
+    fn with_exact_nearest(&self, k: usize) -> Self {
+        let mut mode = self.with_nearest_k(k, None);
+        mode.nearest_exact = true;
+        mode
+    }
+
+    /// Whether `variable`'s scan is proven empty: `answer_proven_empty` on
+    /// the mode that ranks `variable` by `nearest`.
+    fn scan_proven_empty(&self, variable: &str) -> bool {
+        self.answer_proven_empty
+            && self
+                .nearest
+                .as_ref()
+                .is_some_and(|(var, ..)| var == variable)
+    }
+
+    /// The eligible-id set to AND into `variable`'s scan, if this mode ranks
+    /// `variable` (a bm25 arm, or a standalone nearest) and a prefilter gate
+    /// chose the prefilter plan.
+    fn eligible_ids_for(&self, variable: &str) -> Option<&[String]> {
+        let ids = self.eligible_ids.as_ref()?;
+        let ranks_variable = self.bm25.as_ref().is_some_and(|(var, ..)| var == variable)
+            || self
+                .nearest
+                .as_ref()
+                .is_some_and(|(var, ..)| var == variable);
+        ranks_variable.then(|| ids.0.as_slice())
     }
 }
 
@@ -289,7 +368,7 @@ async fn extract_search_mode(
             .unwrap_or(usize::MAX);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
-                ann_probe_budget: Some(AnnProbeBudget::bounded(ann_nprobes())),
+                ann_probe_budget: ann_nprobes(),
                 ..Default::default()
             })
         }
@@ -372,7 +451,7 @@ async fn extract_sub_search_mode(
                 .unwrap_or(100);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
-                ann_probe_budget: Some(AnnProbeBudget::bounded(ann_nprobes())),
+                ann_probe_budget: ann_nprobes(),
                 ..Default::default()
             })
         }
@@ -547,6 +626,48 @@ fn resolve_binding_type_name<'a>(pipeline: &'a [IROp], variable: &str) -> Option
     None
 }
 
+/// A value bound through the Rust `ParamMap` API skips the JSON param arm: refuse
+/// a time-bearing `Date` string, and a non-`Date` literal on a `Date` parameter.
+pub(super) fn check_param_date_literals(
+    params: &ParamMap,
+    declared: &[omnigraph_compiler::query::ast::Param],
+) -> Result<()> {
+    fn check(name: &str, lit: &Literal) -> Result<()> {
+        match lit {
+            Literal::Date(value) => omnigraph_compiler::check_date_literal(value)
+                .map_err(|reason| OmniError::manifest(format!("param '{name}': {reason}"))),
+            Literal::List(items) => items.iter().try_for_each(|item| check(name, item)),
+            _ => Ok(()),
+        }
+    }
+    params.iter().try_for_each(|(name, lit)| check(name, lit))?;
+    for param in declared {
+        let Some(lit) = params.get(&param.name) else {
+            continue;
+        };
+        let is_date = |lit: &Literal| match lit {
+            Literal::Date(_) => true,
+            Literal::Null => param.nullable,
+            _ => false,
+        };
+        let well_typed = match param.type_name.as_str() {
+            "Date" => is_date(lit),
+            "[Date]" => match lit {
+                Literal::List(items) => items.iter().all(is_date),
+                other => is_date(other),
+            },
+            _ => true,
+        };
+        if !well_typed {
+            return Err(OmniError::manifest(format!(
+                "param '{}': expected {}, got {lit:?}",
+                param.name, param.type_name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Execute a lowered QueryIR. Pure function — no state, no caches.
 pub async fn execute_query(
     ir: &QueryIR,
@@ -556,6 +677,7 @@ pub async fn execute_query(
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
 ) -> Result<QueryResult> {
+    check_param_date_literals(params, &ir.params)?;
     let mut resolved_params = None;
     for param in &ir.params {
         if !params.contains_key(&param.name) {
@@ -575,14 +697,58 @@ pub async fn execute_query(
 
     let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
 
-    // RRF requires forked execution. Its bm25 arms are never capped (see
-    // `extract_sub_search_mode`), so no under-fill retry arises for it.
+    // Every large future awaited here is boxed: this function's state is
+    // inline in its callers' (a `block_on` body in tests puts it on the 2 MiB
+    // test stack), and the gq logic harness runs close to that budget.
     if let Some(ref rrf) = search_mode.rrf {
-        return execute_rrf_fusion(ir, params, snapshot, graph_index, catalog, rrf).await;
+        return Box::pin(execute_rrf_fusion(
+            ir,
+            params,
+            snapshot,
+            graph_index,
+            catalog,
+            rrf,
+        ))
+        .await;
     }
 
-    let result_batch =
-        execute_query_once(ir, params, snapshot, graph_index, catalog, &search_mode).await?;
+    let gate_applies = search_mode
+        .nearest
+        .as_ref()
+        .is_some_and(|(ranked_var, ..)| pipeline_expands_from(&ir.pipeline, ranked_var));
+    let search_mode = if gate_applies {
+        match Box::pin(nearest_prefilter_gate(
+            ir,
+            snapshot,
+            graph_index,
+            catalog,
+            &search_mode,
+        ))
+        .await
+        {
+            NearestGatePlan::Prefilter(ids) => SearchMode {
+                eligible_ids: Some(ids),
+                ..search_mode
+            },
+            NearestGatePlan::Postfilter => search_mode,
+            NearestGatePlan::ProvenEmpty => SearchMode {
+                answer_proven_empty: true,
+                ..search_mode
+            },
+        }
+    } else {
+        search_mode
+    };
+
+    let (result_batch, report) = Box::pin(execute_query_once(
+        ir,
+        params,
+        snapshot,
+        graph_index,
+        catalog,
+        &search_mode,
+    ))
+    .await?;
 
     // A capped BM25 scan can under-fill: rows that survive the scan are then
     // dropped by a traversal with no matching edge or by a filter that could
@@ -603,33 +769,98 @@ pub async fn execute_query(
         );
         crate::instrumentation::record_bm25_uncapped_retry();
         let uncapped = search_mode.to_uncapped();
-        let retried =
-            execute_query_once(ir, params, snapshot, graph_index, catalog, &uncapped).await?;
+        let (retried, _) = Box::pin(execute_query_once(
+            ir,
+            params,
+            snapshot,
+            graph_index,
+            catalog,
+            &uncapped,
+        ))
+        .await?;
         return Ok(QueryResult::new(retried.schema(), vec![retried]));
     }
 
-    // A maximum probe guard can return fewer than k rows when the selected
-    // IVF partitions do not contain enough candidates (large k or a selective
-    // prefilter). Retry once without the maximum so the guard cannot silently
-    // lower the query's row limit. Short corpora pay the second scan because
-    // row count alone cannot distinguish them from cap starvation.
-    if search_mode
-        .ann_probe_budget
-        .is_some_and(|budget| budget.maximum.is_some())
-        && ir
-            .limit
-            .is_some_and(|limit| (result_batch.num_rows() as u64) < limit)
-    {
-        tracing::debug!(
-            limit = ir.limit,
-            capped_rows = result_batch.num_rows(),
-            "ANN scan cap under-filled; retrying without a maximum probe cap"
-        );
-        crate::instrumentation::record_ann_uncapped_retry();
-        let uncapped = search_mode.to_uncapped();
-        let retried =
-            execute_query_once(ir, params, snapshot, graph_index, catalog, &uncapped).await?;
-        return Ok(QueryResult::new(retried.schema(), vec![retried]));
+    // Lance's `nearest` returns at most `k` rows however many partitions it
+    // reads, so probing wider cannot lengthen a full scan's answer.
+    let mut result_batch = result_batch;
+    let mut report = report;
+    if let (Some((_, _, _, k0)), Some(limit)) = (search_mode.nearest.as_ref(), ir.limit) {
+        if !projections_have_aggregates(&ir.return_exprs) && !search_mode.answer_proven_empty {
+            let short = |batch: &RecordBatch| (batch.num_rows() as u64) < limit;
+            let full_scan = |report: &ScanReport| {
+                report
+                    .nearest_scan
+                    .filter(|scan| scan.rows >= scan.k && !scan.exhausted)
+            };
+            let mut factor = 1usize;
+            while short(&result_batch) {
+                let Some(scan) = full_scan(&report) else {
+                    break;
+                };
+                let Some(rung) = next_overfetch_rung(factor, *k0, scan) else {
+                    break;
+                };
+                crate::instrumentation::record_ann_overfetch();
+                let rows_before = result_batch.num_rows();
+                let wider = match rung {
+                    OverfetchRung::Wider {
+                        factor: next,
+                        k,
+                        maximum,
+                    } => {
+                        factor = next;
+                        tracing::debug!(
+                            limit,
+                            rows = rows_before,
+                            k,
+                            maximum_nprobes = ?maximum,
+                            "nearest answer short after a full scan; rerunning with more candidates"
+                        );
+                        search_mode.with_nearest_k(k, maximum)
+                    }
+                    OverfetchRung::Exact { k } => {
+                        tracing::debug!(
+                            limit,
+                            rows = rows_before,
+                            rows_hydrated = k,
+                            "nearest answer still short at the overfetch ceiling; rerunning exact over the whole type"
+                        );
+                        crate::instrumentation::record_ann_exact_pass();
+                        search_mode.with_exact_nearest(k)
+                    }
+                };
+                let (retried, retried_report) = Box::pin(execute_query_once(
+                    ir,
+                    params,
+                    snapshot,
+                    graph_index,
+                    catalog,
+                    &wider,
+                ))
+                .await?;
+                result_batch = retried;
+                report = retried_report;
+                if let OverfetchRung::Exact { k } = rung {
+                    if result_batch.num_rows() > rows_before {
+                        tracing::warn!(
+                            limit,
+                            rows_before,
+                            rows = result_batch.num_rows(),
+                            rows_hydrated = k,
+                            "the overfetch ceiling hid survivors; the exact pass over the whole type found them"
+                        );
+                    } else {
+                        tracing::debug!(
+                            limit,
+                            rows = result_batch.num_rows(),
+                            rows_hydrated = k,
+                            "the exact pass added no row: fewer survivors than limit exist"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
@@ -645,7 +876,7 @@ async fn execute_query_once(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     search_mode: &SearchMode,
-) -> Result<RecordBatch> {
+) -> Result<(RecordBatch, ScanReport)> {
     let has_aggregates = projections_have_aggregates(&ir.return_exprs);
 
     // Limit pushdown into a final Expand (query-level half of the legality
@@ -664,6 +895,7 @@ async fn execute_query_once(
 
     let needed_columns = collect_needed_columns(ir);
     let mut wide: Option<RecordBatch> = None;
+    let mut scan_report = ScanReport::default();
     execute_pipeline(
         &ir.pipeline,
         params,
@@ -672,12 +904,18 @@ async fn execute_query_once(
         catalog,
         &mut wide,
         search_mode,
+        &mut scan_report,
         final_expand_cap,
         &needed_columns,
     )
     .await?;
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
-    let mut result_batch = project_return(&wide_batch, &ir.return_exprs, params)?;
+    let mut result_batch = project_return(
+        &wide_batch,
+        &ir.return_exprs,
+        params,
+        &super::projection::ProjectionContext::for_query(catalog, ir),
+    )?;
 
     // Apply ordering. Search-ordered plans sort on the appended score column
     // (mechanism and contract: `search_score_orderings`). Aggregated
@@ -743,7 +981,7 @@ async fn execute_query_once(
         result_batch = result_batch.slice(0, len);
     }
 
-    Ok(result_batch)
+    Ok((result_batch, scan_report))
 }
 
 /// Check if the query's ordering is search-imposed (`nearest()`/`bm25`).
@@ -937,10 +1175,6 @@ async fn rrf_prefilter_gate(
     catalog: &Catalog,
     rrf: &RrfMode,
 ) -> Option<EligibleIds> {
-    use crate::instrumentation::{
-        RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_rrf_gate_verdict,
-    };
-
     let fall_back =
         |fallback: RrfGateFallback, forced: bool, eligible: Option<u64>, corpus: Option<u64>| {
             // Production-visible trace beside the test-only probe: a
@@ -1036,27 +1270,75 @@ async fn rrf_prefilter_gate(
         }
     }
 
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    let (mut ids, eligible_count) =
+        match adjacency_eligible_ids(graph_index, catalog, ranked_type, &sources, corpus, forced)
+            .await
+        {
+            EligibleOutcome::Ids { ids, eligible } => (ids, eligible),
+            EligibleOutcome::FallBack { fallback, eligible } => {
+                fall_back(fallback, forced, eligible, Some(corpus));
+                return None;
+            }
+        };
+    // Test-only red control: deliberately violates the superset rule so the
+    // differential oracle can prove it detects a subset. Compiled out of
+    // release binaries: an answer-corrupting hook must not ship.
+    #[cfg(debug_assertions)]
+    if let Some(dropped) = crate::instrumentation::rrf_gate_subset_drop() {
+        ids.retain(|id| *id != dropped);
+    }
+    record_rrf_gate_verdict(RrfGateVerdict {
+        plan: RrfGatePlan::Prefilter,
+        fallback: None,
+        forced,
+        eligible: Some(eligible_count),
+        corpus: Some(corpus),
+    });
+    Some(EligibleIds(Arc::new(ids)))
+}
+
+/// Outcome of the adjacency eligible-id computation shared by the rrf and
+/// nearest prefilter gates.
+enum EligibleOutcome {
+    /// The eligible ids, materialized; `eligible` is their count.
+    Ids { ids: Vec<String>, eligible: u64 },
+    /// Fell back: the reason and the count when it was reached. The caller
+    /// records the verdict on its own probe.
+    FallBack {
+        fallback: crate::instrumentation::RrfGateFallback,
+        eligible: Option<u64>,
+    },
+}
+
+/// The eligible-id set of `ranked_type` under `sources`: every node with at
+/// least one edge satisfying EACH source's first hop, a SUPERSET of the
+/// traversal's survivors. Count pass first, ids only past the threshold.
+async fn adjacency_eligible_ids(
+    graph_index: &GraphIndexHandle<'_>,
+    catalog: &Catalog,
+    ranked_type: &str,
+    sources: &[(&str, Direction)],
+    corpus: u64,
+    forced: bool,
+) -> EligibleOutcome {
+    let fall_back = |fallback: RrfGateFallback, eligible: Option<u64>| EligibleOutcome::FallBack {
+        fallback,
+        eligible,
+    };
+
     // On build Err the gate falls back — the postfilter plan needs no CSR up
     // front. (`GraphIndexHandle::get` is lazy and fallible; the traversal
     // will surface a real failure on its own terms later.)
     let graph = match graph_index.get().await {
         Ok(Some(graph)) => graph,
-        Ok(None) | Err(_) => {
-            fall_back(RrfGateFallback::BuildErr, forced, None, Some(corpus));
-            return None;
-        }
+        Ok(None) | Err(_) => return fall_back(RrfGateFallback::BuildErr, None),
     };
 
     // The dense space is built from edge-table endpoints only: a ranked type
     // absent from it has no node with any edge — the eligible set is empty.
     let Some(idx) = graph.type_index(ranked_type) else {
-        fall_back(
-            RrfGateFallback::EmptyEligible,
-            forced,
-            Some(0),
-            Some(corpus),
-        );
-        return None;
+        return fall_back(RrfGateFallback::EmptyEligible, Some(0));
     };
 
     // Resolve each source Expand to the adjacency (CSR for Out, CSC for In,
@@ -1070,10 +1352,9 @@ async fn rrf_prefilter_gate(
         Option<&crate::graph_index::CsrIndex>,
         Option<&crate::graph_index::CsrIndex>,
     )> = Vec::with_capacity(sources.len());
-    for (edge_type, direction) in &sources {
+    for (edge_type, direction) in sources {
         let Some(edge_def) = catalog.edge_types.get(*edge_type) else {
-            fall_back(RrfGateFallback::Shape, forced, None, Some(corpus));
-            return None;
+            return fall_back(RrfGateFallback::Shape, None);
         };
         let side_matches = match direction {
             Direction::Out => edge_def.from_type == ranked_type,
@@ -1082,8 +1363,7 @@ async fn rrf_prefilter_gate(
             Direction::Both => edge_def.from_type == ranked_type && edge_def.to_type == ranked_type,
         };
         if !side_matches {
-            fall_back(RrfGateFallback::Shape, forced, None, Some(corpus));
-            return None;
+            return fall_back(RrfGateFallback::Shape, None);
         }
         let (out, incoming) = match direction {
             Direction::Out => (graph.csr(edge_type), None),
@@ -1091,18 +1371,11 @@ async fn rrf_prefilter_gate(
             Direction::Both => (graph.csr(edge_type), graph.csc(edge_type)),
         };
         if out.is_none() && incoming.is_none() {
-            fall_back(
-                RrfGateFallback::EmptyEligible,
-                forced,
-                Some(0),
-                Some(corpus),
-            );
-            return None;
+            return fall_back(RrfGateFallback::EmptyEligible, Some(0));
         }
         for adjacency in [out, incoming].into_iter().flatten() {
             if adjacency.num_nodes() != idx.len() {
-                fall_back(RrfGateFallback::BuildErr, forced, None, Some(corpus));
-                return None;
+                return fall_back(RrfGateFallback::BuildErr, None);
             }
         }
         adjacencies.push((out, incoming));
@@ -1118,13 +1391,7 @@ async fn rrf_prefilter_gate(
     // COUNT pass only — no allocation until the prefilter plan is chosen.
     let eligible_count = (0..idx.len() as u32).filter(|&dense| passes(dense)).count() as u64;
     if eligible_count == 0 {
-        fall_back(
-            RrfGateFallback::EmptyEligible,
-            forced,
-            Some(0),
-            Some(corpus),
-        );
-        return None;
+        return fall_back(RrfGateFallback::EmptyEligible, Some(0));
     }
 
     // Threshold: ratio AND absolute cap, both after the zero override; pure
@@ -1133,13 +1400,7 @@ async fn rrf_prefilter_gate(
         let ratio_ok = corpus > 0 && (eligible_count as f64) <= rrf_gate_ratio() * (corpus as f64);
         let cap_ok = eligible_count <= rrf_gate_max_ids() as u64;
         if !(ratio_ok && cap_ok) {
-            fall_back(
-                RrfGateFallback::Threshold,
-                false,
-                Some(eligible_count),
-                Some(corpus),
-            );
-            return None;
+            return fall_back(RrfGateFallback::Threshold, Some(eligible_count));
         }
     }
 
@@ -1157,40 +1418,113 @@ async fn rrf_prefilter_gate(
     // answer-changing direction). Fall back instead: cost-only, like every
     // other impossible-state fence in this gate.
     if ids.len() as u64 != eligible_count {
-        fall_back(
-            RrfGateFallback::BuildErr,
+        return fall_back(RrfGateFallback::BuildErr, Some(eligible_count));
+    }
+    EligibleOutcome::Ids {
+        ids,
+        eligible: eligible_count,
+    }
+}
+
+/// The nearest prefilter gate (issue #567): a standalone `nearest` whose
+/// ranked variable a top-level Expand constrains ANDs the traversal's
+/// eligible-id superset into its scan.
+async fn nearest_prefilter_gate(
+    ir: &QueryIR,
+    snapshot: &Snapshot,
+    graph_index: &GraphIndexHandle<'_>,
+    catalog: &Catalog,
+    mode: &SearchMode,
+) -> NearestGatePlan {
+    let Some((ranked_var, ..)) = mode.nearest.as_ref() else {
+        return NearestGatePlan::Postfilter;
+    };
+    let force = rrf_plan_force();
+    let forced = force != RrfPlanForce::Auto;
+    let fall_back = |fallback: RrfGateFallback, eligible: Option<u64>, corpus: Option<u64>| {
+        tracing::debug!(
+            ?fallback,
             forced,
-            Some(eligible_count),
-            Some(corpus),
+            "nearest prefilter gate fell back to the unfiltered scan"
         );
-        return None;
+        record_ann_prefilter_verdict(RrfGateVerdict {
+            plan: RrfGatePlan::Postfilter,
+            fallback: Some(fallback),
+            forced,
+            eligible,
+            corpus,
+        });
+    };
+    if force == RrfPlanForce::Postfilter {
+        fall_back(RrfGateFallback::Forced, None, None);
+        return NearestGatePlan::Postfilter;
     }
-    // Test-only red control (`instrumentation::with_rrf_gate_subset_drop`):
-    // deliberately violates the superset rule so the differential oracle can
-    // prove it detects a subset. Compiled out of release binaries with its
-    // seam — an answer-corrupting hook must not exist in production.
-    #[cfg(debug_assertions)]
-    if let Some(dropped) = crate::instrumentation::rrf_gate_subset_drop() {
-        ids.retain(|id| *id != dropped);
+    let Some(sources) = rrf_gate_expand_sources(&ir.pipeline, ranked_var) else {
+        fall_back(RrfGateFallback::Shape, None, None);
+        return NearestGatePlan::Postfilter;
+    };
+    let Some(ranked_type) = resolve_binding_type_name(&ir.pipeline, ranked_var) else {
+        fall_back(RrfGateFallback::Shape, None, None);
+        return NearestGatePlan::Postfilter;
+    };
+    let node_key = format!("node:{}", ranked_type);
+    let Some(node_entry) = snapshot.dataset(&node_key) else {
+        fall_back(RrfGateFallback::Shape, None, None);
+        return NearestGatePlan::Postfilter;
+    };
+    let corpus = node_entry.entity_count;
+    match adjacency_eligible_ids(graph_index, catalog, ranked_type, &sources, corpus, forced).await
+    {
+        EligibleOutcome::Ids { ids, eligible } => {
+            record_ann_prefilter_verdict(RrfGateVerdict {
+                plan: RrfGatePlan::Prefilter,
+                fallback: None,
+                forced,
+                eligible: Some(eligible),
+                corpus: Some(corpus),
+            });
+            NearestGatePlan::Prefilter(EligibleIds(Arc::new(ids)))
+        }
+        EligibleOutcome::FallBack { fallback, eligible } => {
+            fall_back(fallback, eligible, Some(corpus));
+            if fallback == RrfGateFallback::EmptyEligible {
+                NearestGatePlan::ProvenEmpty
+            } else {
+                NearestGatePlan::Postfilter
+            }
+        }
     }
-    record_rrf_gate_verdict(RrfGateVerdict {
-        plan: RrfGatePlan::Prefilter,
-        fallback: None,
-        forced,
-        eligible: Some(eligible_count),
-        corpus: Some(corpus),
-    });
-    Some(EligibleIds(Arc::new(ids)))
+}
+
+/// What `nearest_prefilter_gate` decided for a standalone `nearest`.
+enum NearestGatePlan {
+    /// The selective plan: AND these ids into the ranked scan.
+    Prefilter(EligibleIds),
+    /// The unfiltered scan; a traversal shortfall above it is bounded by
+    /// `execute_query`'s overfetch loop.
+    Postfilter,
+    /// The eligible set is empty, which proves the answer empty: the ranked
+    /// scan returns its zero-row batch without running Lance and no
+    /// overfetch can add a row.
+    ProvenEmpty,
+}
+
+/// Whether any top-level Expand leaves `variable`: the precondition for the
+/// nearest prefilter gate to have anything to constrain the scan with. A
+/// presence test only; `rrf_gate_expand_sources` decides superset-safety.
+fn pipeline_expands_from(pipeline: &[IROp], variable: &str) -> bool {
+    pipeline
+        .iter()
+        .any(|op| matches!(op, IROp::Expand { src_var, .. } if src_var == variable))
 }
 
 /// This arm's mode with the eligible-id prefilter attached iff the arm
-/// carries a bm25 target (both arms when both are bm25). A
-/// `nearest` arm passes through untouched and runs identical code in both
-/// plans — prefiltering its `k`-truncated scan would change answers.
+/// carries a bm25 target. A `nearest` arm passes through untouched:
+/// prefiltering its `k`-truncated scan would change the fused answer.
 fn arm_with_bm25_prefilter(arm: &SearchMode, ids: &EligibleIds) -> SearchMode {
     if arm.bm25.is_some() {
         SearchMode {
-            bm25_eligible_ids: Some(ids.clone()),
+            eligible_ids: Some(ids.clone()),
             ..arm.clone()
         }
     } else {
@@ -1198,90 +1532,9 @@ fn arm_with_bm25_prefilter(arm: &SearchMode, ids: &EligibleIds) -> SearchMode {
     }
 }
 
-/// Execute one RRF arm with its selected search mode.
-async fn execute_rrf_arm_once(
-    ir: &QueryIR,
-    params: &ParamMap,
-    snapshot: &Snapshot,
-    graph_index: &GraphIndexHandle<'_>,
-    catalog: &Catalog,
-    mode: &SearchMode,
-    needed_columns: &HashMap<String, NeededColumns>,
-) -> Result<Option<RecordBatch>> {
-    let mut wide = None;
-    execute_pipeline(
-        &ir.pipeline,
-        params,
-        snapshot,
-        graph_index,
-        catalog,
-        &mut wide,
-        mode,
-        None,
-        needed_columns,
-    )
-    .await?;
-    Ok(wide)
-}
-
-/// Execute one RRF arm and retry a detectably short bounded nearest scan.
-async fn execute_rrf_arm(
-    ir: &QueryIR,
-    params: &ParamMap,
-    snapshot: &Snapshot,
-    graph_index: &GraphIndexHandle<'_>,
-    catalog: &Catalog,
-    mode: &SearchMode,
-    needed_columns: &HashMap<String, NeededColumns>,
-    limit: usize,
-) -> Result<Option<RecordBatch>> {
-    let mut wide = execute_rrf_arm_once(
-        ir,
-        params,
-        snapshot,
-        graph_index,
-        catalog,
-        mode,
-        needed_columns,
-    )
-    .await?;
-    let bounded_nearest = mode
-        .ann_probe_budget
-        .is_some_and(|budget| budget.maximum.is_some());
-    let unique_candidates = match (&mode.nearest, &wide) {
-        (Some((variable, ..)), Some(batch)) => {
-            let ids = extract_id_column_by_name(batch, &format!("{variable}.id"))?;
-            ids.into_iter().collect::<HashSet<_>>().len()
-        }
-        (Some(_), None) => 0,
-        (None, _) => limit,
-    };
-    if bounded_nearest && unique_candidates < limit {
-        tracing::debug!(
-            limit,
-            capped_candidates = unique_candidates,
-            "RRF ANN arm under-filled; retrying without a maximum probe cap"
-        );
-        crate::instrumentation::record_ann_uncapped_retry();
-        wide = execute_rrf_arm_once(
-            ir,
-            params,
-            snapshot,
-            graph_index,
-            catalog,
-            &mode.to_uncapped(),
-            needed_columns,
-        )
-        .await?;
-    }
-    Ok(wide)
-}
-
 /// One RRF pass: run both arms, fuse their ranks, reconstruct and limit.
 ///
-/// INPUT CONTRACT: bm25 arms are complete rankings, never capped — see
-/// `extract_sub_search_mode`. Nearest arms are truncated at `k`; a bounded arm
-/// that returns fewer than `k` distinct candidates retries uncapped.
+/// INPUT CONTRACT: bm25 arms are complete rankings, never capped.
 async fn execute_rrf_fusion(
     ir: &QueryIR,
     params: &ParamMap,
@@ -1317,26 +1570,33 @@ async fn execute_rrf_fusion(
         None => (rrf.primary.as_ref(), rrf.secondary.as_ref()),
     };
 
-    let primary_wide = execute_rrf_arm(
-        ir,
+    let mut primary_wide: Option<RecordBatch> = None;
+    execute_pipeline(
+        &ir.pipeline,
         params,
         snapshot,
         graph_index,
         catalog,
+        &mut primary_wide,
         primary_mode,
+        &mut ScanReport::default(),
+        None,
         &needed_columns,
-        rrf.limit,
     )
     .await?;
-    let secondary_wide = execute_rrf_arm(
-        ir,
+
+    let mut secondary_wide: Option<RecordBatch> = None;
+    execute_pipeline(
+        &ir.pipeline,
         params,
         snapshot,
         graph_index,
         catalog,
+        &mut secondary_wide,
         secondary_mode,
+        &mut ScanReport::default(),
+        None,
         &needed_columns,
-        rrf.limit,
     )
     .await?;
 
@@ -1457,7 +1717,12 @@ async fn execute_rrf_fusion(
     )?;
 
     // Project directly from fused batch
-    let mut result_batch = project_return(&fused_batch, &ir.return_exprs, params)?;
+    let mut result_batch = project_return(
+        &fused_batch,
+        &ir.return_exprs,
+        params,
+        &super::projection::ProjectionContext::for_query(catalog, ir),
+    )?;
     // `rrf.limit` is the query's row limit. A winning entity can now own more
     // than one row after traversal, so enforce the limit after reconstruction.
     let len = result_batch.num_rows().min(rrf.limit);
@@ -1627,14 +1892,50 @@ fn collect_needed_columns(ir: &QueryIR) -> HashMap<String, NeededColumns> {
     for IRProjection { expr, alias: _ } in return_exprs {
         collect_expr_columns(expr, &mut needed);
     }
-    for IROrdering {
-        expr,
-        descending: _,
-    } in order_by
+    for (
+        position,
+        IROrdering {
+            expr,
+            descending: _,
+        },
+    ) in order_by.iter().enumerate()
     {
-        collect_expr_columns(expr, &mut needed);
+        // Lance ranks on the named vector/text column itself and the query
+        // sorts on the `_distance`/`_score` it appends, so a leading search
+        // function's ranked column is never read and is not demanded.
+        if position == 0 {
+            collect_search_ordering_columns(expr, &mut needed);
+        } else {
+            collect_expr_columns(expr, &mut needed);
+        }
     }
     needed
+}
+
+/// Column demand of a leading `order {}` expression: a search function
+/// demands only its query sub-expressions (see `collect_needed_columns`); any
+/// other expression demands what it references.
+fn collect_search_ordering_columns(expr: &IRExpr, needed: &mut HashMap<String, NeededColumns>) {
+    match expr {
+        IRExpr::Nearest {
+            variable: _,
+            property: _,
+            query,
+        } => collect_expr_columns(query, needed),
+        IRExpr::Bm25 { field: _, query } => collect_expr_columns(query, needed),
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            collect_search_ordering_columns(primary, needed);
+            collect_search_ordering_columns(secondary, needed);
+            if let Some(k) = k {
+                collect_expr_columns(k, needed);
+            }
+        }
+        other => collect_expr_columns(other, needed),
+    }
 }
 
 fn collect_pipeline_columns(pipeline: &[IROp], needed: &mut HashMap<String, NeededColumns>) {
@@ -1773,6 +2074,7 @@ fn execute_pipeline<'a>(
     catalog: &'a Catalog,
     wide: &'a mut Option<RecordBatch>,
     search_mode: &'a SearchMode,
+    scan_report: &'a mut ScanReport,
     // The query's `limit`, pushable into a final Expand as an emission bound.
     // `Some` only from `execute_query` when the query-level conditions hold
     // (unordered, aggregate-free, plain search mode); the op-level conditions
@@ -1884,6 +2186,7 @@ fn execute_pipeline<'a>(
                         snapshot,
                         catalog,
                         search_mode,
+                        scan_report,
                         needed_columns.get(variable.as_str()),
                     )
                     .await?;
@@ -2111,14 +2414,127 @@ fn traversal_indexed_override() -> Option<bool> {
 /// maximum only: easy queries retain Lance's one-partition default.
 const DEFAULT_ANN_NPROBES: usize = 20;
 
-fn ann_nprobes_from(value: Option<&str>) -> usize {
-    value
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
-        .unwrap_or(DEFAULT_ANN_NPROBES)
+/// Per-rung multiplier of the probe ladder (20 → 80 → 320 → none).
+const ANN_PROBE_ESCALATION_FACTOR: usize = 4;
+
+/// Per-rung multiplier and ceiling of the query-level overfetch loop
+/// (`k` → 4k → 16k, then one exact pass over the whole type) for a
+/// standalone `nearest` cut short of `limit` by an operator above a full scan.
+const ANN_OVERFETCH_STEP: usize = 4;
+const ANN_OVERFETCH_MAX_FACTOR: usize = 16;
+
+/// The next rung of the probe ladder after `current` starved a scan: ×4, or
+/// no cap once the next rung would cover the ranked partitions anyway.
+fn next_probe_budget(current: usize, partitions_ranked: usize) -> Option<usize> {
+    let next = current.saturating_mul(ANN_PROBE_ESCALATION_FACTOR);
+    (next < partitions_ranked).then_some(next)
 }
 
-fn ann_nprobes() -> usize {
+/// One stop decision of the probe ladder in `execute_node_scan`, pure so
+/// every arm is unit-tested (`ann_probe_budget_tests`): the loop runs the
+/// scan, derives the inputs once, and dispatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LadderStep {
+    /// The batches are final.
+    Stop,
+    /// The IVF scan holds prefilter-admitted rows at `_distance = +inf`:
+    /// every matching row is here but out of `nearest` order. Rescan once as
+    /// the flat exact kNN over the admitted rows, uncapped.
+    FlatRescan,
+    /// Rescan with no cap: the ladder's last rung (`summary_missing:
+    /// false`), or the fail-closed rescan of a capped short scan whose
+    /// execution summary lacks the partition counters (`true`).
+    RescanUncapped { summary_missing: bool },
+    /// Rescan under this cap, the next rung.
+    Rescan(usize),
+}
+
+/// The ladder's decision after one nearest scan under `maximum` (`None` =
+/// uncapped) returned `rows` of the `k` asked for. `summary` is Lance's
+/// `(partitions_searched, partitions_ranked)`, each absent on a flat plan.
+#[allow(clippy::too_many_arguments)]
+fn ladder_step(
+    rows: usize,
+    k: usize,
+    known_matches: Option<usize>,
+    dataset_rows: Option<u64>,
+    has_infinite_distance: bool,
+    summary: Option<(Option<u64>, Option<u64>)>,
+    maximum: Option<usize>,
+    last_rung: Option<(usize, u64)>,
+) -> LadderStep {
+    if has_infinite_distance {
+        return LadderStep::FlatRescan;
+    }
+    let Some(maximum) = maximum else {
+        return LadderStep::Stop;
+    };
+    if rows >= k {
+        return LadderStep::Stop;
+    }
+    if known_matches.is_some_and(|matches| rows >= matches) {
+        return LadderStep::Stop;
+    }
+    if dataset_rows.is_some_and(|count| rows as u64 >= count) {
+        return LadderStep::Stop;
+    }
+    let (searched, ranked) = match summary {
+        Some((None, None)) => return LadderStep::Stop,
+        Some((Some(searched), Some(ranked))) => (searched, ranked),
+        Some((Some(_), None)) | Some((None, Some(_))) | None => {
+            return LadderStep::RescanUncapped {
+                summary_missing: true,
+            };
+        }
+    };
+    if searched >= ranked {
+        return LadderStep::Stop;
+    }
+    if last_rung == Some((rows, searched)) {
+        return LadderStep::Stop;
+    }
+    match next_probe_budget(maximum, usize::try_from(ranked).unwrap_or(usize::MAX)) {
+        Some(next) => LadderStep::Rescan(next),
+        None => LadderStep::RescanUncapped {
+            summary_missing: false,
+        },
+    }
+}
+
+/// Whether any row of a nearest scan carries `_distance = +inf`: Lance's
+/// marker for a prefilter-admitted row its partition search did not reach
+/// (the late search's match-count stop, `lance/src/io/exec/knn.rs`).
+fn batches_hold_infinite_distance(batches: &[RecordBatch]) -> bool {
+    batches.iter().any(|batch| {
+        batch
+            .column_by_name("_distance")
+            .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
+            .is_some_and(|distances| distances.iter().flatten().any(f32::is_infinite))
+    })
+}
+
+/// `OMNIGRAPH_ANN_NPROBES`, the per-delta probe cap a nearest scan starts
+/// at: unset or empty is `DEFAULT_ANN_NPROBES`; `0` is no cap; anything
+/// else that is not a positive integer runs the default, loudly.
+fn ann_nprobes_from(value: Option<&str>) -> Option<usize> {
+    match value.map(str::trim) {
+        None | Some("") => Some(DEFAULT_ANN_NPROBES),
+        Some(other) => match other.parse::<usize>() {
+            Ok(0) => None,
+            Ok(maximum) => Some(maximum),
+            Err(_) => {
+                tracing::warn!(
+                    value = other,
+                    default = DEFAULT_ANN_NPROBES,
+                    "invalid OMNIGRAPH_ANN_NPROBES value (not a non-negative integer); using the default maximum"
+                );
+                Some(DEFAULT_ANN_NPROBES)
+            }
+        },
+    }
+}
+
+fn ann_nprobes() -> Option<usize> {
     let value = std::env::var("OMNIGRAPH_ANN_NPROBES").ok();
     ann_nprobes_from(value.as_deref())
 }
@@ -2871,7 +3287,7 @@ async fn execute_expand_bound(
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", key_col)))?
                 .clone();
-            let opps = batch
+            let opposites = batch
                 .column_by_name(opp_col)
                 .ok_or_else(|| OmniError::manifest(format!("edge batch missing '{}'", opp_col)))?
                 .as_any()
@@ -2888,7 +3304,7 @@ async fn execute_expand_bound(
             for r in 0..batch.num_rows() {
                 // Undirected probes both orientations; a self-loop row would
                 // match the same wide row through both, so emit it only once.
-                if probe_idx == 1 && keys.value(r) == opps.value(r) {
+                if probe_idx == 1 && keys.value(r) == opposites.value(r) {
                     continue;
                 }
                 let Some(wide_rows) = rows_by_src.get(keys.value(r)) else {
@@ -2897,7 +3313,7 @@ async fn execute_expand_bound(
                 for &wide_row in wide_rows {
                     matches.push((
                         wide_row,
-                        opps.value(r).to_string(),
+                        opposites.value(r).to_string(),
                         batch_idx,
                         r,
                         edge_ids.value(r).to_string(),
@@ -3296,7 +3712,7 @@ async fn execute_expand_bfs(
                         .ok_or_else(|| {
                             OmniError::manifest(format!("edge '{}' is not Utf8", key_col))
                         })?;
-                    let opps = batch
+                    let opposites = batch
                         .column_by_name(opp_col)
                         .ok_or_else(|| {
                             OmniError::manifest(format!("edge batch missing '{}'", opp_col))
@@ -3308,7 +3724,7 @@ async fn execute_expand_bfs(
                         })?;
                     for r in 0..batch.num_rows() {
                         let k = src.interner.get_or_insert(keys.value(r));
-                        let o = src.interner.get_or_insert(opps.value(r));
+                        let o = src.interner.get_or_insert(opposites.value(r));
                         src.neighbor_map.entry(k).or_default().push(o);
                     }
                 }
@@ -3741,6 +4157,7 @@ async fn execute_anti_join(
         catalog,
         &mut inner_wide,
         &no_search,
+        &mut ScanReport::default(),
         None,
         needed_columns,
     )
@@ -3788,6 +4205,7 @@ async fn execute_node_scan(
     snapshot: &Snapshot,
     catalog: &Catalog,
     search_mode: &SearchMode,
+    scan_report: &mut ScanReport,
     binding_columns: Option<&NeededColumns>,
 ) -> Result<RecordBatch> {
     let table_key = format!("node:{}", type_name);
@@ -3807,14 +4225,7 @@ async fn execute_node_scan(
     // mutation delete path) migrate in follow-up MRs.
     let mut filter_expr = build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
 
-    // The rrf prefilter gate's selective plan: AND the traversal's
-    // eligible-id set into this bm25 arm's scan — `hydrate_nodes`' proven
-    // `id IN (...)` shape, routed through the `id` BTREE, ranked under
-    // `prefilter(true)` (armed below by the filter's presence). The set is a
-    // superset of the traversal's survivors and the arm stays uncapped, so
-    // this changes cost, never the fused answer (up to BM25 score ties; the
-    // gate's coverage fence keeps scores index-global).
-    if let Some(eligible_ids) = search_mode.bm25_eligible_ids_for(variable) {
+    if let Some(eligible_ids) = search_mode.eligible_ids_for(variable) {
         let in_list = id_in_list_expr(eligible_ids);
         filter_expr = Some(match filter_expr {
             Some(expr) => expr.and(in_list),
@@ -3833,27 +4244,33 @@ async fn execute_node_scan(
         .filter(|f| !node_type.blob_properties.contains(f.name()))
         .map(|f| f.name().as_str())
         .collect();
-    // #564: RETURN-derived projection. `Some(Columns)` prunes the scan to
-    // the demanded set plus the always-keep set: `id` (Expand/AntiJoin join
-    // key, RRF fusion key, `apply_ordering` tie-break) and the type's key
-    // columns (the row's declared identity, retained as cheap insurance).
-    // `None` (unreferenced binding) and `All` (bare `$var`) fail open to the
-    // full non-blob projection; so do search scans, because Lance
-    // autoprojects `_distance`/`_score` onto explicit projections that omit
-    // them, with a deprecation warning. Only NodeScan bindings prune:
-    // `hydrate_nodes` (Expand dst hydration) and edge-property attach keep
-    // the full non-blob width.
-    let is_search_scan = search_mode
+    let nearest_target = search_mode
         .nearest
         .as_ref()
+        .filter(|(var, ..)| var == variable)
+        .map(|(_, prop, vec, k)| (prop.clone(), Float32Array::from(vec.clone()), *k));
+    // Lance 11's `Scanner::project` accepts `_distance`/`_score` by name
+    // before `nearest`/`full_text_search` is set; an explicit projection that
+    // omits them autoprojects them under a deprecation warning on every scan.
+    let hoisted_fts_queries: Vec<lance_index::scalar::FullTextSearchQuery> = filters
+        .iter()
+        .filter(|filter| is_search_filter(filter))
+        .filter_map(|filter| build_fts_query(&filter.left, params))
+        .collect();
+    let scores_fts = search_mode
+        .bm25
+        .as_ref()
         .is_some_and(|(var, ..)| var == variable)
-        || search_mode
-            .bm25
-            .as_ref()
-            .is_some_and(|(var, ..)| var == variable)
-        || filters.iter().any(is_search_filter);
+        || !hoisted_fts_queries.is_empty();
+    let mut search_cols: Vec<&str> = Vec::with_capacity(2);
+    if nearest_target.is_some() {
+        search_cols.push("_distance");
+    }
+    if scores_fts {
+        search_cols.push("_score");
+    }
     let pruned_cols: Option<Vec<&str>> = match binding_columns {
-        Some(NeededColumns::Columns(columns)) if !is_search_scan => Some(
+        Some(NeededColumns::Columns(columns)) => Some(
             non_blob_cols
                 .iter()
                 .copied()
@@ -3865,114 +4282,243 @@ async fn execute_node_scan(
                             .is_some_and(|key| key.iter().any(|k| k == name))
                         || columns.contains(*name)
                 })
+                .chain(search_cols.iter().copied())
                 .collect(),
         ),
         _ => None,
     };
+    let non_blob_search_cols: Vec<&str> = non_blob_cols
+        .iter()
+        .copied()
+        .chain(search_cols.iter().copied())
+        .collect();
     let projection = match &pruned_cols {
         Some(columns) => Some(columns.as_slice()),
-        None => has_blobs.then_some(non_blob_cols.as_slice()),
+        None => has_blobs.then_some(non_blob_search_cols.as_slice()),
     };
-    let batches = crate::table_store::TableStore::scan_stream_with(
-        &ds,
-        projection,
-        None,
-        None,
-        false,
-        |scanner| {
-            // Apply the structured IR filter via Lance's Expr pushdown.
-            if let Some(ref expr) = filter_expr {
-                scanner.filter_expr(expr.clone());
-                // The filter must run BEFORE any ANN/FTS search on this
-                // scanner. Lance defaults to prefilter=false, which applies
-                // the filter to the search's top-k results — "you may get
-                // back fewer results than you ask for (or none at all)"
-                // (lance scanner.rs) — i.e. `limit k` would mean top-k of
-                // the whole table, silently starved by a selective filter.
-                // One flag governs both the vector and FTS sources, and it
-                // is unused by plain scans, so setting it whenever a filter
-                // is present is safe. Prefiltering also re-enables scalar-
-                // index acceleration for the predicate (Lance gates
-                // use_scalar_index on prefilter when a nearest is present).
-                scanner.prefilter(true);
-            }
-
-            // Apply FTS queries from hoisted search filters (search/fuzzy/match_text in match clause)
-            for filter in filters {
-                if is_search_filter(filter) {
-                    if let Some(fts_query) = build_fts_query(&filter.left, params) {
-                        scanner.full_text_search(fts_query).map_err(|error| {
-                            OmniError::storage_context("full_text_search filter", error)
-                        })?;
+    let scan_proven_empty = search_mode.scan_proven_empty(variable);
+    if !scan_proven_empty {
+        crate::instrumentation::record_node_scan_projection(projection);
+    }
+    // A pushed prefilter keeps the cap: without one, Lance's `early_pruning`
+    // promotes its minimum to every partition an uncapped scan may read
+    // (`knn.rs`, `adjust_probes`), the whole-index read of issue #567.
+    let mut probe_budget: Option<usize> = nearest_target.as_ref().and(search_mode.ann_probe_budget);
+    let known_matches: Option<usize> = nearest_target
+        .as_ref()
+        .and_then(|_| search_mode.eligible_ids_for(variable))
+        .map(<[String]>::len);
+    // Lance answers this from fragment metadata, with no data read.
+    let dataset_rows: Option<u64> = match nearest_target.as_ref() {
+        Some(_) if !scan_proven_empty => Some(
+            ds.count_rows(None)
+                .await
+                .map_err(|error| OmniError::storage_context("count_rows", error))?
+                as u64,
+        ),
+        _ => None,
+    };
+    let mut use_index = match (nearest_target.as_ref(), known_matches) {
+        (Some(_), _) if search_mode.nearest_exact => false,
+        (Some((_, _, k)), Some(matches)) => matches > *k,
+        _ => true,
+    };
+    // Lance's late search (`lance/src/io/exec/knn.rs`, `late_search`) stops on
+    // `k` rows found, the maximum reached, or every prefilter-admitted row
+    // found; only the second is the cap's doing (`_distance = +inf` marks it).
+    let mut last_rung: Option<(usize, u64)> = None;
+    let batches = loop {
+        if scan_proven_empty {
+            break Vec::new();
+        }
+        let scan_stats: Arc<
+            std::sync::Mutex<Option<lance_datafusion::exec::ExecutionSummaryCounts>>,
+        > = Arc::new(std::sync::Mutex::new(None));
+        let stats_sink = scan_stats.clone();
+        // Boxed: the scan future is the largest state in this frame and the
+        // loop keeps one alive across the ladder (2 MiB test-stack budget,
+        // see `execute_query`).
+        let batches: Vec<RecordBatch> = Box::pin(async {
+            crate::table_store::TableStore::scan_stream_with(
+                &ds,
+                projection,
+                None,
+                None,
+                false,
+                |scanner| {
+                    if let Some(ref expr) = filter_expr {
+                        scanner.filter_expr(expr.clone());
+                        // Lance defaults to prefilter=false, which applies the
+                        // filter to the search's top-k results: "you may get back
+                        // fewer results than you ask for" (lance scanner.rs).
+                        scanner.prefilter(true);
                     }
-                }
-            }
 
-            // Apply nearest vector search if this variable is the target
-            if let Some((ref var, ref prop, ref vec, k)) = search_mode.nearest {
-                if var == variable {
-                    let query_arr = Float32Array::from(vec.clone());
-                    scanner
-                        .nearest(prop, &query_arr, k)
-                        .map_err(|error| OmniError::storage_context("nearest", error))?;
-                    // Keep Lance's adaptive minimum (one payload partition by
-                    // default) but clamp its centroid-distance heuristic. On
-                    // high-dimensional data that heuristic can otherwise
-                    // promote the minimum to every IVF partition.
-                    let budget = search_mode
-                        .ann_probe_budget
-                        .unwrap_or_else(|| AnnProbeBudget::bounded(ann_nprobes()));
-                    if let Some(maximum) = budget.maximum {
-                        scanner.maximum_nprobes(maximum);
+                    for fts_query in &hoisted_fts_queries {
+                        scanner
+                            .full_text_search(fts_query.clone())
+                            .map_err(|error| {
+                                OmniError::storage_context("full_text_search filter", error)
+                            })?;
                     }
-                    crate::instrumentation::record_ann_probe_budget(budget.maximum);
-                    // Lance 11's late payload `LanceRead` drops the sorted
-                    // candidate stream's ordering metadata. With more than
-                    // one output partition, execute_plan may therefore use a
-                    // scheduling-ordered coalescer and scramble large-k ANN
-                    // or flat results. Keep one DataFusion output partition
-                    // until Lance preserves/remaps that ordering. Reads and
-                    // decoding inside the partition remain concurrent.
-                    scanner.target_parallelism(1);
-                }
-            }
 
-            // Apply BM25 full-text search if this variable is the target
-            if let Some((ref var, ref prop, ref text)) = search_mode.bm25 {
-                if var == variable {
-                    let mut fts_query = lance_index::scalar::FullTextSearchQuery::new(text.clone())
-                        .with_column(prop.clone())
-                        .map_err(|error| OmniError::storage_context("fts with_column", error))?;
-                    // Cap the ranked FTS scan (issue #563): unbounded, Lance
-                    // hydrates every matching document, and a `limit`ed ranked
-                    // read materializes the whole matched corpus past Arrow's
-                    // 2 GiB i32 string-offset ceiling. Lance returns rows
-                    // score-descending (the IR's declared order direction is
-                    // ignored engine-wide), so up to score ties the capped
-                    // rows are the uncapped scan's prefix. This runs after the
-                    // search()-filter loop above and Lance's full_text_search
-                    // REPLACES the scanner's query, so the capped one wins; a
-                    // search() filter without bm25 ordering stays unbounded.
-                    if let Some(rows) = search_mode.bm25_scan_limit {
-                        // A negative limit would mean unlimited to Lance
-                        // (it casts `as usize`); saturate instead.
-                        fts_query = fts_query.limit(Some(i64::try_from(rows).unwrap_or(i64::MAX)));
+                    if let Some((prop, query_arr, k)) = nearest_target.as_ref() {
+                        {
+                            scanner
+                                .nearest(prop, query_arr, *k)
+                                .map_err(|error| OmniError::storage_context("nearest", error))?;
+                            scanner.use_index(use_index);
+                            if let Some(maximum) = probe_budget {
+                                scanner.maximum_nprobes(maximum);
+                            }
+                            crate::instrumentation::record_ann_probe_budget(probe_budget);
+                            scanner.scan_stats_callback(Arc::new(move |summary| {
+                                *stats_sink
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(summary.clone());
+                            }));
+                            // Lance 11's late payload `LanceRead` drops the sorted
+                            // candidate stream's ordering metadata, so a second
+                            // output partition would scramble large-k results.
+                            scanner.target_parallelism(1);
+                        }
                     }
-                    scanner
-                        .full_text_search(fts_query)
-                        .map_err(|error| OmniError::storage_context("full_text_search", error))?;
-                    // No target_parallelism(1) pin needed here, unlike the
-                    // nearest arm above: the FTS plan sorts globally with a
-                    // fetch and emits a single partition.
-                }
+
+                    if let Some((ref var, ref prop, ref text)) = search_mode.bm25 {
+                        if var == variable {
+                            let mut fts_query =
+                                lance_index::scalar::FullTextSearchQuery::new(text.clone())
+                                    .with_column(prop.clone())
+                                    .map_err(|error| {
+                                        OmniError::storage_context("fts with_column", error)
+                                    })?;
+                            // Cap the ranked FTS scan (issue #563): unbounded, Lance
+                            // hydrates every matching document, past Arrow's 2 GiB
+                            // i32 string-offset ceiling. Rows come score-descending.
+                            if let Some(rows) = search_mode.bm25_scan_limit {
+                                // A negative limit would mean unlimited to Lance
+                                // (it casts `as usize`); saturate instead.
+                                fts_query =
+                                    fts_query.limit(Some(i64::try_from(rows).unwrap_or(i64::MAX)));
+                            }
+                            scanner.full_text_search(fts_query).map_err(|error| {
+                                OmniError::storage_context("full_text_search", error)
+                            })?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .await?
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .map_err(OmniError::storage)
+        })
+        .await?;
+
+        let (Some((_, _, k)), Some(type_rows)) = (nearest_target.as_ref(), dataset_rows) else {
+            break batches;
+        };
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        crate::instrumentation::record_ann_scan_rows(rows as u64);
+        // Lance fires the callback with neither counter present when no IVF
+        // partition exec ran, i.e. a flat scan; both counters present means an
+        // IVF index was used. `lance_surface_guards.rs` pins both names.
+        let summary: Option<(Option<u64>, Option<u64>)> = scan_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|summary| {
+                let counter = |name: &str| summary.all_counts.get(name).map(|count| *count as u64);
+                (
+                    counter(lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC),
+                    counter(lance_datafusion::utils::PARTITIONS_RANKED_METRIC),
+                )
+            });
+        if let Some((Some(searched), Some(ranked))) = summary {
+            crate::instrumentation::record_ann_partition_counters(searched, ranked);
+        }
+        scan_report.nearest_scan = Some(NearestScanReport {
+            rows,
+            k: *k,
+            maximum_nprobes: probe_budget,
+            exhausted: !use_index || known_matches.is_some_and(|matches| rows >= matches),
+            dataset_rows: type_rows,
+        });
+        if !use_index {
+            break batches;
+        }
+        match ladder_step(
+            rows,
+            *k,
+            known_matches,
+            dataset_rows,
+            batches_hold_infinite_distance(&batches),
+            summary,
+            probe_budget,
+            last_rung,
+        ) {
+            LadderStep::Stop => break batches,
+            LadderStep::FlatRescan => {
+                tracing::debug!(
+                    variable,
+                    k = *k,
+                    rows,
+                    "nearest scan holds prefilter-admitted rows at +inf distance; rescanning as the flat exact kNN"
+                );
+                crate::instrumentation::record_ann_rescan();
+                crate::instrumentation::record_ann_flat_rescan();
+                use_index = false;
+                probe_budget = None;
             }
-            Ok(())
-        },
-    )
-    .await?
-    .try_collect::<Vec<RecordBatch>>()
-    .await
-    .map_err(OmniError::storage)?;
+            LadderStep::RescanUncapped {
+                summary_missing: true,
+            } => {
+                tracing::warn!(
+                    variable,
+                    k = *k,
+                    rows,
+                    maximum_nprobes = ?probe_budget,
+                    summary_fired = summary.is_some(),
+                    "nearest scan short under its probe cap without Lance's partition counters; rescanning uncapped"
+                );
+                crate::instrumentation::record_ann_summary_missing();
+                crate::instrumentation::record_ann_rescan();
+                probe_budget = None;
+            }
+            LadderStep::RescanUncapped {
+                summary_missing: false,
+            } => {
+                tracing::warn!(
+                    variable,
+                    k = *k,
+                    rows,
+                    partition_counters = ?summary,
+                    maximum_nprobes = ?probe_budget,
+                    "nearest scan short under its probe cap; rescanning uncapped (the ladder's last rung)"
+                );
+                crate::instrumentation::record_ann_rescan();
+                probe_budget = None;
+            }
+            LadderStep::Rescan(next) => {
+                tracing::debug!(
+                    variable,
+                    k = *k,
+                    rows,
+                    partition_counters = ?summary,
+                    maximum_nprobes = ?probe_budget,
+                    next_maximum_nprobes = next,
+                    "nearest scan short under its probe cap; rescanning wider"
+                );
+                crate::instrumentation::record_ann_rescan();
+                last_rung = summary
+                    .and_then(|(searched, _)| searched)
+                    .map(|searched| (rows, searched));
+                probe_budget = Some(next);
+            }
+        }
+    };
 
     if search_mode
         .bm25
@@ -3985,11 +4531,6 @@ async fn execute_node_scan(
     }
 
     let scan_result = if batches.is_empty() {
-        // Build the schema the scan would have produced (the pruned
-        // projection when one applied, all non-blob columns otherwise) so an
-        // empty result is shaped like a non-empty one — except search scans,
-        // whose non-empty batches also carry Lance's autoprojected
-        // `_distance`/`_score`; those are absent here.
         let fields: Vec<_> = node_type
             .arrow_schema
             .fields()
@@ -4019,11 +4560,16 @@ async fn execute_node_scan(
 /// Uses column_by_name (not positional) so it's order-independent, and
 /// silently skips non-blob fields absent from the batch — LOAD-BEARING for
 /// pruned scans (#564), which legitimately omit undemanded non-blob columns.
+/// Every column the scan produced beside the catalog's rides through after
+/// the catalog columns, as the no-blob path (batch passed through untouched)
+/// already delivers it: a search scan's `_distance`/`_score` must survive
+/// this rebuild because `search_score_orderings` ranks on it.
 fn add_null_blob_columns(
     batch: &RecordBatch,
     node_type: &omnigraph_compiler::catalog::NodeType,
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
+    let batch_schema = batch.schema();
     let mut fields = Vec::with_capacity(node_type.arrow_schema.fields().len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(node_type.arrow_schema.fields().len());
 
@@ -4032,7 +4578,6 @@ fn add_null_blob_columns(
             fields.push(Field::new(field.name(), DataType::Utf8, true));
             columns.push(Arc::new(StringArray::from(vec![None::<&str>; num_rows])));
         } else if let Some(col) = batch.column_by_name(field.name()) {
-            let batch_schema = batch.schema();
             let batch_field = batch_schema
                 .field_with_name(field.name())
                 .map_err(OmniError::arrow_internal)?;
@@ -4040,6 +4585,23 @@ fn add_null_blob_columns(
             columns.push(col.clone());
         }
     }
+    for (field, col) in batch_schema.fields().iter().zip(batch.columns()) {
+        if node_type.arrow_schema.fields().find(field.name()).is_none() {
+            fields.push(field.as_ref().clone());
+            columns.push(col.clone());
+        }
+    }
+    debug_assert_eq!(
+        columns.len(),
+        batch.num_columns()
+            + node_type
+                .arrow_schema
+                .fields()
+                .iter()
+                .filter(|field| node_type.blob_properties.contains(field.name()))
+                .count(),
+        "add_null_blob_columns dropped or replaced a scan column"
+    );
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(OmniError::arrow_internal)
 }
@@ -4450,37 +5012,246 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch>
 
 #[cfg(test)]
 mod ann_probe_budget_tests {
-    use super::{AnnProbeBudget, DEFAULT_ANN_NPROBES, SearchMode, ann_nprobes_from};
+    use super::{DEFAULT_ANN_NPROBES, LadderStep, SearchMode, ann_nprobes_from, ladder_step};
 
     #[test]
     fn missing_value_uses_default_maximum() {
-        assert_eq!(ann_nprobes_from(None), DEFAULT_ANN_NPROBES);
-    }
-
-    #[test]
-    fn positive_value_is_used_as_configured() {
-        assert_eq!(ann_nprobes_from(Some("7")), 7);
-    }
-
-    #[test]
-    fn zero_and_invalid_values_use_default() {
-        for value in [Some("0"), Some("not-a-number"), Some("")] {
-            assert_eq!(ann_nprobes_from(value), DEFAULT_ANN_NPROBES);
+        for value in [None, Some(""), Some("  ")] {
+            assert_eq!(ann_nprobes_from(value), Some(DEFAULT_ANN_NPROBES));
         }
     }
 
     #[test]
-    fn uncapped_retry_clears_only_the_maximum() {
+    fn positive_value_is_used_as_configured() {
+        assert_eq!(ann_nprobes_from(Some("7")), Some(7));
+        assert_eq!(ann_nprobes_from(Some(" 7 ")), Some(7));
+    }
+
+    #[test]
+    fn zero_means_no_cap() {
+        for value in [Some("0"), Some("00"), Some(" 0 ")] {
+            assert_eq!(ann_nprobes_from(value), None);
+        }
+    }
+
+    #[test]
+    fn invalid_values_use_default() {
+        for value in [Some("not-a-number"), Some("-5"), Some("1.5"), Some("20x")] {
+            assert_eq!(ann_nprobes_from(value), Some(DEFAULT_ANN_NPROBES));
+        }
+    }
+
+    #[test]
+    fn uncapping_rows_leaves_the_probe_budget_alone() {
         let mode = SearchMode {
             nearest: Some(("d".into(), "embedding".into(), vec![0.0], 10)),
-            ann_probe_budget: Some(AnnProbeBudget::bounded(7)),
+            ann_probe_budget: Some(7),
+            bm25_scan_limit: Some(40),
             ..Default::default()
         };
 
         let retry = mode.to_uncapped();
+        assert_eq!(retry.bm25_scan_limit, None);
+        assert_eq!(retry.ann_probe_budget, Some(7));
+    }
+
+    #[test]
+    fn with_nearest_k_replaces_k_and_seeds_the_probe_cap() {
+        let mode = SearchMode {
+            nearest: Some(("d".into(), "embedding".into(), vec![0.5], 10)),
+            ann_probe_budget: Some(7),
+            ..Default::default()
+        };
+        let wider = mode.with_nearest_k(40, Some(28));
         assert_eq!(
-            retry.ann_probe_budget,
-            Some(AnnProbeBudget { maximum: None })
+            wider.nearest,
+            Some(("d".into(), "embedding".into(), vec![0.5], 40))
+        );
+        assert_eq!(wider.ann_probe_budget, Some(28));
+        let uncapped = mode.with_nearest_k(40, None);
+        assert_eq!(uncapped.ann_probe_budget, None);
+    }
+
+    #[test]
+    fn overfetch_multiplies_then_runs_one_exact_pass() {
+        use super::{NearestScanReport, OverfetchRung};
+        let scan = |k: usize, maximum: Option<usize>, dataset_rows: u64| NearestScanReport {
+            rows: k,
+            k,
+            maximum_nprobes: maximum,
+            exhausted: false,
+            dataset_rows,
+        };
+        assert_eq!(
+            super::next_overfetch_rung(1, 10, scan(10, Some(20), 2_000)),
+            Some(OverfetchRung::Wider {
+                factor: 4,
+                k: 40,
+                maximum: Some(20)
+            })
+        );
+        assert_eq!(
+            super::next_overfetch_rung(4, 10, scan(40, None, 2_000)),
+            Some(OverfetchRung::Wider {
+                factor: 16,
+                k: 160,
+                maximum: None
+            })
+        );
+        assert_eq!(
+            super::next_overfetch_rung(16, 10, scan(160, Some(80), 2_000)),
+            Some(OverfetchRung::Exact { k: 2_000 }),
+            "past the ceiling the exact pass asks for the whole type"
+        );
+        assert_eq!(
+            super::next_overfetch_rung(4, 10, scan(40, Some(80), 100)),
+            Some(OverfetchRung::Exact { k: 100 }),
+            "a rung that would ask for the whole type anyway is the exact pass"
+        );
+        assert_eq!(
+            super::next_overfetch_rung(1, 160, scan(160, Some(20), 160)),
+            None,
+            "a full scan that asked for exactly the whole type returned every row"
+        );
+    }
+
+    #[test]
+    fn probe_ladder_multiplies_then_uncaps() {
+        assert_eq!(super::next_probe_budget(20, 1_000), Some(80));
+        assert_eq!(super::next_probe_budget(80, 1_000), Some(320));
+        assert_eq!(super::next_probe_budget(320, 1_000), None);
+        assert_eq!(super::next_probe_budget(20, 60), None);
+        assert_eq!(super::next_probe_budget(1, 100), Some(4));
+    }
+
+    const IVF_SHORT: Option<(Option<u64>, Option<u64>)> = Some((Some(1), Some(1_000)));
+
+    #[test]
+    fn ladder_rescans_flat_on_an_infinite_distance_before_every_other_stop() {
+        assert_eq!(
+            ladder_step(10, 10, Some(10), Some(10), true, IVF_SHORT, None, None),
+            LadderStep::FlatRescan
+        );
+        assert_eq!(
+            ladder_step(3, 10, None, None, true, Some((None, None)), Some(20), None),
+            LadderStep::FlatRescan
+        );
+    }
+
+    #[test]
+    fn ladder_stops_without_a_cap() {
+        assert_eq!(
+            ladder_step(3, 10, None, None, false, IVF_SHORT, None, None),
+            LadderStep::Stop
+        );
+    }
+
+    #[test]
+    fn ladder_stops_when_the_scan_is_full() {
+        assert_eq!(
+            ladder_step(10, 10, None, None, false, IVF_SHORT, Some(20), None),
+            LadderStep::Stop
+        );
+    }
+
+    #[test]
+    fn ladder_stops_when_every_known_match_is_here() {
+        assert_eq!(
+            ladder_step(5, 10, Some(5), None, false, IVF_SHORT, Some(20), None),
+            LadderStep::Stop
+        );
+        assert_eq!(
+            ladder_step(4, 10, Some(5), None, false, IVF_SHORT, Some(20), None),
+            LadderStep::Rescan(80)
+        );
+    }
+
+    #[test]
+    fn ladder_stops_when_the_scan_holds_the_whole_dataset() {
+        assert_eq!(
+            ladder_step(7, 10, None, Some(7), false, IVF_SHORT, Some(20), None),
+            LadderStep::Stop
+        );
+        assert_eq!(
+            ladder_step(7, 10, None, Some(8), false, IVF_SHORT, Some(20), None),
+            LadderStep::Rescan(80)
+        );
+    }
+
+    #[test]
+    fn ladder_treats_a_summary_with_neither_counter_as_a_flat_scan() {
+        assert_eq!(
+            ladder_step(3, 10, None, None, false, Some((None, None)), Some(20), None),
+            LadderStep::Stop
+        );
+    }
+
+    #[test]
+    fn ladder_fails_closed_without_both_counters() {
+        for summary in [None, Some((Some(1), None)), Some((None, Some(8)))] {
+            assert_eq!(
+                ladder_step(3, 10, None, None, false, summary, Some(20), None),
+                LadderStep::RescanUncapped {
+                    summary_missing: true
+                },
+                "summary {summary:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ladder_stops_when_every_ranked_partition_was_searched() {
+        for summary in [Some((Some(8), Some(8))), Some((Some(9), Some(8)))] {
+            assert_eq!(
+                ladder_step(3, 10, None, None, false, summary, Some(20), None),
+                LadderStep::Stop,
+                "summary {summary:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ladder_stops_when_widening_changed_nothing() {
+        assert_eq!(
+            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((3, 1))),
+            LadderStep::Stop
+        );
+        assert_eq!(
+            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((3, 0))),
+            LadderStep::Rescan(320)
+        );
+        assert_eq!(
+            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((2, 1))),
+            LadderStep::Rescan(320)
+        );
+    }
+
+    #[test]
+    fn ladder_climbs_then_uncaps() {
+        assert_eq!(
+            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(20), None),
+            LadderStep::Rescan(80)
+        );
+        assert_eq!(
+            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(320), None),
+            LadderStep::RescanUncapped {
+                summary_missing: false
+            }
+        );
+        assert_eq!(
+            ladder_step(
+                3,
+                10,
+                None,
+                None,
+                false,
+                Some((Some(1), Some(60))),
+                Some(20),
+                None
+            ),
+            LadderStep::RescanUncapped {
+                summary_missing: false
+            }
         );
     }
 }
@@ -5219,10 +5990,25 @@ mod needed_columns_tests {
             }],
         );
         let needed = collect_needed_columns(&q);
-        // Search bindings fail open at the scan; the demand set still
-        // carries the ranked column so search-scan pruning can consume it
-        // without re-walking.
-        assert_columns(&needed, "c", &["slug", "embedding"]);
+        assert_columns(&needed, "c", &["slug"]);
+    }
+
+    #[test]
+    fn nearest_in_a_later_ordering_position_keeps_the_plain_walk() {
+        let q = ir(
+            vec![scan("c")],
+            vec![prop("c", "slug")],
+            vec![
+                prop("c", "rank"),
+                IRExpr::Nearest {
+                    variable: "c".to_string(),
+                    property: "embedding".to_string(),
+                    query: Box::new(IRExpr::Param("q".to_string())),
+                },
+            ],
+        );
+        let needed = collect_needed_columns(&q);
+        assert_columns(&needed, "c", &["slug", "rank", "embedding"]);
     }
 
     #[test]
@@ -5267,9 +6053,6 @@ mod needed_columns_tests {
 
     #[test]
     fn search_expression_arms_attribute_field_and_nested_columns() {
-        // Nothing consumes these entries while search scans fail open; this
-        // pins the walk's completeness — every operand (field, query,
-        // max_edits, k) — independent of any consumer.
         let q = ir(
             vec![scan("c")],
             vec![prop("c", "slug")],
@@ -5287,11 +6070,7 @@ mod needed_columns_tests {
             }],
         );
         let needed = collect_needed_columns(&q);
-        assert_columns(
-            &needed,
-            "c",
-            &["slug", "title", "probe", "edits", "body", "k_ref"],
-        );
+        assert_columns(&needed, "c", &["slug", "title", "probe", "edits", "k_ref"]);
     }
 
     #[test]

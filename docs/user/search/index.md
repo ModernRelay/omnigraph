@@ -50,19 +50,37 @@ embedding client are normalized, so L2 and cosine similarity produce the same
 ordering for those generated vectors. See [Embeddings](embeddings.md) for text
 queries and provider configuration.
 
-IVF vector searches keep Lance's adaptive one-partition minimum and use a
-maximum of 20 payload partitions by default. This prevents Lance's
-centroid-distance heuristic from expanding an otherwise small search across
-the entire index. Set `OMNIGRAPH_ANN_NPROBES` to a positive integer to tune
-the maximum: larger values can improve recall at the cost of latency and
-object-store I/O.
+IVF vector searches keep Lance's adaptive one-partition minimum and cap the
+partitions a `nearest` scan reads at 20 per index delta by default. The cap
+prevents Lance's centroid-distance heuristic from expanding a small search
+across the entire index; larger values can improve recall at the cost of
+latency and object-store I/O.
 
-If that maximum leaves a standalone nearest query or an RRF nearest arm with
-fewer candidates than requested, OmniGraph retries that scan once without a
-maximum. The retry preserves the requested row budget when enough matches
-exist, but a highly selective query can therefore still take the uncapped
-path. As with every IVF search, a full candidate count does not make the ANN
-ranking exact; the maximum remains a recall/latency tradeoff.
+A capped scan that returns fewer candidates than requested with partitions
+left unread is rerun with the cap raised four-fold, then without a cap, until
+the candidates are found or the index is exhausted. A scan that ended short
+for any other reason (every matching row found, the whole type read) is not
+rerun. When a traversal or a filter above the scan drops candidates and
+leaves `limit` unfilled, the query asks the scan for four times, then
+sixteen times, the requested candidates; a query whose survivors are rarer
+than one in sixteen of the nearest candidates then runs one exact pass over
+the whole type (every row with an embedding ranked, no cap), taken sooner
+once a rung would cover the whole type anyway, so `limit` is
+filled whenever that many survivors exist; a query whose survivors are permanently fewer than
+`limit` pays that whole-type pass on every execution. A `nearest` ordering constrained by a traversal is first restricted
+to the entities that can satisfy the traversal's first hop when few entities
+can (the same gate `rrf()` uses), and ranks only those. A `nearest()` arm
+inside `rrf()` is a top-k window: the arm's scan widens its own cap, but a
+traversal that drops the arm's rows shortens the fused answer. As with every
+IVF search, a full candidate count does not make the ANN ranking exact; the
+cap remains a recall/latency tradeoff.
+
+| Variable | Meaning |
+|---|---|
+| `OMNIGRAPH_ANN_NPROBES` | Partition cap per index delta of a `nearest` scan; default 20, `0` removes the cap, an invalid value is the default with a warning |
+| `OMNIGRAPH_RRF_GATE_RATIO` | Fraction of the ranked type below which a traversal-constrained `nearest` or `rrf()` prefilters its scan; default 0.10, `0` turns the gate off, an invalid value is the default |
+| `OMNIGRAPH_RRF_GATE_MAX_IDS` | Largest eligible set the gate pushes into the scan; default 100000, `0` turns the gate off, an invalid value is the default |
+| `OMNIGRAPH_RRF_PLAN` | `auto` (default), `force_prefilter`, or `force_postfilter`, for diagnosis. On a traversal-constrained `nearest`, `force_postfilter` can leave `limit` unfilled and `force_prefilter` ranks the eligible entities regardless of the size threshold |
 
 ## Full-text search
 

@@ -28,3 +28,7 @@ query ranked() {
 {"p.name": "dave", "p.rank": 1}
 {"p.name": "alice", "p.rank": 2}
 {"p.name": "carol", "p.rank": 2}
+
+--- expect shape
+p.name: String
+p.rank: I64

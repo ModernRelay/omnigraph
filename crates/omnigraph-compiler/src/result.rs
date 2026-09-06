@@ -6,7 +6,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use serde::de::DeserializeOwned;
 
 use crate::error::{CompilerError, Result};
-use crate::json_output::{record_batches_to_json_rows, record_batches_to_rust_json_rows};
+use crate::json_output::{record_batches_to_json_bytes, record_batches_to_json_lines};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MutationExecResult {
@@ -50,16 +50,23 @@ impl QueryResult {
             .map_err(|err| CompilerError::Execution(err.to_string()))
     }
 
-    pub fn to_sdk_json(&self) -> serde_json::Value {
-        serde_json::Value::Array(record_batches_to_json_rows(&self.batches))
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        record_batches_to_json_bytes(&self.batches)
     }
 
-    pub fn to_rust_json(&self) -> serde_json::Value {
-        serde_json::Value::Array(record_batches_to_rust_json_rows(&self.batches))
+    /// One JSON object per row, `\n`-terminated.
+    pub fn to_json_lines(&self) -> Result<Vec<u8>> {
+        record_batches_to_json_lines(&self.batches)
+    }
+
+    pub fn to_rust_json(&self) -> Result<serde_json::Value> {
+        serde_json::from_slice(&self.to_json_bytes()?).map_err(|err| {
+            CompilerError::Execution(format!("query result rendered invalid JSON: {}", err))
+        })
     }
 
     pub fn deserialize<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_value(self.to_rust_json()).map_err(|err| {
+        serde_json::from_slice(&self.to_json_bytes()?).map_err(|err| {
             CompilerError::Execution(format!("failed to deserialize query result: {}", err))
         })
     }
@@ -83,13 +90,6 @@ pub struct MutationResult {
 }
 
 impl MutationResult {
-    pub fn to_sdk_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "affectedNodes": self.affected_nodes,
-            "affectedEdges": self.affected_edges,
-        })
-    }
-
     pub fn to_record_batch(&self) -> Result<RecordBatch> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("affected_nodes", DataType::UInt64, false),
@@ -121,13 +121,6 @@ pub enum RunResult {
 }
 
 impl RunResult {
-    pub fn to_sdk_json(&self) -> serde_json::Value {
-        match self {
-            Self::Query(result) => result.to_sdk_json(),
-            Self::Mutation(result) => result.to_sdk_json(),
-        }
-    }
-
     pub fn into_record_batches(self) -> Result<Vec<RecordBatch>> {
         match self {
             Self::Query(result) => Ok(result.into_batches()),
@@ -232,11 +225,15 @@ mod tests {
         let result = QueryResult::new(schema, vec![batch]);
 
         assert_eq!(
-            result.to_rust_json(),
+            result.to_rust_json().expect("rows"),
             serde_json::json!([{
                 "signed": i64::MIN,
                 "unsigned": u64::MAX,
             }])
+        );
+        assert_eq!(
+            result.to_json_bytes().expect("bytes"),
+            br#"[{"signed":-9223372036854775808,"unsigned":18446744073709551615}]"#
         );
     }
 

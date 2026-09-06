@@ -206,9 +206,21 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     typecheck_clauses(catalog, &query.match_clause, &mut ctx, &params, false)?;
 
     // Typecheck return projections
+    let mut result_columns: HashSet<String> = HashSet::new();
     for proj in &query.return_clause {
         let resolved = resolve_expr_type(catalog, &proj.expr, &ctx, &params)?;
         reject_blob_read_value(&resolved, &proj.expr)?;
+        // T25: one result column per name. The executor emits a batch with
+        // every projection's column under its executed name; two columns of
+        // one name survive the batch (Arrow allows it) and every reader that
+        // keys a row by column name keeps the last one, so the first value
+        // is lost without an error.
+        let column = executed_column_name(&proj.expr, proj.alias.as_deref());
+        if !result_columns.insert(column.clone()) {
+            return Err(CompilerError::Type(format!(
+                "T25: result column `{column}` is produced by more than one projection; give each projection its own alias"
+            )));
+        }
         if let Some(alias) = &proj.alias {
             ctx.aliases.insert(alias.clone(), resolved);
             alias_exprs.insert(alias.clone(), &proj.expr);
@@ -1573,33 +1585,7 @@ fn resolve_expr_type(
         Expr::Aggregate { func, arg } => {
             let arg_type = resolve_expr_type(catalog, arg, ctx, params)?;
             reject_blob_read_value(&arg_type, arg)?;
-
-            // T8: sum/avg require numeric; min/max require numeric or string
-            match func {
-                AggFunc::Sum | AggFunc::Avg => {
-                    if let ResolvedType::Scalar(s) = &arg_type
-                        && (s.list || !s.scalar.is_numeric())
-                    {
-                        return Err(CompilerError::Type(format!(
-                            "T8: {} requires numeric type, got {}",
-                            func,
-                            s.display_name()
-                        )));
-                    }
-                }
-                AggFunc::Min | AggFunc::Max => {
-                    if let ResolvedType::Scalar(s) = &arg_type
-                        && (s.list || (!s.scalar.is_numeric() && s.scalar != ScalarType::String))
-                    {
-                        return Err(CompilerError::Type(format!(
-                            "T8: {} requires numeric or string type, got {}",
-                            func,
-                            s.display_name()
-                        )));
-                    }
-                }
-                _ => {} // count works on any type
-            }
+            check_aggregate_argument(func, arg, &arg_type)?;
 
             Ok(ResolvedType::Aggregate)
         }
@@ -1651,6 +1637,7 @@ fn infer_projection_field(
             // unsupported Blob value.
             let resolved_arg = resolve_expr_type(catalog, arg, ctx, params)?;
             reject_blob_read_value(&resolved_arg, arg)?;
+            check_aggregate_argument(func, arg, &resolved_arg)?;
             let (data_type, nullable) = match func {
                 AggFunc::Count => (DataType::Int64, true),
                 AggFunc::Avg | AggFunc::Sum => (DataType::Float64, true),
@@ -1667,6 +1654,30 @@ fn infer_projection_field(
             let (data_type, nullable) = resolved_type_to_field_shape(catalog, &resolved)?;
             Ok(Field::new(name, data_type, nullable))
         }
+    }
+}
+
+/// The column name a projection carries in the executed result batch
+/// (`exec/projection.rs`, `evaluate_projection` and the aggregate path): the
+/// alias when given, else `var.prop` for a property, the variable or
+/// parameter name for a bare variable, `literal` for a literal, and the
+/// argument's executed name for an aggregate; every other expression keeps
+/// `projection_name`'s spelling. `projection_name` is the inferred-schema
+/// spelling and names an unaliased property by the property alone; the two
+/// spellings drift for unaliased projections today, and this function
+/// follows the executor because T25 guards the batch the executor builds.
+pub fn executed_column_name(expr: &Expr, alias: Option<&str>) -> String {
+    if let Some(alias) = alias {
+        return alias.to_string();
+    }
+    match expr {
+        Expr::PropAccess { variable, property } => format!("{variable}.{property}"),
+        Expr::Variable(variable) => variable.clone(),
+        Expr::Literal(_) => "literal".to_string(),
+        Expr::Aggregate { arg, .. } => executed_column_name(arg, None),
+        // `now()` lowers to the hidden parameter and is named after it.
+        Expr::Now => crate::query::ast::NOW_PARAM_NAME.to_string(),
+        other => projection_name(other, None),
     }
 }
 
@@ -1691,6 +1702,46 @@ fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
     }
 }
 
+/// T8: `count` takes a scalar or a node, `sum`/`avg` a numeric, `min`/`max` an
+/// orderable scalar; none takes an aggregate.
+fn check_aggregate_argument(func: &AggFunc, arg: &Expr, arg_type: &ResolvedType) -> Result<()> {
+    match (func, arg_type) {
+        (_, ResolvedType::Aggregate) => Err(CompilerError::Type(format!(
+            "T8: {func} cannot take an aggregate or a forward alias reference as its argument"
+        ))),
+        (AggFunc::Count, _) => Ok(()),
+        (_, ResolvedType::Node(_)) => {
+            let subject = match arg {
+                Expr::Variable(name) => format!("node binding `${name}`"),
+                Expr::AliasRef(alias) => format!("node projection `{alias}`"),
+                other => format!("node value `{other:?}`"),
+            };
+            Err(CompilerError::Type(format!(
+                "T8: {func} cannot take {subject} bare; access one of the node's properties (`$var.{{prop}}`)"
+            )))
+        }
+        (AggFunc::Sum | AggFunc::Avg, ResolvedType::Scalar(s))
+            if s.list || !s.scalar.is_numeric() =>
+        {
+            Err(CompilerError::Type(format!(
+                "T8: {} requires numeric type, got {}",
+                func,
+                s.display_name()
+            )))
+        }
+        (AggFunc::Min | AggFunc::Max, ResolvedType::Scalar(s))
+            if s.list || !s.scalar.is_orderable() =>
+        {
+            Err(CompilerError::Type(format!(
+                "T8: {} requires a numeric, String, Bool, Date, or DateTime scalar, got {}",
+                func,
+                s.display_name()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn resolved_type_to_field_shape(
     catalog: &Catalog,
     resolved: &ResolvedType,
@@ -1702,10 +1753,10 @@ fn resolved_type_to_field_shape(
                 CompilerError::Type(format!("type `{}` not found in catalog", type_name))
             })?;
             let fields: Vec<Field> = node_type
-                .arrow_schema
-                .fields()
-                .iter()
-                .map(|field| field.as_ref().clone())
+                .node_object_fields()
+                .map(|field| {
+                    Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                })
                 .collect();
             Ok((DataType::Struct(fields.into()), false))
         }
@@ -1721,7 +1772,11 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
         Literal::Integer(_) => Ok(PropType::scalar(ScalarType::I64, false)),
         Literal::Float(_) => Ok(PropType::scalar(ScalarType::F64, false)),
         Literal::Bool(_) => Ok(PropType::scalar(ScalarType::Bool, false)),
-        Literal::Date(_) => Ok(PropType::scalar(ScalarType::Date, false)),
+        Literal::Date(value) => {
+            crate::types::check_date_literal(value)
+                .map_err(|reason| CompilerError::Type(format!("T3: {reason}")))?;
+            Ok(PropType::scalar(ScalarType::Date, false))
+        }
         Literal::DateTime(_) => Ok(PropType::scalar(ScalarType::DateTime, false)),
         Literal::List(items) => {
             if items.is_empty() {

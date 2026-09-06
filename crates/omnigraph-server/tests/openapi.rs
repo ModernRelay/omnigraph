@@ -9,7 +9,7 @@ use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_server::{AppState, build_app, served_openapi};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 fn fixture(name: &str) -> PathBuf {
@@ -2007,6 +2007,22 @@ async fn auth_mode_healthz_still_has_no_security() {
         healthz.get("security").is_none() || healthz["security"].is_null(),
         "auth-mode: /healthz should still have no security"
     );
+}
+
+#[test]
+fn schema_routes_document_actor_setting_and_effective_discovery() {
+    let doc = openapi_json();
+    let request = &doc["components"]["schemas"]["SchemaApplyRequest"];
+    assert!(request["properties"].get("actor_provenance").is_some());
+    assert!(
+        !request["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("actor_provenance"))
+    );
+    let response = &doc["components"]["schemas"]["SchemaOutput"];
+    assert!(response["properties"].get("schema_source").is_some());
+    assert!(response["properties"].get("accepted_schema").is_some());
 }
 
 #[test]

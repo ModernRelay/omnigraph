@@ -1,0 +1,60 @@
+# issue: 634
+# red_on: 2026-09-05, main b570ebb2: query failed: search-ordered query produced rows without its 'c._score' ranking column
+# notes: a node type with a Blob property scans with an explicit non-Blob
+# notes: projection and rebuilds the batch afterwards; the rebuild must keep
+# notes: the ranking column the scan projects (`_score` for bm25, `_distance`
+# notes: for nearest) or the search-ordered read is refused. This case is the
+# notes: sole guard (no Rust twin). Seed rows have equal length so the bm25
+# notes: order rests on tf alone, not on length normalisation, and both
+# notes: expected orders are the reverse of the id tie-break order, so a
+# notes: present-but-constant ranking column fails the step.
+
+--- schema
+node Chunk {
+    slug: String @key
+    text: String @index
+    embedding: Vector(2)
+    payload: Blob?
+}
+
+--- seed
+{"type":"Chunk","data":{"slug":"chunk-00","text":"needle filler filler filler","embedding":[1.0,0.0]}}
+{"type":"Chunk","data":{"slug":"chunk-01","text":"needle needle needle filler","embedding":[0.0,1.0]}}
+
+--- query
+query ranked($q: String) {
+    match {
+        $c: Chunk
+        search($c.text, $q)
+    }
+    return { $c.slug }
+    order { bm25($c.text, $q) }
+}
+
+--- params
+{"q": "needle"}
+
+--- expect ordered
+{"c.slug": "chunk-01"}
+{"c.slug": "chunk-00"}
+
+--- expect shape
+c.slug: String
+
+--- query
+query closest($v: Vector(2)) {
+    match { $c: Chunk }
+    return { $c.slug }
+    order { nearest($c.embedding, $v) }
+    limit 2
+}
+
+--- params
+{"v": [0.0, 0.9]}
+
+--- expect ordered
+{"c.slug": "chunk-01"}
+{"c.slug": "chunk-00"}
+
+--- expect shape
+c.slug: String

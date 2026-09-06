@@ -1,0 +1,56 @@
+# issue: 567
+# red_on: 2026-09-04, main 650e1653: the nearest scan took the 3 nearest docs of the whole table, the traversal kept the one with an edge, and the query returned 1 row instead of 3.
+# notes: a traversal-constrained nearest fills `limit` when enough eligible
+# notes: rows exist. At 10 docs the gate's ratio fence fails (3 eligible of
+# notes: 10 is above 10%), so this case takes the `Threshold` fallback: the
+# notes: unfiltered scan's 3 candidates hold one edge source and the overfetch
+# notes: rerun (k 3 -> 12) fills the limit. The gate's prefilter path is the
+# notes: Rust twin's. Docs sit on a line (embedding = [row, 0, 0, 0]); edges
+# notes: leave d00, d04 and d08 only. Rust twin:
+# notes: issue_567_nearest_traversal_prefilters_then_overfetches (tests/search.rs).
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d00","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d01","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d02","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d03","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d04","embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d05","embedding":[5.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d06","embedding":[6.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d07","embedding":[7.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d08","embedding":[8.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d09","embedding":[9.0,0.0,0.0,0.0]}}
+{"edge":"Knows","from":"d00","to":"d01","data":{"id":"e00"}}
+{"edge":"Knows","from":"d04","to":"d05","data":{"id":"e04"}}
+{"edge":"Knows","from":"d08","to":"d09","data":{"id":"e08"}}
+
+--- query
+query nearest_with_edge($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "d00"}
+{"d.slug": "d04"}
+{"d.slug": "d08"}
+
+--- expect shape
+d.slug: String

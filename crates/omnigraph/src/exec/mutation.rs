@@ -784,23 +784,26 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
-        self.mutate_with_current_actor(
+        // The retry/staging state contains nested Lance futures. Keep it behind
+        // one allocation, as load and merge do, so callers can compose writes
+        // without embedding that state in every outer async frame.
+        Box::pin(self.mutate_with_current_actor(
             branch,
             query_source,
             query_name,
             params,
             actor_id,
             expected_head,
-        )
+        ))
         .await
     }
 
-    /// End-of-query validation for a constructive mutation: build the change-set
+    /// End-of-query validation for every effectful mutation: build the change-set
     /// from the accumulated staging and run the unified evaluator (value/enum,
     /// uniqueness incl. cross-version, edge-RI, cardinality) against committed
     /// state. Read-your-writes is inherent — every same-query insert is already
-    /// in the change-set. Destructive queries (D2) stage no constructive batches,
-    /// so the change-set is empty and this is a no-op (deletes cascade).
+    /// in the change-set. Destructive queries include removed IDs for endpoint
+    /// and cardinality checks, plus any disjoint protocol-owned actor row.
     async fn validate_staged_mutation(
         &self,
         staging: &MutationStaging,
@@ -927,6 +930,14 @@ impl Omnigraph {
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
         let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
+        super::query::check_param_date_literals(params, &ir.params)?;
+        if txn
+            .catalog
+            .actor_provenance()
+            .is_some_and(|binding| binding.enabled)
+        {
+            super::actor_provenance::validate_actor_id(actor_id)?;
+        }
         // Only an insert-only mutation is safe to replay automatically after a
         // pre-effect authority mismatch. Update/Delete keep strict caller-visible
         // `ReadSetChanged`; replaying their stale read-modify-write plan would be
@@ -974,6 +985,9 @@ impl Omnigraph {
                 })
             }
             Ok(total) => {
+                // Keep the actor lookup's Lance scan out of the already large
+                // mutation future, including writes without an actor.
+                Box::pin(self.stage_actor_provenance(&txn, &mut staging, actor_id)).await?;
                 self.validate_staged_mutation(&staging, &txn).await?;
                 let staged = staging.stage_all(self, requested.as_deref()).await?;
                 crate::failpoints::maybe_fail(
@@ -1095,6 +1109,12 @@ impl Omnigraph {
         let ir = lower_mutation_query(&query_decl)?;
         // D₂: reject mixed insert/update + delete before any I/O.
         enforce_no_mixed_destructive_constructive(&ir)?;
+        for op in &ir.ops {
+            let (MutationOpIR::Insert { type_name, .. }
+            | MutationOpIR::Update { type_name, .. }
+            | MutationOpIR::Delete { type_name, .. }) = op;
+            super::actor_provenance::refuse_actor_table_write(catalog, type_name)?;
+        }
         Ok(ir)
     }
 

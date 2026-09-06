@@ -5,9 +5,15 @@ use serde_json::Value;
 
 use crate::error::CompilerError;
 use crate::ir::ParamMap;
-use crate::json_output::{JS_MAX_SAFE_INTEGER_U64, is_js_safe_integer_i64};
 use crate::query::ast::{Literal, Param, QueryDecl};
 use crate::query::parser::parse_query;
+
+const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
+const JS_MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
+
+fn is_js_safe_integer_i64(value: i64) -> bool {
+    (-JS_MAX_SAFE_INTEGER_I64..=JS_MAX_SAFE_INTEGER_I64).contains(&value)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonParamMode {
@@ -421,7 +427,11 @@ fn json_value_to_literal_typed(
             Ok(Literal::Bool(value))
         }
         "Date" => match value {
-            Value::String(value) => Ok(Literal::Date(value.clone())),
+            Value::String(value) => {
+                crate::types::check_date_literal(value)
+                    .map_err(|reason| RunInputError::message(format!("param '{key}': {reason}")))?;
+                Ok(Literal::Date(value.clone()))
+            }
             other => Err(match mode {
                 JsonParamMode::Standard => {
                     RunInputError::message(format!("param '{}': expected date string", key))

@@ -65,7 +65,7 @@ use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 use omnigraph_compiler::schema::parser::parse_schema;
 
-use helpers::{init_and_load, open_dataset_head, snapshot_main};
+use helpers::{open_dataset_head, snapshot_main};
 
 #[test]
 fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
@@ -1814,7 +1814,18 @@ async fn dataset_delta_historical_images_require_the_exact_end_handle() {
 #[tokio::test]
 async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let db = omnigraph::db::Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+    db.load_as(
+        "main",
+        None,
+        helpers::TEST_DATA,
+        omnigraph::loader::LoadMode::Overwrite,
+        Some("lance-surface-guard"),
+    )
+    .await
+    .unwrap();
     let snapshot = snapshot_main(&db).await.unwrap();
     let entries = snapshot
         .datasets()
@@ -1829,8 +1840,8 @@ async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
         .collect::<Vec<_>>();
     assert_eq!(
         entries.len(),
-        4,
-        "the shared fixture must exercise every declared node and edge table"
+        5,
+        "the fixture must exercise every declared node and edge table plus the actor table"
     );
 
     for (table_key, table_path, table_version, table_branch) in entries {
@@ -2315,6 +2326,259 @@ async fn vector_optimize_after_delete_keeps_stable_ids_and_addresses_aligned() {
             pair[1]
         );
     }
+}
+
+// --- Guard: nearest scan_stats_callback reports the IVF partition counters --
+//
+// Lance reports `partitions_searched` and `partitions_ranked` through
+// `Scanner::scan_stats_callback` (`lance_datafusion::utils::PARTITIONS_*_METRIC`,
+// summed over index deltas); the probe ladder fails closed without both.
+
+#[tokio::test]
+async fn nearest_scan_stats_report_partitions_searched_and_ranked() {
+    use lance::index::vector::VectorIndexParams;
+    use lance_datafusion::exec::ExecutionSummaryCounts;
+    use lance_datafusion::utils::{PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC};
+    use lance_linalg::distance::MetricType;
+    use std::sync::Mutex;
+
+    const ROWS: usize = 20_000;
+    const DIMENSION: usize = 32;
+    const INDEX_NAME: &str = "vector_idx";
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("nearest_scan_stats.lance");
+    let uri = uri.to_str().unwrap();
+    let mut dataset = linear_vector_dataset(uri, ROWS, DIMENSION, ROWS).await;
+    dataset
+        .create_index_builder(
+            &["vector"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+        )
+        .name(INDEX_NAME.to_string())
+        .replace(true)
+        .await
+        .unwrap();
+    let deleted = dataset.delete("id % 5 = 0").await.unwrap();
+    let mut dataset = (*deleted.new_dataset).clone();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    let stats: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics(INDEX_NAME)
+            .await
+            .expect("the optimized IVF_FLAT index must expose statistics"),
+    )
+    .unwrap();
+    let expected_ranked: usize = stats["indices"]
+        .as_array()
+        .expect("IVF statistics list one entry per index delta")
+        .iter()
+        .map(|delta| {
+            delta["num_partitions"]
+                .as_u64()
+                .expect("IVF statistics must expose num_partitions") as usize
+        })
+        .sum();
+    assert!(
+        expected_ranked > 1,
+        "the guard needs more partitions than a cap of one can search; stats: {stats}"
+    );
+
+    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+    let summary: Arc<Mutex<Option<ExecutionSummaryCounts>>> = Arc::new(Mutex::new(None));
+    let sink = summary.clone();
+    let mut scanner = dataset.scan();
+    scanner.nearest("vector", &query, 10).unwrap();
+    scanner.maximum_nprobes(1);
+    scanner.target_parallelism(1);
+    scanner.scan_stats_callback(Arc::new(move |counts| {
+        *sink.lock().unwrap() = Some(counts.clone());
+    }));
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 10, "the nearest partition alone fills k");
+
+    let summary = summary
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("Lance must fire scan_stats_callback once the scan stream is drained");
+    let keys = summary.all_counts.keys().cloned().collect::<Vec<_>>();
+    let searched = *summary
+        .all_counts
+        .get(PARTITIONS_SEARCHED_METRIC)
+        .unwrap_or_else(|| {
+            panic!("the summary must carry {PARTITIONS_SEARCHED_METRIC}; keys: {keys:?}")
+        });
+    let ranked = *summary
+        .all_counts
+        .get(PARTITIONS_RANKED_METRIC)
+        .unwrap_or_else(|| {
+            panic!("the summary must carry {PARTITIONS_RANKED_METRIC}; keys: {keys:?}")
+        });
+    assert_eq!(
+        ranked, expected_ranked,
+        "partitions_ranked must be the partition count summed over index deltas"
+    );
+    assert!(
+        (1..=ranked).contains(&searched),
+        "partitions_searched must lie in 1..=partitions_ranked, got {searched} of {ranked}"
+    );
+    assert!(
+        searched < ranked,
+        "a cap of one on a multi-partition index must leave partitions unsearched \
+         (searched {searched} of {ranked}); the probe ladder's rescan signal depends on it"
+    );
+}
+
+// --- Guard: an explicit projection may name `_distance` before `nearest` ---
+//
+// Lance 11 resolves the scoring columns (`_distance`, `_score`) in
+// `ProjectionPlan` independently of the dataset schema (lance-datafusion
+// `projection.rs`, `SCORING_COLUMNS`), so `project` before `nearest` is legal.
+
+#[tokio::test]
+async fn nearest_scan_accepts_distance_in_a_projection_set_before_nearest() {
+    use arrow_array::types::{Float32Type, Int32Type};
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const ROWS: usize = 1_000;
+    const DIMENSION: usize = 8;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("distance_projection.lance");
+    let uri = uri.to_str().unwrap();
+    let mut dataset = linear_vector_dataset(uri, ROWS, DIMENSION, ROWS).await;
+    dataset
+        .create_index_builder(
+            &["vector"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+        )
+        .replace(true)
+        .await
+        .unwrap();
+
+    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+    let mut scanner = dataset.scan();
+    scanner.project(&["id", "_distance"]).unwrap();
+    scanner.nearest("vector", &query, 10).unwrap();
+    scanner.target_parallelism(1);
+    let batch = scanner.try_into_batch().await.unwrap();
+
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["id".to_string(), "_distance".to_string()],
+        "the explicit projection is the output, scoring column included, vector excluded"
+    );
+    assert_eq!(batch.num_rows(), 10, "k rows");
+    assert_eq!(
+        batch
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec(),
+        (0..10).collect::<Vec<i32>>(),
+        "row i sits at distance i^2 from the origin, so the ten nearest are 0..10 in order"
+    );
+    let distances = batch.column(1).as_primitive::<Float32Type>().values();
+    assert!(
+        distances.windows(2).all(|pair| pair[0] <= pair[1]),
+        "ascending `_distance`: {distances:?}"
+    );
+}
+
+#[tokio::test]
+async fn fts_scan_accepts_score_in_a_projection_set_before_full_text_search() {
+    use arrow_array::types::Float32Type;
+
+    const ROWS: usize = 12;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("score_projection.lance");
+    let uri = uri.to_str().unwrap();
+    let ids: Vec<String> = (0..ROWS).map(|i| format!("d-{i:02}")).collect();
+    let texts: Vec<String> = (0..ROWS)
+        .map(|i| {
+            std::iter::repeat_n("alpha".to_string(), i)
+                .chain(std::iter::once(format!("pad{i}")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(texts)),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut scanner = dataset.scan();
+    scanner.project(&["id", "_score"]).unwrap();
+    scanner
+        .full_text_search(
+            FullTextSearchQuery::new("alpha".to_string())
+                .with_column("text".to_string())
+                .unwrap(),
+        )
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["id".to_string(), "_score".to_string()],
+        "the explicit projection is the output, scoring column included, text excluded"
+    );
+    assert_eq!(batch.num_rows(), ROWS - 1, "every doc carrying the term");
+    let scores = batch.column(1).as_primitive::<Float32Type>().values();
+    assert!(
+        scores.windows(2).all(|pair| pair[0] >= pair[1]),
+        "descending `_score`: {scores:?}"
+    );
 }
 
 // --- Lance 10 compatibility: fence late-hydrated KNN ordering --------------

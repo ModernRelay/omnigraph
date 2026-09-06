@@ -93,6 +93,7 @@ jobs:
   check_agents_md:
     name: Check AGENTS.md Links
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -132,6 +133,18 @@ jobs:
 
       - name: Verify documentation structure and RFC registry
         run: python3 scripts/check-docs.py
+
+      # Spelling gate: docs/dev/ci.md, "Pull-request gates". typos also reads
+      # a sibling typos.toml / _typos.toml, so refuse a second config first.
+      - name: Refuse a second typos config
+        run: |
+          if [ -e typos.toml ] || [ -e _typos.toml ]; then
+            echo "::error::every typos exemption lives in .typos.toml; remove typos.toml / _typos.toml"
+            exit 1
+          fi
+
+      - name: Check spelling
+        uses: crate-ci/typos@d43b6c087ac471e2ea7b8af622ff15f05c0c365b # v1.50.1
 
   workflow_action_pins:
     name: Check Workflow Action Pins
@@ -574,7 +587,9 @@ jobs:
   v5_v6_format_fence:
     name: V5 ↔ V6 Format Fence
     needs: classify_changes
-    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    # Pull requests too, as a reporting context like `Test Workspace`: a
+    # fence red reports on the pull request instead of first appearing on `main`.
+    if: needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # This job owns the immutable predecessor build in parallel with the
     # current-tree workspace job. The 2026-07-28 cold measurement was 25m40s
@@ -605,6 +620,7 @@ jobs:
             . -> target
           key: crossversion-v5-v6
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       # CI pins only the immediate predecessor. Older seams remain env-gated
       # and on-demand, per docs/dev/testing.md.

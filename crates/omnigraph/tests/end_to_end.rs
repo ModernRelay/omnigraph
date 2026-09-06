@@ -36,7 +36,8 @@ async fn init_creates_schema_file_and_manifest() {
 
     assert!(dir.path().join("_schema.pg").exists());
     assert!(dir.path().join("__manifest").exists());
-    assert_eq!(db.catalog().node_types.len(), 2);
+    assert_eq!(db.catalog().node_types.len(), 3);
+    assert!(db.catalog().node_types.contains_key("OmniActor"));
     assert_eq!(db.catalog().edge_types.len(), 2);
 }
 
@@ -50,7 +51,8 @@ async fn open_restores_full_state() {
     drop(original);
 
     let reopened = Omnigraph::open(uri).await.unwrap();
-    assert_eq!(reopened.catalog().node_types.len(), 2);
+    assert_eq!(reopened.catalog().node_types.len(), 3);
+    assert!(reopened.catalog().node_types.contains_key("OmniActor"));
     assert_eq!(reopened.catalog().edge_types.len(), 2);
     // Version should be what we left it at
     // (manifest was committed during load)
@@ -172,7 +174,10 @@ node Doc {
         .unwrap()
         .unwrap();
 
-    assert!(missing["embedding"].is_null());
+    assert!(
+        missing.get("embedding").is_none(),
+        "entity fetch omits a null cell's key (RFC 0051): {missing}"
+    );
     assert_eq!(present["embedding"], serde_json::json!([1.0, 2.0]));
 }
 
@@ -1045,7 +1050,7 @@ async fn blob_bearing_query_filters_without_projecting_blob() {
 
         assert_eq!(result.num_rows(), 1, "{query_name}");
 
-        let json = result.to_sdk_json();
+        let json = result.to_rust_json().unwrap();
         let row = json.as_array().unwrap().first().unwrap();
         assert_eq!(row["d.title"], "readme", "{query_name}");
         assert!(
@@ -1074,7 +1079,7 @@ async fn blob_null_does_not_break_non_blob_projection() {
     .unwrap();
 
     assert_eq!(result.num_rows(), 1);
-    let json = result.to_sdk_json();
+    let json = result.to_rust_json().unwrap();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "empty");
     assert!(
@@ -1110,7 +1115,7 @@ async fn blob_insert_mutation() {
     .await
     .unwrap();
     assert_eq!(qr.num_rows(), 1);
-    let json = qr.to_sdk_json();
+    let json = qr.to_rust_json().unwrap();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "new-doc");
     // Blob columns are not part of ordinary query projection.

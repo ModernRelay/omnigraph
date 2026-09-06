@@ -25,6 +25,10 @@ query exactly_two_hops() {
 
 --- expect unordered
 
+--- expect shape
+p.name: String
+f.name: String
+
 --- query
 query one_to_two_hops() {
     match {
@@ -37,3 +41,7 @@ query one_to_two_hops() {
 --- expect unordered
 {"p.name": "alice", "f.name": "bob"}
 {"p.name": "bob", "f.name": "bob"}
+
+--- expect shape
+p.name: String
+f.name: String

@@ -47,6 +47,10 @@ mod blob_cli;
 mod cli;
 mod client;
 mod helpers;
+mod managed;
+#[cfg(test)]
+#[path = "../tests/support/managed_http.rs"]
+mod managed_http_fixture;
 mod output;
 mod planes;
 mod scope;
@@ -144,6 +148,20 @@ async fn main() -> Result<()> {
             .get_matches_from(raw_args);
         Cli::from_arg_matches(&matches)?
     };
+    if let Some(result) = managed::dispatch(&cli).await {
+        let code = result.emit()?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
+    let managed_data = match managed::data::client(&cli) {
+        Ok(client) => client,
+        Err(output) => {
+            let code = output.emit()?;
+            std::process::exit(code);
+        }
+    };
     let http_client = build_http_client()?;
     // RFC-010 Slice 1: reject scope-addressing flags a verb can't consume,
     // from one declared flag × capability matrix — before any per-command
@@ -153,7 +171,10 @@ async fn main() -> Result<()> {
     // resolver and the guard share one classification (planes.rs).
     let capability = planes::command_capability(&cli.command);
     match cli.command {
-        Command::Login { name, token, json } => {
+        Command::Login {
+            name, token, json, ..
+        } => {
+            let name = name.expect("clap requires a server name without --api");
             let token = match token {
                 Some(token) => token,
                 None => {
@@ -172,7 +193,8 @@ async fn main() -> Result<()> {
             let path = crate::operator::write_credential(&name, &token)?;
             finish_login(&name, &path, declared, json)?;
         }
-        Command::Logout { name, json } => {
+        Command::Logout { name, json, .. } => {
+            let name = name.expect("clap requires a server name without --api");
             let path = crate::operator::remove_credential(&name)?;
             finish_logout(&name, &path, json)?;
         }
@@ -309,7 +331,12 @@ async fn main() -> Result<()> {
                 print_embed_human(&output);
             }
         }
-        Command::Init { schema, uri, force } => {
+        Command::Init {
+            schema,
+            uri,
+            force,
+            actor_provenance,
+        } => {
             // RFC-010 Slice 3: graphs inside an established cluster are created
             // by `cluster apply` (which records ledger/recovery/approvals), not
             // by hand-running `init` into the cluster's storage layout.
@@ -334,7 +361,10 @@ async fn main() -> Result<()> {
             Omnigraph::init_with_options(
                 &uri,
                 &schema_source,
-                omnigraph::db::InitOptions { force },
+                omnigraph::db::InitOptions {
+                    force,
+                    actor_provenance: actor_provenance.unwrap_or(true),
+                },
             )
             .await?;
             println!("initialized {}", uri);
@@ -835,6 +865,7 @@ async fn main() -> Result<()> {
                 schema,
                 json,
                 allow_data_loss,
+                actor_provenance,
             } => {
                 let uri = resolve_maintenance_uri(
                     cli.profile.as_deref(),
@@ -846,11 +877,14 @@ async fn main() -> Result<()> {
                 )
                 .await?;
                 let schema_source = fs::read_to_string(&schema)?;
-                let db = Omnigraph::open(&uri).await?;
+                let db = Omnigraph::open_read_only(&uri).await?;
                 let plan = db
                     .plan_schema_with_options(
                         &schema_source,
-                        omnigraph::db::SchemaApplyOptions { allow_data_loss },
+                        omnigraph::db::SchemaApplyOptions {
+                            allow_data_loss,
+                            actor_provenance,
+                        },
                     )
                     .await?;
                 let output = SchemaPlanOutput {
@@ -870,6 +904,7 @@ async fn main() -> Result<()> {
                 schema,
                 json,
                 allow_data_loss,
+                actor_provenance,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
                     capability,
@@ -914,7 +949,12 @@ async fn main() -> Result<()> {
                 // no-op here on both arms.
                 echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
                 let output = client
-                    .apply_schema(&schema_source, allow_data_loss, |_catalog| Ok(()))
+                    .apply_schema(
+                        &schema_source,
+                        allow_data_loss,
+                        actor_provenance,
+                        |_catalog| Ok(()),
+                    )
                     .await?;
                 if json {
                     print_json(&output)?;
@@ -936,7 +976,27 @@ async fn main() -> Result<()> {
                 if json {
                     print_json(&output)?;
                 } else {
+                    println!("Customer schema source (.pg):");
                     println!("{}", output.schema_source);
+                    match output.accepted_schema.as_ref() {
+                        Some(schema) => match schema.actor_provenance.as_ref() {
+                            Some(binding) => {
+                                println!(
+                                    "Accepted actor provenance: {}",
+                                    if binding.enabled {
+                                        "enabled"
+                                    } else {
+                                        "disabled"
+                                    }
+                                );
+                                println!("System type: OmniActor {{ actorId: String @key }}");
+                            }
+                            None => {
+                                println!("Accepted actor provenance: disabled (no system binding)")
+                            }
+                        },
+                        None => println!("Accepted schema details: unavailable from this server"),
+                    }
                 }
             }
         },
@@ -1103,15 +1163,19 @@ async fn main() -> Result<()> {
             format,
             json,
         } => {
-            let client = client::GraphClient::resolve(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                None,
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-            )
-            .await?;
+            let client = if let Some(client) = managed_data {
+                client
+            } else {
+                client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?
+            };
             let params_json = load_params_json(&params)?;
             let target = resolve_read_target(branch, snapshot, None)?;
             let output: ReadOutput = if query.is_some() || query_string.is_some() {
@@ -1150,16 +1214,20 @@ async fn main() -> Result<()> {
             if_commit,
             json,
         } => {
-            let client = client::GraphClient::resolve_with_policy(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                None,
-                cli.as_actor.as_deref(),
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-            )
-            .await?;
+            let client = if let Some(client) = managed_data {
+                client
+            } else {
+                client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?
+            };
             let params_json = load_params_json(&params)?;
             let branch = resolve_branch(branch, None, "main");
             let result: Result<ChangeOutput> = if query.is_some() || query_string.is_some() {
@@ -1586,7 +1654,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Cluster { command } => match command {
+        Command::Use { .. } => unreachable!("managed dispatch handles use"),
+        Command::Cluster { command, .. } => match command {
             ClusterCommand::Validate { config, json } => {
                 let output = validate_config_dir(config);
                 finish_cluster_validate(&output, json)?;
@@ -1595,6 +1664,7 @@ async fn main() -> Result<()> {
                 config,
                 json,
                 observe,
+                ..
             } => {
                 let output = plan_config_dir_with_options(config, PlanOptions { observe }).await;
                 finish_cluster_plan(&output, json)?;
@@ -1603,7 +1673,7 @@ async fn main() -> Result<()> {
                 let output = observe_config_dir(config).await;
                 finish_cluster_state_sync(&output, json)?;
             }
-            ClusterCommand::Apply { config, json } => {
+            ClusterCommand::Apply { config, json, .. } => {
                 // The actor attributes graph-moving operations (sidecars,
                 // audit entries, engine schema-apply commits). Cluster FACTS
                 // stay unlayered; the operator's identity resolves --as flag
@@ -1625,7 +1695,7 @@ async fn main() -> Result<()> {
                 let output = approve_config_dir(config, &resource, &approver).await;
                 finish_cluster_approve(&output, json)?;
             }
-            ClusterCommand::Status { config, json } => {
+            ClusterCommand::Status { config, json, .. } => {
                 let output = status_config_dir(config).await;
                 finish_cluster_status(&output, json)?;
             }
@@ -1644,6 +1714,11 @@ async fn main() -> Result<()> {
             } => {
                 let output = force_unlock_config_dir(config, lock_id).await;
                 finish_cluster_force_unlock(&output, json)?;
+            }
+            ClusterCommand::History { .. }
+            | ClusterCommand::Cancel { .. }
+            | ClusterCommand::Token { .. } => {
+                unreachable!("managed dispatch refuses managed-only verbs without context")
             }
         },
         Command::Graphs { command } => match command {

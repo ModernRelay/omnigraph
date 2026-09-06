@@ -1,0 +1,42 @@
+# issue: 567
+# red_on: 2026-09-04, never red on a released tree: guards the contract the probe ladder must keep (a pushed filter admitting fewer rows than `limit` returns exactly those rows, in distance order); the ladder's uncapped rescan on this shape was the whole-index read of the issue.
+# notes: `keep` holds on d02 and d07 only; `limit 5` asks for more than the
+# notes: two matches. The answer is the two matches in distance order, no
+# notes: padding from non-matching rows, no error. Rust twin:
+# notes: issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k
+# notes: (tests/search.rs).
+
+--- schema
+node Doc {
+    slug: String @key
+    keep: Bool @index
+    embedding: Vector(4) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d00","keep":false,"embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d01","keep":false,"embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d02","keep":true,"embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d03","keep":false,"embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d04","keep":false,"embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d05","keep":false,"embedding":[5.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d06","keep":false,"embedding":[6.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d07","keep":true,"embedding":[7.0,0.0,0.0,0.0]}}
+
+--- query
+query kept_nearest($q: Vector(4)) {
+    match { $d: Doc { keep: true } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 5
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "d02"}
+{"d.slug": "d07"}
+
+--- expect shape
+d.slug: String

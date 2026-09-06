@@ -92,6 +92,67 @@ pub(crate) fn append_policy_binding_changes(
     changes.sort_by(|a, b| a.resource.cmp(&b.resource));
 }
 
+/// A provenance toggle changes accepted graph schema even when the customer
+/// source is byte-identical. The ledger value is only a projection: compare
+/// explicit intent with fresh engine authority before deciding this is a no-op.
+pub(crate) async fn append_actor_provenance_changes(
+    changes: &mut Vec<PlanChange>,
+    prior_state: Option<&ClusterState>,
+    desired: &DesiredCluster,
+    backend: &ClusterStore,
+    pending_graphs: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(state) = prior_state else {
+        return;
+    };
+    for graph in &desired.graphs {
+        if pending_graphs.contains(&graph.id) {
+            continue;
+        }
+        let Some(enabled) = graph.actor_provenance else {
+            continue;
+        };
+        let address = schema_address(&graph.id);
+        let Some(entry) = state.applied_revision.resources.get(&address) else {
+            continue;
+        };
+        if changes.iter().any(|change| change.resource == address) {
+            continue;
+        }
+        let observed = match Omnigraph::open_read_only(&backend.graph_root(&graph.id)).await {
+            Ok(db) => db.actor_provenance_enabled().await,
+            Err(error) => Err(error),
+        };
+        let observed = match observed {
+            Ok(value) => value,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    "actor_provenance_observation_failed",
+                    &address,
+                    format!("could not read accepted actor provenance: {error}"),
+                ));
+                continue;
+            }
+        };
+        if observed == enabled && entry.actor_provenance == Some(enabled) {
+            continue;
+        }
+        changes.push(PlanChange {
+            resource: address,
+            operation: PlanOperation::Update,
+            before_digest: Some(entry.digest.clone()),
+            after_digest: Some(graph.schema_digest.clone()),
+            disposition: None,
+            reason: None,
+            binding_change: false,
+            metadata_change: Some(PlanMetadataChange::ActorProvenance),
+            migration: None,
+        });
+    }
+    changes.sort_by(|a, b| a.resource.cmp(&b.resource));
+}
+
 /// Metadata-only embedding provider changes: the provider digest is unchanged
 /// but the applied state predates storing the profile body needed by
 /// config-free serving. This mirrors policy binding backfill instead of

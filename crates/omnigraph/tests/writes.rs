@@ -392,6 +392,8 @@ async fn mutation_actor_id_lands_in_commit_graph() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = init_and_load(&dir).await;
+    let before = version_main(&db).await.unwrap();
+    assert_eq!(count_rows(&db, "node:OmniActor").await, 0);
 
     db.mutate_as(
         "main",
@@ -411,6 +413,236 @@ async fn mutation_actor_id_lands_in_commit_graph() {
         .unwrap()
         .unwrap();
     assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
+    assert_eq!(version_main(&db).await.unwrap(), before + 1);
+    let actors = db
+        .query(
+            ReadTarget::branch("main"),
+            "query actors() { match { $a: OmniActor } return { $a.actorId } }",
+            "actors",
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&actors), vec!["act-andrew"]);
+
+    db.mutate_as(
+        "main",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 32)]),
+        Some("act-andrew"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(count_rows(&db, "node:OmniActor").await, 1);
+    assert_eq!(version_main(&db).await.unwrap(), before + 2);
+}
+
+/// A protocol actor participates in the customer's one publication, including
+/// a delete-only statement. No-op and validation failures remain state-neutral.
+#[tokio::test]
+async fn actor_provenance_write_kinds_and_refusals_share_publication_issue_661() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let mut version = version_main(&db).await.unwrap();
+    for name in ["set_age", "remove_person"] {
+        let result = db
+            .mutate_as(
+                "main",
+                MUTATION_QUERIES,
+                name,
+                &mixed_params(&[("$name", "Missing")], &[("$age", 8)]),
+                Some("no-op-actor"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.affected_nodes, 0);
+        assert_eq!(version_main(&db).await.unwrap(), version);
+        assert_eq!(count_rows(&db, "node:OmniActor").await, 0);
+    }
+    let error = db
+        .mutate_as(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person_and_friend",
+            &mixed_params(&[("$name", "Eve"), ("$friend", "Missing")], &[("$age", 22)]),
+            Some("failed-actor"),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not found"));
+    assert_eq!(version_main(&db).await.unwrap(), version);
+    assert_eq!(count_rows(&db, "node:OmniActor").await, 0);
+
+    for (index, name) in ["insert_person", "set_age", "remove_person"]
+        .iter()
+        .enumerate()
+    {
+        let actor = format!("actor-{index}");
+        let result = db
+            .mutate_as(
+                "main",
+                MUTATION_QUERIES,
+                name,
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22 + index as i64)]),
+                Some(&actor),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.affected_nodes, 1);
+        version += 1;
+        assert_eq!(version_main(&db).await.unwrap(), version);
+        assert_eq!(count_rows(&db, "node:OmniActor").await, index + 1);
+    }
+    let recovery = dir.path().join("__recovery");
+    assert!(!recovery.exists() || std::fs::read_dir(recovery).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn actor_provenance_protected_writes_and_invalid_identity_leave_no_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = version_main(&db).await.unwrap();
+    for query in [
+        "query forged() { insert OmniActor { actorId: \"forged\" } }",
+        "query forged() { update OmniActor set { actorId: \"forged\" } where actorId = \"absent\" }",
+        "query forged() { delete OmniActor where actorId = \"absent\" }",
+    ] {
+        let error = db
+            .mutate_as("main", query, "forged", &Default::default(), Some("caller"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("actor_provenance_protected"),
+            "{error}"
+        );
+    }
+    let oversized = "x".repeat(1025);
+    for actor in ["", "actor\nspoof", oversized.as_str()] {
+        let error = db
+            .mutate_as(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+                Some(actor),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("actor_provenance_invalid_identity"),
+            "{error}"
+        );
+    }
+    let legacy = r#"{"type":"OmniActor","data":{"actorId":"forged"}}"#;
+    for mode in [LoadMode::Append, LoadMode::Merge, LoadMode::Overwrite] {
+        let error = db
+            .load_as("main", None, legacy, mode, Some("caller"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("actor_provenance_protected"),
+            "{error}"
+        );
+        let error = db
+            .load_graph_batch_as("main", None, legacy, mode, Some("caller"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("actor_provenance_protected"),
+            "{error}"
+        );
+    }
+    let error = db
+        .load_as(
+            "forged-branch",
+            Some("main"),
+            legacy,
+            LoadMode::Append,
+            Some("caller"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("actor_provenance_protected"),
+        "{error}"
+    );
+    let error = db
+        .load_graph_batch_as(
+            "strict-forged-branch",
+            Some("main"),
+            legacy,
+            LoadMode::Append,
+            Some("caller"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("actor_provenance_protected"),
+        "{error}"
+    );
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
+    assert_eq!(version_main(&db).await.unwrap(), before);
+    assert_eq!(count_rows(&db, "node:OmniActor").await, 0);
+    let recovery = dir.path().join("__recovery");
+    assert!(!recovery.exists() || std::fs::read_dir(recovery).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn actor_provenance_load_modes_preserve_previous_actors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(
+        dir.path().to_str().unwrap(),
+        "node Person { name: String @key }",
+    )
+    .await
+    .unwrap();
+    for (index, mode) in [LoadMode::Append, LoadMode::Merge, LoadMode::Overwrite]
+        .into_iter()
+        .enumerate()
+    {
+        let before = version_main(&db).await.unwrap();
+        let row = format!(r#"{{"type":"Person","data":{{"name":"person-{index}"}}}}"#);
+        let actor = format!("loader-{index}");
+        db.load_as("main", None, &row, mode, Some(&actor))
+            .await
+            .unwrap();
+        assert_eq!(version_main(&db).await.unwrap(), before + 1);
+        assert_eq!(count_rows(&db, "node:OmniActor").await, index + 1);
+    }
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn actor_provenance_concurrent_first_use_has_one_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(init_and_load(&dir).await);
+    let before = version_main(&db).await.unwrap();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(4));
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 0..4 {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            let name = format!("concurrent-{index}");
+            barrier.wait().await;
+            db.mutate_as(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", &name)], &[("$age", 22)]),
+                Some("shared-actor"),
+            )
+            .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        assert_eq!(result.unwrap().unwrap().affected_nodes, 1);
+    }
+    assert_eq!(count_rows(&db, "node:OmniActor").await, 1);
+    assert_eq!(version_main(&db).await.unwrap(), before + 4);
 }
 
 /// Repeated loads must not accumulate `__run__*` branches across calls. In
@@ -923,7 +1155,7 @@ async fn overlapping_delete_predicates_do_not_double_count_affected() {
 }
 
 /// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior
-/// delete predicate referencing a NULLable column must NOT drop a later
+/// delete predicate referencing a nullable column must NOT drop a later
 /// statement's matching row just because that column is NULL (SQL UNKNOWN).
 /// With `NOT (age > 30)`, a row with NULL `age` makes the clause UNKNOWN and the
 /// row is filtered out of `deleted_ids` — skipping its cascade (orphaned edges),
@@ -1801,7 +2033,7 @@ query insert_then_replace_blob(
         .await
         .unwrap();
     assert_eq!(qr.num_rows(), 1);
-    let json = qr.to_sdk_json();
+    let json = qr.to_rust_json().unwrap();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "letter");
     assert_eq!(row["d.note"], "draft 1");

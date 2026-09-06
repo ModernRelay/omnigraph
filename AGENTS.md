@@ -136,6 +136,7 @@ cargo clippy --workspace --all-targets --locked -- \
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
+typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
 ```
 
 S3 suites require `OMNIGRAPH_S3_TEST_BUCKET` and the documented `AWS_*`
@@ -158,7 +159,7 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   process environment, concurrency).
 - Every issue fix lands a regression test at the cheapest tier that catches
   the defect: a `.gqt` logic test when the defect is visible in rows, counts,
-  or errors, a `_issue_NNN` Rust test when it needs mechanism or scale
+  result column types, or errors, a `_issue_NNN` Rust test when it needs mechanism or scale
   assertions; when the reported symptom additionally needs scale to
   manifest, a second `#[ignore]`d test in a `tests/repro_issue_*.rs` target
   guards it, and the two cross-reference each other in comments.

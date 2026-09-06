@@ -44,7 +44,8 @@ use lance_core::{
     },
 };
 use lance_datafusion::exec::{
-    ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions, collect_execution_metrics,
+    ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
+    collect_execution_metrics,
 };
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
@@ -171,6 +172,27 @@ impl ScanTuning<'_> {
 
     pub(crate) fn maximum_nprobes(&mut self, n: usize) -> &mut Self {
         self.scanner.maximum_nprobes(n);
+        self
+    }
+
+    /// Whether the `nearest` set on this scanner may use a vector index
+    /// (Lance 11 `Scanner::use_index`; `false` runs the flat exact kNN over
+    /// the rows the filter admits). A no-op before `nearest` is set. A
+    /// scan-input decision, not an ordering one.
+    pub(crate) fn use_index(&mut self, use_index: bool) -> &mut Self {
+        self.scanner.use_index(use_index);
+        self
+    }
+
+    /// Lance calls `callback` once with the plan's execution summary after
+    /// the scan completes (partitions ranked/searched, bytes, IOPS). A
+    /// scan-input observation, not an ordering decision.
+    ///
+    /// INPUT CONTRACT: honored on the unordered `scan_stream_with` path
+    /// only; `execute_bounded_ordered_scan` builds its own plan from the
+    /// scanner and drops the callback.
+    pub(crate) fn scan_stats_callback(&mut self, callback: ExecutionStatsCallback) -> &mut Self {
+        self.scanner.scan_stats_callback(callback);
         self
     }
 

@@ -83,7 +83,7 @@ omnigraph load --data delta.jsonl --from main --branch review --mode merge $GRAP
 ```
 
 - `--mode`: `merge` (upsert by logical entity ID; keyed node IDs derive from their `@key` tuple) · `append` (fails on ID collision) · `overwrite` (destructive, staged). `--from <base>` forks a missing `--branch`; bare `load` needs an existing branch. Works local **and** remote.
-- **Date values**: `mutate --params` takes ISO strings. `load` accepts ISO `Date` strings (recommended) or integer epoch days, and ISO `DateTime` strings.
+- **Date values**: `mutate --params` takes a calendar day (`YYYY-MM-DD`) for `Date` and ISO 8601 for `DateTime`. `load` accepts calendar-day `Date` strings (`YYYY-MM-DD`, recommended) or integer epoch days, and ISO `DateTime` strings or integer epoch milliseconds; a `Date` string carrying a time of day (`2026-04-29T10:00:00Z`) is refused on every path, and any other JSON type for a date fails the load naming the property.
 
 ### Dispatching
 
@@ -105,6 +105,8 @@ The non-obvious facts that bite, then the full grammar:
 - **Variable-hop traversal**: `$p knows{1,3} $f` — bounds are **required to be finite** (`{1,}` is rejected: "unbounded traversal is disabled").
 - **Undirected traversal**: `$p <knows> $f` matches the edge in either direction, deduplicated (a pair connected both ways appears once). Same-endpoint-type edges only (e.g. `Related: Issue -> Issue`) — asymmetric edges are rejected (T22). Composes with bounds (`$p <knows>{1,3} $f`) and `not { }`.
 - **Edge bindings**: an optional `$var:` prefix on the edge word — `$src $w:knows $dst`, undirected `$a $w:<related> $b` — binds the matched edge row, so edge properties work in filters (`$w.confidence = "asserted"`), projections (`return { $w.role }`), aggregates, and ordering. A bound traversal returns one row per edge (parallel edges stay distinct); binding a `{min,max}` multi-hop, rebinding a taken name, or projecting bare `$w` is rejected (T23).
+- **Result columns**: each `return { }` entry is one column, named by its alias or its expression (`$s.slug` → `s.slug`); two entries that would produce one column name are rejected (T25) — alias them apart.
+- **Result JSON spelling**: rows follow Arrow's JSON conventions (the `arrow-json` writer, RFC 0051): a null cell's key is **omitted** from its row; `Date` is `"2026-04-29"`, `DateTime` is `"2026-04-29T08:30:00"` (UTC, no `Z`, `.123` only when non-zero); integers of every width are bare numbers (beyond 2^53 `JSON.parse` rounds them); `F32` prints at 32-bit width (`0.99`); integral floats carry `.0`.
 - **Literals & calls**: `now()`, `date("2026-04-29")`, `datetime("…T00:00:00Z")`, list `[…]`.
 `starts_with`, `contains`, `>=`, `<=`, `!=`, `>`, `<`, `=`
 

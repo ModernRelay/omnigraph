@@ -58,7 +58,22 @@ the same context also rejects any pull request whose own diff adds a
 conflict-marker line in any file type, annotating each offending file and
 line; markers already on the base branch never fail an unrelated pull
 request. There is no exemption; a document that must quote a conflict block
-indents the markers one space.
+indents the markers one space. After the documentation checks, the same
+context runs `typos` (`crate-ci/typos`, pinned by commit) over every tracked
+text file, hidden paths such as `.github/` included; the tool itself skips
+`Cargo.toml` manifests, lock files and binaries. It matches each word against
+a list of known misspellings, not a dictionary: an unknown word never fires,
+and an identifier fires only when one of the words it splits into is on the
+list (a CamelCase fragment or a short abbreviation can be one). A
+flagged token that is correct where it occurs gets one commented line in
+`.typos.toml`: under `[default.extend-words]` when it appears in prose and
+code alike, under `[type.rust.extend-words]` (or `extend-identifiers` for one
+exact identifier) when it exists only in Rust sources, so the same
+misspelling in Markdown still fires; a hyphenated prefix goes in
+`extend-ignore-re`; a generated text file gets an `extend-exclude` glob.
+Every exemption lives in that one file: the job refuses a sibling
+`typos.toml` or `_typos.toml`, and CI ignores a config file in a
+subdirectory (a local run inside that subdirectory would not).
 
 `Graph Vocabulary Guard` remains a required reporting context, but its
 substrate-sized audit steps are currently disabled everywhere (decision of
@@ -130,19 +145,19 @@ every cache key, so the pin is what keeps caches warm across Rust releases.
 The release and publish workflows still build on the floating `stable`
 action and save their caches from the tag ref; they are outside this rule.
 
-The remaining post-merge/tag/manual jobs own contracts that need special infrastructure:
+The remaining jobs own contracts that need special infrastructure. They run after merge, on tags, and by manual dispatch; two of them, the format fence and the AWS feature build, also run on pull requests:
 
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps currently
   disabled; see above).
-- **V5 ↔ V6 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild.
+- **V5 ↔ V6 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every non-documentation pull request, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it as for `Test Workspace`. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
 - **RustFS S3 integration** runs configured engine, server, cluster, CLI, recovery, and deterministic operation-count owners. A configured test that skips is a failure.
 - **Azurite Azure integration** runs only after merge, on tags, or by manual
   dispatch. It exercises configured storage, admission-lease, recovery,
   cluster, server, and CLI owners against a digest-pinned Azurite image, then
   verifies that control objects, Lance data, and the admission object use the
   declared container.
-- **AWS feature** builds and tests `omnigraph-server` with `--features aws`; unlike the others it also runs on every pull request, as a required context.
+- **AWS feature** builds and tests `omnigraph-server` with `--features aws`; it also runs on every pull request, as a required context.
 
 Azure remains a qualification preview. Emulator coverage and the completed
 managed-identity smoke proof do not replace the pending adversarial live-Azure
@@ -191,11 +206,12 @@ python3 scripts/check-workflow-action-pins.py
 python3 scripts/check-release-vocabulary-gates.py
 python3 scripts/check-container-binary-contract.py
 python3 scripts/check-azure-admission-boundary.py
+typos                       # from the repository root; a subdirectory run scans only that subtree
 actionlint .github/workflows/*.yml
 shellcheck scripts/*.sh
 ```
 
-`actionlint` and `shellcheck` are developer tools, not installed by Cargo. Run the applicable subset when a change does not touch their surface.
+`typos` (`cargo install typos-cli --locked --version 1.50.1`, the version `ci.yml` pins; the misspelling list grows per release, so a newer local binary can flag words CI accepts), `actionlint` and `shellcheck` are developer tools, not workspace dependencies. Run the applicable subset when a change does not touch their surface.
 
 ## Release workflows
 

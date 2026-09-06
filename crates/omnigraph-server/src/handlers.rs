@@ -114,9 +114,15 @@ pub(crate) async fn server_graphs_list(
         },
     )?;
 
+    let may_list = |id: &str| {
+        actor
+            .as_ref()
+            .is_none_or(|actor| actor.0.permits_graph_listing(id))
+    };
     let mut graphs: Vec<GraphInfo> = registry
         .list()
         .into_iter()
+        .filter(|handle| may_list(handle.key.graph_id.as_str()))
         .map(|handle| GraphInfo {
             graph_id: handle.key.graph_id.as_str().to_string(),
             uri: handle.uri.clone(),
@@ -125,7 +131,11 @@ pub(crate) async fn server_graphs_list(
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
     Ok(Json(GraphListResponse {
         graphs,
-        quarantined: state.quarantined_graphs(),
+        quarantined: state
+            .quarantined_graphs()
+            .into_iter()
+            .filter(|id| may_list(id))
+            .collect(),
     }))
 }
 
@@ -322,6 +332,11 @@ pub(crate) async fn resolve_graph_handle(
         })?;
     let graph_id = GraphId::try_from(graph_id_str.to_string())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if let Some(actor) = request.extensions_mut().get_mut::<ResolvedActor>() {
+        if !actor.select_graph(&graph_id) {
+            return Err(ApiError::forbidden("credential does not permit this graph"));
+        }
+    }
     let key = GraphKey::cluster(graph_id.clone());
     let handle = match registry.get(&key) {
         RegistryLookup::Ready(handle) => handle,
@@ -389,6 +404,18 @@ pub(crate) fn authorize(
     policy: Option<&PolicyEngine>,
     request: PolicyRequest,
 ) -> std::result::Result<Authz, ApiError> {
+    if let Some(actor) = actor {
+        if !actor.permits_action(request.action) {
+            return Ok(Authz::Denied(
+                "credential does not permit this action".to_string(),
+            ));
+        }
+        if actor.source == AuthSource::SignedData && policy.is_none() {
+            return Ok(Authz::Denied(
+                "signed data credentials require an applied Cedar policy permit".to_string(),
+            ));
+        }
+    }
     let Some(engine) = policy else {
         // No PolicyEngine installed. Three runtime states can reach this:
         //
@@ -560,12 +587,12 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
     security(("bearer_token" = [])),
 )]
 #[deprecated(
-    note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat"
+    note = "use POST /query instead; /read is kept indefinitely with a byte-stable envelope"
 )]
 /// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
 ///
-/// Execute a GQ read query. Behavior is unchanged from prior releases; the
-/// route is kept indefinitely for byte-stable back-compat. New integrations
+/// Execute a GQ read query. The route is kept indefinitely with a byte-stable
+/// envelope; cell spelling follows the JSON writer. New integrations
 /// should target `POST /query`, which has clean field names (`query` /
 /// `name`) and a 400-on-mutation guard. Responses from this route include
 /// `Deprecation: true` and `Link: <query>; rel="successor-version"`
@@ -589,10 +616,11 @@ pub(crate) async fn server_read(
     .await?;
     Ok((
         deprecation_headers("<query>; rel=\"successor-version\""),
-        // `/read` has an indefinite byte-stable response contract. The
-        // canonical `/query` route exposes the additive graph-commit token;
-        // omitting it here preserves the legacy JSON body exactly.
-        Json(api::read_output(selected_name, &target, result, None).into()),
+        Json(
+            api::read_output(selected_name, &target, result, None)
+                .map_err(render_error)?
+                .into(),
+        ),
     ))
 }
 
@@ -636,12 +664,14 @@ pub(crate) async fn server_query(
         true, // /query is read-only; reject mutations
     )
     .await?;
-    Ok(Json(api::read_output(
-        selected_name,
-        &target,
-        result,
-        graph_commit_id,
-    )))
+    Ok(Json(
+        api::read_output(selected_name, &target, result, graph_commit_id).map_err(render_error)?,
+    ))
+}
+
+/// A result the JSON writer refuses to render answers 500 (RFC 0051), never 400.
+fn render_error(err: impl std::fmt::Display) -> ApiError {
+    ApiError::internal(err.to_string())
 }
 
 /// OpenAPI-only marker for an unstructured octet-stream response body.
@@ -1565,12 +1595,9 @@ async fn invoke_stored_query(
             true,
         )
         .await?;
-        Ok(Json(InvokeStoredQueryResponse::Read(api::read_output(
-            selected,
-            &target,
-            result,
-            graph_commit_id,
-        ))))
+        Ok(Json(InvokeStoredQueryResponse::Read(
+            api::read_output(selected, &target, result, graph_commit_id).map_err(render_error)?,
+        )))
     }
 }
 
@@ -1626,17 +1653,18 @@ pub(crate) async fn server_list_queries(
     tag = "schema",
     operation_id = "getSchema",
     responses(
-        (status = 200, description = "Current schema source", body = SchemaOutput),
+        (status = 200, description = "Customer source and accepted effective schema", body = SchemaOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
-/// Read the current schema source.
+/// Read the customer source and accepted effective schema.
 ///
-/// Returns the project's schema as a single string in `.pg` source form.
-/// Useful for clients that want to introspect available types and properties
-/// before constructing GQ queries. Read-only.
+/// `schema_source` preserves the project's `.pg` source. `accepted_schema`
+/// describes all queryable types, including the system-owned OmniActor type
+/// and its stable provenance binding. Both come from one coherent, read-only
+/// accepted schema view; the system type is never appended to customer source.
 pub(crate) async fn server_schema_get(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
@@ -1650,11 +1678,15 @@ pub(crate) async fn server_schema_get(
             target_branch: None,
         },
     )?;
-    let schema_source = {
-        let db = &handle.engine;
-        db.schema_source().to_string()
-    };
-    Ok(Json(SchemaOutput { schema_source }))
+    let (schema_source, accepted_schema) = handle
+        .engine
+        .accepted_schema()
+        .await
+        .map_err(ApiError::from_omni)?;
+    Ok(Json(SchemaOutput {
+        schema_source,
+        accepted_schema: Some(accepted_schema),
+    }))
 }
 
 #[utoipa::path(
@@ -1734,6 +1766,7 @@ pub(crate) async fn server_schema_apply(
             &request.schema_source,
             omnigraph::db::SchemaApplyOptions {
                 allow_data_loss: request.allow_data_loss,
+                actor_provenance: request.actor_provenance,
             },
             actor_id,
             |catalog| {

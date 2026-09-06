@@ -77,4 +77,5 @@ Before merging documentation:
 ```bash
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
+typos   # from the repository root; exemptions in .typos.toml
 ```

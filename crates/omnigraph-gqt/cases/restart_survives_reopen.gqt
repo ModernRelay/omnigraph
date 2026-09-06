@@ -37,3 +37,6 @@ query all_names() {
 {"p.name": "alice"}
 {"p.name": "bob"}
 {"p.name": "carol"}
+
+--- expect shape
+p.name: String

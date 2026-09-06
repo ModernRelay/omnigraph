@@ -1,0 +1,37 @@
+# Known-misspelling check (crate-ci/typos). CI runs it from the repository
+# root, and so must a local run. Every exemption lives in this file, one
+# comment per entry saying why the token is intended where it occurs.
+
+[files]
+ignore-hidden = false # workflows, issue templates and .cargo/ hold prose too
+extend-exclude = [
+  ".git/",
+  ".typos.toml", # names the tokens it exempts
+]
+
+[default]
+# The "mis-" prefix (mis-renamed, mis-estimate); a bare "mis" still fires.
+extend-ignore-re = ['\bmis-\w+']
+
+# Tokens that occur in prose and code alike.
+[default.extend-words]
+AKS = "AKS"                 # Azure Kubernetes Service (RFC 0029 assets)
+BA = "BA"                   # AB/BA measurement-order labels (RFCs 0023, 0031); also the hex fragment of the short commit SHAs 2aab48ba (RFC 0019) and da466ba (vocabulary guard test). Cost: a bare "ba" typed for "by" passes
+fof = "fof"                 # friend-of-friend: pattern variable in test queries and the query reference
+unparseable = "unparseable" # accepted variant; appears in operator-facing error strings and docs
+
+# Tokens that exist only inside Rust sources; the same misspelling in
+# Markdown still fires.
+[type.rust.extend-identifiers]
+write_applyable_state = "write_applyable_state"                 # cluster test helper: state that can be applied
+seed_applyable_state = "seed_applyable_state"                   # same family
+write_cluster_applyable_state = "write_cluster_applyable_state" # CLI test helper, same meaning
+
+[type.rust.extend-words]
+alph = "alph"         # prefix-filter probe value in literal_filters.rs
+celle = "celle"       # matrix cell "e" in server/tests/multi_graph.rs (cella … cellj)
+froms = "froms"       # plural of `from`, paired with `tos`, in the DST edge fixtures
+nmae = "nmae"         # deliberately wrong parameter name (stored_queries.rs, vocabulary guard lib.rs tests)
+pn = "pn"             # external-id prefix ("pn:12345") in a consistency fixture
+propert = "propert"   # deliberate substring assertion on a typecheck error message
+referenc = "referenc" # deliberate substring match on Lance's error text (table_ops.rs, branch_control.rs)

@@ -94,6 +94,20 @@ limit 20
 
 Return expressions include variables, properties, literals, `now()`, earlier
 projection aliases, and the aggregates `count`, `sum`, `avg`, `min`, and `max`.
+`min` and `max` accept a numeric, `String`, `Bool`, `Date`, or `DateTime`
+column and return the column's own type; `Bool` orders `false` before `true`,
+dates and datetimes chronologically. When no row matches, a query whose
+projections are all aggregates returns one row: `count` is 0 and every other
+aggregate is null; a query that also projects a group value returns no rows.
+A bare node variable returns the node as one object: its `id` and every
+property except `Blob` and `Vector` ones, so `return { $p }` gives a column
+`p` holding `{"id": "alice", "name": "alice", "age": 30}`; project a property
+(`$p.name`, `$p.embedding`) for a single field. `count($p)` counts rows; the
+other aggregates take a property, not a bare node binding (`T8`). Each
+projection produces one result column, named by its alias or, without one,
+by its expression (`$p.name` gives `p.name`). Two projections that would
+produce the same column name are refused at compile time (`T25`); give each
+its own alias.
 Search expressions are documented in [Search](../search/index.md).
 
 An explicit order is total and deterministic: OmniGraph adds entity ids as a
@@ -136,6 +150,32 @@ inherited from the source branch and is valid for the branch's first
 conditional mutation.
 
 See [Branches, Commits, and History](../branching/index.md).
+
+## JSON result spelling
+
+JSON `rows` follow Arrow's JSON conventions: OmniGraph writes them with the
+`arrow-json` writer from the result batches and keeps no per-type spelling of
+its own. The spellings a consumer sees:
+
+- A null cell's key is omitted from its row, and from a struct cell; a null
+  element inside a list value stays `null`.
+- `Date` is `"2024-01-01"`; `DateTime` is `"2024-01-01T12:34:56.789"` in UTC
+  with no `Z`, and no fractional part when it is zero.
+- Integers of every width are bare numbers; JavaScript's `JSON.parse` rounds
+  values beyond 2^53.
+- `F32` prints at 32-bit width (`0.99`) and `F64` at 64-bit width; integral
+  floats carry `.0`; magnitudes from 1e10 up or below 1e-5 take exponent form
+  (`1.0e20`, `1.0e-7`); a non-finite computed value is `null`.
+- `Vector(N)` and list properties are JSON arrays.
+
+On input, a `Date` string is a calendar day, `"2024-01-01"`; a string that
+carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is refused as a
+load value, a param, or a `date(...)` literal, and an instant belongs in a
+`DateTime` property.
+
+A `Date` or `DateTime` count outside the range the writer can format is refused
+on load. A read that meets one fails with status 500; the error names the
+column, the result row, and the count, and an `update` of that row repairs it.
 
 ## Linting
 

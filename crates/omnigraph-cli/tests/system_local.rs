@@ -968,7 +968,7 @@ query get_task($slug: String) {
     ));
     assert_eq!(filtered["row_count"], 1);
     assert_eq!(filtered["rows"][0]["t.slug"], "alpha");
-    assert_eq!(filtered["rows"][0]["t.due_at"], "2026-04-01T08:30:00.000Z");
+    assert_eq!(filtered["rows"][0]["t.due_at"], "2026-04-01T08:30:00");
     assert_eq!(
         filtered["rows"][0]["t.tags"],
         serde_json::json!(["launch", "priority"])
@@ -1023,7 +1023,7 @@ query get_task($slug: String) {
     ));
     assert_eq!(gamma["row_count"], 1);
     assert_eq!(gamma["rows"][0]["t.slug"], "gamma");
-    assert_eq!(gamma["rows"][0]["t.due_at"], "2026-04-04T10:45:00.000Z");
+    assert_eq!(gamma["rows"][0]["t.due_at"], "2026-04-04T10:45:00");
     assert_eq!(
         gamma["rows"][0]["t.tags"],
         serde_json::json!(["embed", "released"])

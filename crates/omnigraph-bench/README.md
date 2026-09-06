@@ -106,6 +106,9 @@ measurement protocol and identity vocabulary.
 - Store counts are **logical store calls** made by the engine. They do not
   observe retries, pagination, multipart fan-out, or other physical attempts,
   and therefore are not network-request or cloud-cost measurements.
+- Builder-v2 explicitly disables actor provenance to retain its historical
+  declared schema and table-count cost contract. System-table measurements need
+  a separately versioned fixture recipe.
 - Fixture validation covers the exact schema, empty index inventory, and every
   row on `main`, `bench-source`, and `bench-target`. Its logical-content digest
   is stable across rebuilt Lance ids, timestamps, and encodings; a separate

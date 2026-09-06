@@ -397,6 +397,8 @@ pub(crate) async fn observe_declared_graphs(
                         schema_digest: None,
                         desired_schema_digest: &graph.schema_digest,
                         schema_matches_desired: Some(false),
+                        actor_provenance: None,
+                        desired_actor_provenance: graph.actor_provenance,
                         error: Some("derived graph root is missing"),
                     }),
                 );
@@ -420,10 +422,14 @@ pub(crate) async fn observe_declared_graphs(
 
         match observe_live_graph(&graph_uri).await {
             Ok(observation) => {
-                let schema_matches = observation.schema_digest == graph.schema_digest;
+                let schema_matches = observation.schema_digest == graph.schema_digest
+                    && graph
+                        .actor_provenance
+                        .is_none_or(|enabled| enabled == observation.actor_provenance);
                 state.applied_revision.resources.insert(
                     schema_address.clone(),
                     StateResource {
+                        actor_provenance: Some(observation.actor_provenance),
                         digest: observation.schema_digest.clone(),
                         applies_to: None,
                         embedding_provider: None,
@@ -447,6 +453,7 @@ pub(crate) async fn observe_declared_graphs(
                 state.applied_revision.resources.insert(
                     graph_address.clone(),
                     StateResource {
+                        actor_provenance: None,
                         digest: graph_digest_value,
                         applies_to: None,
                         embedding_provider,
@@ -465,6 +472,8 @@ pub(crate) async fn observe_declared_graphs(
                         schema_digest: Some(observation.schema_digest.as_str()),
                         desired_schema_digest: &graph.schema_digest,
                         schema_matches_desired: Some(schema_matches),
+                        actor_provenance: Some(observation.actor_provenance),
+                        desired_actor_provenance: graph.actor_provenance,
                         error: None,
                     }),
                 );
@@ -477,14 +486,14 @@ pub(crate) async fn observe_declared_graphs(
                         &graph_address,
                         ResourceLifecycleStatus::Drifted,
                         "schema_mismatch",
-                        "live schema digest differs from desired schema digest",
+                        "accepted schema or actor provenance differs from desired configuration",
                     );
                     set_resource_status(
                         state,
                         &schema_address,
                         ResourceLifecycleStatus::Drifted,
                         "schema_mismatch",
-                        "live schema digest differs from desired schema digest",
+                        "accepted schema or actor provenance differs from desired configuration",
                     );
                 }
             }
@@ -501,6 +510,8 @@ pub(crate) async fn observe_declared_graphs(
                         schema_digest: None,
                         desired_schema_digest: &graph.schema_digest,
                         schema_matches_desired: None,
+                        actor_provenance: None,
+                        desired_actor_provenance: graph.actor_provenance,
                         error: Some(error.as_str()),
                     }),
                 );
@@ -529,13 +540,20 @@ pub(crate) async fn observe_declared_graphs(
 pub(crate) async fn preview_schema_migration(
     graph_uri: &str,
     schema_path: &str,
+    actor_provenance: Option<bool>,
 ) -> Result<SchemaMigrationPlan, String> {
     let source = fs::read_to_string(schema_path).map_err(|err| err.to_string())?;
     let db = Omnigraph::open_read_only(graph_uri)
         .await
         .map_err(|err| err.to_string())?;
     let preview = db
-        .preview_schema_apply_with_options(&source, SchemaApplyOptions::default())
+        .preview_schema_apply_with_options(
+            &source,
+            SchemaApplyOptions {
+                actor_provenance,
+                ..SchemaApplyOptions::default()
+            },
+        )
         .await
         .map_err(|err| err.to_string())?;
     Ok(preview.plan)
@@ -544,6 +562,7 @@ pub(crate) async fn preview_schema_migration(
 pub(crate) struct LiveGraphObservation {
     graph_manifest_version: u64,
     schema_digest: String,
+    actor_provenance: bool,
 }
 
 pub(crate) async fn observe_live_graph(graph_uri: &str) -> Result<LiveGraphObservation, String> {
@@ -554,10 +573,14 @@ pub(crate) async fn observe_live_graph(graph_uri: &str) -> Result<LiveGraphObser
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .map_err(|err| err.to_string())?;
-    let schema_source = db.schema_source();
+    let (schema_source, accepted_schema) =
+        db.accepted_schema().await.map_err(|err| err.to_string())?;
     Ok(LiveGraphObservation {
         graph_manifest_version: snapshot.graph_manifest_version(),
         schema_digest: sha256_hex(schema_source.as_bytes()),
+        actor_provenance: accepted_schema
+            .actor_provenance
+            .is_some_and(|binding| binding.enabled),
     })
 }
 
@@ -570,6 +593,8 @@ pub(crate) struct GraphObservationJson<'a> {
     schema_digest: Option<&'a str>,
     desired_schema_digest: &'a str,
     schema_matches_desired: Option<bool>,
+    actor_provenance: Option<bool>,
+    desired_actor_provenance: Option<bool>,
     error: Option<&'a str>,
 }
 
@@ -584,6 +609,8 @@ pub(crate) fn graph_observation_json(observation: GraphObservationJson<'_>) -> s
         "schema_digest": observation.schema_digest,
         "desired_schema_digest": observation.desired_schema_digest,
         "schema_matches_desired": observation.schema_matches_desired,
+        "actor_provenance": observation.actor_provenance,
+        "desired_actor_provenance": observation.desired_actor_provenance,
         "error": observation.error,
     })
 }
@@ -728,7 +755,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         };
 
         let catalog = schema_source.and_then(|source| match parse_schema(&source) {
-            Ok(schema) => match build_catalog(&schema) {
+            Ok(schema) => match provisional_catalog(&schema) {
                 Ok(catalog) => Some(catalog),
                 Err(err) => {
                     diagnostics.push(Diagnostic::error(
@@ -995,6 +1022,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         .keys()
         .map(|graph_id| DesiredGraph {
             id: graph_id.clone(),
+            actor_provenance: raw.graphs[graph_id].actor_provenance,
             schema_digest: graph_schema_digests
                 .get(graph_id)
                 .cloned()
@@ -1024,6 +1052,190 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         diagnostics,
         config_dir,
         config_file,
+    }
+}
+
+// Synchronous validation has no accepted graph to consult. A provisional
+// catalog permits references to the built-in, including a disabled binding
+// retained by an existing graph. Plan/apply recheck against the exact accepted
+// schema preview before any graph or catalog effect. A customer-owned name is
+// never silently adopted as the built-in.
+fn provisional_catalog(
+    schema: &omnigraph_compiler::schema::ast::SchemaFile,
+) -> Result<omnigraph_compiler::catalog::Catalog, String> {
+    use omnigraph_compiler::{
+        ACTOR_TYPE_NAME, SchemaIdentityDomain, build_catalog_from_ir, compile_schema_source_shape,
+        initialize_schema_ir_with_actor_provenance,
+    };
+    let shape = compile_schema_source_shape(schema).map_err(|err| err.to_string())?;
+    if shape.nodes.iter().any(|node| node.name == ACTOR_TYPE_NAME)
+        || shape.edges.iter().any(|edge| edge.name == ACTOR_TYPE_NAME)
+        || shape
+            .interfaces
+            .iter()
+            .any(|interface| interface.name == ACTOR_TYPE_NAME)
+    {
+        return build_catalog(schema).map_err(|err| err.to_string());
+    }
+    let resolution =
+        initialize_schema_ir_with_actor_provenance(SchemaIdentityDomain::new(), &shape, true)
+            .map_err(|err| err.to_string())?;
+    build_catalog_from_ir(&resolution.schema_ir).map_err(|err| err.to_string())
+}
+
+/// Validate query files against the accepted or proposed catalog. Omission
+/// preserves a legacy graph, while disabling a bound graph retains OmniActor;
+/// desired configuration alone cannot distinguish them. An existing missing
+/// graph retains source-only catalog reconciliation without assuming a binding.
+pub(crate) async fn validate_accepted_query_catalogs(
+    desired: &DesiredCluster,
+    backend: &ClusterStore,
+    changes: &[PlanChange],
+    pending_graphs: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for graph in &desired.graphs {
+        // Recovery already prevents this graph and its dependents from moving.
+        // Preserve its owning classification and durable status publication.
+        if pending_graphs.contains(&graph.id) {
+            continue;
+        }
+        let query_resources: Vec<_> = desired.resources.iter().filter(|resource| {
+            matches!(resource_kind(&resource.address), ResourceKind::Query { graph: ref id, .. } if id == &graph.id)
+        }).collect();
+        if query_resources.is_empty() {
+            continue;
+        }
+        let catalog: Result<omnigraph_compiler::catalog::Catalog, String> = async {
+            let schema_resource = desired
+                .resources
+                .iter()
+                .find(|resource| resource.address == schema_address(&graph.id))
+                .ok_or("desired schema resource is absent")?;
+            let source = fs::read_to_string(
+                schema_resource
+                    .path
+                    .as_deref()
+                    .ok_or("schema path is absent")?,
+            )
+            .map_err(|err| err.to_string())?;
+            if sha256_hex(source.as_bytes()) != graph.schema_digest {
+                return Err("schema source changed while validating; re-plan".to_string());
+            }
+            let root = backend.graph_root(&graph.id);
+            if backend
+                .graph_root_exists(&root)
+                .await
+                .map_err(|err| err.to_string())?
+            {
+                let db = Omnigraph::open_read_only(&root)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                let (accepted_source, accepted_schema) =
+                    db.accepted_schema().await.map_err(|err| err.to_string())?;
+                let accepted_actor = accepted_schema
+                    .actor_provenance
+                    .as_ref()
+                    .is_some_and(|binding| binding.enabled);
+                if accepted_source == source
+                    && graph
+                        .actor_provenance
+                        .is_none_or(|enabled| enabled == accepted_actor)
+                {
+                    return omnigraph_compiler::build_catalog_from_ir(&accepted_schema)
+                        .map_err(|err| err.to_string());
+                }
+                let preview = db
+                    .preview_schema_apply_with_options(
+                        &source,
+                        SchemaApplyOptions {
+                            actor_provenance: graph.actor_provenance,
+                            ..SchemaApplyOptions::default()
+                        },
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?;
+                Ok(preview.catalog)
+            } else {
+                use omnigraph_compiler::{
+                    SchemaIdentityDomain, build_catalog_from_ir, compile_schema_source_shape,
+                    initialize_schema_ir_with_actor_provenance,
+                };
+                let schema = parse_schema(&source).map_err(|err| err.to_string())?;
+                let creating_graph = changes.iter().any(|change| {
+                    change.resource == graph_address(&graph.id)
+                        && change.operation == PlanOperation::Create
+                });
+                if !creating_graph {
+                    // Existing control-object-only reconciliation may proceed
+                    // without a live graph. Preserve its source validation,
+                    // but never infer a system binding from an absent root.
+                    return build_catalog(&schema).map_err(|err| err.to_string());
+                }
+                let shape = compile_schema_source_shape(&schema).map_err(|err| err.to_string())?;
+                let resolution = initialize_schema_ir_with_actor_provenance(
+                    SchemaIdentityDomain::new(),
+                    &shape,
+                    graph.actor_provenance.unwrap_or(true),
+                )
+                .map_err(|err| err.to_string())?;
+                build_catalog_from_ir(&resolution.schema_ir).map_err(|err| err.to_string())
+            }
+        }
+        .await;
+        let catalog = match catalog {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                // The existing schema/create executor owns unsupported-plan
+                // refusal and dependent-resource demotion. Keep its terminal
+                // path intact rather than replacing it with an early failure.
+                let schema_work =
+                    changes
+                        .iter()
+                        .any(|change| match resource_kind(&change.resource) {
+                            ResourceKind::Graph(id) => {
+                                id == graph.id && change.operation == PlanOperation::Create
+                            }
+                            ResourceKind::Schema(id) => {
+                                id == graph.id
+                                    && matches!(
+                                        change.operation,
+                                        PlanOperation::Create | PlanOperation::Update
+                                    )
+                            }
+                            _ => false,
+                        });
+                diagnostics.push(if schema_work {
+                    Diagnostic::warning(
+                        "accepted_query_catalog_unavailable",
+                        schema_address(&graph.id),
+                        error,
+                    )
+                } else {
+                    Diagnostic::error(
+                        "accepted_query_catalog_unavailable",
+                        schema_address(&graph.id),
+                        error,
+                    )
+                });
+                continue;
+            }
+        };
+        for resource in query_resources {
+            let ResourceKind::Query { name, .. } = resource_kind(&resource.address) else {
+                unreachable!()
+            };
+            match resource.path.as_deref().map(fs::read_to_string) {
+                Some(Ok(source)) if sha256_hex(source.as_bytes()) == resource.digest => {
+                    validate_query_source(&graph.id, &name, &source, Some(&catalog), diagnostics);
+                }
+                _ => diagnostics.push(Diagnostic::error(
+                    "resource_content_changed",
+                    &resource.address,
+                    "query source changed while validating; re-plan",
+                )),
+            }
+        }
     }
 }
 

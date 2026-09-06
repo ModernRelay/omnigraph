@@ -368,14 +368,30 @@ async fn entity_from_snapshot(
         .open_snapshot_at_table(snapshot, type_key)
         .await?;
     let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
-    let batches = db
+    let mut batches = db
         .storage()
-        .scan(&ds, None, Some(&filter_sql), None)
+        .scan_stream_bounded(
+            &ds,
+            None,
+            Some(&filter_sql),
+            None,
+            true,
+            EXPORT_SCAN_TARGET_ROWS,
+            EXPORT_SCAN_TARGET_BYTES,
+        )
         .await?;
-    let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
-        return Ok(None);
-    };
-    Ok(Some(record_batch_row_to_json(batch, 0)?))
+    while let Some(batch) = batches
+        .try_next()
+        .await
+        .map_err(crate::table_store::TableStore::ordered_scan_error)?
+    {
+        if batch.num_rows() > 0 {
+            let mut image = logical_row_image(ds.dataset(), &batch, 0).await?;
+            image.retain(|_, value| !value.is_null());
+            return Ok(Some(serde_json::Value::Object(image)));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -596,24 +612,23 @@ pub(crate) async fn logical_row_image(
         Some(export_blob_values(source_ds, &row_batch, &[row_id], &blob_properties).await?)
     };
 
-    let mut image = serde_json::Map::new();
-    for field in row_batch
+    let fields = row_batch
         .schema()
         .fields()
         .iter()
         .filter(|field| !is_reserved_storage_system_column(field.name()))
-    {
-        image.insert(
-            field.name().clone(),
-            export_value_for_field(
-                &row_batch,
-                field.name(),
-                0,
-                blob_values
-                    .as_ref()
-                    .and_then(|values| values.get(field.name())),
-            )?,
-        );
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>();
+    let lines = row_json_lines(&row_batch, &fields, blob_values.as_ref(), 0)?;
+    let bytes = json_rows(&lines)
+        .next()
+        .ok_or_else(|| OmniError::manifest_internal("row image rendered no JSON object"))?;
+    let mut image: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)
+        .map_err(|err| {
+            OmniError::manifest_internal(format!("row image did not parse as a JSON object: {err}"))
+        })?;
+    for name in fields {
+        image.entry(name).or_insert(serde_json::Value::Null);
     }
     Ok(image)
 }
@@ -634,32 +649,32 @@ where
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
-        for row in 0..batch.num_rows() {
-            let mut data = serde_json::Map::new();
-            data.insert(
-                "id".to_string(),
-                json_value_from_named_column(batch, "id", row)?,
-            );
-            for field in node_type.arrow_schema.fields().iter().skip(1) {
-                data.insert(
-                    field.name().clone(),
-                    export_value_for_field(
-                        batch,
-                        field.name(),
-                        row,
-                        blob_values.and_then(|values| values.get(field.name())),
-                    )?,
-                );
+        let fields = std::iter::once("id".to_string()).chain(
+            node_type
+                .arrow_schema
+                .fields()
+                .iter()
+                .skip(1)
+                .map(|field| field.name().clone()),
+        );
+        let fields = fields.collect::<Vec<_>>();
+        let mut prefix = b"{\"type\":".to_vec();
+        json_string_into(&mut prefix, type_name)?;
+        prefix.extend_from_slice(b",\"data\":");
+        for rows in render_windows(batch.num_rows()) {
+            let lines = row_json_lines(
+                &batch.slice(rows.start, rows.len()),
+                &fields,
+                blob_values,
+                rows.start,
+            )?;
+            for data in json_rows(&lines) {
+                let mut line = Vec::with_capacity(prefix.len() + data.len() + 2);
+                line.extend_from_slice(&prefix);
+                line.extend_from_slice(data);
+                line.extend_from_slice(b"}\n");
+                emit_export_line(emit, line).await?;
             }
-            emit_export_jsonl_row(
-                emit,
-                table_key,
-                &serde_json::json!({
-                    "type": type_name,
-                    "data": serde_json::Value::Object(data),
-                }),
-            )
-            .await?;
         }
         return Ok(());
     }
@@ -669,36 +684,35 @@ where
             .edge_types
             .get(edge_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;
-        for row in 0..batch.num_rows() {
-            let from = named_string_value(batch, "src", row)?;
-            let to = named_string_value(batch, "dst", row)?;
-            let mut data = serde_json::Map::new();
-            data.insert(
-                "id".to_string(),
-                json_value_from_named_column(batch, "id", row)?,
-            );
-            for field in edge_type.arrow_schema.fields().iter().skip(3) {
-                data.insert(
-                    field.name().clone(),
-                    export_value_for_field(
-                        batch,
-                        field.name(),
-                        row,
-                        blob_values.and_then(|values| values.get(field.name())),
-                    )?,
-                );
+        let fields = std::iter::once("id".to_string()).chain(
+            edge_type
+                .arrow_schema
+                .fields()
+                .iter()
+                .skip(3)
+                .map(|field| field.name().clone()),
+        );
+        let fields = fields.collect::<Vec<_>>();
+        for rows in render_windows(batch.num_rows()) {
+            let lines = row_json_lines(
+                &batch.slice(rows.start, rows.len()),
+                &fields,
+                blob_values,
+                rows.start,
+            )?;
+            for (offset, data) in json_rows(&lines).enumerate() {
+                let row = rows.start + offset;
+                let mut line = b"{\"edge\":".to_vec();
+                json_string_into(&mut line, edge_name)?;
+                line.extend_from_slice(b",\"from\":");
+                json_string_into(&mut line, &named_string_value(batch, "src", row)?)?;
+                line.extend_from_slice(b",\"to\":");
+                json_string_into(&mut line, &named_string_value(batch, "dst", row)?)?;
+                line.extend_from_slice(b",\"data\":");
+                line.extend_from_slice(data);
+                line.extend_from_slice(b"}\n");
+                emit_export_line(emit, line).await?;
             }
-            emit_export_jsonl_row(
-                emit,
-                table_key,
-                &serde_json::json!({
-                    "edge": edge_name,
-                    "from": from,
-                    "to": to,
-                    "data": serde_json::Value::Object(data),
-                }),
-            )
-            .await?;
         }
         return Ok(());
     }
@@ -709,26 +723,100 @@ where
     )))
 }
 
-async fn emit_export_jsonl_row<Emit, EmitFuture>(
-    emit: &mut Emit,
-    table_key: &str,
-    row: &serde_json::Value,
-) -> Result<()>
+fn json_string_into(out: &mut Vec<u8>, value: &str) -> Result<()> {
+    serde_json::to_writer(out, value).map_err(|err| {
+        OmniError::manifest_internal(format!("export string {value:?} did not encode: {err}"))
+    })
+}
+
+async fn emit_export_line<Emit, EmitFuture>(emit: &mut Emit, line: Vec<u8>) -> Result<()>
 where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
     EmitFuture: Future<Output = Result<()>>,
 {
-    let mut encoded = serde_json::to_vec(row).map_err(|err| {
-        OmniError::manifest(format!(
-            "failed to serialize export row for '{}': {}",
-            table_key, err
-        ))
-    })?;
-    encoded.push(b'\n');
-    for chunk in encoded.chunks(EXPORT_CHUNK_MAX_BYTES) {
+    for chunk in line.chunks(EXPORT_CHUNK_MAX_BYTES) {
         emit(chunk.to_vec()).await?;
     }
     Ok(())
+}
+
+/// Rows rendered per writer call on export, so the first line leaves before a
+/// whole scanner batch is rendered.
+const EXPORT_RENDER_ROWS: usize = 256;
+
+fn render_windows(rows: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    (0..rows)
+        .step_by(EXPORT_RENDER_ROWS)
+        .map(move |start| start..(start + EXPORT_RENDER_ROWS).min(rows))
+}
+
+/// `batch` rendered by `QueryResult::to_json_lines` with its columns in `fields`
+/// order; a column named in `blob_values` is emitted from those strings (indexed
+/// from `first_row`) instead of the batch column. Iterate the rows with [`json_rows`].
+fn row_json_lines(
+    batch: &RecordBatch,
+    fields: &[String],
+    blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
+    first_row: usize,
+) -> Result<Vec<u8>> {
+    let source = batch.schema();
+    let mut schema_fields: Vec<Arc<Field>> = Vec::new();
+    let mut columns: Vec<Arc<dyn Array>> = Vec::new();
+    for name in fields {
+        if let Some(values) = blob_values.and_then(|values| values.get(name)) {
+            schema_fields.push(Arc::new(Field::new(name, DataType::Utf8, true)));
+            columns.push(Arc::new(
+                values
+                    .iter()
+                    .skip(first_row)
+                    .take(batch.num_rows())
+                    .map(Option::as_deref)
+                    .collect::<StringArray>(),
+            ));
+            continue;
+        }
+        let (index, _) = source.column_with_name(name).ok_or_else(|| {
+            OmniError::manifest_internal(format!("missing column '{}' in export batch", name))
+        })?;
+        schema_fields.push(source.fields()[index].clone());
+        columns.push(batch.column(index).clone());
+    }
+    let schema = Arc::new(Schema::new(schema_fields));
+    let projected =
+        RecordBatch::try_new(schema.clone(), columns).map_err(OmniError::arrow_internal)?;
+    if let Some(cell) =
+        omnigraph_compiler::json_output::unformattable_date(std::slice::from_ref(&projected))
+    {
+        let id = projected
+            .column_by_name("id")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .filter(|ids| ids.is_valid(cell.row))
+            .map(|ids| ids.value(cell.row).to_string());
+        return Err(OmniError::manifest(match id {
+            Some(id) => format!("entity {id:?}: {cell}"),
+            None => cell.to_string(),
+        }));
+    }
+    let lines = omnigraph_compiler::result::QueryResult::new(schema, vec![projected])
+        .to_json_lines()
+        .map_err(|err| {
+            OmniError::manifest_internal(format!("row did not render as JSON: {err}"))
+        })?;
+    let rendered = json_rows(&lines).count();
+    if rendered != batch.num_rows() {
+        return Err(OmniError::manifest_internal(format!(
+            "rendered {} JSON rows for {} batch rows",
+            rendered,
+            batch.num_rows()
+        )));
+    }
+    Ok(lines)
+}
+
+fn json_rows(lines: &[u8]) -> impl Iterator<Item = &[u8]> {
+    lines
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
 }
 
 async fn export_blob_column_values(
@@ -804,33 +892,6 @@ async fn export_blob_column_values(
     }
 
     Ok(values)
-}
-
-fn export_value_for_field(
-    batch: &RecordBatch,
-    field_name: &str,
-    row: usize,
-    blob_values: Option<&Vec<Option<String>>>,
-) -> Result<serde_json::Value> {
-    if let Some(blob_values) = blob_values {
-        return Ok(blob_values
-            .get(row)
-            .and_then(|value| value.clone())
-            .map(serde_json::Value::String)
-            .unwrap_or(serde_json::Value::Null));
-    }
-    json_value_from_named_column(batch, field_name, row)
-}
-
-fn json_value_from_named_column(
-    batch: &RecordBatch,
-    field_name: &str,
-    row: usize,
-) -> Result<serde_json::Value> {
-    let column = batch.column_by_name(field_name).ok_or_else(|| {
-        OmniError::manifest_internal(format!("missing column '{}' in export batch", field_name))
-    })?;
-    json_value_from_array(column.as_ref(), row)
 }
 
 fn named_string_value(batch: &RecordBatch, field_name: &str, row: usize) -> Result<String> {
