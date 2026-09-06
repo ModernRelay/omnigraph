@@ -3,11 +3,11 @@ rfc: "0049"
 title: "Control-plane seams: observe, readiness witness, bounded shutdown"
 track: maintainer
 status: accepted
-implementation: complete
+implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-06
 discussion: null
 supersedes: []
 superseded_by: []
@@ -120,6 +120,13 @@ from; it is fixed for the life of the process, because the server never
 reloads. The digest and CAS are hashes of configuration bytes: they say
 whether two replicas booted the same revision and nothing else. `/healthz` is
 unchanged: it answers 200 while the process is alive, draining included.
+
+The accepted empty-cluster amendment in [RFC 0005](0005-server-cluster-boot.md)
+permits an actual applied zero-graph revision to report serving with both
+counts zero. Its real digest, positive ledger revision and CAS remain required;
+canonical-root and configured public-trust validation remain internal boot
+checks. This changes no readiness fields or authentication gates and does not
+turn a nonempty, entirely failed graph set into a healthy empty deployment.
 
 ### Bounded shutdown
 
@@ -275,3 +282,5 @@ None that block acceptance. The default grace of 25 seconds matches RFC
 - 2026-09-03: accepted by the maintainer. Implementation follows in two
   PRs, the cluster crate and CLI (observe) and the server (witness and
   bounded shutdown); `implementation` advances with each.
+- 2026-09-06: accepted the zero-graph readiness amendment from RFC 0005;
+  implementation and process HTTP evidence follow without a wire-format change.
