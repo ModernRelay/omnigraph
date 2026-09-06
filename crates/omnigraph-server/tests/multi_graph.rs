@@ -582,6 +582,22 @@ rules:
             queries: stored_query_registry(&[]),
         },
     ];
+    let all_failed = omnigraph_server::open_multi_graph_state(
+        vec![graphs[0].clone()],
+        Vec::new(),
+        Some(&server_policy),
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await;
+    assert!(
+        all_failed
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("no healthy graphs opened"),
+        "a nonempty failed graph set must not become an empty serving revision"
+    );
     let strict_err = match omnigraph_server::open_multi_graph_state(
         graphs.clone(),
         vec![("act-admin".to_string(), "admin-token".to_string())],

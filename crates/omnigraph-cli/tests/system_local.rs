@@ -1810,6 +1810,102 @@ graphs:
     assert!(body.to_string().contains("Ada"), "{body}");
 }
 
+/// An applied empty cluster is a serving revision, not a fabricated default
+/// graph. Exercise both config-directory and config-free process boot.
+#[test]
+fn local_applied_empty_cluster_serves_exact_witness_and_empty_inventory() {
+    use sha2::{Digest, Sha256};
+
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("server.policy.yaml"),
+        "version: 1\ngroups:\n  admins: [act-admin]\nrules:\n  - id: list\n    allow:\n      actors: { group: admins }\n      actions: [graph_list]\n").unwrap();
+    fs::write(temp.path().join("cluster.yaml"),
+        "version: 1\ngraphs: {}\npolicies:\n  server:\n    file: ./server.policy.yaml\n    applies_to: [cluster]\n").unwrap();
+    assert_eq!(cluster_cli(temp.path(), &["import"])["ok"], true);
+    let applied = cluster_cli(temp.path(), &["apply"]);
+    assert_eq!(applied["converged"], true, "{applied}");
+    let state_path = temp.path().join("__cluster/state.json");
+    let bytes = fs::read(&state_path).unwrap();
+    let ledger: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(ledger["state_revision"].as_u64().unwrap() > 0);
+    let state_cas = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let storage_root = std::path::PathBuf::from(format!(
+        "file://{}",
+        fs::canonicalize(temp.path()).unwrap().display()
+    ));
+    // Desired graph contents are not serving authority until applied.
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  future:\n    schema: ./missing.pg\n",
+    )
+    .unwrap();
+    for source in [temp.path(), storage_root.as_path()] {
+        let server = spawn_server_with_cluster_env(
+            source,
+            &[
+                (
+                    "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+                    r#"{"act-admin":"admin-token","act-denied":"denied-token"}"#,
+                ),
+                ("OMNIGRAPH_REQUIRE_ALL_GRAPHS", "true"),
+            ],
+        );
+        let client = Client::new();
+        let ready: Value = client
+            .get(format!("{}/readyz", server.base_url))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(ready["ready"], true, "{ready}");
+        assert_eq!(
+            ready["booted_serving_digest"],
+            ledger["applied_revision"]["config_digest"]
+        );
+        assert_eq!(ready["state_revision"], ledger["state_revision"]);
+        assert_eq!(ready["state_cas"], state_cas);
+        assert_eq!(ready["served_graph_count"], 0);
+        assert_eq!(ready["quarantined_graph_count"], 0);
+        let inventory = format!("{}/graphs", server.base_url);
+        assert_eq!(
+            client.get(&inventory).send().unwrap().status().as_u16(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(&inventory)
+                .bearer_auth("denied-token")
+                .send()
+                .unwrap()
+                .status()
+                .as_u16(),
+            403
+        );
+        let listed: Value = client
+            .get(&inventory)
+            .bearer_auth("admin-token")
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(listed["graphs"], serde_json::json!([]));
+        assert_eq!(listed["quarantined"], serde_json::json!([]));
+        let absent = client
+            .post(format!("{}/graphs/future/query", server.base_url))
+            .bearer_auth("admin-token")
+            .json(&serde_json::json!({"query": "query q() { return { 1 } }"}))
+            .send()
+            .unwrap();
+        assert_eq!(absent.status().as_u16(), 404);
+        assert!(!temp.path().join("graphs").exists());
+        assert_eq!(fs::read(&state_path).unwrap(), bytes);
+    }
+}
+
 // ---- Comprehensive full-cycle cluster e2e (Phases 1-5 composed) ----
 
 /// Run a `cluster` subcommand and return its JSON output. Deliberately does

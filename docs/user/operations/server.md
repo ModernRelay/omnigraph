@@ -33,6 +33,13 @@ The default bind address is `127.0.0.1:8080`. `--require-all-graphs` makes any
 graph startup failure fatal. Without it, an unhealthy graph is quarantined and
 healthy graphs continue to serve.
 
+An applied empty cluster can serve too: `/readyz` reports its actual applied
+digest, ledger revision and CAS with zero served and quarantined graphs.
+Authorized `GET /graphs` returns an empty inventory; graph requests still
+require an existing graph. No default graph is created. Missing or unapplied
+state refuses startup, as does a nonempty cluster whose graphs all fail.
+Authentication, policy and managed data-token root checks still apply.
+
 Applied changes become active after restart. Add or remove graphs with
 `cluster.yaml` and `cluster apply`; there are no runtime graph-create/delete
 routes. An unapplied resource edit does not activate it, although changing or
