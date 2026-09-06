@@ -15,7 +15,7 @@ edge Knows: Doc -> Doc {
 --- seed
 
 --- query
-query sweep($q: Vector(4)) {
+query scenario($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t

@@ -39,7 +39,7 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d019","n":19,"name":"doc-019","embedding":[19.0,0.0,0.0,0.0]}}
 
 --- query
-query sweep($q: Vector(4)) {
+query scenario($q: Vector(4)) {
     match {
         $d: Doc
         not { $d.name starts_with "doc-00" }

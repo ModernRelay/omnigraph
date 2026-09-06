@@ -106,7 +106,7 @@ edge Likes: Doc -> Doc {
 {"edge":"Likes","from":"d055","to":"d056","data":{"id":"l055"}}
 
 --- query
-query sweep($q: Vector(4)) {
+query scenario($q: Vector(4)) {
     match {
         $d: Doc
         $d.n > 15
@@ -128,7 +128,7 @@ query sweep($q: Vector(4)) {
 d.slug: String
 
 --- query
-query sweep($q: Vector(4)) {
+query scenario($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t
@@ -150,7 +150,7 @@ query sweep($q: Vector(4)) {
 d.slug: String
 
 --- query
-query sweep($q: Vector(4)) {
+query scenario($q: Vector(4)) {
     match {
         $d: Doc
         $d.n > 15

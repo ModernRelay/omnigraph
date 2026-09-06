@@ -27,7 +27,7 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d009","n":9,"name":"doc-009","embedding":[9.0,0.0,0.0,0.0]}}
 
 --- query
-query sweep($q: Vector(4)) {
+query scenario($q: Vector(4)) {
     match {
         $d: Doc { n: 7 }
     }

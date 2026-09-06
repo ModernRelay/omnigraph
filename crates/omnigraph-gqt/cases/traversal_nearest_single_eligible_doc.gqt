@@ -39,7 +39,7 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","from":"d015","to":"d016","data":{"id":"e015_0"}}
 
 --- query
-query sweep($q: Vector(4)) {
+query scenario($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t

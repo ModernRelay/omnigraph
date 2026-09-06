@@ -44,7 +44,7 @@ query ins($s: String, $n: I64, $nm: String, $e: Vector(4)) {
 --- expect affected: nodes=1 edges=0
 
 --- query
-query sweep($q: Vector(4)) {
+query scenario($q: Vector(4)) {
     match {
         $d: Doc
     }
@@ -68,7 +68,7 @@ d.slug: String
 --- restart
 
 --- query
-query sweep($q: Vector(4)) {
+query scenario($q: Vector(4)) {
     match {
         $d: Doc
     }

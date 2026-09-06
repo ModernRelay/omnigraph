@@ -33,7 +33,7 @@ query del($s: String) {
 --- expect affected: nodes=1 edges=1
 
 --- query
-query sweep($q: Vector(4)) {
+query scenario($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t
