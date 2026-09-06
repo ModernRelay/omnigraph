@@ -183,4 +183,5 @@ This table is the human index for the canonical RFC corpus.
 | [0054](0054-default-actor-provenance.md) | Default graph actor provenance | maintainer | rejected | removed |
 | [0055](0055-gq-branch-statements.md) | Branch statements in GQ | maintainer | draft | in-progress |
 | [0057](0057-bounded-merge-preparation.md) | Accepted-context reuse and bounded merge preparation | maintainer | accepted | in-progress |
+| [0058](0058-retained-merged-ancestry.md) | Retained merged ancestry | maintainer | draft | not-started |
 | [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |
