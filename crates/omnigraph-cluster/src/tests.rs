@@ -4102,6 +4102,15 @@ async fn serving_snapshot_reads_converged_cluster() {
     let snapshot = read_serving_snapshot(dir.path())
         .await
         .expect("converged cluster must serve");
+    assert_eq!(
+        snapshot.canonical_root,
+        format!("file://{}", fs::canonicalize(dir.path()).unwrap().display())
+    );
+    let direct = read_serving_snapshot_from_storage(&snapshot.canonical_root)
+        .await
+        .unwrap();
+    assert_eq!(direct.canonical_root, snapshot.canonical_root);
+    assert_eq!(direct.state_cas, snapshot.state_cas);
     assert_eq!(snapshot.graphs.len(), 1);
     assert_eq!(snapshot.graphs[0].graph_id, "knowledge");
     assert!(snapshot.graphs[0].root.ends_with("graphs/knowledge.omni"));

@@ -112,11 +112,10 @@ impl IntentApiFixture {
                     "HTTP/1.1 {} Fixture\r\nConnection: close\r\nContent-Type: application/json\r\n",
                     reply.status
                 );
-                if !reply
-                    .headers
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                {
+                if !reply.headers.iter().any(|(name, _)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        || name.eq_ignore_ascii_case("transfer-encoding")
+                }) {
                     response.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
                 }
                 for (name, value) in reply.headers {

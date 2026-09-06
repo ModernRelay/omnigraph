@@ -71,6 +71,17 @@ Servers do not hot-reload. Apply the new revision and restart every server that 
 
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
 
+The optional [offline data-token profile](../rfcs/0053-offline-data-token-verification.md)
+uses immutable public trust loaded before graph open. The Core's serving
+snapshot supplies the canonical storage root from the same resolution as the
+applied revision; the server checks that root against trust without reading a
+managed identity marker. The verifier resolves `principal:<sub>` and retains
+per-graph action ceilings. Graph selection checks the ceiling before registry
+lookup; the common authorization gate checks actions before Cedar, which must
+explicitly permit signed identities even when no static credentials exist.
+Static credential authority remains unchanged. Issuer reachability is outside
+the serving request path.
+
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the
 applied `config_digest` as `booted_serving_digest`, the ledger revision and
 CAS, and how many applied graphs it serves and does not; it answers 503 from

@@ -503,6 +503,28 @@ pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwn
     bearer_token: Option<&str>,
     expected_commit: Option<&str>,
 ) -> Result<T> {
+    remote_json_bounded(
+        client,
+        method,
+        url,
+        body,
+        bearer_token,
+        expected_commit,
+        None,
+    )
+    .await
+}
+
+/// Same typed graph protocol with an optional response limit for managed data access.
+pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    method: Method,
+    url: String,
+    body: Option<Value>,
+    bearer_token: Option<&str>,
+    expected_commit: Option<&str>,
+    response_limit: Option<usize>,
+) -> Result<T> {
     let request = apply_bearer_token(client.request(method, url), bearer_token);
     let request = if let Some(commit_id) = expected_commit {
         request.header(
@@ -517,10 +539,33 @@ pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwn
     } else {
         request
     };
-    let response = request.send().await?;
+    let mut response = request.send().await?;
     let status = response.status();
-    let text = response.text().await?;
+    let text = if let Some(limit) = response_limit {
+        if status.is_redirection() {
+            bail!("managed data redirects are not followed");
+        }
+        if response.content_length().is_some_and(|n| n > limit as u64) {
+            bail!("managed data response exceeds 8 MiB");
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > limit.saturating_sub(bytes.len()) {
+                bail!("managed data response exceeds 8 MiB");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        String::from_utf8(bytes)?
+    } else {
+        response.text().await?
+    };
     if !status.is_success() {
+        let text = match (response_limit, bearer_token) {
+            (Some(_), Some(token)) if !token.is_empty() => {
+                crate::managed::scrub_response_error(text, token)
+            }
+            _ => text,
+        };
         if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
             if error.precondition_failure.is_some() {
                 return Err(PreconditionFailedCli { output: error }.into());
@@ -529,7 +574,13 @@ pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwn
         }
         bail!("server returned {}: {}", status, text);
     }
-    Ok(serde_json::from_str(&text)?)
+    if response_limit.is_some() {
+        // Serde errors can include rejected field values, including a reflected secret.
+        serde_json::from_str(&text)
+            .map_err(|_| color_eyre::eyre::eyre!("invalid managed data response"))
+    } else {
+        Ok(serde_json::from_str(&text)?)
+    }
 }
 
 /// The graph URI a command addresses (RFC-011): the scope-resolved URI string

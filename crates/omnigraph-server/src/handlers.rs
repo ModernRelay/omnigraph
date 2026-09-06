@@ -114,9 +114,15 @@ pub(crate) async fn server_graphs_list(
         },
     )?;
 
+    let may_list = |id: &str| {
+        actor
+            .as_ref()
+            .is_none_or(|actor| actor.0.permits_graph_listing(id))
+    };
     let mut graphs: Vec<GraphInfo> = registry
         .list()
         .into_iter()
+        .filter(|handle| may_list(handle.key.graph_id.as_str()))
         .map(|handle| GraphInfo {
             graph_id: handle.key.graph_id.as_str().to_string(),
             uri: handle.uri.clone(),
@@ -125,7 +131,11 @@ pub(crate) async fn server_graphs_list(
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
     Ok(Json(GraphListResponse {
         graphs,
-        quarantined: state.quarantined_graphs(),
+        quarantined: state
+            .quarantined_graphs()
+            .into_iter()
+            .filter(|id| may_list(id))
+            .collect(),
     }))
 }
 
@@ -322,6 +332,11 @@ pub(crate) async fn resolve_graph_handle(
         })?;
     let graph_id = GraphId::try_from(graph_id_str.to_string())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if let Some(actor) = request.extensions_mut().get_mut::<ResolvedActor>() {
+        if !actor.select_graph(&graph_id) {
+            return Err(ApiError::forbidden("credential does not permit this graph"));
+        }
+    }
     let key = GraphKey::cluster(graph_id.clone());
     let handle = match registry.get(&key) {
         RegistryLookup::Ready(handle) => handle,
@@ -389,6 +404,18 @@ pub(crate) fn authorize(
     policy: Option<&PolicyEngine>,
     request: PolicyRequest,
 ) -> std::result::Result<Authz, ApiError> {
+    if let Some(actor) = actor {
+        if !actor.permits_action(request.action) {
+            return Ok(Authz::Denied(
+                "credential does not permit this action".to_string(),
+            ));
+        }
+        if actor.source == AuthSource::SignedData && policy.is_none() {
+            return Ok(Authz::Denied(
+                "signed data credentials require an applied Cedar policy permit".to_string(),
+            ));
+        }
+    }
     let Some(engine) = policy else {
         // No PolicyEngine installed. Three runtime states can reach this:
         //

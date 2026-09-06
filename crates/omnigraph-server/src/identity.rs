@@ -1,17 +1,7 @@
-//! Identity types for the multi-graph server (MR-668) plus forward-compatible
-//! shapes for the Cloud/OAuth work tracked by MR-956.
-//!
-//! Per decision 13 in the implementation plan: ship the type shapes that
-//! Cloud mode will consume, without committing to any trait shape
-//! (`TokenVerifier` stays draft in MR-956). Every Cluster-mode call site
-//! constructs these types with their Cluster-mode-specific values:
-//!
-//! - `tenant_id: None` (Cloud will set `Some(...)` from the OAuth `org_id` claim)
-//! - `scopes: vec![Scope::Full]` (Cloud will populate from the OAuth `scope` claim)
-//! - `source: AuthSource::Static` (Cloud / OIDC will set `AuthSource::Oidc`)
-//!
-//! The enums use `#[non_exhaustive]` so MR-956 can
-//! add variants without breaking exhaustive matches in callers.
+//! Server-resolved identities for static credentials and RFC 0053 offline
+//! signed data credentials. Both use the cluster registry (`tenant_id: None`).
+//! Signed identities retain exact graph/action grants; the selected graph
+//! narrows those grants before the existing Cedar policy gate.
 
 use std::fmt;
 use std::sync::Arc;
@@ -146,49 +136,46 @@ impl fmt::Display for GraphKey {
     }
 }
 
-/// Authorization scope. Cluster mode: every authenticated actor gets
-/// `Scope::Full`. MR-956 adds OAuth-style scopes via the
-/// dashboard-configured `graph:read`, `graph:write`, `graph:admin`,
-/// `graph:*` set; those become additional variants here.
-///
-/// `#[non_exhaustive]` so MR-956 can extend without breaking matches.
+/// Authorization shape. Static credentials use Cedar without an additional
+/// grant ceiling; signed data credentials retain their exact grants.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum Scope {
-    /// Full access. The Cluster-mode default — every authenticated actor
-    /// has unrestricted access subject to Cedar policy.
+    /// Static credential authority, subject to Cedar policy.
     Full,
+    /// Exact graph/action ceilings are retained in the authenticated claims.
+    DataToken,
 }
 
-/// How the actor was authenticated. Cluster mode: every actor authenticates
-/// via the existing SHA-256 hash compare against a static token set, so
-/// `AuthSource::Static`. MR-956 adds `AuthSource::Oidc` when the
-/// `OidcJwtVerifier` ships.
-///
-/// `#[non_exhaustive]` so MR-956 can extend without breaking matches.
+/// How the server authenticated the actor.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum AuthSource {
     /// Authenticated via the static bearer-token hash table.
     Static,
+    /// RFC 0053 offline signed data credential; no managed-service call.
+    SignedData,
 }
 
 /// Server-resolved actor identity. Replaces the previous
 /// `AuthenticatedActor(Arc<str>)` from `lib.rs`.
 ///
 /// The fields are populated by `authenticate_bearer_token` after a successful
-/// constant-time hash match. **Clients cannot set any of these fields directly**
+/// static hash match or signed credential verification.
+/// **Clients cannot set any of these fields directly**
 /// — this is the MR-731 invariant. See `authorize_request` in `lib.rs` for the
 /// chokepoint that overwrites any client-supplied actor identity.
 ///
-/// Cluster mode constructs this with `tenant_id: None`, `scopes: vec![Scope::Full]`,
-/// `source: AuthSource::Static` via the convenience constructor below.
+/// The static constructor uses `Scope::Full`; the data-token verifier attaches
+/// validated claims and uses `Scope::DataToken`.
 #[derive(Debug, Clone)]
 pub struct ResolvedActor {
     pub actor_id: Arc<str>,
     pub tenant_id: Option<TenantId>,
     pub scopes: Vec<Scope>,
     pub source: AuthSource,
+    pub(crate) data_token: Option<Arc<crate::data_tokens::DataTokenClaims>>,
+    pub(crate) selected_graph: Option<GraphId>,
 }
 
 impl ResolvedActor {
@@ -200,6 +187,8 @@ impl ResolvedActor {
             tenant_id: None,
             scopes: vec![Scope::Full],
             source: AuthSource::Static,
+            data_token: None,
+            selected_graph: None,
         }
     }
 
@@ -207,6 +196,53 @@ impl ResolvedActor {
     /// boundary — Cedar always sees this value as the principal.
     pub fn actor_id_str(&self) -> &str {
         &self.actor_id
+    }
+
+    /// Authenticated signed claims, excluding the original bearer plaintext.
+    pub fn data_claims(&self) -> Option<&crate::data_tokens::DataTokenClaims> {
+        self.data_token.as_deref()
+    }
+
+    pub(crate) fn select_graph(&mut self, graph_id: &GraphId) -> bool {
+        if self.source == AuthSource::Static {
+            return true;
+        }
+        if self.data_token.as_ref().is_some_and(|claims| {
+            claims
+                .grants
+                .iter()
+                .any(|grant| grant.graph_id == *graph_id)
+        }) {
+            self.selected_graph = Some(graph_id.clone());
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn permits_action(&self, action: omnigraph_policy::PolicyAction) -> bool {
+        if self.source == AuthSource::Static {
+            return true;
+        }
+        self.data_token.as_ref().is_some_and(|claims| {
+            claims.grants.iter().any(|grant| {
+                (self.selected_graph.as_ref() == Some(&grant.graph_id)
+                    || (self.selected_graph.is_none()
+                        && action == omnigraph_policy::PolicyAction::GraphList))
+                    && grant.actions.contains(&action)
+            })
+        })
+    }
+
+    pub(crate) fn permits_graph_listing(&self, graph_id: &str) -> bool {
+        self.source == AuthSource::Static
+            || self.data_token.as_ref().is_some_and(|claims| {
+                claims.grants.iter().any(|grant| {
+                    grant.graph_id.as_str() == graph_id
+                        && grant
+                            .actions
+                            .contains(&omnigraph_policy::PolicyAction::GraphList)
+                })
+            })
     }
 }
 

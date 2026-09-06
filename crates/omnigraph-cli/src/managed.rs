@@ -1,5 +1,5 @@
-//! RFC 0052: the Intent API is the only authority on this path. Context is
-//! routing, never a cached ledger, and no error here may dispatch to Core.
+//! Managed control routing (RFC 0052) and offline data credentials (RFC 0053).
+//! Context selects authority, never caches a ledger; errors never fall back to Core.
 
 use crate::cli::{Cli, ClusterCommand, Command, ManagedRunArgs};
 use reqwest::{Client, Method, StatusCode};
@@ -12,6 +12,19 @@ use tokio::time::Instant;
 use url::Url;
 
 mod auth;
+pub(crate) mod data;
+
+/// Managed transports must not render an endpoint's reflected credential.
+pub(crate) fn scrub_response_error(text: String, secret: &str) -> String {
+    let text = if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
+        auth::scrub_value(&mut value, secret);
+        value.to_string()
+    } else {
+        text
+    };
+    // JSON object keys can reflect credentials too; normalization decodes escapes first.
+    text.replace(secret, "[redacted]")
+}
 
 const MAX_CONTEXT: u64 = 16 * 1024;
 const MAX_BODY: usize = 8 * 1024 * 1024;
@@ -455,7 +468,9 @@ fn managed_flags(command: &ClusterCommand) -> bool {
         } => revision.is_some() || opts(managed),
         ClusterCommand::Apply { plan, managed, .. } => plan.is_some() || opts(managed),
         ClusterCommand::Status { run_id, .. } => run_id.is_some(),
-        ClusterCommand::History { .. } | ClusterCommand::Cancel { .. } => true,
+        ClusterCommand::History { .. }
+        | ClusterCommand::Cancel { .. }
+        | ClusterCommand::Token { .. } => true,
         _ => false,
     }
 }
@@ -472,7 +487,8 @@ fn config_and_json(command: &ClusterCommand) -> (&Path, bool) {
         | ClusterCommand::Import { config, json }
         | ClusterCommand::ForceUnlock { config, json, .. }
         | ClusterCommand::History { config, json, .. }
-        | ClusterCommand::Cancel { config, json, .. } => (config, *json),
+        | ClusterCommand::Cancel { config, json, .. }
+        | ClusterCommand::Token { config, json, .. } => (config, *json),
     }
 }
 
@@ -497,6 +513,17 @@ async fn cluster_command(
     context: &Context,
     command: &ClusterCommand,
 ) -> Result<(Value, i32)> {
+    if let ClusterCommand::Token {
+        actions,
+        ttl,
+        clear,
+        ..
+    } = command
+    {
+        return data::token(cli, context, actions.as_deref(), *ttl, *clear)
+            .await
+            .map(|body| (body, 0));
+    }
     reject_scope(cli)?;
     // Reject unsupported verbs and invalid requests before accessing credentials.
     match command {
@@ -526,7 +553,7 @@ async fn cluster_command(
     }
     let api = Api::new(
         context.api.clone(),
-        Some(auth::credential(&auth::OsStore, &context.api)?),
+        Some(auth::credential(&auth::CONTROL_STORE, &context.api)?),
     )?;
     let base = format!("/v1/clusters/{}", context.cluster);
     match command {
@@ -644,7 +671,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
             ..
         } => {
             let result = match reject_scope(cli).and_then(|()| canonical_origin(api)) {
-                Ok(origin) => auth::login(&auth::OsStore, origin).await,
+                Ok(origin) => auth::login(&auth::CONTROL_STORE, origin).await,
                 Err(err) => Err(err),
             };
             Some(Output::from_result(result, *json, 0))
@@ -655,7 +682,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
             ..
         } => {
             let result = match reject_scope(cli).and_then(|()| canonical_origin(api)) {
-                Ok(origin) => auth::logout(&auth::OsStore, origin).await,
+                Ok(origin) => auth::logout(&auth::CONTROL_STORE, origin).await,
                 Err(err) => Err(err),
             };
             Some(Output::from_result(result, *json, 0))
@@ -673,7 +700,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
                 let origin = canonical_origin(api)?;
                 let client = Api::new(
                     origin.clone(),
-                    Some(auth::credential(&auth::OsStore, &origin)?),
+                    Some(auth::credential(&auth::CONTROL_STORE, &origin)?),
                 )?;
                 let body = client
                     .request(
@@ -700,9 +727,9 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
             .await;
             Some(Output::from_result(result, *json, 0))
         }
-        Command::Cluster { command, direct } => {
+        Command::Cluster { command } => {
             let (config, json) = config_and_json(command);
-            let context = if *direct {
+            let context = if cli.direct {
                 Ok(None)
             } else {
                 read_context(config)

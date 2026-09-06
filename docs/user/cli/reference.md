@@ -277,7 +277,7 @@ Status and history reads exit 0 when retrieved successfully. Abandoning a
 saved plan preserves its converged result and exits 0. Managed apply does not
 prompt for an additional approval: the API checks the authenticated caller's
 permissions. `--as`, `--server`, `--profile`, `--graph`, `--store`, and the
-global `--cluster` selector do not apply to managed commands.
+global `--cluster` selector do not apply to these managed cluster operations.
 
 For unattended execution, provide an explicitly scoped automation token and
 its API origin together:
@@ -298,6 +298,12 @@ Without a context, existing direct cluster commands behave as before.
 `--direct` or without a context refuse. Other cluster verbs, including
 `approve`, `observe`, `refresh`, and `force-unlock`, refuse when a managed
 context is present. API failures never trigger direct execution.
+
+## Managed data access
+
+Use `cluster token` to cache scoped data authority, then `query` or `mutate`
+with `--graph` from the managed folder. See [managed data access](managed-data.md)
+for permissions, offline behavior, expiry, and local credential clearing.
 
 ## Confirmation rules
 

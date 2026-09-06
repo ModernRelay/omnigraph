@@ -155,6 +155,13 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    let managed_data = match managed::data::client(&cli) {
+        Ok(client) => client,
+        Err(output) => {
+            let code = output.emit()?;
+            std::process::exit(code);
+        }
+    };
     let http_client = build_http_client()?;
     // RFC-010 Slice 1: reject scope-addressing flags a verb can't consume,
     // from one declared flag × capability matrix — before any per-command
@@ -1118,15 +1125,19 @@ async fn main() -> Result<()> {
             format,
             json,
         } => {
-            let client = client::GraphClient::resolve(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                None,
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-            )
-            .await?;
+            let client = if let Some(client) = managed_data {
+                client
+            } else {
+                client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?
+            };
             let params_json = load_params_json(&params)?;
             let target = resolve_read_target(branch, snapshot, None)?;
             let output: ReadOutput = if query.is_some() || query_string.is_some() {
@@ -1165,16 +1176,20 @@ async fn main() -> Result<()> {
             if_commit,
             json,
         } => {
-            let client = client::GraphClient::resolve_with_policy(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                None,
-                cli.as_actor.as_deref(),
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-            )
-            .await?;
+            let client = if let Some(client) = managed_data {
+                client
+            } else {
+                client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?
+            };
             let params_json = load_params_json(&params)?;
             let branch = resolve_branch(branch, None, "main");
             let result: Result<ChangeOutput> = if query.is_some() || query_string.is_some() {
@@ -1662,7 +1677,9 @@ async fn main() -> Result<()> {
                 let output = force_unlock_config_dir(config, lock_id).await;
                 finish_cluster_force_unlock(&output, json)?;
             }
-            ClusterCommand::History { .. } | ClusterCommand::Cancel { .. } => {
+            ClusterCommand::History { .. }
+            | ClusterCommand::Cancel { .. }
+            | ClusterCommand::Token { .. } => {
                 unreachable!("managed dispatch refuses managed-only verbs without context")
             }
         },

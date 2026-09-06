@@ -23,6 +23,246 @@ mod support;
 use support::*;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
+    let tokens = data_tokens::DataTokens::new();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        permit_all_policy_yaml(&[&tokens.actor, "breakglass"]),
+    )
+    .unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("breakglass".into(), "explicit.static.credential".into())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap()
+    .with_data_token_trust(tokens.trust.clone());
+    let app = build_app(state);
+    let read = tokens.token(json!([
+        {"graph_id":"default","actions":["read"]},
+        {"graph_id":"reports","actions":["change"]}
+    ]));
+    let request = || {
+        Request::builder().uri(g("/mutate")).method(Method::POST)
+        .header("authorization",format!("Bearer {read}"))
+        .header("x-actor-id","breakglass")
+        .header("content-type","application/json")
+        .body(Body::from(json!({"query":MUTATION_QUERIES,"name":"insert_person","params":{"name":"Signed","age":28},"branch":"main"}).to_string())).unwrap()
+    };
+    let (status, before) =
+        json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = json_response(&app, request()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "another graph's change grant must not leak"
+    );
+    let (_, after) = json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
+    assert_eq!(after, before, "denial must not publish a commit");
+    let (status, _) = json_response(
+        &app,
+        get_request("/graphs/hidden/snapshot?branch=main", &read),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "no graph existence probe outside the token grant"
+    );
+    let (status, _) = json_response(
+        &app,
+        get_request(&g("/snapshot?branch=main"), "explicit.static.credential"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "explicit static dot credentials still work"
+    );
+    let write = tokens.token(json!([{"graph_id":"default","actions":["read","change"]}]));
+    let mut allowed = request();
+    allowed
+        .headers_mut()
+        .insert("authorization", format!("Bearer {write}").parse().unwrap());
+    let (status, body) = json_response(&app, allowed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["actor_id"], tokens.actor);
+    let (_, commits) = json_response(&app, get_request(&g("/commits?branch=main"), &write)).await;
+    assert_eq!(commits["commits"][0]["actor_id"], tokens.actor);
+    assert_ne!(commits, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route() {
+    let tokens = data_tokens::DataTokens::new();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open_with_bearer_tokens(
+        graph.to_string_lossy().to_string(),
+        vec![("breakglass".into(), "static-token".into())],
+    )
+    .await
+    .unwrap()
+    .with_data_token_trust(tokens.trust.clone());
+    let app = build_app(state);
+    let token = tokens.token(json!([{"graph_id":"default","actions":["read"]}]));
+    let (status, _) = json_response(&app, get_request(&g("/snapshot?branch=main"), &token)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "JWT must not inherit static no-policy read default"
+    );
+    let (status, _) = json_response(
+        &app,
+        get_request(&g("/snapshot?branch=main"), "static-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let policy_path = temp.path().join("other-principal.yaml");
+    fs::write(&policy_path, permit_all_policy_yaml(&["someone-else"])).unwrap();
+    let unknown_actor_app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            Vec::new(),
+            Some(&policy_path),
+        )
+        .await
+        .unwrap()
+        .with_data_token_trust(tokens.trust.clone()),
+    );
+    let (status, _) = json_response(
+        &unknown_actor_app,
+        get_request(&g("/snapshot?branch=main"), &token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a valid token must not enroll its actor in Cedar"
+    );
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap()
+        .with_data_token_trust(tokens.trust);
+    let app = build_app(state);
+    for (method, path) in [
+        (Method::GET, "/snapshot"),
+        (Method::GET, "/blob"),
+        (Method::HEAD, "/blob"),
+        (Method::POST, "/export"),
+        (Method::POST, "/read"),
+        (Method::POST, "/query"),
+        (Method::POST, "/change"),
+        (Method::POST, "/mutate"),
+        (Method::POST, "/mutate/if-graph-commit"),
+        (Method::GET, "/queries"),
+        (Method::POST, "/queries/find_person"),
+        (Method::POST, "/queries/find_person/if-graph-commit"),
+        (Method::GET, "/schema"),
+        (Method::POST, "/schema/apply"),
+        (Method::POST, "/load"),
+        (Method::POST, "/load/ndjson"),
+        (Method::POST, "/ingest"),
+        (Method::GET, "/branches"),
+        (Method::POST, "/branches"),
+        (Method::DELETE, "/branches/feature"),
+        (Method::POST, "/branches/merge"),
+        (Method::GET, "/commits"),
+        (Method::GET, "/commits/unknown"),
+        (Method::GET, "/commits/unknown/changes"),
+        (Method::GET, "/changes"),
+        (Method::POST, "/changes/baseline"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(g(path))
+                    .header("authorization", "Bearer invalid.jwt.signature")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+    for path in ["/graphs", "/graphs/default/snapshot"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "JWT-only boot must require auth"
+        );
+    }
+    let (status, _) = json_response(&app, get_request("/healthz", "invalid")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_merge_cannot_smuggle_source_deletion_through_merge_grant() {
+    let tokens = data_tokens::DataTokens::new();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    drop(db);
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, permit_all_policy_yaml(&[&tokens.actor])).unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            Vec::new(),
+            Some(&policy_path),
+        )
+        .await
+        .unwrap()
+        .with_data_token_trust(tokens.trust.clone()),
+    );
+    let token = tokens.token(json!([{"graph_id":"default","actions":["read","branch_merge"]}]));
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri(g("/branches/merge"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"source":"feature","target":"main","delete_branch":true}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "already_up_to_date");
+    assert_eq!(body["branch_deleted"], false);
+    assert!(
+        body["branch_delete_error"]
+            .as_str()
+            .unwrap()
+            .contains("credential does not permit")
+    );
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    assert!(
+        db.branch_list()
+            .await
+            .unwrap()
+            .contains(&"feature".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn healthz_succeeds_after_startup() {
     let (_temp, app) = app_for_loaded_graph().await;
     let (status, body) = json_response(

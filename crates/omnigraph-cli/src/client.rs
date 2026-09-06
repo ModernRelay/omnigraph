@@ -51,8 +51,8 @@ use crate::cli::CliLoadMode;
 use crate::helpers::{
     apply_bearer_token, apply_server_flag, build_blob_http_client, build_http_client,
     is_remote_uri, legacy_change_request_body, precondition_failed_cli, query_params_from_json,
-    remote_json, remote_json_with_graph_commit_precondition, remote_url, resolve_cli_actor,
-    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
+    remote_json, remote_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
+    resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
@@ -68,6 +68,7 @@ pub(crate) enum GraphClient {
         http: reqwest::Client,
         base_url: String,
         token: Option<String>,
+        response_limit: Option<usize>,
     },
 }
 
@@ -112,6 +113,20 @@ fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
 }
 
 impl GraphClient {
+    /// An already validated managed credential never enters legacy scope or token resolution.
+    pub(crate) fn managed(endpoint: &str, graph: &str, token: String) -> Result<Self> {
+        Ok(Self::Remote {
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?,
+            base_url: remote_url(endpoint, &["graphs", graph], &[])?,
+            token: Some(token),
+            response_limit: Some(8 * 1024 * 1024),
+        })
+    }
+
     /// The single owner of registry (`GET /graphs`) addressing: the bare base
     /// URL of `server` (a config name or literal URL) — never `/graphs/<id>`
     /// — with the keyed bearer-token chain. Synchronous: pure config
@@ -124,6 +139,7 @@ impl GraphClient {
             http: build_http_client()?,
             base_url: base,
             token,
+            response_limit: None,
         })
     }
 
@@ -211,6 +227,7 @@ impl GraphClient {
                 http: build_http_client()?,
                 base_url: uri,
                 token,
+                response_limit: None,
             })
         } else {
             Ok(GraphClient::Embedded { uri, actor: None })
@@ -275,6 +292,7 @@ impl GraphClient {
                 http: build_http_client()?,
                 base_url: resolved.uri,
                 token,
+                response_limit: None,
             })
         } else {
             let actor = resolve_cli_actor(cli_as)?;
@@ -310,6 +328,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -335,6 +354,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -363,6 +383,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -388,6 +409,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let url = match branch {
                     Some(branch) => remote_url(base_url, &["commits"], &[("branch", branch)])?,
@@ -414,6 +436,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -446,6 +469,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let limit_value = limit.map(|limit| limit.to_string());
                 let mut query = Vec::new();
@@ -503,6 +527,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let limit_value = limit.map(|limit| limit.to_string());
                 let mut query = Vec::new();
@@ -577,6 +602,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let request = apply_bearer_token(
                     http.request(
@@ -656,6 +682,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let data = std::fs::read_to_string(data)?;
                 let mut query = vec![("branch", branch), ("mode", mode.as_str())];
@@ -726,6 +753,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let data = std::fs::read_to_string(data)?;
                 remote_json(
@@ -778,6 +806,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
             } => {
                 let (url, body) = if expected_head.is_some() {
                     (
@@ -795,13 +824,14 @@ impl GraphClient {
                         legacy_change_request_body(query_source, query_name, branch, params_json),
                     )
                 };
-                remote_json_with_graph_commit_precondition(
+                remote_json_bounded(
                     http,
                     Method::POST,
                     url,
                     Some(body),
                     token.as_deref(),
                     expected_head,
+                    *response_limit,
                 )
                 .await
             }
@@ -858,12 +888,13 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
             } => {
                 let (branch, snapshot) = match &target {
                     ReadTarget::Branch(branch) => (Some(branch.clone()), None),
                     ReadTarget::Snapshot(snapshot) => (None, Some(snapshot.as_str().to_string())),
                 };
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::POST,
                     remote_url(base_url, &["query"], &[])?,
@@ -875,6 +906,8 @@ impl GraphClient {
                         snapshot,
                     })?),
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -916,6 +949,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
             } => {
                 let body = InvokeStoredQueryRequest {
                     params: params_json.cloned(),
@@ -923,7 +957,7 @@ impl GraphClient {
                     snapshot,
                     expect_mutation: Some(expect_mutation),
                 };
-                remote_json_with_graph_commit_precondition(
+                remote_json_bounded(
                     http,
                     Method::POST,
                     if expected_head.is_some() {
@@ -934,6 +968,7 @@ impl GraphClient {
                     Some(serde_json::to_value(body)?),
                     token.as_deref(),
                     expected_head,
+                    *response_limit,
                 )
                 .await
             }
@@ -955,6 +990,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -989,6 +1025,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -1026,6 +1063,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -1092,6 +1130,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 // MR-694 PR B: SchemaApplyRequest carries allow_data_loss so
                 // Hard-mode drops are no longer CLI-only; the server's
@@ -1141,6 +1180,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let request = apply_bearer_token(
                     http.request(Method::POST, remote_url(base_url, &["export"], &[])?),
@@ -1350,6 +1390,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,

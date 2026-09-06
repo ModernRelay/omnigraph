@@ -57,6 +57,104 @@ fn assert_no_core_effects(root: &std::path::Path) {
 }
 
 #[test]
+fn managed_data_process_refuses_unsupported_and_conflicting_scope_before_keychain() {
+    let temp = tempdir().unwrap();
+    let api = IntentApiFixture::new(vec![]);
+    write_managed_context(temp.path(), &api.origin);
+    for args in [
+        vec!["query", "q", "--json"],
+        vec![
+            "mutate",
+            "m",
+            "--graph",
+            "knowledge",
+            "--as",
+            "forged",
+            "--json",
+        ],
+        vec![
+            "query",
+            "q",
+            "--graph",
+            "knowledge",
+            "--server",
+            "https://foreign.example",
+            "--json",
+        ],
+        vec!["cluster", "token", "--actions", "read", "--json"],
+        vec![
+            "cluster",
+            "token",
+            "--clear",
+            "--graph",
+            "knowledge",
+            "--json",
+        ],
+    ] {
+        let output = cli().current_dir(temp.path()).args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let problem = parse_stdout_json(&output);
+        assert!(
+            matches!(
+                problem["type"].as_str(),
+                Some("graph_required" | "managed_scope_conflict" | "token_clear_conflict")
+            ),
+            "{problem}"
+        );
+        assert_no_core_effects(temp.path());
+    }
+    for args in [
+        vec!["graphs", "list"],
+        vec!["alias", "legacy-alias"],
+        vec!["snapshot", "--store", "/tmp/managed-must-not-open"],
+    ] {
+        let output = cli().current_dir(temp.path()).args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("managed_command_unsupported"));
+    }
+    assert!(api.requests().is_empty());
+    assert_no_core_effects(temp.path());
+}
+
+#[test]
+fn managed_data_direct_override_uses_only_explicit_legacy_transport() {
+    let temp = tempdir().unwrap();
+    let api = IntentApiFixture::new(vec![]);
+    write_managed_context(temp.path(), &api.origin);
+    fs::write(temp.path().join(".omnigraph/context"), "malformed").unwrap();
+    let data = IntentApiFixture::new(vec![IntentReply::json(
+        200,
+        serde_json::json!({
+            "query_name":"q", "target":{"branch":"main"}, "row_count":1,
+            "columns":["value"], "rows":[{"value":42}], "graph_commit_id":"head-a"
+        }),
+    )]);
+    let output = output_success(
+        cli()
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_BEARER_TOKEN", "explicit-legacy-token")
+            .env("OMNIGRAPH_CONTROL_TOKEN", "never-data")
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args(["query", "q", "--graph", "knowledge", "--server"])
+            .arg(&data.origin)
+            .args(["--json", "--direct"]),
+    );
+    assert_eq!(
+        parse_stdout_json(&output)["rows"],
+        serde_json::json!([{"value":42}])
+    );
+    let requests = data.requests();
+    assert_eq!(requests[0].path, "/graphs/knowledge/queries/q");
+    assert_eq!(
+        requests[0].headers["authorization"],
+        "Bearer explicit-legacy-token"
+    );
+    assert!(api.requests().is_empty());
+    data.assert_complete();
+    assert_no_core_effects(temp.path());
+}
+
+#[test]
 fn managed_use_verifies_access_before_writing_context() {
     let temp = tempdir().unwrap();
     let body = serde_json::json!({"data":{"cluster_id":"managed-test","name":"prod"},
