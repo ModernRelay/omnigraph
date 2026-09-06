@@ -97,9 +97,12 @@ derives each binding's needed columns from the whole query (RETURN, `order {}`,
 every filter, recursing into anti-join inner pipelines), and `execute_node_scan`
 prunes its Lance projection to that demand plus an always-keep set: `id` (join,
 fusion, and tie-break key) and the type's key columns. The verdicts fail open,
-never closed: a bare `$var`, a binding absent from the demand map, and any
-search-target scan keep the full non-blob projection. Expand destination
-hydration and edge-property attach are not yet pruned.
+never closed: a bare `$var` and a binding absent from the demand map keep the
+full non-blob projection. A search-target scan prunes like any other and names
+Lance's ranking column (`_distance` or `_score`) in its projection, so the
+score survives the scan and the vector or text column is read only when
+demanded. Expand destination hydration and edge-property attach are not yet
+pruned.
 
 ## Search and rank
 
@@ -108,6 +111,26 @@ execution concepts. Rank and score remain columns through downstream
 operations; traversal or projection must not silently discard them. RRF
 executes its sources independently against the same graph snapshot and fuses
 their ordered results.
+
+A `nearest` scan carries a probe cap per index delta (`OMNIGRAPH_ANN_NPROBES`,
+default 20). `execute_node_scan` runs a probe ladder: a capped scan short of
+`k` with partitions unread reruns at four times the cap, then uncapped. The
+stop rules (`ladder_step`) end the ladder on every other cause of a short
+scan, read from Lance's execution summary (`partitions_searched` /
+`partitions_ranked`) and from the `_distance = +inf` marker Lance emits when a
+prefilter admits fewer rows than `k`, which triggers one flat exact rescan; a
+missing summary fails closed into one uncapped rescan. Above the scan,
+`execute_query` runs an overfetch loop: a full scan whose result is short of
+`limit` after later operators reruns with `k` times 4, then times 16, seeded
+with the rung that filled the previous pass, then once more exact (`k` = the
+type's row count, no probe cap), so a short answer is never served while
+survivors exist; aggregate returns never overfetch. Before either, `nearest_prefilter_gate` applies the `rrf` gate's
+shape and size fences to a standalone `nearest` constrained by a traversal and
+pushes the eligible ids into the scan as an `id IN (...)` prefilter; an empty
+eligible set proves the answer empty and runs no scan. The `rrf` gate is
+answer-preserving (its set over-approximates the survivors); the nearest gate
+is answer-changing by design (it ranks the eligible entities exactly instead
+of the global window's survivors).
 
 Lance 11 still loses final KNN ordering metadata in one late payload-hydration
 shape, so OmniGraph requests one output partition for the affected nearest

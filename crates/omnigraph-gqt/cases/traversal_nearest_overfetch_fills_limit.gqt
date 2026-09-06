@@ -1,0 +1,68 @@
+# issue: none
+# notes: `$d knows $t` over 20 docs with edges leaving 2, 5, 8, 11: 4 of 20 (20%,
+# notes: still 15% with one fewer) fails the gate's 10% fence, so the scan is
+# notes: unfiltered and the traversal drops rows above it. Limit 3: the first
+# notes: pass (rows 0..2) keeps one source, short; the x4 rerun asks for 12 of
+# notes: the 20 live rows (12 < 20, so a wider rung, not the exact pass) and
+# notes: holds four sources (4 > 3): the loop stops there with d002, d005, d008.
+# notes: Rust twin (probes: one overfetch, no exact pass):
+# notes: issue_567_nearest_gate_falls_back_above_the_ratio.
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64 @index
+    name: String @index
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","n":2,"name":"doc-002","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","n":3,"name":"doc-003","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","n":4,"name":"doc-004","embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d005","n":5,"name":"doc-005","embedding":[5.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d006","n":6,"name":"doc-006","embedding":[6.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d007","n":7,"name":"doc-007","embedding":[7.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d008","n":8,"name":"doc-008","embedding":[8.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d009","n":9,"name":"doc-009","embedding":[9.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d010","n":10,"name":"doc-010","embedding":[10.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d011","n":11,"name":"doc-011","embedding":[11.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d012","n":12,"name":"doc-012","embedding":[12.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d013","n":13,"name":"doc-013","embedding":[13.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d014","n":14,"name":"doc-014","embedding":[14.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d015","n":15,"name":"doc-015","embedding":[15.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d016","n":16,"name":"doc-016","embedding":[16.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d017","n":17,"name":"doc-017","embedding":[17.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d018","n":18,"name":"doc-018","embedding":[18.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d019","n":19,"name":"doc-019","embedding":[19.0,0.0,0.0,0.0]}}
+{"edge":"Knows","from":"d002","to":"d003","data":{"id":"e002_0"}}
+{"edge":"Knows","from":"d005","to":"d006","data":{"id":"e005_0"}}
+{"edge":"Knows","from":"d008","to":"d009","data":{"id":"e008_0"}}
+{"edge":"Knows","from":"d011","to":"d012","data":{"id":"e011_0"}}
+
+--- query
+query sweep($q: Vector(4)) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d002"}
+{"d.slug":"d005"}
+{"d.slug":"d008"}
+
+--- expect shape
+d.slug: String
