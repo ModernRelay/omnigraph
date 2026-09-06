@@ -1434,8 +1434,8 @@ async fn run_query_step(
                 .and_then(|ctx| infer_query_result_schema(&catalog, &step.decl, &ctx))
                 .map_err(|e| fail(format!("result schema inference failed: {e}")))?;
             let drift = schema_drift(&step.decl, &inferred, &result);
-            if let Some(mismatch) = shape_mismatch(&shape.lines, &result, &inferred) {
-                let (message, bless_lines) = match (&drift, bless_shape_lines(&result)) {
+            if let Some(mismatch) = shape_mismatch(&shape.lines, &result, &inferred, &catalog) {
+                let (message, bless_lines) = match (&drift, bless_shape_lines(&result, &catalog)) {
                     (Some(drift), _) => (
                         format!(
                             "{mismatch}\nthe executor disagrees with the compiler's schema, so bless does not rewrite the shape: {drift}"

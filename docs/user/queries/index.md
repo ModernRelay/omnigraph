@@ -99,8 +99,13 @@ column and return the column's own type; `Bool` orders `false` before `true`,
 dates and datetimes chronologically. When no row matches, a query whose
 projections are all aggregates returns one row: `count` is 0 and every other
 aggregate is null; a query that also projects a group value returns no rows.
-Each projection produces one result column, named by its alias or, without
-one, by its expression (`$p.name` gives `p.name`). Two projections that would
+A bare node variable returns the node as one object: its `id` and every
+property except `Blob` and `Vector` ones, so `return { $p }` gives a column
+`p` holding `{"id": "alice", "name": "alice", "age": 30}`; project a property
+(`$p.name`, `$p.embedding`) for a single field. `count($p)` counts rows; the
+other aggregates take a property, not a bare node binding (`T8`). Each
+projection produces one result column, named by its alias or, without one,
+by its expression (`$p.name` gives `p.name`). Two projections that would
 produce the same column name are refused at compile time (`T25`); give each
 its own alias.
 Search expressions are documented in [Search](../search/index.md).

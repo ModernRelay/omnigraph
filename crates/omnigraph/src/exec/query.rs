@@ -677,7 +677,12 @@ async fn execute_query_once(
     )
     .await?;
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
-    let mut result_batch = project_return(&wide_batch, &ir.return_exprs, params)?;
+    let mut result_batch = project_return(
+        &wide_batch,
+        &ir.return_exprs,
+        params,
+        &super::projection::ProjectionContext::for_query(catalog, ir),
+    )?;
 
     // Apply ordering. Search-ordered plans sort on the appended score column
     // (mechanism and contract: `search_score_orderings`). Aggregated
@@ -1457,7 +1462,12 @@ async fn execute_rrf_fusion(
     )?;
 
     // Project directly from fused batch
-    let mut result_batch = project_return(&fused_batch, &ir.return_exprs, params)?;
+    let mut result_batch = project_return(
+        &fused_batch,
+        &ir.return_exprs,
+        params,
+        &super::projection::ProjectionContext::for_query(catalog, ir),
+    )?;
     // `rrf.limit` is the query's row limit. A winning entity can now own more
     // than one row after traversal, so enforce the limit after reconstruction.
     let len = result_batch.num_rows().min(rrf.limit);

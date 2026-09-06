@@ -83,7 +83,7 @@ omnigraph load --data delta.jsonl --from main --branch review --mode merge $GRAP
 ```
 
 - `--mode`: `merge` (upsert by logical entity ID; keyed node IDs derive from their `@key` tuple) · `append` (fails on ID collision) · `overwrite` (destructive, staged). `--from <base>` forks a missing `--branch`; bare `load` needs an existing branch. Works local **and** remote.
-- **Date values**: `mutate --params` takes ISO strings. `load` accepts ISO `Date` strings (recommended) or integer epoch days, and ISO `DateTime` strings.
+- **Date values**: `mutate --params` takes ISO strings. `load` accepts ISO `Date` strings (recommended) or integer epoch days, and ISO `DateTime` strings or integer epoch milliseconds; any other JSON type for a date fails the load naming the property.
 
 ### Dispatching
 
