@@ -14,47 +14,103 @@ use tower::ServiceExt;
 mod support;
 use support::*;
 
-#[tokio::test]
-async fn data_trust_root_mismatch_refuses_before_recovery_open() {
-    use omnigraph_server::queries::QueryRegistry;
+/// External consumers may construct and exhaustively destructure the legacy
+/// public settings and identity records without opting into managed trust.
+#[test]
+fn legacy_public_struct_literals_and_destructuring_compile() {
+    use omnigraph_cluster::ServingSnapshot;
     use omnigraph_server::{
-        BootWitness, DEFAULT_SHUTDOWN_GRACE, GraphStartupConfig, ServerConfig, ServerConfigMode,
+        AuthSource, BootWitness, DEFAULT_SHUTDOWN_GRACE, ResolvedActor, Scope, ServerConfig,
+        ServerConfigMode,
     };
 
+    let ServerConfig {
+        mode,
+        bind,
+        allow_unauthenticated,
+        require_all_graphs,
+        witness,
+        shutdown_grace,
+    } = ServerConfig {
+        mode: ServerConfigMode::Multi {
+            graphs: vec![],
+            config_path: "cluster".into(),
+            server_policy: None,
+        },
+        bind: "127.0.0.1:0".into(),
+        allow_unauthenticated: true,
+        require_all_graphs: false,
+        witness: BootWitness::default(),
+        shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+    };
+    assert!(matches!(mode, ServerConfigMode::Multi { .. }));
+    assert_eq!(bind, "127.0.0.1:0");
+    assert!(allow_unauthenticated && !require_all_graphs);
+    assert!(witness.applied_graphs.is_empty());
+    assert_eq!(shutdown_grace, DEFAULT_SHUTDOWN_GRACE);
+
+    let ServingSnapshot {
+        graphs,
+        queries,
+        policies,
+        diagnostics,
+        config_digest,
+        state_revision,
+        state_cas,
+        applied_graphs,
+        quarantined_graphs,
+    } = ServingSnapshot {
+        graphs: vec![],
+        queries: vec![],
+        policies: vec![],
+        diagnostics: vec![],
+        config_digest: None,
+        state_revision: 0,
+        state_cas: None,
+        applied_graphs: vec![],
+        quarantined_graphs: vec![],
+    };
+    assert!(graphs.is_empty() && queries.is_empty() && policies.is_empty());
+    assert!(diagnostics.is_empty() && config_digest.is_none() && state_cas.is_none());
+    assert_eq!(state_revision, 0);
+    assert!(applied_graphs.is_empty() && quarantined_graphs.is_empty());
+
+    let ResolvedActor {
+        actor_id,
+        tenant_id,
+        scopes,
+        source,
+    } = ResolvedActor {
+        actor_id: "legacy-actor".into(),
+        tenant_id: None,
+        scopes: vec![Scope::Full],
+        source: AuthSource::Static,
+    };
+    assert_eq!(&*actor_id, "legacy-actor");
+    assert!(tenant_id.is_none());
+    assert_eq!(scopes, vec![Scope::Full]);
+    assert_eq!(source, AuthSource::Static);
+}
+
+#[tokio::test]
+async fn data_trust_root_mismatch_refuses_before_recovery_open() {
     let tokens = data_tokens::DataTokens::new();
-    let temp = tempfile::tempdir().unwrap();
-    let graph = temp.path().join("graph.omni");
-    let schema = fs::read_to_string(fixture("test.pg")).unwrap();
-    Omnigraph::init(graph.to_str().unwrap(), &schema)
-        .await
-        .unwrap();
+    let temp = converged_cluster_dir("").await;
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
     // A read-write engine open normally cleans matching no-op schema staging.
     // Wrong public trust must refuse before even that recovery effect.
     let staging = graph.join("_schema.pg.staging");
     fs::write(&staging, &schema).unwrap();
     let trust_path = temp.path().join("trust.json");
     fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
-    let result = omnigraph_server::serve(ServerConfig {
-        mode: ServerConfigMode::Multi {
-            graphs: vec![GraphStartupConfig {
-                graph_id: "graph-a".into(),
-                uri: graph.to_str().unwrap().into(),
-                policy: None,
-                embedding: None,
-                external_blob_policy: Default::default(),
-                queries: QueryRegistry::default(),
-            }],
-            config_path: temp.path().into(),
-            server_policy: None,
-        },
-        bind: "127.0.0.1:0".into(),
-        canonical_root: "file:///another-root".into(),
-        data_token_trust: Some(trust_path),
-        allow_unauthenticated: true,
-        require_all_graphs: true,
-        witness: BootWitness::default(),
-        shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
-    })
+    let result = omnigraph_server::load_server_settings_with_data_token_trust(
+        Some(&temp.path().to_path_buf()),
+        Some("127.0.0.1:0".into()),
+        true,
+        true,
+        &trust_path,
+    )
     .await;
     assert!(
         result
@@ -65,6 +121,81 @@ async fn data_trust_root_mismatch_refuses_before_recovery_open() {
     assert!(
         staging.exists(),
         "invalid trust must not open the graph for recovery"
+    );
+}
+
+#[tokio::test]
+async fn managed_settings_bind_the_applied_store_not_the_config_directory() {
+    let mut tokens = data_tokens::DataTokens::new();
+    let store = converged_cluster_dir("").await;
+    let config = tempfile::tempdir().unwrap();
+    let canonical_root = format!(
+        "file://{}",
+        fs::canonicalize(store.path()).unwrap().display()
+    );
+    fs::write(
+        config.path().join("cluster.yaml"),
+        format!("version: 1\nstorage: {canonical_root}\n"),
+    )
+    .unwrap();
+    let config_path = config.path().to_path_buf();
+    let trust_path = config.path().join("trust.json");
+    tokens.document["canonical_root"] = serde_json::json!(format!(
+        "file://{}",
+        fs::canonicalize(config.path()).unwrap().display()
+    ));
+    fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+    assert!(
+        omnigraph_server::load_server_settings_with_data_token_trust(
+            Some(&config_path),
+            None,
+            true,
+            false,
+            &trust_path,
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("serving-root binding")
+    );
+
+    tokens.document["canonical_root"] = serde_json::json!(canonical_root);
+    fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+    let managed = omnigraph_server::load_server_settings_with_data_token_trust(
+        Some(&config_path),
+        None,
+        true,
+        false,
+        &trust_path,
+    )
+    .await
+    .unwrap()
+    .with_shutdown_grace(std::time::Duration::from_secs(7));
+    let legacy = cluster_settings(&config_path).await.unwrap();
+    assert_eq!(managed.canonical_root(), canonical_root);
+    assert_eq!(managed.config().witness.state_cas, legacy.witness.state_cas);
+    assert_eq!(managed.config().witness.applied_graphs, vec!["knowledge"]);
+    assert_eq!(
+        managed.config().shutdown_grace,
+        std::time::Duration::from_secs(7)
+    );
+    let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &managed.config().mode;
+    assert_eq!(graphs[0].graph_id, "knowledge");
+    assert!(graphs[0].uri.contains("/graphs/knowledge.omni"));
+
+    let direct = omnigraph_server::load_server_settings_with_data_token_trust(
+        Some(&std::path::PathBuf::from(&canonical_root)),
+        None,
+        true,
+        false,
+        &trust_path,
+    )
+    .await
+    .unwrap();
+    assert_eq!(direct.canonical_root(), canonical_root);
+    assert_eq!(
+        direct.config().witness.state_cas,
+        managed.config().witness.state_cas
     );
 }
 

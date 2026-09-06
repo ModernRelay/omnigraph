@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-09-06
 discussion: https://github.com/ModernRelay/omnigraph/pull/633
 supersedes: []
 superseded_by: []
@@ -158,10 +158,12 @@ unknown request `kid` refuses without fetching anything.
 `canonical_root` is nonempty and at most 4,096 bytes. Issuer and endpoint
 origins are at most 2,048 bytes in addition to their containing object bounds.
 The server compares `canonical_root` with the actual root selected by
-`--cluster`. The Core exposes `ServingSnapshot.canonical_root` from the same
-store and snapshot resolution; it does not reparse configuration or reread
-mutable state for this binding. Local file roots are canonical absolute
-paths encoded as file URIs. A mismatched root refuses before graph engines
+`--cluster`. The Core's opt-in `RootBoundServingSnapshot` exposes the canonical
+root alongside the legacy `ServingSnapshot`, from the same store and snapshot
+resolution; it does not reparse configuration or reread mutable state for this
+binding. Ordinary snapshot reads do not require that extra canonicalization.
+Local file roots are canonical absolute paths encoded as file URIs. A
+mismatched root refuses before graph engines
 open. The server does not read or reinterpret a private managed identity
 marker. The authority supplying trust owns verification of that identity and
 the account/cluster/incarnation binding before deployment. In the managed
@@ -230,16 +232,32 @@ until expiry or trust retirement, and local clearing is not server revocation.
 Automation may use the explicit origin-bound control credential to mint into
 the same keychain; unattended raw-token consumers use the issuance API.
 
-With managed context in the exact current directory, `query` and `mutate`
-require `--graph` and use this cached data endpoint/credential. Other data
-verbs refuse as unsupported in this increment. Missing, malformed, expired,
-or under-scoped credentials never fall through to static credentials, a
-profile, or direct storage. Managed data access rejects explicit `--server`,
-`--profile`, `--store`, `--cluster`, and `--as` and ignores inherited legacy
-profiles and token settings. `--direct` becomes a global explicit override;
-existing `cluster --direct` remains compatible. Without context, legacy data
-commands keep their behavior. Managed requests refuse redirects and have a
-10-second deadline and 8 MiB response bound.
+Only implicitly addressed `query` and `mutate` consult managed context in the
+exact current directory. An explicit `--server`, `--profile`, `--store`, or
+`--cluster` retains ordinary addressing and command-applicability validation,
+without reading that context. Every other graph, storage, alias, or local
+command likewise retains its existing handler. This does not add managed
+transport support to those commands. Global `--direct` bypasses context as
+before, including for cluster commands.
+
+For implicit `query`/`mutate`, absent context leaves ordinary resolution
+unchanged; malformed context refuses. Valid context plus a nonempty
+`OMNIGRAPH_PROFILE` or an operator `defaults.server`/`defaults.store` target
+refuses with `managed_target_ambiguous` before keychain access or requests.
+Even a matching-looking URL is insufficient to equate the two authentication
+paths. Select the intended ordinary target explicitly, use `--direct` for
+ordinary ambient resolution, or clear the competing ambient target to use
+the managed folder. Merely defining profiles, presentation defaults, or a
+direct actor preference does not select a target.
+
+An unambiguous managed request requires explicit `--graph`, rejects explicit
+`--as`, and uses the separately cached data endpoint/credential. Missing,
+malformed, expired, or under-scoped credentials never fall through to static
+credentials, a profile, or direct storage. Legacy token settings never supply
+managed authority. Managed requests refuse redirects and have a 10-second
+deadline and 8 MiB response bound. Cluster control dispatch and token issuance
+retain their existing scope requirements. New named managed connections are
+a separate change.
 
 ## Invariants
 
@@ -259,6 +277,18 @@ trust flag disables signed credentials deliberately. The trust supplier must
 not leave a token-only deployment in unauthenticated mode after rollback.
 No graph storage, ledger, manifest, policy-file, or managed-marker format
 changes. The public API gains authentication semantics, not a new graph route.
+
+The public `ServerConfig`, `ServingSnapshot`, and `ResolvedActor` retain their
+pre-data-token field shapes, including literal construction and exhaustive
+destructuring. Managed embedders use additive root-bound snapshot and server
+boot entry points. `ResolvedActor` is an identity projection; an opaque
+`AuthenticatedActor` retains verified signed claims and the selected graph
+through authorization. The existing verifier's identity-only return remains
+available; server middleware uses its authenticated-result counterpart.
+Constructing a public identity, including a signed-looking scope, cannot
+manufacture authenticated request authority. Callers that adopted the interim
+root/trust fields migrate to the additive managed APIs described in the
+[developer guide](../dev/control-plane.md#public-embedding-apis).
 
 ## Alternatives
 
@@ -331,6 +361,25 @@ None for the bounded wire and authorization contract. Implementation and
 qualification remain separate from acceptance.
 
 ## Decision log
+
+2026-09-06: The compatibility repair restores the three public struct shapes
+and isolates canonical-root validation in opt-in managed boot. This replaces
+the Boot trust sentence naming `ServingSnapshot.canonical_root`; root binding
+still comes from the same opened store and must validate before graph open.
+An opaque authenticated-request value preserves signed authorization ceilings
+while the public actor remains constructible. Existing CLI trust flags and
+wire contracts remain unchanged; the additive APIs replace interim field-based
+embedding without claiming compatibility with both conflicting literal shapes.
+
+2026-09-06: Authorized a bounded compatibility repair independently of the
+broader configuration/CLI proposal. This amendment replaces the CLI paragraph
+that refused other data verbs and explicit ordinary selectors in managed
+folders, and the sentence that ignored inherited profiles. Context now gates
+only implicit query/mutate; competing ambient targets refuse before credential
+access rather than silently selecting either destination. Existing unambiguous
+managed access, offline verification, action grants and no-fallback guarantees
+remain. Implementation and regression evidence for this correction must be
+reported separately from the earlier pilot qualification.
 
 2026-09-05: Recorded the bounded offline verifier before implementation,
 following the existing server policy/action audit. Managed root identity is

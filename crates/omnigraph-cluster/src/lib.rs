@@ -41,9 +41,10 @@ use diff::{
     diff_resources, resource_kind,
 };
 pub use serve::{
-    ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, cluster_graph_ids,
-    cluster_root_for_graph_uri, read_serving_snapshot, read_serving_snapshot_from_storage,
-    resolve_graph_storage_uri,
+    RootBoundServingSnapshot, ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot,
+    cluster_graph_ids, cluster_root_for_graph_uri, read_root_bound_serving_snapshot,
+    read_root_bound_serving_snapshot_from_storage, read_serving_snapshot,
+    read_serving_snapshot_from_storage, resolve_graph_storage_uri,
 };
 use store::ClusterStore;
 use sweep::{

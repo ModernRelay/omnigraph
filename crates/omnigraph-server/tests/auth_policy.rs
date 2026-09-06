@@ -46,10 +46,28 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
         {"graph_id":"default","actions":["read"]},
         {"graph_id":"reports","actions":["change"]}
     ]));
+    let wider = tokens.token(json!([{"graph_id":"default","actions":["change"]}]));
+    let unrelated_authentication = tokens
+        .trust
+        .verify_authenticated_at(
+            &wider,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
     let request = || {
         Request::builder().uri(g("/mutate")).method(Method::POST)
         .header("authorization",format!("Bearer {read}"))
         .header("x-actor-id","breakglass")
+        .extension(omnigraph_server::ResolvedActor {
+            actor_id: "breakglass".into(),
+            tenant_id: None,
+            scopes: vec![omnigraph_server::Scope::Full],
+            source: omnigraph_server::AuthSource::Static,
+        })
+        .extension(unrelated_authentication.clone())
         .header("content-type","application/json")
         .body(Body::from(json!({"query":MUTATION_QUERIES,"name":"insert_person","params":{"name":"Signed","age":28},"branch":"main"}).to_string())).unwrap()
     };
@@ -60,7 +78,7 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "another graph's change grant must not leak"
+        "neither another graph's grant nor a forged public actor may widen signed authority"
     );
     let (_, after) = json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
     assert_eq!(after, before, "denial must not publish a commit");

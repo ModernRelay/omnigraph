@@ -37,8 +37,6 @@ pub struct ServingPolicy {
 /// Everything a server needs to boot from the cluster catalog (RFC-005 §D2).
 #[derive(Debug, Clone)]
 pub struct ServingSnapshot {
-    /// Canonical root of the store used for this snapshot (RFC 0053).
-    pub canonical_root: String,
     pub graphs: Vec<ServingGraph>,
     pub queries: Vec<ServingQuery>,
     pub policies: Vec<ServingPolicy>,
@@ -57,6 +55,32 @@ pub struct ServingSnapshot {
     pub quarantined_graphs: Vec<String>,
 }
 
+/// A serving snapshot paired with the canonical root of the same opened store.
+///
+/// The binding is read-only metadata for managed boot trust, not a writer fence
+/// or a guarantee that the ledger has not changed since this snapshot was read.
+/// Only the root-bound readers can construct this pair.
+#[derive(Debug, Clone)]
+pub struct RootBoundServingSnapshot {
+    snapshot: ServingSnapshot,
+    canonical_root: String,
+}
+
+impl RootBoundServingSnapshot {
+    pub fn snapshot(&self) -> &ServingSnapshot {
+        &self.snapshot
+    }
+
+    pub fn canonical_root(&self) -> &str {
+        &self.canonical_root
+    }
+
+    /// Discard the root binding and return the legacy snapshot projection.
+    pub fn into_snapshot(self) -> ServingSnapshot {
+        self.snapshot
+    }
+}
+
 /// Read the applied revision as a serving snapshot — the read-only loader for
 /// the Phase-5 server boot. Cluster-global readiness failures are still
 /// all-or-nothing, but graph-attributed pending recovery sidecars quarantine
@@ -67,10 +91,14 @@ pub struct ServingSnapshot {
 pub async fn read_serving_snapshot(
     config_dir: impl AsRef<Path>,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
-    let config_dir = config_dir.as_ref().to_path_buf();
+    let backend = store_for_serving_snapshot(config_dir.as_ref())?;
+    read_snapshot_with_store(&backend).await
+}
+
+fn store_for_serving_snapshot(config_dir: &Path) -> Result<ClusterStore, Vec<Diagnostic>> {
     // The declared storage: root decides where the ledger/catalog/graphs
     // live; config parse errors surface through the normal validation path.
-    let parsed = parse_cluster_config(&config_dir);
+    let parsed = parse_cluster_config(config_dir);
     let storage_root = parsed.raw.as_ref().and_then(|raw| {
         raw.storage
             .as_deref()
@@ -83,9 +111,9 @@ pub async fn read_serving_snapshot(
             Ok(backend) => backend,
             Err(diagnostic) => return Err(vec![diagnostic]),
         },
-        None => ClusterStore::for_config_dir(&config_dir),
+        None => ClusterStore::for_config_dir(config_dir),
     };
-    read_snapshot_with_store(backend).await
+    Ok(backend)
 }
 
 /// Read the applied revision directly from a storage root URI — config-free
@@ -98,7 +126,38 @@ pub async fn read_serving_snapshot_from_storage(
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let backend =
         ClusterStore::for_storage_root(storage_root).map_err(|diagnostic| vec![diagnostic])?;
-    read_snapshot_with_store(backend).await
+    read_snapshot_with_store(&backend).await
+}
+
+/// Read an applied snapshot and its canonical store root for managed boot trust.
+/// Ordinary snapshot reads do not perform this extra canonicalization step.
+pub async fn read_root_bound_serving_snapshot(
+    config_dir: impl AsRef<Path>,
+) -> Result<RootBoundServingSnapshot, Vec<Diagnostic>> {
+    let backend = store_for_serving_snapshot(config_dir.as_ref())?;
+    read_root_bound_snapshot_with_store(&backend).await
+}
+
+/// Read a root-bound applied snapshot directly from its storage URI.
+pub async fn read_root_bound_serving_snapshot_from_storage(
+    storage_root: &str,
+) -> Result<RootBoundServingSnapshot, Vec<Diagnostic>> {
+    let backend =
+        ClusterStore::for_storage_root(storage_root).map_err(|diagnostic| vec![diagnostic])?;
+    read_root_bound_snapshot_with_store(&backend).await
+}
+
+async fn read_root_bound_snapshot_with_store(
+    backend: &ClusterStore,
+) -> Result<RootBoundServingSnapshot, Vec<Diagnostic>> {
+    let snapshot = read_snapshot_with_store(backend).await?;
+    let canonical_root = backend
+        .canonical_root()
+        .map_err(|diagnostic| vec![diagnostic])?;
+    Ok(RootBoundServingSnapshot {
+        snapshot,
+        canonical_root,
+    })
 }
 
 /// Cluster root for a graph **storage URI** of the cluster layout
@@ -221,7 +280,7 @@ fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
 }
 
 async fn read_snapshot_with_store(
-    backend: ClusterStore,
+    backend: &ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let mut startup_diagnostics: Vec<Diagnostic> = Vec::new();
@@ -471,7 +530,6 @@ async fn read_snapshot_with_store(
         return Err(diagnostics);
     }
     Ok(ServingSnapshot {
-        canonical_root: backend.canonical_root().map_err(|error| vec![error])?,
         graphs,
         queries,
         policies,

@@ -3,6 +3,7 @@
 //! modularization).
 
 use super::*;
+use std::path::Path;
 
 /// Build serving settings from a cluster directory's applied revision
 /// (RFC-005 §D2): graphs at derived roots, stored queries from verified
@@ -21,28 +22,47 @@ pub(crate) async fn load_cluster_settings(
     // Any supported scheme-qualified argument (s3://, az://, file://) is a storage root; a
     // bare path is a config directory.
     let cluster_arg = cluster_dir.to_string_lossy();
-    let diagnostic_cluster = omnigraph::storage::redacted_storage_uri(cluster_arg.as_ref());
     let snapshot = if cluster_arg.contains("://") {
         omnigraph_cluster::read_serving_snapshot_from_storage(cluster_arg.as_ref()).await
     } else {
         omnigraph_cluster::read_serving_snapshot(cluster_dir).await
     }
-    .map_err(|diagnostics| {
-        let details = diagnostics
-            .iter()
-            .map(|diagnostic| {
-                format!(
-                    "[{}] {}: {}",
-                    diagnostic.code, diagnostic.path, diagnostic.message
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n  ");
-        eyre!(
-            "the cluster at '{}' is not ready to serve:\n  {details}",
-            diagnostic_cluster
-        )
-    })?;
+    .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
+    settings_from_snapshot(
+        cluster_dir,
+        cli_bind,
+        cli_allow_unauthenticated,
+        cli_require_all_graphs,
+        snapshot,
+    )
+}
+
+fn serving_snapshot_error(
+    cluster_dir: &Path,
+    diagnostics: &[omnigraph_cluster::Diagnostic],
+) -> color_eyre::Report {
+    let diagnostic_cluster =
+        omnigraph::storage::redacted_storage_uri(&cluster_dir.to_string_lossy());
+    let details = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            format!(
+                "[{}] {}: {}",
+                diagnostic.code, diagnostic.path, diagnostic.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    eyre!("the cluster at '{diagnostic_cluster}' is not ready to serve:\n  {details}")
+}
+
+fn settings_from_snapshot(
+    cluster_dir: &Path,
+    cli_bind: Option<String>,
+    cli_allow_unauthenticated: bool,
+    cli_require_all_graphs: bool,
+    snapshot: omnigraph_cluster::ServingSnapshot,
+) -> Result<ServerConfig> {
     for diagnostic in &snapshot.diagnostics {
         warn!(
             code = %diagnostic.code,
@@ -203,12 +223,10 @@ pub(crate) async fn load_cluster_settings(
     Ok(ServerConfig {
         mode: ServerConfigMode::Multi {
             graphs,
-            config_path: cluster_dir.clone(),
+            config_path: cluster_dir.to_path_buf(),
             server_policy,
         },
         bind: cli_bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
-        canonical_root: snapshot.canonical_root,
-        data_token_trust: None,
         allow_unauthenticated: cli_allow_unauthenticated || env_unauth,
         require_all_graphs,
         witness,
@@ -228,6 +246,51 @@ pub async fn load_server_settings(
     cli_allow_unauthenticated: bool,
     cli_require_all_graphs: bool,
 ) -> Result<ServerConfig> {
+    let cluster_dir = required_cluster(cli_cluster)?;
+    load_cluster_settings(
+        cluster_dir,
+        cli_bind,
+        cli_allow_unauthenticated,
+        cli_require_all_graphs,
+    )
+    .await
+}
+
+/// Load applied serving settings with explicitly enabled offline data-token
+/// trust. Root metadata and the snapshot come from the same opened Core store;
+/// trust is validated before any graph engine can be opened for recovery.
+pub async fn load_server_settings_with_data_token_trust(
+    cli_cluster: Option<&PathBuf>,
+    cli_bind: Option<String>,
+    cli_allow_unauthenticated: bool,
+    cli_require_all_graphs: bool,
+    trust_path: &Path,
+) -> Result<ManagedServerConfig> {
+    let cluster_dir = required_cluster(cli_cluster)?;
+    let cluster_arg = cluster_dir.to_string_lossy();
+    let bound = if cluster_arg.contains("://") {
+        omnigraph_cluster::read_root_bound_serving_snapshot_from_storage(&cluster_arg).await
+    } else {
+        omnigraph_cluster::read_root_bound_serving_snapshot(cluster_dir).await
+    }
+    .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
+    let canonical_root = bound.canonical_root().to_string();
+    let trust = data_tokens::DataTokenTrust::read(trust_path, &canonical_root)?;
+    let config = settings_from_snapshot(
+        cluster_dir,
+        cli_bind,
+        cli_allow_unauthenticated,
+        cli_require_all_graphs,
+        bound.into_snapshot(),
+    )?;
+    Ok(ManagedServerConfig {
+        config,
+        canonical_root,
+        trust,
+    })
+}
+
+fn required_cluster(cli_cluster: Option<&PathBuf>) -> Result<&PathBuf> {
     let Some(cluster_dir) = cli_cluster else {
         bail!(
             "omnigraph-server boots from a cluster: pass --cluster <dir|s3://…|az://…> \
@@ -236,13 +299,7 @@ pub async fn load_server_settings(
              has been removed."
         );
     };
-    load_cluster_settings(
-        cluster_dir,
-        cli_bind,
-        cli_allow_unauthenticated,
-        cli_require_all_graphs,
-    )
-    .await
+    Ok(cluster_dir)
 }
 
 fn env_flag(name: &str) -> bool {
@@ -409,7 +466,7 @@ mod tests {
     #[test]
     fn authorize_splits_decision_from_operational_error() {
         use super::{
-            Authz, PolicyAction, PolicyCompiler, PolicyConfig, PolicyRequest, ResolvedActor,
+            AuthenticatedActor, Authz, PolicyAction, PolicyCompiler, PolicyConfig, PolicyRequest,
             authorize,
         };
         use std::sync::Arc;
@@ -421,7 +478,7 @@ mod tests {
                 target_branch: None,
             }
         }
-        let actor = ResolvedActor::cluster_static(Arc::from("act-alice"));
+        let actor = AuthenticatedActor::cluster_static(Arc::from("act-alice"));
 
         // --- No policy engine installed (open / default-deny modes) ---
         // A server-scoped action is denied in every no-policy state.
@@ -679,8 +736,6 @@ mod tests {
                 server_policy: Some(crate::PolicySource::File(policy_path)),
             },
             bind: "127.0.0.1:0".to_string(),
-            canonical_root: String::new(),
-            data_token_trust: None,
             allow_unauthenticated: false,
             require_all_graphs: false,
             witness: crate::BootWitness::default(),
@@ -737,8 +792,6 @@ mod tests {
                 server_policy: None,
             },
             bind: "127.0.0.1:0".to_string(),
-            canonical_root: String::new(),
-            data_token_trust: None,
             allow_unauthenticated: false,
             require_all_graphs: false,
             witness: crate::BootWitness::default(),
