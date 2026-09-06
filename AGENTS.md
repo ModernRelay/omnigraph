@@ -74,6 +74,7 @@ authority model.
 | Understand atomic writes and crashes | [Write path](docs/dev/writes.md) and [recovery](docs/dev/recovery.md) |
 | Understand query execution | [Execution](docs/dev/execution.md) |
 | Understand clusters and serving | [Control plane](docs/dev/control-plane.md) |
+| Review configuration and CLI contracts | [Configuration and CLI framework](docs/dev/config-cli-framework.md) |
 | Propose or inspect a decision | [RFC registry](docs/rfcs/README.md) |
 | Write documentation | [Documentation guide](docs/dev/documentation.md) |
 | Review shipped history | [Release notes](docs/releases/) |
