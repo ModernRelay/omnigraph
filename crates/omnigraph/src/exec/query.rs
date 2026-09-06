@@ -68,10 +68,7 @@ impl Omnigraph {
         // the applying handle could pair that new snapshot with the old catalog.
         let (resolved, catalog) = self.capture_read_view(target).await?;
 
-        let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
-            .map_err(|e| OmniError::manifest(e.to_string()))?;
-        let type_ctx = typecheck_query(&catalog, &query_decl)?;
-        let ir = lower_query(&catalog, &query_decl, &type_ctx)?;
+        let ir = self.compile_named_query(&catalog, query_source, query_name)?;
 
         let needs_graph = ir
             .pipeline
@@ -120,10 +117,7 @@ impl Omnigraph {
         // live-target query.
         let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
 
-        let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
-            .map_err(|e| OmniError::manifest(e.to_string()))?;
-        let type_ctx = typecheck_query(&catalog, &query_decl)?;
-        let ir = lower_query(&catalog, &query_decl, &type_ctx)?;
+        let ir = self.compile_named_query(&catalog, query_source, query_name)?;
 
         let needs_graph = ir
             .pipeline
@@ -150,6 +144,29 @@ impl Omnigraph {
             },
         )
         .await
+    }
+
+    /// Compile `query_name` from `query_source` against `catalog`, cached in
+    /// `ReadCaches::compiled_queries`; errors are never cached. INPUT CONTRACT:
+    /// a hit needs the memoized `Arc` from `build_accepted_catalog_with_schema_gate_held`.
+    fn compile_named_query(
+        &self,
+        catalog: &Arc<Catalog>,
+        query_source: &str,
+        query_name: &str,
+    ) -> Result<Arc<QueryIR>> {
+        let cache = &self.read_caches().compiled_queries;
+        let key = crate::runtime_cache::CompiledQueryCache::key_for(query_source, query_name);
+        if let Some(ir) = cache.get(catalog, &key) {
+            return Ok(ir);
+        }
+        let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
+            .map_err(|e| OmniError::manifest(e.to_string()))?;
+        let type_ctx = typecheck_query(catalog, &query_decl)?;
+        let ir = Arc::new(lower_query(catalog, &query_decl, &type_ctx)?);
+        crate::instrumentation::record_query_compile();
+        cache.insert(catalog, key, Arc::clone(&ir));
+        Ok(ir)
     }
 }
 

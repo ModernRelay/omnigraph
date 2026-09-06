@@ -47,7 +47,13 @@ pub struct SchemaIdentityDomain(String);
 
 impl SchemaIdentityDomain {
     pub fn new() -> Self {
-        Self(Ulid::new().to_string())
+        Self::from_ulid(Ulid::new())
+    }
+
+    /// The domain of an already-minted ULID; the engine mints through its
+    /// identity seam.
+    pub fn from_ulid(ulid: Ulid) -> Self {
+        Self(ulid.to_string())
     }
 
     pub fn parse(value: impl AsRef<str>) -> Result<Self> {

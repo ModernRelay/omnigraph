@@ -86,7 +86,13 @@ The executor hoists a filter only when its bindings and operation make the move
 semantically safe. Pushable scalar expressions use structured DataFusion/Lance
 expressions with case-preserved column identities. Search prefilters remain on
 the same scanner as the search operation. Multi-binding or unsupported
-expressions stay in the engine at their lowered position.
+expressions stay in the engine at their lowered position. A scan with a
+SQL-string filter inspects its planned filter for full-text demand (a
+`contains_tokens` call); full-text index coverage
+(`FullTextIndexRebuildRequired`) is checked only when a full-text query or a
+`contains_tokens` demand is present. A scan with no full-text query, no
+SQL-string filter and no `contains_tokens` call in its typed filters skips
+both.
 
 String-built SQL is retained only at explicitly documented compatibility
 seams. The camel-case regression and its two-parser boundary are recorded in

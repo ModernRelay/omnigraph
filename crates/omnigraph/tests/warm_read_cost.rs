@@ -15,8 +15,8 @@ use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_trave
 
 use helpers::cost::{cost_harness, last_manifest_reads, measure};
 use helpers::{
-    MUTATION_QUERIES, TEST_QUERIES, commit_many, count_rows, first_column_sorted, init_and_load,
-    mixed_params, mutate_branch, mutate_main, params,
+    MUTATION_QUERIES, TEST_QUERIES, TEST_SCHEMA, commit_many, count_rows, first_column_sorted,
+    init_and_load, mixed_params, mutate_branch, mutate_main, params,
 };
 
 /// A warm same-branch read must do ZERO `__manifest` object-store reads and must
@@ -1016,5 +1016,156 @@ async fn single_edge_query_builds_only_referenced_edge() {
         graph_edges.load(Ordering::Relaxed),
         1,
         "a query referencing only `knows` must build only that edge, not all catalog edges"
+    );
+}
+
+/// Warm queries over unchanged contract bytes build no catalog and compile each
+/// named query once (the key digests the source); a SchemaApply rewrites the
+/// bytes, so both handles see the added type and the next query rebuilds once.
+#[tokio::test]
+async fn warm_query_memoizes_catalog_and_compiled_query_until_schema_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let reader = Omnigraph::open(uri).await.unwrap();
+    let no_params = params(&[]);
+    let total_people = |probes: QueryIoProbes| {
+        with_query_io_probes(
+            probes,
+            reader.query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "total_people",
+                &no_params,
+            ),
+        )
+    };
+
+    let probes = QueryIoProbes::default();
+    total_people(probes.clone()).await.unwrap();
+    total_people(probes.clone()).await.unwrap();
+    assert_eq!(
+        probes.catalog_builds.load(Ordering::Relaxed),
+        0,
+        "open memoizes the catalog it validated, so unchanged contract bytes build nothing"
+    );
+    assert_eq!(
+        probes.query_compiles.load(Ordering::Relaxed),
+        1,
+        "the same source and name against the same catalog compile once"
+    );
+
+    with_query_io_probes(
+        probes.clone(),
+        reader.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "adults",
+            &no_params,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(probes.catalog_builds.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        probes.query_compiles.load(Ordering::Relaxed),
+        2,
+        "a different named query from the same source is its own compile"
+    );
+    assert_eq!(
+        probes.fts_validations.load(Ordering::Relaxed),
+        0,
+        "a read with a typed filter, no full-text query and no SQL-string filter runs no full-text validation"
+    );
+
+    let limited = "query total_people() { match { $p: Person } return { $p.name } limit 1 }";
+    let names = with_query_io_probes(
+        probes.clone(),
+        reader.query(
+            ReadTarget::branch("main"),
+            limited,
+            "total_people",
+            &no_params,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        probes.query_compiles.load(Ordering::Relaxed),
+        3,
+        "the same query name in a second source is a second compile: the key digests the source"
+    );
+    assert_eq!(names.num_rows(), 1);
+    assert_eq!(
+        names.concat_batches().unwrap().schema().field(0).name(),
+        "p.name",
+        "the second source answers with its own rows"
+    );
+    total_people(probes.clone()).await.unwrap();
+    assert_eq!(
+        probes.query_compiles.load(Ordering::Relaxed),
+        3,
+        "the first source's entry survives the second's"
+    );
+
+    let projects_query = "query projects() { match { $p: Project } return { $p.name } }";
+    let before = writer
+        .query(
+            ReadTarget::branch("main"),
+            projects_query,
+            "projects",
+            &no_params,
+        )
+        .await
+        .expect_err("before apply_schema the catalog has no `Project`");
+    assert!(
+        before.to_string().contains("unknown node type `Project`"),
+        "the refusal is the typecheck's unknown type, got: {before}"
+    );
+
+    let desired = format!("{TEST_SCHEMA}\nnode Project {{\n    name: String @key\n}}\n");
+    writer.apply_schema(&desired).await.unwrap();
+
+    let through_writer = writer
+        .query(
+            ReadTarget::branch("main"),
+            projects_query,
+            "projects",
+            &no_params,
+        )
+        .await
+        .expect("the applying handle answers a query naming the added type");
+    assert_eq!(through_writer.num_rows(), 0, "the new type has no rows yet");
+
+    let probes = QueryIoProbes::default();
+    let projects = with_query_io_probes(
+        probes.clone(),
+        reader.query(
+            ReadTarget::branch("main"),
+            projects_query,
+            "projects",
+            &no_params,
+        ),
+    )
+    .await
+    .expect("the next query after another handle's SchemaApply must see the added type");
+    assert_eq!(projects.num_rows(), 0);
+    assert_eq!(
+        probes.catalog_builds.load(Ordering::Relaxed),
+        1,
+        "rewritten contract bytes miss the memo and rebuild the catalog"
+    );
+    assert_eq!(probes.query_compiles.load(Ordering::Relaxed), 1);
+
+    total_people(probes.clone()).await.unwrap();
+    assert_eq!(
+        probes.catalog_builds.load(Ordering::Relaxed),
+        1,
+        "the rebuilt catalog is memoized in turn"
+    );
+    assert_eq!(
+        probes.query_compiles.load(Ordering::Relaxed),
+        2,
+        "a query cached under the old catalog recompiles under the rebuilt one"
     );
 }

@@ -1,9 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use lance::Dataset;
 use lance::session::Session;
+use omnigraph_compiler::catalog::Catalog;
+use omnigraph_compiler::ir::QueryIR;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::db::{ResolvedTarget, Snapshot};
@@ -425,6 +428,124 @@ impl Default for TableHandleCacheInner {
 pub struct ReadCaches {
     pub session: Arc<Session>,
     pub handles: Arc<TableHandleCache>,
+    /// The accepted catalog built by
+    /// `Omnigraph::build_accepted_catalog_with_schema_gate_held`, memoized on
+    /// the contract's exact bytes.
+    pub accepted_catalog: AcceptedCatalogMemo,
+    /// Named queries compiled against an accepted catalog.
+    pub compiled_queries: CompiledQueryCache,
+}
+
+/// Memo of the last accepted catalog, keyed on the contract's byte-exact text
+/// (`SchemaContractText`), which the caller reads on every call, so a
+/// rewritten contract misses. One entry: a graph has one accepted contract at
+/// a time.
+#[derive(Default)]
+pub struct AcceptedCatalogMemo {
+    inner: std::sync::Mutex<Option<Arc<AcceptedCatalogEntry>>>,
+}
+
+struct AcceptedCatalogEntry {
+    text: crate::db::SchemaContractText,
+    catalog: Arc<Catalog>,
+}
+
+impl AcceptedCatalogMemo {
+    pub(crate) fn get(&self, text: &crate::db::SchemaContractText) -> Option<Arc<Catalog>> {
+        let entry = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        (entry.text == *text).then(|| Arc::clone(&entry.catalog))
+    }
+
+    pub(crate) fn memoize(&self, text: crate::db::SchemaContractText, catalog: Arc<Catalog>) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(AcceptedCatalogEntry { text, catalog }));
+    }
+}
+
+/// Bound on distinct `(query source, query name)` pairs a handle keeps
+/// compiled. Small: a deployment's named queries are a fixed set.
+const COMPILED_QUERY_CACHE_CAP: usize = 256;
+
+/// Named queries compiled against an accepted catalog, keyed on a SHA-256
+/// digest of the source bytes plus the query name (the digest, not the source,
+/// is kept). A hit also needs the entry's `Weak<Catalog>` to upgrade to the
+/// caller's `Arc` (`Arc::ptr_eq`): a rebuilt or dropped catalog never hits.
+pub struct CompiledQueryCache {
+    inner: std::sync::Mutex<LruMap<CompiledQueryKey, CompiledQueryEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CompiledQueryKey {
+    source_digest: [u8; 32],
+    name: String,
+}
+
+struct CompiledQueryEntry {
+    catalog: Weak<Catalog>,
+    ir: Arc<QueryIR>,
+}
+
+impl Default for CompiledQueryCache {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(LruMap::new(COMPILED_QUERY_CACHE_CAP)),
+        }
+    }
+}
+
+impl CompiledQueryCache {
+    pub(crate) fn key_for(source: &str, name: &str) -> CompiledQueryKey {
+        CompiledQueryKey {
+            source_digest: Sha256::digest(source.as_bytes()).into(),
+            name: name.to_string(),
+        }
+    }
+
+    pub(crate) fn get(
+        &self,
+        catalog: &Arc<Catalog>,
+        key: &CompiledQueryKey,
+    ) -> Option<Arc<QueryIR>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .filter(|entry| {
+                entry
+                    .catalog
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(&held, catalog))
+            })
+            .map(|entry| Arc::clone(&entry.ir))
+    }
+
+    pub(crate) fn insert(&self, catalog: &Arc<Catalog>, key: CompiledQueryKey, ir: Arc<QueryIR>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key,
+                CompiledQueryEntry {
+                    catalog: Arc::downgrade(catalog),
+                    ir,
+                },
+            );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
 }
 
 impl std::fmt::Debug for ReadCaches {
@@ -608,5 +729,54 @@ edge Likes: Person -> Person {}
         );
         // Sanity that the shared index really is the artifact's full catalog.
         assert!(knows.csr("Knows").is_some() && knows.csr("Likes").is_some());
+    }
+
+    /// A hit needs the live `Arc<Catalog>` the entry was compiled under: an
+    /// equal catalog under another `Arc` misses; once that `Arc` is dropped the
+    /// entry pins nothing, never hits again, and stays counted until evicted.
+    #[tokio::test]
+    async fn compiled_query_cache_hit_requires_the_live_compiled_under_catalog() {
+        const SCHEMA: &str = "node Person { name: String @key }";
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+        let (_, built) = db.capture_current_read_view().await.unwrap();
+        let compile = |catalog: &Catalog, source: &str, name: &str| {
+            let decl = omnigraph_compiler::find_named_query(source, name).unwrap();
+            let ctx =
+                omnigraph_compiler::query::typecheck::typecheck_query(catalog, &decl).unwrap();
+            Arc::new(omnigraph_compiler::lower_query(catalog, &decl, &ctx).unwrap())
+        };
+        let cache = CompiledQueryCache::default();
+        let source = "query q() { match { $p: Person } return { $p.name } }";
+        let key = CompiledQueryCache::key_for(source, "q");
+
+        let first = Arc::new((*built).clone());
+        let ir = compile(&first, source, "q");
+        cache.insert(&first, key.clone(), Arc::clone(&ir));
+        assert!(Arc::ptr_eq(&cache.get(&first, &key).unwrap(), &ir));
+
+        let equal = Arc::new((*built).clone());
+        assert!(
+            cache.get(&equal, &key).is_none(),
+            "an equal catalog under another Arc must miss"
+        );
+
+        let dropped = Arc::downgrade(&first);
+        drop(first);
+        assert!(
+            dropped.upgrade().is_none(),
+            "the entry must hold no Arc to its catalog"
+        );
+        let source_r = "query r() { match { $p: Person } return { $p.name } }";
+        let key_r = CompiledQueryCache::key_for(source_r, "r");
+        cache.insert(&equal, key_r.clone(), compile(&equal, source_r, "r"));
+        assert!(
+            cache.get(&equal, &key).is_none(),
+            "an entry whose catalog was dropped never hits under a later catalog"
+        );
+        assert!(cache.get(&equal, &key_r).is_some());
+        assert_eq!(cache.len(), 2, "the dead entry stays until evicted");
     }
 }
