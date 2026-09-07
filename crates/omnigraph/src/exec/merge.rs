@@ -4831,6 +4831,92 @@ impl Omnigraph {
         Box::pin(self.branch_merge_impl(source, target, actor_id)).await
     }
 
+    /// The merge base over the two captured lineages, with the records of
+    /// merged parents that live in other branches read from those branches;
+    /// a record no live branch holds leaves the walk at the base it found.
+    async fn resolve_merge_base(
+        &self,
+        source_commits: &crate::db::commit_graph::CommitGraphSnapshot,
+        target_commits: &crate::db::commit_graph::CommitGraphSnapshot,
+        source_commit_id: &str,
+        target_commit_id: &str,
+        merging_branches: &[Option<&str>],
+    ) -> Result<crate::db::commit_graph::GraphCommit> {
+        let mut imported = HashMap::new();
+        let mut other_branches: Option<Vec<String>> = None;
+        loop {
+            let search = CommitGraph::merge_base_search(
+                source_commits,
+                target_commits,
+                &imported,
+                source_commit_id,
+                target_commit_id,
+            );
+            let resolved =
+                search.unresolved_source.is_empty() && search.unresolved_target.is_empty();
+            let next_branch = if resolved {
+                None
+            } else {
+                if other_branches.is_none() {
+                    other_branches = Some(
+                        self.branch_list()
+                            .await?
+                            .into_iter()
+                            .filter(|branch| !merging_branches.contains(&Some(branch.as_str())))
+                            .collect(),
+                    );
+                }
+                other_branches.as_mut().and_then(Vec::pop)
+            };
+            let Some(branch) = next_branch else {
+                let both_sides: Vec<&String> = search
+                    .unresolved_source
+                    .iter()
+                    .filter(|id| search.unresolved_target.contains(id))
+                    .collect();
+                if !both_sides.is_empty() {
+                    tracing::warn!(
+                        commits = ?both_sides,
+                        "merge lineage names commits no live branch holds that both branches \
+                         descend from; the merge base may be older than the true one"
+                    );
+                } else if !resolved {
+                    tracing::debug!(
+                        source = ?search.unresolved_source,
+                        target = ?search.unresolved_target,
+                        "merge lineage names commits no live branch holds; the merge base is \
+                         chosen from the reachable history"
+                    );
+                }
+                return search.base.ok_or_else(|| {
+                    OmniError::manifest(
+                        "captured branch commits are unavailable or have no common ancestor"
+                            .to_string(),
+                    )
+                });
+            };
+            let branch = Some(branch.as_str()).filter(|b| *b != "main");
+            let rows = match ManifestCoordinator::read_graph_lineage_at(self.uri(), branch).await {
+                Ok((rows, _)) => rows,
+                Err(OmniError::BranchNotFound { .. }) => {
+                    tracing::debug!(
+                        branch = ?branch,
+                        "branch listed for merge-base resolution was deleted before its \
+                         lineage was read"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for row in rows {
+                let commit = crate::db::commit_graph::graph_commit_from_manifest_row(row);
+                imported
+                    .entry(commit.graph_commit_id.clone())
+                    .or_insert(commit);
+            }
+        }
+    }
+
     async fn branch_merge_impl(
         &self,
         source: &str,
@@ -4889,17 +4975,15 @@ impl Omnigraph {
             .effective_graph_head
             .clone()
             .ok_or_else(|| OmniError::manifest("target branch has no head commit".to_string()))?;
-        let base_commit = CommitGraph::merge_base_from_snapshots(
-            source_commits,
-            target_commits,
-            &source_head_commit_id,
-            &target_head_commit_id,
-        )
-        .ok_or_else(|| {
-            OmniError::manifest(
-                "captured branch commits are unavailable or have no common ancestor".to_string(),
+        let base_commit = self
+            .resolve_merge_base(
+                &source_commits,
+                &target_commits,
+                &source_head_commit_id,
+                &target_head_commit_id,
+                &relevant_branches,
             )
-        })?;
+            .await?;
 
         if source_head_commit_id == target_head_commit_id
             || base_commit.graph_commit_id == source_head_commit_id

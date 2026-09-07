@@ -1,0 +1,75 @@
+# issue: 639
+# red_on: 2026-09-06, main 5d74278c: step 8 `branch merge t` failed with `merge conflicts: node type 'Item', entity id 'a' (divergent_update)`; steps 1-7 green, both imports `fast_forward`.
+# notes: main and t both fast-forward x (a=1), then main sets a=2 and t
+# notes: sets x=1. The base of the t-into-main merge must be x's commit; the
+# notes: fork point (a=0) makes x's write look like an edit on both sides.
+
+--- schema
+node Item {
+    slug: String @key
+    value: I32
+}
+
+--- seed
+{"type":"Item","data":{"slug":"a","value":0}}
+{"type":"Item","data":{"slug":"x","value":0}}
+
+--- mutate
+branch create x
+
+--- expect ok
+
+--- mutate
+branch create t
+
+--- expect ok
+
+--- mutate branch: x
+query set_a_on_x() {
+    update Item set { value: 1 } where slug = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge x
+
+--- expect outcome: fast_forward
+
+--- mutate
+branch merge x into t
+
+--- expect outcome: fast_forward
+
+--- mutate
+query set_a_on_main() {
+    update Item set { value: 2 } where slug = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: t
+query set_x_on_t() {
+    update Item set { value: 1 } where slug = "x"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge t
+
+--- expect outcome: merged
+
+--- query
+query values_on_main() {
+    match { $i: Item }
+    return { $i.slug, $i.value }
+}
+
+--- expect unordered
+{"i.slug": "a", "i.value": 2}
+{"i.slug": "x", "i.value": 1}
+
+--- expect shape
+i.slug: String
+i.value: I32

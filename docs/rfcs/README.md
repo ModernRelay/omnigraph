@@ -185,3 +185,4 @@ This table is the human index for the canonical RFC corpus.
 | [0057](0057-bounded-merge-preparation.md) | Accepted-context reuse and bounded merge preparation | maintainer | accepted | in-progress |
 | [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |
 | [0062](0062-manifest-version-clock.md) | Manifest version as the table registration clock | maintainer | draft | in-progress |
+| [0062](0062-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |

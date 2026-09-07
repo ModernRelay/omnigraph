@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -44,7 +44,7 @@ pub(crate) struct FirstParentEdge {
 /// dataset (Phase B retired `_graph_commits.lance` / `_graph_commit_actors.lance`):
 /// the in-memory cache is built from `ManifestCoordinator::read_graph_lineage_at`,
 /// and branch authority lives entirely in `__manifest`. Reads
-/// (`head_commit`/`load_commits`/`get_commit`/`merge_base`) and writes
+/// (`head_commit`/`load_commits`/`get_commit`/`merge_base_search`) and writes
 /// (`insert_committed`, fed by the coordinator's manifest publish CAS) both work
 /// off this projection.
 pub struct CommitGraph {
@@ -60,6 +60,15 @@ pub struct CommitGraph {
 #[derive(Clone)]
 pub(crate) struct CommitGraphSnapshot {
     commit_by_id: Arc<HashMap<String, GraphCommit>>,
+}
+
+/// One merge-base walk over the two branch-local maps plus imported records;
+/// each `unresolved_*` side lists the ids it reaches, held by no map, before
+/// meeting a commit the other side also holds.
+pub(crate) struct MergeBaseSearch {
+    pub(crate) base: Option<GraphCommit>,
+    pub(crate) unresolved_source: Vec<String>,
+    pub(crate) unresolved_target: Vec<String>,
 }
 
 impl CommitGraph {
@@ -206,69 +215,19 @@ impl CommitGraph {
         self.commit_by_id.get(commit_id).cloned()
     }
 
-    pub async fn merge_base(
-        root_uri: &str,
-        source_branch: Option<&str>,
-        target_branch: Option<&str>,
-    ) -> Result<Option<GraphCommit>> {
-        let source = open_for_branch(root_uri, source_branch).await?;
-        let target = open_for_branch(root_uri, target_branch).await?;
-
-        let source_head = match source.head_commit().await? {
-            Some(commit) => commit,
-            None => return Ok(None),
-        };
-        let target_head = match target.head_commit().await? {
-            Some(commit) => commit,
-            None => return Ok(None),
-        };
-
-        Self::merge_base_from_open_graphs(
-            source,
-            target,
-            &source_head.graph_commit_id,
-            &target_head.graph_commit_id,
-        )
-        .await
-    }
-
-    async fn merge_base_from_open_graphs(
-        source: Self,
-        target: Self,
+    /// The walk behind `Omnigraph::resolve_merge_base`; `imported` holds the
+    /// records read from other branches for ids the two branch-local maps lack.
+    pub(crate) fn merge_base_search(
+        source: &CommitGraphSnapshot,
+        target: &CommitGraphSnapshot,
+        imported: &HashMap<String, GraphCommit>,
         source_commit_id: &str,
         target_commit_id: &str,
-    ) -> Result<Option<GraphCommit>> {
-        Ok(Self::merge_base_from_snapshots(
-            source.snapshot(),
-            target.snapshot(),
-            source_commit_id,
-            target_commit_id,
-        ))
-    }
-
-    /// Compute a merge base from two O(1) authority snapshots without cloning
-    /// either branch's complete lineage. The maps are read-only for the
-    /// duration of this synchronous walk. Snapshots are consumed so their Arc
-    /// references are structurally gone before a later publish updates either
-    /// coordinator via copy-on-write.
-    pub(crate) fn merge_base_from_snapshots(
-        source: CommitGraphSnapshot,
-        target: CommitGraphSnapshot,
-        source_commit_id: &str,
-        target_commit_id: &str,
-    ) -> Option<GraphCommit> {
-        if Arc::ptr_eq(&source.commit_by_id, &target.commit_by_id) {
-            return merge_base_from_maps(
-                &source.commit_by_id,
-                &source.commit_by_id,
-                source_commit_id,
-                target_commit_id,
-            );
-        }
-
+    ) -> MergeBaseSearch {
         merge_base_from_maps(
             &source.commit_by_id,
             &target.commit_by_id,
+            imported,
             source_commit_id,
             target_commit_id,
         )
@@ -315,7 +274,9 @@ fn build_commit_cache(
     (commit_by_id, head_commit)
 }
 
-fn graph_commit_from_manifest_row(row: crate::db::manifest::GraphLineageRow) -> GraphCommit {
+pub(crate) fn graph_commit_from_manifest_row(
+    row: crate::db::manifest::GraphLineageRow,
+) -> GraphCommit {
     GraphCommit {
         graph_commit_id: row.graph_commit_id,
         graph_branch: row.graph_branch,
@@ -330,17 +291,52 @@ fn graph_commit_from_manifest_row(row: crate::db::manifest::GraphLineageRow) -> 
 fn merge_base_from_maps(
     source_commits: &HashMap<String, GraphCommit>,
     target_commits: &HashMap<String, GraphCommit>,
+    imported: &HashMap<String, GraphCommit>,
     source_commit_id: &str,
     target_commit_id: &str,
-) -> Option<GraphCommit> {
-    let get = |id: &str| source_commits.get(id).or_else(|| target_commits.get(id));
+) -> MergeBaseSearch {
+    let get = |id: &str| {
+        source_commits
+            .get(id)
+            .or_else(|| target_commits.get(id))
+            .or_else(|| imported.get(id))
+    };
     if get(source_commit_id).is_none() || get(target_commit_id).is_none() {
-        return None;
+        return MergeBaseSearch {
+            base: None,
+            unresolved_source: Vec::new(),
+            unresolved_target: Vec::new(),
+        };
     }
 
-    let source_distances = ancestor_distances_from(source_commit_id, &get);
-    let target_distances = ancestor_distances_from(target_commit_id, &get);
-    source_distances
+    let mut full_walk_unresolved = BTreeSet::new();
+    let source_distances = ancestor_distances_from(
+        source_commit_id,
+        &get,
+        &|_| false,
+        &mut full_walk_unresolved,
+    );
+    let target_distances = ancestor_distances_from(
+        target_commit_id,
+        &get,
+        &|_| false,
+        &mut full_walk_unresolved,
+    );
+    let mut unresolved_source = BTreeSet::new();
+    ancestor_distances_from(
+        source_commit_id,
+        &get,
+        &|id| target_distances.contains_key(id),
+        &mut unresolved_source,
+    );
+    let mut unresolved_target = BTreeSet::new();
+    ancestor_distances_from(
+        target_commit_id,
+        &get,
+        &|id| source_distances.contains_key(id),
+        &mut unresolved_target,
+    );
+    let base = source_distances
         .iter()
         .filter_map(|(id, source_distance)| {
             target_distances.get(id).and_then(|target_distance| {
@@ -356,12 +352,21 @@ fn merge_base_from_maps(
             })
         })
         .min_by_key(|(score, _)| *score)
-        .map(|(_, commit)| commit)
+        .map(|(_, commit)| commit);
+    MergeBaseSearch {
+        base,
+        unresolved_source: unresolved_source.into_iter().collect(),
+        unresolved_target: unresolved_target.into_iter().collect(),
+    }
 }
 
+/// Breadth-first ancestor distances from `start_id`; a commit `stop_at` accepts
+/// is recorded but not expanded, and ids `get` cannot resolve go to `unresolved`.
 fn ancestor_distances_from<'a>(
     start_id: &str,
     get: &impl Fn(&str) -> Option<&'a GraphCommit>,
+    stop_at: &impl Fn(&str) -> bool,
+    unresolved: &mut BTreeSet<String>,
 ) -> HashMap<String, u64> {
     let mut distances = HashMap::new();
     let mut queue = VecDeque::from([(start_id.to_string(), 0u64)]);
@@ -375,12 +380,20 @@ fn ancestor_distances_from<'a>(
         }
         distances.insert(id.clone(), distance);
 
-        if let Some(commit) = get(&id) {
-            if let Some(parent) = &commit.parent_commit_id {
-                queue.push_back((parent.clone(), distance + 1));
+        match get(&id) {
+            Some(commit) => {
+                if stop_at(&id) {
+                    continue;
+                }
+                if let Some(parent) = &commit.parent_commit_id {
+                    queue.push_back((parent.clone(), distance + 1));
+                }
+                if let Some(parent) = &commit.merged_parent_commit_id {
+                    queue.push_back((parent.clone(), distance + 1));
+                }
             }
-            if let Some(parent) = &commit.merged_parent_commit_id {
-                queue.push_back((parent.clone(), distance + 1));
+            None => {
+                unresolved.insert(id);
             }
         }
     }
@@ -389,11 +402,4 @@ fn ancestor_distances_from<'a>(
 
 fn should_replace_head(current: Option<&GraphCommit>, candidate: &GraphCommit) -> bool {
     current.is_none_or(|existing| candidate.lineage_key() > existing.lineage_key())
-}
-
-async fn open_for_branch(root_uri: &str, branch: Option<&str>) -> Result<CommitGraph> {
-    match branch {
-        Some(branch) if branch != "main" => CommitGraph::open_at_branch(root_uri, branch).await,
-        _ => CommitGraph::open(root_uri).await,
-    }
 }

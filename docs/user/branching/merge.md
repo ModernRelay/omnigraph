@@ -71,6 +71,16 @@ structured conflict list and publishes nothing.
 | `cardinality_violation` | The result would violate edge cardinality. |
 | `value_constraint_violation` | The result would violate an enum, range, or other value constraint. |
 
+A merge classifies both sides against their merge base, the nearest commit
+both branches descend from, counting a merged branch as an ancestor. Two
+branches that each merged the same third branch therefore share that
+branch's commit as their base, and an entity only one of them changed after
+that import merges cleanly. The record of such a commit lives in the branch
+it was merged from, and the merge reads it from any live branch whose
+lineage still holds it. Once no live branch holds it, the base falls back to
+the older common commit, so an entity both sides received from the deleted
+branch and one side then changed can report `divergent_update`.
+
 Each conflict identifies the affected type and, when applicable, entity id. The
 HTTP server returns conflicts with status `409`, the same answer for
 `POST /branches/merge` and for a `branch merge` statement on `POST /mutate`.

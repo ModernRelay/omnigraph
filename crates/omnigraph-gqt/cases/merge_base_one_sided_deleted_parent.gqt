@@ -1,0 +1,68 @@
+# issue: none
+# notes: companion of issue_639_shared_merged_parent_base: the ordinary flow around a deleted branch: s forks main; x forks main,
+# notes: writes, is merged into main and deleted; s merges into main. Only main's
+# notes: walk reaches x's commit before shared history, so it is not a base
+# notes: candidate and the merge proceeds on the fork point (RFC 0062 step 1).
+
+--- schema
+node Item {
+    slug: String @key
+    value: I32
+}
+
+--- seed
+{"type":"Item","data":{"slug":"a","value":0}}
+{"type":"Item","data":{"slug":"x","value":0}}
+
+--- mutate
+branch create s
+
+--- expect ok
+
+--- mutate
+branch create x
+
+--- expect ok
+
+--- mutate branch: x
+query set_a_on_x() {
+    update Item set { value: 1 } where slug = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge x
+
+--- expect outcome: fast_forward
+
+--- mutate
+branch delete x
+
+--- expect ok
+
+--- mutate branch: s
+query set_x_on_s() {
+    update Item set { value: 1 } where slug = "x"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge s
+
+--- expect outcome: merged
+
+--- query
+query values_on_main() {
+    match { $i: Item }
+    return { $i.slug, $i.value }
+}
+
+--- expect unordered
+{"i.slug": "a", "i.value": 1}
+{"i.slug": "x", "i.value": 1}
+
+--- expect shape
+i.slug: String
+i.value: I32
