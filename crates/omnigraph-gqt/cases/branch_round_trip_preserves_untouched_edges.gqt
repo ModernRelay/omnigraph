@@ -1,0 +1,135 @@
+# issue: none
+# red_on: 2026-09-07, main 5f94a741: after merging main into feature, only two of the expected three bound edge rows remained.
+# notes: Churn a feature's edge history, merge it, add an edge on main, merge
+# notes: main back, then edit only a node. The final merge must retain all three
+# notes: edges after reopening. A bound edge makes duplicate or missing rows visible.
+# notes: PR 630; branching.rs::branch_merge_preserves_untouched_edges_after_round_trip
+# notes: retains native-version and exact stored-edge ID assertions.
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"bob"}}
+{"type":"Person","data":{"name":"charlie"}}
+{"type":"Person","data":{"name":"diana"}}
+{"edge":"Knows","from":"alice","to":"bob"}
+{"edge":"Knows","from":"alice","to":"charlie"}
+{"edge":"Knows","from":"bob","to":"diana"}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- loop $i 0 8
+
+--- mutate branch: feature
+query add_temporary_edge() {
+    insert Knows { from: "diana", to: "alice" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: feature
+query remove_temporary_edge() {
+    delete Knows where from = "diana"
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- endloop
+
+--- mutate branch: feature
+query remove_bob_edge() {
+    delete Knows where from = "bob"
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge feature into main
+
+--- expect outcome: fast_forward
+
+--- mutate
+query add_main_edge() {
+    insert Knows { from: "alice", to: "diana" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: fast_forward
+
+--- query branch: feature
+query feature_received_every_edge() {
+    match {
+        $a: Person
+        $a $e:knows $b
+    }
+    return { $a.name as source, $b.name as target }
+}
+
+--- expect unordered
+{"source":"alice","target":"bob"}
+{"source":"alice","target":"charlie"}
+{"source":"alice","target":"diana"}
+
+--- expect shape
+source: String
+target: String
+
+--- mutate branch: feature
+query unrelated_node() {
+    insert Person { name: "eve" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge feature into main
+
+--- expect outcome: fast_forward
+
+--- restart
+
+--- query
+query main_kept_every_edge() {
+    match {
+        $a: Person
+        $a $e:knows $b
+    }
+    return { $a.name as source, $b.name as target }
+}
+
+--- expect unordered
+{"source":"alice","target":"bob"}
+{"source":"alice","target":"charlie"}
+{"source":"alice","target":"diana"}
+
+--- expect shape
+source: String
+target: String
+
+--- query
+query main_received_unrelated_node() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+{"p.name":"charlie"}
+{"p.name":"diana"}
+{"p.name":"eve"}
+
+--- expect shape
+p.name: String
